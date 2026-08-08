@@ -47,6 +47,9 @@ extension BluetoothAvailability {
 
  Blocked identities are dropped from Recent activity here and from the People
  groups by the core, so a block is honoured on this page in both directions.
+ The block tombstones come from one query rather than a per-contact question: a
+ block can outlive the contact row and can sort past the people cap, and either
+ way an activity row for a blocked identity is the tombstone leaking.
 
  Mirrors `loadConnectionSnapshot` in ConnectionDetailsScreen.kt.
  */
@@ -55,6 +58,7 @@ enum ConnectionSnapshotLoader {
         let store = AppStore.get()
         let allContacts: [Contact] = (try? store.listContacts()) ?? []
         let contacts = Array(allContacts.prefix(connectionPeopleLimit))
+        let blocked = Set((try? store.listBlockedUsers()) ?? [])
 
         let depthRows: [RelayQueueDepth] =
             (try? store.pendingRelayOutboundDepthByRecipient(nowMs: nowMs)) ?? []
@@ -84,7 +88,7 @@ enum ConnectionSnapshotLoader {
                 userId: contact.userId,
                 userIdHex: UserIdHex.encode(contact.userId),
                 name: coreContactDisplayName(contact: contact),
-                blocked: (try? store.isUserBlocked(userId: contact.userId)) ?? false,
+                blocked: blocked.contains(contact.userId),
                 hasRelayEndpoint: !relayUrl.isEmpty,
                 queued: depths[contact.userId] ?? 0,
                 latest: evidence
@@ -92,10 +96,8 @@ enum ConnectionSnapshotLoader {
         }
 
         var names: [Data: String] = [:]
-        var blocked: Set<Data> = []
         for person in people {
             names[person.userId] = person.name
-            if person.blocked { blocked.insert(person.userId) }
         }
 
         let events: [PeerConnectionEvent] = (try? store.peerConnectionEvents(
@@ -119,8 +121,15 @@ enum ConnectionSnapshotLoader {
     }
 }
 
-/// How often the polling fallback asks for a reload while the page is visible.
-private let storePollIntervalMs: Int64 = 5_000
+/**
+ How often the polling fallback asks for a reload while the page is visible.
+
+ Four seconds, not five: the coalescing window adds up to another 500 ms before
+ a load even starts, and the acceptance criterion is that a newly recorded
+ connection event appears *within* five. A tick exactly at the budget spends the
+ whole of it and then some.
+ */
+private let storePollIntervalMs: Int64 = 4_000
 
 /**
  How often relative times, the freshness label, and the bounded Checking state
@@ -166,7 +175,7 @@ final class ConnectionDetailsModel: ObservableObject {
     /// a mark that restarted on every render would make the bound unreachable.
     let checkingClock = CheckingClock()
 
-    private var coalescer = StoreChangeCoalescer()
+    private let coalescer = StoreChangeCoalescer()
     private var requests: AsyncStream<Void>.Continuation?
     private var loopTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
@@ -181,7 +190,8 @@ final class ConnectionDetailsModel: ObservableObject {
 
     func start() {
         guard loopTask == nil else { return }
-        coalescer = StoreChangeCoalescer()
+        // A previous run may have been torn down mid-window or mid-load.
+        coalescer.reset()
 
         let stream = AsyncStream<Void>(Void.self, bufferingPolicy: .bufferingNewest(1)) {
             continuation in
@@ -203,13 +213,18 @@ final class ConnectionDetailsModel: ObservableObject {
             // absorbed, not stacked.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(storePollIntervalMs) * 1_000_000)
+                // Not `self?.` -- a deallocated model with no `stop()` behind
+                // it would otherwise leave this timer looping forever doing
+                // nothing at all.
+                guard let self = self else { return }
                 if Task.isCancelled { return }
-                self?.signalStoreChanged()
+                self.signalStoreChanged()
             }
         }
         clockTask = Task { [weak self] in
             while !Task.isCancelled {
-                self?.nowMs = ConnectionClock.nowMs
+                guard let self = self else { return }
+                self.nowMs = ConnectionClock.nowMs
                 try? await Task.sleep(nanoseconds: UInt64(clockTickMs) * 1_000_000)
             }
         }
@@ -234,7 +249,7 @@ final class ConnectionDetailsModel: ObservableObject {
         // A reload cancelled mid-flight would otherwise leave the coalescer
         // believing one is still running, and every later signal would be
         // absorbed as a follow-up that never comes.
-        coalescer = StoreChangeCoalescer()
+        coalescer.reset()
         resumePullWaiters()
     }
 

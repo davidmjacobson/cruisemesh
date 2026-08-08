@@ -105,7 +105,7 @@ final class ConnectionDetailsLogicTests: XCTestCase {
 
     func testEveryRelayHealthHasExactlyOnePathState() {
         let cases: [(RelayHealth, CoreRelayPathState)] = [
-            (.noConfig, .notSetUp),
+            (.noConfig, .checking),
             (.checking, .checking),
             (.noInternet, .waitingForInternet),
             (.ok(lastSyncMs: Self.fixedNowMs), .connected),
@@ -164,11 +164,82 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         XCTAssertEqual(clock.mark(pending: true, nowMs: 10_000), 10_000)
     }
 
-    func testOnlyStartupAndAnUnansweredPassCheckArePending() {
-        XCTAssertTrue(connectionCheckPending(runtime: .starting, relay: .connected))
-        XCTAssertTrue(connectionCheckPending(runtime: .active, relay: .checking))
-        XCTAssertFalse(connectionCheckPending(runtime: .active, relay: .connected))
-        XCTAssertFalse(connectionCheckPending(runtime: .stopped, relay: .notSetUp))
+    func testEveryPathThatCanStillBeComingUpCountsAsPending() {
+        // Including the two radios. This platform reports CoreBluetooth
+        // `.unknown` on a cold launch and `.resetting` on a radio toggle, both
+        // while the mesh is already meshing -- a predicate that watched only
+        // the runtime and the pass never started the bound for either, and the
+        // card rendered "Needs attention" while the radio was still answering.
+        XCTAssertTrue(
+            connectionCheckPending(
+                runtime: .starting,
+                bluetooth: .available,
+                localWifi: .available,
+                relay: .connected
+            )
+        )
+        XCTAssertTrue(
+            connectionCheckPending(
+                runtime: .active,
+                bluetooth: .starting,
+                localWifi: .off,
+                relay: .notSetUp
+            )
+        )
+        XCTAssertTrue(
+            connectionCheckPending(
+                runtime: .active,
+                bluetooth: .off,
+                localWifi: .starting,
+                relay: .notSetUp
+            )
+        )
+        XCTAssertTrue(
+            connectionCheckPending(
+                runtime: .active,
+                bluetooth: .available,
+                localWifi: .available,
+                relay: .checking
+            )
+        )
+        XCTAssertFalse(
+            connectionCheckPending(
+                runtime: .active,
+                bluetooth: .available,
+                localWifi: .available,
+                relay: .connected
+            )
+        )
+        XCTAssertFalse(
+            connectionCheckPending(
+                runtime: .stopped,
+                bluetooth: .off,
+                localWifi: .off,
+                relay: .notSetUp
+            )
+        )
+    }
+
+    /// The trace the narrower predicate produced: a relaunch with the
+    /// Bluetooth stack unanswered, no LAN, and no pass showed a red failure
+    /// card for the few hundred milliseconds before the radio replied.
+    func testARadioStillComingUpIsCheckingNotAFailure() {
+        let pending = connectionCheckPending(
+            runtime: ConnectionInputs.runtime(.meshing(nearby: 0), bluetooth: .starting),
+            bluetooth: ConnectionInputs.bluetooth(.meshing(nearby: 0), availability: .starting),
+            localWifi: ConnectionInputs.localWifi(.meshing(nearby: 0), listening: false),
+            relay: ConnectionInputs.relay(.noConfig, configured: false)
+        )
+        XCTAssertTrue(pending)
+        let result = state(
+            people: [],
+            relayHealth: .noConfig,
+            relayConfigured: false,
+            lanListening: false,
+            bluetoothAvailability: .starting,
+            checkingSinceMs: Self.fixedNowMs
+        )
+        XCTAssertEqual(result.health.state, CoreConnectionHealth.checking)
     }
 
     // MARK: - Freshness and event times
@@ -297,90 +368,105 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         XCTAssertFalse(coalescer.onReloadFinished())
     }
 
+    /// The page is torn down every time it goes away, and the loop can be
+    /// cancelled inside the window or inside the load. Without the reset the
+    /// coalescer spends the rest of its life absorbing every signal as "a
+    /// reload is already running", and the page never loads again.
+    func testResetForgetsAWindowOrAReloadLeftOutstandingByATeardown() {
+        let coalescer = StoreChangeCoalescer(windowMs: 500)
+        // Cancelled inside the window.
+        XCTAssertTrue(coalescer.onSignal(nowMs: 0))
+        XCTAssertFalse(coalescer.onSignal(nowMs: 0))
+        coalescer.reset()
+        XCTAssertTrue(coalescer.onSignal(nowMs: 1_000))
+
+        // Cancelled inside the load.
+        coalescer.onReloadStarted()
+        XCTAssertFalse(coalescer.onSignal(nowMs: 1_000))
+        coalescer.reset()
+        XCTAssertTrue(coalescer.onSignal(nowMs: 2_000))
+        // And nothing is owed from before the teardown.
+        coalescer.onReloadStarted()
+        XCTAssertFalse(coalescer.onReloadFinished())
+    }
+
     // MARK: - Delivery language
 
-    func testNothingWaitingMeansNoDeliveryLineAtAll() {
-        XCTAssertNil(
-            DeliveryPresentation.line(
-                queued: 0,
-                routeIsDirect: false,
-                ownRelayUsable: false,
-                contactHasRelayEndpoint: true,
-                contactRelayStale: false,
-                relay: .waitingForInternet
-            )
+    private func deliveryLine(
+        queued: Int,
+        routeIsDirect: Bool = false,
+        ownRelayUsable: Bool = true,
+        contactHasRelayEndpoint: Bool = true,
+        contactRelayStale: Bool = false,
+        relay: CoreRelayPathState = .connected,
+        receiptIsNewestEvidence: Bool = false
+    ) -> DeliveryLine? {
+        DeliveryPresentation.line(
+            queued: queued,
+            routeIsDirect: routeIsDirect,
+            ownRelayUsable: ownRelayUsable,
+            contactHasRelayEndpoint: contactHasRelayEndpoint,
+            contactRelayStale: contactRelayStale,
+            relay: relay,
+            receiptIsNewestEvidence: receiptIsNewestEvidence
         )
+    }
+
+    func testNothingWaitingMeansNoDeliveryLineAtAll() {
+        XCTAssertNil(deliveryLine(queued: 0))
     }
 
     func testALiveLinkMeansTheWorkIsGoingOutNow() {
         XCTAssertEqual(
-            DeliveryPresentation.line(
-                queued: 2,
-                routeIsDirect: true,
-                ownRelayUsable: false,
-                contactHasRelayEndpoint: false,
-                contactRelayStale: false,
-                relay: .notSetUp
-            ),
+            deliveryLine(queued: 2, routeIsDirect: true, ownRelayUsable: false),
             DeliveryLine(kind: .sending, count: 2)
         )
     }
 
     func testAWorkingPassPlusTheirEndpointIsAlsoAUsableRoute() {
-        XCTAssertEqual(
-            DeliveryPresentation.line(
-                queued: 1,
-                routeIsDirect: false,
-                ownRelayUsable: true,
-                contactHasRelayEndpoint: true,
-                contactRelayStale: false,
-                relay: .connected
-            ),
-            DeliveryLine(kind: .sending, count: 1)
-        )
+        XCTAssertEqual(deliveryLine(queued: 1), DeliveryLine(kind: .sending, count: 1))
     }
 
-    /// A written-off endpoint is not a route today -- and still not an error.
-    func testAWrittenOffEndpointWaitsForTheNextEncounter() {
-        XCTAssertEqual(
-            DeliveryPresentation.line(
-                queued: 3,
-                routeIsDirect: false,
-                ownRelayUsable: true,
-                contactHasRelayEndpoint: true,
-                contactRelayStale: true,
-                relay: .connected
-            ),
-            DeliveryLine(kind: .willDeliverWhenReconnected, count: 3)
-        )
+    /// Nothing will ever mark these rows uploaded, so the number is not a
+    /// backlog: it is every message written to them inside the retention
+    /// window, and it would sit under their name for a week.
+    func testAWrittenOffEndpointMeansNoLineBecauseTheCountCannotDrain() {
+        XCTAssertNil(deliveryLine(queued: 4, contactRelayStale: true))
     }
 
     func testNoInternetWithOnlyAPassRouteSaysSoPlainly() {
         XCTAssertEqual(
-            DeliveryPresentation.line(
-                queued: 2,
-                routeIsDirect: false,
-                ownRelayUsable: false,
-                contactHasRelayEndpoint: true,
-                contactRelayStale: false,
-                relay: .waitingForInternet
-            ),
-            DeliveryLine(kind: .waitingForInternet, count: 2)
+            deliveryLine(queued: 3, ownRelayUsable: false, relay: .waitingForInternet),
+            DeliveryLine(kind: .waitingForInternet, count: 3)
         )
     }
 
-    func testAFriendWithNoEndpointAtAllWaitsForTheNextEncounter() {
+    func testAPassFaultStillPromisesTheNextEncounterRatherThanAFailure() {
         XCTAssertEqual(
-            DeliveryPresentation.line(
-                queued: 1,
-                routeIsDirect: false,
-                ownRelayUsable: true,
-                contactHasRelayEndpoint: false,
-                contactRelayStale: false,
-                relay: .waitingForInternet
-            ),
-            DeliveryLine(kind: .willDeliverWhenReconnected, count: 1)
+            deliveryLine(queued: 4, ownRelayUsable: false, relay: .passExpired),
+            DeliveryLine(kind: .willDeliverWhenReconnected, count: 4)
         )
+    }
+
+    /// The contradiction this page exists to remove. The count is rows whose
+    /// upload stamp is unset, and only an upload sets it -- not a receipt, and
+    /// not handing the message over in person. On a phone with no pass saved,
+    /// or for a friend whose card carries no endpoint, the number never goes
+    /// down.
+    func testABacklogThatRelayUploadCannotDrainIsNotShownAtAll() {
+        XCTAssertNil(
+            deliveryLine(
+                queued: 12,
+                routeIsDirect: true,
+                ownRelayUsable: false,
+                relay: .notSetUp
+            )
+        )
+        XCTAssertNil(deliveryLine(queued: 12, contactHasRelayEndpoint: false))
+    }
+
+    func testARowThatAlreadySaysTheyReceivedAMessageGetsNoLineUnderIt() {
+        XCTAssertNil(deliveryLine(queued: 12, receiptIsNewestEvidence: true))
     }
 
     // MARK: - View-state assembly
@@ -410,11 +496,14 @@ final class ConnectionDetailsLogicTests: XCTestCase {
     private func state(
         people: [ConnectionPerson],
         directPaths: [Data: DirectPath] = [:],
-        relayHealth: RelayHealth = .ok(lastSyncMs: ConnectionDetailsLogicTests.now),
+        relayHealth: RelayHealth = .ok(lastSyncMs: ConnectionDetailsLogicTests.fixedNowMs),
         relayConfigured: Bool = true,
         lanListening: Bool = true,
         runtimeState: MeshRuntimeState = .meshing(nearby: 0),
         bluetoothAvailability: BluetoothAvailability = .available,
+        /// Zero, unless a test is about the bounded Checking state: a mark of
+        /// zero is "nothing pending" and resolves the bound immediately.
+        checkingSinceMs: Int64 = 0,
         stale: Set<Data> = [],
         presence: [Data: Int64] = [:],
         activity: [ConnectionActivityRow] = []
@@ -435,7 +524,7 @@ final class ConnectionDetailsLogicTests: XCTestCase {
                 activity: activity,
                 loadedAtMs: Self.fixedNowMs
             ),
-            checkingSinceMs: 0,
+            checkingSinceMs: checkingSinceMs,
             refreshing: false,
             nowMs: Self.fixedNowMs
         )
@@ -554,15 +643,54 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         XCTAssertNil(result.otherPeople[0].badge)
     }
 
-    func testWaitingWorkNeverRendersAsAnError() {
+    func testWaitingWorkNeverRendersAsAnErrorWhateverThePathState() {
         let result = state(
-            people: [person(1, "Ash", hasRelayEndpoint: false, queued: 4)],
+            people: [person(1, "Ash", queued: 3)],
             relayHealth: .noInternet
         )
         XCTAssertEqual(
             result.otherPeople[0].delivery,
-            DeliveryLine(kind: .willDeliverWhenReconnected, count: 4)
+            DeliveryLine(kind: .waitingForInternet, count: 3)
         )
+    }
+
+    /// The contradiction in one assertion: the row says "Received your message
+    /// 12 min ago" and the old page put "Sending 12 messages…" directly
+    /// beneath it, for as long as the retention window lasted.
+    func testAFriendWhoAlreadyReceivedAMessageGetsNoQueueLineUnderTheRow() {
+        let receivedAt = Self.fixedNowMs - 12 * minute
+        let result = state(
+            people: [
+                person(
+                    1,
+                    "Ash",
+                    queued: 12,
+                    latest: PersonEvidence(
+                        evidence: .messageDelivered,
+                        path: .shorePass,
+                        atMs: receivedAt
+                    )
+                )
+            ]
+        )
+        XCTAssertEqual(
+            result.otherPeople[0].status,
+            .history(evidence: .messageDelivered, atMs: receivedAt)
+        )
+        XCTAssertNil(result.otherPeople[0].delivery)
+    }
+
+    /// Not in a group, and not in the numbers above the groups either: a count
+    /// only a blocked person produces discloses them just as surely.
+    func testABlockedFriendStandingNextToUsIsCountedNowhere() {
+        let result = state(
+            people: [person(1, "Ash", blocked: true), person(2, "Bo")],
+            directPaths: [userId(1): .bluetooth]
+        )
+        XCTAssertTrue(result.reachableNow.isEmpty)
+        XCTAssertEqual(result.otherPeople.map { $0.name }, ["Bo"])
+        XCTAssertEqual(result.health.nearbyFriendCount, 0)
+        XCTAssertEqual(result.paths.bluetoothLinks, 0)
     }
 
     func testAStoppedMeshNeedsAttentionAndOffersToStart() {

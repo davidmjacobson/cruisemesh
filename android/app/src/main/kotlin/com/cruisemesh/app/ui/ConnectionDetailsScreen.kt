@@ -50,6 +50,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -81,6 +82,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
@@ -159,62 +161,72 @@ fun ConnectionDetailsScreen(
         }
     }
 
+    // The loop lives in ConnectionDetailsLogic so its lifecycle -- what
+    // survives a pause, what is owed after a cancellation -- has a test. It is
+    // cancelled on every ON_PAUSE and restarted on ON_RESUME, and it resets the
+    // coalescer on the way in for exactly that reason.
     LaunchedEffect(resumed) {
         if (!resumed) return@LaunchedEffect
-        // Seed with a window that has already elapsed: the first paint should
-        // not wait out a debounce nobody asked for.
-        if (coalescer.onSignal(System.currentTimeMillis() - CONNECTION_COALESCE_WINDOW_MS)) {
-            requests.trySend(Unit)
-        }
-        // Polling fallback until the store publishes a change signal. Same
-        // three rules apply: a tick that lands mid-reload is absorbed, not
-        // stacked.
-        launch {
-            while (true) {
-                delay(STORE_POLL_INTERVAL_MS)
-                signal()
-            }
-        }
-        while (true) {
-            requests.receive()
-            var wait = coalescer.remainingMs(System.currentTimeMillis())
-            while (wait > 0L) {
-                delay(wait)
-                wait = coalescer.remainingMs(System.currentTimeMillis())
-            }
-            coalescer.onReloadStarted()
-            refreshing = true
+        runConnectionRefreshLoop(
+            coalescer = coalescer,
+            requests = requests,
+            signal = signal,
+            nowMs = System::currentTimeMillis,
+            pollIntervalMs = STORE_POLL_INTERVAL_MS,
+            onRefreshingChanged = { running ->
+                refreshing = running
+                if (!running) pullRefreshing = false
+            },
             // The only place this page touches the store, and it is never the
             // main thread.
-            val loaded = withContext(Dispatchers.IO) {
-                loadConnectionSnapshot(store, System.currentTimeMillis())
-            }
-            // The last good snapshot stayed on screen throughout; it is
-            // replaced only once a whole new one exists.
-            snapshot = loaded
-            refreshing = false
-            pullRefreshing = false
-            if (coalescer.onReloadFinished()) signal()
-        }
+            load = {
+                withContext(Dispatchers.IO) {
+                    loadConnectionSnapshot(store, System.currentTimeMillis())
+                }
+            },
+            onLoaded = { snapshot = it },
+        )
     }
 
+    val lanListening = lanState.localEndpoint != null
     val checkingClock = remember { CheckingClock() }
-    val state = run {
-        val runtime = ConnectionInputs.runtime(runtimeState)
-        val relayPath = ConnectionInputs.relay(relayHealth, relayConfigured)
-        // The same clock the classification is given: a mark stamped from a
-        // fresher clock than `nowMs` would look like it came from the future
-        // and resolve the bound instantly, so Checking would never be shown.
-        val checkingSinceMs = checkingClock.mark(
-            connectionCheckPending(runtime, relayPath),
-            nowMs,
-        )
+    // The same clock the classification is given: a mark stamped from a fresher
+    // clock than `nowMs` would look like it came from the future and resolve the
+    // bound instantly, so Checking would never be shown.
+    val checkingSinceMs = checkingClock.mark(
+        connectionCheckPending(
+            ConnectionInputs.runtime(runtimeState),
+            ConnectionInputs.bluetooth(runtimeState),
+            ConnectionInputs.localWifi(runtimeState, lanListening),
+            ConnectionInputs.relay(relayHealth, relayConfigured),
+        ),
+        nowMs,
+    )
+    // Remembered on its inputs rather than recomputed per recomposition. Two
+    // FFI round trips marshalling the whole address book each way is not work
+    // to repeat because an unrelated disclosure section was expanded -- and the
+    // observables above emit at mesh-flood rates, so "once per recomposition"
+    // is the wrong budget for it.
+    val state = remember(
+        runtimeState,
+        transports,
+        relayHealth,
+        lanListening,
+        bluetoothAudio,
+        staleRelayContacts,
+        presenceLastSeen,
+        contactLastSeen,
+        snapshot,
+        checkingSinceMs,
+        refreshing,
+        nowMs,
+    ) {
         buildConnectionDetailsState(
             runtimeState = runtimeState,
             transports = transports,
             relayHealth = relayHealth,
             relayConfigured = relayConfigured,
-            lanListening = lanState.localEndpoint != null,
+            lanListening = lanListening,
             bluetoothAudioActive = bluetoothAudio,
             staleRelayContacts = staleRelayContacts,
             presenceLastSeen = presenceLastSeen,
@@ -229,6 +241,7 @@ fun ConnectionDetailsScreen(
     var showClear by remember { mutableStateOf(false) }
     var troubleshootingExpanded by remember { mutableStateOf(false) }
     var howToFixReason by remember { mutableStateOf<CoreHealthReason?>(null) }
+    val scope = rememberCoroutineScope()
 
     Scaffold(
         topBar = {
@@ -291,9 +304,16 @@ fun ConnectionDetailsScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        runCatching { store.clearPeerConnectionHistory() }
                         showClear = false
-                        signal()
+                        // A delete over the whole event table, plus the wait for
+                        // a store lock the receive path also wants: not work for
+                        // the thread that has to keep answering taps.
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                runCatching { store.clearPeerConnectionHistory() }
+                            }
+                            signal()
+                        }
                     },
                 ) { Text(stringResource(R.string.ui_clear)) }
             },
@@ -306,8 +326,15 @@ fun ConnectionDetailsScreen(
     }
 }
 
-/** How often the polling fallback asks for a reload while the page is visible. */
-private const val STORE_POLL_INTERVAL_MS = 5_000L
+/**
+ * How often the polling fallback asks for a reload while the page is visible.
+ *
+ * Four seconds, not five: the coalescing window adds up to another 500 ms
+ * before a load even starts, and the acceptance criterion is that a newly
+ * recorded connection event appears *within* five. A tick exactly at the
+ * budget spends the whole of it and then some.
+ */
+private const val STORE_POLL_INTERVAL_MS = 4_000L
 
 /**
  * How often relative times, the freshness label, and the bounded Checking
@@ -403,7 +430,11 @@ fun ConnectionDetailsContent(
             }
         }
 
-        if (!state.hasContacts) {
+        // Only once a snapshot has actually been read. "No friends added yet"
+        // is a claim, and asserting it on the first frame of every open --
+        // before the background load has returned -- is a false one for
+        // everybody who has friends.
+        if (state.updatedAtMs > 0L && !state.hasContacts) {
             Spacer(modifier = Modifier.height(18.dp))
             Text(
                 stringResource(R.string.ui_no_friends_added_yet),
@@ -415,6 +446,12 @@ fun ConnectionDetailsContent(
         Spacer(modifier = Modifier.height(18.dp))
         CollapsibleSection(
             title = stringResource(R.string.ui_section_recent_activity),
+            // Collapsed, the newest event time is the only signal that
+            // anything happened at all; without it the row gives a reader no
+            // reason to open it.
+            detail = state.activity.firstOrNull()?.let {
+                eventTimeText(it.atMs, nowMs, startOfTodayMs)
+            },
             expanded = activityExpanded,
             onToggle = { activityExpanded = !activityExpanded },
         ) {
@@ -845,6 +882,7 @@ private fun CollapsibleSection(
     title: String,
     expanded: Boolean,
     onToggle: () -> Unit,
+    detail: String? = null,
     content: @Composable () -> Unit,
 ) {
     val toggleLabel = if (expanded) {
@@ -852,7 +890,12 @@ private fun CollapsibleSection(
     } else {
         stringResource(R.string.ui_show)
     }
-    val label = stringResource(R.string.ui_a11y_two_sentences, title, toggleLabel)
+    val heading = if (detail == null) {
+        title
+    } else {
+        stringResource(R.string.ui_section_with_detail, title, detail)
+    }
+    val label = stringResource(R.string.ui_a11y_two_sentences, heading, toggleLabel)
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -864,7 +907,7 @@ private fun CollapsibleSection(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                title,
+                heading,
                 style = MaterialTheme.typography.titleSmall,
                 modifier = Modifier.weight(1f),
             )
@@ -893,6 +936,7 @@ private fun CollapsibleSection(
 @Composable
 private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: () -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isEnabled(context)) }
     // Counts the delivery metrics too: they are captured whether or not
     // diagnostic logging is on, so a tester who never touched the switch can
@@ -947,19 +991,25 @@ private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: 
     ) { Text(stringResource(R.string.ui_share_diagnostics)) }
     OutlinedButton(
         onClick = {
-            DebugFileLog.deleteCapturedLogs(context)
-            // The metrics are captured whether or not diagnostic logging is
-            // on, so a delete that skipped them would leave behind the one
-            // captured thing it did not name.
-            runCatching { AppStore.get(context).clearDeliveryMetrics() }
-            FieldMetricsExport.deleteCsvFile(context)
-            runCatching { AppStore.get(context).clearMessageConflicts() }
-            ConflictDiagnosticsExport.deleteCsvFile(context)
-            // The last share left a zip holding copies of them all.
-            DiagnosticsShare.deleteArchive(context)
             hasCapturedDiagnostics = false
             supportMessage = context.getString(R.string.ui_diagnostics_deleted)
-            onStoreChanged()
+            // Two table-wide deletes and several file removals, each of them
+            // waiting on a store lock the receive path also wants.
+            scope.launch {
+                withContext(Dispatchers.IO) {
+                    DebugFileLog.deleteCapturedLogs(context)
+                    // The metrics are captured whether or not diagnostic
+                    // logging is on, so a delete that skipped them would leave
+                    // behind the one captured thing it did not name.
+                    runCatching { AppStore.get(context).clearDeliveryMetrics() }
+                    FieldMetricsExport.deleteCsvFile(context)
+                    runCatching { AppStore.get(context).clearMessageConflicts() }
+                    ConflictDiagnosticsExport.deleteCsvFile(context)
+                    // The last share left a zip holding copies of them all.
+                    DiagnosticsShare.deleteArchive(context)
+                }
+                onStoreChanged()
+            }
         },
         enabled = hasCapturedDiagnostics,
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -1078,11 +1128,11 @@ private fun pathBadgeLabelId(badge: ConnectionPathBadge): Int = when (badge) {
 }
 
 @PluralsRes
-private fun deliveryTextId(kind: DeliveryKind): Int = when (kind) {
-    DeliveryKind.SENDING -> R.plurals.ui_delivery_sending
-    DeliveryKind.WILL_DELIVER_WHEN_RECONNECTED ->
+private fun deliveryTextId(kind: CoreDeliveryState): Int = when (kind) {
+    CoreDeliveryState.SENDING -> R.plurals.ui_delivery_sending
+    CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED ->
         R.plurals.ui_delivery_will_deliver_when_you_reconnect
-    DeliveryKind.WAITING_FOR_INTERNET -> R.plurals.ui_delivery_waiting_for_internet
+    CoreDeliveryState.WAITING_FOR_INTERNET -> R.plurals.ui_delivery_waiting_for_internet
 }
 
 @Composable
@@ -1232,6 +1282,9 @@ internal fun transportLabelId(transport: PeerConnectionTransport): Int? = when (
  *
  * Blocked identities are dropped from Recent activity here and from the People
  * groups by the core, so a block is honoured on this page in both directions.
+ * The block tombstones come from one query rather than a per-contact question:
+ * a block can outlive the contact row and can sort past the people cap, and
+ * either way an activity row for a blocked identity is the tombstone leaking.
  */
 internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): ConnectionStoreSnapshot {
     val contacts = runCatching { store.listContacts() }
@@ -1243,6 +1296,10 @@ internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): Connectio
     val summaries = runCatching { store.peerConnectionSummaries() }
         .getOrDefault(emptyList())
         .groupBy { UserIdHex.encode(it.userId) }
+    val blocked = runCatching { store.listBlockedUsers() }
+        .getOrDefault(emptyList())
+        .map { UserIdHex.encode(it) }
+        .toSet()
 
     val people = contacts.map { contact ->
         val hex = UserIdHex.encode(contact.userId)
@@ -1250,7 +1307,7 @@ internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): Connectio
             userIdHex = hex,
             userId = contact.userId,
             name = coreContactDisplayName(contact),
-            blocked = runCatching { store.isUserBlocked(contact.userId) }.getOrDefault(false),
+            blocked = hex in blocked,
             hasRelayEndpoint = !contact.relayUrl.isNullOrBlank(),
             queued = depths[hex] ?: 0,
             latest = latestPeerStatus(summaries[hex].orEmpty()),
@@ -1258,7 +1315,6 @@ internal fun loadConnectionSnapshot(store: MessageStore, nowMs: Long): Connectio
     }
 
     val names = people.associate { it.userIdHex to it.name }
-    val blocked = people.filter { it.blocked }.map { it.userIdHex }.toSet()
     val activity = runCatching {
         store.peerConnectionEvents(null, CONNECTION_ACTIVITY_QUERY_LIMIT.toUInt())
     }

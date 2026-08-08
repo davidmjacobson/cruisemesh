@@ -4,8 +4,14 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.mesh.MeshRouterState
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.RelayHealth
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import uniffi.cruisemesh_core.CoreConnectionHealth
 import uniffi.cruisemesh_core.CoreConnectionHealthInput
+import uniffi.cruisemesh_core.CoreDeliveryLineInput
+import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectLink
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
@@ -16,6 +22,8 @@ import uniffi.cruisemesh_core.CorePersonReach
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.coreClassifyConnectionHealth
+import uniffi.cruisemesh_core.coreClassifyDeliveryLine
+import uniffi.cruisemesh_core.coreConnectionCheckPending
 import uniffi.cruisemesh_core.coreGroupPeople
 
 /**
@@ -67,23 +75,10 @@ sealed interface PersonStatus {
 /**
  * The user-visible meaning of messages still waiting for this person.
  *
- * Deliberately has no error member. Phase 1 reads only signals the app already
- * has -- receipts, waiting work, and path state -- and none of those can prove
- * a terminal failure. Waiting for a friend who is simply elsewhere is what
- * this product does, so it is never dressed as a fault.
+ * The states themselves are the core's ([CoreDeliveryState]); this record only
+ * carries one to the renderer with its count.
  */
-enum class DeliveryKind {
-    /** A route to this person is usable now. */
-    SENDING,
-
-    /** No route right now; the work travels at the next encounter. */
-    WILL_DELIVER_WHEN_RECONNECTED,
-
-    /** Shore Pass is the only known route and this phone has no internet. */
-    WAITING_FOR_INTERNET,
-}
-
-data class DeliveryLine(val kind: DeliveryKind, val count: Int)
+data class DeliveryLine(val kind: CoreDeliveryState, val count: Int)
 
 data class ConnectionPersonRow(
     val userIdHex: String,
@@ -250,7 +245,13 @@ object ConnectionInputs {
     fun relay(health: RelayHealth, configured: Boolean): CoreRelayPathState {
         if (!configured) return CoreRelayPathState.NOT_SET_UP
         return when (health) {
-            is RelayHealth.NoConfig -> CoreRelayPathState.NOT_SET_UP
+            // A saved pass with no published verdict yet. That happens on
+            // every cold start before the first check lands and again after
+            // the service tears its status down, and reading it as "not set
+            // up" tells a person with a working pass to go and buy one --
+            // which is what the Shore Pass screen's own flicker machinery
+            // exists to avoid saying.
+            is RelayHealth.NoConfig -> CoreRelayPathState.CHECKING
             is RelayHealth.Checking -> CoreRelayPathState.CHECKING
             is RelayHealth.NoInternet -> CoreRelayPathState.WAITING_FOR_INTERNET
             is RelayHealth.Ok -> CoreRelayPathState.CONNECTED
@@ -305,9 +306,20 @@ class CheckingClock {
     }
 }
 
-/** Is some path still coming up, with no verdict on it yet? */
-fun connectionCheckPending(runtime: CoreMeshRuntime, relay: CoreRelayPathState): Boolean =
-    runtime == CoreMeshRuntime.STARTING || relay == CoreRelayPathState.CHECKING
+/**
+ * Is some path still coming up, with no verdict on it yet?
+ *
+ * The answer is the core's ([coreConnectionCheckPending]) because the same
+ * question is asked inside the classification, and a shell that asked a
+ * narrower one would start the bounded-Checking clock late -- or never -- and
+ * show a failure before the check that would prove it had finished.
+ */
+fun connectionCheckPending(
+    runtime: CoreMeshRuntime,
+    bluetooth: CoreDirectPathState,
+    localWifi: CoreDirectPathState,
+    relay: CoreRelayPathState,
+): Boolean = coreConnectionCheckPending(runtime, bluetooth, localWifi, relay)
 
 // ---------------------------------------------------------------------------
 // Freshness and event times
@@ -448,6 +460,85 @@ class StoreChangeCoalescer(private val windowMs: Long = CONNECTION_COALESCE_WIND
         followUp = false
         return owed
     }
+
+    /**
+     * Forget any window or reload this object still believes is outstanding.
+     *
+     * Called when the loop that drives it starts, because the loop can be
+     * cancelled mid-window or mid-load -- the page is paused every time the
+     * screen locks -- and this object outlives it. Without the reset it would
+     * spend the rest of the composition absorbing every signal as "a reload is
+     * already running", and the page would never load again: frozen rows, a
+     * freshness label that keeps ageing, and a pull-to-refresh spinner with
+     * nothing behind it.
+     */
+    fun reset() {
+        inFlight = false
+        followUp = false
+        windowEndsAtMs = null
+    }
+}
+
+/**
+ * The page's reload loop: seed, poll, coalesce, load, repeat.
+ *
+ * Lives here rather than inside the composable so the seam between the loop
+ * and its policy has a test. Everything that made the seam worth extracting is
+ * a *lifecycle* property -- what survives a pause, what is owed after a
+ * cancellation -- and none of it is observable from [StoreChangeCoalescer]'s
+ * own unit tests, which pass with the loop wired up wrongly.
+ *
+ * Runs on the caller's dispatcher and does no store work itself: [load] is
+ * handed in, and its implementation is where the background dispatcher is
+ * chosen. That keeps "no store query on the main thread" a property visible at
+ * the call site instead of an assumption buried in here.
+ *
+ * Never returns normally; it ends only by cancellation.
+ */
+@Suppress("LongParameterList")
+internal suspend fun runConnectionRefreshLoop(
+    coalescer: StoreChangeCoalescer,
+    requests: Channel<Unit>,
+    signal: () -> Unit,
+    nowMs: () -> Long,
+    pollIntervalMs: Long,
+    onRefreshingChanged: (Boolean) -> Unit,
+    load: suspend () -> ConnectionStoreSnapshot,
+    onLoaded: (ConnectionStoreSnapshot) -> Unit,
+) {
+    // Before anything else: a previous run of this loop may have been
+    // cancelled part-way through a window or a load.
+    coalescer.reset()
+    // Seed with a window that has already elapsed: the first paint should not
+    // wait out a debounce nobody asked for.
+    if (coalescer.onSignal(nowMs() - CONNECTION_COALESCE_WINDOW_MS)) requests.trySend(Unit)
+    coroutineScope {
+        // Polling fallback until the store publishes a change signal. The same
+        // three rules apply: a tick that lands mid-reload is absorbed, not
+        // stacked.
+        launch {
+            while (true) {
+                delay(pollIntervalMs)
+                signal()
+            }
+        }
+        while (true) {
+            requests.receive()
+            var wait = coalescer.remainingMs(nowMs())
+            while (wait > 0L) {
+                delay(wait)
+                wait = coalescer.remainingMs(nowMs())
+            }
+            coalescer.onReloadStarted()
+            onRefreshingChanged(true)
+            val loaded = load()
+            // The last good snapshot stayed on screen throughout; it is
+            // replaced only once a whole new one exists.
+            onLoaded(loaded)
+            onRefreshingChanged(false)
+            if (coalescer.onReloadFinished()) signal()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,16 +548,18 @@ class StoreChangeCoalescer(private val windowMs: Long = CONNECTION_COALESCE_WIND
 object DeliveryPresentation {
     /**
      * The neutral delivery line for one person, or null when there is nothing
-     * to say.
+     * honest to say.
      *
-     * Nothing here is an error, and nothing here is red. A message waiting for
-     * a friend who is ashore is the product working; the old page's red
-     * `Pending relay upload` under every friend -- including friends who had
-     * already received the message -- is exactly what this replaces.
+     * The decision is the core's ([coreClassifyDeliveryLine]) -- including the
+     * route-usability predicate and the rule that decides whether the
+     * relay-upload backlog says anything about delivery at all. All that
+     * happens here is handing over this platform's facts and pairing the
+     * answer with its count.
      *
-     * Phase 1 reads only signals that already exist. `queued` is
-     * receipt-aware upstream: work covered by a delivery receipt is gone from
-     * it, so a person who has received everything gets no line at all.
+     * Note what `queued` is *not*: it is not receipt-aware. It counts outbound
+     * rows whose upload stamp is unset, and only an upload sets that stamp --
+     * not a delivery receipt, and not handing the message over in person. The
+     * core gates on that; see `core_relay_queue_reflects_delivery`.
      *
      * @param routeIsDirect a live direct link to this person exists right now.
      * @param ownRelayUsable our own Shore Pass path can deliver
@@ -476,7 +569,11 @@ object DeliveryPresentation {
      *   on this phone reaches them.
      * @param contactRelayStale their endpoint has been written off after
      *   authoritatively rejecting us, so it is not a usable route today.
+     * @param receiptIsNewestEvidence the freshest thing recorded about this
+     *   person is a delivery receipt -- their row already says they received a
+     *   message from us.
      */
+    @Suppress("LongParameterList")
     fun line(
         queued: Int,
         routeIsDirect: Boolean,
@@ -484,14 +581,21 @@ object DeliveryPresentation {
         contactHasRelayEndpoint: Boolean,
         contactRelayStale: Boolean,
         relay: CoreRelayPathState,
+        receiptIsNewestEvidence: Boolean,
     ): DeliveryLine? {
         if (queued <= 0) return null
-        val relayRouteUsable = ownRelayUsable && contactHasRelayEndpoint && !contactRelayStale
-        if (routeIsDirect || relayRouteUsable) return DeliveryLine(DeliveryKind.SENDING, queued)
-        if (contactHasRelayEndpoint && relay == CoreRelayPathState.WAITING_FOR_INTERNET) {
-            return DeliveryLine(DeliveryKind.WAITING_FOR_INTERNET, queued)
-        }
-        return DeliveryLine(DeliveryKind.WILL_DELIVER_WHEN_RECONNECTED, queued)
+        val state = coreClassifyDeliveryLine(
+            CoreDeliveryLineInput(
+                queued = queued.toUInt(),
+                relay = relay,
+                ownRelayUsable = ownRelayUsable,
+                contactHasRelayEndpoint = contactHasRelayEndpoint,
+                contactRelayStale = contactRelayStale,
+                directLink = routeIsDirect,
+                deliveryReceiptIsNewestEvidence = receiptIsNewestEvidence,
+            ),
+        ) ?: return null
+        return DeliveryLine(state, queued)
     }
 }
 
@@ -544,8 +648,12 @@ fun buildConnectionDetailsState(
 ): ConnectionDetailsState {
     val people = snapshot.people
     // Only friends count as "nearby": a stranger's phone HELLO'ing past is not
-    // someone this page can promise anything about.
-    val friendTransports = transports.filterKeys { hex -> people.any { it.userIdHex == hex } }
+    // someone this page can promise anything about. Blocked identities are not
+    // friends either -- a block is a tombstone, and a count that only a blocked
+    // person produces ("1 friend nearby" above a People section with nobody in
+    // it) discloses their presence just as surely as a row would.
+    val visibleHexes = people.asSequence().filter { !it.blocked }.map { it.userIdHex }.toSet()
+    val friendTransports = transports.filterKeys { hex -> hex in visibleHexes }
     val bluetoothLinks = friendTransports.count { it.value != MeshRouterState.Transport.LAN }
     val localWifiLinks = friendTransports.count { it.value == MeshRouterState.Transport.LAN }
 
@@ -677,6 +785,8 @@ private fun personRow(
             contactHasRelayEndpoint = person.hasRelayEndpoint,
             contactRelayStale = stale,
             relay = relay,
+            receiptIsNewestEvidence =
+            person.latest?.evidence == PeerEvidence.MESSAGE_DELIVERED,
         ),
     )
 }

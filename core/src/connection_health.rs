@@ -395,6 +395,28 @@ fn reason_and_action(
     None
 }
 
+/// Is some path still coming up, with no verdict on it yet?
+///
+/// Exported because both shells have to answer the same question *before* they
+/// call [`core_classify_connection_health`] -- they own the clock that records
+/// when the wait began, and the classification only bounds a wait it is told
+/// about. Answering it in Kotlin and again in Swift is how iOS came to omit
+/// the two radio cases and show `Needs attention` while its Bluetooth stack
+/// was still answering. One definition, used by the classifier itself below,
+/// makes that class of drift impossible.
+#[uniffi::export]
+pub fn core_connection_check_pending(
+    runtime: CoreMeshRuntime,
+    bluetooth: CoreDirectPathState,
+    local_wifi: CoreDirectPathState,
+    relay: CoreRelayPathState,
+) -> bool {
+    runtime == CoreMeshRuntime::Starting
+        || bluetooth == CoreDirectPathState::Starting
+        || local_wifi == CoreDirectPathState::Starting
+        || relay == CoreRelayPathState::Checking
+}
+
 /// Classify this device's overall connection health.
 ///
 /// The order of the decision matters and is the specification's, not an
@@ -443,10 +465,7 @@ pub fn core_classify_connection_health(
         own_relay_usable,
     };
 
-    let pending = input.runtime == CoreMeshRuntime::Starting
-        || bluetooth == CoreDirectPathState::Starting
-        || input.local_wifi == CoreDirectPathState::Starting
-        || relay == CoreRelayPathState::Checking;
+    let pending = core_connection_check_pending(input.runtime, bluetooth, input.local_wifi, relay);
 
     if !stopped
         && !checking_expired
@@ -762,6 +781,143 @@ fn name_order(left: &CorePersonHealthInput, right: &CorePersonHealthInput) -> st
     left.display_name
         .to_lowercase()
         .cmp(&right.display_name.to_lowercase())
+}
+
+// ---------------------------------------------------------------------------
+// Delivery language
+// ---------------------------------------------------------------------------
+
+/// The user-visible meaning of messages still waiting for one person.
+///
+/// Deliberately has no error member. Phase 1 reads only signals that already
+/// exist -- receipts, waiting work, and path state -- and none of those can
+/// prove a terminal failure. Waiting for a friend who is simply elsewhere is
+/// what this product does, so it is never dressed as a fault. The blocked and
+/// delayed reasons arrive with the per-recipient read model in Phase 2, which
+/// is also what will let this take a real age.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreDeliveryState {
+    /// A route to this person is usable now.
+    Sending,
+    /// No route right now; the work travels at the next encounter.
+    WillDeliverWhenReconnected,
+    /// Shore Pass is the only known route and this phone has no internet.
+    WaitingForInternet,
+}
+
+/// Everything the per-person delivery line consumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreDeliveryLineInput {
+    /// Rows still awaiting *relay upload* for this recipient, straight from
+    /// the diagnostic relay-depth query. See
+    /// [`core_relay_queue_reflects_delivery`] for why this number is only
+    /// sometimes evidence about delivery.
+    pub queued: u32,
+    /// This phone's own Shore Pass path, normalized
+    /// ([`CoreConnectionEvidence::relay`]).
+    pub relay: CoreRelayPathState,
+    /// This phone's own Shore Pass path can deliver right now
+    /// ([`CoreConnectionEvidence::own_relay_usable`]).
+    pub own_relay_usable: bool,
+    /// Their friend card carries an internet-delivery endpoint at all.
+    /// Without one, no amount of internet on this phone reaches them.
+    pub contact_has_relay_endpoint: bool,
+    /// Their endpoint has been written off after authoritatively rejecting us
+    /// (`core_contact_relay_endpoint_usable` said no), so it is not a route
+    /// today.
+    pub contact_relay_stale: bool,
+    /// A live direct link to this person exists right now.
+    pub direct_link: bool,
+    /// The freshest thing recorded about this person is a delivery receipt --
+    /// the page's own row says they received a message from us.
+    pub delivery_receipt_is_newest_evidence: bool,
+}
+
+/// Is there a route to *this person* right now, by the specification's
+/// definition?
+///
+/// A live direct link, or our own working Shore Pass path plus an endpoint of
+/// theirs that is not resting after rejecting us. Exported rather than spelled
+/// out in each shell so a later change to what counts as usable cannot land on
+/// one platform only.
+#[uniffi::export]
+pub fn core_contact_route_usable(
+    direct_link: bool,
+    own_relay_usable: bool,
+    contact_has_relay_endpoint: bool,
+    contact_relay_stale: bool,
+) -> bool {
+    direct_link || (own_relay_usable && contact_has_relay_endpoint && !contact_relay_stale)
+}
+
+/// Does the relay-upload backlog for this recipient say anything about
+/// *delivery*?
+///
+/// Only when relay upload is the thing that would drain it. The backlog counts
+/// outbound rows whose upload timestamp is still unset, and that timestamp is
+/// set by one event only: a successful upload. Delivery receipts do not clear
+/// it, and neither does handing the message straight to the person over
+/// Bluetooth -- durable copies are left in place on purpose.
+///
+/// So on a phone with no pass saved, or for a friend whose card carries no
+/// endpoint, or one whose endpoint has been written off, the number is not a
+/// backlog at all: it is every message written to that person inside the
+/// retention window, and it never goes down. Reading it as delivery state
+/// there produces exactly the contradiction this page exists to remove --
+/// `Received your message 12 min ago` with `Sending 12 messages…` underneath
+/// it, for a week.
+///
+/// This is a Phase 1 honesty gate over an existing diagnostic query, not the
+/// per-recipient delivery read model. That model (Phase 2) replaces the whole
+/// question with a receipt-aware count and makes this function unnecessary.
+#[uniffi::export]
+pub fn core_relay_queue_reflects_delivery(
+    relay: CoreRelayPathState,
+    contact_has_relay_endpoint: bool,
+    contact_relay_stale: bool,
+) -> bool {
+    relay != CoreRelayPathState::NotSetUp && contact_has_relay_endpoint && !contact_relay_stale
+}
+
+/// The delivery line for one person, or `None` when there is nothing honest to
+/// say.
+///
+/// Nothing here is an error and nothing here is red. The old page's red
+/// `Pending relay upload` under every friend -- including friends who had
+/// already received the message -- is what this replaces.
+#[uniffi::export]
+pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreDeliveryState> {
+    if input.queued == 0 {
+        return None;
+    }
+    if !core_relay_queue_reflects_delivery(
+        input.relay,
+        input.contact_has_relay_endpoint,
+        input.contact_relay_stale,
+    ) {
+        return None;
+    }
+    // The page has just told the reader this person received a message from
+    // us. Whatever bookkeeping is left, contradicting that sentence one line
+    // below it is worse than saying nothing.
+    if input.delivery_receipt_is_newest_evidence {
+        return None;
+    }
+    if core_contact_route_usable(
+        input.direct_link,
+        input.own_relay_usable,
+        input.contact_has_relay_endpoint,
+        input.contact_relay_stale,
+    ) {
+        return Some(CoreDeliveryState::Sending);
+    }
+    if input.relay == CoreRelayPathState::WaitingForInternet {
+        return Some(CoreDeliveryState::WaitingForInternet);
+    }
+    // Deliberately a promise, not a failure: store-and-forward through
+    // encounters is the product's core behavior, and a friend who is simply
+    // ashore may stay here indefinitely without anything being wrong.
+    Some(CoreDeliveryState::WillDeliverWhenReconnected)
 }
 
 #[cfg(test)]
@@ -1336,6 +1492,224 @@ mod tests {
         ));
         assert!(core_person_is_reachable_now(CorePersonReach::RelayPresence));
         assert!(!core_person_is_reachable_now(CorePersonReach::None));
+    }
+
+    #[test]
+    fn check_pending_covers_every_path_that_can_still_be_coming_up() {
+        // The shells own the clock that records when a wait began, so they ask
+        // this question themselves. iOS asked a narrower one and rendered
+        // "Needs attention" while CoreBluetooth was still answering.
+        assert!(core_connection_check_pending(
+            CoreMeshRuntime::Starting,
+            CoreDirectPathState::Available,
+            CoreDirectPathState::Available,
+            CoreRelayPathState::Connected
+        ));
+        assert!(core_connection_check_pending(
+            CoreMeshRuntime::Active,
+            CoreDirectPathState::Starting,
+            CoreDirectPathState::Off,
+            CoreRelayPathState::NotSetUp
+        ));
+        assert!(core_connection_check_pending(
+            CoreMeshRuntime::Active,
+            CoreDirectPathState::Off,
+            CoreDirectPathState::Starting,
+            CoreRelayPathState::NotSetUp
+        ));
+        assert!(core_connection_check_pending(
+            CoreMeshRuntime::Active,
+            CoreDirectPathState::Available,
+            CoreDirectPathState::Available,
+            CoreRelayPathState::Checking
+        ));
+        assert!(!core_connection_check_pending(
+            CoreMeshRuntime::Active,
+            CoreDirectPathState::Available,
+            CoreDirectPathState::Off,
+            CoreRelayPathState::NotSetUp
+        ));
+        assert!(!core_connection_check_pending(
+            CoreMeshRuntime::Stopped,
+            CoreDirectPathState::Off,
+            CoreDirectPathState::Off,
+            CoreRelayPathState::NotSetUp
+        ));
+    }
+
+    #[test]
+    fn a_radio_still_coming_up_is_checking_not_a_failure() {
+        // The exact iOS trace: relaunch with the Bluetooth stack unanswered,
+        // no LAN, no pass. Nothing is usable yet, but nothing has failed
+        // either.
+        let input = CoreConnectionHealthInput {
+            runtime: CoreMeshRuntime::Active,
+            bluetooth: CoreDirectPathState::Starting,
+            local_wifi: CoreDirectPathState::Off,
+            relay: CoreRelayPathState::NotSetUp,
+            validated_internet: false,
+            checking_since_ms: NOW,
+            ..healthy()
+        };
+        assert_eq!(
+            classify(CoreConnectionHealthInput {
+                now_ms: NOW + 1_000,
+                ..input.clone()
+            }),
+            CoreConnectionHealth::Checking
+        );
+        // And it still resolves at the bound rather than resting there.
+        assert_eq!(
+            classify(CoreConnectionHealthInput {
+                now_ms: NOW + CONNECTION_CHECKING_TIMEOUT_MS,
+                ..input
+            }),
+            CoreConnectionHealth::NeedsAttention
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Delivery language
+    // -----------------------------------------------------------------------
+
+    fn queued(count: u32) -> CoreDeliveryLineInput {
+        CoreDeliveryLineInput {
+            queued: count,
+            relay: CoreRelayPathState::Connected,
+            own_relay_usable: true,
+            contact_has_relay_endpoint: true,
+            contact_relay_stale: false,
+            direct_link: false,
+            delivery_receipt_is_newest_evidence: false,
+        }
+    }
+
+    #[test]
+    fn nothing_waiting_means_no_line() {
+        assert_eq!(core_classify_delivery_line(queued(0)), None);
+    }
+
+    #[test]
+    fn a_backlog_that_relay_upload_cannot_drain_is_not_delivery_evidence() {
+        // The failure this gate exists for: no pass saved, so the upload
+        // stamp is never set, so the "backlog" is every message written to
+        // this person in the retention window -- forever, and beside a row
+        // that already says they received one.
+        assert_eq!(
+            core_classify_delivery_line(CoreDeliveryLineInput {
+                relay: CoreRelayPathState::NotSetUp,
+                own_relay_usable: false,
+                direct_link: true,
+                ..queued(12)
+            }),
+            None
+        );
+        // Same reasoning for a friend whose card carries no endpoint at all,
+        // and for one whose endpoint has been written off.
+        assert_eq!(
+            core_classify_delivery_line(CoreDeliveryLineInput {
+                contact_has_relay_endpoint: false,
+                ..queued(12)
+            }),
+            None
+        );
+        assert_eq!(
+            core_classify_delivery_line(CoreDeliveryLineInput {
+                contact_relay_stale: true,
+                ..queued(12)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_delivery_receipt_silences_the_line_rather_than_contradicting_it() {
+        assert_eq!(
+            core_classify_delivery_line(CoreDeliveryLineInput {
+                delivery_receipt_is_newest_evidence: true,
+                ..queued(12)
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn delivery_matrix() {
+        // (relay, own relay usable, direct link) -> line
+        let cases: Vec<(CoreRelayPathState, bool, bool, Option<CoreDeliveryState>)> = vec![
+            (
+                CoreRelayPathState::Connected,
+                true,
+                false,
+                Some(CoreDeliveryState::Sending),
+            ),
+            (
+                CoreRelayPathState::SyncingSlowed,
+                true,
+                false,
+                Some(CoreDeliveryState::Sending),
+            ),
+            // No usable pass, but they are standing right here.
+            (
+                CoreRelayPathState::WaitingForInternet,
+                false,
+                true,
+                Some(CoreDeliveryState::Sending),
+            ),
+            (
+                CoreRelayPathState::WaitingForInternet,
+                false,
+                false,
+                Some(CoreDeliveryState::WaitingForInternet),
+            ),
+            // Terminal-looking pass faults are still not failures for the
+            // person: the work travels at the next encounter.
+            (
+                CoreRelayPathState::Unreachable,
+                false,
+                false,
+                Some(CoreDeliveryState::WillDeliverWhenReconnected),
+            ),
+            (
+                CoreRelayPathState::PassExpired,
+                false,
+                false,
+                Some(CoreDeliveryState::WillDeliverWhenReconnected),
+            ),
+            (
+                CoreRelayPathState::StorageFull,
+                false,
+                false,
+                Some(CoreDeliveryState::WillDeliverWhenReconnected),
+            ),
+            (
+                CoreRelayPathState::Checking,
+                false,
+                false,
+                Some(CoreDeliveryState::WillDeliverWhenReconnected),
+            ),
+        ];
+        for (relay, own_relay_usable, direct_link, want) in cases {
+            assert_eq!(
+                core_classify_delivery_line(CoreDeliveryLineInput {
+                    relay,
+                    own_relay_usable,
+                    direct_link,
+                    ..queued(2)
+                }),
+                want,
+                "{relay:?}/own={own_relay_usable}/direct={direct_link}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_usability_is_one_predicate() {
+        assert!(core_contact_route_usable(true, false, false, true));
+        assert!(core_contact_route_usable(false, true, true, false));
+        assert!(!core_contact_route_usable(false, true, true, true));
+        assert!(!core_contact_route_usable(false, true, false, false));
+        assert!(!core_contact_route_usable(false, false, true, false));
     }
 
     #[test]

@@ -4,6 +4,15 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.mesh.MeshRouterState
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.RelayHealth
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -11,6 +20,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectLink
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
@@ -18,6 +28,7 @@ import uniffi.cruisemesh_core.CoreHealthReason
 import uniffi.cruisemesh_core.CoreMeshRuntime
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The page's shell-side logic, tested without Compose, Android, or a store.
@@ -89,7 +100,12 @@ class ConnectionDetailsLogicTest {
     @Test
     fun `every relay health has exactly one path state`() {
         val cases = listOf(
-            RelayHealth.NoConfig to CoreRelayPathState.NOT_SET_UP,
+            // With a pass saved, "no verdict published" is Checking, never
+            // "not set up": the service publishes NoConfig before its first
+            // check lands and again after it tears its status down, and
+            // telling someone who has a pass to go and set one up is the one
+            // answer that is certainly wrong.
+            RelayHealth.NoConfig to CoreRelayPathState.CHECKING,
             RelayHealth.Checking to CoreRelayPathState.CHECKING,
             RelayHealth.NoInternet to CoreRelayPathState.WAITING_FOR_INTERNET,
             RelayHealth.Ok(NOW) to CoreRelayPathState.CONNECTED,
@@ -171,11 +187,59 @@ class ConnectionDetailsLogicTest {
     }
 
     @Test
-    fun `only startup and an unanswered pass check are pending`() {
-        assertTrue(connectionCheckPending(CoreMeshRuntime.STARTING, CoreRelayPathState.CONNECTED))
-        assertTrue(connectionCheckPending(CoreMeshRuntime.ACTIVE, CoreRelayPathState.CHECKING))
-        assertFalse(connectionCheckPending(CoreMeshRuntime.ACTIVE, CoreRelayPathState.CONNECTED))
-        assertFalse(connectionCheckPending(CoreMeshRuntime.STOPPED, CoreRelayPathState.NOT_SET_UP))
+    fun `every path that can still be coming up counts as pending`() {
+        // Including the two radios: a shell that only watched the runtime and
+        // the pass would never start the bound for a radio that has not
+        // answered yet, and would render a failure while it was still
+        // answering.
+        assertTrue(
+            connectionCheckPending(
+                CoreMeshRuntime.STARTING,
+                CoreDirectPathState.AVAILABLE,
+                CoreDirectPathState.AVAILABLE,
+                CoreRelayPathState.CONNECTED,
+            ),
+        )
+        assertTrue(
+            connectionCheckPending(
+                CoreMeshRuntime.ACTIVE,
+                CoreDirectPathState.STARTING,
+                CoreDirectPathState.OFF,
+                CoreRelayPathState.NOT_SET_UP,
+            ),
+        )
+        assertTrue(
+            connectionCheckPending(
+                CoreMeshRuntime.ACTIVE,
+                CoreDirectPathState.OFF,
+                CoreDirectPathState.STARTING,
+                CoreRelayPathState.NOT_SET_UP,
+            ),
+        )
+        assertTrue(
+            connectionCheckPending(
+                CoreMeshRuntime.ACTIVE,
+                CoreDirectPathState.AVAILABLE,
+                CoreDirectPathState.AVAILABLE,
+                CoreRelayPathState.CHECKING,
+            ),
+        )
+        assertFalse(
+            connectionCheckPending(
+                CoreMeshRuntime.ACTIVE,
+                CoreDirectPathState.AVAILABLE,
+                CoreDirectPathState.AVAILABLE,
+                CoreRelayPathState.CONNECTED,
+            ),
+        )
+        assertFalse(
+            connectionCheckPending(
+                CoreMeshRuntime.STOPPED,
+                CoreDirectPathState.OFF,
+                CoreDirectPathState.OFF,
+                CoreRelayPathState.NOT_SET_UP,
+            ),
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -293,100 +357,208 @@ class ConnectionDetailsLogicTest {
     }
 
     // -----------------------------------------------------------------------
+    // The reload loop
+    //
+    // The policy above passes with the loop wired up wrongly -- everything
+    // that can wedge this page lives in the seam between the two, and the seam
+    // only exists while a loop is actually running and being cancelled. So
+    // these drive the real loop, with real signals and a real pause.
+    // -----------------------------------------------------------------------
+
+    /** One run of the loop, with the levers a test needs to hold. */
+    private class LoopHarness {
+        val coalescer = StoreChangeCoalescer()
+        val requests = Channel<Unit>(Channel.CONFLATED)
+        val loads = AtomicInteger(0)
+        /** Set to make the next load hang until the job is cancelled. */
+        @Volatile
+        var blockLoad = false
+
+        fun signal() {
+            if (coalescer.onSignal(System.currentTimeMillis())) requests.trySend(Unit)
+        }
+
+        fun CoroutineScope.start(): Job = launch {
+            runConnectionRefreshLoop(
+                coalescer = coalescer,
+                requests = requests,
+                signal = ::signal,
+                nowMs = System::currentTimeMillis,
+                // Long enough that nothing in these tests is driven by the
+                // poll: every reload here is one a test asked for.
+                pollIntervalMs = 60_000L,
+                onRefreshingChanged = {},
+                load = {
+                    if (blockLoad) awaitCancellation()
+                    loads.incrementAndGet()
+                    ConnectionStoreSnapshot(emptyList(), emptyList(), System.currentTimeMillis())
+                },
+                onLoaded = {},
+            )
+        }
+
+        suspend fun awaitLoads(count: Int) {
+            withTimeout(5_000L) {
+                while (loads.get() < count) delay(10L)
+            }
+        }
+    }
+
+    @Test
+    fun `the loop loads once as soon as it starts, without waiting out a debounce`() = runBlocking {
+        val harness = LoopHarness()
+        val job = with(harness) { start() }
+        harness.awaitLoads(1)
+        job.cancelAndJoin()
+    }
+
+    @Test
+    fun `a pause inside the coalescing window does not wedge the next run`() = runBlocking {
+        val harness = LoopHarness()
+        val first = with(harness) { start() }
+        harness.awaitLoads(1)
+
+        // A store change opens a 500 ms window; the loop takes the request and
+        // waits it out. The screen locks part-way through.
+        harness.signal()
+        delay(100L)
+        first.cancelAndJoin()
+
+        // ON_RESUME. Without the reset the coalescer still believes a window is
+        // open, absorbs the seed, and the loop blocks on an empty channel
+        // forever: rows frozen for the life of the composition.
+        val second = with(harness) { start() }
+        harness.awaitLoads(2)
+        second.cancelAndJoin()
+    }
+
+    @Test
+    fun `a pause during a load does not wedge the next run`() = runBlocking {
+        val harness = LoopHarness()
+        harness.blockLoad = true
+        val first = with(harness) { start() }
+        // Give the loop time to reach the load and hang there.
+        delay(200L)
+        assertEquals(0, harness.loads.get())
+        first.cancelAndJoin()
+
+        harness.blockLoad = false
+        val second = with(harness) { start() }
+        harness.awaitLoads(1)
+        second.cancelAndJoin()
+    }
+
+    @Test
+    fun `a burst of signals through the running loop costs one reload, then one follow-up`() =
+        runBlocking {
+            val harness = LoopHarness()
+            val job = with(harness) { start() }
+            harness.awaitLoads(1)
+
+            // A thousand store events inside one window -- the mesh-flood case,
+            // pumped through the real loop rather than the policy object.
+            repeat(1_000) { harness.signal() }
+            harness.awaitLoads(2)
+            // Nothing has been signalled since, so no further reload is owed.
+            delay(CONNECTION_COALESCE_WINDOW_MS * 2)
+            assertEquals(2, harness.loads.get())
+            job.cancelAndJoin()
+        }
+
+    // -----------------------------------------------------------------------
     // Delivery language
     // -----------------------------------------------------------------------
 
+    @Suppress("LongParameterList")
+    private fun deliveryLine(
+        queued: Int,
+        routeIsDirect: Boolean = false,
+        ownRelayUsable: Boolean = true,
+        contactHasRelayEndpoint: Boolean = true,
+        contactRelayStale: Boolean = false,
+        relay: CoreRelayPathState = CoreRelayPathState.CONNECTED,
+        receiptIsNewestEvidence: Boolean = false,
+    ) = DeliveryPresentation.line(
+        queued = queued,
+        routeIsDirect = routeIsDirect,
+        ownRelayUsable = ownRelayUsable,
+        contactHasRelayEndpoint = contactHasRelayEndpoint,
+        contactRelayStale = contactRelayStale,
+        relay = relay,
+        receiptIsNewestEvidence = receiptIsNewestEvidence,
+    )
+
     @Test
     fun `nothing waiting means no delivery line at all`() {
-        // The spec's flagship contradiction: a friend who already received the
-        // message must not then be shown a warning about it.
-        assertNull(
-            DeliveryPresentation.line(
-                queued = 0,
-                routeIsDirect = false,
-                ownRelayUsable = true,
-                contactHasRelayEndpoint = true,
-                contactRelayStale = false,
-                relay = CoreRelayPathState.CONNECTED,
-            ),
-        )
+        assertNull(deliveryLine(queued = 0))
     }
 
     @Test
     fun `a live link means the work is going out now`() {
         assertEquals(
-            DeliveryLine(DeliveryKind.SENDING, 2),
-            DeliveryPresentation.line(
-                queued = 2,
-                routeIsDirect = true,
-                ownRelayUsable = false,
-                contactHasRelayEndpoint = false,
-                contactRelayStale = false,
-                relay = CoreRelayPathState.WAITING_FOR_INTERNET,
-            ),
+            DeliveryLine(CoreDeliveryState.SENDING, 2),
+            deliveryLine(queued = 2, routeIsDirect = true, ownRelayUsable = false),
         )
     }
 
     @Test
     fun `a working pass plus their endpoint is also a usable route`() {
-        assertEquals(
-            DeliveryLine(DeliveryKind.SENDING, 1),
-            DeliveryPresentation.line(
-                queued = 1,
-                routeIsDirect = false,
-                ownRelayUsable = true,
-                contactHasRelayEndpoint = true,
-                contactRelayStale = false,
-                relay = CoreRelayPathState.CONNECTED,
-            ),
-        )
+        assertEquals(DeliveryLine(CoreDeliveryState.SENDING, 1), deliveryLine(queued = 1))
     }
 
     @Test
-    fun `their written-off endpoint is not a usable route, and still not an error`() {
-        assertEquals(
-            DeliveryLine(DeliveryKind.WILL_DELIVER_WHEN_RECONNECTED, 4),
-            DeliveryPresentation.line(
-                queued = 4,
-                routeIsDirect = false,
-                ownRelayUsable = true,
-                contactHasRelayEndpoint = true,
-                contactRelayStale = true,
-                relay = CoreRelayPathState.CONNECTED,
-            ),
-        )
+    fun `their written-off endpoint means no line, because the count cannot drain`() {
+        // Nothing will ever mark these rows uploaded, so the number is not a
+        // backlog: it is every message written to them inside the retention
+        // window, and it would sit under their name for a week.
+        assertNull(deliveryLine(queued = 4, contactRelayStale = true))
     }
 
     @Test
     fun `no internet with only a pass route says so plainly`() {
         assertEquals(
-            DeliveryLine(DeliveryKind.WAITING_FOR_INTERNET, 3),
-            DeliveryPresentation.line(
+            DeliveryLine(CoreDeliveryState.WAITING_FOR_INTERNET, 3),
+            deliveryLine(
                 queued = 3,
-                routeIsDirect = false,
                 ownRelayUsable = false,
-                contactHasRelayEndpoint = true,
-                contactRelayStale = false,
                 relay = CoreRelayPathState.WAITING_FOR_INTERNET,
             ),
         )
     }
 
     @Test
-    fun `a friend with no endpoint at all waits for the next encounter`() {
-        // No amount of internet on this phone reaches a friend whose card
-        // carries no endpoint, so "waiting for internet" would be a lie.
+    fun `a pass fault still promises the next encounter rather than a failure`() {
         assertEquals(
-            DeliveryLine(DeliveryKind.WILL_DELIVER_WHEN_RECONNECTED, 1),
-            DeliveryPresentation.line(
-                queued = 1,
-                routeIsDirect = false,
+            DeliveryLine(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, 4),
+            deliveryLine(
+                queued = 4,
                 ownRelayUsable = false,
-                contactHasRelayEndpoint = false,
-                contactRelayStale = false,
-                relay = CoreRelayPathState.WAITING_FOR_INTERNET,
+                relay = CoreRelayPathState.PASS_EXPIRED,
             ),
         )
+    }
+
+    @Test
+    fun `a backlog that relay upload cannot drain is not shown at all`() {
+        // The contradiction this page exists to remove. The count is rows
+        // whose upload stamp is unset, and only an upload sets it -- not a
+        // receipt, and not handing the message over in person. On a phone with
+        // no pass saved, or for a friend whose card carries no endpoint, the
+        // number never goes down.
+        assertNull(
+            deliveryLine(
+                queued = 12,
+                routeIsDirect = true,
+                ownRelayUsable = false,
+                relay = CoreRelayPathState.NOT_SET_UP,
+            ),
+        )
+        assertNull(deliveryLine(queued = 12, contactHasRelayEndpoint = false))
+    }
+
+    @Test
+    fun `a row that already says they received a message gets no line under it`() {
+        assertNull(deliveryLine(queued = 12, receiptIsNewestEvidence = true))
     }
 
     // -----------------------------------------------------------------------
@@ -568,8 +740,48 @@ class ConnectionDetailsLogicTest {
         )
         val delivery = result.otherPeople[0].delivery
         assertNotNull(delivery)
-        assertEquals(DeliveryKind.WAITING_FOR_INTERNET, delivery?.kind)
+        assertEquals(CoreDeliveryState.WAITING_FOR_INTERNET, delivery?.kind)
         assertEquals(3, delivery?.count)
+    }
+
+    @Test
+    fun `a friend who already received a message gets no queue line under the row`() {
+        // The contradiction in one assertion: the row says "Received your
+        // message 12 min ago" and the old page put "Sending 12 messages…"
+        // directly beneath it, for as long as the retention window lasted.
+        val result = state(
+            people = listOf(
+                person(
+                    1,
+                    "Ash",
+                    queued = 12,
+                    latest = PeerStatusLine(
+                        PeerEvidence.MESSAGE_DELIVERED,
+                        PeerConnectionTransport.SHORE_PASS,
+                        NOW - 12 * MINUTE,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            PersonStatus.History(PeerEvidence.MESSAGE_DELIVERED, NOW - 12 * MINUTE),
+            result.otherPeople[0].status,
+        )
+        assertNull(result.otherPeople[0].delivery)
+    }
+
+    @Test
+    fun `a blocked friend standing next to us is counted nowhere`() {
+        val result = state(
+            people = listOf(person(1, "Ash", blocked = true), person(2, "Bo")),
+            transports = mapOf(hex(1) to MeshRouterState.Transport.CENTRAL),
+        )
+        // Not in a group, and not in the numbers above the groups either: a
+        // count only a blocked person produces discloses them just as surely.
+        assertTrue(result.reachableNow.isEmpty())
+        assertEquals(listOf("Bo"), result.otherPeople.map { it.name })
+        assertEquals(0, result.health.nearbyFriendCount)
+        assertEquals(0, result.paths.bluetoothLinks)
     }
 
     @Test

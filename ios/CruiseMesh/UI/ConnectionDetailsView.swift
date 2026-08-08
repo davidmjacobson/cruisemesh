@@ -314,6 +314,11 @@ enum ConnectionCopy {
         String(localized: "\(status) via \(path)")
     }
 
+    /// A collapsed section heading with its newest event time beside it.
+    static func sectionWithDetail(_ title: String, _ detail: String) -> String {
+        String(localized: "\(title) · \(detail)")
+    }
+
     static func refreshing() -> String {
         String(localized: "Refreshing")
     }
@@ -387,7 +392,11 @@ struct ConnectionDetailsView: View {
                 if !state.otherPeople.isEmpty {
                     otherPeopleSection(state.otherPeople, times: times)
                 }
-                if !state.hasContacts {
+                // Only once a snapshot has actually been read. "No friends
+                // added yet" is a claim, and asserting it on the first frame of
+                // every open -- before the background load has returned -- is a
+                // false one for everybody who has friends.
+                if state.updatedAtMs > 0 && !state.hasContacts {
                     Section {
                         Text("No friends added yet.")
                             .foregroundStyle(.secondary)
@@ -405,8 +414,13 @@ struct ConnectionDetailsView: View {
             .refreshable { await model.refreshFromPull() }
             .onAppear {
                 relayConfigured = RelayConfigStore.load() != nil
-                hasDiagnosticArchive = hasAnythingCaptured()
                 model.start()
+                // Two of the four probes behind this reach the store, and the
+                // rule on this page is that no store query runs on the main
+                // actor -- ever. During a flood the write lock is held by the
+                // mesh queue, and blocking here would stall the whole app on
+                // the one page rewritten to stop doing that.
+                Task { await refreshCapturedDiagnostics() }
             }
             .onDisappear { model.stop() }
             // The store-change signal the spec asks for. It fires per message
@@ -429,8 +443,15 @@ struct ConnectionDetailsView: View {
                 titleVisibility: .visible
             ) {
                 Button("Clear history", role: .destructive) {
-                    try? AppStore.get().clearPeerConnectionHistory()
-                    model.signalStoreChanged()
+                    // A delete over the whole event table, plus the wait for a
+                    // store lock the receive path also wants: not work for the
+                    // actor that has to keep answering taps.
+                    Task {
+                        await Task.detached(priority: .userInitiated) {
+                            try? AppStore.get().clearPeerConnectionHistory()
+                        }.value
+                        model.signalStoreChanged()
+                    }
                 }
             } message: {
                 Text("This removes local connection events and per-person path summaries. Messages and friends are not affected.")
@@ -465,8 +486,19 @@ struct ConnectionDetailsView: View {
         )
         let coreRuntime = ConnectionInputs.runtime(runtime.state, bluetooth: availability)
         let coreRelay = ConnectionInputs.relay(connectivity.relay, configured: relayConfigured)
+        // Only whether a listening socket exists. The endpoint itself never
+        // reaches the view state, let alone the screen.
+        let lanListening = lan.snapshot.localEndpoint != nil
         let checkingSinceMs = model.checkingClock.mark(
-            pending: connectionCheckPending(runtime: coreRuntime, relay: coreRelay),
+            pending: connectionCheckPending(
+                runtime: coreRuntime,
+                bluetooth: ConnectionInputs.bluetooth(
+                    runtime.state,
+                    availability: availability
+                ),
+                localWifi: ConnectionInputs.localWifi(runtime.state, listening: lanListening),
+                relay: coreRelay
+            ),
             nowMs: model.nowMs
         )
         return ConnectionDetailsLogic.buildState(
@@ -475,9 +507,7 @@ struct ConnectionDetailsView: View {
             directPaths: connectivity.directPaths,
             relayHealth: connectivity.relay,
             relayConfigured: relayConfigured,
-            // Only whether a listening socket exists. The endpoint itself never
-            // reaches the view state, let alone the screen.
-            lanListening: lan.snapshot.localEndpoint != nil,
+            lanListening: lanListening,
             bluetoothAudioActive: runtime.bluetoothAudioConnected,
             staleRelayContacts: connectivity.staleRelayContacts,
             presenceLastSeen: connectivity.presenceLastSeen,
@@ -700,8 +730,12 @@ struct ConnectionDetailsView: View {
         // One sentence per fact, in the order they are read on screen. The
         // delivery line has to be in here: the row replaces its children's
         // labels with this one, and anything left out is silent.
+        // The badge name, not the mid-sentence one: the badge is what a sighted
+        // reader sees on this row, and it is what TalkBack reads on the Android
+        // row. Two screen readers saying different words for the same thing is
+        // the kind of divergence this page was built to close.
         let statusPhrase = row.badge
-            .map { ConnectionCopy.viaPath(status, ConnectionCopy.pathInSentence($0)) } ?? status
+            .map { ConnectionCopy.viaPath(status, ConnectionCopy.pathName($0)) } ?? status
         let label = delivery
             .map { ConnectionCopy.threeSentences(row.name, statusPhrase, $0) }
             ?? ConnectionCopy.twoSentences(row.name, statusPhrase)
@@ -776,10 +810,27 @@ struct ConnectionDetailsView: View {
                     }
                 }
             } label: {
-                Text("Recent activity")
+                Text(activityHeading(activity, times: times))
                     .frame(minHeight: 44)
             }
         }
+    }
+
+    /// The collapsed Recent activity row.
+    ///
+    /// Collapsed, the newest event time is the only signal that anything
+    /// happened at all; without it the row gives a reader no reason to open it.
+    /// A row whose timestamp is zero or unreadable contributes nothing rather
+    /// than rendering as a date.
+    private func activityHeading(
+        _ activity: [ConnectionActivityRow],
+        times: ConnectionTimeContext
+    ) -> String {
+        let title = String(localized: "Recent activity")
+        guard let newest = activity.first,
+              let when = ConnectionCopy.eventTime(newest.atMs, times: times)
+        else { return title }
+        return ConnectionCopy.sectionWithDetail(title, when)
     }
 
     // MARK: - Troubleshooting and diagnostics
@@ -892,6 +943,15 @@ struct ConnectionDetailsView: View {
         shareFile = ShareableFile(urls: archive.map { [$0] } ?? urls)
     }
 
+    /// Answers `hasAnythingCaptured` off the main actor and posts the result.
+    @MainActor
+    private func refreshCapturedDiagnostics() async {
+        let captured = await Task.detached(priority: .utility) {
+            ConnectionDetailsView.hasAnythingCaptured()
+        }.value
+        hasDiagnosticArchive = captured
+    }
+
     /// Whether the delete button has anything to act on.
     ///
     /// Has to count everything `shareEverything` sends, or the two buttons
@@ -900,7 +960,11 @@ struct ConnectionDetailsView: View {
     /// disk, share them, then be told they were deleted when they were not.
     /// Delivery metrics are captured unconditionally, and MetricKit collection
     /// is not gated by the logging switch either.
-    private func hasAnythingCaptured() -> Bool {
+    ///
+    /// Static because two of these reach the store, so it has to be callable
+    /// from a detached task without dragging a view's worth of observed
+    /// objects across with it.
+    private static func hasAnythingCaptured() -> Bool {
         if DiagnosticLogExport.hasArchive() { return true }
         if !DiagnosticLogExport.metricKitFileURLs().isEmpty { return true }
         if FieldMetricsExport.hasCapturedMetrics() { return true }
@@ -909,19 +973,28 @@ struct ConnectionDetailsView: View {
 
     /// Erases everything `shareEverything` would send. Anything left behind
     /// here becomes a lie the next share tells.
+    ///
+    /// The button updates first and the work happens off the main actor: two
+    /// table-wide deletes and a handful of file removals, each waiting on a
+    /// store lock the receive path also wants.
+    @MainActor
     private func deleteEverythingCaptured() {
-        DiagnosticLogExport.deleteArchive()
-        for url in DiagnosticLogExport.metricKitFileURLs() {
-            try? FileManager.default.removeItem(at: url)
-        }
-        try? AppStore.get().clearDeliveryMetrics()
-        FieldMetricsExport.deleteExportedCSV()
-        try? AppStore.get().clearMessageConflicts()
-        ConflictDiagnosticsExport.deleteExportedCSV()
-        // The last share left a zip holding copies of all of the above.
-        DiagnosticsArchive.deleteArchives()
         hasDiagnosticArchive = false
-        model.signalStoreChanged()
+        Task {
+            await Task.detached(priority: .userInitiated) {
+                DiagnosticLogExport.deleteArchive()
+                for url in DiagnosticLogExport.metricKitFileURLs() {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                try? AppStore.get().clearDeliveryMetrics()
+                FieldMetricsExport.deleteExportedCSV()
+                try? AppStore.get().clearMessageConflicts()
+                ConflictDiagnosticsExport.deleteExportedCSV()
+                // The last share left a zip holding copies of all of the above.
+                DiagnosticsArchive.deleteArchives()
+            }.value
+            model.signalStoreChanged()
+        }
     }
 }
 

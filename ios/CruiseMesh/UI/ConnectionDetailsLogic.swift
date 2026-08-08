@@ -60,22 +60,11 @@ enum PersonStatus: Equatable {
 /**
  The user-visible meaning of messages still waiting for this person.
 
- Deliberately has no error member. Phase 1 reads only signals the app already
- has -- receipts, waiting work, and path state -- and none of those can prove
- a terminal failure. Waiting for a friend who is simply elsewhere is what this
- product does, so it is never dressed as a fault.
+ The states themselves are the core's (`CoreDeliveryState`); this record only
+ carries one to the renderer with its count.
  */
-enum DeliveryKind: Equatable {
-    /// A route to this person is usable now.
-    case sending
-    /// No route right now; the work travels at the next encounter.
-    case willDeliverWhenReconnected
-    /// Shore Pass is the only known route and this phone has no internet.
-    case waitingForInternet
-}
-
 struct DeliveryLine: Equatable {
-    let kind: DeliveryKind
+    let kind: CoreDeliveryState
     let count: Int
 }
 
@@ -266,7 +255,13 @@ enum ConnectionInputs {
     static func relay(_ health: RelayHealth, configured: Bool) -> CoreRelayPathState {
         guard configured else { return .notSetUp }
         switch health {
-        case .noConfig: return .notSetUp
+        // A saved pass with no published verdict yet. That happens on every
+        // cold start before the first check lands and again after the
+        // controller tears its status down, and reading it as "not set up"
+        // tells a person with a working pass to go and buy one -- which is
+        // what the Shore Pass screen's own flicker machinery exists to avoid
+        // saying.
+        case .noConfig: return .checking
         case .checking: return .checking
         case .noInternet: return .waitingForInternet
         case .ok: return .connected
@@ -328,9 +323,29 @@ final class CheckingClock {
     }
 }
 
-/// Is some path still coming up, with no verdict on it yet?
-func connectionCheckPending(runtime: CoreMeshRuntime, relay: CoreRelayPathState) -> Bool {
-    runtime == .starting || relay == .checking
+/**
+ Is some path still coming up, with no verdict on it yet?
+
+ The answer is the core's (`coreConnectionCheckPending`) because the same
+ question is asked inside the classification, and a shell that asked a narrower
+ one would start the bounded-Checking clock late -- or never -- and show a
+ failure before the check that would prove it had finished. This platform's
+ Bluetooth stack reports `.unknown` on a cold launch and `.resetting` when the
+ radio is toggled, both of which arrive while the mesh is already meshing; a
+ predicate that only looked at the runtime and the pass missed both.
+ */
+func connectionCheckPending(
+    runtime: CoreMeshRuntime,
+    bluetooth: CoreDirectPathState,
+    localWifi: CoreDirectPathState,
+    relay: CoreRelayPathState
+) -> Bool {
+    coreConnectionCheckPending(
+        runtime: runtime,
+        bluetooth: bluetooth,
+        localWifi: localWifi,
+        relay: relay
+    )
 }
 
 // MARK: - Freshness and event times
@@ -474,23 +489,41 @@ final class StoreChangeCoalescer {
         followUp = false
         return owed
     }
+
+    /**
+     Forget any window or reload this object still believes is outstanding.
+
+     Called when the loop that drives it starts and stops, because the loop is
+     cancelled every time the page goes away and this object outlives it.
+     Without the reset it would spend the rest of its life absorbing every
+     signal as "a reload is already running", and the page would never load
+     again: frozen rows, a freshness label that keeps ageing, and a
+     pull-to-refresh spinner with nothing behind it.
+     */
+    func reset() {
+        inFlight = false
+        followUp = false
+        windowEndsAtMs = nil
+    }
 }
 
 // MARK: - Delivery language
 
 enum DeliveryPresentation {
     /**
-     The neutral delivery line for one person, or nil when there is nothing to
-     say.
+     The neutral delivery line for one person, or nil when there is nothing
+     honest to say.
 
-     Nothing here is an error, and nothing here is red. A message waiting for a
-     friend who is ashore is the product working; the old page's red
-     `Pending relay upload` under every friend -- including friends who had
-     already received the message -- is exactly what this replaces.
+     The decision is the core's (`coreClassifyDeliveryLine`) -- including the
+     route-usability predicate and the rule that decides whether the
+     relay-upload backlog says anything about delivery at all. All that happens
+     here is handing over this platform's facts and pairing the answer with its
+     count.
 
-     Phase 1 reads only signals that already exist. `queued` is receipt-aware
-     upstream: work covered by a delivery receipt is gone from it, so a person
-     who has received everything gets no line at all.
+     Note what `queued` is *not*: it is not receipt-aware. It counts outbound
+     rows whose upload stamp is unset, and only an upload sets that stamp --
+     not a delivery receipt, and not handing the message over in person. The
+     core gates on that; see `core_relay_queue_reflects_delivery`.
 
      - Parameter routeIsDirect: a live direct link to this person exists right now.
      - Parameter ownRelayUsable: our own Shore Pass path can deliver
@@ -500,6 +533,9 @@ enum DeliveryPresentation {
        this phone reaches them.
      - Parameter contactRelayStale: their endpoint has been written off after
        authoritatively rejecting us, so it is not a usable route today.
+     - Parameter receiptIsNewestEvidence: the freshest thing recorded about
+       this person is a delivery receipt -- their row already says they
+       received a message from us.
      */
     static func line(
         queued: Int,
@@ -507,17 +543,23 @@ enum DeliveryPresentation {
         ownRelayUsable: Bool,
         contactHasRelayEndpoint: Bool,
         contactRelayStale: Bool,
-        relay: CoreRelayPathState
+        relay: CoreRelayPathState,
+        receiptIsNewestEvidence: Bool
     ) -> DeliveryLine? {
         if queued <= 0 { return nil }
-        let relayRouteUsable = ownRelayUsable && contactHasRelayEndpoint && !contactRelayStale
-        if routeIsDirect || relayRouteUsable {
-            return DeliveryLine(kind: .sending, count: queued)
-        }
-        if contactHasRelayEndpoint && relay == .waitingForInternet {
-            return DeliveryLine(kind: .waitingForInternet, count: queued)
-        }
-        return DeliveryLine(kind: .willDeliverWhenReconnected, count: queued)
+        let state = coreClassifyDeliveryLine(
+            input: CoreDeliveryLineInput(
+                queued: UInt32(queued),
+                relay: relay,
+                ownRelayUsable: ownRelayUsable,
+                contactHasRelayEndpoint: contactHasRelayEndpoint,
+                contactRelayStale: contactRelayStale,
+                directLink: routeIsDirect,
+                deliveryReceiptIsNewestEvidence: receiptIsNewestEvidence
+            )
+        )
+        guard let state = state else { return nil }
+        return DeliveryLine(kind: state, count: queued)
     }
 }
 
@@ -569,11 +611,15 @@ enum ConnectionDetailsLogic {
         nowMs: Int64
     ) -> ConnectionDetailsState {
         let people = snapshot.people
-        let knownIds = Set(people.map { $0.userId })
         // Only friends count as "nearby": a stranger's phone HELLO'ing past is
-        // not someone this page can promise anything about.
+        // not someone this page can promise anything about. Blocked identities
+        // are not friends either -- a block is a tombstone, and a count that
+        // only a blocked person produces ("1 friend nearby" above a People
+        // section with nobody in it) discloses their presence just as surely as
+        // a row would.
+        let visibleIds = Set(people.filter { !$0.blocked }.map { $0.userId })
         var friendPaths: [Data: DirectPath] = [:]
-        for (userId, path) in directPaths where knownIds.contains(userId) {
+        for (userId, path) in directPaths where visibleIds.contains(userId) {
             friendPaths[userId] = path
         }
         let bluetoothLinks = friendPaths.values.filter { $0 == .bluetooth }.count
@@ -708,7 +754,8 @@ enum ConnectionDetailsLogic {
                 ownRelayUsable: ownRelayUsable,
                 contactHasRelayEndpoint: person.hasRelayEndpoint,
                 contactRelayStale: stale,
-                relay: relay
+                relay: relay,
+                receiptIsNewestEvidence: person.latest?.evidence == .messageDelivered
             )
         )
     }

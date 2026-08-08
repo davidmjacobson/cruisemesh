@@ -479,6 +479,9 @@
     </plurals>
     <!-- Collapsible sections at the bottom of the page. -->
     <string name="ui_section_recent_activity">Recent activity</string>
+    <!-- A collapsed section heading with its newest event time beside it, so a
+         reader can tell something happened without opening the section. -->
+    <string name="ui_section_with_detail">%1$s · %2$s</string>
     <string name="ui_section_troubleshooting">Troubleshooting &amp; diagnostics</string>
     <string name="ui_show">Show</string>
     <string name="ui_show_all_activity">Show all activity</string>

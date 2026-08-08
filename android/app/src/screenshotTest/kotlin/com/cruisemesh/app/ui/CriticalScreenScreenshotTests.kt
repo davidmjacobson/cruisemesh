@@ -10,6 +10,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.chat.MessageComposer
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
@@ -194,7 +195,7 @@ private val limitedState = fixtureState(
             "Ash",
             PersonStatus.History(PeerEvidence.CONNECTED, FIXTURE_NOW_MS - 45 * 60_000L),
             ConnectionPathBadge.BLUETOOTH,
-            DeliveryLine(DeliveryKind.WAITING_FOR_INTERNET, 2),
+            DeliveryLine(CoreDeliveryState.WAITING_FOR_INTERNET, 2),
         ),
     ),
 )
@@ -221,7 +222,7 @@ private val needsAttentionState = fixtureState(
             "Sam",
             PersonStatus.History(PeerEvidence.DISCONNECTED, FIXTURE_NOW_MS - 8 * 60_000L),
             ConnectionPathBadge.BLUETOOTH,
-            DeliveryLine(DeliveryKind.WILL_DELIVER_WHEN_RECONNECTED, 3),
+            DeliveryLine(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, 3),
         ),
     ),
 )

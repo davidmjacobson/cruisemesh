@@ -9200,6 +9200,175 @@ public func FfiConverterTypeCoreConnectionHealthReport_lower(_ value: CoreConnec
 
 
 /**
+ * Everything the per-person delivery line consumes.
+ */
+public struct CoreDeliveryLineInput {
+    /**
+     * Rows still awaiting *relay upload* for this recipient, straight from
+     * the diagnostic relay-depth query. See
+     * [`core_relay_queue_reflects_delivery`] for why this number is only
+     * sometimes evidence about delivery.
+     */
+    public var queued: UInt32
+    /**
+     * This phone's own Shore Pass path, normalized
+     * ([`CoreConnectionEvidence::relay`]).
+     */
+    public var relay: CoreRelayPathState
+    /**
+     * This phone's own Shore Pass path can deliver right now
+     * ([`CoreConnectionEvidence::own_relay_usable`]).
+     */
+    public var ownRelayUsable: Bool
+    /**
+     * Their friend card carries an internet-delivery endpoint at all.
+     * Without one, no amount of internet on this phone reaches them.
+     */
+    public var contactHasRelayEndpoint: Bool
+    /**
+     * Their endpoint has been written off after authoritatively rejecting us
+     * (`core_contact_relay_endpoint_usable` said no), so it is not a route
+     * today.
+     */
+    public var contactRelayStale: Bool
+    /**
+     * A live direct link to this person exists right now.
+     */
+    public var directLink: Bool
+    /**
+     * The freshest thing recorded about this person is a delivery receipt --
+     * the page's own row says they received a message from us.
+     */
+    public var deliveryReceiptIsNewestEvidence: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Rows still awaiting *relay upload* for this recipient, straight from
+         * the diagnostic relay-depth query. See
+         * [`core_relay_queue_reflects_delivery`] for why this number is only
+         * sometimes evidence about delivery.
+         */queued: UInt32,
+        /**
+         * This phone's own Shore Pass path, normalized
+         * ([`CoreConnectionEvidence::relay`]).
+         */relay: CoreRelayPathState,
+        /**
+         * This phone's own Shore Pass path can deliver right now
+         * ([`CoreConnectionEvidence::own_relay_usable`]).
+         */ownRelayUsable: Bool,
+        /**
+         * Their friend card carries an internet-delivery endpoint at all.
+         * Without one, no amount of internet on this phone reaches them.
+         */contactHasRelayEndpoint: Bool,
+        /**
+         * Their endpoint has been written off after authoritatively rejecting us
+         * (`core_contact_relay_endpoint_usable` said no), so it is not a route
+         * today.
+         */contactRelayStale: Bool,
+        /**
+         * A live direct link to this person exists right now.
+         */directLink: Bool,
+        /**
+         * The freshest thing recorded about this person is a delivery receipt --
+         * the page's own row says they received a message from us.
+         */deliveryReceiptIsNewestEvidence: Bool) {
+        self.queued = queued
+        self.relay = relay
+        self.ownRelayUsable = ownRelayUsable
+        self.contactHasRelayEndpoint = contactHasRelayEndpoint
+        self.contactRelayStale = contactRelayStale
+        self.directLink = directLink
+        self.deliveryReceiptIsNewestEvidence = deliveryReceiptIsNewestEvidence
+    }
+}
+
+
+
+extension CoreDeliveryLineInput: Equatable, Hashable {
+    public static func ==(lhs: CoreDeliveryLineInput, rhs: CoreDeliveryLineInput) -> Bool {
+        if lhs.queued != rhs.queued {
+            return false
+        }
+        if lhs.relay != rhs.relay {
+            return false
+        }
+        if lhs.ownRelayUsable != rhs.ownRelayUsable {
+            return false
+        }
+        if lhs.contactHasRelayEndpoint != rhs.contactHasRelayEndpoint {
+            return false
+        }
+        if lhs.contactRelayStale != rhs.contactRelayStale {
+            return false
+        }
+        if lhs.directLink != rhs.directLink {
+            return false
+        }
+        if lhs.deliveryReceiptIsNewestEvidence != rhs.deliveryReceiptIsNewestEvidence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(queued)
+        hasher.combine(relay)
+        hasher.combine(ownRelayUsable)
+        hasher.combine(contactHasRelayEndpoint)
+        hasher.combine(contactRelayStale)
+        hasher.combine(directLink)
+        hasher.combine(deliveryReceiptIsNewestEvidence)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryLineInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryLineInput {
+        return
+            try CoreDeliveryLineInput(
+                queued: FfiConverterUInt32.read(from: &buf),
+                relay: FfiConverterTypeCoreRelayPathState.read(from: &buf),
+                ownRelayUsable: FfiConverterBool.read(from: &buf),
+                contactHasRelayEndpoint: FfiConverterBool.read(from: &buf),
+                contactRelayStale: FfiConverterBool.read(from: &buf),
+                directLink: FfiConverterBool.read(from: &buf),
+                deliveryReceiptIsNewestEvidence: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDeliveryLineInput, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.queued, into: &buf)
+        FfiConverterTypeCoreRelayPathState.write(value.relay, into: &buf)
+        FfiConverterBool.write(value.ownRelayUsable, into: &buf)
+        FfiConverterBool.write(value.contactHasRelayEndpoint, into: &buf)
+        FfiConverterBool.write(value.contactRelayStale, into: &buf)
+        FfiConverterBool.write(value.directLink, into: &buf)
+        FfiConverterBool.write(value.deliveryReceiptIsNewestEvidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLineInput_lift(_ buf: RustBuffer) throws -> CoreDeliveryLineInput {
+    return try FfiConverterTypeCoreDeliveryLineInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLineInput_lower(_ value: CoreDeliveryLineInput) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryLineInput.lower(value)
+}
+
+
+/**
  * One link found in a message body.
  *
  * The range is half-open in **UTF-16 code units** over the body that was
@@ -15304,6 +15473,96 @@ extension CoreConnectionHealth: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The user-visible meaning of messages still waiting for one person.
+ *
+ * Deliberately has no error member. Phase 1 reads only signals that already
+ * exist -- receipts, waiting work, and path state -- and none of those can
+ * prove a terminal failure. Waiting for a friend who is simply elsewhere is
+ * what this product does, so it is never dressed as a fault. The blocked and
+ * delayed reasons arrive with the per-recipient read model in Phase 2, which
+ * is also what will let this take a real age.
+ */
+
+public enum CoreDeliveryState {
+
+    /**
+     * A route to this person is usable now.
+     */
+    case sending
+    /**
+     * No route right now; the work travels at the next encounter.
+     */
+    case willDeliverWhenReconnected
+    /**
+     * Shore Pass is the only known route and this phone has no internet.
+     */
+    case waitingForInternet
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .sending
+
+        case 2: return .willDeliverWhenReconnected
+
+        case 3: return .waitingForInternet
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDeliveryState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .sending:
+            writeInt(&buf, Int32(1))
+
+
+        case .willDeliverWhenReconnected:
+            writeInt(&buf, Int32(2))
+
+
+        case .waitingForInternet:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryState_lift(_ buf: RustBuffer) throws -> CoreDeliveryState {
+    return try FfiConverterTypeCoreDeliveryState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryState_lower(_ value: CoreDeliveryState) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryState.lower(value)
+}
+
+
+
+extension CoreDeliveryState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which direct radio a live link to a person uses.
  */
 
@@ -18320,6 +18579,30 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreDeliveryState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreDeliveryState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreDeliveryState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreDirectLink: FfiConverterRustBuffer {
     typealias SwiftType = CoreDirectLink?
 
@@ -19651,6 +19934,42 @@ public func coreClassifyConnectionHealth(input: CoreConnectionHealthInput) -> Co
 })
 }
 /**
+ * The delivery line for one person, or `None` when there is nothing honest to
+ * say.
+ *
+ * Nothing here is an error and nothing here is red. The old page's red
+ * `Pending relay upload` under every friend -- including friends who had
+ * already received the message -- is what this replaces.
+ */
+public func coreClassifyDeliveryLine(input: CoreDeliveryLineInput) -> CoreDeliveryState? {
+    return try!  FfiConverterOptionTypeCoreDeliveryState.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_classify_delivery_line(
+        FfiConverterTypeCoreDeliveryLineInput.lower(input),$0
+    )
+})
+}
+/**
+ * Is some path still coming up, with no verdict on it yet?
+ *
+ * Exported because both shells have to answer the same question *before* they
+ * call [`core_classify_connection_health`] -- they own the clock that records
+ * when the wait began, and the classification only bounds a wait it is told
+ * about. Answering it in Kotlin and again in Swift is how iOS came to omit
+ * the two radio cases and show `Needs attention` while its Bluetooth stack
+ * was still answering. One definition, used by the classifier itself below,
+ * makes that class of drift impossible.
+ */
+public func coreConnectionCheckPending(runtime: CoreMeshRuntime, bluetooth: CoreDirectPathState, localWifi: CoreDirectPathState, relay: CoreRelayPathState) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_connection_check_pending(
+        FfiConverterTypeCoreMeshRuntime.lower(runtime),
+        FfiConverterTypeCoreDirectPathState.lower(bluetooth),
+        FfiConverterTypeCoreDirectPathState.lower(localWifi),
+        FfiConverterTypeCoreRelayPathState.lower(relay),$0
+    )
+})
+}
+/**
  * Has an unresolved check outlived [`CONNECTION_CHECKING_TIMEOUT_MS`]?
  *
  * `checking_since_ms <= 0` (nothing recorded) and a mark in the future (the
@@ -19918,6 +20237,25 @@ public func coreContactRelayUnreachableIsStale(unreachableStreak: Int64) -> Bool
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_contact_relay_unreachable_is_stale(
         FfiConverterInt64.lower(unreachableStreak),$0
+    )
+})
+}
+/**
+ * Is there a route to *this person* right now, by the specification's
+ * definition?
+ *
+ * A live direct link, or our own working Shore Pass path plus an endpoint of
+ * theirs that is not resting after rejecting us. Exported rather than spelled
+ * out in each shell so a later change to what counts as usable cannot land on
+ * one platform only.
+ */
+public func coreContactRouteUsable(directLink: Bool, ownRelayUsable: Bool, contactHasRelayEndpoint: Bool, contactRelayStale: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_route_usable(
+        FfiConverterBool.lower(directLink),
+        FfiConverterBool.lower(ownRelayUsable),
+        FfiConverterBool.lower(contactHasRelayEndpoint),
+        FfiConverterBool.lower(contactRelayStale),$0
     )
 })
 }
@@ -20390,6 +20728,37 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
     return try!  FfiConverterSequenceInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_relay_ack_ids(
         FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),$0
+    )
+})
+}
+/**
+ * Does the relay-upload backlog for this recipient say anything about
+ * *delivery*?
+ *
+ * Only when relay upload is the thing that would drain it. The backlog counts
+ * outbound rows whose upload timestamp is still unset, and that timestamp is
+ * set by one event only: a successful upload. Delivery receipts do not clear
+ * it, and neither does handing the message straight to the person over
+ * Bluetooth -- durable copies are left in place on purpose.
+ *
+ * So on a phone with no pass saved, or for a friend whose card carries no
+ * endpoint, or one whose endpoint has been written off, the number is not a
+ * backlog at all: it is every message written to that person inside the
+ * retention window, and it never goes down. Reading it as delivery state
+ * there produces exactly the contradiction this page exists to remove --
+ * `Received your message 12 min ago` with `Sending 12 messages…` underneath
+ * it, for a week.
+ *
+ * This is a Phase 1 honesty gate over an existing diagnostic query, not the
+ * per-recipient delivery read model. That model (Phase 2) replaces the whole
+ * question with a receipt-aware count and makes this function unnecessary.
+ */
+public func coreRelayQueueReflectsDelivery(relay: CoreRelayPathState, contactHasRelayEndpoint: Bool, contactRelayStale: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_queue_reflects_delivery(
+        FfiConverterTypeCoreRelayPathState.lower(relay),
+        FfiConverterBool.lower(contactHasRelayEndpoint),
+        FfiConverterBool.lower(contactRelayStale),$0
     )
 })
 }
@@ -22402,6 +22771,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_classify_connection_health() != 10468) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_delivery_line() != 45405) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_connection_check_pending() != 38815) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_connection_checking_expired() != 49423) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -22433,6 +22808,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_is_stale() != 17717) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_route_usable() != 20984) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
@@ -22523,6 +22901,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_queue_reflects_delivery() != 16350) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {
