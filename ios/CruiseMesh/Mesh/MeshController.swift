@@ -3791,7 +3791,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     try relayRequest { try RelayClient.ackEnvelopes(config: walkConfig, ids: ids) }
                 },
                 abortsPass: { $0 is FamilyRelayRateLimitAbort },
-                noteFailure: { walkConfig, error in noteFailure(error, usedConfig: walkConfig) }
+                noteFailure: { walkConfig, error in noteFailure(error, usedConfig: walkConfig) },
+                // The walk asks for this only after the store reports it
+                // lowered this mailbox's frontier. A socket subscribed at the
+                // old value can never deliver a row at or below it, so a
+                // lowering that does not reach the socket leaves the live path
+                // deaf to the whole rebuilt mailbox; `resubscribe` is a no-op
+                // for every mailbox except the one this client watches.
+                reopenPushSocket: { [self] walkConfig in
+                    meshQueue.async { [self] in
+                        relayPushClient.resubscribe(config: walkConfig)
+                    }
+                }
             )
             for cfg in distinctConfigs {
                 // Presence rides each mailbox for the contacts resolved to

@@ -61,6 +61,18 @@ internal interface RelayMailboxPages {
      * on the token's budget and so says nothing more can be spent anywhere.
      */
     fun abortsPass(error: Exception): Boolean
+
+    /**
+     * Reopens the live push socket against this mailbox, because the walk just
+     * lowered the frontier the socket was subscribed with.
+     *
+     * On the seam rather than in the walk because the socket is the shell's:
+     * [RelaySyncEngine] hands this to
+     * [com.cruisemesh.app.relay.RelayPushClient.resubscribe], which is itself a
+     * no-op for every mailbox except the one that client watches, and a test
+     * simply records that it was asked.
+     */
+    fun reopenPushSocket(config: RelayConfig)
 }
 
 /** What one mailbox walk leaves for the pass around it to act on. */
@@ -210,6 +222,15 @@ internal class RelayMailboxWalker(
      * mailbox had been swept, and go quiet for another interval while real
      * mail sat below the frontier.
      *
+     * The frontier itself is repaired at the other end of that walk. A sweep
+     * that reaches the natural empty page having found its highest matching
+     * row *below* the remembered frontier has proved the frontier sits above
+     * the top of the mailbox that exists, and [noteSweepCompleted] lowers it
+     * to what the walk actually found. Without that, a rebuilt mailbox stayed
+     * on sweep-cadence delivery for good: ordinary passes asked above its top
+     * and saw nothing, and relayd's live push gates on the same value, so the
+     * socket saw nothing either.
+     *
      * TODO(relay-proxy-polling follow-up): [MessageStore.relayProxyHints]
      * fetches every contact's hints on every pass, so its cost scales with
      * contact-list size. Fine for this app's small family circles; would need
@@ -308,7 +329,14 @@ internal class RelayMailboxWalker(
                 "Fetched ${page.envelopes.size} relay envelope(s) from ${config.relayUrl} after=$after next=${page.nextCursor}",
             )
             if (page.envelopes.isEmpty()) {
-                if (sweeping) noteSweepCompleted(cursorKey, now)
+                // `after` is where the walk got to: the highest id of a
+                // hint-matching row this sweep proved exists, carried across
+                // the sweep's continuations because a resumed walk re-covers
+                // anything its predecessor could not persist. On a mailbox
+                // whose ids restarted underneath our frontier that is the
+                // evidence the frontier is wrong -- see
+                // MessageStore.noteRelaySweepCompleted.
+                if (sweeping) noteSweepCompleted(cursorKey, config, now, after, pages)
                 return RelayMailboxWalkResult(answered = true, continuationNeeded = false)
             }
             pagesFetched += 1u
@@ -461,14 +489,52 @@ internal class RelayMailboxWalker(
 
     /**
      * Records that a walk reached the end of this mailbox: restarts the sweep
-     * interval and clears the sweep's resume cursor. Only called on natural
+     * interval, clears the sweep's resume cursor, and lowers the frontier if
+     * [sweptThroughId] -- the `after=` the walk was holding when the empty
+     * page arrived -- proves it sits above the top of the mailbox that
+     * actually exists. Only called on natural
      * termination -- a sweep cut short by the service stopping, the network
      * going away, a relay error, or simply running out of its per-pass budget
-     * leaves the timestamp alone, so the next pass finishes the sweep from
-     * where this one stopped rather than believing a partial re-walk.
+     * leaves all three alone, so the next pass finishes the sweep from where
+     * this one stopped rather than believing a partial re-walk.
+     *
+     * The whole decision is core's ([uniffi.cruisemesh_core.relayFrontierAfterCompletedSweep],
+     * applied inside [MessageStore.noteRelaySweepCompleted]); this passes the
+     * observation and acts on the answer, so iOS reaches the same one.
+     *
+     * A lowered frontier has to reach relayd's push gate as well as its fetch
+     * cursor: the socket only pushes rows above the `after=` it was subscribed
+     * with, and that gate only ever moves *up* for the life of the socket, so
+     * one opened against the old frontier can never deliver a row at or below
+     * it and is deaf to the whole rebuilt mailbox. Reopening it is a no-op
+     * unless this is the mailbox the socket actually watches.
+     *
+     * A lowering is not by itself a rebuilt relay, which is why the log below
+     * states what happened rather than diagnosing why it happened. relayd
+     * deletes a row when it is acked, so a healthy mailbox whose newest row was
+     * a message this phone consumed routinely reports a top below the frontier;
+     * lowering there is correct and costs nothing, since ids are never reused.
+     * The reopen fires on every lowering all the same, because the client
+     * cannot tell the two cases apart and a threshold that guessed would
+     * suppress it in exactly the rebuild whose frontier was low to begin with.
+     * The bill is one socket reopen per completed sweep of the single mailbox
+     * this socket watches -- at most one per sweep interval.
      */
-    private fun noteSweepCompleted(cursorKey: String, now: Long) {
+    private fun noteSweepCompleted(
+        cursorKey: String,
+        config: RelayConfig,
+        now: Long,
+        sweptThroughId: Long,
+        pages: RelayMailboxPages,
+    ) {
         sweptThisSession.add(cursorKey)
-        store.noteRelaySweepCompleted(cursorKey, now)
+        if (store.noteRelaySweepCompleted(cursorKey, now, sweptThroughId)) {
+            Log.i(
+                TAG,
+                "Lowering the ${config.relayUrl} fetch frontier to $sweptThroughId: the completed " +
+                    "sweep found no matching row above it. Reopening the push socket",
+            )
+            pages.reopenPushSocket(config)
+        }
     }
 }

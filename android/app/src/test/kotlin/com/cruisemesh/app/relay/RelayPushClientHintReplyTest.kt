@@ -35,4 +35,26 @@ class RelayPushClientHintReplyTest {
     fun `a reply with no desired config at all (stopped mid-flight) is stale`() {
         assertFalse(isPushHintReplyCurrent(stopped = false, desiredConfig = null, replyConfig = config))
     }
+
+    @Test
+    fun `callbacks from the socket this client is actually using are acted on`() {
+        assertTrue(isCurrentPushSocket(stopped = false, currentGeneration = 7L, callbackGeneration = 7L))
+    }
+
+    @Test
+    fun `callbacks from a socket that was deliberately replaced are ignored`() {
+        // Cancelling a socket does not silence it: OkHttp delivers onFailure
+        // for the cancel afterwards, on its own thread. resubscribe() replaces
+        // a socket precisely so a changed subscribe cursor reaches relayd, and
+        // it cannot fall back on the `stopped` flag the way stop() does -- the
+        // client is still meant to be running. Acting on the dead socket's
+        // callback would null out its successor's reference and schedule a
+        // reconnect beside it: two sockets, one unreachable and never closed.
+        assertFalse(isCurrentPushSocket(stopped = false, currentGeneration = 8L, callbackGeneration = 7L))
+    }
+
+    @Test
+    fun `callbacks arriving after stop are ignored whatever the generation`() {
+        assertFalse(isCurrentPushSocket(stopped = true, currentGeneration = 7L, callbackGeneration = 7L))
+    }
 }

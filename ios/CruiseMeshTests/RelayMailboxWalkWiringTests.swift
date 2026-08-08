@@ -61,7 +61,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
             pageNextCursor: 29_000,
             pageFullyProcessed: true
         )
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         var now: Int64 = 1_000_000 + relaySweepIntervalMs()
         XCTAssertTrue(try harness.sweepDue(now), "the sweep must be due for this test to test anything")
 
@@ -113,8 +113,13 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // which is what the field saw ~97 times in fourteen minutes.
         XCTAssertEqual(harness.processed, (1...100).map(Int64.init))
 
-        // The frontier is untouched by a sweep re-reading rows below it.
-        XCTAssertEqual(try harness.cursor().afterId, 29_000)
+        // A sweep in flight never touches the frontier -- but the completed
+        // one at the end of it lowers it to the top the walk actually found.
+        // Reaching the empty page at after=100 having started from a
+        // remembered 29000 is proof no matching row exists above 100, which is
+        // the whole repair; the pages in between changed nothing.
+        XCTAssertEqual(try harness.cursor().afterId, 100)
+        XCTAssertEqual(harness.mailbox.pushReopens, [config.relayUrl])
     }
 
     func testAnUnfinishedSweepKeepsTheMailboxSweepingWhateverTheTimestampSays() async throws {
@@ -122,7 +127,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // thing that writes `last_sweep_at`, so between the first yield and the
         // last page the timestamp still describes the *previous* sweep.
         let harness = try makeHarness(rows: 100, serverPageSize: 10)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let now: Int64 = 1_000_000 + relaySweepIntervalMs()
 
         let result = try await harness.walk(now: now)
@@ -189,7 +194,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
             pageNextCursor: 50,
             pageFullyProcessed: true
         )
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let now: Int64 = 1_000_000 + 1_000
         XCTAssertFalse(try harness.sweepDue(now))
 
@@ -206,7 +211,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
 
     func testADeepFrontierPassYieldsAndItsContinuationPicksUpWhereItStopped() async throws {
         let harness = try makeHarness(rows: 100, serverPageSize: 10)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         var now: Int64 = 1_000_000 + 1_000
         XCTAssertFalse(try harness.sweepDue(now))
 
@@ -234,7 +239,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // every other mailbox's pages for the rest of the pass is not a fix for
         // anything.
         let harness = try makeHarness(rows: 100, serverPageSize: 10)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let full = Int(relayFetchBatchLimit())
         harness.mailbox.refuseLimitsAbove(full / 4)
         let now: Int64 = 1_000_000 + 1_000
@@ -266,7 +271,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // because skipping past them strands them until expiry.
         let harness = try makeHarness(rows: 30, serverPageSize: 10, disposition: .consumed)
         harness.mailbox.failAckOnPage(2)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let now: Int64 = 1_000_000 + 1_000
 
         let result = try await harness.walk(now: now)
@@ -314,7 +319,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // retries it instead.
         let harness = try makeHarness(rows: 100, serverPageSize: 10, disposition: .consumed)
         harness.mailbox.failAckOnPage(1)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let now: Int64 = 1_000_000 + 1_000
 
         let result = try await harness.walk(now: now)
@@ -328,7 +333,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         // single bad page costs one retry rather than the whole drain.
         let healthy = try makeHarness(rows: 100, serverPageSize: 10, disposition: .consumed)
         healthy.mailbox.failAckOnPage(2)
-        try healthy.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try healthy.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let healthyResult = try await healthy.walk(now: now)
         XCTAssertTrue(healthyResult.continuationNeeded)
     }
@@ -347,7 +352,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
             pageNextCursor: 500,
             pageFullyProcessed: true
         )
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         harness.mailbox.freezeCursorFromPage(2)
         var now: Int64 = 1_000_000 + relaySweepIntervalMs()
         XCTAssertTrue(try harness.sweepDue(now))
@@ -372,7 +377,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
 
     func testAFrontierPassThatBailsOutLeavesTheSweepScheduleAlone() async throws {
         let harness = try makeHarness(rows: 100, serverPageSize: 10)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         harness.mailbox.freezeCursorFromPage(2)
         let now: Int64 = 1_000_000 + 1_000
         XCTAssertFalse(try harness.sweepDue(now))
@@ -445,7 +450,7 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
             pageNextCursor: 29_000,
             pageFullyProcessed: true
         )
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let sweepStarted: Int64 = 1_000_000 + relaySweepIntervalMs()
         _ = try harness.store.advanceRelaySweepCursor(
             configKey: cursorKey(),
@@ -467,11 +472,83 @@ final class RelayMailboxWalkWiringTests: XCTestCase {
         XCTAssertEqual(harness.mailbox.fetches[resumed].after, 40)
     }
 
+    // MARK: - a frontier that outlived the ids it named
+
+    func testACompletedSweepOfARebuiltMailboxLowersTheFrontierAndReopensThePushSocket() async throws {
+        // The relay was rebuilt from a fresh volume: its row ids restart at 1,
+        // underneath a frontier this phone still remembers at 29000. Ordinary
+        // passes ask above the top of everything that exists and see nothing,
+        // and relayd's live push gates on the same value, so the socket is deaf
+        // too. The sweep is the only walk that reaches this mail, and the empty
+        // page at the end of it is the proof that repairs the frontier.
+        // Mirrors RelayMailboxWalkWiringTest.kt.
+        let harness = try makeHarness(rows: 30, serverPageSize: 10)
+        _ = try harness.store.advanceRelayFetchCursor(
+            configKey: cursorKey(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
+        let now: Int64 = 1_000_000 + relaySweepIntervalMs()
+        XCTAssertTrue(try harness.sweepDue(now))
+
+        _ = try await harness.walk(now: now)
+
+        // Lowered to what the walk actually found, not to zero: the sweep
+        // proved there is no matching row above id 30.
+        XCTAssertEqual(try harness.cursor().afterId, 30)
+        XCTAssertEqual(try harness.cursor().lastSweepAtMs, now)
+        // ...and the socket subscribed at 29000 was told to reopen, because it
+        // can never deliver a row at or below the value it was opened with.
+        XCTAssertEqual(harness.mailbox.pushReopens, [config.relayUrl])
+
+        // The next ordinary pass now asks from below the rebuilt mailbox's top
+        // rather than from a frontier nothing will ever reach.
+        let resumed = harness.mailbox.fetches.count
+        _ = try await harness.walk(now: now + relaySweepIntervalMs() / 2)
+        XCTAssertEqual(harness.mailbox.fetches[resumed].after, 30)
+    }
+
+    func testASweepThatFindsNothingAboveTheFrontierLeavesItAndTheSocketAlone() async throws {
+        // The other side of the same rule, and the common one: a mailbox whose
+        // rows all sit above the remembered frontier is healthy, so the
+        // completed sweep must not move it and must not spend a socket reopen.
+        let harness = try makeHarness(rows: 30, serverPageSize: 10)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
+        let now: Int64 = 1_000_000 + relaySweepIntervalMs()
+
+        _ = try await harness.walk(now: now)
+
+        XCTAssertEqual(try harness.cursor().afterId, 30)
+        XCTAssertEqual(harness.mailbox.pushReopens, [])
+    }
+
+    func testASweepCutShortBeforeTheEmptyPageRepairsNothing() async throws {
+        // The frontier may only be lowered by a walk that reached the natural
+        // end of the mailbox. A sweep that ran out of its per-pass budget has
+        // proved nothing about what sits above it, and lowering there would
+        // hand the next pass a frontier below rows it has already consumed.
+        let harness = try makeHarness(rows: 100, serverPageSize: 10)
+        _ = try harness.store.advanceRelayFetchCursor(
+            configKey: cursorKey(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
+        let now: Int64 = 1_000_000 + relaySweepIntervalMs()
+
+        let result = try await harness.walk(now: now)
+
+        XCTAssertTrue(result.continuationNeeded)
+        XCTAssertEqual(try harness.cursor().afterId, 29_000)
+        XCTAssertEqual(harness.mailbox.pushReopens, [])
+    }
+
     // MARK: - the mailbox key the whole walk is filed under
 
     func testARotatedTokenWalksADifferentMailboxFromTheBeginning() async throws {
         let harness = try makeHarness(rows: 30, serverPageSize: 10)
-        try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000)
+        _ = try harness.store.noteRelaySweepCompleted(configKey: cursorKey(), nowMs: 1_000_000, sweptThroughId: 0)
         let now: Int64 = 1_000_000 + 1_000
         _ = try await harness.walk(now: now)
         XCTAssertEqual(try harness.cursor().afterId, 30)
@@ -625,6 +702,13 @@ final class FakeRelayMailbox {
     /// to take costs one halving; paying it again on the next page of the same
     /// mailbox is the regression this records.
     private(set) var shrinks: [Shrink] = []
+    /// Every relay the walk asked to have its push socket reopened, in order.
+    ///
+    /// The walk only asks after the store reports it lowered this mailbox's
+    /// frontier, and a socket subscribed at the old value can never deliver a
+    /// row at or below it -- so a lowering that does not reach the socket
+    /// leaves the live path deaf to the whole rebuilt mailbox.
+    private(set) var pushReopens: [String] = []
 
     init(rows: [RelayFetchedEnvelope], serverPageSize: Int) {
         self.rows = rows.sorted { $0.id < $1.id }
@@ -698,7 +782,8 @@ final class FakeRelayMailbox {
                 try self.ackRows(ids)
             },
             abortsPass: { _ in false },
-            noteFailure: { _, _ in }
+            noteFailure: { _, _ in },
+            reopenPushSocket: { config in self.pushReopens.append(config.relayUrl) }
         )
     }
 }

@@ -30,6 +30,22 @@ internal fun isPushHintReplyCurrent(stopped: Boolean, desiredConfig: RelayConfig
     !stopped && desiredConfig == replyConfig
 
 /**
+ * Whether the socket a listener callback belongs to is still the one this
+ * client is using. Pure for the same reason [isPushHintReplyCurrent] is:
+ * the decision is worth testing without a socket.
+ *
+ * Cancelling a WebSocket does not silence it -- OkHttp still delivers
+ * `onFailure` for the cancel, later, on its own thread. A callback from a
+ * socket that has since been deliberately replaced ([RelayPushClient.stop],
+ * [RelayPushClient.resubscribe], or a [RelayPushClient.start] against a new
+ * config) must do nothing: acting on it would clear the *successor* socket's
+ * reference and schedule a reconnect alongside it, leaving two sockets open,
+ * one of them unreachable and never closed.
+ */
+internal fun isCurrentPushSocket(stopped: Boolean, currentGeneration: Long, callbackGeneration: Long): Boolean =
+    !stopped && currentGeneration == callbackGeneration
+
+/**
  * What a subscribe needs: which recipient hints to watch, and where in the
  * mailbox to start from.
  *
@@ -138,6 +154,21 @@ class RelayPushClient(
     @Volatile private var connected = false
     private var reconnectRunnable: Runnable? = null
 
+    /**
+     * Which socket the listener callbacks arriving right now belong to.
+     *
+     * Cancelling a socket does not silence it: OkHttp still delivers
+     * `onFailure` for the cancel, some time later, on its own thread. Without
+     * a generation the callback from a socket we deliberately replaced would
+     * clear [webSocket] out from under its successor and schedule a reconnect
+     * of its own -- two sockets open, one of them unreachable and never
+     * closed. [stop] happens to be safe from that only because it also sets
+     * [stopped]; [resubscribe] cannot, since its whole job is to keep this
+     * client running. Every listener callback carries the generation it was
+     * created for and does nothing once that generation is no longer current.
+     */
+    private var socketGeneration = 0L
+
     /** Whether the push socket is open and this class isn't tearing down -- see the class doc's "Health signal" section. */
     fun isHealthy(): Boolean = connected && !stopped
 
@@ -165,12 +196,53 @@ class RelayPushClient(
         connect()
     }
 
+    /**
+     * Reopens the socket, if this client is currently subscribed to [config],
+     * so a changed subscribe cursor reaches relayd.
+     *
+     * relayd's push gate is the `after=` the client subscribed with: it only
+     * pushes rows above that id, and it only ever moves that id *up* for the
+     * life of the socket (`handle_ws` keeps a local `after` and runs
+     * `after = after.max(id)` on every row it replays or pushes). So a socket
+     * can never deliver a row at or below the value it was opened with, and
+     * when the poll path lowers this mailbox's frontier -- a completed sweep
+     * proving the relay's row ids restarted underneath it, see
+     * `relay_frontier_after_completed_sweep` in the core -- a socket opened
+     * against the old frontier stays deaf to the entire rebuilt mailbox until
+     * something unrelated happens to drop it. On a phone that can be hours.
+     *
+     * A no-op for any other relay ([RelaySyncEngine] polls every contact's
+     * mailbox, and only one of them is the one this socket watches), and a
+     * no-op when stopped. Deliberately reports the drop through
+     * [onHealthChanged] even though it is intentional -- unlike [stop], this
+     * client is still trying to keep a socket up, and the poll cadence should
+     * cover the gap until the new one opens.
+     */
+    @Synchronized
+    fun resubscribe(config: RelayConfig) {
+        if (stopped || desiredConfig != config || hintsProvider == null) return
+        Log.i(TAG, "Reopening the relay push socket to ${config.relayUrl} to pick up a changed cursor")
+        socketGeneration += 1
+        reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
+        reconnectRunnable = null
+        webSocket?.cancel()
+        webSocket = null
+        val wasConnected = connected
+        connected = false
+        if (wasConnected) onHealthChanged(false)
+        // Not a connection failure: a deliberate reopen must not inherit the
+        // backoff of whatever went wrong last.
+        backoff.recordSuccess()
+        connect()
+    }
+
     /** Closes the socket (if any) and cancels any pending reconnect. Idempotent. */
     @Synchronized
     fun stop() {
         stopped = true
         desiredConfig = null
         hintsProvider = null
+        socketGeneration += 1
         reconnectRunnable?.let { mainHandler.removeCallbacks(it) }
         reconnectRunnable = null
         webSocket?.cancel()
@@ -224,21 +296,50 @@ class RelayPushClient(
             .header("Authorization", "Bearer ${config.relayToken}")
             .build()
         Log.i(TAG, "Connecting relay push socket to ${config.relayUrl} after=${subscription.afterId}")
-        webSocket = httpClient.newWebSocket(request, listener)
+        socketGeneration += 1
+        webSocket = httpClient.newWebSocket(request, listener(socketGeneration))
     }
 
-    private val listener = object : WebSocketListener() {
+    /** Whether callbacks from the socket opened at [generation] still matter -- see [socketGeneration]. */
+    @Synchronized
+    private fun isCurrentSocket(generation: Long): Boolean =
+        isCurrentPushSocket(stopped, socketGeneration, generation)
+
+    /**
+     * Marks the socket opened at [generation] healthy, or reports that it is
+     * no longer the one this client is using.
+     *
+     * The check and the two things it authorises have to happen under one
+     * hold of the monitor. Split apart, a [resubscribe] landing between them
+     * cancels this socket and clears [connected], and this callback then
+     * re-asserts `connected = true` for a socket that no longer exists --
+     * [isHealthy] would claim healthy with nothing open, and the poll cadence
+     * would stay at its push-healthy interval until the successor socket
+     * happened to open.
+     */
+    @Synchronized
+    private fun markConnected(generation: Long): Boolean {
+        if (!isCurrentPushSocket(stopped, socketGeneration, generation)) return false
+        backoff.recordSuccess()
+        connected = true
+        onHealthChanged(true)
+        return true
+    }
+
+    private fun listener(generation: Long) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (!markConnected(generation)) {
+                webSocket.cancel()
+                return
+            }
             Log.i(TAG, "Relay push socket open")
-            backoff.recordSuccess()
-            connected = true
-            onHealthChanged(true)
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
             // Content is ignored on purpose -- see class doc. Any pushed
             // envelope, replayed or live, just means "go run the
             // authoritative poll pass now."
+            if (!isCurrentSocket(generation)) return
             onPush()
         }
 
@@ -248,18 +349,18 @@ class RelayPushClient(
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.i(TAG, "Relay push socket closed: $code $reason")
-            handleDisconnect()
+            handleDisconnect(generation)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "Relay push socket failed: ${t.message}")
-            handleDisconnect()
+            handleDisconnect(generation)
         }
     }
 
     @Synchronized
-    private fun handleDisconnect() {
-        if (stopped) return
+    private fun handleDisconnect(generation: Long) {
+        if (!isCurrentSocket(generation)) return
         webSocket = null
         val wasConnected = connected
         connected = false

@@ -33,6 +33,16 @@ struct RelayMailboxPages {
     /// Records a failure against the config being walked, for the pass's own
     /// relay-health reporting.
     let noteFailure: (RelayConfig, Error) -> Void
+
+    /// Reopens the live push socket against this mailbox, because the walk just
+    /// lowered the frontier the socket was subscribed with.
+    ///
+    /// On the seam rather than in the walk because the socket is the shell's:
+    /// the pass hands this to `RelayPushClient.resubscribe`, which is itself a
+    /// no-op for every mailbox except the one that client watches, and a test
+    /// simply records that it was asked. Mirrors `RelayMailboxPages` in
+    /// RelayMailboxWalker.kt.
+    let reopenPushSocket: (RelayConfig) -> Void
 }
 
 /// What one mailbox walk leaves for the pass around it to act on. Mirrors
@@ -129,6 +139,15 @@ final class RelayMailboxWalk {
     /// keeps a phone that was offline while its relay was rebuilt healing on
     /// its first pass back.
     ///
+    /// The frontier itself is repaired at the other end of that walk. A sweep
+    /// that reaches the natural empty page having found its highest matching
+    /// row *below* the remembered frontier has proved the frontier sits above
+    /// the top of the mailbox that exists, and `finishSweep` lowers it to what
+    /// the walk actually found. Without that, a rebuilt mailbox stayed on
+    /// sweep-cadence delivery for good: ordinary passes asked above its top and
+    /// saw nothing, and relayd's live push gates on the same value, so the
+    /// socket saw nothing either.
+    ///
     /// Mirrors `RelayMailboxWalker.walk` in RelayMailboxWalker.kt.
     func walk(
         config cfg: RelayConfig,
@@ -219,14 +238,23 @@ final class RelayMailboxWalk {
             fetchBatchLimit = fetched.limit
             guard !page.envelopes.isEmpty else {
                 // Records that the walk reached the end of the mailbox:
-                // restarts the sweep interval and clears the sweep's resume
-                // cursor. Only here -- a sweep cut short by a relay error, a
-                // lost network, or simply running out of its per-pass budget
-                // leaves both alone, so the next pass finishes it from where
-                // this one stopped.
+                // restarts the sweep interval, clears the sweep's resume
+                // cursor, and lowers the frontier if the walk proved it sits
+                // above the top of the mailbox that actually exists. Only here
+                // -- a sweep cut short by a relay error, a lost network, or
+                // simply running out of its per-pass budget leaves all three
+                // alone, so the next pass finishes it from where this one
+                // stopped.
+                //
+                // `afterId` is where the walk got to: the highest id of a
+                // hint-matching row this sweep proved exists, carried across
+                // the sweep's continuations because a resumed walk re-covers
+                // anything its predecessor could not persist. On a mailbox
+                // whose ids restarted underneath our frontier that is the
+                // evidence the frontier is wrong.
                 if sweeping {
                     RelaySweepSession.shared.noteSwept(cursorKey)
-                    try? store.noteRelaySweepCompleted(configKey: cursorKey, nowMs: now)
+                    finishSweep(cursorKey: cursorKey, config: cfg, nowMs: now, sweptThroughId: afterId, pages: pages)
                 }
                 return RelayMailboxWalkResult(answered: true, continuationNeeded: false)
             }
@@ -369,5 +397,50 @@ final class RelayMailboxWalk {
                 )
             }
         }
+    }
+
+    /// Records that a walk reached the end of this mailbox: restarts the sweep
+    /// interval, clears the sweep's resume cursor, and lowers the frontier if
+    /// `sweptThroughId` -- the `after=` the walk was holding when the empty
+    /// page arrived -- proves it sits above the top of the mailbox that
+    /// actually exists.
+    ///
+    /// The decision itself is core's (`relayFrontierAfterCompletedSweep`,
+    /// applied inside `noteRelaySweepCompleted`); this passes the observation
+    /// and acts on the answer, so Android reaches the same one. Mirrors
+    /// `RelayMailboxWalker.noteSweepCompleted` in RelayMailboxWalker.kt.
+    ///
+    /// A lowered frontier has to reach relayd's push gate as well as its fetch
+    /// cursor: the socket only pushes rows above the `after=` it was subscribed
+    /// with, and that gate only ever moves *up* for the life of the socket, so
+    /// one opened against the old frontier can never deliver a row at or below
+    /// it and is deaf to the whole rebuilt mailbox. Reopening it is a no-op for
+    /// every mailbox except the one the socket actually watches.
+    ///
+    /// A lowering is not by itself a rebuilt relay, which is why the log states
+    /// what happened rather than diagnosing why: relayd deletes a row when it
+    /// is acked, so a healthy mailbox whose newest row was a message this phone
+    /// consumed routinely reports a top below the frontier, and lowering there
+    /// is correct and free (ids are never reused). The reopen fires on every
+    /// lowering all the same, because the client cannot tell the two cases
+    /// apart and a threshold that guessed would suppress it in exactly the
+    /// rebuild whose frontier was low to begin with.
+    private func finishSweep(
+        cursorKey: String,
+        config cfg: RelayConfig,
+        nowMs now: Int64,
+        sweptThroughId: Int64,
+        pages: RelayMailboxPages
+    ) {
+        let lowered = (try? store.noteRelaySweepCompleted(
+            configKey: cursorKey,
+            nowMs: now,
+            sweptThroughId: sweptThroughId
+        )) ?? false
+        guard lowered else { return }
+        relaySyncLog.info(
+            "Lowering the relay fetch frontier to \(sweptThroughId, privacy: .public): the completed sweep found no matching row above it. Reopening the push socket"
+        )
+        pages.reopenPushSocket(cfg)
     }
 }

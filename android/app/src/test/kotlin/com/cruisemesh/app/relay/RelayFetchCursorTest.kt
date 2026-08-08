@@ -15,6 +15,7 @@ import uniffi.cruisemesh_core.relayCursorKey
 import uniffi.cruisemesh_core.relayFetchBatchLimit
 import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayFetchWalkContinues
+import uniffi.cruisemesh_core.relayFrontierAfterCompletedSweep
 import uniffi.cruisemesh_core.relayPassStartCursor
 import uniffi.cruisemesh_core.relaySweepDue
 import uniffi.cruisemesh_core.relaySweepIntervalMs
@@ -117,7 +118,7 @@ class RelayFetchCursorTest {
         val store = MessageStore.open(":memory:")
         assertEquals("", relayCursorKey(url, "   "))
         assertEquals(0L, store.advanceRelayFetchCursor("", 9_000L, true))
-        store.noteRelaySweepCompleted("", 5_000L)
+        store.noteRelaySweepCompleted("", 5_000L, 0L)
         assertEquals(0L, store.relayFetchCursor("").afterId)
         assertEquals(0L, store.relayFetchCursor("").lastSweepAtMs)
     }
@@ -168,7 +169,7 @@ class RelayFetchCursorTest {
     fun `a completed sweep restarts the interval without costing the frontier`() {
         val store = MessageStore.open(":memory:")
         store.advanceRelayFetchCursor(key(), 9_000L, true)
-        store.noteRelaySweepCompleted(key(), 1_000_000L)
+        assertFalse(store.noteRelaySweepCompleted(key(), 1_000_000L, 9_000L))
         val cursor = store.relayFetchCursor(key())
         assertEquals(9_000L, cursor.afterId)
         assertEquals(1_000_000L, cursor.lastSweepAtMs)
@@ -196,7 +197,7 @@ class RelayFetchCursorTest {
         // A long-established mailbox: frontier at the top, last swept six
         // hours ago.
         store.advanceRelayFetchCursor(key(), 29_000L, true)
-        store.noteRelaySweepCompleted(key(), 1_000_000L)
+        store.noteRelaySweepCompleted(key(), 1_000_000L, 29_000L)
         val now = 1_000_000L + relaySweepIntervalMs()
 
         var cursor = store.relayFetchCursor(key())
@@ -219,7 +220,7 @@ class RelayFetchCursorTest {
         assertEquals(29_000L, relayPassStartCursor(false, cursor.afterId, cursor.sweepAfterId))
 
         // The empty page ends it: interval restarts, resume cursor cleared.
-        store.noteRelaySweepCompleted(key(), now)
+        store.noteRelaySweepCompleted(key(), now, 29_000L)
         cursor = store.relayFetchCursor(key())
         assertEquals(0L, cursor.sweepAfterId)
         assertEquals(29_000L, cursor.afterId)
@@ -264,7 +265,7 @@ class RelayFetchCursorTest {
         // a frontier no ordinary pass goes under.
         val store = MessageStore.open(":memory:")
         store.advanceRelayFetchCursor(key(), 29_000L, true)
-        store.noteRelaySweepCompleted(key(), 1_000_000L)
+        store.noteRelaySweepCompleted(key(), 1_000_000L, 29_000L)
         val sweepStarted = 1_000_000L + relaySweepIntervalMs()
         store.advanceRelaySweepCursor(key(), 20_000L, true, sweepStarted)
 
@@ -323,6 +324,75 @@ class RelayFetchCursorTest {
         assertEquals(0L, cursor.sweepAfterId)
         assertFalse(relaySweepDue(true, cursor.lastSweepAtMs, cursor.sweepAfterId, 2_000L))
         assertEquals(29_000L, relayPassStartCursor(false, cursor.afterId, cursor.sweepAfterId))
+    }
+
+    // -- repairing a frontier that outlived its id space ------------------
+
+    @Test
+    fun `a completed sweep over a rebuilt mailbox lowers the frontier`() {
+        // The operator event, end to end: the relay is rebuilt from a fresh
+        // volume and its row ids restart at 1 underneath a frontier of 29000.
+        // Ordinary passes ask above the top of the new mailbox and see
+        // nothing, and relayd's live push gates on the same value, so the
+        // socket is blind too. Only a sweep, which starts at 0, ever reaches
+        // that mail -- until the sweep that finds it also fixes the frontier.
+        val store = MessageStore.open(":memory:")
+        store.advanceRelayFetchCursor(key(), 29_000L, true)
+        store.noteRelaySweepCompleted(key(), 1_000_000L, 29_000L)
+        val now = 1_000_000L + relaySweepIntervalMs()
+        assertEquals(29_000L, relayPassStartCursor(false, store.relayFetchCursor(key()).afterId, 0L))
+
+        // The sweep walks the new mailbox: two pages ending at id 40, all far
+        // below the frontier, so no page can move it.
+        for (pageCursor in listOf(16L, 40L)) {
+            store.advanceRelaySweepCursor(key(), pageCursor, true, now)
+            store.advanceRelayFetchCursor(key(), pageCursor, true)
+        }
+        assertEquals(29_000L, store.relayFetchCursor(key()).afterId)
+
+        // The empty page ends the walk at after=40, and that is the evidence.
+        assertTrue(store.noteRelaySweepCompleted(key(), now, 40L))
+        var cursor = store.relayFetchCursor(key())
+        assertEquals(40L, cursor.afterId)
+        assertEquals(0L, cursor.sweepAfterId)
+        // Ordinary delivery is restored, without waiting for another sweep.
+        assertEquals(40L, relayPassStartCursor(false, cursor.afterId, cursor.sweepAfterId))
+        assertEquals(41L, store.advanceRelayFetchCursor(key(), 41L, true))
+
+        // And it does not repeat: the next completed sweep finds the same top
+        // of the same mailbox and writes nothing back.
+        assertFalse(store.noteRelaySweepCompleted(key(), now + relaySweepIntervalMs(), 41L))
+        cursor = store.relayFetchCursor(key())
+        assertEquals(41L, cursor.afterId)
+    }
+
+    @Test
+    fun `a quiet mailbox and an unfinished sweep both leave the frontier alone`() {
+        // The hazard the rule turns on. A drained mailbox and a rebuilt one
+        // look almost the same from here, and the empty page carries no
+        // evidence either way -- so an empty mailbox never lowers anything.
+        // Nothing is lost: mail arriving on a relay that was not rebuilt lands
+        // above the frontier where an ordinary pass finds it.
+        assertEquals(29_000L, relayFrontierAfterCompletedSweep(29_000L, 0L))
+        // A walk that outran a frozen frontier (a page whose envelopes could
+        // not all be processed) must not RAISE it -- that would skip the very
+        // envelope the freeze exists to re-present.
+        assertEquals(5_900L, relayFrontierAfterCompletedSweep(5_900L, 29_000L))
+
+        val store = MessageStore.open(":memory:")
+        store.advanceRelayFetchCursor(key(), 29_000L, true)
+        assertFalse(store.noteRelaySweepCompleted(key(), 2_000_000L, 0L))
+        assertEquals(29_000L, store.relayFetchCursor(key()).afterId)
+
+        // A sweep that yielded on its budget has walked a prefix and knows
+        // nothing about the top of the mailbox; it never reaches the repair at
+        // all, because only the empty page records a completed sweep.
+        for (pageCursor in listOf(128L, 256L, 384L, 512L)) {
+            store.advanceRelaySweepCursor(key(), pageCursor, true, 2_000_000L)
+        }
+        assertEquals(29_000L, store.relayFetchCursor(key()).afterId)
+        store.resetRelaySweepProgress(key(), 2_100_000L)
+        assertEquals(29_000L, store.relayFetchCursor(key()).afterId)
     }
 
     @Test
