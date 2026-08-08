@@ -57,7 +57,7 @@ of it: the gap is now countable.
 | `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | unimplemented | package C0; walk-budget half is already core |
 | `MARK-01` | A successfully relay-uploaded carried row is durably marked before the pass ends; the marker survives restart and suppresses repeat upload for its lifetime. | core | `core/src/store.rs` upload-marker tests; index re-asserts first-writer-wins |
 | `WM-01` | Receipt repair has a reachable, bounded path from every supported stored state; a peer watermark of zero cannot permanently gate repair. | hoist-pending | shell repair planners |
-| `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | hoist-pending | byte budget is core; the per-second cadence gate is not built |
+| `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | hoist-pending | core spends a per-encounter byte budget, but every budget number is a shell constant; the per-second cadence gate is not built at all |
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
@@ -503,6 +503,11 @@ This is the deployed order, read from the Android engine and the iOS
 controller as they stand. Package C0 pins it as an explicit stage enum; until
 then it is documented here so a change is visible as a change.
 
+The two shells do not agree everywhere. Where they differ, this section states
+both and section 5.2 records the divergence as a row, because a contract that
+silently writes down one shell's behaviour hides exactly the change it exists
+to make visible.
+
 1. **Prune and repair local state.** Expire outbound envelopes, outgoing
    receipt envelopes, carried rows, and consumed-hidden records. Restore
    persisted contact-endpoint health and begin this pass's provisional
@@ -517,8 +522,12 @@ then it is documented here so a change is visible as a change.
    (`MARK-01`).
 6. **Decide hint-triggered rewalk.** If the hint source set changed, drop
    frontiers so the walks below start at zero.
-7. **For each eligible config: presence, then the mailbox page
-   walk/process/ack.**
+7. **For each eligible config: presence, and the mailbox page
+   walk/process/ack.** The two run in the opposite order on the two shells
+   today — iOS presence first, Android walk first — and they treat a presence
+   failure differently as well. Neither ordering is written down anywhere as
+   deliberate. See 5.2; C0 has to choose one, migrate the other shell onto
+   it, and say so in the same PR.
 8. **Commit silence and rejection evidence and fold pass health.** Silence
    may only be committed now, because only now is it known whether this
    device's own mailbox answered (`SILENCE-01`).
@@ -540,6 +549,24 @@ Ordering constraints that are load-bearing rather than incidental: receipts
 before authored before carried (a receipt is small and unblocks a peer's
 queue); announce before every upload (so a changed endpoint rides the same
 pass); rewalk decision before the walks; silence commit after the walks.
+
+### 5.2 Known cross-shell divergences inside a stage
+
+Places where reading the two shells gave two answers. They are recorded rather
+than resolved: this revision changes no behaviour, and picking a winner is a
+migration with a canary, not a documentation edit. Each row names the package
+that must choose. The list is what reading the stages for this revision turned
+up; it is append-only, and finding another one is a finding, not a failure.
+
+| Divergence | Android today | iOS today | Whose choice |
+|---|---|---|---|
+| Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | C0 pins one in the stage enum and migrates the other shell in the same PR |
+| What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | C0, with the same stage enum |
+
+Neither is known to be load-bearing, which is the point: an undocumented
+difference cannot be reasoned about, and a migration that quietly changes
+Android's deployed ordering to match a written stage enum would otherwise
+land with no invariant, no fixture, and no row saying it was ever different.
 
 ## 6. Fixture and event schema — `cruisemesh.protocol-event/v1`
 
@@ -654,9 +681,9 @@ against the tree as it stands. Labels:
 |---|---|---|---|---|---|
 | Family request pacing and 429 backoff | `mesh/FamilyRelayBackpressure.kt` | `Relay/FamilyRelayBackpressure.swift` | fault classification and the `Retry-After` clamp in `relay_status.rs` | hoist-now | `relay_policy.rs`; B0/B2 |
 | Pending relay rerun | `mesh/RelayRerunPolicy.kt` + `RelaySyncEngine.kt` | rerun path in `MeshController.swift` | none | hoist-now | `relay_policy.rs`, then `relay_pass.rs`; B0/C0 |
-| Mailbox per-pass work/yield budget | delegating only — the budget itself is core | delegating only | `relay_cursor.rs` owns pages, envelopes, continuation delay (#270) | delete | remove the shell wrappers with B2 |
+| Mailbox per-pass work/yield budget | none — `RelayMailboxWalkBudget.kt` was removed outright in #270; only the call-through `RelayMailboxWalkBudgetTest.kt` remains | none — `Relay/RelayMailboxWalk.swift` calls `relayMailboxWalkAction` directly and never had a local copy | `relay_cursor.rs` owns pages, envelopes, continuation delay (#270) | delete | already done in #270; nothing left to remove, and the Kotlin test stays as the guard that Android still reaches core |
 | Mailbox walk execution | `mesh/RelayMailboxWalker.kt` (#276) | `Relay/RelayMailboxWalk.swift` (#276) | walk action, sweep due, resume, frontier in `relay_cursor.rs` | hoist-now | `relay_pass.rs`; C4 |
-| Relay pass stage order | `mesh/RelaySyncEngine.kt` | `relaySyncBlocking` region of `MeshController.swift` | none | hoist-now | `relay_pass.rs`; C0–C5 |
+| Relay pass stage order | `mesh/RelaySyncEngine.kt` | `relaySyncBlocking` region of `MeshController.swift` | none — and the two shells already disagree inside stage 7, see 5.2 | hoist-now | `relay_pass.rs`; C0–C5, which must resolve the 5.2 rows explicitly rather than by picking whichever shell it reads first |
 | Relay HTTP execution and page-size cap | `relay/RelayClient.kt` | `Relay/RelayClient.swift` | codecs, caps and status classification in `relay_wire.rs` / `relay_status.rs` | hoist-now (semantics) / shell-forever (transport) | core request/response semantics, native execution; C0–C2 |
 | Sweep, frontier, ack, continuation | `RelaySyncEngine.kt` + `RelayMailboxWalker.kt` | `MeshController.swift` + `Relay/RelaySweepSession.swift` | `relay_cursor.rs` + `store.rs` helpers; frontier lowering is core (#279) | hoist-now | `relay_pass.rs` + a transactional store API; C4 |
 | Contact rejection / silence / rest | `mesh/ContactRelaySilence.kt` + engine | `ContactRelaySilence` in `RelaySweepSession.swift` + controller | `contact_relay_health.rs` + persisted store state | hoist-now | policy in B0, orchestration in C3/C4 |
@@ -664,11 +691,12 @@ against the tree as it stands. Labels:
 | Connection and delivery health classification | consumes core (#281, #282) | consumes core (#281, #282) | `connection_health.rs` owns classification, per-recipient delivery, receipt-gated lines | presentation-only | stays core; shells render |
 | Failover resume debounce | `mesh/FailoverResumeDebounce.kt` — thin wrapper | equivalent wrapper | `transport_policy.rs` owns the window and coalescing (#269) | presentation-only | stays core; wrappers are adapters |
 | Peripheral link admission and spray cooldown | `mesh/PeripheralLinkAdmission.kt`, spray cooldown classes (#277) | not yet extracted | none | hoist-later | `mesh_meet.rs` when D2 lands; the byte/cadence half is `SPRAY-01` |
+| Per-encounter spray byte budgets | three constants in `mesh/InboundEnvelopeProcessor.kt` (carried 256 KiB, own outbound 256 KiB, receipts 64 KiB) | the same three in `Core/ProtocolKinds.swift` | `core_digest_spray_plan` spends the budgets and resumes from a carried cursor, but every value is passed in by the shell | hoist-now | the numbers belong beside the plan in `mesh_meet.rs`; D2. Equal today, and nothing makes them stay equal |
 | Inbound envelope disposition | `mesh/InboundEnvelopeProcessor.kt` | `processInboundEnvelope` and handlers in `MeshController.swift` | crypto/store primitives and ack eligibility in `engine.rs` / `store.rs` | hoist-now | `mesh_receive.rs`; D0/D1 |
 | HELLO / digest / carry encounter | `MeshService.kt` + `InboundEnvelopeProcessor.kt` | `MeshController.swift` | digest and spray planning in `engine.rs`, session state in `transport_policy.rs` | hoist-now | `mesh_meet.rs`; D2/D3 |
 | Logical peer routing | `MeshRouter.kt` / `MeshRouterState.kt` | `MeshRouter.swift` / `MeshRouterState.swift` | `CoreMeshRouterState` in `transport_policy.rs`; peer collapse is core (#266) | hoist-later | extend the existing core router; D2 |
 | LAN endpoint cache and provenance | `mesh/LanEndpointCache.kt` | `LanEndpointStore.swift` | `lan_util.rs` owns provenance, eviction and same-network checks (#271, #278) | presentation-only | stays core |
-| LAN endpoint hint authoring | `mesh/LanEndpointSender.kt` | not authored on iOS | encoder and host validation in `protocol.rs` | hoist-later | `ENDPOINT-01`'s authoring half; D2/D3 |
+| LAN endpoint hint authoring | `mesh/LanEndpointSender.kt` + `LanEndpointSendPolicy.kt` | full twin: `Mesh/LanEndpointSender.swift`, plus `sendLanEndpointHint` / `queueCurrentLanEndpoint` in `MeshController.swift` | encoder and host validation in `protocol.rs` | hoist-later | `ENDPOINT-01`'s authoring half; D2/D3 must move **both** copies |
 | LAN scan and socket lifecycle | `LanTransport.kt` and scan files | `LanTransport.swift` and scan files | primitives in `lan_util.rs` / `lan_session.rs` | shell-forever (drivers) | shared progress policy in D2/D3 |
 | BLE central / peripheral lifecycle | `BleCentral.kt`, `BlePeripheral.kt` | `BleTransport.swift` | framing only, in `framing.rs` | shell-forever | — |
 | Push, OS polling, background wake | `relay/RelayPushClient.kt` + service scheduling | `Relay/RelayPushClient.swift` + controller scheduling | none | shell-forever | push stays a pass nudge only |
@@ -683,8 +711,13 @@ against the tree as it stands. Labels:
 Recorded so a reader does not have to diff two documents:
 
 - The mailbox walk budget and the sweep resume policy are **core** now
-  (#270). The Android budget class is a delegating shim, so its row is
-  `delete`, not `hoist-now`.
+  (#270), and the Android class did not become a shim — `RelayMailboxWalkBudget.kt`
+  was deleted outright in that PR. What survives is
+  `RelayMailboxWalkBudgetTest.kt`, which calls the core functions directly and
+  is worth keeping for exactly that reason. iOS never had a budget class at
+  all; `RelayMailboxWalk.swift` calls `relayMailboxWalkAction` itself. So the
+  row is `delete` and the deletion has already happened — there is nothing
+  left for B2 to remove here.
 - The walk itself is **extracted on both shells** (#276) with a scripted
   fake-relay wiring harness on each, which is what makes `PAGE-01` and
   `CURSOR-01` testable outside a device.
@@ -697,3 +730,13 @@ Recorded so a reader does not have to diff two documents:
   `UI-01` has a real core owner rather than only native UI tests.
 - Peripheral link admission and the notify-reject spray brake are **plain
   shell classes** (#277) with no core owner yet.
+- LAN endpoint hint authoring is **not** Android-only. iOS carries a full
+  twin — `Mesh/LanEndpointSender.swift` for the kind-8 hint envelope, and
+  `sendLanEndpointHint` in `MeshController.swift` for the `0x04` frame. D2/D3
+  owns two copies, not one, and a hoist that moves only the Kotlin file
+  leaves `ENDPOINT-01`'s authoring half exactly as split as it is today.
+- The per-encounter spray byte budgets are still duplicated constants on both
+  shells. Core spends them; neither shell reads its numbers from core.
+- Stage 7 is not one order. Android walks the mailbox and then syncs
+  presence; iOS syncs presence and then walks. Section 5.2 carries this and
+  the presence-failure difference beside it.

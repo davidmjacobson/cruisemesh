@@ -153,8 +153,12 @@ const CONTRACT: &[Invariant] = &[
         id: "WM-01",
         statement: "Receipt repair is reachable and bounded from every supported stored state; a \
                     zero peer watermark cannot permanently gate it.",
+        // Android has no watermark test of its own: the watermark cases live
+        // inside ReceiptRepairTest.kt, which drives PeerStreamWatermark
+        // directly. Naming a file that does not exist would defeat the point
+        // of this registry, so only real files are listed.
         owner: Owner::HoistPending {
-            shell_tests: "android ReceiptRepairTest.kt + PeerStreamWatermarkTest.kt; \
+            shell_tests: "android ReceiptRepairTest.kt (which also covers PeerStreamWatermark); \
                           ios ReceiptRepairTests.swift + PeerStreamWatermarkTests.swift",
             package: "D2 (mesh_meet) hoists the repair planner",
         },
@@ -331,6 +335,191 @@ fn every_invariant_names_a_real_owner() {
                 entry.id
             ),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A named owner has to be a real file
+// ---------------------------------------------------------------------------
+//
+// `every_invariant_names_a_real_owner` above only checks that the owner
+// strings are non-empty, and a non-empty string is not evidence of anything:
+// the first draft of WM-01 named an Android watermark test that has never
+// existed, and the suite stayed green. Shell tests get renamed and deleted
+// throughout waves B–D. If a `hoist-pending` entry can rot while the build
+// passes, this index is advertising owners that are gone, which is worse than
+// admitting there is no owner at all.
+//
+// So every Kotlin/Swift filename named anywhere in this file or in the
+// contract document must exist on disk.
+
+/// Source of this file, so the scan covers `#[ignore]` marker text as well as
+/// the registry — the marker strings name owners too.
+const THIS_FILE: &str = include_str!("protocol_contract.rs");
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("core/ has a parent")
+        .to_path_buf()
+}
+
+fn collect_file_names(dir: &Path, out: &mut BTreeSet<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|name| name.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        if path.is_dir() {
+            // Build output only ever mirrors sources; skipping it keeps the
+            // walk quick and stops a stale artifact from satisfying a name.
+            if name != "build" && name != ".gradle" {
+                collect_file_names(&path, out);
+            }
+        } else {
+            out.insert(name);
+        }
+    }
+}
+
+/// Every Kotlin and Swift file the shells ship, by basename.
+fn shell_file_names() -> BTreeSet<String> {
+    let root = repo_root();
+    let mut names = BTreeSet::new();
+    for relative in ["android/app/src", "ios"] {
+        let dir = root.join(relative);
+        assert!(
+            dir.is_dir(),
+            "{} is missing; this test needs a full checkout, not just core/",
+            dir.display()
+        );
+        collect_file_names(&dir, &mut names);
+    }
+    names
+}
+
+/// Pull Kotlin and Swift file basenames out of arbitrary text. Hand-rolled
+/// rather than pulling in a regex dependency for one scan.
+fn named_shell_files(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut found = BTreeSet::new();
+
+    for extension in [".kt", ".swift"] {
+        for (start, _) in text.match_indices(extension) {
+            // `.kt` must not be the head of `.kts` or `.ktx`, and the name
+            // must not run on into another word.
+            let after = start + extension.len();
+            if bytes
+                .get(after)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                continue;
+            }
+            let mut begin = start;
+            while begin > 0 {
+                let previous = bytes[begin - 1];
+                if previous.is_ascii_alphanumeric() || previous == b'_' {
+                    begin -= 1;
+                } else {
+                    break;
+                }
+            }
+            if begin < start {
+                found.insert(text[begin..after].to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Files this contract names precisely because they are *gone*. Each needs a
+/// reason, so the list cannot quietly become a place to park a broken name.
+const NAMED_AS_ABSENT: &[(&str, &str)] = &[(
+    "RelayMailboxWalkBudget.kt",
+    "deleted outright in #270 when the walk budget became core; Appendix A and A.1 record the \
+     deletion, so the name has to appear in the document without existing on disk",
+)];
+
+/// The strict half, checked against the registry's own strings rather than
+/// the file text: a shell test named as a *current owner* must exist, and may
+/// never be one of the files this contract records as deleted.
+#[test]
+fn every_named_shell_test_owner_is_a_file_that_exists() {
+    let existing = shell_file_names();
+    let absent: BTreeSet<&str> = NAMED_AS_ABSENT.iter().map(|(name, _)| *name).collect();
+
+    for entry in CONTRACT {
+        let Owner::HoistPending { shell_tests, .. } = entry.owner else {
+            continue;
+        };
+        let named = named_shell_files(shell_tests);
+        assert!(
+            !named.is_empty(),
+            "{} is hoist-pending but its owner string names no Kotlin or Swift file",
+            entry.id
+        );
+        for name in named {
+            assert!(
+                existing.contains(&name),
+                "{} names {name} as a current shell owner, and no such file exists under \
+                 android/app/src or ios/. A named owner that is not a real file is worse than no \
+                 owner: it reads as coverage. Point at the real file or drop the name.",
+                entry.id
+            );
+            assert!(
+                !absent.contains(name.as_str()),
+                "{} names {name}, which this contract records as deleted",
+                entry.id
+            );
+        }
+    }
+}
+
+/// The broad half: any Kotlin/Swift filename mentioned anywhere in this file,
+/// including inside `#[ignore]` marker text, has to be real. Names on the
+/// deleted list are skipped, because the list itself has to spell them.
+#[test]
+fn every_shell_file_this_index_mentions_exists() {
+    let existing = shell_file_names();
+    let absent: BTreeSet<&str> = NAMED_AS_ABSENT.iter().map(|(name, _)| *name).collect();
+
+    for name in named_shell_files(THIS_FILE) {
+        if absent.contains(name.as_str()) {
+            continue;
+        }
+        assert!(
+            existing.contains(&name),
+            "core/tests/protocol_contract.rs mentions {name}, which does not exist under \
+             android/app/src or ios/. Fix the reference, or add it to NAMED_AS_ABSENT with the \
+             reason it is cited anyway."
+        );
+    }
+}
+
+#[test]
+fn every_shell_file_the_document_names_exists_or_is_declared_gone() {
+    let existing = shell_file_names();
+
+    for name in named_shell_files(CONTRACT_DOC) {
+        if let Some((_, reason)) = NAMED_AS_ABSENT.iter().find(|(absent, _)| *absent == name) {
+            assert!(
+                !existing.contains(&name),
+                "{name} is listed in NAMED_AS_ABSENT ({reason}) but exists again; the document \
+                 and the list are now both wrong"
+            );
+            continue;
+        }
+        assert!(
+            existing.contains(&name),
+            "specs/protocol-contract-v1.md names {name}, which does not exist under \
+             android/app/src or ios/. Appendix A is an inventory of where decisions actually \
+             live; a row pointing at a file that is gone is the drift it exists to catch. Fix \
+             the row, or add the name to NAMED_AS_ABSENT with the reason it is cited anyway."
+        );
     }
 }
 
@@ -728,11 +917,15 @@ fn hello_01_the_legacy_handshake_is_frozen_and_hello2_is_the_extension_point() {
 }
 
 #[test]
-fn spray_01_the_row_count_half_of_the_bound_exists_in_core() {
-    // Deliberately not claiming SPRAY-01 is owned here: the byte budget and
-    // the concurrent-offer cap are core, the per-second cadence gate is not.
-    // The registry keeps this invariant hoist-pending; this test only pins the
-    // part that would otherwise regress silently.
+fn spray_01_the_concurrent_carried_offer_cap_exists_in_core() {
+    // Deliberately not claiming SPRAY-01 is owned here. What this pins is one
+    // narrow thing: how many peers may have a carried offer in flight at once.
+    // It is NOT a bound on how much work goes toward a single peer, so it
+    // would not catch #280's evidence at any value. The per-encounter byte
+    // budget is spent by core but its numbers come from shell constants, and
+    // the re-offer cadence gate does not exist. The registry keeps this
+    // invariant hoist-pending; this test only pins the part that would
+    // otherwise regress silently.
     let id = lookup("SPRAY-01").id;
     contract_assert!(
         id,
@@ -801,10 +994,16 @@ fn rate_01_pacing_and_backoff_are_still_shell_owned() {
 
 #[test]
 #[ignore = "HOIST-PENDING: ENDPOINT-01 hint authoring is owned by android LanEndpointSendPolicyTest.kt \
-            and LanEndpointCacheTest.kt (core validates hosts and scopes relay-change notices, but \
-            does not author the hint); hoist in package D2/D3"]
+            and LanEndpointCacheTest.kt plus ios LanEndpointStoreTests.swift (core validates hosts \
+            and scopes relay-change notices, but does not author the hint); hoist in package D2/D3"]
 fn endpoint_01_hint_authoring_is_still_shell_owned() {
-    unimplemented!("package D2/D3 moves LAN endpoint hint authoring into mesh_meet");
+    // Both shells author. Android has LanEndpointSender.kt; iOS has
+    // LanEndpointSender.swift for the kind-8 hint envelope and
+    // MeshController.sendLanEndpointHint for the 0x04 frame. A hoist that
+    // moves one of them finishes nothing.
+    unimplemented!(
+        "package D2/D3 moves LAN endpoint hint authoring into mesh_meet, on both shells"
+    );
 }
 
 #[test]
@@ -815,10 +1014,11 @@ fn wm_01_receipt_repair_has_no_core_model() {
 }
 
 #[test]
-#[ignore = "HOIST-PENDING: SPRAY-01 byte budget is core (digest spray plan) but the per-encounter \
-            byte cap toward one peer and the re-offer cadence gate are not built; the cooldown half \
-            is owned by android PeripheralSprayCooldownTest.kt; see issue #280; hoist in package D2"]
-fn spray_01_has_no_cadence_gate_or_per_peer_byte_cap() {
+#[ignore = "HOIST-PENDING: SPRAY-01 -- core_digest_spray_plan spends a per-encounter byte budget, \
+            but all three budget numbers are shell constants (InboundEnvelopeProcessor.kt and \
+            ProtocolKinds.swift) and nothing gates how often an encounter may re-offer; the cooldown \
+            half is owned by android PeripheralSprayCooldownTest.kt; see issue #280; hoist in D2"]
+fn spray_01_has_no_cadence_gate_and_its_byte_budgets_are_shell_constants() {
     unimplemented!(
         "issue #280: 34 copies of an 18,795-byte frame queued to one peer in one second"
     );
