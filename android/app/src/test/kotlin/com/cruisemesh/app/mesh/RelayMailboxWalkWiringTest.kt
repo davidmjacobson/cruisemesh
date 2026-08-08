@@ -68,7 +68,7 @@ class RelayMailboxWalkWiringTest {
         // nothing is acked and nothing leaves the mailbox as the walk goes.
         val harness = harness(rows = 100, serverPageSize = 10)
         harness.store.advanceRelayFetchCursor(cursorKey, 29_000L, true)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         var now = 1_000_000L + relaySweepIntervalMs()
         assertTrue("the sweep must be due for this test to be testing anything", harness.sweepDue(now))
 
@@ -122,8 +122,13 @@ class RelayMailboxWalkWiringTest {
         // which is what the field saw ~97 times in fourteen minutes.
         assertEquals((1L..100L).toList(), harness.processed)
 
-        // The frontier is untouched by a sweep re-reading rows below it.
-        assertEquals(29_000L, harness.cursor().afterId)
+        // A sweep in flight never touches the frontier -- but the completed
+        // one at the end of it lowers it to the top the walk actually found.
+        // Reaching the empty page at after=100 having started from a
+        // remembered 29000 is proof no matching row exists above 100, which is
+        // the whole repair; the pages in between changed nothing.
+        assertEquals(100L, harness.cursor().afterId)
+        assertEquals(listOf(config.relayUrl), harness.mailbox.pushReopens)
     }
 
     @Test
@@ -134,7 +139,7 @@ class RelayMailboxWalkWiringTest {
         // Abandoning the walk there would strand the resume cursor mid-mailbox
         // and leave the coverage it exists to provide quietly incomplete.
         val harness = harness(rows = 100, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + relaySweepIntervalMs()
 
         assertTrue(harness.walk(now).continuationNeeded)
@@ -189,7 +194,7 @@ class RelayMailboxWalkWiringTest {
         // mode again.
         val harness = harness(rows = 80, serverPageSize = 10)
         harness.store.advanceRelayFetchCursor(cursorKey, 50L, true)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + 1_000L
         assertFalse(harness.sweepDue(now))
 
@@ -211,7 +216,7 @@ class RelayMailboxWalkWiringTest {
     @Test
     fun `a deep frontier pass yields on the budget and the continuation picks up where it stopped`() {
         val harness = harness(rows = 100, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         var now = 1_000_000L + 1_000L
         assertFalse(harness.sweepDue(now))
 
@@ -239,7 +244,7 @@ class RelayMailboxWalkWiringTest {
         // every other mailbox's pages for the rest of the pass is not a fix
         // for anything.
         val harness = harness(rows = 100, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val full = relayFetchBatchLimit().toInt()
         harness.mailbox.refuseLimitsAbove(full / 4)
         val now = 1_000_000L + 1_000L
@@ -267,7 +272,7 @@ class RelayMailboxWalkWiringTest {
     fun `a page that fails to process freezes both cursors without blocking the mail behind it`() {
         val harness = harness(rows = 30, serverPageSize = 10)
         harness.failProcessingRow(15L)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + 1_000L
 
         val result = harness.walk(now)
@@ -312,7 +317,7 @@ class RelayMailboxWalkWiringTest {
         // skipping past them would strand them in the mailbox until expiry.
         val harness = harness(rows = 30, serverPageSize = 10, disposition = CoreInboundDisposition.CONSUMED)
         harness.mailbox.failAckOnPage(2)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + 1_000L
 
         harness.walk(now)
@@ -332,7 +337,7 @@ class RelayMailboxWalkWiringTest {
         // interval retries it instead.
         val harness = harness(rows = 100, serverPageSize = 10)
         harness.failProcessingRow(1L)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + 1_000L
 
         val result = harness.walk(now)
@@ -345,7 +350,7 @@ class RelayMailboxWalkWiringTest {
         // a single bad page costs one retry rather than the whole drain.
         val healthy = harness(rows = 100, serverPageSize = 10)
         healthy.failProcessingRow(15L)
-        healthy.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        healthy.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         assertTrue(healthy.walk(now).continuationNeeded)
     }
 
@@ -360,7 +365,7 @@ class RelayMailboxWalkWiringTest {
         // pass again: new mail at the top of it would stop arriving.
         val harness = harness(rows = 100, serverPageSize = 10)
         harness.store.advanceRelayFetchCursor(cursorKey, 500L, true)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         harness.mailbox.freezeCursorFromPage(2)
         var now = 1_000_000L + relaySweepIntervalMs()
         assertTrue(harness.sweepDue(now))
@@ -386,7 +391,7 @@ class RelayMailboxWalkWiringTest {
     @Test
     fun `a frontier pass that bails out leaves the sweep schedule alone`() {
         val harness = harness(rows = 100, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         harness.mailbox.freezeCursorFromPage(2)
         val now = 1_000_000L + 1_000L
         assertFalse(harness.sweepDue(now))
@@ -458,7 +463,7 @@ class RelayMailboxWalkWiringTest {
         // would be the same livelock in a longer costume.
         val harness = harness(rows = 100, serverPageSize = 10)
         harness.store.advanceRelayFetchCursor(cursorKey, 29_000L, true)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val sweepStarted = 1_000_000L + relaySweepIntervalMs()
         harness.store.advanceRelaySweepCursor(cursorKey, 20_000L, true, sweepStarted)
 
@@ -475,12 +480,77 @@ class RelayMailboxWalkWiringTest {
         assertEquals(40L, harness.mailbox.fetches[resumed].after)
     }
 
+    // -- a frontier that outlived the ids it named --------------------------
+
+    @Test
+    fun `a completed sweep of a rebuilt mailbox lowers the frontier and reopens the push socket`() {
+        // The relay was rebuilt from a fresh volume: its row ids restart at 1,
+        // underneath a frontier this phone still remembers at 29000. Ordinary
+        // passes ask above the top of everything that exists and see nothing,
+        // and relayd's live push gates on the same value, so the socket is deaf
+        // too. The sweep is the only walk that reaches this mail, and the empty
+        // page at the end of it is the proof that repairs the frontier.
+        val harness = harness(rows = 30, serverPageSize = 10)
+        harness.store.advanceRelayFetchCursor(cursorKey, 29_000L, true)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
+        val now = 1_000_000L + relaySweepIntervalMs()
+        assertTrue(harness.sweepDue(now))
+
+        harness.walk(now)
+
+        // Lowered to what the walk actually found, not to zero: the sweep
+        // proved there is no matching row above id 30.
+        assertEquals(30L, harness.cursor().afterId)
+        assertEquals(now, harness.cursor().lastSweepAtMs)
+        // ...and the socket subscribed at 29000 was told to reopen, because it
+        // can never deliver a row at or below the value it was opened with.
+        assertEquals(listOf(config.relayUrl), harness.mailbox.pushReopens)
+
+        // The next ordinary pass now asks from below the rebuilt mailbox's top
+        // rather than from a frontier nothing will ever reach.
+        val resumed = harness.mailbox.fetches.size
+        harness.walk(now + relaySweepIntervalMs() / 2)
+        assertEquals(30L, harness.mailbox.fetches[resumed].after)
+    }
+
+    @Test
+    fun `a sweep that finds nothing above the frontier leaves it and the socket alone`() {
+        // The other side of the same rule, and the common one: a mailbox whose
+        // rows all sit above the remembered frontier is healthy, so the
+        // completed sweep must not move it and must not spend a socket reopen.
+        val harness = harness(rows = 30, serverPageSize = 10)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
+        val now = 1_000_000L + relaySweepIntervalMs()
+
+        harness.walk(now)
+
+        assertEquals(30L, harness.cursor().afterId)
+        assertEquals(emptyList<String>(), harness.mailbox.pushReopens)
+    }
+
+    @Test
+    fun `a sweep cut short before the empty page repairs nothing`() {
+        // The frontier may only be lowered by a walk that reached the natural
+        // end of the mailbox. A sweep that ran out of its per-pass budget has
+        // proved nothing about what sits above it, and lowering there would
+        // hand the next pass a frontier below rows it has already consumed.
+        val harness = harness(rows = 100, serverPageSize = 10)
+        harness.store.advanceRelayFetchCursor(cursorKey, 29_000L, true)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
+        val now = 1_000_000L + relaySweepIntervalMs()
+
+        assertTrue(harness.walk(now).continuationNeeded)
+
+        assertEquals(29_000L, harness.cursor().afterId)
+        assertEquals(emptyList<String>(), harness.mailbox.pushReopens)
+    }
+
     // -- the walk stopping because the service did --------------------------
 
     @Test
     fun `losing the network mid-walk yields nothing to the continuation and strands nothing`() {
         val harness = harness(rows = 100, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         harness.stopAfterPages(2)
         val now = 1_000_000L + 1_000L
 
@@ -499,7 +569,7 @@ class RelayMailboxWalkWiringTest {
     @Test
     fun `a rotated token walks a different mailbox from the beginning`() {
         val harness = harness(rows = 30, serverPageSize = 10)
-        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L)
+        harness.store.noteRelaySweepCompleted(cursorKey, 1_000_000L, 0L)
         val now = 1_000_000L + 1_000L
         harness.walk(now)
         assertEquals(30L, harness.cursor().afterId)
@@ -621,6 +691,16 @@ internal class FakeRelayMailbox(
      */
     val shrinks = mutableListOf<Pair<Int, Int>>()
 
+    /**
+     * Every relay the walk asked to have its push socket reopened, in order.
+     *
+     * The walk only asks after the store reports it lowered this mailbox's
+     * frontier, and a socket subscribed at the old value can never deliver a
+     * row at or below it -- so a lowering that does not reach the socket
+     * leaves the live path deaf to the whole rebuilt mailbox.
+     */
+    val pushReopens = mutableListOf<String>()
+
     private var freezeFromPage = Int.MAX_VALUE
     private var failAckOnPage = Int.MAX_VALUE
     private var maxServableLimit = Int.MAX_VALUE
@@ -688,5 +768,9 @@ internal class FakeRelayMailbox(
         override fun ack(config: RelayConfig, relayIds: List<Long>) = ackRows(relayIds)
 
         override fun abortsPass(error: Exception): Boolean = false
+
+        override fun reopenPushSocket(config: RelayConfig) {
+            pushReopens += config.relayUrl
+        }
     }
 }

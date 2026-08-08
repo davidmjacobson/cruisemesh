@@ -64,6 +64,34 @@
 //! because a relay rebuilt in the meantime has restarted its row ids at 1 and
 //! the remembered cursor now points past the end of everything.
 //!
+//! ## The third bug: a frontier that outlived its id space
+//!
+//! The sweep cursor above keeps *sweeps* sound across a rebuilt relay. The
+//! frontier was a separate casualty of the same event and stayed broken for
+//! longer: ids restarting at 1 under a frontier of 29000 meant every ordinary
+//! pass asked for `after=29000` and got nothing, and relayd's live push gates
+//! on the same client-supplied value, so the socket saw nothing either. Only
+//! the six-hourly sweep, which starts at 0, ever reached that mail. The mailbox
+//! was in permanent sweep-cadence delivery and nothing in the module repaired
+//! it.
+//!
+//! [`relay_frontier_after_completed_sweep`] is the repair, and it is the single
+//! exception to [`relay_cursor_advance`]'s never-backwards rule. A sweep that
+//! walked from its start point to the natural empty page and found its highest
+//! matching row *below* the remembered frontier has proved the frontier is
+//! above the top of the mailbox that actually exists; it drops to what that
+//! walk found. Only a completed sweep is evidence, and only a non-empty
+//! mailbox is — a drained mailbox and a rebuilt one look the same from here,
+//! and the drained one loses nothing by being left alone.
+//!
+//! A lowering is routine rather than an alarm, and it is worth saying so here
+//! because the words "the ids regressed" invite the opposite reading. relayd
+//! deletes a row when it is acked, so a healthy mailbox whose newest row was a
+//! message this phone consumed already has a frontier above everything that
+//! survives; the sweep lowers it to the top of what is left, harmlessly, since
+//! ids are never reused. The rebuilt relay is the case the repair exists for,
+//! not the case that fires most often.
+//!
 //! Policy lives here, as plain functions, so both shells answer every
 //! question the same way and every answer is unit-testable without a relay,
 //! a socket, or a store.
@@ -313,20 +341,22 @@ pub fn relay_hint_source_digest(mut source_ids: Vec<Vec<u8>>) -> String {
 /// repaired by restarting the app.
 ///
 /// It is worth being precise about what "repaired" ever meant here, because it
-/// is less than it sounds. [`relay_cursor_advance`] never moves the frontier
-/// *backwards*, and a sweep only re-reads pages — it never lowers `after_id`.
+/// was less than it sounded. [`relay_cursor_advance`] never moves the frontier
+/// *backwards*, and a sweep only re-reads pages — it never lowered `after_id`.
 /// So on a mailbox whose ids restarted under a frontier of, say, 29000, that
-/// frontier stays at 29000 for good. Ordinary passes send `after=29000` and see
+/// frontier stayed at 29000 for good. Ordinary passes sent `after=29000` and saw
 /// nothing; relayd's live push gates on the same client-supplied value, so the
-/// socket is blind too. Only a sweep, which starts from 0, sees that mail. The
-/// mailbox is therefore in permanent sweep-cadence delivery either way — this
-/// change moves that cadence from minutes (one forced walk per app restart, and
+/// socket was blind too. Only a sweep, which starts from 0, saw that mail. The
+/// mailbox was therefore in permanent sweep-cadence delivery either way — this
+/// change moved that cadence from minutes (one forced walk per app restart, and
 /// phones restart all day) to up to [`RELAY_SWEEP_INTERVAL_MS`].
 ///
-/// That is a real regression for one rare operator event, accepted against a
-/// constant cost paid by every phone every day. Lowering the frontier when a
-/// completed sweep proves the mailbox's ids have regressed would fix it
-/// properly and is the obvious follow-up; nothing here forecloses it.
+/// The sweep that cadence describes now *ends* the state rather than papering
+/// over it: [`relay_frontier_after_completed_sweep`] lowers the frontier to
+/// whatever a completed walk actually found, so the mailbox is back on ordinary
+/// frontier delivery — and back on live push, which gates on the same value —
+/// from the first completed sweep that finds anything in the rebuilt mailbox
+/// rather than never.
 ///
 /// The sweep's own resume cursor could have made that case *worse* — a cursor
 /// remembered from the old id space points past the end of a rebuilt mailbox,
@@ -521,6 +551,13 @@ pub fn relay_sweep_restart_from_zero(
 /// frontier its position, so an interrupted sweep cannot turn into a
 /// re-walk-everything-next-pass loop.
 ///
+/// There is exactly one way the frontier moves down, and it is deliberately
+/// not expressible here: [`relay_frontier_after_completed_sweep`], applied once
+/// by a sweep that walked all the way to the empty page. Per *page* the
+/// never-backwards rule has to be absolute, because a page cursor below the
+/// frontier is the normal shape of a sweep in progress and says nothing about
+/// the top of the mailbox. Only the end of a completed walk does.
+///
 /// The same function decides the sweep's own `sweep_after_id`
 /// (`MessageStore::advance_relay_sweep_cursor`), because the rule is the same
 /// rule: a page that did not finish must be presented again, and a cursor that
@@ -540,6 +577,132 @@ pub fn relay_cursor_advance(
         return persisted;
     }
     page_next_cursor
+}
+
+/// The frontier to persist when a sweep reaches the end of the mailbox,
+/// given how far that sweep actually walked.
+///
+/// This is the one place the frontier is allowed to move *down*, and it exists
+/// for the operator event [`relay_sweep_due`]'s doc comment describes and could
+/// not repair: a relay rebuilt from a fresh volume restarts its row ids at 1
+/// underneath a frontier we still remember. [`relay_cursor_advance`] never
+/// moves backwards, so ordinary passes go on sending `after=29000` against a
+/// mailbox whose highest row is 40 and see nothing; relayd's live push gates on
+/// the same client-supplied value, so the socket is blind too. Delivery for
+/// that mailbox degrades to sweep cadence — up to [`RELAY_SWEEP_INTERVAL_MS`] —
+/// permanently.
+///
+/// `swept_through_id` is the `after=` the walk was holding when the empty page
+/// arrived: the highest id of a row matching our hints that the sweep proved
+/// exists. It is not a new cursor the shells have to keep — it is the walk's
+/// own loop variable, which starts at the sweep's resume point and takes each
+/// page's `next_cursor` in turn, so it already covers the passes before this
+/// one (a sweep resumes from a cursor no higher than what those passes saw, and
+/// re-walks anything above it).
+///
+/// Three rules, and each of them is load-bearing:
+///
+/// - **Only downwards.** `swept_through_id` at or above the frontier returns
+///   the frontier untouched. A sweep whose walk outran the frontier is the
+///   ordinary case — a page that failed to process freezes the frontier while
+///   the walk carries on — and letting the sweep's cursor *raise* the frontier
+///   there would skip exactly the envelope the freeze exists to re-present.
+///   Raising is also how a broken or hostile relay would push this device past
+///   its own mail, which is reason enough on its own. It is what makes this
+///   safe alongside `MessageStore::note_relay_hint_sources`, too: a hint-set
+///   change that zeroed the frontier mid-sweep stays zeroed, because a sweep
+///   completing afterwards can only lower.
+///
+/// - **Only on a mailbox with rows in it.** `swept_through_id` of 0 — a walk
+///   from 0 that met the empty page immediately — changes nothing. This is the
+///   distinction the whole function turns on, because a regressed id space and
+///   a drained mailbox look almost identical from here, and an empty mailbox is
+///   the one shape that carries no evidence either way. It also costs nothing
+///   to decline on a relay that was *not* rebuilt: new mail lands above the
+///   remembered frontier and an ordinary pass sees it. On one that *was*, it
+///   costs a bounded blind window, and the honest statement of it is this: a
+///   message sent just after an empty sweep lands at an id below the stale
+///   frontier, where no ordinary pass and no live push can reach it, and the
+///   sweep that would repair the frontier is up to [`RELAY_SWEEP_INTERVAL_MS`]
+///   away — because the empty sweep just stamped `last_sweep_at`. So that one
+///   message waits for the next sweep to fetch it *and* to lower the frontier;
+///   everything after it arrives normally. One sweep interval, once, at the
+///   moment a rebuilt mailbox stops being empty — against the permanent
+///   blindness this function replaces, and against the alternative below.
+///   Lowering an empty mailbox's frontier to 0 would ask relayd to re-scan from
+///   the bottom of a shared family mailbox on every poll, forever, and would
+///   fire on every ordinary drained mailbox rather than on the rare rebuild.
+///
+/// - **To what the sweep proved, not to 0.** The repaired frontier is
+///   `swept_through_id` itself. A completed sweep sends the same hints an
+///   ordinary pass does, so "no matching row above `swept_through_id`" is
+///   exactly what it established; dropping to 0 instead would re-present every
+///   row below it on the next ordinary pass — the deliberately-unacked carry
+///   copies included — which is the thousands-of-round-trips behaviour this
+///   whole module exists to remove.
+///
+/// What a lowering does *not* prove is that anything went wrong, and the
+/// distinction matters to whoever reads the log line a shell writes here.
+/// relayd deletes a row when it is acked, so the ordinary steady state of a
+/// healthy mailbox is a frontier sitting above every row that still exists: the
+/// last message this phone consumed took its row with it, and the top surviving
+/// hint-matching row — a `CARRIED` proxy copy left in place on purpose, a
+/// legacy group-hint row that is never acked at all — is older and lower. A
+/// completed sweep over *that* mailbox lowers the frontier too, and it is
+/// correct and free to do so: ids are never reused, so nothing above the new
+/// value can appear later at an id below it, and nothing below it is
+/// re-presented (the walk that just finished proved the new value is the top).
+/// The rebuilt relay is the case this repair exists for; the drained-top
+/// mailbox is the case that reaches it most often.
+///
+/// The write is idempotent by construction: after one lowering the frontier
+/// *is* `swept_through_id`, so a second completed sweep proving the same top of
+/// the mailbox lands in the "at or above" branch and writes nothing.
+///
+/// Note what this deliberately does not do: it never re-presents mail, it only
+/// stops the frontier lying about where the mailbox ends. Everything between
+/// the repaired frontier and the old one has already been walked by the sweep
+/// that just finished, and anything re-fetched later is deduped on the way in.
+///
+/// It also cannot violate the rule the frontier exists to keep — nothing is
+/// persisted past an envelope that never reached a terminal disposition —
+/// because it only ever moves the cursor *down*. A page that failed mid-walk
+/// sits below the old frontier and below the repaired one alike, so no envelope
+/// becomes newly skipped; the sweep that re-reads that page from 0 remains the
+/// path that presents it again. That is why this exception can sit beside
+/// [`relay_cursor_advance`]'s never-backwards rule without weakening it: the
+/// rule stops a *page* cursor from undoing the frontier, and lowering is not a
+/// page cursor.
+///
+/// One interaction with the sweep's own resume cursor is worth stating plainly,
+/// because `swept_through_id` is that cursor's final value rather than an
+/// independent observation of the mailbox. A sweep paused mid-walk when the
+/// relay is rebuilt under it resumes at a cursor from the id space that is now
+/// gone, meets the empty page immediately, and reports *that* stale id. The
+/// frontier is then lowered to a value which is itself above the new mailbox —
+/// a weaker repair, never a wrong one. Nothing that was reachable stops being
+/// reachable (the frontier was already above the new top and still is), and
+/// completing the sweep clears its progress, so the *next* sweep necessarily
+/// starts at 0, walks the new mailbox, and finishes the repair. Buying the
+/// stronger answer would mean persisting the highest row id a sweep has
+/// actually seen — a third cursor — to improve a case that already converges on
+/// its own.
+///
+/// Only a *completed* sweep may call it. A walk that yielded on its budget, was
+/// abandoned because the relay stopped advancing its cursor, or simply ran out
+/// of network has seen a prefix of the mailbox and knows nothing about the top
+/// of it; lowering the frontier to a prefix's last id would strand every row
+/// above it behind a re-walk on every ordinary pass. Both shells call this only
+/// through `MessageStore::note_relay_sweep_completed`, which is only reached on
+/// the empty page that ends the walk.
+#[uniffi::export]
+pub fn relay_frontier_after_completed_sweep(persisted_after_id: i64, swept_through_id: i64) -> i64 {
+    let persisted = persisted_after_id.max(0);
+    let swept = swept_through_id.max(0);
+    if swept <= 0 || swept >= persisted {
+        return persisted;
+    }
+    swept
 }
 
 /// Should the walk fetch another page?
@@ -975,6 +1138,170 @@ mod tests {
         // A negative persisted value is clamped, not propagated.
         assert_eq!(relay_cursor_advance(-3, 5, true), 5);
         assert_eq!(relay_cursor_advance(-3, 5, false), 0);
+    }
+
+    /// The operator event, in one function: a relay rebuilt from a fresh
+    /// volume restarts its row ids at 1, and the sweep that walks the new
+    /// mailbox end to end is what proves the remembered frontier names an id
+    /// space that is gone.
+    #[test]
+    fn a_completed_sweep_over_a_regressed_id_space_lowers_the_frontier() {
+        assert_eq!(relay_frontier_after_completed_sweep(29_000, 40), 40);
+        // ...and the next ordinary pass therefore asks for after=40 rather
+        // than after=29000, which is the whole repair.
+        assert_eq!(relay_pass_start_cursor(false, 40, 0), 40);
+    }
+
+    /// The hazard the rule turns on. A drained mailbox and a rebuilt one look
+    /// nearly identical from the client, and the empty one carries no evidence
+    /// either way — so it is left alone. Nothing is lost: on a relay that was
+    /// not rebuilt, new mail lands above the remembered frontier and an
+    /// ordinary pass finds it; on one that was, the mailbox stops being empty
+    /// as soon as there is anything to deliver, and the sweep after that has
+    /// the evidence.
+    #[test]
+    fn a_quiet_mailbox_does_not_lower_the_frontier() {
+        assert_eq!(relay_frontier_after_completed_sweep(29_000, 0), 29_000);
+        // A mailbox that still holds a few ancient rows is *not* the empty
+        // case: it has rows, and their top is what the sweep proved.
+        assert_eq!(relay_frontier_after_completed_sweep(29_000, 30), 30);
+    }
+
+    /// The shape that reaches this function most often, and the reason a shell
+    /// must not log a lowering as "the relay was rebuilt": relayd deletes a row
+    /// when it is acked, so a healthy mailbox whose newest row was a message
+    /// this phone consumed already has a frontier above everything that
+    /// survives. The sweep lowers it to the top of what is left, and that costs
+    /// nothing.
+    #[test]
+    fn a_healthy_mailbox_whose_newest_rows_were_acked_still_lowers() {
+        // Frontier 9_000, put there by a 1:1 message that was consumed, acked,
+        // and deleted server-side. What survives is an older carried copy.
+        assert_eq!(relay_frontier_after_completed_sweep(9_000, 8_400), 8_400);
+        // Nothing is re-presented — the walk that just finished proved 8_400 is
+        // the top — and nothing is missed, because relayd's ids only climb: the
+        // next message still lands above 9_000 and an ordinary pass sees it.
+        assert_eq!(relay_pass_start_cursor(false, 8_400, 0), 8_400);
+        assert_eq!(relay_cursor_advance(8_400, 9_100, true), 9_100);
+    }
+
+    /// The frontier's own safety rule survives the exception. A page that
+    /// failed to process freezes the frontier while the walk carries on above
+    /// it, so a completed sweep routinely ends *above* the frontier; treating
+    /// that as license to raise it would skip the very envelope the freeze
+    /// exists to re-present.
+    #[test]
+    fn a_completed_sweep_never_raises_the_frontier() {
+        assert_eq!(relay_frontier_after_completed_sweep(5_900, 29_000), 5_900);
+        assert_eq!(relay_frontier_after_completed_sweep(5_900, 5_900), 5_900);
+        assert_eq!(relay_frontier_after_completed_sweep(0, 29_000), 0);
+        // Corrupt/hand-edited rows are clamped rather than propagated, as
+        // everywhere else in this module.
+        assert_eq!(relay_frontier_after_completed_sweep(-5, 40), 0);
+        assert_eq!(relay_frontier_after_completed_sweep(29_000, -5), 29_000);
+    }
+
+    /// Applying the repair twice must be the same as applying it once, or
+    /// every sweep after a rebuild would re-lower a frontier that had already
+    /// climbed back up through the new id space.
+    #[test]
+    fn lowering_the_frontier_is_idempotent() {
+        let lowered = relay_frontier_after_completed_sweep(29_000, 40);
+        assert_eq!(lowered, 40);
+        assert_eq!(relay_frontier_after_completed_sweep(lowered, 40), 40);
+        // And a frontier that has since moved up through the new id space is
+        // not dragged back down by a sweep that finds the same top.
+        assert_eq!(relay_frontier_after_completed_sweep(120, 120), 120);
+    }
+
+    /// End to end in the shape a shell runs it, on the mailbox from the field:
+    /// a frontier near the top of the old id space, a relay rebuilt underneath
+    /// it, and a sweep that walks the new mailbox and hands the frontier back
+    /// to ordinary delivery.
+    #[test]
+    fn a_rebuilt_mailbox_returns_to_frontier_delivery_after_one_sweep() {
+        let mut frontier = 29_000i64;
+        // Ordinary passes are blind: they ask above the top of the new
+        // mailbox, so relayd answers with nothing, forever.
+        assert_eq!(relay_pass_start_cursor(false, frontier, 0), 29_000);
+
+        // The sweep starts at 0 and walks the whole (small) new mailbox. Its
+        // pages cannot move the frontier — they are all far below it.
+        let mut after = relay_pass_start_cursor(true, frontier, 0);
+        assert_eq!(after, 0);
+        for page_end in [16i64, 40i64] {
+            assert!(relay_fetch_walk_continues(16, after, page_end));
+            frontier = relay_cursor_advance(frontier, page_end, true);
+            after = page_end;
+        }
+        assert_eq!(frontier, 29_000, "a page below the frontier never moves it");
+
+        // The empty page ends the walk, and only there is the frontier
+        // allowed to come down to what the walk actually found.
+        assert!(!relay_fetch_walk_continues(0, after, after));
+        frontier = relay_frontier_after_completed_sweep(frontier, after);
+        assert_eq!(frontier, 40);
+
+        // Ordinary delivery is restored: the next pass asks just above the new
+        // mailbox's top and sees the mail that lands there.
+        assert_eq!(relay_pass_start_cursor(false, frontier, 0), 40);
+        frontier = relay_cursor_advance(frontier, 41, true);
+        assert_eq!(frontier, 41);
+        // The next sweep finds the same top it left and changes nothing.
+        assert_eq!(relay_frontier_after_completed_sweep(frontier, 41), 41);
+    }
+
+    /// The one case where the repair lands short, and the reason it is still
+    /// worth making: a sweep paused mid-walk when the relay is rebuilt under it
+    /// resumes at a cursor from the dead id space and reports that id. The
+    /// frontier comes down to a value still above the new mailbox — no worse
+    /// than the frontier it replaced, since both were blind — and completing
+    /// the sweep clears its progress, so the next sweep starts at 0 and
+    /// finishes the job.
+    #[test]
+    fn a_sweep_resumed_from_a_dead_id_space_converges_on_the_next_sweep() {
+        let mut frontier = 29_000i64;
+        // Paused at 20_000 when the relay was rebuilt; the new mailbox ends at
+        // 40. The staleness guard does not fire — this sweep is minutes old,
+        // and firing on every empty page after a resume is the livelock
+        // `relay_sweep_restart_from_zero` exists to avoid.
+        let started = 1_000_000i64;
+        let mut progress = 20_000i64;
+        let resumed_at = started + 1_000;
+        assert!(!relay_sweep_restart_from_zero(
+            progress, started, resumed_at
+        ));
+        let after = relay_pass_start_cursor(true, frontier, progress);
+        assert_eq!(after, 20_000);
+
+        // The empty page arrives at once, and the stale cursor is what gets
+        // reported.
+        assert!(!relay_fetch_walk_continues(0, after, after));
+        frontier = relay_frontier_after_completed_sweep(frontier, after);
+        progress = 0; // completion clears it, whatever else it did
+        assert_eq!(frontier, 20_000, "lower, but still above the new mailbox");
+        assert_eq!(
+            relay_pass_start_cursor(false, frontier, progress),
+            20_000,
+            "an ordinary pass was blind at 29_000 and is blind at 20_000: \
+             nothing reachable was lost"
+        );
+
+        // The next sweep has no progress to resume from, so it walks the new
+        // mailbox from 0 and repairs the rest.
+        let next_sweep = resumed_at + RELAY_SWEEP_INTERVAL_MS;
+        assert!(relay_sweep_due(true, resumed_at, progress, next_sweep));
+        let mut after = relay_pass_start_cursor(true, frontier, progress);
+        assert_eq!(after, 0);
+        for page_end in [16i64, 40i64] {
+            assert!(relay_fetch_walk_continues(16, after, page_end));
+            frontier = relay_cursor_advance(frontier, page_end, true);
+            after = page_end;
+        }
+        assert!(!relay_fetch_walk_continues(0, after, after));
+        frontier = relay_frontier_after_completed_sweep(frontier, after);
+        assert_eq!(frontier, 40);
+        assert_eq!(relay_pass_start_cursor(false, frontier, 0), 40);
     }
 
     #[test]

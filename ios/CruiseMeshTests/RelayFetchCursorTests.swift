@@ -110,7 +110,7 @@ final class RelayFetchCursorTests: XCTestCase {
             try store.advanceRelayFetchCursor(configKey: "", pageNextCursor: 9_000, pageFullyProcessed: true),
             0
         )
-        try store.noteRelaySweepCompleted(configKey: "", nowMs: 5_000)
+        _ = try store.noteRelaySweepCompleted(configKey: "", nowMs: 5_000, sweptThroughId: 0)
         XCTAssertEqual(try store.relayFetchCursor(configKey: "").afterId, 0)
         XCTAssertEqual(try store.relayFetchCursor(configKey: "").lastSweepAtMs, 0)
     }
@@ -163,7 +163,9 @@ final class RelayFetchCursorTests: XCTestCase {
     func testACompletedSweepRestartsTheIntervalWithoutCostingTheFrontier() throws {
         let store = try MessageStore.open(path: ":memory:")
         _ = try store.advanceRelayFetchCursor(configKey: key(), pageNextCursor: 9_000, pageFullyProcessed: true)
-        try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000)
+        XCTAssertFalse(
+            try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000, sweptThroughId: 9_000)
+        )
         let cursor = try store.relayFetchCursor(configKey: key())
         XCTAssertEqual(cursor.afterId, 9_000)
         XCTAssertEqual(cursor.lastSweepAtMs, 1_000_000)
@@ -195,7 +197,7 @@ final class RelayFetchCursorTests: XCTestCase {
             pageNextCursor: 29_000,
             pageFullyProcessed: true
         )
-        try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000)
+        _ = try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000, sweptThroughId: 29_000)
         let now: Int64 = 1_000_000 + relaySweepIntervalMs()
 
         var cursor = try store.relayFetchCursor(configKey: key())
@@ -254,7 +256,7 @@ final class RelayFetchCursorTests: XCTestCase {
         )
 
         // The empty page ends it: interval restarts, resume cursor cleared.
-        try store.noteRelaySweepCompleted(configKey: key(), nowMs: now)
+        _ = try store.noteRelaySweepCompleted(configKey: key(), nowMs: now, sweptThroughId: 29_000)
         cursor = try store.relayFetchCursor(configKey: key())
         XCTAssertEqual(cursor.sweepAfterId, 0)
         XCTAssertEqual(cursor.afterId, 29_000)
@@ -354,7 +356,7 @@ final class RelayFetchCursorTests: XCTestCase {
             pageNextCursor: 29_000,
             pageFullyProcessed: true
         )
-        try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000)
+        _ = try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000, sweptThroughId: 29_000)
         let sweepStarted: Int64 = 1_000_000 + relaySweepIntervalMs()
         _ = try store.advanceRelaySweepCursor(
             configKey: key(),
@@ -480,6 +482,123 @@ final class RelayFetchCursorTests: XCTestCase {
             ),
             29_000
         )
+    }
+
+    // MARK: - repairing a frontier that outlived its id space
+
+    func testACompletedSweepOverARebuiltMailboxLowersTheFrontier() throws {
+        // The operator event, end to end: the relay is rebuilt from a fresh
+        // volume and its row ids restart at 1 underneath a frontier of 29000.
+        // Ordinary passes ask above the top of the new mailbox and see
+        // nothing, and relayd's live push gates on the same value, so the
+        // socket is blind too. Only a sweep, which starts at 0, ever reaches
+        // that mail -- until the sweep that finds it also fixes the frontier.
+        let store = try MessageStore.open(path: ":memory:")
+        _ = try store.advanceRelayFetchCursor(
+            configKey: key(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        _ = try store.noteRelaySweepCompleted(configKey: key(), nowMs: 1_000_000, sweptThroughId: 29_000)
+        let now: Int64 = 1_000_000 + relaySweepIntervalMs()
+        let blindFrontier = try store.relayFetchCursor(configKey: key()).afterId
+        XCTAssertEqual(
+            relayPassStartCursor(
+                sweeping: false,
+                persistedAfterId: blindFrontier,
+                sweepProgressAfterId: 0
+            ),
+            29_000
+        )
+
+        // The sweep walks the new mailbox: two pages ending at id 40, all far
+        // below the frontier, so no page can move it.
+        for pageCursor: Int64 in [16, 40] {
+            _ = try store.advanceRelaySweepCursor(
+                configKey: key(),
+                pageNextCursor: pageCursor,
+                pageFullyProcessed: true,
+                nowMs: now
+            )
+            _ = try store.advanceRelayFetchCursor(
+                configKey: key(),
+                pageNextCursor: pageCursor,
+                pageFullyProcessed: true
+            )
+        }
+        XCTAssertEqual(try store.relayFetchCursor(configKey: key()).afterId, 29_000)
+
+        // The empty page ends the walk at after=40, and that is the evidence.
+        XCTAssertTrue(try store.noteRelaySweepCompleted(configKey: key(), nowMs: now, sweptThroughId: 40))
+        var cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertEqual(cursor.afterId, 40)
+        XCTAssertEqual(cursor.sweepAfterId, 0)
+        // Ordinary delivery is restored, without waiting for another sweep.
+        XCTAssertEqual(
+            relayPassStartCursor(
+                sweeping: false,
+                persistedAfterId: cursor.afterId,
+                sweepProgressAfterId: cursor.sweepAfterId
+            ),
+            40
+        )
+        XCTAssertEqual(
+            try store.advanceRelayFetchCursor(configKey: key(), pageNextCursor: 41, pageFullyProcessed: true),
+            41
+        )
+
+        // And it does not repeat: the next completed sweep finds the same top
+        // of the same mailbox and writes nothing back.
+        XCTAssertFalse(try store.noteRelaySweepCompleted(
+            configKey: key(),
+            nowMs: now + relaySweepIntervalMs(),
+            sweptThroughId: 41
+        ))
+        cursor = try store.relayFetchCursor(configKey: key())
+        XCTAssertEqual(cursor.afterId, 41)
+    }
+
+    func testAQuietMailboxAndAnUnfinishedSweepBothLeaveTheFrontierAlone() throws {
+        // The hazard the rule turns on. A drained mailbox and a rebuilt one
+        // look almost the same from here, and the empty page carries no
+        // evidence either way -- so an empty mailbox never lowers anything.
+        // Nothing is lost: mail arriving on a relay that was not rebuilt lands
+        // above the frontier where an ordinary pass finds it.
+        XCTAssertEqual(
+            relayFrontierAfterCompletedSweep(persistedAfterId: 29_000, sweptThroughId: 0),
+            29_000
+        )
+        // A walk that outran a frozen frontier (a page whose envelopes could
+        // not all be processed) must not RAISE it -- that would skip the very
+        // envelope the freeze exists to re-present.
+        XCTAssertEqual(
+            relayFrontierAfterCompletedSweep(persistedAfterId: 5_900, sweptThroughId: 29_000),
+            5_900
+        )
+
+        let store = try MessageStore.open(path: ":memory:")
+        _ = try store.advanceRelayFetchCursor(
+            configKey: key(),
+            pageNextCursor: 29_000,
+            pageFullyProcessed: true
+        )
+        XCTAssertFalse(try store.noteRelaySweepCompleted(configKey: key(), nowMs: 2_000_000, sweptThroughId: 0))
+        XCTAssertEqual(try store.relayFetchCursor(configKey: key()).afterId, 29_000)
+
+        // A sweep that yielded on its budget has walked a prefix and knows
+        // nothing about the top of the mailbox; it never reaches the repair at
+        // all, because only the empty page records a completed sweep.
+        for pageCursor: Int64 in [128, 256, 384, 512] {
+            _ = try store.advanceRelaySweepCursor(
+                configKey: key(),
+                pageNextCursor: pageCursor,
+                pageFullyProcessed: true,
+                nowMs: 2_000_000
+            )
+        }
+        XCTAssertEqual(try store.relayFetchCursor(configKey: key()).afterId, 29_000)
+        try store.resetRelaySweepProgress(configKey: key(), nowMs: 2_100_000)
+        XCTAssertEqual(try store.relayFetchCursor(configKey: key()).afterId, 29_000)
     }
 
     // MARK: - the per-pass walk budget

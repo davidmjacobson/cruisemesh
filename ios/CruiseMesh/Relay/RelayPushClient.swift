@@ -134,6 +134,50 @@ final class RelayPushClient: NSObject {
         }
     }
 
+    /// Reopens the socket, if this client is currently subscribed to `config`,
+    /// so a changed subscribe cursor reaches relayd.
+    ///
+    /// relayd's push gate is the `after=` the client subscribed with: it only
+    /// pushes rows above that id, and it only ever moves that id *up* for the
+    /// life of the socket (`handle_ws` keeps a local `after` and runs
+    /// `after = after.max(id)` on every row it replays or pushes). So a socket
+    /// can never deliver a row at or below the value it was opened with, and
+    /// when the poll path lowers this mailbox's frontier -- a completed sweep
+    /// proving the relay's row ids restarted underneath it, see
+    /// `relayFrontierAfterCompletedSweep` in the core -- a socket opened
+    /// against the old frontier stays deaf to the entire rebuilt mailbox until
+    /// something unrelated happens to drop it. On a phone that can be hours.
+    ///
+    /// A no-op for any other relay (the sync pass polls every contact's
+    /// mailbox, and only one of them is the one this socket watches), and a
+    /// no-op when stopped. Deliberately reports the drop through
+    /// `onHealthChanged` even though it is intentional -- unlike `stop`, this
+    /// client is still trying to keep a socket up, and the poll cadence should
+    /// cover the gap until the new one opens. Mirrors RelayPushClient.kt.
+    func resubscribe(config: RelayConfig) {
+        queue.async { [self] in
+            guard !stopped, desiredConfig == config, hintsProvider != nil else { return }
+            Self.log.info("Reopening the relay push socket to pick up a changed cursor")
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
+            // Every delegate callback and the receive loop check
+            // `webSocketTask === task`, so clearing this first is what orphans
+            // the old socket's late callbacks rather than letting them tear
+            // down its successor.
+            webSocketTask?.cancel(with: .goingAway, reason: nil)
+            webSocketTask = nil
+            urlSession?.invalidateAndCancel()
+            urlSession = nil
+            let wasHealthy = isHealthy()
+            setHealthy(false)
+            if wasHealthy { onHealthChanged(false) }
+            // Not a connection failure: a deliberate reopen must not inherit
+            // the backoff of whatever went wrong last.
+            backoff.recordSuccess()
+            connectLocked()
+        }
+    }
+
     /// Closes the socket (if any) and cancels any pending reconnect. Idempotent.
     func stop() {
         queue.async { [self] in stopLocked() }

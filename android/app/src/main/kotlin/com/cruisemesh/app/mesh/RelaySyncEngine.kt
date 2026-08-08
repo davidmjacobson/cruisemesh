@@ -873,6 +873,10 @@ internal class RelaySyncEngine(
         }
 
         override fun abortsPass(error: Exception): Boolean = error is FamilyRateLimitAbort
+
+        override fun reopenPushSocket(config: RelayConfig) {
+            relayPushClient.resubscribe(config)
+        }
     }
 
     private fun distinctRelayConfigs(contacts: List<Contact>, fallbackConfig: RelayConfig?): List<RelayConfig> =
