@@ -319,6 +319,16 @@ fun ConnectionDetailsScreen(
                 expandedPersonEvents = expandedPersonEvents,
                 onToggleTroubleshooting = { troubleshootingExpanded = !troubleshootingExpanded },
                 onTogglePerson = { hex ->
+                    // Cleared here, not after the query returns: the events
+                    // held right now belong to the row that was open, and
+                    // `PersonCardRow` hands whatever is in this list to
+                    // whichever row is expanded. Leaving them in place prints
+                    // one friend's history, by name, under another friend's
+                    // name for the whole background round trip -- which under
+                    // store-lock contention is not one frame. Reloads
+                    // deliberately do not clear it, so an open row keeps its
+                    // events while the page refreshes underneath it.
+                    expandedPersonEvents = null
                     expandedPersonHex = if (expandedPersonHex == hex) null else hex
                 },
                 onHealthAction = { action ->
@@ -1829,6 +1839,8 @@ internal fun loadConnectionSnapshot(
                     // zero, and a shell that let an unsigned value fold into a
                     // negative would put an absurd number under someone's name.
                     waitingCount = it.waitingCount.toLong()
+                        .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+                    unpostedWaitingCount = it.unpostedWaitingCount.toLong()
                         .coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
                     oldestWaitingMs = it.oldestWaitingMs,
                     lastProgressMs = it.lastProgressMs,

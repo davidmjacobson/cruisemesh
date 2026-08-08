@@ -266,9 +266,12 @@ private val needsAttentionState = fixtureState(
         relay = CoreRelayPathState.WAITING_FOR_INTERNET,
         relayLastSyncMs = FIXTURE_NOW_MS - 4 * 60 * 60 * 1000L,
     ),
-    // The three treatments that have to be distinguishable at a glance and
-    // must never all be red: a friend whose own setup needs repairing, a
-    // working path that has stalled, and ordinary waiting.
+    // With Bluetooth off and no internet, nothing on this phone can carry a
+    // message: `core_contact_route_usable` is false for everyone, so the only
+    // per-person verdict this world can actually produce is a friend whose own
+    // saved setup is broken. A stalled-but-working route needs a working
+    // route, which is what `delayedState` below is for -- putting one in this
+    // fixture would bless a combination the page cannot reach.
     needsAttention = listOf(
         fixturePerson(
             "Alex",
@@ -280,6 +283,39 @@ private val needsAttentionState = fixtureState(
             ),
             lastSeenMs = FIXTURE_NOW_MS - 3 * 60 * 60 * 1000L,
         ),
+    ),
+    otherPeople = listOf(
+        // Ordinary waiting, in the neutral treatment, beside the error above:
+        // the contrast the reference is here to hold.
+        fixturePerson(
+            "Ash",
+            PersonStatus.History(PeerEvidence.PRESENCE_SEEN, FIXTURE_NOW_MS - 40 * 60_000L),
+            ConnectionPathBadge.SHORE_PASS,
+            fixtureDelivery(1, CoreDeliveryState.WAITING_FOR_INTERNET),
+            lastSeenMs = FIXTURE_NOW_MS - 40 * 60_000L,
+        ),
+        fixturePerson(
+            "Sam",
+            PersonStatus.History(PeerEvidence.DISCONNECTED, FIXTURE_NOW_MS - 8 * 60_000L),
+            ConnectionPathBadge.BLUETOOTH,
+            fixtureDelivery(3),
+            lastSeenMs = FIXTURE_NOW_MS - 8 * 60_000L,
+        ),
+    ),
+)
+
+/**
+ * The caution treatment, in the only world that produces it: this phone is
+ * fine and one friend's mail has stopped moving anyway.
+ *
+ * A device with no usable path cannot produce a delayed row -- the delayed
+ * window is only consulted while a route is usable -- so the stalled case has
+ * to be shown over a healthy card, which is also how a reader would meet it.
+ */
+private val delayedState = fixtureState(
+    health = readyState.health,
+    paths = readyState.paths,
+    needsAttention = listOf(
         fixturePerson(
             "Ash",
             PersonStatus.History(PeerEvidence.PRESENCE_SEEN, FIXTURE_NOW_MS - 40 * 60_000L),
@@ -295,15 +331,16 @@ private val needsAttentionState = fixtureState(
             lastSeenMs = FIXTURE_NOW_MS - 40 * 60_000L,
         ),
     ),
-    otherPeople = listOf(
+    reachableNow = listOf(
         fixturePerson(
             "Sam",
-            PersonStatus.History(PeerEvidence.DISCONNECTED, FIXTURE_NOW_MS - 8 * 60_000L),
+            PersonStatus.ConnectedNow,
             ConnectionPathBadge.BLUETOOTH,
-            fixtureDelivery(3),
-            lastSeenMs = FIXTURE_NOW_MS - 8 * 60_000L,
+            bestRoute = CorePersonRoute.DIRECT_BLUETOOTH,
+            lastSeenMs = FIXTURE_NOW_MS - 2 * 60_000L,
         ),
     ),
+    otherPeople = listOf(fixturePerson("Dana", PersonStatus.NoHistory)),
 )
 
 private val longListState = fixtureState(
@@ -387,6 +424,17 @@ fun ConnectionDetailsLimitedScreenshot() {
 @Composable
 fun ConnectionDetailsNeedsAttentionScreenshot() {
     ConnectionDetailsFixture(needsAttentionState)
+}
+
+@Preview(
+    name = "connection_delayed",
+    widthDp = 360,
+    heightDp = 900,
+    showBackground = true,
+)
+@Composable
+fun ConnectionDetailsDelayedScreenshot() {
+    ConnectionDetailsFixture(delayedState)
 }
 
 @Preview(name = "connection_long_list", widthDp = 360, heightDp = 900, showBackground = true)

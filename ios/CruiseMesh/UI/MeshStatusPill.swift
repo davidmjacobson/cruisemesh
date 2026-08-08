@@ -1,4 +1,33 @@
+import Combine
 import SwiftUI
+
+/**
+ The pill's own clock, ticking every ten seconds.
+
+ Deliberately not `ConnectivityClock` (thirty seconds), which ages the chat
+ list's reachability badges. The pill and the Connection details health card
+ now consume the same core verdict, and the spec's rule is that the two can
+ never contradict each other -- but one classification only buys that if both
+ shells ask it at comparable times. The bounded `Checking` window is ten
+ seconds: on the slower tick the page open beside this pill would resolve to a
+ fault while the pill still showed a neutral "still checking" dot for up to
+ twenty seconds more. Ten matches `clockTickMs` in `ConnectionDetailsModel`,
+ and `PILL_TICK_MS` on Android.
+ */
+@MainActor
+final class MeshStatusPillClock: ObservableObject {
+    static let shared = MeshStatusPillClock()
+    @Published private(set) var nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+    private var timer: AnyCancellable?
+
+    private init() {
+        timer = Timer.publish(every: 10, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] date in
+                self?.nowMs = Int64(date.timeIntervalSince1970 * 1_000)
+            }
+    }
+}
 
 /**
  The home screen's one-line connection summary.
@@ -7,7 +36,7 @@ import SwiftUI
  .build` -- the same classification the Connection details health card renders,
  so the two can never disagree about the same phone. Everything it observes is
  already observable state: the runtime, the direct links, our pass health, the
- 30-second connectivity clock, and the local Wi-Fi *listening flag* (mapped and
+ ten-second pill clock, and the local Wi-Fi *listening flag* (mapped and
  deduplicated by `LanListeningSignal`, never the whole LAN snapshot).
  */
 struct MeshStatusPill: View {
@@ -15,7 +44,7 @@ struct MeshStatusPill: View {
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
     @ObservedObject private var lan = LanListeningSignal.shared
     @ObservedObject private var bluetooth = BluetoothAccess.shared
-    @ObservedObject private var clock = ConnectivityClock.shared
+    @ObservedObject private var clock = MeshStatusPillClock.shared
     @State private var pulse = false
     /// Held across renders so the core's bounded-Checking window is measured
     /// from when the wait actually began; a mark restamped on every render can

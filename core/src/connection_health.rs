@@ -879,16 +879,27 @@ pub struct CoreDeliveryLine {
     pub count: u32,
     /// Where this work is going.
     pub state: CoreDeliveryState,
-    /// A usable route exists and nothing has progressed for
+    /// A usable route exists, this device still has work it has not handed
+    /// over, and nothing has progressed for
     /// [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+    ///
+    /// All three, not just the last two: mail already accepted for a friend
+    /// who has not collected it is the product working, at ten minutes and at
+    /// ten days.
     pub delayed: bool,
     /// A terminal or configuration fault stops the internet route.
     pub blocked_reason: Option<CoreDeliveryBlockedReason>,
     /// Where this person belongs in the People grouping; `None` leaves them
     /// wherever their reachability puts them.
     pub attention: Option<CorePersonAttention>,
-    /// Authoring time of the oldest affected message, epoch ms; `0` when
+    /// When the oldest affected message started waiting, epoch ms; `0` when
     /// unknown. Dates the delayed line and orders Needs attention.
+    ///
+    /// This device's queue time, passed through from
+    /// [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`]. Deliberately
+    /// not the message's displayed timestamp: causal ordering floors an
+    /// authored timestamp above the whole chat, so a peer with a fast clock
+    /// could drag ours past `now` and suppress the line entirely.
     pub oldest_waiting_ms: i64,
 }
 
@@ -1063,7 +1074,17 @@ pub fn core_relay_queue_reflects_delivery(
 pub struct CoreRecipientDeliveryInput {
     /// User-visible messages their delivery receipt does not cover.
     pub waiting_count: u32,
-    /// Authoring time of the oldest of those, epoch ms; `0` when unknown.
+    /// How many of those this device has not yet handed to Shore Pass
+    /// ([`crate::CoreRecipientDeliveryStatus::unposted_waiting_count`]).
+    ///
+    /// Zero, with messages still waiting, means this phone has done everything
+    /// it can and the other phone has not collected -- the ordinary
+    /// store-and-forward case, and never a stall.
+    pub unposted_waiting_count: u32,
+    /// When the oldest of those started waiting, epoch ms; `0` when unknown.
+    /// This device's queue time, not the message's displayed timestamp -- see
+    /// [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`] for why the
+    /// two differ and why using the displayed one would be wrong.
     pub oldest_waiting_ms: i64,
     /// Newest evidence that their mail moved, epoch ms; `0` when none.
     pub last_progress_ms: i64,
@@ -1097,6 +1118,9 @@ pub struct CoreRecipientDeliveryInput {
 /// how much evidence they are able to supply it.
 struct DeliveryFacts {
     waiting_count: u32,
+    /// How much of the waiting work this device has not handed over yet. The
+    /// gate on `delayed`: see [`delivery_progress_possible`].
+    unposted_waiting_count: u32,
     oldest_waiting_ms: i64,
     last_progress_ms: i64,
     oversized_waiting: bool,
@@ -1122,6 +1146,32 @@ struct DeliveryFacts {
 /// timestamps and a clock that has moved backwards both answer `false` --
 /// inventing a delay from a missing number would put a red row under a friend
 /// on nothing but arithmetic.
+/// Is there anything left for *this device* to make progress on?
+///
+/// Only while some of the waiting work has not been handed over yet. A
+/// successful upload is terminal progress on this side: once every waiting
+/// envelope has been accepted, nothing further happens here until their receipt
+/// comes back or the two phones meet, and no amount of time passing changes
+/// that.
+///
+/// This is the difference between a stall and the product working. Without it,
+/// "a usable route and no progress for ten minutes" describes every message
+/// sent to a phone that is asleep -- the upload succeeds in seconds, the
+/// receipt cannot arrive until they wake, and the row would sit in Needs
+/// attention reading `1 message delayed · 9 hours` by morning, with nothing
+/// wrong and nothing to do. It is also permanent in the field failure where a
+/// peer's contiguous receipt watermark stalls behind a gap: the waiting count
+/// never returns to zero, so an age-only rule would never let go.
+///
+/// A phone with no pass, or a friend whose card carries no endpoint, never
+/// posts anything, so everything waiting is un-posted. That is correct: the
+/// delayed window is only consulted while a route is usable, and without an
+/// endpoint the only usable route is a live link -- where work genuinely should
+/// be moving.
+fn delivery_progress_possible(facts: &DeliveryFacts) -> bool {
+    facts.unposted_waiting_count > 0
+}
+
 fn delivery_progress_stalled(last_progress_ms: i64, oldest_waiting_ms: i64, now_ms: i64) -> bool {
     let since = last_progress_ms.max(oldest_waiting_ms);
     if since <= 0 || now_ms < since {
@@ -1222,7 +1272,11 @@ fn classify_delivery(facts: DeliveryFacts) -> Option<CoreDeliveryLine> {
         // wrong.
         CoreDeliveryState::WillDeliverWhenReconnected
     };
+    // Three conditions, and all three are needed for the word "delayed" to be
+    // true: a route this device could use, work it has not managed to hand
+    // over, and enough time on both for that to be surprising.
     let delayed = route_usable
+        && delivery_progress_possible(&facts)
         && delivery_progress_stalled(
             facts.last_progress_ms,
             facts.oldest_waiting_ms,
@@ -1250,9 +1304,12 @@ fn classify_delivery(facts: DeliveryFacts) -> Option<CoreDeliveryLine> {
 ///   and a waiting line cannot appear together -- not because a special case
 ///   suppresses the second, but because there is nothing left to count.
 /// * **Age alone is never a fault.** The delayed window is only consulted
-///   while a route is usable, and the movement state under any fault stays a
-///   promise. A friend who is offline stays neutral at ten minutes, at ten
-///   hours, and at ten days.
+///   while a route is usable *and* this device still has work it has not
+///   handed over, and the movement state under any fault stays a promise. A
+///   friend who is offline stays neutral at ten minutes, at ten hours, and at
+///   ten days -- including the common case where our own pass is working
+///   perfectly, accepted every message, and their phone simply has not
+///   collected them.
 #[uniffi::export]
 pub fn core_classify_recipient_delivery(
     input: CoreRecipientDeliveryInput,
@@ -1273,6 +1330,7 @@ pub fn core_classify_recipient_delivery(
     );
     classify_delivery(DeliveryFacts {
         waiting_count: input.waiting_count,
+        unposted_waiting_count: input.unposted_waiting_count,
         oldest_waiting_ms: input.oldest_waiting_ms,
         last_progress_ms: input.last_progress_ms,
         oversized_waiting: input.oversized_waiting,
@@ -1326,6 +1384,9 @@ pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreD
     }
     classify_delivery(DeliveryFacts {
         waiting_count: input.queued,
+        // The Phase 1 depth *is* the un-posted backlog: it counts rows whose
+        // upload timestamp is still unset.
+        unposted_waiting_count: input.queued,
         oldest_waiting_ms: 0,
         last_progress_ms: 0,
         oversized_waiting: false,
@@ -2141,11 +2202,12 @@ mod tests {
         CONTACT_RELAY_UNREACHABLE_STALE_STREAK, CONTACT_RELAY_UNREACHABLE_STREAK,
     };
 
-    /// A healthy recipient with `count` messages waiting, everything working,
-    /// and progress a minute ago.
+    /// A healthy recipient with `count` messages waiting, none of them handed
+    /// over yet, everything working, and progress a minute ago.
     fn waiting(count: u32) -> CoreRecipientDeliveryInput {
         CoreRecipientDeliveryInput {
             waiting_count: count,
+            unposted_waiting_count: count,
             oldest_waiting_ms: NOW - 60_000,
             last_progress_ms: NOW - 60_000,
             oversized_waiting: false,
@@ -2166,6 +2228,16 @@ mod tests {
         CoreRecipientDeliveryInput {
             relay: CoreRelayPathState::WaitingForInternet,
             own_relay_usable: false,
+            ..waiting(count)
+        }
+    }
+
+    /// Our own path is fine and every waiting message was accepted; the friend
+    /// simply has not collected them. The commonest state in the product, and
+    /// the one an age-only rule would call a fault.
+    fn uncollected(count: u32) -> CoreRecipientDeliveryInput {
+        CoreRecipientDeliveryInput {
+            unposted_waiting_count: 0,
             ..waiting(count)
         }
     }
@@ -2377,6 +2449,51 @@ mod tests {
     }
 
     #[test]
+    fn a_friend_who_has_not_collected_yet_is_never_an_error_at_any_age() {
+        // The same DTN rule for the far commoner shape: our pass is Connected,
+        // their endpoint is healthy, every message was accepted -- and their
+        // phone is asleep. A successful upload is the last progress this
+        // device can ever record, so measuring a stall against it would put
+        // "1 message delayed · 9 hours" under every friend messaged overnight,
+        // permanently in the field failure where a peer's receipt watermark
+        // stalls behind a gap.
+        let minute = 60_000i64;
+        for age in [
+            10 * minute,
+            60 * minute,
+            24 * 60 * minute,
+            30 * 24 * 60 * minute,
+        ] {
+            let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - age,
+                // The upload succeeded when the message was written, and
+                // nothing has happened since.
+                last_progress_ms: NOW - age,
+                ..uncollected(2)
+            })
+            .expect("waiting work still gets a line");
+            // Truthful about where the work is, silent about whose fault it
+            // is, and nowhere near Needs attention.
+            assert_eq!(line.state, CoreDeliveryState::Sending, "age {age}ms");
+            assert!(!line.delayed, "age {age}ms");
+            assert_eq!(line.blocked_reason, None, "age {age}ms");
+            assert_eq!(line.attention, None, "age {age}ms");
+        }
+
+        // One message left un-posted in the same conversation is enough to
+        // bring the stall back: now this phone really is stuck.
+        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+            unposted_waiting_count: 1,
+            oldest_waiting_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+            last_progress_ms: NOW - RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+            ..uncollected(2)
+        })
+        .unwrap();
+        assert!(line.delayed);
+        assert_eq!(line.attention, Some(CorePersonAttention::Delayed));
+    }
+
+    #[test]
     fn a_fault_never_takes_the_promise_away() {
         // Every blocking reason still leaves a truthful movement state
         // underneath it: the messages really do travel at the next encounter.
@@ -2502,6 +2619,19 @@ mod tests {
                 oldest_waiting_ms: NOW - 100 * RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
                 last_progress_ms: 0,
                 ..offline(2)
+            })
+            .unwrap()
+            .delayed
+        );
+
+        // Nothing left for this device to hand over: age means nothing here
+        // either, however usable the route is. Waiting on the other phone is
+        // not a stall.
+        assert!(
+            !core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                oldest_waiting_ms: NOW - 100 * RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                last_progress_ms: NOW - 100 * RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
+                ..uncollected(2)
             })
             .unwrap()
             .delayed
@@ -2826,6 +2956,7 @@ mod tests {
                         );
                         let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
                             waiting_count: 2,
+                            unposted_waiting_count: 2,
                             oldest_waiting_ms: NOW - 60_000,
                             last_progress_ms: NOW - 60_000,
                             oversized_waiting: false,

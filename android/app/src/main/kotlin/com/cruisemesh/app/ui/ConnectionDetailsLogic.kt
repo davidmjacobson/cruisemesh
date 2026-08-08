@@ -178,6 +178,14 @@ data class ConnectionDetailsState(
  */
 data class PersonDeliveryFacts(
     val waitingCount: Int,
+    /**
+     * How much of [waitingCount] this phone has not managed to hand over yet.
+     *
+     * Zero, with messages still waiting, means this phone has done everything
+     * it can and the other one has not collected -- ordinary store-and-forward,
+     * never a stall. The core gates the delayed line on it.
+     */
+    val unpostedWaitingCount: Int,
     val oldestWaitingMs: Long,
     val lastProgressMs: Long,
     val oversizedWaiting: Boolean,
@@ -188,7 +196,7 @@ data class PersonDeliveryFacts(
 ) {
     companion object {
         /** Nothing outstanding and no endpoint trouble: the ordinary case. */
-        val NONE = PersonDeliveryFacts(0, 0L, 0L, false, 0L, 0L, 0L, 0L)
+        val NONE = PersonDeliveryFacts(0, 0, 0L, 0L, false, 0L, 0L, 0L, 0L)
     }
 }
 
@@ -669,6 +677,9 @@ object DeliveryPresentation {
     ): CoreDeliveryLine? = coreClassifyRecipientDelivery(
         CoreRecipientDeliveryInput(
             waitingCount = person.delivery.waitingCount.coerceAtLeast(0).toUInt(),
+            unpostedWaitingCount = person.delivery.unpostedWaitingCount
+                .coerceAtLeast(0)
+                .toUInt(),
             oldestWaitingMs = person.delivery.oldestWaitingMs,
             lastProgressMs = person.delivery.lastProgressMs,
             oversizedWaiting = person.delivery.oversizedWaiting,

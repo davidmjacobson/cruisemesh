@@ -689,6 +689,25 @@ pub struct CoreRecipientDeliveryStatus {
     /// Nor is a receipt *watermark* on its own -- it carries no timestamp, so
     /// the confirmation event above is what dates it.
     pub last_progress_ms: i64,
+    /// How many of [`waiting_count`](Self::waiting_count) this device has not
+    /// yet handed to Shore Pass (`relay_posted_at IS NULL`).
+    ///
+    /// The difference between "we still have work to do" and "we have done
+    /// everything we can and the other phone has not collected yet". A
+    /// successful upload is *terminal* progress for this device: nothing
+    /// further happens on this side until either their receipt comes back or
+    /// the two phones meet. So a count of zero here, with messages still
+    /// waiting, is the ordinary store-and-forward case -- a friend who is
+    /// asleep, ashore, or simply not syncing -- and must never be reported as
+    /// a stall. A count above zero is the case where this phone's own queue is
+    /// genuinely not moving.
+    ///
+    /// On a phone with no pass, or for a friend whose card carries no
+    /// endpoint, nothing is ever posted, so this equals `waiting_count`. That
+    /// is correct and harmless: the delayed window is only consulted while a
+    /// route is usable, and without an endpoint the only usable route is a
+    /// live link -- where work really should be moving.
+    pub unposted_waiting_count: u64,
     /// A waiting envelope is larger than any transport will carry (the sealed
     /// ceiling is enforced identically by the relay and by peer framing), so
     /// retrying can never deliver it.
@@ -3022,8 +3041,15 @@ impl MessageStore {
 
         let mut out = Vec::with_capacity(recipient_user_ids.len());
         for recipient in recipient_user_ids {
+            // Skipped, not fatal. One degenerate id -- an old import, a
+            // half-written restore -- must not empty the whole page: both
+            // shells treat an error from this call as "no delivery state at
+            // all", so failing the batch would silently blank every friend's
+            // line rather than the one row that cannot be read. Dropping the
+            // offending recipient degrades to exactly one missing line, the
+            // same way a blocked identity does.
             if recipient.is_empty() || recipient.len() > 128 {
-                return Err(CoreError::Malformed("invalid recipient user id".into()));
+                continue;
             }
             let blocked = blocked_stmt
                 .query_row(params![&recipient], |_| Ok(()))
@@ -3046,25 +3072,31 @@ impl MessageStore {
                 .optional()
                 .map_err(store_err)?
                 .unwrap_or(0);
-            let (waiting_count, oldest_waiting_ms, last_upload_ms, oversized_waiting) =
-                waiting_stmt
-                    .query_row(
-                        params![
-                            &recipient,
-                            through_lamport,
-                            now_ms,
-                            MAX_ENVELOPE_SEALED_BYTES as i64
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)? != 0,
-                            ))
-                        },
-                    )
-                    .map_err(store_err)?;
+            let (
+                waiting_count,
+                oldest_waiting_ms,
+                last_upload_ms,
+                oversized_waiting,
+                unposted_waiting_count,
+            ) = waiting_stmt
+                .query_row(
+                    params![
+                        &recipient,
+                        through_lamport,
+                        now_ms,
+                        MAX_ENVELOPE_SEALED_BYTES as i64
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)? != 0,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .map_err(store_err)?;
             let last_delivered_ms: i64 = delivered_stmt
                 .query_row(params![&recipient], |row| row.get(0))
                 .map_err(store_err)?;
@@ -3085,6 +3117,7 @@ impl MessageStore {
                 waiting_count: waiting_count.max(0) as u64,
                 oldest_waiting_ms: oldest_waiting_ms.max(0),
                 last_progress_ms: last_upload_ms.max(last_delivered_ms).max(0),
+                unposted_waiting_count: unposted_waiting_count.max(0) as u64,
                 oversized_waiting,
                 relay_reject_streak: reject_streak,
                 relay_rejected_at_ms: rejected_at,
@@ -6810,6 +6843,14 @@ fn visible_chat_kind_sql_list() -> String {
 /// kinds -- posting any envelope for this person is progress on their queue,
 /// whether or not it shows up in the chat.
 ///
+/// The un-posted count is the same visible set as the waiting count, narrowed
+/// to rows this device has not managed to hand over yet (`relay_posted_at IS
+/// NULL`). It is the only way to tell "our queue is stuck" from "we have done
+/// our part and they have not collected", and the two must not be confused: a
+/// completed upload is the last progress this side can ever record, so
+/// measuring a stall against it would put a permanent warning under every
+/// friend whose phone is switched off.
+///
 /// The age comes from `queued_at`, not from the message's own `timestamp`.
 /// They differ: an authored message's display timestamp is floored above
 /// everything already in the chat, so a peer whose clock runs fast drags our
@@ -6827,6 +6868,9 @@ fn recipient_waiting_sql() -> String {
              COALESCE(MAX(relay_posted_at), 0),
              COALESCE(MAX(CASE WHEN expiry > ?3 AND kind IN ({visible})
                                     AND LENGTH(sealed) > ?4
+                               THEN 1 ELSE 0 END), 0),
+             COALESCE(SUM(CASE WHEN expiry > ?3 AND kind IN ({visible})
+                                    AND relay_posted_at IS NULL
                                THEN 1 ELSE 0 END), 0)
          FROM outbound_envelopes
          WHERE recipient_user_id = ?1 AND chat_id = ?1 AND lamport > ?2"
@@ -9609,6 +9653,63 @@ mod tests {
         // a stuck conversation must not reset the delay clock.
         queue_pairwise(&store, BOB, 3, crate::KIND_TEXT, 1_900_000, live, 32);
         assert_eq!(delivery_status(&store, BOB).last_progress_ms, 1_700_000);
+    }
+
+    #[test]
+    fn work_this_device_has_already_handed_over_stops_counting_as_ours() {
+        // The difference between "our queue is stuck" and "we have done our
+        // part and they have not collected yet". Both leave `waiting_count`
+        // where it is -- only their receipt clears that -- so without this
+        // column there is no way to tell a stalled upload from a friend whose
+        // phone is switched off, and the page would warn about both.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let live = DELIVERY_NOW + 60_000;
+        let first = queue_pairwise(&store, BOB, 1, crate::KIND_TEXT, 1_000_000, live, 32);
+        let second = queue_pairwise(&store, BOB, 2, crate::KIND_TEXT, 1_100_000, live, 32);
+        assert_eq!(delivery_status(&store, BOB).unposted_waiting_count, 2);
+
+        store
+            .mark_outbound_envelope_relay_posted(first, 1_400_000)
+            .unwrap();
+        assert_eq!(delivery_status(&store, BOB).unposted_waiting_count, 1);
+
+        store
+            .mark_outbound_envelope_relay_posted(second, 1_450_000)
+            .unwrap();
+        let bob = delivery_status(&store, BOB);
+        // Everything uploaded, nothing confirmed: still waiting on them, but
+        // nothing left for this phone to do about it.
+        assert_eq!(bob.waiting_count, 2);
+        assert_eq!(bob.unposted_waiting_count, 0);
+    }
+
+    #[test]
+    fn one_unreadable_recipient_id_costs_one_row_not_the_page() {
+        // Both shells read an error from this call as "no delivery state at
+        // all", so failing the batch over a single degenerate id -- an old
+        // import, a half-written restore -- would blank every friend's line
+        // instead of one.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        queue_pairwise(
+            &store,
+            BOB,
+            1,
+            crate::KIND_TEXT,
+            1_000_000,
+            DELIVERY_NOW + 60_000,
+            32,
+        );
+
+        let rows = store
+            .recipient_delivery_status(
+                ALICE.to_vec(),
+                vec![Vec::new(), vec![9u8; 129], BOB.to_vec()],
+                DELIVERY_NOW,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recipient_user_id, BOB.to_vec());
+        assert_eq!(rows[0].waiting_count, 1);
     }
 
     #[test]

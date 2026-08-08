@@ -483,6 +483,8 @@ class ConnectionDetailsLogicTest {
         oversizedWaiting: Boolean = false,
         relayRejectStreak: Long = 0L,
         relay: CoreRelayPathState = CoreRelayPathState.CONNECTED,
+        /** By default nothing has been handed over yet. */
+        unpostedWaitingCount: Int = waitingCount,
     ) = DeliveryPresentation.line(
         person = person(
             1,
@@ -490,6 +492,7 @@ class ConnectionDetailsLogicTest {
             hasRelayEndpoint = hasRelayEndpoint,
             delivery = PersonDeliveryFacts(
                 waitingCount = waitingCount,
+                unpostedWaitingCount = unpostedWaitingCount,
                 oldestWaitingMs = oldestWaitingMs,
                 lastProgressMs = lastProgressMs,
                 oversizedWaiting = oversizedWaiting,
@@ -575,6 +578,24 @@ class ConnectionDetailsLogicTest {
         assertEquals(CorePersonAttention.DELAYED, line?.attention)
         // Still Sending underneath: the path works, it is just not moving.
         assertEquals(CoreDeliveryState.SENDING, line?.state)
+    }
+
+    @Test
+    fun `a friend who has not collected mail we already sent is never delayed`() {
+        // Our pass works, their endpoint is healthy, every message was
+        // accepted -- and their phone is off. A successful upload is the last
+        // progress this device can record, so an age-only rule would park this
+        // friend in Needs attention overnight, every night, with nothing to do
+        // about it.
+        val line = deliveryLine(
+            waitingCount = 2,
+            oldestWaitingMs = NOW - 3 * DAY,
+            lastProgressMs = NOW - 3 * DAY,
+            unpostedWaitingCount = 0,
+        )
+        assertEquals(CoreDeliveryState.SENDING, line?.state)
+        assertFalse(line?.delayed ?: true)
+        assertNull(line?.attention)
     }
 
     @Test
@@ -683,8 +704,10 @@ class ConnectionDetailsLogicTest {
     }
 
     /** [waitingCount] messages that started waiting [ageMs] ago and have not moved since. */
+    /** Waiting work none of which this phone has managed to hand over yet. */
     private fun waiting(waitingCount: Int, ageMs: Long = MINUTE) = PersonDeliveryFacts.NONE.copy(
         waitingCount = waitingCount,
+        unpostedWaitingCount = waitingCount,
         oldestWaitingMs = NOW - ageMs,
         lastProgressMs = NOW - ageMs,
     )

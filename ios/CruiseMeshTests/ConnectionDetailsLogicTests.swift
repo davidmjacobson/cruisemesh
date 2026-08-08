@@ -397,10 +397,13 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         oldestWaitingMs: Int64,
         lastProgressMs: Int64,
         oversizedWaiting: Bool = false,
-        relayRejectStreak: Int64 = 0
+        relayRejectStreak: Int64 = 0,
+        /// By default nothing has been handed over yet.
+        unpostedWaitingCount: Int? = nil
     ) -> PersonDeliveryFacts {
         PersonDeliveryFacts(
             waitingCount: waitingCount,
+            unpostedWaitingCount: unpostedWaitingCount ?? waitingCount,
             oldestWaitingMs: oldestWaitingMs,
             lastProgressMs: lastProgressMs,
             oversizedWaiting: oversizedWaiting,
@@ -505,6 +508,34 @@ final class ConnectionDetailsLogicTests: XCTestCase {
         XCTAssertEqual(line?.attention, CorePersonAttention.delayed)
         // Still sending underneath: the path works, it is just not moving.
         XCTAssertEqual(line?.state, CoreDeliveryState.sending)
+    }
+
+    /// Our pass works, their endpoint is healthy, every message was accepted --
+    /// and their phone is off. A successful upload is the last progress this
+    /// device can record, so an age-only rule would park this friend in Needs
+    /// attention overnight, every night, with nothing to do about it.
+    func testAFriendWhoHasNotCollectedMailWeAlreadySentIsNeverDelayed() {
+        let threeDaysMs = 3 * 24 * ConnectionDetailsLogicTests.oneHourMs
+        let line = DeliveryPresentation.line(
+            person: person(
+                1,
+                "Ash",
+                hasRelayEndpoint: true,
+                delivery: facts(
+                    waitingCount: 2,
+                    oldestWaitingMs: Self.fixedNowMs - threeDaysMs,
+                    lastProgressMs: Self.fixedNowMs - threeDaysMs,
+                    unpostedWaitingCount: 0
+                )
+            ),
+            directLink: false,
+            ownRelayUsable: true,
+            relay: .connected,
+            nowMs: Self.fixedNowMs
+        )
+        XCTAssertEqual(line?.state, CoreDeliveryState.sending)
+        XCTAssertEqual(line?.delayed, false)
+        XCTAssertNil(line?.attention)
     }
 
     func testTheirRejectedCardIsTheMostSevereAttentionThereIs() {

@@ -39,13 +39,18 @@ pub use backup::{
 };
 pub use causal_order::{causal_display_timestamp, CAUSAL_ORDER_MAX_SKEW_MS};
 pub use connection_health::{
-    core_classify_connection_health, core_connection_checking_expired, core_group_people,
-    core_person_attention_rank, core_person_is_reachable_now, core_person_reach,
-    CoreConnectionEvidence, CoreConnectionHealth, CoreConnectionHealthInput,
-    CoreConnectionHealthReport, CoreDirectLink, CoreDirectPathState, CoreHealthAction,
-    CoreHealthReason, CoreMeshRuntime, CorePeopleGroups, CorePersonAttention, CorePersonGroup,
-    CorePersonHealthInput, CorePersonPlacement, CorePersonReach, CoreRelayPathState,
+    core_classify_connection_health, core_classify_delivery_line, core_classify_recipient_delivery,
+    core_connection_check_pending, core_connection_checking_expired, core_contact_endpoint_resting,
+    core_contact_route_usable, core_group_people, core_person_attention_rank,
+    core_person_best_route, core_person_is_reachable_now, core_person_reach,
+    core_relay_queue_reflects_delivery, CoreConnectionEvidence, CoreConnectionHealth,
+    CoreConnectionHealthInput, CoreConnectionHealthReport, CoreDeliveryBlockedReason,
+    CoreDeliveryLine, CoreDeliveryLineInput, CoreDeliveryState, CoreDirectLink,
+    CoreDirectPathState, CoreHealthAction, CoreHealthReason, CoreMeshRuntime, CorePeopleGroups,
+    CorePersonAttention, CorePersonGroup, CorePersonHealthInput, CorePersonPlacement,
+    CorePersonReach, CorePersonRoute, CoreRecipientDeliveryInput, CoreRelayPathState,
     CONNECTION_CHECKING_TIMEOUT_MS, CONNECTION_PRESENCE_ONLINE_WINDOW_MS,
+    RELAY_DELIVERY_DELAYED_THRESHOLD_MS,
 };
 pub use contact_relay_health::{
     contact_relay_fault_is_authoritative, core_contact_relay_endpoint_usable,

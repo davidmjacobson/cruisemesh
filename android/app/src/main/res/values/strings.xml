@@ -564,9 +564,14 @@
          does these out of order fixes nothing and has to start again. The
          steps are numbered and the warning sits directly under them. -->
     <string name="ui_how_to_fix_contact_setup_rejected">%1$s\'s phone saved a Shore Pass setup that isn\'t accepting messages, so yours are waiting.\n\nDo these three things in this order:\n\n1. Ask %1$s to open Shore Pass on their own phone and get it working again. This has to happen first.\n2. After that is working, ask them to share their friend card with you again.\n3. Scan the new card they send you.\n\nThe order matters. A friend card shared before their Shore Pass is fixed carries the same setup, so the messages keep waiting and you have to start over.\n\nUntil then, your messages still reach %1$s whenever the two of you are near each other.</string>
-    <!-- Message too large. The limit is MAX_ENVELOPE_SEALED_BYTES (512 KB);
-         keep this copy in step with core/src/limits.rs. -->
-    <string name="ui_how_to_fix_message_too_large">Something you sent to %1$s is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with %1$s, delete the message that won\'t send, and send a shorter voice note or a smaller photo instead.</string>
+    <!-- Message too large. The number a reader can act on is the one the
+         composer enforces: ATTACHMENT_MAX_BLOB_BYTES in core/src/content.rs,
+         180 KiB. The sealed-envelope ceiling that produces this fault
+         (MAX_ENVELOPE_SEALED_BYTES, 512 KiB) is nearly three times larger and
+         cannot be reached through the normal send path, so quoting it would
+         teach the wrong limit and the advice would fail on a photo that
+         obeyed it. Keep this copy in step with core/src/content.rs. -->
+    <string name="ui_how_to_fix_message_too_large">Something you sent to %1$s is too big to travel. Photos and voice notes have to be under about 180 KB.\n\nOpen your conversation with %1$s, delete the message that won\'t send, and send a smaller photo or a shorter voice note instead.</string>
     <!-- Screen-reader labels. A person row is announced as one sentence, so a
          name and its status are never read as two unrelated items. -->
     <string name="ui_a11y_two_sentences">%1$s. %2$s.</string>

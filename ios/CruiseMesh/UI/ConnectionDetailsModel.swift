@@ -79,6 +79,7 @@ enum ConnectionSnapshotLoader {
                 // and a shell that let an out-of-range value fold into a
                 // negative would put an absurd number under someone's name.
                 waitingCount: Int(clamping: row.waitingCount),
+                unpostedWaitingCount: Int(clamping: row.unpostedWaitingCount),
                 oldestWaitingMs: row.oldestWaitingMs,
                 lastProgressMs: row.lastProgressMs,
                 oversizedWaiting: row.oversizedWaiting,
@@ -615,6 +616,12 @@ final class ConnectionDetailsModel: ObservableObject {
     private func loadSelectedPersonEvents() {
         personEventsTask?.cancel()
         personEventsTask = nil
+        // A page that has been torn down starts no new store work. `reload()`
+        // can reach here after `stop()`: the detached load it is suspended on
+        // is not cancelled by its parent, so it returns to a dead page and
+        // runs on to this call, and `selectedPersonHex` is still set because
+        // stopping does not close the sheet.
+        guard loopTask != nil else { return }
         guard let hex = selectedPersonHex else { return }
         guard let person = snapshot.people.first(where: { $0.userIdHex == hex }) else {
             // Known to be open, but not in the snapshot: nothing to read, and

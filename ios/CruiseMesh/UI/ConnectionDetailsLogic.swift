@@ -213,6 +213,14 @@ struct PersonEvidence: Equatable {
  */
 struct PersonDeliveryFacts: Equatable {
     let waitingCount: Int
+    /**
+     How much of `waitingCount` this phone has not managed to hand over yet.
+
+     Zero, with messages still waiting, means this phone has done everything it
+     can and the other one has not collected -- ordinary store-and-forward,
+     never a stall. The core gates the delayed line on it.
+     */
+    let unpostedWaitingCount: Int
     let oldestWaitingMs: Int64
     let lastProgressMs: Int64
     let oversizedWaiting: Bool
@@ -224,6 +232,7 @@ struct PersonDeliveryFacts: Equatable {
     /// Nothing outstanding and no endpoint trouble: the ordinary case.
     static let none = PersonDeliveryFacts(
         waitingCount: 0,
+        unpostedWaitingCount: 0,
         oldestWaitingMs: 0,
         lastProgressMs: 0,
         oversizedWaiting: false,
@@ -676,6 +685,7 @@ enum DeliveryPresentation {
                 // and a shell that let a negative fold into an unsigned value
                 // would put an absurd number under someone's name.
                 waitingCount: UInt32(clamping: person.delivery.waitingCount),
+                unpostedWaitingCount: UInt32(clamping: person.delivery.unpostedWaitingCount),
                 oldestWaitingMs: person.delivery.oldestWaitingMs,
                 lastProgressMs: person.delivery.lastProgressMs,
                 oversizedWaiting: person.delivery.oversizedWaiting,

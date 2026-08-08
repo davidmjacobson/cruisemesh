@@ -9364,8 +9364,13 @@ public struct CoreDeliveryLine {
      */
     public var state: CoreDeliveryState
     /**
-     * A usable route exists and nothing has progressed for
+     * A usable route exists, this device still has work it has not handed
+     * over, and nothing has progressed for
      * [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+     *
+     * All three, not just the last two: mail already accepted for a friend
+     * who has not collected it is the product working, at ten minutes and at
+     * ten days.
      */
     public var delayed: Bool
     /**
@@ -9378,8 +9383,14 @@ public struct CoreDeliveryLine {
      */
     public var attention: CorePersonAttention?
     /**
-     * Authoring time of the oldest affected message, epoch ms; `0` when
+     * When the oldest affected message started waiting, epoch ms; `0` when
      * unknown. Dates the delayed line and orders Needs attention.
+     *
+     * This device's queue time, passed through from
+     * [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`]. Deliberately
+     * not the message's displayed timestamp: causal ordering floors an
+     * authored timestamp above the whole chat, so a peer with a fast clock
+     * could drag ours past `now` and suppress the line entirely.
      */
     public var oldestWaitingMs: Int64
 
@@ -9394,8 +9405,13 @@ public struct CoreDeliveryLine {
          * Where this work is going.
          */state: CoreDeliveryState,
         /**
-         * A usable route exists and nothing has progressed for
+         * A usable route exists, this device still has work it has not handed
+         * over, and nothing has progressed for
          * [`RELAY_DELIVERY_DELAYED_THRESHOLD_MS`].
+         *
+         * All three, not just the last two: mail already accepted for a friend
+         * who has not collected it is the product working, at ten minutes and at
+         * ten days.
          */delayed: Bool,
         /**
          * A terminal or configuration fault stops the internet route.
@@ -9405,8 +9421,14 @@ public struct CoreDeliveryLine {
          * wherever their reachability puts them.
          */attention: CorePersonAttention?,
         /**
-         * Authoring time of the oldest affected message, epoch ms; `0` when
+         * When the oldest affected message started waiting, epoch ms; `0` when
          * unknown. Dates the delayed line and orders Needs attention.
+         *
+         * This device's queue time, passed through from
+         * [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`]. Deliberately
+         * not the message's displayed timestamp: causal ordering floors an
+         * authored timestamp above the whole chat, so a peer with a fast clock
+         * could drag ours past `now` and suppress the line entirely.
          */oldestWaitingMs: Int64) {
         self.count = count
         self.state = state
@@ -11003,7 +11025,19 @@ public struct CoreRecipientDeliveryInput {
      */
     public var waitingCount: UInt32
     /**
-     * Authoring time of the oldest of those, epoch ms; `0` when unknown.
+     * How many of those this device has not yet handed to Shore Pass
+     * ([`crate::CoreRecipientDeliveryStatus::unposted_waiting_count`]).
+     *
+     * Zero, with messages still waiting, means this phone has done everything
+     * it can and the other phone has not collected -- the ordinary
+     * store-and-forward case, and never a stall.
+     */
+    public var unpostedWaitingCount: UInt32
+    /**
+     * When the oldest of those started waiting, epoch ms; `0` when unknown.
+     * This device's queue time, not the message's displayed timestamp -- see
+     * [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`] for why the
+     * two differ and why using the displayed one would be wrong.
      */
     public var oldestWaitingMs: Int64
     /**
@@ -11050,7 +11084,18 @@ public struct CoreRecipientDeliveryInput {
          * User-visible messages their delivery receipt does not cover.
          */waitingCount: UInt32,
         /**
-         * Authoring time of the oldest of those, epoch ms; `0` when unknown.
+         * How many of those this device has not yet handed to Shore Pass
+         * ([`crate::CoreRecipientDeliveryStatus::unposted_waiting_count`]).
+         *
+         * Zero, with messages still waiting, means this phone has done everything
+         * it can and the other phone has not collected -- the ordinary
+         * store-and-forward case, and never a stall.
+         */unpostedWaitingCount: UInt32,
+        /**
+         * When the oldest of those started waiting, epoch ms; `0` when unknown.
+         * This device's queue time, not the message's displayed timestamp -- see
+         * [`crate::CoreRecipientDeliveryStatus::oldest_waiting_ms`] for why the
+         * two differ and why using the displayed one would be wrong.
          */oldestWaitingMs: Int64,
         /**
          * Newest evidence that their mail moved, epoch ms; `0` when none.
@@ -11078,6 +11123,7 @@ public struct CoreRecipientDeliveryInput {
          * A live direct link to this person exists right now.
          */directLink: Bool, nowMs: Int64) {
         self.waitingCount = waitingCount
+        self.unpostedWaitingCount = unpostedWaitingCount
         self.oldestWaitingMs = oldestWaitingMs
         self.lastProgressMs = lastProgressMs
         self.oversizedWaiting = oversizedWaiting
@@ -11098,6 +11144,9 @@ public struct CoreRecipientDeliveryInput {
 extension CoreRecipientDeliveryInput: Equatable, Hashable {
     public static func ==(lhs: CoreRecipientDeliveryInput, rhs: CoreRecipientDeliveryInput) -> Bool {
         if lhs.waitingCount != rhs.waitingCount {
+            return false
+        }
+        if lhs.unpostedWaitingCount != rhs.unpostedWaitingCount {
             return false
         }
         if lhs.oldestWaitingMs != rhs.oldestWaitingMs {
@@ -11141,6 +11190,7 @@ extension CoreRecipientDeliveryInput: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(waitingCount)
+        hasher.combine(unpostedWaitingCount)
         hasher.combine(oldestWaitingMs)
         hasher.combine(lastProgressMs)
         hasher.combine(oversizedWaiting)
@@ -11165,6 +11215,7 @@ public struct FfiConverterTypeCoreRecipientDeliveryInput: FfiConverterRustBuffer
         return
             try CoreRecipientDeliveryInput(
                 waitingCount: FfiConverterUInt32.read(from: &buf),
+                unpostedWaitingCount: FfiConverterUInt32.read(from: &buf),
                 oldestWaitingMs: FfiConverterInt64.read(from: &buf),
                 lastProgressMs: FfiConverterInt64.read(from: &buf),
                 oversizedWaiting: FfiConverterBool.read(from: &buf),
@@ -11182,6 +11233,7 @@ public struct FfiConverterTypeCoreRecipientDeliveryInput: FfiConverterRustBuffer
 
     public static func write(_ value: CoreRecipientDeliveryInput, into buf: inout [UInt8]) {
         FfiConverterUInt32.write(value.waitingCount, into: &buf)
+        FfiConverterUInt32.write(value.unpostedWaitingCount, into: &buf)
         FfiConverterInt64.write(value.oldestWaitingMs, into: &buf)
         FfiConverterInt64.write(value.lastProgressMs, into: &buf)
         FfiConverterBool.write(value.oversizedWaiting, into: &buf)
@@ -11285,6 +11337,27 @@ public struct CoreRecipientDeliveryStatus {
      */
     public var lastProgressMs: Int64
     /**
+     * How many of [`waiting_count`](Self::waiting_count) this device has not
+     * yet handed to Shore Pass (`relay_posted_at IS NULL`).
+     *
+     * The difference between "we still have work to do" and "we have done
+     * everything we can and the other phone has not collected yet". A
+     * successful upload is *terminal* progress for this device: nothing
+     * further happens on this side until either their receipt comes back or
+     * the two phones meet. So a count of zero here, with messages still
+     * waiting, is the ordinary store-and-forward case -- a friend who is
+     * asleep, ashore, or simply not syncing -- and must never be reported as
+     * a stall. A count above zero is the case where this phone's own queue is
+     * genuinely not moving.
+     *
+     * On a phone with no pass, or for a friend whose card carries no
+     * endpoint, nothing is ever posted, so this equals `waiting_count`. That
+     * is correct and harmless: the delayed window is only consulted while a
+     * route is usable, and without an endpoint the only usable route is a
+     * live link -- where work really should be moving.
+     */
+    public var unpostedWaitingCount: UInt64
+    /**
      * A waiting envelope is larger than any transport will carry (the sealed
      * ceiling is enforced identically by the relay and by peer framing), so
      * retrying can never deliver it.
@@ -11343,6 +11416,26 @@ public struct CoreRecipientDeliveryStatus {
          * the confirmation event above is what dates it.
          */lastProgressMs: Int64,
         /**
+         * How many of [`waiting_count`](Self::waiting_count) this device has not
+         * yet handed to Shore Pass (`relay_posted_at IS NULL`).
+         *
+         * The difference between "we still have work to do" and "we have done
+         * everything we can and the other phone has not collected yet". A
+         * successful upload is *terminal* progress for this device: nothing
+         * further happens on this side until either their receipt comes back or
+         * the two phones meet. So a count of zero here, with messages still
+         * waiting, is the ordinary store-and-forward case -- a friend who is
+         * asleep, ashore, or simply not syncing -- and must never be reported as
+         * a stall. A count above zero is the case where this phone's own queue is
+         * genuinely not moving.
+         *
+         * On a phone with no pass, or for a friend whose card carries no
+         * endpoint, nothing is ever posted, so this equals `waiting_count`. That
+         * is correct and harmless: the delayed window is only consulted while a
+         * route is usable, and without an endpoint the only usable route is a
+         * live link -- where work really should be moving.
+         */unpostedWaitingCount: UInt64,
+        /**
          * A waiting envelope is larger than any transport will carry (the sealed
          * ceiling is enforced identically by the relay and by peer framing), so
          * retrying can never deliver it.
@@ -11356,6 +11449,7 @@ public struct CoreRecipientDeliveryStatus {
         self.waitingCount = waitingCount
         self.oldestWaitingMs = oldestWaitingMs
         self.lastProgressMs = lastProgressMs
+        self.unpostedWaitingCount = unpostedWaitingCount
         self.oversizedWaiting = oversizedWaiting
         self.relayRejectStreak = relayRejectStreak
         self.relayRejectedAtMs = relayRejectedAtMs
@@ -11378,6 +11472,9 @@ extension CoreRecipientDeliveryStatus: Equatable, Hashable {
             return false
         }
         if lhs.lastProgressMs != rhs.lastProgressMs {
+            return false
+        }
+        if lhs.unpostedWaitingCount != rhs.unpostedWaitingCount {
             return false
         }
         if lhs.oversizedWaiting != rhs.oversizedWaiting {
@@ -11403,6 +11500,7 @@ extension CoreRecipientDeliveryStatus: Equatable, Hashable {
         hasher.combine(waitingCount)
         hasher.combine(oldestWaitingMs)
         hasher.combine(lastProgressMs)
+        hasher.combine(unpostedWaitingCount)
         hasher.combine(oversizedWaiting)
         hasher.combine(relayRejectStreak)
         hasher.combine(relayRejectedAtMs)
@@ -11423,6 +11521,7 @@ public struct FfiConverterTypeCoreRecipientDeliveryStatus: FfiConverterRustBuffe
                 waitingCount: FfiConverterUInt64.read(from: &buf),
                 oldestWaitingMs: FfiConverterInt64.read(from: &buf),
                 lastProgressMs: FfiConverterInt64.read(from: &buf),
+                unpostedWaitingCount: FfiConverterUInt64.read(from: &buf),
                 oversizedWaiting: FfiConverterBool.read(from: &buf),
                 relayRejectStreak: FfiConverterInt64.read(from: &buf),
                 relayRejectedAtMs: FfiConverterInt64.read(from: &buf),
@@ -11436,6 +11535,7 @@ public struct FfiConverterTypeCoreRecipientDeliveryStatus: FfiConverterRustBuffe
         FfiConverterUInt64.write(value.waitingCount, into: &buf)
         FfiConverterInt64.write(value.oldestWaitingMs, into: &buf)
         FfiConverterInt64.write(value.lastProgressMs, into: &buf)
+        FfiConverterUInt64.write(value.unpostedWaitingCount, into: &buf)
         FfiConverterBool.write(value.oversizedWaiting, into: &buf)
         FfiConverterInt64.write(value.relayRejectStreak, into: &buf)
         FfiConverterInt64.write(value.relayRejectedAtMs, into: &buf)
@@ -21316,9 +21416,12 @@ public func coreClassifyDeliveryLine(input: CoreDeliveryLineInput) -> CoreDelive
  * and a waiting line cannot appear together -- not because a special case
  * suppresses the second, but because there is nothing left to count.
  * * **Age alone is never a fault.** The delayed window is only consulted
- * while a route is usable, and the movement state under any fault stays a
- * promise. A friend who is offline stays neutral at ten minutes, at ten
- * hours, and at ten days.
+ * while a route is usable *and* this device still has work it has not
+ * handed over, and the movement state under any fault stays a promise. A
+ * friend who is offline stays neutral at ten minutes, at ten hours, and at
+ * ten days -- including the common case where our own pass is working
+ * perfectly, accepted every message, and their phone simply has not
+ * collected them.
  */
 public func coreClassifyRecipientDelivery(input: CoreRecipientDeliveryInput) -> CoreDeliveryLine? {
     return try!  FfiConverterOptionTypeCoreDeliveryLine.lift(try! rustCall() {
@@ -24439,7 +24542,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_classify_delivery_line() != 33523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_classify_recipient_delivery() != 44154) {
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_recipient_delivery() != 694) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_connection_check_pending() != 38815) {

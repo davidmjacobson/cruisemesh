@@ -1226,9 +1226,21 @@
     "Needs attention (%lld)": {
       "localizations": {
         "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Needs attention (%lld)"
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Needs attention (%lld)"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Needs attention (%lld)"
+                }
+              }
+            }
           }
         }
       }
@@ -3321,12 +3333,12 @@
         }
       }
     },
-    "Something you sent to %@ is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with %@, delete the message that won't send, and send a shorter voice note or a smaller photo instead.": {
+    "Something you sent to %@ is too big to travel. Photos and voice notes have to be under about 180 KB.\n\nOpen your conversation with %@, delete the message that won't send, and send a smaller photo or a shorter voice note instead.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Something you sent to %@ is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with %@, delete the message that won't send, and send a shorter voice note or a smaller photo instead."
+            "value": "Something you sent to %@ is too big to travel. Photos and voice notes have to be under about 180 KB.\n\nOpen your conversation with %@, delete the message that won't send, and send a smaller photo or a shorter voice note instead."
           }
         }
       }

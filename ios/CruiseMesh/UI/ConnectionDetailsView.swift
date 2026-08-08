@@ -127,10 +127,15 @@ enum ConnectionCopy {
         switch reason {
         case .contactSetupRejected:
             return String(localized: "\(name)'s phone saved a Shore Pass setup that isn't accepting messages, so yours are waiting.\n\nDo these three things in this order:\n\n1. Ask \(name) to open Shore Pass on their own phone and get it working again. This has to happen first.\n2. After that is working, ask them to share their friend card with you again.\n3. Scan the new card they send you.\n\nThe order matters. A friend card shared before their Shore Pass is fixed carries the same setup, so the messages keep waiting and you have to start over.\n\nUntil then, your messages still reach \(name) whenever the two of you are near each other.")
-        // The limit is MAX_ENVELOPE_SEALED_BYTES (512 KB); keep this copy in
-        // step with core/src/limits.rs.
+        // The number a reader can act on is the one the composer enforces:
+        // ATTACHMENT_MAX_BLOB_BYTES in core/src/content.rs, 180 KiB. The
+        // sealed-envelope ceiling that produces this fault
+        // (MAX_ENVELOPE_SEALED_BYTES, 512 KiB) is nearly three times larger
+        // and unreachable through the normal send path, so quoting it would
+        // teach the wrong limit and the advice would fail on a photo that
+        // obeyed it. Keep this copy in step with core/src/content.rs.
         case .messageTooLarge:
-            return String(localized: "Something you sent to \(name) is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with \(name), delete the message that won't send, and send a shorter voice note or a smaller photo instead.")
+            return String(localized: "Something you sent to \(name) is too big to travel. Photos and voice notes have to be under about 180 KB.\n\nOpen your conversation with \(name), delete the message that won't send, and send a smaller photo or a shorter voice note instead.")
         case .passExpired:
             return String(localized: "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.")
         case .passSuspended:
@@ -540,6 +545,9 @@ struct ConnectionDetailsView: View {
     /// be scrolled.
     @State private var howToFix: HowToFixTopic?
     @State private var showShorePass = false
+    /// Set when `How to fix` asks for Shore Pass, consumed once that sheet has
+    /// finished dismissing. See the `onDismiss` handoff below.
+    @State private var shorePassAfterHowToFix = false
 
     @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
     @State private var hasDiagnosticArchive = DiagnosticLogExport.hasArchive()
@@ -650,12 +658,25 @@ struct ConnectionDetailsView: View {
         // On the navigation stack rather than the list: four sheet modifiers
         // stacked on one view is more than SwiftUI reliably presents, and these
         // two are the ones a reader reaches most.
-        .sheet(item: $howToFix) { topic in
+        // The second presentation waits for the first to finish dismissing.
+        // Asking for both in one state update is the classic swallowed
+        // handoff: a presentation requested while the previous sheet is still
+        // animating out is dropped, and a reader who tapped `Manage Shore
+        // Pass` to repair an expired pass would land back on the page with
+        // nothing opened and no way to fix it from here.
+        .sheet(
+            item: $howToFix,
+            onDismiss: {
+                guard shorePassAfterHowToFix else { return }
+                shorePassAfterHowToFix = false
+                showShorePass = true
+            }
+        ) { topic in
             HowToFixSheet(
                 topic: topic,
                 onManageShorePass: {
+                    shorePassAfterHowToFix = true
                     howToFix = nil
-                    showShorePass = true
                 }
             )
         }
