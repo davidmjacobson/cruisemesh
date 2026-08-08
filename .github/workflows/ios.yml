@@ -80,9 +80,19 @@ jobs:
       # compiling, so what this job proves is the complementary half: that a
       # freshly generated binding actually builds and its tests pass.
       #
+      # Note what that means for CoreBindingSmokeTests.swift, which this job
+      # runs later: because the step above rewrites Generated/ first, the
+      # XCTest suite always exercises FRESHLY generated bindings and never the
+      # committed ones. Those smokes catch marshalling bugs. They cannot catch
+      # committed drift, and must never be cited as a reason to skip
+      # regenerating -- rust.yml's diff is the only thing between a stale
+      # checked-in binding and a launch-time fatalError on TestFlight.
+      #
       # If macOS generation ever diverges from Linux generation, fix it by
       # making rust.yml's gate reproduce the difference -- do not re-add a
-      # second gate here.
+      # second gate here. (Both paths now pass --no-format for exactly that
+      # reason: uniffi-bindgen runs swiftformat on whichever host happens to
+      # have it installed, and only a Mac does.)
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate

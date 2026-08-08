@@ -59,8 +59,18 @@ introspects the *host* library, so the same command works on Windows:
 
 ```powershell
 cargo build -p cruisemesh-core --features cruisemesh-core/cli
-cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- generate --library target/debug/cruisemesh_core.dll --language swift --out-dir ios/CruiseMesh/Generated
+cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- generate --no-format --library target/debug/cruisemesh_core.dll --language swift --out-dir ios/CruiseMesh/Generated
 ```
+
+`--no-format` is not optional. Without it `uniffi-bindgen` pipes the generated
+Swift through `swiftformat` **if that binary happens to be on `PATH`** — which it
+is on a Mac with the Homebrew formula installed, and is not on the Linux runner
+that gates the result. `swiftformat` rewraps and reorders, so the difference is
+not whitespace and the `--ignore-all-space` below would not absorb it: someone
+who has it installed would regenerate in good faith and be told their bindings
+are stale, the single worst message a tripwire can give. The flag makes every
+generation path emit the same bytes. `core/build-ios.sh` and `rust.yml` pass it
+for the same reason.
 
 `cruisemesh_coreFFI.modulemap` regenerates byte-identical; revert it if it shows
 as modified (line endings only). Compiling the Swift itself still needs a Mac or
@@ -70,9 +80,17 @@ the `ios.yml` runner.
 
 Regenerate, always — including for a change that looks cosmetic. UniFFI verifies
 a per-function checksum at *runtime*, so a stale or edited binding is not a
-compile error: it is a `fatalError` the moment the app launches, which is how two
-launch crashes shipped. Since UniFFI 0.28.3 a function's doc comment feeds that
-checksum, so even a comment-only edit in `core/` invalidates the committed Swift.
+compile error: it is a `fatalError` the moment the app launches. Since UniFFI
+0.28.3 a function's doc comment feeds that checksum, so even a comment-only edit
+in `core/` invalidates the committed Swift.
+
+Both halves of that have already happened here. Master carried a stale Swift
+binding for several days — a doc-comment edit to `core_transport_send_plan` moved
+its checksum with nothing regenerated — and it was found by hand while adding the
+gate below (#269), not by any check; the next iOS release build would have died at
+launch. The Android analogue got further: `jniLibs/` drifting from `kotlin-gen/`
+shipped an APK that crashed on launch with `UnsatisfiedLinkError`, which is why
+that pair now carries a matching build-time stamp (#112).
 
 `rust.yml` holds the one authoritative gate on this. It regenerates the bindings
 and then runs, blocking, on every PR with no path filter:
@@ -103,6 +121,13 @@ enum discriminants, optionals present and absent, byte arrays, nested record
 round trips — as *shape* checks only. When an exported enum or record lands with
 a shape those files do not already cover, extend them. Never restate in them the
 policy the core's own tests own.
+
+They are not a second drift check and cannot stand in for one. Both shells build
+their bindings fresh before running tests — Android's are gitignored, and
+`ios.yml` regenerates `Generated/` in `core/build-ios.sh` before `xcodebuild` — so
+neither suite ever loads the *committed* Swift. The smokes catch marshalling bugs;
+only the `rust.yml` diff catches a checked-in binding going stale. Nothing else
+stands between that and a launch-time `fatalError` on TestFlight.
 
 ## iOS build and simulator
 

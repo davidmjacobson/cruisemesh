@@ -35,6 +35,11 @@ import uniffi.cruisemesh_core.corePersonReach
  * about *what the answers mean* is tested in `core/src/connection_health.rs`
  * and must not be restated here. `CoreBindingSmokeTests.swift` is the same
  * file for the other shell.
+ *
+ * The reverse is true too, and matters more: these are not a second drift
+ * check. Both shells build their bindings fresh before tests run, so neither
+ * suite ever loads a *committed* one. They catch marshalling bugs; only the
+ * `rust.yml` diff catches a checked-in binding going stale.
  */
 class CoreBindingSmokeTest {
 
@@ -63,29 +68,39 @@ class CoreBindingSmokeTest {
     }
 
     /**
-     * The other direction: a variant chosen in Rust arrives as the matching
-     * Kotlin constant. Exactly one reach means "no route", so a mismatched
-     * lift shows up as the wrong count of `false` answers.
+     * A second enum, lowered through a different signature: every declared
+     * constant reaches Rust as a discriminant Rust recognises, so a shifted
+     * one lands out of range and panics rather than answering.
+     *
+     * Deliberately not asserted: *which* variants answer which way. Which
+     * reaches count as reachable is policy, owned and pinned by
+     * `core/src/connection_health.rs`; restating it here would turn a future
+     * policy change into a red marshalling test. Only that the answers are not
+     * all identical, which is what a total discriminant collapse would look
+     * like from this side.
      */
     @Test
-    fun `every reach variant lifts out of rust`() {
-        val unreachable = CorePersonReach.entries.filterNot { corePersonIsReachableNow(it) }
-        assertEquals(listOf(CorePersonReach.NONE), unreachable)
+    fun `every reach variant lowers into a discriminant rust recognises`() {
+        val answers = CorePersonReach.entries.map { corePersonIsReachableNow(it) }
+        assertEquals(CorePersonReach.entries.size, answers.size)
+        assertEquals(2, answers.toSet().size)
     }
 
     // -- optional fields ----------------------------------------------------
 
+    /**
+     * Three distinct answers: the absent form is not confused with a present
+     * one, and two different present values are not confused with each other
+     * — so the payload of `Some(..)` is genuinely carried, not just its
+     * presence. Which link maps to which reach is the core's business, so it
+     * is the distinctness that is asserted and not the mapping.
+     */
     @Test
     fun `an optional argument carries both its absent and present forms`() {
-        assertEquals(CorePersonReach.NONE, corePersonReach(null, 0L, false, NOW))
-        assertEquals(
-            CorePersonReach.DIRECT_BLUETOOTH,
-            corePersonReach(CoreDirectLink.BLUETOOTH, 0L, false, NOW),
-        )
-        assertEquals(
-            CorePersonReach.DIRECT_LOCAL_WIFI,
-            corePersonReach(CoreDirectLink.LOCAL_WIFI, 0L, false, NOW),
-        )
+        val absent = corePersonReach(null, 0L, false, NOW)
+        val bluetooth = corePersonReach(CoreDirectLink.BLUETOOTH, 0L, false, NOW)
+        val localWifi = corePersonReach(CoreDirectLink.LOCAL_WIFI, 0L, false, NOW)
+        assertEquals(3, setOf(absent, bluetooth, localWifi).size)
     }
 
     // -- byte arrays and record round trips ---------------------------------

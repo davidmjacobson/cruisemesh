@@ -87,10 +87,19 @@ jobs:
       # silently invalidate a checked-in binding. Regenerate and diff, exactly
       # like the tripwire above. Blocking, with no continue-on-error: a
       # non-blocking drift check is an unread log line.
+      #
+      # --no-format is load-bearing for a gate that compares Linux output
+      # against bytes a contributor may have generated on a Mac: uniffi-bindgen
+      # silently pipes its Swift through swiftformat whenever that binary is on
+      # PATH (`brew install swiftformat` puts it there; this runner has none).
+      # swiftformat rewraps and reorders, so the difference is NOT whitespace
+      # and --ignore-all-space below would not absorb it -- the gate would fail
+      # a regeneration that is in fact perfectly current. core/build-ios.sh
+      # passes the same flag so every generation path emits the same bytes.
       - name: Generate Swift UniFFI bindings
         run: |
           cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli -- \
-            generate --library target/debug/libcruisemesh_core.so --language swift \
+            generate --no-format --library target/debug/libcruisemesh_core.so --language swift \
             --out-dir ios/CruiseMesh/Generated
       # --ignore-all-space on purpose: the committed copies are the generator's
       # output with trailing whitespace stripped (what every editor in the

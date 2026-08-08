@@ -18,6 +18,12 @@ import XCTest
 /// answers mean* is tested in `core/src/connection_health.rs` and must not be
 /// restated here. `CoreBindingSmokeTest.kt` is the same file for the other
 /// shell.
+///
+/// The reverse is true too, and matters more: this is not a second drift
+/// check. `ios.yml` regenerates `Generated/` in `core/build-ios.sh` before
+/// `xcodebuild` runs, so this suite always exercises freshly generated
+/// bindings and never the committed ones. It catches marshalling bugs; only
+/// the `rust.yml` diff catches a checked-in binding going stale.
 final class CoreBindingSmokeTests: XCTestCase {
     /// Fixed instant; nothing here depends on which one.
     private let now: Int64 = 1_760_000_000_000
@@ -32,29 +38,34 @@ final class CoreBindingSmokeTests: XCTestCase {
         XCTAssertEqual(Set(ranks).count, Self.allAttentionCases.count)
     }
 
-    /// The other direction: a variant chosen in Rust arrives as the matching
-    /// Swift case. Exactly one reach means "no route", so a mismatched lift
-    /// shows up as the wrong count of `false` answers.
-    func testEveryReachVariantLiftsOutOfRust() {
-        let unreachable = Self.allReachCases.filter { !corePersonIsReachableNow(reach: $0) }
-        XCTAssertEqual(unreachable, [CorePersonReach.none])
+    /// A second enum, lowered through a different signature: every declared
+    /// case reaches Rust as a discriminant Rust recognises, so a shifted one
+    /// lands out of range and traps rather than answering.
+    ///
+    /// Deliberately not asserted: *which* cases answer which way. Which
+    /// reaches count as reachable is policy, owned and pinned by
+    /// `core/src/connection_health.rs`; restating it here would turn a future
+    /// policy change into a red marshalling test. Only that the answers are
+    /// not all identical, which is what a total discriminant collapse would
+    /// look like from this side.
+    func testEveryReachVariantLowersIntoADiscriminantRustRecognises() {
+        let answers = Self.allReachCases.map { corePersonIsReachableNow(reach: $0) }
+        XCTAssertEqual(answers.count, Self.allReachCases.count)
+        XCTAssertEqual(Set(answers).count, 2)
     }
 
     // MARK: - Optional fields
 
+    /// Three distinct answers: the absent form is not confused with a present
+    /// one, and two different present values are not confused with each other
+    /// -- so the payload of an optional is genuinely carried, not just its
+    /// presence. Which link maps to which reach is the core's business, so it
+    /// is the distinctness that is asserted and not the mapping.
     func testAnOptionalArgumentCarriesBothItsAbsentAndPresentForms() {
-        XCTAssertEqual(
-            corePersonReach(directLink: nil, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now),
-            CorePersonReach.none
-        )
-        XCTAssertEqual(
-            corePersonReach(directLink: .bluetooth, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now),
-            CorePersonReach.directBluetooth
-        )
-        XCTAssertEqual(
-            corePersonReach(directLink: .localWifi, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now),
-            CorePersonReach.directLocalWifi
-        )
+        let absent = corePersonReach(directLink: nil, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now)
+        let bluetooth = corePersonReach(directLink: .bluetooth, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now)
+        let localWifi = corePersonReach(directLink: .localWifi, presenceLastSeenMs: 0, ownRelayUsable: false, nowMs: now)
+        XCTAssertEqual(Set([absent, bluetooth, localWifi]).count, 3)
     }
 
     // MARK: - Byte arrays and record round trips
