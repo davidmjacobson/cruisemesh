@@ -10,21 +10,26 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uniffi.cruisemesh_core.CoreConnectionHealth
 import uniffi.cruisemesh_core.CoreConnectionHealthInput
-import uniffi.cruisemesh_core.CoreDeliveryLineInput
-import uniffi.cruisemesh_core.CoreDeliveryState
+import uniffi.cruisemesh_core.CoreDeliveryBlockedReason
+import uniffi.cruisemesh_core.CoreDeliveryLine
 import uniffi.cruisemesh_core.CoreDirectLink
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
 import uniffi.cruisemesh_core.CoreMeshRuntime
+import uniffi.cruisemesh_core.CorePersonAttention
 import uniffi.cruisemesh_core.CorePersonHealthInput
 import uniffi.cruisemesh_core.CorePersonReach
+import uniffi.cruisemesh_core.CorePersonRoute
+import uniffi.cruisemesh_core.CoreRecipientDeliveryInput
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.coreClassifyConnectionHealth
-import uniffi.cruisemesh_core.coreClassifyDeliveryLine
+import uniffi.cruisemesh_core.coreClassifyRecipientDelivery
 import uniffi.cruisemesh_core.coreConnectionCheckPending
+import uniffi.cruisemesh_core.coreContactEndpointResting
 import uniffi.cruisemesh_core.coreGroupPeople
+import uniffi.cruisemesh_core.corePersonBestRoute
 
 /**
  * Everything the Connection details page decides *before* it touches Compose.
@@ -73,19 +78,40 @@ sealed interface PersonStatus {
 }
 
 /**
- * The user-visible meaning of messages still waiting for this person.
+ * The informational expansion under a person row.
  *
- * The states themselves are the core's ([CoreDeliveryState]); this record only
- * carries one to the renderer with its count.
+ * Everything here is a restatement, never a control: the spec forbids a manual
+ * transport picker, and [bestRoute] in particular is the core's routing answer
+ * ([corePersonBestRoute]) rather than anything this page worked out. A page
+ * that re-derived reachability from "can I poll them" would report post-only
+ * friend cards as broken, which is the failure the core answer exists to
+ * prevent.
  */
-data class DeliveryLine(val kind: CoreDeliveryState, val count: Int)
+data class PersonDetail(
+    val bestRoute: CorePersonRoute,
+    /** Freshest evidence their device was alive, epoch ms; `0` when none. */
+    val lastSeenMs: Long,
+    /** Their delivery receipt for one of our messages, epoch ms; `0` when none. */
+    val lastDeliveredMs: Long,
+)
 
 data class ConnectionPersonRow(
     val userIdHex: String,
     val name: String,
     val status: PersonStatus,
     val badge: ConnectionPathBadge?,
-    val delivery: DeliveryLine?,
+    /**
+     * What is still outstanding for this person, as the core classified it
+     * ([coreClassifyRecipientDelivery]); null when there is nothing to say.
+     */
+    val delivery: CoreDeliveryLine?,
+    /**
+     * Why they are in Needs attention. The same verdict as [delivery]'s, since
+     * both come out of the one classification, so a row cannot sit in Needs
+     * attention over a problem its own delivery line does not mention.
+     */
+    val attention: CorePersonAttention?,
+    val detail: PersonDetail,
 )
 
 data class ConnectionActivityRow(
@@ -127,6 +153,7 @@ data class PathsCardState(
 data class ConnectionDetailsState(
     val health: HealthCardState,
     val paths: PathsCardState,
+    val needsAttention: List<ConnectionPersonRow>,
     val reachableNow: List<ConnectionPersonRow>,
     val otherPeople: List<ConnectionPersonRow>,
     val hasContacts: Boolean,
@@ -140,6 +167,31 @@ data class ConnectionDetailsState(
 // Store snapshot (produced off the main thread, consumed here)
 // ---------------------------------------------------------------------------
 
+/**
+ * What one person's outgoing mail looks like, straight from the core's
+ * per-recipient read model (`MessageStore::recipient_delivery_status`).
+ *
+ * Facts only, and every one of them is passed to the core untouched. In
+ * particular the four endpoint-health numbers are *not* interpreted here: the
+ * streak thresholds and rest windows belong to `contact_relay_health`, and a
+ * shell that reproduced any of them would be the start of the next drift.
+ */
+data class PersonDeliveryFacts(
+    val waitingCount: Int,
+    val oldestWaitingMs: Long,
+    val lastProgressMs: Long,
+    val oversizedWaiting: Boolean,
+    val relayRejectStreak: Long,
+    val relayRejectedAtMs: Long,
+    val relayUnreachableStreak: Long,
+    val relayUnreachableAtMs: Long,
+) {
+    companion object {
+        /** Nothing outstanding and no endpoint trouble: the ordinary case. */
+        val NONE = PersonDeliveryFacts(0, 0L, 0L, false, 0L, 0L, 0L, 0L)
+    }
+}
+
 /** One person as the background load found them. */
 data class ConnectionPerson(
     val userIdHex: String,
@@ -148,10 +200,11 @@ data class ConnectionPerson(
     val blocked: Boolean,
     /** Their friend card carries an internet-delivery endpoint. */
     val hasRelayEndpoint: Boolean,
-    /** User-visible messages still waiting to go out to them. */
-    val queued: Int,
+    val delivery: PersonDeliveryFacts,
     /** Newest recorded evidence across every path, or null when there is none. */
     val latest: PeerStatusLine?,
+    /** Their newest delivery receipt for one of our messages; `0` when none. */
+    val lastDeliveredMs: Long,
 ) {
     // Data classes with an array member need these spelled out; the generated
     // ones compare identity, which would make two equal snapshots look
@@ -163,8 +216,9 @@ data class ConnectionPerson(
             name == other.name &&
             blocked == other.blocked &&
             hasRelayEndpoint == other.hasRelayEndpoint &&
-            queued == other.queued &&
-            latest == other.latest
+            delivery == other.delivery &&
+            latest == other.latest &&
+            lastDeliveredMs == other.lastDeliveredMs
     }
 
     override fun hashCode(): Int {
@@ -172,8 +226,9 @@ data class ConnectionPerson(
         result = 31 * result + name.hashCode()
         result = 31 * result + blocked.hashCode()
         result = 31 * result + hasRelayEndpoint.hashCode()
-        result = 31 * result + queued
+        result = 31 * result + delivery.hashCode()
         result = 31 * result + (latest?.hashCode() ?: 0)
+        result = 31 * result + lastDeliveredMs.hashCode()
         return result
     }
 }
@@ -334,6 +389,24 @@ sealed interface FreshnessLabel {
     data class Hours(val value: Int) : FreshnessLabel
 }
 
+/**
+ * How long a message has been waiting, for the `· 14 min` half of a delayed or
+ * blocked delivery line.
+ *
+ * Deliberately not [EventTime]: that renders a *moment* ("14 min ago",
+ * "yesterday at 8:03 PM"), and an age is a duration. Reusing it would put "ago"
+ * inside a sentence that already reads as elapsed time, and would eventually
+ * put a calendar date there — `2 messages delayed · on 3/14/26` says nothing a
+ * reader can use.
+ */
+sealed interface WaitingAge {
+    /** Unusable or under a minute. The line renders with no age at all. */
+    data object Unknown : WaitingAge
+    data class Minutes(val value: Int) : WaitingAge
+    data class Hours(val value: Int) : WaitingAge
+    data class Days(val value: Int) : WaitingAge
+}
+
 /** How a recorded moment reads in a person row or an activity line. */
 sealed interface EventTime {
     /** Zero, negative, or otherwise unusable. Renders as no time at all. */
@@ -387,6 +460,23 @@ object ConnectionTimes {
         }
         if (atMs >= startOfTodayMs - DAY_MS) return EventTime.Yesterday
         return EventTime.Older
+    }
+
+    /**
+     * How long something queued at [sinceMs] has been waiting.
+     *
+     * An unset stamp and a stamp in the future both come back [WaitingAge
+     * .Unknown]: the second is a clock artifact, and the alternative is a
+     * negative age rendered as an enormous one. Under a minute is Unknown too,
+     * because `2 messages delayed · 0 min` reads as a bug.
+     */
+    fun waitingAge(sinceMs: Long, nowMs: Long): WaitingAge {
+        if (sinceMs <= 0L || nowMs < sinceMs) return WaitingAge.Unknown
+        val age = nowMs - sinceMs
+        if (age < MINUTE_MS) return WaitingAge.Unknown
+        if (age < HOUR_MS) return WaitingAge.Minutes((age / MINUTE_MS).toInt())
+        if (age < DAY_MS) return WaitingAge.Hours((age / HOUR_MS).toInt())
+        return WaitingAge.Days((age / DAY_MS).toInt())
     }
 }
 
@@ -547,56 +637,95 @@ internal suspend fun runConnectionRefreshLoop(
 
 object DeliveryPresentation {
     /**
-     * The neutral delivery line for one person, or null when there is nothing
+     * The delivery verdict for one person, or null when there is nothing
      * honest to say.
      *
-     * The decision is the core's ([coreClassifyDeliveryLine]) -- including the
-     * route-usability predicate and the rule that decides whether the
-     * relay-upload backlog says anything about delivery at all. All that
-     * happens here is handing over this platform's facts and pairing the
-     * answer with its count.
+     * Every part of the decision is the core's ([coreClassifyRecipientDelivery])
+     * -- the route-usability predicate, the delayed window, which faults become
+     * an error row, and which of those puts a person in Needs attention. All
+     * that happens here is handing over the store's facts and this device's
+     * path state.
      *
-     * Note what `queued` is *not*: it is not receipt-aware. It counts outbound
-     * rows whose upload stamp is unset, and only an upload sets that stamp --
-     * not a delivery receipt, and not handing the message over in person. The
-     * core gates on that; see `core_relay_queue_reflects_delivery`.
+     * The count arriving here is already receipt-aware, which is what makes
+     * "Received your message 12 min ago" and a waiting line unable to appear
+     * together: not a special case that suppresses the second, but nothing
+     * left to count. The Phase 1 front end that had to suppress it by hand is
+     * still exported for the other shell and is not used here.
      *
-     * @param routeIsDirect a live direct link to this person exists right now.
+     * @param directLink a live direct link to this person exists right now.
      * @param ownRelayUsable our own Shore Pass path can deliver
      *   (`CoreConnectionEvidence.own_relay_usable`).
-     * @param contactHasRelayEndpoint their friend card carries an
-     *   internet-delivery endpoint at all. Without one, no amount of internet
-     *   on this phone reaches them.
-     * @param contactRelayStale their endpoint has been written off after
-     *   authoritatively rejecting us, so it is not a usable route today.
-     * @param receiptIsNewestEvidence the freshest thing recorded about this
-     *   person is a delivery receipt -- their row already says they received a
-     *   message from us.
+     * @param relay this phone's normalized Shore Pass path
+     *   (`CoreConnectionEvidence.relay`).
      */
-    @Suppress("LongParameterList")
     fun line(
-        queued: Int,
-        routeIsDirect: Boolean,
+        person: ConnectionPerson,
+        directLink: Boolean,
         ownRelayUsable: Boolean,
-        contactHasRelayEndpoint: Boolean,
-        contactRelayStale: Boolean,
         relay: CoreRelayPathState,
-        receiptIsNewestEvidence: Boolean,
-    ): DeliveryLine? {
-        if (queued <= 0) return null
-        val state = coreClassifyDeliveryLine(
-            CoreDeliveryLineInput(
-                queued = queued.toUInt(),
-                relay = relay,
-                ownRelayUsable = ownRelayUsable,
-                contactHasRelayEndpoint = contactHasRelayEndpoint,
-                contactRelayStale = contactRelayStale,
-                directLink = routeIsDirect,
-                deliveryReceiptIsNewestEvidence = receiptIsNewestEvidence,
-            ),
-        ) ?: return null
-        return DeliveryLine(state, queued)
-    }
+        nowMs: Long,
+    ): CoreDeliveryLine? = coreClassifyRecipientDelivery(
+        CoreRecipientDeliveryInput(
+            waitingCount = person.delivery.waitingCount.coerceAtLeast(0).toUInt(),
+            oldestWaitingMs = person.delivery.oldestWaitingMs,
+            lastProgressMs = person.delivery.lastProgressMs,
+            oversizedWaiting = person.delivery.oversizedWaiting,
+            relayRejectStreak = person.delivery.relayRejectStreak,
+            relayRejectedAtMs = person.delivery.relayRejectedAtMs,
+            relayUnreachableStreak = person.delivery.relayUnreachableStreak,
+            relayUnreachableAtMs = person.delivery.relayUnreachableAtMs,
+            relay = relay,
+            ownRelayUsable = ownRelayUsable,
+            contactHasRelayEndpoint = person.hasRelayEndpoint,
+            directLink = directLink,
+            nowMs = nowMs,
+        ),
+    )
+
+    /**
+     * How a message to this person would travel right now, asked of the core
+     * rather than worked out here.
+     *
+     * The endpoint-resting half is [coreContactEndpointResting], the same
+     * predicate the delivery classification consults, so the person detail's
+     * route sentence and the delivery line under their name are two readings
+     * of one answer.
+     */
+    fun bestRoute(
+        person: ConnectionPerson,
+        directLink: CoreDirectLink?,
+        ownRelayUsable: Boolean,
+        nowMs: Long,
+    ): CorePersonRoute = corePersonBestRoute(
+        directLink,
+        ownRelayUsable,
+        person.hasRelayEndpoint,
+        coreContactEndpointResting(
+            person.delivery.relayRejectStreak,
+            person.delivery.relayRejectedAtMs,
+            person.delivery.relayUnreachableStreak,
+            person.delivery.relayUnreachableAtMs,
+            nowMs,
+        ),
+    )
+}
+
+/**
+ * What a `How to fix` control opens onto.
+ *
+ * Two sources, one destination: the health card's device-wide fault and a
+ * person row's per-recipient one. They are separate types in the core because
+ * one is about this phone and the other about one friend -- the distinction
+ * that stops a friend's broken card turning the whole page red -- and the
+ * shell keeps them apart for the same reason rather than flattening them into
+ * a single reason enum.
+ */
+sealed interface HowToFixTopic {
+    /** A fault with this device's own connection. */
+    data class Device(val reason: CoreHealthReason) : HowToFixTopic
+
+    /** A fault stopping delivery to one friend, named so the copy can say who. */
+    data class Person(val reason: CoreDeliveryBlockedReason, val name: String) : HowToFixTopic
 }
 
 // ---------------------------------------------------------------------------
@@ -616,19 +745,29 @@ const val CONNECTION_ACTIVITY_PREVIEW_COUNT = 10
 const val CONNECTION_OTHER_PEOPLE_COLLAPSE_AT = 5
 
 /**
+ * Recent events shown inside one person's expansion.
+ *
+ * The spec's number, and it is also why this query is not part of the page
+ * reload: five rows for one person, read once when a reader asks for them, is
+ * a bounded cost that does not multiply by the address book.
+ */
+const val CONNECTION_PERSON_EVENT_LIMIT = 5
+
+/**
  * Turn live signals plus the last store snapshot into everything the page
  * renders.
  *
- * Both classifications come from the core and neither is second-guessed here.
- * In particular the relay state the health card reports is the *normalized*
- * one from the core's evidence, and the Paths row renders that same value --
- * which is what stops the page claiming Shore Pass is connected on a phone
- * that has been offline for an hour.
+ * All three classifications come from the core and none is second-guessed
+ * here. In particular the relay state the health card reports is the
+ * *normalized* one from the core's evidence, and the Paths row renders that
+ * same value -- which is what stops the page claiming Shore Pass is connected
+ * on a phone that has been offline for an hour.
  *
- * Phase 1 supplies no per-person attention reason, so the core's Needs
- * attention group is structurally empty and the page shows two groups. The
- * machinery that fills it in is the per-recipient delivery read model, which
- * is Phase 2.
+ * The order below is load-bearing. Each person's delivery is classified
+ * *before* the grouping call, and the attention it produces is what the
+ * grouping is given. That is what makes a Needs attention row and its own
+ * delivery line the same verdict rather than two judgements that can disagree
+ * -- a person cannot be filed under a problem their row does not state.
  */
 @Suppress("LongParameterList")
 fun buildConnectionDetailsState(
@@ -638,7 +777,6 @@ fun buildConnectionDetailsState(
     relayConfigured: Boolean,
     lanListening: Boolean,
     bluetoothAudioActive: Boolean,
-    staleRelayContacts: Set<String>,
     presenceLastSeen: Map<String, Long>,
     contactLastSeen: Map<String, Long>,
     snapshot: ConnectionStoreSnapshot,
@@ -675,8 +813,24 @@ fun buildConnectionDetailsState(
     )
     val evidence = report.evidence
 
+    // Classified once per person per reload, and reused for the grouping, the
+    // row, and the expansion -- not recomputed at each of those points, which
+    // would be three FFI calls per friend on a list that recomposes whenever
+    // any observable moves.
+    val deliveryByHex = people.associate { person ->
+        val directLink = ConnectionInputs.directLink(transports[person.userIdHex])
+        person.userIdHex to DeliveryPresentation.line(
+            person = person,
+            directLink = directLink != null,
+            ownRelayUsable = evidence.ownRelayUsable,
+            relay = evidence.relay,
+            nowMs = nowMs,
+        )
+    }
+
     val placements = coreGroupPeople(
         people.map { person ->
+            val delivery = deliveryByHex[person.userIdHex]
             CorePersonHealthInput(
                 userId = person.userId,
                 displayName = person.name,
@@ -687,9 +841,8 @@ fun buildConnectionDetailsState(
                     contactLastSeen[person.userIdHex] ?: 0L,
                     person.latest?.atMs ?: 0L,
                 ),
-                // Phase 1 has no per-person attention machinery; see the KDoc.
-                attention = null,
-                attentionSinceMs = 0L,
+                attention = delivery?.attention,
+                attentionSinceMs = delivery?.oldestWaitingMs ?: 0L,
             )
         },
         evidence.ownRelayUsable,
@@ -704,9 +857,18 @@ fun buildConnectionDetailsState(
                 person = person,
                 reach = placement.reach,
                 presenceLastSeenMs = presenceLastSeen[person.userIdHex] ?: 0L,
-                ownRelayUsable = evidence.ownRelayUsable,
-                relay = evidence.relay,
-                stale = staleRelayContacts.contains(person.userIdHex),
+                delivery = deliveryByHex[person.userIdHex],
+                bestRoute = DeliveryPresentation.bestRoute(
+                    person = person,
+                    directLink = ConnectionInputs.directLink(transports[person.userIdHex]),
+                    ownRelayUsable = evidence.ownRelayUsable,
+                    nowMs = nowMs,
+                ),
+                lastSeenMs = maxOf(
+                    contactLastSeen[person.userIdHex] ?: 0L,
+                    presenceLastSeen[person.userIdHex] ?: 0L,
+                    person.latest?.atMs ?: 0L,
+                ),
             )
         }
 
@@ -727,9 +889,7 @@ fun buildConnectionDetailsState(
             relay = evidence.relay,
             relayLastSyncMs = ConnectionInputs.relayLastSyncMs(relayHealth),
         ),
-        // Needs attention is empty by construction in Phase 1; if a later
-        // change ever fills it, surfacing it here beside Reachable now would
-        // be wrong, so it is deliberately not merged in.
+        needsAttention = rowsFor(placements.needsAttention),
         reachableNow = rowsFor(placements.reachableNow),
         otherPeople = rowsFor(placements.otherPeople),
         hasContacts = people.any { !it.blocked },
@@ -739,13 +899,14 @@ fun buildConnectionDetailsState(
     )
 }
 
+@Suppress("LongParameterList")
 private fun personRow(
     person: ConnectionPerson,
     reach: CorePersonReach,
     presenceLastSeenMs: Long,
-    ownRelayUsable: Boolean,
-    relay: CoreRelayPathState,
-    stale: Boolean,
+    delivery: CoreDeliveryLine?,
+    bestRoute: CorePersonRoute,
+    lastSeenMs: Long,
 ): ConnectionPersonRow {
     val status: PersonStatus
     val badge: ConnectionPathBadge?
@@ -777,16 +938,12 @@ private fun personRow(
         name = person.name,
         status = status,
         badge = badge,
-        delivery = DeliveryPresentation.line(
-            queued = person.queued,
-            routeIsDirect = reach == CorePersonReach.DIRECT_BLUETOOTH ||
-                reach == CorePersonReach.DIRECT_LOCAL_WIFI,
-            ownRelayUsable = ownRelayUsable,
-            contactHasRelayEndpoint = person.hasRelayEndpoint,
-            contactRelayStale = stale,
-            relay = relay,
-            receiptIsNewestEvidence =
-            person.latest?.evidence == PeerEvidence.MESSAGE_DELIVERED,
+        delivery = delivery,
+        attention = delivery?.attention,
+        detail = PersonDetail(
+            bestRoute = bestRoute,
+            lastSeenMs = lastSeenMs,
+            lastDeliveredMs = person.lastDeliveredMs,
         ),
     )
 }

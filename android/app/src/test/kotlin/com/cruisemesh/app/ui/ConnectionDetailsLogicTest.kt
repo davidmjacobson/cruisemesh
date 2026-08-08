@@ -20,12 +20,15 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryBlockedReason
 import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectLink
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
 import uniffi.cruisemesh_core.CoreMeshRuntime
+import uniffi.cruisemesh_core.CorePersonAttention
+import uniffi.cruisemesh_core.CorePersonRoute
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import java.util.concurrent.atomic.AtomicInteger
@@ -471,107 +474,200 @@ class ConnectionDetailsLogicTest {
 
     @Suppress("LongParameterList")
     private fun deliveryLine(
-        queued: Int,
-        routeIsDirect: Boolean = false,
+        waitingCount: Int,
+        directLink: Boolean = false,
         ownRelayUsable: Boolean = true,
-        contactHasRelayEndpoint: Boolean = true,
-        contactRelayStale: Boolean = false,
+        hasRelayEndpoint: Boolean = true,
+        oldestWaitingMs: Long = NOW - MINUTE,
+        lastProgressMs: Long = NOW - MINUTE,
+        oversizedWaiting: Boolean = false,
+        relayRejectStreak: Long = 0L,
         relay: CoreRelayPathState = CoreRelayPathState.CONNECTED,
-        receiptIsNewestEvidence: Boolean = false,
     ) = DeliveryPresentation.line(
-        queued = queued,
-        routeIsDirect = routeIsDirect,
+        person = person(
+            1,
+            "Ash",
+            hasRelayEndpoint = hasRelayEndpoint,
+            delivery = PersonDeliveryFacts(
+                waitingCount = waitingCount,
+                oldestWaitingMs = oldestWaitingMs,
+                lastProgressMs = lastProgressMs,
+                oversizedWaiting = oversizedWaiting,
+                relayRejectStreak = relayRejectStreak,
+                relayRejectedAtMs = if (relayRejectStreak > 0L) NOW else 0L,
+                relayUnreachableStreak = 0L,
+                relayUnreachableAtMs = 0L,
+            ),
+        ),
+        directLink = directLink,
         ownRelayUsable = ownRelayUsable,
-        contactHasRelayEndpoint = contactHasRelayEndpoint,
-        contactRelayStale = contactRelayStale,
         relay = relay,
-        receiptIsNewestEvidence = receiptIsNewestEvidence,
+        nowMs = NOW,
     )
 
     @Test
     fun `nothing waiting means no delivery line at all`() {
-        assertNull(deliveryLine(queued = 0))
+        assertNull(deliveryLine(waitingCount = 0))
     }
 
     @Test
     fun `a live link means the work is going out now`() {
-        assertEquals(
-            DeliveryLine(CoreDeliveryState.SENDING, 2),
-            deliveryLine(queued = 2, routeIsDirect = true, ownRelayUsable = false),
-        )
+        val line = deliveryLine(waitingCount = 2, directLink = true, ownRelayUsable = false)
+        assertEquals(CoreDeliveryState.SENDING, line?.state)
+        assertEquals(2u, line?.count)
     }
 
     @Test
     fun `a working pass plus their endpoint is also a usable route`() {
-        assertEquals(DeliveryLine(CoreDeliveryState.SENDING, 1), deliveryLine(queued = 1))
-    }
-
-    @Test
-    fun `their written-off endpoint means no line, because the count cannot drain`() {
-        // Nothing will ever mark these rows uploaded, so the number is not a
-        // backlog: it is every message written to them inside the retention
-        // window, and it would sit under their name for a week.
-        assertNull(deliveryLine(queued = 4, contactRelayStale = true))
+        assertEquals(CoreDeliveryState.SENDING, deliveryLine(waitingCount = 1)?.state)
     }
 
     @Test
     fun `no internet with only a pass route says so plainly`() {
-        assertEquals(
-            DeliveryLine(CoreDeliveryState.WAITING_FOR_INTERNET, 3),
-            deliveryLine(
-                queued = 3,
-                ownRelayUsable = false,
-                relay = CoreRelayPathState.WAITING_FOR_INTERNET,
-            ),
+        val line = deliveryLine(
+            waitingCount = 3,
+            ownRelayUsable = false,
+            relay = CoreRelayPathState.WAITING_FOR_INTERNET,
         )
+        assertEquals(CoreDeliveryState.WAITING_FOR_INTERNET, line?.state)
+        assertEquals(3u, line?.count)
     }
 
     @Test
     fun `a pass fault still promises the next encounter rather than a failure`() {
-        assertEquals(
-            DeliveryLine(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, 4),
-            deliveryLine(
-                queued = 4,
-                ownRelayUsable = false,
-                relay = CoreRelayPathState.PASS_EXPIRED,
-            ),
+        // The movement state stays a promise underneath the fault. An expired
+        // pass stops the internet route; it does not stop the next encounter,
+        // and the copy must not say otherwise.
+        val line = deliveryLine(
+            waitingCount = 4,
+            ownRelayUsable = false,
+            relay = CoreRelayPathState.PASS_EXPIRED,
         )
+        assertEquals(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, line?.state)
+        assertEquals(CoreDeliveryBlockedReason.PASS_EXPIRED, line?.blockedReason)
     }
 
     @Test
-    fun `a backlog that relay upload cannot drain is not shown at all`() {
-        // The contradiction this page exists to remove. The count is rows
-        // whose upload stamp is unset, and only an upload sets it -- not a
-        // receipt, and not handing the message over in person. On a phone with
-        // no pass saved, or for a friend whose card carries no endpoint, the
-        // number never goes down.
-        assertNull(
-            deliveryLine(
-                queued = 12,
-                routeIsDirect = true,
-                ownRelayUsable = false,
-                relay = CoreRelayPathState.NOT_SET_UP,
-            ),
+    fun `a friend who is merely offline is never an error, at any age`() {
+        // The DTN invariant, asserted at an age where a naive threshold would
+        // have fired a thousand times over.
+        val line = deliveryLine(
+            waitingCount = 6,
+            ownRelayUsable = false,
+            hasRelayEndpoint = false,
+            oldestWaitingMs = NOW - 10 * DAY,
+            lastProgressMs = 0L,
         )
-        assertNull(deliveryLine(queued = 12, contactHasRelayEndpoint = false))
+        assertEquals(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, line?.state)
+        assertFalse(line?.delayed ?: true)
+        assertNull(line?.blockedReason)
+        assertNull(line?.attention)
     }
 
     @Test
-    fun `a row that already says they received a message gets no line under it`() {
-        assertNull(deliveryLine(queued = 12, receiptIsNewestEvidence = true))
+    fun `a usable route that has carried nothing for the window reads as delayed`() {
+        val line = deliveryLine(
+            waitingCount = 2,
+            oldestWaitingMs = NOW - 30 * MINUTE,
+            lastProgressMs = NOW - 30 * MINUTE,
+        )
+        assertTrue(line?.delayed ?: false)
+        assertEquals(CorePersonAttention.DELAYED, line?.attention)
+        // Still Sending underneath: the path works, it is just not moving.
+        assertEquals(CoreDeliveryState.SENDING, line?.state)
+    }
+
+    @Test
+    fun `their rejected card is the most severe attention there is`() {
+        val line = deliveryLine(waitingCount = 5, relayRejectStreak = 4)
+        assertEquals(CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED, line?.blockedReason)
+        assertEquals(CorePersonAttention.SETUP_REJECTED, line?.attention)
+    }
+
+    @Test
+    fun `an oversized message is terminal even with the friend in the room`() {
+        val line = deliveryLine(waitingCount = 1, directLink = true, oversizedWaiting = true)
+        assertEquals(CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE, line?.blockedReason)
+        assertEquals(CorePersonAttention.MESSAGE_TOO_LARGE, line?.attention)
+    }
+
+    @Test
+    fun `our own pass fault never reaches a friend the internet was not a route to`() {
+        // The "red under every friend" failure, in one assertion: a friend
+        // whose card carries no endpoint is untouched by our expired pass.
+        val line = deliveryLine(
+            waitingCount = 3,
+            ownRelayUsable = false,
+            hasRelayEndpoint = false,
+            relay = CoreRelayPathState.PASS_EXPIRED,
+        )
+        assertNull(line?.blockedReason)
+        assertNull(line?.attention)
+    }
+
+    // -----------------------------------------------------------------------
+    // Best route
+    // -----------------------------------------------------------------------
+
+    private fun bestRoute(
+        directLink: CoreDirectLink? = null,
+        ownRelayUsable: Boolean = true,
+        hasRelayEndpoint: Boolean = true,
+        relayRejectStreak: Long = 0L,
+    ) = DeliveryPresentation.bestRoute(
+        person = person(
+            1,
+            "Ash",
+            hasRelayEndpoint = hasRelayEndpoint,
+            delivery = PersonDeliveryFacts.NONE.copy(
+                relayRejectStreak = relayRejectStreak,
+                relayRejectedAtMs = if (relayRejectStreak > 0L) NOW else 0L,
+            ),
+        ),
+        directLink = directLink,
+        ownRelayUsable = ownRelayUsable,
+        nowMs = NOW,
+    )
+
+    @Test
+    fun `the best route restates the core answer rather than re-deriving it`() {
+        assertEquals(CorePersonRoute.DIRECT_BLUETOOTH, bestRoute(CoreDirectLink.BLUETOOTH))
+        assertEquals(CorePersonRoute.DIRECT_LOCAL_WIFI, bestRoute(CoreDirectLink.LOCAL_WIFI))
+        assertEquals(CorePersonRoute.SHORE_PASS, bestRoute())
+        assertEquals(CorePersonRoute.NONE_NOW, bestRoute(ownRelayUsable = false))
+        assertEquals(CorePersonRoute.NONE_NOW, bestRoute(hasRelayEndpoint = false))
+        assertEquals(CorePersonRoute.NONE_NOW, bestRoute(relayRejectStreak = 4))
+    }
+
+    // -----------------------------------------------------------------------
+    // Waiting age
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a waiting age is a duration and never a date`() {
+        assertEquals(WaitingAge.Unknown, ConnectionTimes.waitingAge(0L, NOW))
+        // A stamp from the future is a clock artifact, not a negative age.
+        assertEquals(WaitingAge.Unknown, ConnectionTimes.waitingAge(NOW + MINUTE, NOW))
+        // Under a minute renders nothing rather than "0 min".
+        assertEquals(WaitingAge.Unknown, ConnectionTimes.waitingAge(NOW - 30_000L, NOW))
+        assertEquals(WaitingAge.Minutes(14), ConnectionTimes.waitingAge(NOW - 14 * MINUTE, NOW))
+        assertEquals(WaitingAge.Hours(3), ConnectionTimes.waitingAge(NOW - 3 * HOUR, NOW))
+        assertEquals(WaitingAge.Days(2), ConnectionTimes.waitingAge(NOW - 2 * DAY, NOW))
     }
 
     // -----------------------------------------------------------------------
     // View-state assembly
     // -----------------------------------------------------------------------
 
+    @Suppress("LongParameterList")
     private fun person(
         id: Byte,
         name: String,
         blocked: Boolean = false,
         hasRelayEndpoint: Boolean = true,
-        queued: Int = 0,
+        delivery: PersonDeliveryFacts = PersonDeliveryFacts.NONE,
         latest: PeerStatusLine? = null,
+        lastDeliveredMs: Long = 0L,
     ): ConnectionPerson {
         val bytes = byteArrayOf(id)
         return ConnectionPerson(
@@ -580,10 +676,18 @@ class ConnectionDetailsLogicTest {
             name = name,
             blocked = blocked,
             hasRelayEndpoint = hasRelayEndpoint,
-            queued = queued,
+            delivery = delivery,
             latest = latest,
+            lastDeliveredMs = lastDeliveredMs,
         )
     }
+
+    /** [waitingCount] messages that started waiting [ageMs] ago and have not moved since. */
+    private fun waiting(waitingCount: Int, ageMs: Long = MINUTE) = PersonDeliveryFacts.NONE.copy(
+        waitingCount = waitingCount,
+        oldestWaitingMs = NOW - ageMs,
+        lastProgressMs = NOW - ageMs,
+    )
 
     private fun hex(id: Byte) = UserIdHex.encode(byteArrayOf(id))
 
@@ -594,7 +698,6 @@ class ConnectionDetailsLogicTest {
         relayHealth: RelayHealth = RelayHealth.Ok(NOW),
         relayConfigured: Boolean = true,
         lanListening: Boolean = true,
-        stale: Set<String> = emptySet(),
         presence: Map<String, Long> = emptyMap(),
         runtime: MeshRuntimeState = MeshRuntimeState.ACTIVE,
         activity: List<ConnectionActivityRow> = emptyList(),
@@ -605,7 +708,6 @@ class ConnectionDetailsLogicTest {
         relayConfigured = relayConfigured,
         lanListening = lanListening,
         bluetoothAudioActive = false,
-        staleRelayContacts = stale,
         presenceLastSeen = presence,
         contactLastSeen = emptyMap(),
         snapshot = ConnectionStoreSnapshot(people, activity, NOW),
@@ -735,31 +837,36 @@ class ConnectionDetailsLogicTest {
     @Test
     fun `waiting work never renders as an error, whatever the path state`() {
         val result = state(
-            people = listOf(person(1, "Ash", queued = 3)),
+            people = listOf(person(1, "Ash", delivery = waiting(3))),
             relayHealth = RelayHealth.NoInternet,
         )
         val delivery = result.otherPeople[0].delivery
         assertNotNull(delivery)
-        assertEquals(CoreDeliveryState.WAITING_FOR_INTERNET, delivery?.kind)
-        assertEquals(3, delivery?.count)
+        assertEquals(CoreDeliveryState.WAITING_FOR_INTERNET, delivery?.state)
+        assertEquals(3u, delivery?.count)
+        assertNull(delivery?.blockedReason)
+        // Not in Needs attention either: no fault, no stall, nothing to do.
+        assertTrue(result.needsAttention.isEmpty())
     }
 
     @Test
     fun `a friend who already received a message gets no queue line under the row`() {
-        // The contradiction in one assertion: the row says "Received your
-        // message 12 min ago" and the old page put "Sending 12 messages…"
-        // directly beneath it, for as long as the retention window lasted.
+        // The contradiction this page exists to remove. The row says "Received
+        // your message 12 min ago"; the old page put "Sending 12 messages…"
+        // directly beneath it for as long as the retention window lasted.
+        // Phase 2 makes that impossible upstream: the count is receipt-aware,
+        // so a satisfied conversation arrives here as zero.
         val result = state(
             people = listOf(
                 person(
                     1,
                     "Ash",
-                    queued = 12,
                     latest = PeerStatusLine(
                         PeerEvidence.MESSAGE_DELIVERED,
                         PeerConnectionTransport.SHORE_PASS,
                         NOW - 12 * MINUTE,
                     ),
+                    lastDeliveredMs = NOW - 12 * MINUTE,
                 ),
             ),
         )
@@ -768,6 +875,79 @@ class ConnectionDetailsLogicTest {
             result.otherPeople[0].status,
         )
         assertNull(result.otherPeople[0].delivery)
+        assertEquals(NOW - 12 * MINUTE, result.otherPeople[0].detail.lastDeliveredMs)
+    }
+
+    @Test
+    fun `a friend needing attention leads the page and states why in their own row`() {
+        val result = state(
+            people = listOf(
+                person(1, "Bo"),
+                person(
+                    2,
+                    "Ash",
+                    delivery = waiting(2, ageMs = 14 * MINUTE)
+                        .copy(relayRejectStreak = 4, relayRejectedAtMs = NOW),
+                ),
+            ),
+        )
+        // Grouped by the same verdict their row renders -- one classification,
+        // used twice, so a row cannot be filed under a problem it never states.
+        assertEquals(listOf("Ash"), result.needsAttention.map { it.name })
+        val row = result.needsAttention[0]
+        assertEquals(CorePersonAttention.SETUP_REJECTED, row.attention)
+        assertEquals(
+            CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+            row.delivery?.blockedReason,
+        )
+        assertEquals(NOW - 14 * MINUTE, row.delivery?.oldestWaitingMs)
+        // And nowhere else on the page.
+        assertEquals(listOf("Bo"), result.otherPeople.map { it.name })
+        assertTrue(result.reachableNow.isEmpty())
+    }
+
+    @Test
+    fun `a delayed friend needs attention without their row becoming an error`() {
+        val result = state(
+            people = listOf(person(1, "Ash", delivery = waiting(2, ageMs = 30 * MINUTE))),
+        )
+        val row = result.needsAttention.single()
+        assertEquals(CorePersonAttention.DELAYED, row.attention)
+        assertTrue(row.delivery?.delayed ?: false)
+        assertNull(row.delivery?.blockedReason)
+    }
+
+    @Test
+    fun `the person expansion carries the core route and the times it can prove`() {
+        val result = state(
+            people = listOf(person(1, "Sam", lastDeliveredMs = NOW - 5 * MINUTE)),
+            transports = mapOf(hex(1) to MeshRouterState.Transport.CENTRAL),
+        )
+        val detail = result.reachableNow.single().detail
+        assertEquals(CorePersonRoute.DIRECT_BLUETOOTH, detail.bestRoute)
+        assertEquals(NOW - 5 * MINUTE, detail.lastDeliveredMs)
+    }
+
+    @Test
+    fun `a blocked friend with a rejected card is not promoted into Needs attention`() {
+        // A block is a tombstone. The most eye-catching group on the page is
+        // exactly where a leak would be most visible.
+        val result = state(
+            people = listOf(
+                person(
+                    1,
+                    "Blocked",
+                    blocked = true,
+                    delivery = waiting(9, ageMs = HOUR).copy(
+                        relayRejectStreak = 4,
+                        relayRejectedAtMs = NOW,
+                    ),
+                ),
+            ),
+        )
+        assertTrue(result.needsAttention.isEmpty())
+        assertTrue(result.otherPeople.isEmpty())
+        assertFalse(result.hasContacts)
     }
 
     @Test

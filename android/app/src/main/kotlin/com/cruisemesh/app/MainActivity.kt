@@ -37,6 +37,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.cruisemesh.app.chat.ChatSummaryLoader
@@ -107,6 +109,9 @@ import com.cruisemesh.app.notify.MessageNotifier
 import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.relay.RelayImport
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.ui.CheckingClock
+import com.cruisemesh.app.ui.ConnectionInputs
+import com.cruisemesh.app.ui.connectionCheckPending
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
@@ -292,6 +297,7 @@ fun CruiseMeshApp(
         composable("settings") { SettingsRoute(identity, navController) }
         composable("connectionDetails") {
             ConnectionDetailsScreen(
+                ownUserId = identity.userId,
                 onBack = { navController.popOrExit(context) },
                 onStartMesh = { startMesh(context) },
                 onManageShorePass = { navController.navigate("shorePass") },
@@ -919,12 +925,46 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val displayRelayHealth = remember(relayHealth, pushHealthy, connectivityNowMs) {
         freshRelayHealthForDisplay(relayHealth, connectivityNowMs, pushHealthy)
     }
-    val pillStatus = remember(runtimeStatus, nearbyPeerIds, displayRelayHealth, internetDeliveryService) {
+    // The pill's severity is now the core's, which needs the local Wi-Fi path
+    // as well. Only whether the transport holds a listening socket is taken,
+    // mapped before it is collected: the full LAN snapshot changes on every
+    // peer and every sweep, and collecting it here would recompose the whole
+    // home screen at LAN-event rates for a boolean that flips when the mesh
+    // starts and stops. The endpoint itself never leaves this line.
+    val lanListening by remember {
+        LanTransportDiagnostics.state
+            .map { it.localEndpoint != null }
+            .distinctUntilChanged()
+    }.collectAsState(initial = false)
+    // Held across recompositions so the core's bounded-Checking window is
+    // measured from when the wait actually began; a mark restamped on every
+    // recomposition can never expire.
+    val pillCheckingClock = remember { CheckingClock() }
+    val pillStatus = remember(
+        runtimeStatus,
+        nearbyPeerIds,
+        displayRelayHealth,
+        internetDeliveryService,
+        lanListening,
+        connectivityNowMs,
+    ) {
+        val relayPath = ConnectionInputs.relay(displayRelayHealth, internetDeliveryService != null)
         MeshStatusTextLogic.build(
-            runtimeStatus,
-            nearbyPeerIds.size,
-            displayRelayHealth,
-            internetDeliveryService,
+            runtimeState = runtimeStatus,
+            nearbyCount = nearbyPeerIds.size,
+            relayHealth = displayRelayHealth,
+            internetDeliveryService = internetDeliveryService,
+            lanListening = lanListening,
+            checkingSinceMs = pillCheckingClock.mark(
+                connectionCheckPending(
+                    ConnectionInputs.runtime(runtimeStatus),
+                    ConnectionInputs.bluetooth(runtimeStatus),
+                    ConnectionInputs.localWifi(runtimeStatus, lanListening),
+                    relayPath,
+                ),
+                connectivityNowMs,
+            ),
+            nowMs = connectivityNowMs,
         )
     }
     val pillDotColor = pillStatus.dot.toComposeColor()

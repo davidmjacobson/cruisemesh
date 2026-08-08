@@ -10,10 +10,14 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.chat.MessageComposer
 import uniffi.cruisemesh_core.CoreConnectionHealth
+import uniffi.cruisemesh_core.CoreDeliveryBlockedReason
+import uniffi.cruisemesh_core.CoreDeliveryLine
 import uniffi.cruisemesh_core.CoreDeliveryState
 import uniffi.cruisemesh_core.CoreDirectPathState
 import uniffi.cruisemesh_core.CoreHealthAction
 import uniffi.cruisemesh_core.CoreHealthReason
+import uniffi.cruisemesh_core.CorePersonAttention
+import uniffi.cruisemesh_core.CorePersonRoute
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
 
@@ -99,30 +103,60 @@ private fun ComposerFrame(draft: String, hasPendingAttachment: Boolean) {
 private const val FIXTURE_NOW_MS = 1_760_000_000_000L
 private const val FIXTURE_START_OF_TODAY_MS = FIXTURE_NOW_MS - 10 * 60 * 60 * 1000L
 
+/** Waiting work in whichever of the core's shapes a fixture needs. */
+private fun fixtureDelivery(
+    count: Int,
+    state: CoreDeliveryState = CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED,
+    delayed: Boolean = false,
+    blockedReason: CoreDeliveryBlockedReason? = null,
+    attention: CorePersonAttention? = null,
+    waitingForMs: Long = 14 * 60_000L,
+) = CoreDeliveryLine(
+    count = count.toUInt(),
+    state = state,
+    delayed = delayed,
+    blockedReason = blockedReason,
+    attention = attention,
+    oldestWaitingMs = FIXTURE_NOW_MS - waitingForMs,
+)
+
 private fun fixturePerson(
     name: String,
     status: PersonStatus,
     badge: ConnectionPathBadge? = null,
-    delivery: DeliveryLine? = null,
+    delivery: CoreDeliveryLine? = null,
+    bestRoute: CorePersonRoute = CorePersonRoute.NONE_NOW,
+    lastSeenMs: Long = 0L,
+    lastDeliveredMs: Long = 0L,
 ) = ConnectionPersonRow(
     userIdHex = name.lowercase().filter { it.isLetterOrDigit() },
     name = name,
     status = status,
     badge = badge,
     delivery = delivery,
+    attention = delivery?.attention,
+    detail = PersonDetail(
+        bestRoute = bestRoute,
+        lastSeenMs = lastSeenMs,
+        lastDeliveredMs = lastDeliveredMs,
+    ),
 )
 
 private fun fixtureState(
     health: HealthCardState,
     paths: PathsCardState,
+    needsAttention: List<ConnectionPersonRow> = emptyList(),
     reachableNow: List<ConnectionPersonRow> = emptyList(),
     otherPeople: List<ConnectionPersonRow> = emptyList(),
 ) = ConnectionDetailsState(
     health = health,
     paths = paths,
+    needsAttention = needsAttention,
     reachableNow = reachableNow,
     otherPeople = otherPeople,
-    hasContacts = reachableNow.isNotEmpty() || otherPeople.isNotEmpty(),
+    hasContacts = needsAttention.isNotEmpty() ||
+        reachableNow.isNotEmpty() ||
+        otherPeople.isNotEmpty(),
     activity = listOf(
         ConnectionActivityRow(
             name = "Riley's phone",
@@ -153,18 +187,33 @@ private val readyState = fixtureState(
         relayLastSyncMs = FIXTURE_NOW_MS - 90_000L,
     ),
     reachableNow = listOf(
+        // A live link is also the best route to that person: both come out of
+        // the same core answer, so a fixture showing them disagreeing would
+        // bless a contradiction the page cannot actually produce.
         fixturePerson(
             "Riley's phone",
             PersonStatus.ConnectedNow,
             ConnectionPathBadge.LOCAL_WIFI,
+            bestRoute = CorePersonRoute.DIRECT_LOCAL_WIFI,
+            lastSeenMs = FIXTURE_NOW_MS - 60_000L,
+            lastDeliveredMs = FIXTURE_NOW_MS - 26 * 60_000L,
         ),
-        fixturePerson("Sam", PersonStatus.ConnectedNow, ConnectionPathBadge.BLUETOOTH),
+        fixturePerson(
+            "Sam",
+            PersonStatus.ConnectedNow,
+            ConnectionPathBadge.BLUETOOTH,
+            bestRoute = CorePersonRoute.DIRECT_BLUETOOTH,
+            lastSeenMs = FIXTURE_NOW_MS - 2 * 60_000L,
+        ),
     ),
     otherPeople = listOf(
         fixturePerson(
             "Ash",
             PersonStatus.History(PeerEvidence.MESSAGE_DELIVERED, FIXTURE_NOW_MS - 12 * 60_000L),
             ConnectionPathBadge.SHORE_PASS,
+            bestRoute = CorePersonRoute.SHORE_PASS,
+            lastSeenMs = FIXTURE_NOW_MS - 12 * 60_000L,
+            lastDeliveredMs = FIXTURE_NOW_MS - 12 * 60_000L,
         ),
         fixturePerson("Dana", PersonStatus.NoHistory),
     ),
@@ -195,7 +244,7 @@ private val limitedState = fixtureState(
             "Ash",
             PersonStatus.History(PeerEvidence.CONNECTED, FIXTURE_NOW_MS - 45 * 60_000L),
             ConnectionPathBadge.BLUETOOTH,
-            DeliveryLine(CoreDeliveryState.WAITING_FOR_INTERNET, 2),
+            fixtureDelivery(2, CoreDeliveryState.WAITING_FOR_INTERNET),
         ),
     ),
 )
@@ -217,12 +266,42 @@ private val needsAttentionState = fixtureState(
         relay = CoreRelayPathState.WAITING_FOR_INTERNET,
         relayLastSyncMs = FIXTURE_NOW_MS - 4 * 60 * 60 * 1000L,
     ),
+    // The three treatments that have to be distinguishable at a glance and
+    // must never all be red: a friend whose own setup needs repairing, a
+    // working path that has stalled, and ordinary waiting.
+    needsAttention = listOf(
+        fixturePerson(
+            "Alex",
+            PersonStatus.History(PeerEvidence.CONNECTED, FIXTURE_NOW_MS - 3 * 60 * 60 * 1000L),
+            delivery = fixtureDelivery(
+                count = 2,
+                blockedReason = CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+                attention = CorePersonAttention.SETUP_REJECTED,
+            ),
+            lastSeenMs = FIXTURE_NOW_MS - 3 * 60 * 60 * 1000L,
+        ),
+        fixturePerson(
+            "Ash",
+            PersonStatus.History(PeerEvidence.PRESENCE_SEEN, FIXTURE_NOW_MS - 40 * 60_000L),
+            ConnectionPathBadge.SHORE_PASS,
+            delivery = fixtureDelivery(
+                count = 1,
+                state = CoreDeliveryState.SENDING,
+                delayed = true,
+                attention = CorePersonAttention.DELAYED,
+                waitingForMs = 22 * 60_000L,
+            ),
+            bestRoute = CorePersonRoute.SHORE_PASS,
+            lastSeenMs = FIXTURE_NOW_MS - 40 * 60_000L,
+        ),
+    ),
     otherPeople = listOf(
         fixturePerson(
             "Sam",
             PersonStatus.History(PeerEvidence.DISCONNECTED, FIXTURE_NOW_MS - 8 * 60_000L),
             ConnectionPathBadge.BLUETOOTH,
-            DeliveryLine(CoreDeliveryState.WILL_DELIVER_WHEN_RECONNECTED, 3),
+            fixtureDelivery(3),
+            lastSeenMs = FIXTURE_NOW_MS - 8 * 60_000L,
         ),
     ),
 )
@@ -247,7 +326,11 @@ private val longListState = fixtureState(
 )
 
 @Composable
-private fun ConnectionDetailsFixture(state: ConnectionDetailsState) {
+private fun ConnectionDetailsFixture(
+    state: ConnectionDetailsState,
+    expandedPersonHex: String? = null,
+    expandedPersonEvents: List<ConnectionActivityRow>? = null,
+) {
     CruiseMeshTheme {
         // The real page sits inside a Scaffold, which paints the themed
         // background; the preview has to supply it or the dark reference
@@ -260,6 +343,8 @@ private fun ConnectionDetailsFixture(state: ConnectionDetailsState) {
                 state = state,
                 nowMs = FIXTURE_NOW_MS,
                 startOfTodayMs = FIXTURE_START_OF_TODAY_MS,
+                expandedPersonHex = expandedPersonHex,
+                expandedPersonEvents = expandedPersonEvents,
             )
         }
     }
@@ -308,4 +393,32 @@ fun ConnectionDetailsNeedsAttentionScreenshot() {
 @Composable
 fun ConnectionDetailsLongListScreenshot() {
     ConnectionDetailsFixture(longListState)
+}
+
+@Preview(
+    name = "connection_person_expanded",
+    widthDp = 360,
+    heightDp = 900,
+    showBackground = true,
+)
+@Composable
+fun ConnectionDetailsPersonExpandedScreenshot() {
+    ConnectionDetailsFixture(
+        state = readyState,
+        expandedPersonHex = "rileysphone",
+        expandedPersonEvents = listOf(
+            ConnectionActivityRow(
+                name = "Riley's phone",
+                evidence = PeerEvidence.CONNECTED,
+                transport = PeerConnectionTransport.LOCAL_WIFI,
+                atMs = FIXTURE_NOW_MS - 4 * 60_000L,
+            ),
+            ConnectionActivityRow(
+                name = "Riley's phone",
+                evidence = PeerEvidence.MESSAGE_DELIVERED,
+                transport = PeerConnectionTransport.CARRIED,
+                atMs = FIXTURE_NOW_MS - 26 * 60_000L,
+            ),
+        ),
+    )
 }

@@ -477,6 +477,68 @@
         <item quantity="one">%1$d message waiting for internet</item>
         <item quantity="other">%1$d messages waiting for internet</item>
     </plurals>
+    <!-- The two that are not routine. Delayed means a working path has carried
+         nothing for a while and may clear itself; can't be sent means
+         something has to change first, and always comes with a reason and an
+         action beneath it. Neither is ever shown for a friend who is simply
+         elsewhere, at any age. -->
+    <plurals name="ui_delivery_delayed">
+        <item quantity="one">%1$d message delayed</item>
+        <item quantity="other">%1$d messages delayed</item>
+    </plurals>
+    <plurals name="ui_delivery_cant_be_sent">
+        <item quantity="one">%1$d message can\'t be sent</item>
+        <item quantity="other">%1$d messages can\'t be sent</item>
+    </plurals>
+    <string name="ui_delivery_nothing_waiting">Nothing waiting</string>
+    <!-- A delivery line with how long it has been waiting: "2 messages
+         delayed · 14 min". Its own string rather than a shared separator, so a
+         translator sees a sentence joined to a duration and can order the two
+         however the language wants. -->
+    <string name="ui_delivery_with_age">%1$s · %2$s</string>
+    <!-- Why an error row is an error row. The person's name is already above
+         the line, so these do not repeat it. -->
+    <string name="ui_delivery_reason_contact_setup_rejected">Their saved Shore Pass setup was rejected</string>
+    <string name="ui_delivery_reason_pass_expired">Your Shore Pass has expired</string>
+    <string name="ui_delivery_reason_pass_suspended">Your Shore Pass is suspended</string>
+    <string name="ui_delivery_reason_storage_full">Your family\'s Shore Pass storage is full</string>
+    <string name="ui_delivery_reason_own_setup_rejected">Shore Pass didn\'t accept this phone\'s saved setup</string>
+    <string name="ui_delivery_reason_message_too_large">A message is too large to send</string>
+    <!-- How long something has been waiting. A duration, never a moment: these
+         must not read "ago" and must never become a calendar date. -->
+    <plurals name="ui_waiting_age_minutes">
+        <item quantity="one">%1$d min</item>
+        <item quantity="other">%1$d min</item>
+    </plurals>
+    <plurals name="ui_waiting_age_hours">
+        <item quantity="one">%1$d hour</item>
+        <item quantity="other">%1$d hours</item>
+    </plurals>
+    <plurals name="ui_waiting_age_days">
+        <item quantity="one">%1$d day</item>
+        <item quantity="other">%1$d days</item>
+    </plurals>
+    <!-- Needs attention group. First on the page when it has anyone in it, and
+         omitted entirely when it does not. -->
+    <plurals name="ui_section_needs_attention">
+        <item quantity="one">Needs attention (%1$d)</item>
+        <item quantity="other">Needs attention (%1$d)</item>
+    </plurals>
+    <!-- Person detail. Informational only: it states how a message would
+         travel, it does not offer a choice of path. -->
+    <string name="ui_person_detail_best_route">Best route now</string>
+    <string name="ui_person_detail_route_bluetooth">Bluetooth</string>
+    <string name="ui_person_detail_route_local_wifi">Local Wi-Fi</string>
+    <string name="ui_person_detail_route_shore_pass">Shore Pass</string>
+    <string name="ui_person_detail_route_none">Nothing right now — messages travel when you next meet</string>
+    <string name="ui_person_detail_last_seen">Last seen</string>
+    <string name="ui_person_detail_last_delivered">Last received your message</string>
+    <string name="ui_person_detail_never">No record yet</string>
+    <string name="ui_person_detail_waiting">Waiting</string>
+    <string name="ui_person_detail_recent_events">Recent events</string>
+    <string name="ui_person_detail_no_events">No connection events recorded yet.</string>
+    <string name="ui_a11y_person_expanded">Expanded</string>
+    <string name="ui_a11y_person_collapsed">Collapsed</string>
     <!-- Collapsible sections at the bottom of the page. -->
     <string name="ui_section_recent_activity">Recent activity</string>
     <!-- A collapsed section heading with its newest event time beside it, so a
@@ -485,15 +547,37 @@
     <string name="ui_section_troubleshooting">Troubleshooting &amp; diagnostics</string>
     <string name="ui_show">Show</string>
     <string name="ui_show_all_activity">Show all activity</string>
-    <!-- How to fix, for the two Shore Pass faults the health card can name in
-         this release. Both are written for someone who will not open a
-         settings screen on their own. -->
+    <!-- How to fix. Every one of these is written for someone who will not
+         open a settings screen on their own, and each ends by saying what
+         still works, because none of these faults stops delivery when the two
+         phones are near each other. -->
+    <string name="ui_how_to_fix_title">How to fix</string>
+    <!-- Only reachable if a new fault ships without its instructions. Says so
+         plainly rather than opening an empty sheet. -->
+    <string name="ui_how_to_fix_unknown">CruiseMesh doesn\'t have step-by-step help for this one yet. Open Troubleshooting &amp; diagnostics, share diagnostics, and contact support.</string>
     <string name="ui_how_to_fix_setup_rejected">Shore Pass didn\'t accept this phone\'s saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.</string>
     <string name="ui_how_to_fix_storage_full">Your family\'s Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.</string>
+    <string name="ui_how_to_fix_pass_expired">Your Shore Pass has run out, so messages can\'t travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.</string>
+    <string name="ui_how_to_fix_pass_suspended">Your Shore Pass has been turned off, so messages can\'t travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.</string>
+    <!-- The order-sensitive one. A friend card shared before the friend has
+         fixed their own pass carries the same broken setup, so a reader who
+         does these out of order fixes nothing and has to start again. The
+         steps are numbered and the warning sits directly under them. -->
+    <string name="ui_how_to_fix_contact_setup_rejected">%1$s\'s phone saved a Shore Pass setup that isn\'t accepting messages, so yours are waiting.\n\nDo these three things in this order:\n\n1. Ask %1$s to open Shore Pass on their own phone and get it working again. This has to happen first.\n2. After that is working, ask them to share their friend card with you again.\n3. Scan the new card they send you.\n\nThe order matters. A friend card shared before their Shore Pass is fixed carries the same setup, so the messages keep waiting and you have to start over.\n\nUntil then, your messages still reach %1$s whenever the two of you are near each other.</string>
+    <!-- Message too large. The limit is MAX_ENVELOPE_SEALED_BYTES (512 KB);
+         keep this copy in step with core/src/limits.rs. -->
+    <string name="ui_how_to_fix_message_too_large">Something you sent to %1$s is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with %1$s, delete the message that won\'t send, and send a shorter voice note or a smaller photo instead.</string>
     <!-- Screen-reader labels. A person row is announced as one sentence, so a
          name and its status are never read as two unrelated items. -->
     <string name="ui_a11y_two_sentences">%1$s. %2$s.</string>
     <string name="ui_a11y_three_sentences">%1$s. %2$s. %3$s.</string>
+    <!-- A person row announces a variable number of facts (name, status,
+         waiting work, a reason, expanded state), so it is built one sentence
+         at a time rather than from a fixed-arity template. Both halves live
+         here so sentence punctuation and the gap between sentences stay the
+         translator's to change. -->
+    <string name="ui_a11y_sentence">%1$s.</string>
+    <string name="ui_a11y_sentence_join">%1$s %2$s</string>
     <string name="ui_a11y_via_path">%1$s via %2$s</string>
     <string name="ui_a11y_refreshing">Refreshing</string>
     <string name="ui_connection_activity_will_appear_here_as_cruisemesh_reaches">Connection activity will appear here as CruiseMesh reaches your friends.</string>

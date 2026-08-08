@@ -17750,6 +17750,106 @@ extension CorePersonReach: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * How a message to this person would travel if one were sent right now.
+ *
+ * The person detail expansion's "best known route now", as an enum. There is
+ * no `Relay`/`ShorePass` case that means "probably": either the internet
+ * route is available to this person by [`core_contact_route_usable`]'s
+ * definition, or the honest answer is that the work travels at the next
+ * encounter.
+ */
+
+public enum CorePersonRoute {
+
+    /**
+     * A live Bluetooth link to them right now.
+     */
+    case directBluetooth
+    /**
+     * A live local Wi-Fi link to them right now.
+     */
+    case directLocalWifi
+    /**
+     * No live link, but our Shore Pass path and their endpoint can carry it.
+     */
+    case shorePass
+    /**
+     * No route at this moment. Not a fault: the work travels when the phones
+     * next meet, which is what this product is for.
+     */
+    case noneNow
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonRoute: FfiConverterRustBuffer {
+    typealias SwiftType = CorePersonRoute
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonRoute {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .directBluetooth
+
+        case 2: return .directLocalWifi
+
+        case 3: return .shorePass
+
+        case 4: return .noneNow
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CorePersonRoute, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .directBluetooth:
+            writeInt(&buf, Int32(1))
+
+
+        case .directLocalWifi:
+            writeInt(&buf, Int32(2))
+
+
+        case .shorePass:
+            writeInt(&buf, Int32(3))
+
+
+        case .noneNow:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonRoute_lift(_ buf: RustBuffer) throws -> CorePersonRoute {
+    return try FfiConverterTypeCorePersonRoute.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonRoute_lower(_ value: CorePersonRoute) -> RustBuffer {
+    return FfiConverterTypeCorePersonRoute.lower(value)
+}
+
+
+
+extension CorePersonRoute: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * One structured relay rejection, classified. Ordered by nothing — use
  * [`relay_fault_rank`] when several faults from one sync pass compete for
  * the single status slot.
@@ -21400,6 +21500,38 @@ public func coreContactDisplayName(contact: Contact) -> String {
 })
 }
 /**
+ * Is this person's saved endpoint resting -- not a route to try right now?
+ *
+ * Both halves of the persisted endpoint health, asked as one question.
+ * Written off after authoritatively rejecting us, or quiet long enough that
+ * spending further requests on it is waste: either way there is no internet
+ * route to this person at this moment.
+ *
+ * Exported because two callers need the same answer -- the delivery
+ * classification below and [`core_person_best_route`] -- and because the
+ * alternative is each shell re-deriving it from four persisted numbers and
+ * two rest windows it does not own. `crate::contact_relay_health` remains the
+ * only place those thresholds live; this is a name for the conjunction, not a
+ * second copy of the rules.
+ *
+ * Deliberately *not* the same question as "should a person be told about
+ * this": a rested endpoint becomes probe-eligible again on a timer, so this
+ * answer blinks off and on for as long as the fault lasts. What a person is
+ * told is driven by the streak having reached the stale threshold, which only
+ * a success clears.
+ */
+public func coreContactEndpointResting(relayRejectStreak: Int64, relayRejectedAtMs: Int64, relayUnreachableStreak: Int64, relayUnreachableAtMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_endpoint_resting(
+        FfiConverterInt64.lower(relayRejectStreak),
+        FfiConverterInt64.lower(relayRejectedAtMs),
+        FfiConverterInt64.lower(relayUnreachableStreak),
+        FfiConverterInt64.lower(relayUnreachableAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * The whole per-contact decision for one sync pass, in one call so neither
  * shell can implement half of it: given the persisted streak and when it
  * last advanced, may we post to this contact's card endpoint right now?
@@ -21945,6 +22077,25 @@ public func corePersonAttentionRank(attention: CorePersonAttention) -> UInt8 {
     return try!  FfiConverterUInt8.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_person_attention_rank(
         FfiConverterTypeCorePersonAttention.lower(attention),$0
+    )
+})
+}
+/**
+ * The core's routing answer for one person, for the shells to restate.
+ *
+ * The page must never re-derive this. Some friend endpoints are post-only by
+ * design (newer friend cards carry no address this phone may poll), and a
+ * shell that answered "can I reach it myself" would report those friends
+ * broken when delivery to them works perfectly. Asking the core the same
+ * question the router would ask is what stops that.
+ */
+public func corePersonBestRoute(directLink: CoreDirectLink?, ownRelayUsable: Bool, contactHasRelayEndpoint: Bool, contactEndpointResting: Bool) -> CorePersonRoute {
+    return try!  FfiConverterTypeCorePersonRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_person_best_route(
+        FfiConverterOptionTypeCoreDirectLink.lower(directLink),
+        FfiConverterBool.lower(ownRelayUsable),
+        FfiConverterBool.lower(contactHasRelayEndpoint),
+        FfiConverterBool.lower(contactEndpointResting),$0
     )
 })
 }
@@ -24306,6 +24457,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_display_name() != 41746) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_endpoint_resting() != 33659) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_endpoint_usable() != 26591) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -24406,6 +24560,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_person_attention_rank() != 6449) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_person_best_route() != 23751) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_person_is_reachable_now() != 46454) {

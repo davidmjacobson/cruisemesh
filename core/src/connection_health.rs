@@ -937,6 +937,92 @@ pub fn core_contact_route_usable(
     direct_link || (own_relay_usable && contact_has_relay_endpoint && !contact_relay_stale)
 }
 
+/// Is this person's saved endpoint resting -- not a route to try right now?
+///
+/// Both halves of the persisted endpoint health, asked as one question.
+/// Written off after authoritatively rejecting us, or quiet long enough that
+/// spending further requests on it is waste: either way there is no internet
+/// route to this person at this moment.
+///
+/// Exported because two callers need the same answer -- the delivery
+/// classification below and [`core_person_best_route`] -- and because the
+/// alternative is each shell re-deriving it from four persisted numbers and
+/// two rest windows it does not own. `crate::contact_relay_health` remains the
+/// only place those thresholds live; this is a name for the conjunction, not a
+/// second copy of the rules.
+///
+/// Deliberately *not* the same question as "should a person be told about
+/// this": a rested endpoint becomes probe-eligible again on a timer, so this
+/// answer blinks off and on for as long as the fault lasts. What a person is
+/// told is driven by the streak having reached the stale threshold, which only
+/// a success clears.
+#[uniffi::export]
+pub fn core_contact_endpoint_resting(
+    relay_reject_streak: i64,
+    relay_rejected_at_ms: i64,
+    relay_unreachable_streak: i64,
+    relay_unreachable_at_ms: i64,
+    now_ms: i64,
+) -> bool {
+    !core_contact_relay_endpoint_usable(relay_reject_streak, relay_rejected_at_ms, now_ms)
+        || !core_contact_relay_unreachable_endpoint_usable(
+            relay_unreachable_streak,
+            relay_unreachable_at_ms,
+            now_ms,
+        )
+}
+
+/// How a message to this person would travel if one were sent right now.
+///
+/// The person detail expansion's "best known route now", as an enum. There is
+/// no `Relay`/`ShorePass` case that means "probably": either the internet
+/// route is available to this person by [`core_contact_route_usable`]'s
+/// definition, or the honest answer is that the work travels at the next
+/// encounter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CorePersonRoute {
+    /// A live Bluetooth link to them right now.
+    DirectBluetooth,
+    /// A live local Wi-Fi link to them right now.
+    DirectLocalWifi,
+    /// No live link, but our Shore Pass path and their endpoint can carry it.
+    ShorePass,
+    /// No route at this moment. Not a fault: the work travels when the phones
+    /// next meet, which is what this product is for.
+    NoneNow,
+}
+
+/// The core's routing answer for one person, for the shells to restate.
+///
+/// The page must never re-derive this. Some friend endpoints are post-only by
+/// design (newer friend cards carry no address this phone may poll), and a
+/// shell that answered "can I reach it myself" would report those friends
+/// broken when delivery to them works perfectly. Asking the core the same
+/// question the router would ask is what stops that.
+#[uniffi::export]
+pub fn core_person_best_route(
+    direct_link: Option<CoreDirectLink>,
+    own_relay_usable: bool,
+    contact_has_relay_endpoint: bool,
+    contact_endpoint_resting: bool,
+) -> CorePersonRoute {
+    match direct_link {
+        Some(CoreDirectLink::Bluetooth) => return CorePersonRoute::DirectBluetooth,
+        Some(CoreDirectLink::LocalWifi) => return CorePersonRoute::DirectLocalWifi,
+        None => {}
+    }
+    if core_contact_route_usable(
+        false,
+        own_relay_usable,
+        contact_has_relay_endpoint,
+        contact_endpoint_resting,
+    ) {
+        CorePersonRoute::ShorePass
+    } else {
+        CorePersonRoute::NoneNow
+    }
+}
+
 /// Does the relay-upload backlog for this recipient say anything about
 /// *delivery*?
 ///
@@ -1175,13 +1261,12 @@ pub fn core_classify_recipient_delivery(
     // `contact_relay_health`, never re-derived: that module owns the streak
     // thresholds, the rest windows, and the backwards-clock rule, and a second
     // copy of any of them here is how the two shells drifted in the first
-    // place.
-    let rejected_resting = !core_contact_relay_endpoint_usable(
+    // place. `core_contact_endpoint_resting` is the exported name for the
+    // conjunction, so the person detail's route answer and this verdict cannot
+    // disagree about whether the internet route exists.
+    let endpoint_resting = core_contact_endpoint_resting(
         input.relay_reject_streak,
         input.relay_rejected_at_ms,
-        input.now_ms,
-    );
-    let silent_resting = !core_contact_relay_unreachable_endpoint_usable(
         input.relay_unreachable_streak,
         input.relay_unreachable_at_ms,
         input.now_ms,
@@ -1191,7 +1276,7 @@ pub fn core_classify_recipient_delivery(
         oldest_waiting_ms: input.oldest_waiting_ms,
         last_progress_ms: input.last_progress_ms,
         oversized_waiting: input.oversized_waiting,
-        contact_endpoint_resting: rejected_resting || silent_resting,
+        contact_endpoint_resting: endpoint_resting,
         // Resting and actionable are deliberately different questions. A
         // written-off card becomes probe-eligible again every six hours, and
         // an unanswered host every half hour, so "resting" blinks off and on
@@ -2577,6 +2662,200 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_resting_endpoint_is_either_half_of_the_persisted_health() {
+        use crate::contact_relay_health::{
+            CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
+            CONTACT_RELAY_UNREACHABLE_REST_MS, CONTACT_RELAY_UNREACHABLE_STREAK,
+        };
+        // (reject streak, rejected at, unreachable streak, unreachable at,
+        //  resting, what it is)
+        let cases: [(i64, i64, i64, i64, bool, &str); 6] = [
+            (0, 0, 0, 0, false, "a healthy endpoint rests for nothing"),
+            (
+                CONTACT_RELAY_STALE_STREAK,
+                NOW,
+                0,
+                0,
+                true,
+                "just written off after rejecting us",
+            ),
+            (
+                CONTACT_RELAY_STALE_STREAK,
+                NOW - CONTACT_RELAY_RECHECK_MS,
+                0,
+                0,
+                false,
+                "written off, but the re-probe is due again",
+            ),
+            (
+                0,
+                0,
+                CONTACT_RELAY_UNREACHABLE_STREAK,
+                NOW,
+                true,
+                "gone quiet, still inside its rest window",
+            ),
+            (
+                0,
+                0,
+                CONTACT_RELAY_UNREACHABLE_STREAK,
+                NOW - CONTACT_RELAY_UNREACHABLE_REST_MS,
+                false,
+                "gone quiet, rested, worth one more request",
+            ),
+            (
+                CONTACT_RELAY_STALE_STREAK,
+                NOW - CONTACT_RELAY_RECHECK_MS,
+                CONTACT_RELAY_UNREACHABLE_STREAK,
+                NOW,
+                true,
+                "either half resting is enough to rest the endpoint",
+            ),
+        ];
+        for (reject, rejected_at, unreachable, unreachable_at, resting, what) in cases {
+            assert_eq!(
+                core_contact_endpoint_resting(
+                    reject,
+                    rejected_at,
+                    unreachable,
+                    unreachable_at,
+                    NOW
+                ),
+                resting,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_best_route_is_the_routers_answer_and_never_the_pages() {
+        // (direct link, own relay usable, they have an endpoint, resting,
+        //  route, what it is)
+        let cases: [(
+            Option<CoreDirectLink>,
+            bool,
+            bool,
+            bool,
+            CorePersonRoute,
+            &str,
+        ); 7] = [
+            (
+                Some(CoreDirectLink::Bluetooth),
+                false,
+                false,
+                true,
+                CorePersonRoute::DirectBluetooth,
+                "a live radio beats every internet consideration",
+            ),
+            (
+                Some(CoreDirectLink::LocalWifi),
+                true,
+                true,
+                false,
+                CorePersonRoute::DirectLocalWifi,
+                "the local link is named, not the pass behind it",
+            ),
+            (
+                None,
+                true,
+                true,
+                false,
+                CorePersonRoute::ShorePass,
+                "our pass works and their endpoint is live",
+            ),
+            (
+                None,
+                false,
+                true,
+                false,
+                CorePersonRoute::NoneNow,
+                "their endpoint is fine; ours cannot post",
+            ),
+            (
+                None,
+                true,
+                false,
+                false,
+                CorePersonRoute::NoneNow,
+                "no endpoint on their card: internet reaches nobody",
+            ),
+            (
+                None,
+                true,
+                true,
+                true,
+                CorePersonRoute::NoneNow,
+                "their endpoint is resting, so it is not a route today",
+            ),
+            (
+                None,
+                false,
+                false,
+                true,
+                CorePersonRoute::NoneNow,
+                "nothing anywhere, which is still not a fault",
+            ),
+        ];
+        for (direct, own_relay_usable, has_endpoint, resting, route, what) in cases {
+            assert_eq!(
+                core_person_best_route(direct, own_relay_usable, has_endpoint, resting),
+                route,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_best_route_agrees_with_the_delivery_verdict() {
+        // The property the person detail depends on: if the route answer says
+        // there is one, the delivery line says the work is moving. Two
+        // sentences in the same expansion disagreeing about whether a friend
+        // is reachable is exactly the contradiction this page replaces.
+        for own_relay_usable in [true, false] {
+            for has_endpoint in [true, false] {
+                for direct_link in [true, false] {
+                    for reject_streak in [0, CONTACT_RELAY_STALE_STREAK_FOR_TEST] {
+                        let resting = core_contact_endpoint_resting(reject_streak, NOW, 0, 0, NOW);
+                        let route = core_person_best_route(
+                            direct_link.then_some(CoreDirectLink::Bluetooth),
+                            own_relay_usable,
+                            has_endpoint,
+                            resting,
+                        );
+                        let line = core_classify_recipient_delivery(CoreRecipientDeliveryInput {
+                            waiting_count: 2,
+                            oldest_waiting_ms: NOW - 60_000,
+                            last_progress_ms: NOW - 60_000,
+                            oversized_waiting: false,
+                            relay_reject_streak: reject_streak,
+                            relay_rejected_at_ms: NOW,
+                            relay_unreachable_streak: 0,
+                            relay_unreachable_at_ms: 0,
+                            relay: CoreRelayPathState::Connected,
+                            own_relay_usable,
+                            contact_has_relay_endpoint: has_endpoint,
+                            direct_link,
+                            now_ms: NOW,
+                        })
+                        .expect("two messages are waiting");
+                        assert_eq!(
+                            route != CorePersonRoute::NoneNow,
+                            line.state == CoreDeliveryState::Sending,
+                            "route {route:?} and state {:?} disagree",
+                            line.state,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Local alias so the loop above reads without an import at the top of a
+    /// module that otherwise names no streak thresholds.
+    const CONTACT_RELAY_STALE_STREAK_FOR_TEST: i64 =
+        crate::contact_relay_health::CONTACT_RELAY_STALE_STREAK;
 
     #[test]
     fn health_evidence_feeds_the_people_grouping_without_a_second_opinion() {
