@@ -23,6 +23,7 @@ mod limits;
 mod link_detect;
 mod outbound_retirement;
 mod protocol;
+mod protocol_event;
 mod recipient_hints;
 mod relay_cursor;
 mod relay_setup;
@@ -134,6 +135,16 @@ pub use protocol::{
     KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST,
     KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE,
     KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+};
+// Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
+// below: no shell composes an event. Core decision points emit them and the
+// store persists them, so redaction stays a property of the type rather than
+// of every call site that might one day cross the boundary.
+pub use protocol_event::{
+    is_known_invariant, protocol_event_codes, redaction_defect, replay, validate, ProtocolEvent,
+    ProtocolEventArchive, ProtocolEventCode, ProtocolEventDefect, ProtocolEventHeader,
+    ReplaySummary, PROTOCOL_EVENT_ARCHIVE_STEM, PROTOCOL_EVENT_MAX_BYTES,
+    PROTOCOL_EVENT_MAX_RECORDS, PROTOCOL_EVENT_SCHEMA, PROTOCOL_INVARIANT_IDS,
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_cursor::{

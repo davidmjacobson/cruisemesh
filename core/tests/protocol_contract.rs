@@ -213,7 +213,9 @@ const CONTRACT: &[Invariant] = &[
         id: "SECRET-01",
         statement: "Events, fixtures, summaries, and exported diagnostics carry no tokens, \
                     friend cards, plaintext, keys, or endpoint-bearing bodies.",
-        owner: Owner::Core("core/tests/protocol_contract.rs fixture canary scan"),
+        owner: Owner::Core(
+            "core/src/protocol_event.rs ring redaction + core/tests/protocol_event_ring.rs              live-store canary + core/tests/protocol_contract.rs fixture canary scan",
+        ),
     },
 ];
 
@@ -1422,29 +1424,16 @@ const FIXTURES: &[&str] = &[
 ];
 
 /// Stable event codes. Codes are API; prose log messages are not.
-const EVENT_CODES: &[&str] = &[
-    "action_emitted",
-    "action_result_accepted",
-    "action_result_stale_ignored",
-    "budget_yield",
-    "carried_row_marked",
-    "continuation_scheduled",
-    "endpoint_recovered",
-    "endpoint_rested",
-    "frontier_advanced",
-    "frontier_held",
-    "invariant_violation",
-    "outbound_queue_scanned",
-    "page_ingested",
-    "pass_finish",
-    "pass_start",
-    "rate_limit_abort",
-    "receipt_watermark_observed",
-    "shadow_mismatch",
-    "silence_observed",
-    "spray_planned",
-    "request_rejected",
-];
+///
+/// The list itself moved into `core/src/protocol_event.rs` when the ring
+/// landed, because the emitter and the validator disagreeing about what a code
+/// is called is exactly the failure this file exists to prevent. Three places
+/// now have to agree, and two tests below make that a build failure rather
+/// than a code review: the Rust enum, this corpus validator, and the code
+/// table in section 7 of the contract document.
+fn event_codes() -> Vec<&'static str> {
+    cruisemesh_core::protocol_event_codes()
+}
 
 const HEADER_KEYS: &[&str] = &[
     "schema",
@@ -1691,7 +1680,7 @@ fn every_fixture_matches_the_versioned_schema() {
                 .as_str()
                 .unwrap_or_else(|| panic!("{stem}.jsonl line {line}: code must be a string"));
             assert!(
-                EVENT_CODES.contains(&code),
+                event_codes().contains(&code),
                 "{stem}.jsonl line {line}: {code} is not a stable event code"
             );
 
@@ -1855,6 +1844,68 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
             "{} has no incident fixture. Either add one or add it to NO_FIXTURE_NEEDED with a \
              reason.",
             entry.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The event ring, the contract document, and this registry must agree
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_documented_event_codes_are_exactly_the_ones_core_can_emit() {
+    let mut documented: Vec<String> = CONTRACT_DOC
+        .split_once("## 7. Event code table")
+        .expect("the contract document must have a section 7")
+        .1
+        .lines()
+        .take_while(|line| !line.starts_with("## "))
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(|code| code.to_string()))
+        .collect();
+    documented.sort();
+    documented.dedup();
+
+    let owned: Vec<String> = event_codes().iter().map(|code| code.to_string()).collect();
+    assert_eq!(
+        documented, owned,
+        "section 7 of specs/protocol-contract-v1.md and          core/src/protocol_event.rs disagree about the stable event codes"
+    );
+}
+
+#[test]
+fn the_invariant_ids_core_knows_are_exactly_the_ones_in_this_registry() {
+    // The replay command checks a record's declared invariant ids without
+    // linking this test crate, so it carries its own copy of the id list. That
+    // copy is a mirror, and this is the mirror's test: adding an invariant here
+    // without adding it there would let a transcript declare an id the command
+    // silently accepted as unknown-but-fine.
+    let mut registry: Vec<&str> = CONTRACT.iter().map(|entry| entry.id).collect();
+    registry.sort_unstable();
+    let mut mirrored: Vec<&str> = cruisemesh_core::PROTOCOL_INVARIANT_IDS.to_vec();
+    mirrored.sort_unstable();
+    assert_eq!(
+        registry, mirrored,
+        "core/src/protocol_event.rs PROTOCOL_INVARIANT_IDS has drifted from the registry"
+    );
+}
+
+#[test]
+fn every_checked_in_fixture_passes_the_replay_command_s_own_validator() {
+    // The corpus above is validated by this file's rules. This asserts the
+    // *other* implementation -- the one the command and the live export share
+    // -- accepts exactly the same files, so "run the fixture through the
+    // command" is never a different question from "is the fixture valid".
+    for stem in FIXTURES {
+        let raw = read_fixture(stem);
+        let archive = cruisemesh_core::validate(&raw)
+            .unwrap_or_else(|defects| panic!("{stem}.jsonl: {defects:?}"));
+        assert_eq!(archive.header.fixture, *stem);
+        let summary = cruisemesh_core::replay(&archive);
+        assert!(
+            summary.divergence.is_none(),
+            "{stem}.jsonl replays with a divergence: {:?}",
+            summary.divergence
         );
     }
 }

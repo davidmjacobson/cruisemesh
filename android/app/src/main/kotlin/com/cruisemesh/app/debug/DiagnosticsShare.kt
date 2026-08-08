@@ -74,7 +74,8 @@ object DiagnosticsShare {
         if (DebugFileLog.hasCapturedLogs(context)) return true
         val store = AppStore.get(context)
         if (runCatching { store.hasDeliveryMetrics() }.getOrNull() == true) return true
-        return runCatching { store.hasMessageConflicts() }.getOrNull() ?: false
+        if (runCatching { store.hasMessageConflicts() }.getOrNull() == true) return true
+        return ProtocolEventExport.hasCapturedEvents(context)
     }
 
     /**
@@ -101,6 +102,7 @@ object DiagnosticsShare {
         DebugFileLog.logFile(context).takeIf { it.exists() && it.length() > 0 }?.let(files::add)
         FieldMetricsExport.writeCsvFile(context)?.let(files::add)
         ConflictDiagnosticsExport.writeCsvFile(context)?.let(files::add)
+        ProtocolEventExport.writeJsonlFile(context)?.let(files::add)
         return files
     }
 

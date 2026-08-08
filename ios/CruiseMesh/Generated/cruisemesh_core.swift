@@ -2328,6 +2328,15 @@ public protocol CoreSprayPolicyProtocol : AnyObject {
     func admitPlan(peerKey: String, linkKey: String, lanes: CoreSprayPlanShape, nowMs: Int64)  -> CoreSprayAdmission
 
     /**
+     * Attach this policy's decisions to a store's protocol-event ring.
+     *
+     * One call per process, wherever the shell already builds both. Optional
+     * by design -- an unattached policy behaves exactly as it did before this
+     * existed, which is what keeps the tests that predate the ring honest.
+     */
+    func attachEventJournal(store: MessageStore)
+
+    /**
      * Mesh stopped. Everything is scheduling state; none of it survives.
      */
     func clear()
@@ -2510,6 +2519,20 @@ open func admitPlan(peerKey: String, linkKey: String, lanes: CoreSprayPlanShape,
         FfiConverterInt64.lower(nowMs),$0
     )
 })
+}
+
+    /**
+     * Attach this policy's decisions to a store's protocol-event ring.
+     *
+     * One call per process, wherever the shell already builds both. Optional
+     * by design -- an unattached policy behaves exactly as it did before this
+     * existed, which is what keeps the tests that predate the ring honest.
+     */
+open func attachEventJournal(store: MessageStore) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_attach_event_journal(self.uniffiClonePointer(),
+        FfiConverterTypeMessageStore.lower(store),$0
+    )
+}
 }
 
     /**
@@ -3347,6 +3370,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearPeerConnectionHistory() throws
 
     /**
+     * Erase the ring. Part of "delete captured diagnostics": an archive the
+     * person believes they deleted must not be reconstructible from the
+     * store it came out of.
+     */
+    func clearProtocolEvents() throws
+
+    /**
      * Forget every remembered frontier, so the next pass re-walks each
      * mailbox from the beginning.
      *
@@ -3748,6 +3778,16 @@ public protocol MessageStoreProtocol : AnyObject {
     func exportMessageConflictsCsv() throws  -> String
 
     /**
+     * The whole ring as a JSONL archive, ready to drop into the diagnostics
+     * zip the Advanced screen already shares.
+     *
+     * Nothing uploads it. Nothing schedules it. It is produced when a person
+     * taps share and not otherwise, which is why it can afford to be a full
+     * serialization rather than a sampled one.
+     */
+    func exportProtocolEventsJsonl() throws  -> String
+
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -3866,6 +3906,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * not materialise the retained summaries or touch the filesystem.
      */
     func hasMessageConflicts() throws  -> Bool
+
+    /**
+     * Whether the ring holds anything, for gating the share and delete
+     * buttons. Stops at the first row rather than serializing the archive to
+     * count it -- the same reason `has_delivery_metrics` exists.
+     */
+    func hasProtocolEvents() throws  -> Bool
 
     /**
      * The highest lamport value N such that every message `1..=N` from this
@@ -4174,6 +4221,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: Int64) throws  -> Int64
 
     /**
+     * The generic violation hook: record that a named Contract v1 invariant
+     * did not hold here.
+     *
+     * `invariant_id` must be one the contract knows, and `outcome` must be a
+     * short stable token; anything else is refused rather than written,
+     * because a violation record that carried prose would be the easiest
+     * place in the whole system to leak a message body.
+     */
+    func noteInvariantViolation(invariantId: String, outcome: String, nowMs: Int64) throws
+
+    /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
      * whether this pass did so.
@@ -4238,6 +4296,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * already starts from 0.
      */
     func noteRelayHintSources(ownUserId: Data) throws  -> Bool
+
+    /**
+     * Record that a family rate limit ended a pass's remaining network work.
+     *
+     * The 429 decision itself still lives in the shells today; this is the
+     * one call each of them needs to make the abort visible in an archive,
+     * and it is deliberately typed rather than a free-form journal entry --
+     * counts and a fixed outcome, so no caller can put a token or a URL in
+     * it. When the relay policy hoist gives core the decision, the emit moves
+     * inside and this method goes with the shell code that called it.
+     */
+    func noteRelayRateLimitAbort(mailboxKey: String, retryAfterMs: Int64, requestsMade: Int64, envelopesRemaining: Int64, nowMs: Int64) throws
 
     /**
      * Record that a walk from 0 completed for this mailbox, restarting its
@@ -5491,6 +5561,17 @@ open func clearPeerConnectionHistory()throws  {try rustCallWithError(FfiConverte
 }
 
     /**
+     * Erase the ring. Part of "delete captured diagnostics": an archive the
+     * person believes they deleted must not be reconstructible from the
+     * store it came out of.
+     */
+open func clearProtocolEvents()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_protocol_events(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+    /**
      * Forget every remembered frontier, so the next pass re-walks each
      * mailbox from the beginning.
      *
@@ -6059,6 +6140,21 @@ open func exportMessageConflictsCsv()throws  -> String {
 }
 
     /**
+     * The whole ring as a JSONL archive, ready to drop into the diagnostics
+     * zip the Advanced screen already shares.
+     *
+     * Nothing uploads it. Nothing schedules it. It is produced when a person
+     * taps share and not otherwise, which is why it can afford to be a full
+     * serialization rather than a sampled one.
+     */
+open func exportProtocolEventsJsonl()throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_export_protocol_events_jsonl(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
      * Unexpired carried envelopes that were classified as family traffic
      * when received, oldest first. Used by relay upload so one phone with
      * internet can uplink ciphertext it is muling for known contacts.
@@ -6250,6 +6346,18 @@ open func hasDeliveryMetrics()throws  -> Bool {
 open func hasMessageConflicts()throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_has_message_conflicts(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
+     * Whether the ring holds anything, for gating the share and delete
+     * buttons. Stops at the first row rather than serializing the archive to
+     * count it -- the same reason `has_delivery_metrics` exists.
+     */
+open func hasProtocolEvents()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_has_protocol_events(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -6763,6 +6871,24 @@ open func noteContactRelayUnreachable(userId: Data, endpointKey: String, nowMs: 
 }
 
     /**
+     * The generic violation hook: record that a named Contract v1 invariant
+     * did not hold here.
+     *
+     * `invariant_id` must be one the contract knows, and `outcome` must be a
+     * short stable token; anything else is refused rather than written,
+     * because a violation record that carried prose would be the easiest
+     * place in the whole system to leak a message body.
+     */
+open func noteInvariantViolation(invariantId: String, outcome: String, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_invariant_violation(self.uniffiClonePointer(),
+        FfiConverterString.lower(invariantId),
+        FfiConverterString.lower(outcome),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
      * Notice that the set of ids our relay fetch hints derive from has
      * changed, and invalidate every remembered frontier if it has. Returns
      * whether this pass did so.
@@ -6832,6 +6958,27 @@ open func noteRelayHintSources(ownUserId: Data)throws  -> Bool {
         FfiConverterData.lower(ownUserId),$0
     )
 })
+}
+
+    /**
+     * Record that a family rate limit ended a pass's remaining network work.
+     *
+     * The 429 decision itself still lives in the shells today; this is the
+     * one call each of them needs to make the abort visible in an archive,
+     * and it is deliberately typed rather than a free-form journal entry --
+     * counts and a fixed outcome, so no caller can put a token or a URL in
+     * it. When the relay policy hoist gives core the decision, the emit moves
+     * inside and this method goes with the shell code that called it.
+     */
+open func noteRelayRateLimitAbort(mailboxKey: String, retryAfterMs: Int64, requestsMade: Int64, envelopesRemaining: Int64, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_note_relay_rate_limit_abort(self.uniffiClonePointer(),
+        FfiConverterString.lower(mailboxKey),
+        FfiConverterInt64.lower(retryAfterMs),
+        FfiConverterInt64.lower(requestsMade),
+        FfiConverterInt64.lower(envelopesRemaining),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
 }
 
     /**
@@ -28003,6 +28150,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_admit_plan() != 64273) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_attach_event_journal() != 14397) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_clear() != 37090) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -28135,6 +28285,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_peer_connection_history() != 2544) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_protocol_events() != 39383) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 48310) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -28207,6 +28360,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_export_message_conflicts_csv() != 84) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_export_protocol_events_jsonl() != 33716) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_family_carried_envelopes() != 13806) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -28241,6 +28397,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_message_conflicts() != 27119) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_protocol_events() != 27445) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
@@ -28333,7 +28492,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_contact_relay_unreachable() != 15591) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_invariant_violation() != 39391) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_hint_sources() != 12844) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_rate_limit_abort() != 1228) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 29578) {

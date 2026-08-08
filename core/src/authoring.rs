@@ -905,7 +905,7 @@ fn insert_authored_rows(
     // `crate::outbound_retirement::supersedes_queued_generations` for the
     // per-kind justification and for why request-shaped hidden kinds are not
     // in the set.
-    retire_superseded(
+    let superseded = retire_superseded(
         tx,
         &envelope.recipient_user_id,
         &envelope.chat_id,
@@ -913,6 +913,24 @@ fn insert_authored_rows(
         envelope.kind,
         envelope.lamport,
     )?;
+    if superseded > 0 {
+        let peer = crate::protocol_event::actor_pseudonym(tx, "peer", &envelope.recipient_user_id)?;
+        crate::protocol_event::append(
+            tx,
+            &[crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::OutboundRowSuperseded,
+                queued_at_ms,
+                "a_newer_generation_replaced_them",
+            )
+            .actor(peer)
+            .invariants(&["QUEUE-01"])
+            .count(
+                "rows_superseded",
+                i64::try_from(superseded).unwrap_or(i64::MAX),
+            )
+            .count("kind", envelope.kind as i64)],
+        )?;
+    }
     Ok(())
 }
 

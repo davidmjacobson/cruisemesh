@@ -839,6 +839,8 @@ impl MessageStore {
         conn.pragma_update(None, "busy_timeout", 5_000)
             .map_err(store_err)?;
         conn.execute_batch(SCHEMA).map_err(store_err)?;
+        conn.execute_batch(crate::protocol_event::PROTOCOL_EVENT_SCHEMA_SQL)
+            .map_err(store_err)?;
         migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
@@ -1035,7 +1037,25 @@ impl MessageStore {
         // Forward-only, and no schema change: no column and no index is added
         // or repurposed, so an older build reading this store afterwards sees
         // a smaller queue and nothing else.
-        crate::outbound_retirement::sweep_receipt_covered(&conn)?;
+        let retired = crate::outbound_retirement::sweep_receipt_covered(&conn)?;
+        // Only when it found something. The catch-up sweep runs on every open
+        // and, after the first one, retires nothing for the rest of the
+        // device's life -- so recording the empty case would put one record per
+        // launch into the ring, and would leave a brand-new install with
+        // "diagnostics captured" showing on a screen where nothing had
+        // happened yet.
+        if retired > 0 {
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::OutboundQueueScanned,
+                    0,
+                    "receipt_covered_rows_retired",
+                )
+                .invariants(&["QUEUE-01"])
+                .count("rows_retired", i64::try_from(retired).unwrap_or(i64::MAX))],
+            )?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             #[cfg(test)]
@@ -1831,6 +1851,27 @@ fn quarantine_message_conflict(
     )
     .map_err(store_err)?;
     Ok(())
+}
+
+/// Ring plumbing for core policy objects that hold no connection of their own
+/// (today: `CoreSprayPolicy`). Not exported: no shell composes an event.
+impl MessageStore {
+    pub(crate) fn record_protocol_events(
+        &self,
+        drafts: &[crate::protocol_event::ProtocolEventDraft],
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::append(&conn, drafts)
+    }
+
+    pub(crate) fn protocol_event_pseudonym(
+        &self,
+        kind: &'static str,
+        raw: &[u8],
+    ) -> Result<String, CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::actor_pseudonym(&conn, kind, raw)
+    }
 }
 
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
@@ -3458,12 +3499,30 @@ impl MessageStore {
                     |row| row.get(0),
                 )
                 .map_err(store_err)?;
-            crate::outbound_retirement::retire_receipt_covered(
+            let retired = crate::outbound_retirement::retire_receipt_covered(
                 &tx,
                 &chat_id,
                 &sender_user_id,
                 effective.max(0) as u64,
             )?;
+            if retired > 0 {
+                // Per receipt, not per row: a delivered watermark that covers
+                // 200 envelopes is one decision, and recording it 200 times
+                // would put a hot loop in the ring.
+                let peer = crate::protocol_event::actor_pseudonym(&tx, "peer", &chat_id)?;
+                crate::protocol_event::append(
+                    &tx,
+                    &[crate::protocol_event::ProtocolEventDraft::new(
+                        crate::protocol_event::ProtocolEventCode::OutboundRowRetired,
+                        0,
+                        "delivered_watermark_covered_them",
+                    )
+                    .actor(peer)
+                    .invariants(&["QUEUE-01", "CARRY-01"])
+                    .count("rows_retired", i64::try_from(retired).unwrap_or(i64::MAX))
+                    .count("through_lamport", effective.max(0))],
+                )?;
+            }
         }
         tx.commit().map_err(store_err)?;
         Ok(())
@@ -3854,7 +3913,20 @@ impl MessageStore {
             )
             .optional()
             .map_err(store_err)?;
-        Ok(streak.unwrap_or(0))
+        let streak = streak.unwrap_or(0);
+        let peer = crate::protocol_event::actor_pseudonym(&conn, "peer", &user_id)?;
+        crate::protocol_event::append(
+            &conn,
+            &[crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::RequestRejected,
+                now_ms,
+                "contact_endpoint_rejected_us_authoritatively",
+            )
+            .actor(peer)
+            .invariants(&["SILENCE-01"])
+            .count("reject_streak", streak)],
+        )?;
+        Ok(streak)
     }
 
     /// Forget any recorded rejection for a contact — called on every
@@ -3941,7 +4013,26 @@ impl MessageStore {
             )
             .optional()
             .map_err(store_err)?;
-        Ok(streak.unwrap_or(0))
+        let streak = streak.unwrap_or(0);
+        if streak == crate::CONTACT_RELAY_UNREACHABLE_STREAK {
+            // Only on the crossing, not on every failure after it. A dead
+            // endpoint that is retried once every rest window would otherwise
+            // fill the ring with the same record and evict the evidence of how
+            // it got there.
+            let peer = crate::protocol_event::actor_pseudonym(&conn, "peer", &user_id)?;
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::EndpointRested,
+                    now_ms,
+                    "no_answer_streak_reached_the_rest_threshold",
+                )
+                .actor(peer)
+                .invariants(&["SILENCE-01"])
+                .count("unreachable_streak", streak)],
+            )?;
+        }
+        Ok(streak)
     }
 
     /// Clear the transport-level streak when the endpoint gives any HTTP
@@ -3949,15 +4040,29 @@ impl MessageStore {
     /// the host is reachable and must settle the silence verdict.
     pub fn clear_contact_relay_unreachable(&self, user_id: Vec<u8>) -> Result<(), CoreError> {
         let conn = lock_conn(&self.conn);
-        conn.execute(
-            "UPDATE contacts
-             SET relay_unreachable_endpoint_key = NULL,
-                 relay_unreachable_streak = 0,
-                 relay_unreachable_at = 0
-             WHERE user_id = ?1 AND relay_unreachable_streak <> 0",
-            params![user_id],
-        )
-        .map_err(store_err)?;
+        let recovered = conn
+            .execute(
+                "UPDATE contacts
+                 SET relay_unreachable_endpoint_key = NULL,
+                     relay_unreachable_streak = 0,
+                     relay_unreachable_at = 0
+                 WHERE user_id = ?1 AND relay_unreachable_streak <> 0",
+                params![user_id],
+            )
+            .map_err(store_err)?;
+        if recovered > 0 {
+            let peer = crate::protocol_event::actor_pseudonym(&conn, "peer", &user_id)?;
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::EndpointRecovered,
+                    0,
+                    "endpoint_answered_again",
+                )
+                .actor(peer)
+                .invariants(&["SILENCE-01"])],
+            )?;
+        }
         Ok(())
     }
 
@@ -4057,7 +4162,33 @@ impl MessageStore {
             .unwrap_or(0);
         let advanced =
             crate::relay_cursor_advance(persisted, page_next_cursor, page_fully_processed);
+        let mailbox =
+            crate::protocol_event::actor_pseudonym(&conn, "mailbox", config_key.as_bytes())?;
         if advanced == persisted {
+            // A held frontier is the interesting half. `sweep-livelock` is
+            // exactly this record repeating with the same numbers, and until
+            // now the only way to see it was to read a device's prose log.
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::FrontierHeld,
+                    // This method has no clock argument, and adding one would
+                    // change an exported signature both shells call. The ring
+                    // clamps forward instead, so the record reads as "no
+                    // earlier than the one before it" -- which is exactly what
+                    // is known here. C4 gives the walk a real clock.
+                    0,
+                    if page_fully_processed {
+                        "page_did_not_advance_the_cursor"
+                    } else {
+                        "page_not_fully_processed"
+                    },
+                )
+                .actor(mailbox)
+                .invariants(&["CURSOR-01", "PAGE-01"])
+                .count("frontier", persisted.max(0))
+                .count("page_next_cursor", page_next_cursor.max(0))],
+            )?;
             return Ok(persisted);
         }
         conn.execute(
@@ -4067,6 +4198,18 @@ impl MessageStore {
             params![config_key, advanced],
         )
         .map_err(store_err)?;
+        crate::protocol_event::append(
+            &conn,
+            &[crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::FrontierAdvanced,
+                0,
+                "page_fully_processed",
+            )
+            .actor(mailbox)
+            .invariants(&["CURSOR-01"])
+            .count("frontier_before", persisted.max(0))
+            .count("frontier_after", advanced.max(0))],
+        )?;
         Ok(advanced)
     }
 
@@ -4116,9 +4259,39 @@ impl MessageStore {
             .unwrap_or(0);
         let advanced =
             crate::relay_cursor_advance(persisted, page_next_cursor, page_fully_processed);
+        let mailbox =
+            crate::protocol_event::actor_pseudonym(&conn, "mailbox", config_key.as_bytes())?;
         if advanced == persisted {
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::FrontierHeld,
+                    now_ms,
+                    "sweep_cursor_held",
+                )
+                .actor(mailbox)
+                .invariants(&["CURSOR-01", "PROGRESS-01"])
+                .count("sweep_cursor", persisted.max(0))
+                .count("page_next_cursor", page_next_cursor.max(0))],
+            )?;
             return Ok(persisted);
         }
+        crate::protocol_event::append(
+            &conn,
+            &[crate::protocol_event::ProtocolEventDraft::new(
+                if persisted <= 0 {
+                    crate::protocol_event::ProtocolEventCode::SweepStarted
+                } else {
+                    crate::protocol_event::ProtocolEventCode::SweepResumed
+                },
+                now_ms,
+                "page_fully_processed",
+            )
+            .actor(mailbox)
+            .invariants(&["CURSOR-01", "PROGRESS-01"])
+            .count("sweep_cursor_before", persisted.max(0))
+            .count("sweep_cursor_after", advanced.max(0))],
+        )?;
         if persisted <= 0 {
             // This sweep's first page: date it.
             conn.execute(
@@ -4177,12 +4350,27 @@ impl MessageStore {
             return Ok(());
         }
         let conn = lock_conn(&self.conn);
-        conn.execute(
-            "UPDATE relay_fetch_cursors SET sweep_after_id = 0, sweep_started_at = ?2
-             WHERE config_key = ?1",
-            params![config_key, now_ms],
-        )
-        .map_err(store_err)?;
+        let forgotten = conn
+            .execute(
+                "UPDATE relay_fetch_cursors SET sweep_after_id = 0, sweep_started_at = ?2
+                 WHERE config_key = ?1",
+                params![config_key, now_ms],
+            )
+            .map_err(store_err)?;
+        if forgotten > 0 {
+            let mailbox =
+                crate::protocol_event::actor_pseudonym(&conn, "mailbox", config_key.as_bytes())?;
+            crate::protocol_event::append(
+                &conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::SweepRestarted,
+                    now_ms,
+                    "resume_cursor_no_longer_meant_what_it_said",
+                )
+                .actor(mailbox)
+                .invariants(&["PROGRESS-01"])],
+            )?;
+        }
         Ok(())
     }
 
@@ -4262,7 +4450,143 @@ impl MessageStore {
             params![config_key, now_ms, repaired],
         )
         .map_err(store_err)?;
+        let mailbox =
+            crate::protocol_event::actor_pseudonym(&conn, "mailbox", config_key.as_bytes())?;
+        let mut events = vec![crate::protocol_event::ProtocolEventDraft::new(
+            crate::protocol_event::ProtocolEventCode::SweepCompleted,
+            now_ms,
+            "empty_page_reached",
+        )
+        .actor(mailbox.clone())
+        .invariants(&["CURSOR-01", "PROGRESS-01"])
+        .count("swept_through_id", swept_through_id.max(0))
+        .count("frontier", repaired.max(0))];
+        if repaired < persisted {
+            // The one place the frontier moves down, so the one record that
+            // has to say so plainly: a reader who sees a frontier fall without
+            // this beside it is looking at a bug rather than a repair.
+            events.push(
+                crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::FrontierLowered,
+                    now_ms,
+                    "completed_sweep_found_a_lower_top",
+                )
+                .actor(mailbox)
+                .invariants(&["CURSOR-01"])
+                .count("frontier_before", persisted.max(0))
+                .count("frontier_after", repaired.max(0)),
+            );
+        }
+        crate::protocol_event::append(&conn, &events)?;
         Ok(repaired < persisted)
+    }
+
+    // -----------------------------------------------------------------
+    // Protocol-event ring (see `crate::protocol_event`)
+    // -----------------------------------------------------------------
+
+    /// The whole ring as a JSONL archive, ready to drop into the diagnostics
+    /// zip the Advanced screen already shares.
+    ///
+    /// Nothing uploads it. Nothing schedules it. It is produced when a person
+    /// taps share and not otherwise, which is why it can afford to be a full
+    /// serialization rather than a sampled one.
+    pub fn export_protocol_events_jsonl(&self) -> Result<String, CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::export_jsonl(&conn)
+    }
+
+    /// Whether the ring holds anything, for gating the share and delete
+    /// buttons. Stops at the first row rather than serializing the archive to
+    /// count it -- the same reason `has_delivery_metrics` exists.
+    pub fn has_protocol_events(&self) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let (records, _) = crate::protocol_event::ring_size(&conn)?;
+        Ok(records > 0)
+    }
+
+    /// Erase the ring. Part of "delete captured diagnostics": an archive the
+    /// person believes they deleted must not be reconstructible from the
+    /// store it came out of.
+    pub fn clear_protocol_events(&self) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::clear(&conn)
+    }
+
+    /// Record that a family rate limit ended a pass's remaining network work.
+    ///
+    /// The 429 decision itself still lives in the shells today; this is the
+    /// one call each of them needs to make the abort visible in an archive,
+    /// and it is deliberately typed rather than a free-form journal entry --
+    /// counts and a fixed outcome, so no caller can put a token or a URL in
+    /// it. When the relay policy hoist gives core the decision, the emit moves
+    /// inside and this method goes with the shell code that called it.
+    pub fn note_relay_rate_limit_abort(
+        &self,
+        mailbox_key: String,
+        retry_after_ms: i64,
+        requests_made: i64,
+        envelopes_remaining: i64,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mailbox =
+            crate::protocol_event::actor_pseudonym(&conn, "mailbox", mailbox_key.as_bytes())?;
+        crate::protocol_event::append(
+            &conn,
+            &[crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::RateLimitAbort,
+                now_ms,
+                "remaining_network_stages_skipped",
+            )
+            .actor(mailbox)
+            .invariants(&["RATE-01", "LIVE-01"])
+            .count("retry_after_ms", retry_after_ms.max(0))
+            .count("requests", requests_made.max(0))
+            .count("envelopes_remaining", envelopes_remaining.max(0))],
+        )
+    }
+
+    /// The generic violation hook: record that a named Contract v1 invariant
+    /// did not hold here.
+    ///
+    /// `invariant_id` must be one the contract knows, and `outcome` must be a
+    /// short stable token; anything else is refused rather than written,
+    /// because a violation record that carried prose would be the easiest
+    /// place in the whole system to leak a message body.
+    pub fn note_invariant_violation(
+        &self,
+        invariant_id: String,
+        outcome: String,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        if !crate::protocol_event::is_known_invariant(&invariant_id) {
+            return Err(CoreError::Malformed(format!(
+                "{invariant_id} is not a Contract v1 invariant"
+            )));
+        }
+        if !crate::protocol_event::is_stable_token(&outcome) {
+            return Err(CoreError::Malformed(
+                "an invariant-violation outcome must be a short stable token".into(),
+            ));
+        }
+        let conn = lock_conn(&self.conn);
+        // The id is resolved back to the contract's own `'static` entry rather
+        // than kept as the caller's string, so the stored id is by
+        // construction one the contract knows.
+        let id: &'static str = crate::PROTOCOL_INVARIANT_IDS
+            .iter()
+            .copied()
+            .find(|known| *known == invariant_id)
+            .expect("checked above");
+        let draft = crate::protocol_event::ProtocolEventDraft::with_checked_outcome(
+            crate::protocol_event::ProtocolEventCode::InvariantViolation,
+            now_ms,
+            &outcome,
+        )
+        .expect("checked above")
+        .invariants(&[id]);
+        crate::protocol_event::append(&conn, &[draft])
     }
 
     /// Forget every remembered frontier, so the next pass re-walks each

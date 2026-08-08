@@ -77,6 +77,7 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.ConflictDiagnosticsExport
+import com.cruisemesh.app.debug.ProtocolEventExport
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.debug.DiagnosticsShare
 import com.cruisemesh.app.debug.FieldMetricsExport
@@ -1309,6 +1310,10 @@ private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: 
                     FieldMetricsExport.deleteCsvFile(context)
                     runCatching { AppStore.get(context).clearMessageConflicts() }
                     ConflictDiagnosticsExport.deleteCsvFile(context)
+                    // Both halves, or the next share rebuilds the file that
+                    // was just deleted from the ring that was not.
+                    runCatching { AppStore.get(context).clearProtocolEvents() }
+                    ProtocolEventExport.deleteJsonlFile(context)
                     // The last share left a zip holding copies of them all.
                     DiagnosticsShare.deleteArchive(context)
                 }

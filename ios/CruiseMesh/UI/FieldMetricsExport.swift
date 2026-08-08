@@ -76,6 +76,57 @@ enum ConflictDiagnosticsExport {
     }
 }
 
+/// The core's protocol-event ring, written into the shared diagnostics
+/// archive.
+///
+/// Rust owns everything about the file: the schema, what may appear in a
+/// record, the archive-local pseudonyms that stand in for contacts and
+/// mailboxes, and the export itself. This type decides nothing -- it asks the
+/// store for a string and puts it on disk. That is deliberate: the ring exists
+/// so a support hand-off carries what the device actually decided, and a shell
+/// that reformatted or filtered it on the way out would be one more place for
+/// the two platforms to disagree. Android's `ProtocolEventExport` is the same
+/// wrapper around the same call.
+///
+/// Nothing here uploads or schedules anything. The file is written only when
+/// someone taps share.
+enum ProtocolEventExport {
+    private static let fileName = "cruisemesh-protocol-events.jsonl"
+
+    /// A freshly exported ring, or `nil` when the core has nothing to say.
+    static func writeJSONLFile() -> URL? {
+        guard hasCapturedEvents() else { return nil }
+        guard let jsonl = try? AppStore.get().exportProtocolEventsJsonl() else { return nil }
+        // A header with no records answers nothing; its absence serves the
+        // reader better than an empty archive does.
+        guard jsonl.split(separator: "\n", omittingEmptySubsequences: true).count > 1 else {
+            return nil
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try jsonl.write(to: url, atomically: true, encoding: .utf8)
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    /// Whether the ring holds anything, for gating the share and delete
+    /// buttons. Stops at the first row rather than serialising the archive to
+    /// count it.
+    static func hasCapturedEvents() -> Bool {
+        (try? AppStore.get().hasProtocolEvents()) ?? false
+    }
+
+    /// Removes the exported copy. The ring itself is cleared separately, in
+    /// the same block that clears the metrics tables -- both have to go, or the
+    /// next share rebuilds the file that was just deleted.
+    static func deleteExportedJSONL() {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
 /// Identifiable wrapper so a freshly written set of export files can drive
 /// `.sheet(item:)`. Plural because "Share diagnostics" shares the log file
 /// alongside any `MetricKitCollector` JSON payloads in one sheet.
