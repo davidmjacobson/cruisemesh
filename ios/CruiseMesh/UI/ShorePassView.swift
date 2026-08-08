@@ -110,6 +110,12 @@ struct ShorePassView: View {
                         Text("Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        // Who bills for what, before anyone commits to a pass.
+                        // Same secondary style as the line above: it is an
+                        // answer, not a warning.
+                        Text("Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
                     } else {
                         LabeledContent("Status", value: passStatus)
                         // CP2b: plain-language explanation for the structured

@@ -1651,6 +1651,16 @@
         }
       }
     },
+    "Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet."
+          }
+        }
+      }
+    },
     "Shore Pass wasn’t set up": {
       "localizations": {
         "en": {
@@ -2517,6 +2527,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "OK"
+          }
+        }
+      }
+    },
+    "On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges."
           }
         }
       }

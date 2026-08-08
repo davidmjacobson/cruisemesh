@@ -184,6 +184,11 @@
     <string name="ui_onboarding_permission_nearby_detail">Lets your phone hand messages directly to phones around you, and tells you the moment one arrives.</string>
     <string name="ui_onboarding_permission_background_title">Background activity</string>
     <string name="ui_onboarding_permission_background_detail">Keeps the mesh working while your phone is in your pocket, so messages still move when the screen is off.</string>
+    <!-- The one phone setting that decides whether a cruise ends with a
+         roaming bill. It sits on the permissions slide because that is where
+         people are already turning radios on, and it is worded as a tip, not
+         a warning: nothing in CruiseMesh causes the charge. -->
+    <string name="ui_onboarding_airplane_tip">On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.</string>
     <string name="ui_onboarding_wifi_eyebrow">Local Wi-Fi</string>
     <string name="ui_onboarding_wifi_title">Leave Wi-Fi on, even with no internet</string>
     <string name="ui_onboarding_wifi_body">On a ship or anywhere the Wi-Fi has no internet, keep it connected anyway — CruiseMesh uses that local network to reach phones near you faster than Bluetooth alone.</string>
@@ -303,6 +308,10 @@
     <string name="ui_setup_card">Setup card</string>
     <string name="ui_cmrelay1">CMRELAY1:…</string>
     <string name="ui_paste_your_setup_card_well_test_it">Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.</string>
+    <!-- Shore Pass is the only part of CruiseMesh that uses the internet, so
+         this is the only screen where a data charge can surprise anyone. Say
+         who bills for what before a pass is set up, not after. -->
+    <string name="ui_shore_pass_data_note">Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.</string>
     <string name="ui_paste_and_set_up">Paste and set up</string>
     <string name="ui_enter_setup_card_manually">Enter setup card manually</string>
     <string name="ui_hide_manual_entry">Hide manual entry</string>
