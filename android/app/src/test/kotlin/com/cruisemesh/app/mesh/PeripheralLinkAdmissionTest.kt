@@ -43,10 +43,11 @@ class PeripheralLinkAdmissionTest {
     }
 
     @Test
-    fun `a duplicate connect callback for a held address does not consume a second slot`() {
-        // The GATT stack can deliver a repeat STATE_CONNECTED for a device it
-        // has already reported; treating that as a fresh admission would leak
-        // a slot and, at the cap, reject a link we are already serving.
+    fun `a repeat subscribe for a held address does not consume a second slot`() {
+        // A central can re-write the CCCD on a link it already holds (a
+        // re-subscribe after a transient failure); treating that as a fresh
+        // admission would leak a slot and, at the cap, reject a link we are
+        // already serving.
         val admission = PeripheralLinkAdmission(maxLinks = 2)
         assertEquals(PeripheralAdmissionDecision.Admitted(1), admission.admit("a"))
         assertEquals(PeripheralAdmissionDecision.AlreadyHeld(1), admission.admit("a"))
@@ -57,7 +58,7 @@ class PeripheralLinkAdmissionTest {
     }
 
     @Test
-    fun `a duplicate connect callback at the cap is admitted, not rejected`() {
+    fun `a repeat subscribe at the cap is admitted, not rejected`() {
         val admission = PeripheralLinkAdmission(maxLinks = 1)
         admission.admit("a")
         assertEquals(PeripheralAdmissionDecision.AlreadyHeld(1), admission.admit("a"))
@@ -87,6 +88,21 @@ class PeripheralLinkAdmissionTest {
         assertTrue(admission.release("a"))
         assertFalse(admission.release("a"))
         assertEquals(0, admission.activeCount())
+    }
+
+    @Test
+    fun `a central that never subscribes never spends a slot`() {
+        // The reason admission is decided at the CCCD write and not at connect.
+        // A watch, a pair of earbuds, or a mesh peer whose connect stalls all
+        // reach BluetoothGattServerCallback.onConnectionStateChange; none of
+        // them reaches this class, so none of them costs the mesh a slot -- and
+        // at the cap, none of them is aimed a cancelConnection.
+        val admission = PeripheralLinkAdmission(maxLinks = 3)
+        admission.admit("mesh-peer")
+
+        assertEquals(1, admission.activeCount())
+        assertFalse(admission.holds("smartwatch"))
+        assertFalse(admission.holds("earbuds"))
     }
 
     @Test

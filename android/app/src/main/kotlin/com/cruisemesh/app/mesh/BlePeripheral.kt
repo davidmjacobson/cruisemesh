@@ -172,11 +172,13 @@ internal fun shouldPaceFrameStart(
  * left over from the above. First, only the *outbound* half of the dual role
  * was budgeted -- [BleCentral]'s `MAX_CENTRAL_LINKS` -- so inbound centrals
  * could quietly consume the ACL headroom the central role was leaving free.
- * [PeripheralLinkAdmission] now caps them at [MAX_PERIPHERAL_LINKS]; a central
- * turned away at the margin is disconnected before it is ever tracked here, its
- * GATT requests are answered with an error rather than a success (so the far
- * side's reconnect backoff actually escalates -- see
- * [GATT_INSUFFICIENT_RESOURCES]), and every already-established link is immune.
+ * [PeripheralLinkAdmission] now caps them at [MAX_PERIPHERAL_LINKS]. The
+ * decision is made at the CCCD-enable write rather than at connect -- that is
+ * the first point a connection is known to be a mesh client at all, so a paired
+ * watch or a stalled connect cannot spend a mesh slot -- and at the margin the
+ * subscribe is failed with an error rather than a success (so the far side's
+ * reconnect backoff actually escalates -- see [GATT_INSUFFICIENT_RESOURCES]),
+ * the link is dropped, and every already-established link is immune.
  * Second, the notify-reject
  * teardown path below wiped an address's state and re-advertised immediately,
  * so the same central could reconnect on its next scan hit and re-trigger the
@@ -243,22 +245,21 @@ class BlePeripheral(
 
     /**
      * Centrals turned away by [linkAdmission] that have not delivered their
-     * STATE_DISCONNECTED yet. A rejected central is disconnected asynchronously
-     * (the binder call cannot be made from inside the connect callback), so it
-     * can still get a few GATT requests in first; without this, each of those
-     * would allocate per-address state that nothing ever cleans up, because
-     * [tearDownLink] no-ops for an address that was never tracked. Membership
-     * here -- rather than absence from [connectedDevices] -- is the guard, so
-     * every device this class did *not* reject is handled exactly as before.
+     * STATE_DISCONNECTED yet, and the generation each pending drop attempt
+     * belongs to -- see [PeripheralRejectionLedger]. A rejected central is
+     * disconnected asynchronously (the binder call cannot be made from inside
+     * the GATT request callback), so it can still get a few GATT requests in
+     * first; membership here is what makes those a no-op instead of letting a
+     * link this class refused go on being served.
      *
-     * Every path out of this set is bounded: STATE_DISCONNECTED (the normal
-     * one), a fresh admission decision for the same address, [stop], or
+     * Every path out is bounded: STATE_DISCONNECTED, a fresh connection or
+     * admission decision for the same address, [stop], or
      * [adoptUndroppableCentral] once [enforceRejection] has run out of attempts.
      * That last one matters -- membership here means "ignored", and an address
      * that could get in but never out would be a blackhole for the life of the
-     * connection. Guarded by [lock].
+     * connection. Leaf-synchronized itself, so it is safe to read under [lock].
      */
-    private val rejectedCentrals = mutableSetOf<String>()
+    private val rejections = PeripheralRejectionLedger()
 
     /** Monotonic ms of the last at-cap log; throttles it per [AT_CAP_LOG_INTERVAL_MS]. Guarded by [lock]. */
     private var lastAtCapLogMs = 0L
@@ -374,7 +375,26 @@ class BlePeripheral(
             Log.i(TAG, "Central ${device.address} connection state=$newState")
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    val decision = admitCentral(device)
+                    // Tracked, but deliberately NOT admitted here. This callback
+                    // fires for every central that opens a GATT connection to
+                    // this phone -- a paired watch, LE earbuds, a car head unit
+                    // -- not only for ones that touch our service, and a mesh
+                    // peer whose connect stalls before it subscribes looks
+                    // identical at this point. Spending one of three inbound
+                    // mesh slots on any of those, and at the cap aiming
+                    // cancelConnection at a link this app does not own, is what
+                    // deciding here would mean. Admission waits for the
+                    // CCCD-enable write (see onDescriptorWriteRequest and
+                    // PeripheralLinkAdmission). Tracking the device is still
+                    // right: it is what makes STATE_DISCONNECTED clean up the
+                    // MTU and reassembler state such a central can create.
+                    synchronized(lock) {
+                        // A reconnect under an address a previous connection was
+                        // rejected under starts clean; this also retires that
+                        // rejection's drop ladder.
+                        rejections.clear(device.address)
+                        connectedDevices[device.address] = device
+                    }
                     // Legacy connectable advertising auto-stops the instant a
                     // central connects. Without restarting it, this phone goes
                     // dark to every other peer for the rest of the process
@@ -387,17 +407,16 @@ class BlePeripheral(
                     // about -- which is what silently answered
                     // ADVERTISE_FAILED_ALREADY_STARTED until 2026-08-07.
                     //
-                    // This runs for a *rejected* central too, and must: the
-                    // framework stopped the advertisement for a connection we
-                    // are about to drop, so skipping the restart here would
-                    // make being at cap the one thing that reliably turns this
-                    // phone dark. A phone at cap stays discoverable on purpose
-                    // -- see PeripheralLinkAdmission.
+                    // This runs unconditionally, including for a connection
+                    // that is about to be turned away at the cap: the framework
+                    // has stopped the advertisement either way, so making the
+                    // restart conditional would make being at cap the one thing
+                    // that reliably turns this phone dark. A phone at cap stays
+                    // discoverable on purpose -- see PeripheralLinkAdmission.
                     restartAdvertisingAfterConnect()
-                    if (decision is PeripheralAdmissionDecision.Rejected) rejectCentral(device, decision)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    synchronized(lock) { rejectedCentrals.remove(device.address) }
+                    rejections.clear(device.address)
                     tearDownLink(device.address, "status=$status")
                 }
             }
@@ -405,8 +424,8 @@ class BlePeripheral(
 
         override fun onMtuChanged(device: BluetoothDevice, mtu: Int) {
             Log.i(TAG, "MTU negotiated for ${device.address}: $mtu")
+            if (rejections.isRejected(device.address)) return
             synchronized(lock) {
-                if (device.address in rejectedCentrals) return
                 negotiatedMtu[device.address] = mtu
             }
         }
@@ -424,9 +443,9 @@ class BlePeripheral(
             // A central we already turned away at the cap: answer the request
             // so it isn't left hanging on a link that is about to close, but
             // answer it with an *error* (see GATT_INSUFFICIENT_RESOURCES) and
-            // don't allocate a reassembler for it -- nothing would ever clean
-            // that up, since tearDownLink no-ops for an untracked address.
-            if (synchronized(lock) { device.address in rejectedCentrals }) {
+            // don't feed its bytes into a reassembler -- a link this class
+            // refused must not produce a HELLO and become a route.
+            if (rejections.isRejected(device.address)) {
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, GATT_INSUFFICIENT_RESOURCES, offset, null)
                 }
@@ -461,20 +480,33 @@ class BlePeripheral(
             // central's writeDescriptor() (used to subscribe to notifications
             // via the CCCD) hangs and eventually fails with GATT_ERROR (133).
             Log.i(TAG, "Descriptor write request from ${device.address} for ${descriptor.uuid}")
+            val isOutboundCccdEnable = descriptor.uuid == MeshConstants.CLIENT_CONFIG_DESCRIPTOR_UUID &&
+                descriptor.characteristic?.uuid == MeshConstants.OUTBOUND_CHARACTERISTIC_UUID &&
+                value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            // Admission is decided here and nowhere else: enabling notifications
+            // on our outbound characteristic is the first moment this connection
+            // is known to be a mesh client rather than some other app's
+            // accessory, and it is the moment before which no inbound slot is
+            // worth spending (see PeripheralLinkAdmission).
+            val decision = if (isOutboundCccdEnable) admitCentral(device) else null
+            val rejected = decision is PeripheralAdmissionDecision.Rejected ||
+                rejections.isRejected(device.address)
             // The CCCD write is the one request whose *status* decides the far
-            // side's retry pacing, so a central we turned away at the cap must
-            // be told this failed -- see GATT_INSUFFICIENT_RESOURCES. Answering
-            // it at all (rather than staying silent) is still right: an error
-            // arrives now, where silence costs the central a ~30s hang.
-            val rejected = synchronized(lock) { device.address in rejectedCentrals }
+            // side's retry pacing, so a central turned away at the cap must be
+            // told this failed -- see GATT_INSUFFICIENT_RESOURCES. Answering it
+            // at all (rather than staying silent) is still right: an error
+            // arrives now, where silence costs the central a ~30s hang. It also
+            // goes out before the drop below, so the answer reaches the far side
+            // rather than racing its own disconnect.
             if (responseNeeded) {
                 val status = if (rejected) GATT_INSUFFICIENT_RESOURCES else BluetoothGatt.GATT_SUCCESS
                 gattServer?.sendResponse(device, requestId, status, offset, null)
             }
+            if (decision is PeripheralAdmissionDecision.Rejected) {
+                rejectCentral(device, decision)
+                return
+            }
             if (rejected) return
-            val isOutboundCccdEnable = descriptor.uuid == MeshConstants.CLIENT_CONFIG_DESCRIPTOR_UUID &&
-                descriptor.characteristic?.uuid == MeshConstants.OUTBOUND_CHARACTERISTIC_UUID &&
-                value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
             if (isOutboundCccdEnable) {
                 // The central has subscribed to our outbound notify
                 // characteristic: this link can carry frames from us now, so
@@ -554,29 +586,29 @@ class BlePeripheral(
     }
 
     /**
-     * Decides whether a freshly connected central may hold one of this phone's
-     * [MAX_PERIPHERAL_LINKS] inbound links, and publishes it into
-     * [connectedDevices] only if so -- an untracked device is one this class
-     * will not notify, will not reassemble frames for, and will not report as
-     * connected, which is exactly what a refusal should mean.
+     * Decides whether a subscribing central may hold one of this phone's
+     * [MAX_PERIPHERAL_LINKS] inbound links. Runs at the CCCD-enable write, not
+     * at connect -- see [PeripheralLinkAdmission] for why that ordering is the
+     * whole point.
      *
-     * No binder call happens here, and none may: this runs on the connect
-     * callback itself, where `cancelConnection` is both a call under [lock] and
-     * a call into the stack from inside its own dispatch. [rejectCentral] does
+     * A refused address stays in [connectedDevices] (it was put there at
+     * connect, and that entry is what makes STATE_DISCONNECTED clean up its MTU
+     * and reassembler state) but is marked in [rejections], which is the guard
+     * every send and every inbound request consults. Refusal therefore means:
+     * not notified, its writes discarded, no HELLO, no route.
+     *
+     * No binder call happens here, and none may: this runs on a GATT request
+     * callback, where `cancelConnection` would be both a call under [lock] and a
+     * call into the stack from inside its own dispatch. [rejectCentral] does
      * that part, after the lock is released and off this callback.
      */
     private fun admitCentral(device: BluetoothDevice): PeripheralAdmissionDecision {
         val address = device.address
         return synchronized(lock) {
-            // A reconnect under an address we previously rejected is a brand
-            // new admission decision, not a continuation of that rejection.
-            rejectedCentrals.remove(address)
             val decision = linkAdmission.admit(address)
-            when (decision) {
-                is PeripheralAdmissionDecision.Rejected -> rejectedCentrals += address
-                is PeripheralAdmissionDecision.Admitted,
-                is PeripheralAdmissionDecision.AlreadyHeld,
-                -> connectedDevices[address] = device
+            if (decision !is PeripheralAdmissionDecision.Rejected) {
+                connectedDevices[address] = device
+                rejections.clear(address)
             }
             decision
         }
@@ -584,12 +616,13 @@ class BlePeripheral(
 
     /**
      * Drops a central admitted by nobody. Posted rather than called inline:
-     * `cancelConnection` is a binder call, and issuing it from inside
-     * `onConnectionStateChange` re-enters the stack during its own connect
-     * dispatch. Posting it also keeps the binder call off [lock] entirely
-     * (the teardown-under-lock shape flagged in the #269 review).
+     * `cancelConnection` is a binder call, and issuing it from inside a GATT
+     * request callback re-enters the stack during its own dispatch. Posting it
+     * also keeps the binder call off [lock] entirely (the teardown-under-lock
+     * shape flagged in the #269 review).
      */
     private fun rejectCentral(device: BluetoothDevice, decision: PeripheralAdmissionDecision.Rejected) {
+        val generation = rejections.reject(device.address)
         val shouldLog = synchronized(lock) {
             val nowMs = SystemClock.elapsedRealtime()
             (nowMs - lastAtCapLogMs >= AT_CAP_LOG_INTERVAL_MS).also { if (it) lastAtCapLogMs = nowMs }
@@ -598,11 +631,11 @@ class BlePeripheral(
             Log.i(
                 TAG,
                 "At inbound link cap (${decision.activeCount}/$MAX_PERIPHERAL_LINKS); turning away newly " +
-                    "connected centrals (e.g. ${device.address}) until a slot frees -- established links are " +
+                    "subscribing centrals (e.g. ${device.address}) until a slot frees -- established links are " +
                     "kept, and this phone stays discoverable",
             )
         }
-        handler.post { enforceRejection(device, attempt = 1) }
+        handler.post { enforceRejection(device, attempt = 1, generation = generation) }
     }
 
     /**
@@ -611,28 +644,31 @@ class BlePeripheral(
      * bounded loop exists for, both of which the first naive single `post`
      * got wrong:
      *
-     * 1. **It self-cancels.** The post carries a [BluetoothDevice], and
-     *    `cancelConnection` is keyed by address, so a post that runs late could
-     *    drop a *different, legitimately admitted* link that had since taken the
-     *    same address (BLE RPAs only rotate every ~15 minutes, so the reconnect
-     *    of a rejected central usually reuses the address). Re-reading
-     *    [rejectedCentrals] here means the post does nothing unless this exact
-     *    address is still the rejected one.
-     * 2. **It has an end.** [rejectedCentrals] is otherwise cleared only by
+     * 1. **It self-cancels, and only against its own rejection.** The post
+     *    carries a [BluetoothDevice], and `cancelConnection` is keyed by
+     *    address, so a post that runs late could drop a *different, legitimately
+     *    admitted* link that had since taken the same address (BLE RPAs only
+     *    rotate every ~15 minutes, so the reconnect of a rejected central
+     *    usually reuses the address). Matching on [generation] rather than just
+     *    on the address means the ladder does nothing unless this exact
+     *    rejection is still the address's current one -- see
+     *    [PeripheralRejectionLedger] for why an address match alone let an old
+     *    ladder adopt a newer connection before its own attempts were spent.
+     * 2. **It has an end.** A rejection is otherwise cleared only by
      *    STATE_DISCONNECTED, so a `cancelConnection` that does not actually drop
      *    the ACL would leave the central connected but permanently ignored --
      *    every write discarded, no HELLO, no route, and the controller holding a
      *    slot that [linkAdmission] believes is free. After the last attempt the
      *    link is adopted instead ([adoptUndroppableCentral]).
      */
-    private fun enforceRejection(device: BluetoothDevice, attempt: Int) {
-        if (!synchronized(lock) { device.address in rejectedCentrals }) return
+    private fun enforceRejection(device: BluetoothDevice, attempt: Int, generation: Long) {
+        if (!rejections.ownsRejection(device.address, generation)) return
         runCatching { gattServer?.cancelConnection(device) }
             .onFailure { Log.w(TAG, "cancelConnection for a rejected central failed: ${it.message}") }
         val next: () -> Unit = if (attempt < MAX_REJECT_TEARDOWN_ATTEMPTS) {
-            { enforceRejection(device, attempt + 1) }
+            { enforceRejection(device, attempt + 1, generation) }
         } else {
-            { adoptUndroppableCentral(device) }
+            { adoptUndroppableCentral(device, generation) }
         }
         handler.postDelayed({ next() }, REJECT_TEARDOWN_RETRY_MS)
     }
@@ -650,18 +686,22 @@ class BlePeripheral(
      * the device is tracked, which also means an ordinary teardown will release
      * it later.
      *
-     * The link is not fully useful on adoption: its CCCD write was answered with
-     * an error, so notifications to it will fail until the central subscribes
-     * again -- and if it never does, [NotifyFailureTracker] tears the link down
-     * on the first burst, which frees the slot properly. Inbound writes from it
-     * work immediately. Nothing here fires [onCentralSubscribed]: claiming a
-     * subscription the central does not have would put frames on a notify path
-     * the stack silently drops.
+     * Adoption fires [onCentralSubscribed], and that is what makes it an escape
+     * hatch rather than a nicer name for the same zombie. The central *did*
+     * subscribe -- it wrote ENABLE_NOTIFICATION_VALUE, and [BleCentral] enables
+     * notification delivery locally before it writes the CCCD, so the error we
+     * answered with does not stop notifications reaching it. Without that
+     * callout, `MeshRouter` would have no route for the address, nothing would
+     * ever notify it, and so [NotifyFailureTracker] -- the only thing that
+     * retires an inbound link short of a disconnect -- could never see a
+     * failure. The slot would then be force-held for the life of the ACL with
+     * nothing able to free it. With it, the link either works (fine: the
+     * controller was holding the slot regardless) or its notifies fail and the
+     * ordinary teardown releases the slot properly.
      */
-    private fun adoptUndroppableCentral(device: BluetoothDevice) {
+    private fun adoptUndroppableCentral(device: BluetoothDevice, generation: Long) {
+        if (!rejections.clearIfOwned(device.address, generation)) return
         val activeCount = synchronized(lock) {
-            if (device.address !in rejectedCentrals) return
-            rejectedCentrals.remove(device.address)
             connectedDevices[device.address] = device
             linkAdmission.forceHold(device.address)
         }
@@ -671,6 +711,9 @@ class BlePeripheral(
                 "attempts; adopting the link it is holding anyway rather than ignoring it " +
                 "($activeCount inbound links now held, over the cap of $MAX_PERIPHERAL_LINKS)",
         )
+        // Outside [lock] on purpose: this callout re-enters MeshService, which
+        // sends our HELLO straight back into sendFrame.
+        onCentralSubscribed(device.address)
     }
 
     /**
@@ -909,7 +952,7 @@ class BlePeripheral(
             notifyFrameStarted.clear()
             inFlightFragment.clear()
             notifyFailures.clearAll()
-            rejectedCentrals.clear()
+            rejections.clearAll()
             linkAdmission.clearAll()
             // The peripheral role is going away entirely; there is no
             // reconnect for a cooldown to brake, and a restart starts clean.
@@ -922,10 +965,16 @@ class BlePeripheral(
      * Push a frame to every subscribed central via the notify characteristic,
      * fragmenting per each central's negotiated MTU if needed (DESIGN.md
      * §5.2).
+     *
+     * "Subscribed" is [linkAdmission], not [connectedDevices]: the latter tracks
+     * every central holding an ACL to our server (including a watch or a pair of
+     * earbuds that will never touch our service) so their per-address state gets
+     * cleaned up on disconnect, and only a central that subscribed and was
+     * admitted is a mesh link.
      */
     fun notifyFrame(frame: ByteArray) {
         synchronized(lock) {
-            connectedDevices.values.toList()
+            connectedDevices.values.filter { linkAdmission.holds(it.address) }
         }.forEach { device ->
             sendFrame(device.address, frame)
         }
@@ -943,6 +992,14 @@ class BlePeripheral(
         synchronized(lock) {
             val device = connectedDevices[deviceAddress] ?: run {
                 Log.w(TAG, "sendFrame: no connection tracked for $deviceAddress")
+                return
+            }
+            if (rejections.isRejected(deviceAddress)) {
+                // Belt and braces: a refused link never gets a route, so nothing
+                // should be addressing it. If something does, the notify would
+                // fail anyway (its CCCD write was answered with an error) and
+                // charge NotifyFailureTracker for a link we are already dropping.
+                Log.w(TAG, "sendFrame: $deviceAddress was turned away at the inbound link cap; dropping frame")
                 return
             }
             val payloadSize = (negotiatedMtu[deviceAddress] ?: FrameFraming.DEFAULT_ATT_MTU) -

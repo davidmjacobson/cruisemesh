@@ -1,8 +1,8 @@
 package com.cruisemesh.app.mesh
 
 /**
- * What [BlePeripheral] should do with a central that just connected to our
- * GATT server.
+ * What [BlePeripheral] should do with a central that just subscribed to our
+ * GATT server's outbound characteristic.
  *
  * [activeCount] is the number of inbound links held *after* the decision, so a
  * log line can report the cap state without a second query racing it.
@@ -14,8 +14,8 @@ sealed interface PeripheralAdmissionDecision {
     data class Admitted(override val activeCount: Int) : PeripheralAdmissionDecision
 
     /**
-     * This address already holds a slot. A duplicate `STATE_CONNECTED` for a
-     * link we are already serving must not consume a second slot, and must
+     * This address already holds a slot. A repeat CCCD-enable write for a link
+     * we are already serving must not consume a second slot, and must
      * certainly not be rejected -- an established link is never severed by the
      * cap (see [PeripheralLinkAdmission]).
      */
@@ -63,15 +63,33 @@ sealed interface PeripheralAdmissionDecision {
  * fleet for the peers whose links it already holds -- see
  * [BleAdvertiserStateMachine] for how expensive an unadvertised phone is.
  *
+ * ## When the decision is made
+ *
+ * Not at `STATE_CONNECTED`, which is the obvious place and the wrong one. That
+ * callback fires for *every* central that opens a GATT connection to this
+ * phone -- a paired watch, LE earbuds, a car head unit, anything -- not only
+ * for ones that touch our service. Deciding there would spend a mesh slot on a
+ * device that will never write our CCCD (a watch holds one all day), and at the
+ * cap it would aim `cancelConnection` at a link this app does not own. The same
+ * shape catches mesh peers whose connect stalls before they subscribe (the
+ * status=133 doomed connects [BleCentral] describes): a slot held until the
+ * supervision timeout by something that never becomes a route.
+ *
+ * The decision is made at the CCCD-enable write instead -- the first moment a
+ * connection is known to be a mesh client at all, and the moment before which
+ * no inbound slot is worth spending. The refusal also has a natural answer
+ * there: the subscribe request itself is failed, which is exactly what the far
+ * side's central role needs to hear.
+ *
  * ## Known limitation: the decision is never revisited
  *
  * The cap cannot flex for "this link is the peer's only route", in two stages.
  *
- * At admission it *cannot* know: `STATE_CONNECTED` is the one moment nothing is
- * known about who the peer is -- the identity arrives later in the HELLO, and
- * the BLE address in hand is a rotating RPA -- so by the time `MeshRouter`
- * could say whether a sibling route exists, the slot has already been granted
- * or refused.
+ * At admission it *cannot* know: the CCCD write still precedes the HELLO
+ * exchange in both directions, so nothing is yet known about who the peer is --
+ * the identity arrives later in the HELLO, and the BLE address in hand is a
+ * rotating RPA -- and by the time `MeshRouter` could say whether a sibling
+ * route exists, the slot has already been granted or refused.
  *
  * The sharper half is that a second later it *could* know and still does not.
  * Slots are keyed by BLE address and released only by a real teardown, so an
@@ -126,7 +144,7 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
      * Not an admission decision and never called on the admission path: this is
      * reconciliation for the one case where the radio and the ledger disagree --
      * a central this class turned away that could not actually be disconnected
-     * (see [BlePeripheral.adoptUndroppableCentral]). The controller is holding
+     * (see `BlePeripheral.adoptUndroppableCentral`). The controller is holding
      * that ACL slot whatever this class thinks, and a ledger that calls it free
      * would over-subscribe the pool the cap exists to protect, so the honest
      * count is the one that includes it. [release] frees it like any other.
@@ -153,6 +171,90 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
 
     @Synchronized
     fun clearAll() = held.clear()
+}
+
+/**
+ * Which centrals [PeripheralLinkAdmission] turned away and are still being
+ * dropped, and -- the part that needs a class rather than a set -- *which
+ * rejection* each pending drop attempt belongs to.
+ *
+ * A turned-away central is disconnected by a short ladder of posted
+ * `cancelConnection` attempts, because one call does not reliably drop an ACL
+ * the far side opened. Those posts outlive the connection they were issued for.
+ * BLE resolvable private addresses only rotate every ~15 minutes, so the same
+ * central reconnecting seconds later usually reuses the same address, and a
+ * plain "is this address rejected" check cannot tell the two apart: an older
+ * ladder would keep acting on the newer connection, and would reach its
+ * end-of-ladder adoption after only some of its own attempts had run against
+ * that ACL -- force-holding a slot over the cap while the drop path had not
+ * actually been exhausted.
+ *
+ * Every rejection therefore gets a process-unique generation. A ladder carries
+ * the generation it started with and retires the moment that generation stops
+ * being the address's current one, so a stale ladder can neither drop a link it
+ * does not own nor adopt one prematurely. Generations come from one
+ * monotonically increasing counter rather than a per-address one, so a
+ * disconnect-and-reconnect cycle can never hand a stale ladder a number that
+ * matches again.
+ *
+ * All methods are `@Synchronized`: GATT server callbacks and the ladder's own
+ * posted runnables run on different threads. This is a leaf monitor -- it never
+ * calls out -- so it cannot deadlock with [BlePeripheral]'s own locks.
+ */
+class PeripheralRejectionLedger {
+    private var sequence = 0L
+    private val rejectedAt = mutableMapOf<String, Long>()
+
+    /**
+     * Record [address] as turned away and return the generation the drop ladder
+     * for this rejection must carry. Replaces any earlier rejection of the same
+     * address, which is what retires that one's ladder.
+     */
+    @Synchronized
+    fun reject(address: String): Long {
+        sequence += 1
+        rejectedAt[address] = sequence
+        return sequence
+    }
+
+    /** Whether [address] is currently being turned away, under any generation. */
+    @Synchronized
+    fun isRejected(address: String): Boolean = address in rejectedAt
+
+    /**
+     * Whether [address] is still rejected under exactly [generation] -- the
+     * guard every posted drop attempt runs before touching the radio.
+     */
+    @Synchronized
+    fun ownsRejection(address: String, generation: Long): Boolean = rejectedAt[address] == generation
+
+    /**
+     * End [address]'s rejection only if [generation] is the one that owns it,
+     * returning whether it did. Used by the end of the ladder, where acting on
+     * someone else's rejection would adopt a link over the cap.
+     */
+    @Synchronized
+    fun clearIfOwned(address: String, generation: Long): Boolean =
+        if (rejectedAt[address] == generation) {
+            rejectedAt.remove(address)
+            true
+        } else {
+            false
+        }
+
+    /**
+     * End [address]'s rejection whatever generation owns it -- a disconnect or a
+     * fresh connection, both of which make every pending ladder stale.
+     */
+    @Synchronized
+    fun clear(address: String): Boolean = rejectedAt.remove(address) != null
+
+    @Synchronized
+    fun clearAll() = rejectedAt.clear()
+
+    /** Visible for tests: how many addresses are currently being turned away. */
+    @Synchronized
+    fun rejectedCount(): Int = rejectedAt.size
 }
 
 /**
@@ -197,24 +299,28 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
  * through the same coalescing resume the failover debounce uses, so a peer
  * whose link genuinely settled gets its carry drain and digest one window
  * late rather than not at all -- one re-arm per peer, not one per gated frame.
- * (Even without that, the 60s digest-maintenance pass would re-send the digest
- * -- but it would never re-run the carry drain, which is the DTN-carrying
- * half.)
+ * That resume is also where the window is read, so *every* way into it is
+ * braked (a failover from a dying sibling link, a route promotion, the
+ * deferral's own re-entry), not just the two frame handlers that arm it.
  *
- * A peer *digest* gated by the window is the one thing dropped rather than
- * queued: nothing a digest says is written to our store, so there is nothing to
- * replay, and the peer's own maintenance tick re-sends it. The cost is bounded
- * by that tick -- our outbound backlog to this peer can wait one maintenance
- * interval instead of going out into a link we just watched fail.
+ * A peer *digest* gated by the window is held too, not thrown away. Dropping
+ * it looks safe -- nothing a digest says is written to our own store, and the
+ * peer re-sends one on its own maintenance tick -- but the peer's digest is the
+ * only thing that triggers the receipts we owe it, the messages its watermark
+ * says it is missing, and the confirmation that lets us retire carried copies
+ * it already holds. Dropping it would push all of that out to that maintenance
+ * tick, which is minutes, on exactly the link that just recovered. So the
+ * gated digest's contents are stashed per peer and replayed when the deferral
+ * fires, against whatever route is elected by then.
  *
  * ## Sizing
  *
  * [DEFAULT_WINDOW_MS] matches [ReconnectBackoffTracker.INITIAL_BACKOFF_MS]:
  * that is what the far side's central role already waits before its first
  * retry to a known-failed address, so the two brakes describe the same "let
- * this settle" interval instead of fighting each other. It is deliberately far
- * shorter than the digest maintenance interval, so a peer that has genuinely
- * recovered is never held back for long.
+ * this settle" interval instead of fighting each other. Nothing waits on the
+ * digest maintenance interval, so the window is the whole delay a recovered
+ * peer sees.
  *
  * `nowMs` must come from a monotonic clock (`SystemClock.elapsedRealtime()`),
  * the same one the deferral's timer counts down on -- measuring the window on

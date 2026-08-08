@@ -284,6 +284,22 @@ class MeshService : Service() {
      * DIGEST frames for one peer can arrive on different binder threads.
      */
     private val pendingSprayDeferrals = mutableMapOf<String, Runnable>()
+
+    /**
+     * A peer DIGEST that arrived inside a peripheral spray-cooldown window,
+     * held (keyed by hex user id) until [resumeLogicalPeerSync] can answer it.
+     *
+     * Dropping it instead is what the first cut did, and it is wrong in a way
+     * that is easy to miss: [handleDigest] is the only link path that resends
+     * the receipts we owe a peer, the authored messages its watermark says it is
+     * missing, and the carried-copy confirmations that let the store retire what
+     * the peer already holds. None of that comes back on its own -- the peer's
+     * own digest-maintenance tick is minutes away, and it is our *response* that
+     * is missing, not our digest. Holding the contents costs one small entry per
+     * peer, replaced by any newer digest and taken when the deferral fires.
+     * Guarded by its own monitor (frames arrive on binder threads).
+     */
+    private val gatedDigests = mutableMapOf<String, GatedDigest>()
     private val relayMainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val bluetoothManager by lazy {
         getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -699,6 +715,7 @@ class MeshService : Service() {
             pendingSprayDeferrals.values.forEach(relayMainHandler::removeCallbacks)
             pendingSprayDeferrals.clear()
         }
+        synchronized(gatedDigests) { gatedDigests.clear() }
         // FA3: stop accepting new storeExecutor work only after every producer
         // that could submit some is already stopped above (relaySync?.stopPush()
         // clears the push client's hintsProvider and cancels any pending reconnect;
@@ -1245,14 +1262,52 @@ class MeshService : Service() {
     }
 
     /** Immediately continue sync after either promotion or failover instead
-     * of waiting for the next periodic digest. */
+     * of waiting for the next periodic digest.
+     *
+     * This is where the peripheral spray cooldown (#275) is read, rather than
+     * at the frame handlers that arm it, because this one function is the
+     * chokepoint every full burst goes through: a LAN drop failing over onto an
+     * inbound BLE address, a route promotion, an election flip inside
+     * [handleHello], and the cooldown's own deferred re-entry all land here.
+     * Checking at the entry points instead left every one of those free to spray
+     * the exact address the cooldown was protecting -- including a re-entry
+     * whose link had failed again while the deferral was counting down.
+     */
     private fun resumeLogicalPeerSync(peerUserId: ByteArray) {
         val identity = identity ?: return
         val (_, address) = MeshRouter.routeFor(peerUserId) ?: return
+        val deferralMs = peripheralSyncSprayDeferralMs(address)
+        if (deferralMs > 0L) {
+            Log.i(
+                TAG,
+                "Holding the resume burst for $address for ${deferralMs}ms " +
+                    "after a notify-reject teardown on this address",
+            )
+            scheduleDeferredSpray(peerUserId, deferralMs)
+            return
+        }
         Log.i(TAG, "Logical peer selected $address; resuming carry and digest sync")
+        // A digest this peer sent while its window was open is answered first:
+        // its carried-copy confirmations retire envelopes the drain below would
+        // otherwise re-offer, which is the spray the cooldown exists to reduce.
+        takeGatedDigest(peerUserId)?.let { gated ->
+            respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity)
+        }
         envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId)
         sendDigestTo(address, peerUserId, identity)
     }
+
+    /** A peer DIGEST held by the spray cooldown; see [gatedDigests]. */
+    private class GatedDigest(val entries: List<DigestEntry>, val recentMsgIds: List<ByteArray>)
+
+    private fun stashGatedDigest(peerUserId: ByteArray, entries: List<DigestEntry>, recentMsgIds: List<ByteArray>) {
+        synchronized(gatedDigests) {
+            gatedDigests[UserIdHex.encode(peerUserId)] = GatedDigest(entries, recentMsgIds)
+        }
+    }
+
+    private fun takeGatedDigest(peerUserId: ByteArray): GatedDigest? =
+        synchronized(gatedDigests) { gatedDigests.remove(UserIdHex.encode(peerUserId)) }
 
     private fun onLanNetworkReady(hint: Frame.LanEndpoint, networkId: String?) {
         val frame = encodeLanEndpointFrame(hint) ?: return
@@ -1574,9 +1629,11 @@ class MeshService : Service() {
         // below is what was failing. The connection is welcome back
         // immediately -- see PeripheralSprayCooldown -- but the multi-KB half
         // of the exchange waits out the window rather than re-running the
-        // thing that just broke the link. [handleDigest] gates the other
-        // outbound half of the same exchange for the same window; either one
-        // alone leaves the reconnect loop unbraked.
+        // thing that just broke the link. This handler runs its own drain and
+        // digest rather than going through [resumeLogicalPeerSync], so it needs
+        // its own read of the window; [handleDigest] gates the other outbound
+        // half of the same exchange, and any one of the three left ungated
+        // leaves the reconnect loop unbraked.
         val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
 
         // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
@@ -1618,10 +1675,11 @@ class MeshService : Service() {
     }
 
     /**
-     * Re-arms a burst the cooldown held back, so a suppressed carry drain is
-     * delayed rather than lost -- the digest would come back on its own via
-     * [checkDigestMaintenance], but nothing re-runs the DTN carry drain on a
-     * link that stays up.
+     * Re-arms a burst the cooldown held back, so a suppressed carry drain,
+     * digest and digest *response* are delayed rather than lost. Nothing else
+     * re-runs any of the three on a link that stays up: the DTN carry drain has
+     * no periodic tick at all, and the receipts and backlog a peer's digest
+     * triggers wait on that peer's own 3-5 min maintenance pass.
      *
      * It lands in [scheduleFailoverResume] rather than calling
      * [resumeLogicalPeerSync] directly so it composes with the #269 debounce
@@ -1771,19 +1829,21 @@ class MeshService : Service() {
         val resolvedPeerUserId = peerUserId!!
 
         // Post-reject cooldown (#275), the other half of the one in
-        // [handleHello]. Everything below this line is outbound on the same
+        // [handleHello]. Everything in [respondToDigest] is outbound on the same
         // notify path the cooldown was armed for, and it is the *larger* half of
         // the burst: receipts, every 1:1 message the peer's watermark says it is
         // missing, every group envelope we authored (from lamport 0 -- there are
         // no group digests yet), and the carry-queue spray. Gating only the
         // HELLO side would not brake the reconnect loop at all: our own HELLO is
         // still sent -- it must be, or the link is useless for anything -- and
-        // the peer answers a HELLO with its DIGEST, which lands right here. The
-        // peer's digest is dropped rather than queued; nothing from a digest is
-        // ever written to our store, and the peer's own maintenance tick re-sends
-        // it, so the only cost of dropping it is that our outbound backlog to
-        // this peer waits for that tick rather than going out into a link we
-        // just watched fail.
+        // the peer answers a HELLO with its DIGEST, which lands right here.
+        //
+        // The digest is held, not discarded: this is the only link path that
+        // sends those receipts and that backlog, and the peer receiving our own
+        // digest does not make it send another, so discarding would stall both
+        // until the peer's next 3-5 min maintenance tick -- on exactly the link
+        // that just recovered, and with a stuck receipt watermark being a bug
+        // this project has already shipped once (#241).
         val syncDeferralMs = peripheralSyncSprayDeferralMs(address)
         if (syncDeferralMs > 0L) {
             Log.i(
@@ -1791,10 +1851,30 @@ class MeshService : Service() {
                 "Holding the digest response for $address for ${syncDeferralMs}ms " +
                     "after a notify-reject teardown on this address",
             )
+            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds)
             scheduleDeferredSpray(resolvedPeerUserId, syncDeferralMs)
             return
         }
 
+        respondToDigest(address, resolvedPeerUserId, entries, recentMsgIds, identity)
+    }
+
+    /**
+     * The outbound half of [handleDigest], split out so a digest held by the
+     * spray cooldown can be replayed unchanged once the window lapses (see
+     * [gatedDigests]).
+     *
+     * [address] is passed rather than re-derived: on the replay path the elected
+     * route may have moved since the digest arrived, and what the peer told us
+     * about its own state is true whichever link we answer on.
+     */
+    private fun respondToDigest(
+        address: String,
+        resolvedPeerUserId: ByteArray,
+        entries: List<DigestEntry>,
+        recentMsgIds: List<ByteArray>,
+        identity: Identity,
+    ) {
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
             envelopeProcessor?.syncReceiptsFirst(identity, contact, address)

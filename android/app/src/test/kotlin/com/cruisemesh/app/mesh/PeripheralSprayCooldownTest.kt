@@ -22,9 +22,11 @@ class PeripheralSprayCooldownTest {
             ReconnectBackoffTracker.INITIAL_BACKOFF_MS,
             PeripheralSprayCooldown.DEFAULT_WINDOW_MS,
         )
-        // And far shorter than the 60s digest-maintenance pass, so a recovered
-        // peer is never held back for anything like a maintenance cycle.
-        assertTrue(PeripheralSprayCooldown.DEFAULT_WINDOW_MS < 60_000L)
+        // And far shorter than the 3-5 min re-digest interval
+        // (transport_policy.rs REDIGEST_MIN_INTERVAL_MS). That gap is the whole
+        // reason a gated digest is replayed rather than left to the peer's own
+        // maintenance pass: the window is seconds, that fallback is minutes.
+        assertTrue(PeripheralSprayCooldown.DEFAULT_WINDOW_MS < 3 * 60_000L)
     }
 
     @Test

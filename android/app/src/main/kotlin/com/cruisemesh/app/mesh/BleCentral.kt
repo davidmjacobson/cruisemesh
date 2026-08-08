@@ -43,11 +43,14 @@ private const val CONNECT_TIMEOUT_MS = 12_000L
 // doomed connects and squeezes the slot pool. Cap the central role's live
 // links (in-flight + established) below that ceiling and stop issuing new
 // connects once full: this bounds the churn while leaving headroom for the
-// peripheral role, which stays uncapped so a contact whose central can't get
-// a slot still reaches us on the inbound half of the dual-role link. Freed
-// slots (a peer rotated away or a link torn down) let the scan pick up
-// whoever is discovered next. This only bites in dense environments; a
-// typical few-phone family sits far below the cap and is unaffected.
+// peripheral role, which is rationed separately at MAX_PERIPHERAL_LINKS = 3
+// (see PeripheralLinkAdmission) so a contact whose central can't get a slot can
+// still reach us on the inbound half of the dual-role link. 5 + 3 is the whole
+// budget: the two roles describe one pool, and neither number may be raised on
+// the assumption that the other side is unbounded. Freed slots (a peer rotated
+// away or a link torn down) let the scan pick up whoever is discovered next.
+// This only bites in dense environments; a typical few-phone family sits far
+// below the cap and is unaffected.
 private const val MAX_CENTRAL_LINKS = 5
 
 // onScanResult fires once per advertisement in range, so in a saturated room

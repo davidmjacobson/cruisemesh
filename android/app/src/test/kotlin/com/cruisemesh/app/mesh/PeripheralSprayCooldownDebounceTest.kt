@@ -91,6 +91,22 @@ class PeripheralSprayCooldownDebounceTest {
     }
 
     @Test
+    fun `a window re-armed mid-deferral holds the re-entry back again`() {
+        // The deferral does not fire the burst itself -- it re-enters the one
+        // resume path, which re-reads the window rather than treating its own
+        // timer as proof the link settled. If the link failed a second time
+        // while the deferral was counting down, the burst waits out the new
+        // window instead of landing on a link that had just broken again.
+        val cooldown = PeripheralSprayCooldown(windowMs = 5_000)
+        cooldown.armAfterRejectTeardown("aa:bb", nowMs = 1_000)
+        val firesAtMs = 1_000 + cooldown.deferralMs("aa:bb", nowMs = 1_000)
+
+        cooldown.armAfterRejectTeardown("aa:bb", nowMs = firesAtMs - 500)
+
+        assertEquals(4_500L, cooldown.deferralMs("aa:bb", nowMs = firesAtMs))
+    }
+
+    @Test
     fun `one address's cooldown never holds back another peer's resume`() {
         val cooldown = PeripheralSprayCooldown(windowMs = 5_000)
         val debounce = FailoverResumeDebounce(windowMs = 300)
