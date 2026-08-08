@@ -9,3 +9,10 @@
 # box, and systemd reads a CRLF "ExecStart=...\r" as a path that ends in a
 # carriage return.
 relayd/deploy/* text eol=lf
+# Screenshot references and every other image are bytes, not text. Git's
+# autodetection already treats them as binary, but this checkout runs with
+# core.autocrlf=true, and an explicit rule is cheaper than discovering a
+# line-ending rewrite inside a PNG the hard way.
+*.png binary
+*.jpg binary
+*.webp binary

@@ -8877,6 +8877,570 @@ public func FfiConverterTypeCoreChatPreview_lower(_ value: CoreChatPreview) -> R
 
 
 /**
+ * The facts behind the state, for the shell to render into its own copy.
+ *
+ * Counts and enums only. Path fields carry the *normalized* states -- for
+ * instance a relay reporting `Connected` with no validated internet comes
+ * back as [`CoreRelayPathState::WaitingForInternet`] -- so the Paths rows and
+ * the health card are rendered from one consistent set of facts and cannot
+ * contradict each other on screen.
+ */
+public struct CoreConnectionEvidence {
+    public var nearbyFriendCount: UInt32
+    public var bluetooth: CoreDirectPathState
+    public var bluetoothLinks: UInt32
+    public var localWifi: CoreDirectPathState
+    public var localWifiLinks: UInt32
+    public var relay: CoreRelayPathState
+    /**
+     * At least one path could carry a message right now.
+     */
+    public var anyPathUsable: Bool
+    /**
+     * This phone's own Shore Pass path is usable for delivery right now.
+     * Feeds the relay half of the reachable-now test (see
+     * [`core_person_reach`]).
+     */
+    public var ownRelayUsable: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nearbyFriendCount: UInt32, bluetooth: CoreDirectPathState, bluetoothLinks: UInt32, localWifi: CoreDirectPathState, localWifiLinks: UInt32, relay: CoreRelayPathState,
+        /**
+         * At least one path could carry a message right now.
+         */anyPathUsable: Bool,
+        /**
+         * This phone's own Shore Pass path is usable for delivery right now.
+         * Feeds the relay half of the reachable-now test (see
+         * [`core_person_reach`]).
+         */ownRelayUsable: Bool) {
+        self.nearbyFriendCount = nearbyFriendCount
+        self.bluetooth = bluetooth
+        self.bluetoothLinks = bluetoothLinks
+        self.localWifi = localWifi
+        self.localWifiLinks = localWifiLinks
+        self.relay = relay
+        self.anyPathUsable = anyPathUsable
+        self.ownRelayUsable = ownRelayUsable
+    }
+}
+
+
+
+extension CoreConnectionEvidence: Equatable, Hashable {
+    public static func ==(lhs: CoreConnectionEvidence, rhs: CoreConnectionEvidence) -> Bool {
+        if lhs.nearbyFriendCount != rhs.nearbyFriendCount {
+            return false
+        }
+        if lhs.bluetooth != rhs.bluetooth {
+            return false
+        }
+        if lhs.bluetoothLinks != rhs.bluetoothLinks {
+            return false
+        }
+        if lhs.localWifi != rhs.localWifi {
+            return false
+        }
+        if lhs.localWifiLinks != rhs.localWifiLinks {
+            return false
+        }
+        if lhs.relay != rhs.relay {
+            return false
+        }
+        if lhs.anyPathUsable != rhs.anyPathUsable {
+            return false
+        }
+        if lhs.ownRelayUsable != rhs.ownRelayUsable {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nearbyFriendCount)
+        hasher.combine(bluetooth)
+        hasher.combine(bluetoothLinks)
+        hasher.combine(localWifi)
+        hasher.combine(localWifiLinks)
+        hasher.combine(relay)
+        hasher.combine(anyPathUsable)
+        hasher.combine(ownRelayUsable)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreConnectionEvidence: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreConnectionEvidence {
+        return
+            try CoreConnectionEvidence(
+                nearbyFriendCount: FfiConverterUInt32.read(from: &buf),
+                bluetooth: FfiConverterTypeCoreDirectPathState.read(from: &buf),
+                bluetoothLinks: FfiConverterUInt32.read(from: &buf),
+                localWifi: FfiConverterTypeCoreDirectPathState.read(from: &buf),
+                localWifiLinks: FfiConverterUInt32.read(from: &buf),
+                relay: FfiConverterTypeCoreRelayPathState.read(from: &buf),
+                anyPathUsable: FfiConverterBool.read(from: &buf),
+                ownRelayUsable: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreConnectionEvidence, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.nearbyFriendCount, into: &buf)
+        FfiConverterTypeCoreDirectPathState.write(value.bluetooth, into: &buf)
+        FfiConverterUInt32.write(value.bluetoothLinks, into: &buf)
+        FfiConverterTypeCoreDirectPathState.write(value.localWifi, into: &buf)
+        FfiConverterUInt32.write(value.localWifiLinks, into: &buf)
+        FfiConverterTypeCoreRelayPathState.write(value.relay, into: &buf)
+        FfiConverterBool.write(value.anyPathUsable, into: &buf)
+        FfiConverterBool.write(value.ownRelayUsable, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionEvidence_lift(_ buf: RustBuffer) throws -> CoreConnectionEvidence {
+    return try FfiConverterTypeCoreConnectionEvidence.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionEvidence_lower(_ value: CoreConnectionEvidence) -> RustBuffer {
+    return FfiConverterTypeCoreConnectionEvidence.lower(value)
+}
+
+
+/**
+ * Everything the overall health classification consumes.
+ *
+ * Deliberately contains no per-person data. See the module note: the overall
+ * card describes *this device's* ability to take part, so one friend's
+ * broken card cannot reach it even by mistake.
+ */
+public struct CoreConnectionHealthInput {
+    public var runtime: CoreMeshRuntime
+    public var bluetooth: CoreDirectPathState
+    /**
+     * Live direct Bluetooth links right now.
+     */
+    public var bluetoothLinks: UInt32
+    public var localWifi: CoreDirectPathState
+    /**
+     * Live direct local Wi-Fi links right now.
+     */
+    public var localWifiLinks: UInt32
+    public var relay: CoreRelayPathState
+    /**
+     * A network with validated internet is available for relay traffic.
+     */
+    public var validatedInternet: Bool
+    /**
+     * Friends (not strangers) reachable over a live direct link right now.
+     * Zero is an ordinary, healthy number.
+     */
+    public var nearbyFriendCount: UInt32
+    /**
+     * When the current unresolved check started, epoch ms; `0` when nothing
+     * is pending. Used only to bound [`CoreConnectionHealth::Checking`].
+     */
+    public var checkingSinceMs: Int64
+    public var nowMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(runtime: CoreMeshRuntime, bluetooth: CoreDirectPathState,
+        /**
+         * Live direct Bluetooth links right now.
+         */bluetoothLinks: UInt32, localWifi: CoreDirectPathState,
+        /**
+         * Live direct local Wi-Fi links right now.
+         */localWifiLinks: UInt32, relay: CoreRelayPathState,
+        /**
+         * A network with validated internet is available for relay traffic.
+         */validatedInternet: Bool,
+        /**
+         * Friends (not strangers) reachable over a live direct link right now.
+         * Zero is an ordinary, healthy number.
+         */nearbyFriendCount: UInt32,
+        /**
+         * When the current unresolved check started, epoch ms; `0` when nothing
+         * is pending. Used only to bound [`CoreConnectionHealth::Checking`].
+         */checkingSinceMs: Int64, nowMs: Int64) {
+        self.runtime = runtime
+        self.bluetooth = bluetooth
+        self.bluetoothLinks = bluetoothLinks
+        self.localWifi = localWifi
+        self.localWifiLinks = localWifiLinks
+        self.relay = relay
+        self.validatedInternet = validatedInternet
+        self.nearbyFriendCount = nearbyFriendCount
+        self.checkingSinceMs = checkingSinceMs
+        self.nowMs = nowMs
+    }
+}
+
+
+
+extension CoreConnectionHealthInput: Equatable, Hashable {
+    public static func ==(lhs: CoreConnectionHealthInput, rhs: CoreConnectionHealthInput) -> Bool {
+        if lhs.runtime != rhs.runtime {
+            return false
+        }
+        if lhs.bluetooth != rhs.bluetooth {
+            return false
+        }
+        if lhs.bluetoothLinks != rhs.bluetoothLinks {
+            return false
+        }
+        if lhs.localWifi != rhs.localWifi {
+            return false
+        }
+        if lhs.localWifiLinks != rhs.localWifiLinks {
+            return false
+        }
+        if lhs.relay != rhs.relay {
+            return false
+        }
+        if lhs.validatedInternet != rhs.validatedInternet {
+            return false
+        }
+        if lhs.nearbyFriendCount != rhs.nearbyFriendCount {
+            return false
+        }
+        if lhs.checkingSinceMs != rhs.checkingSinceMs {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(runtime)
+        hasher.combine(bluetooth)
+        hasher.combine(bluetoothLinks)
+        hasher.combine(localWifi)
+        hasher.combine(localWifiLinks)
+        hasher.combine(relay)
+        hasher.combine(validatedInternet)
+        hasher.combine(nearbyFriendCount)
+        hasher.combine(checkingSinceMs)
+        hasher.combine(nowMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreConnectionHealthInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreConnectionHealthInput {
+        return
+            try CoreConnectionHealthInput(
+                runtime: FfiConverterTypeCoreMeshRuntime.read(from: &buf),
+                bluetooth: FfiConverterTypeCoreDirectPathState.read(from: &buf),
+                bluetoothLinks: FfiConverterUInt32.read(from: &buf),
+                localWifi: FfiConverterTypeCoreDirectPathState.read(from: &buf),
+                localWifiLinks: FfiConverterUInt32.read(from: &buf),
+                relay: FfiConverterTypeCoreRelayPathState.read(from: &buf),
+                validatedInternet: FfiConverterBool.read(from: &buf),
+                nearbyFriendCount: FfiConverterUInt32.read(from: &buf),
+                checkingSinceMs: FfiConverterInt64.read(from: &buf),
+                nowMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreConnectionHealthInput, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreMeshRuntime.write(value.runtime, into: &buf)
+        FfiConverterTypeCoreDirectPathState.write(value.bluetooth, into: &buf)
+        FfiConverterUInt32.write(value.bluetoothLinks, into: &buf)
+        FfiConverterTypeCoreDirectPathState.write(value.localWifi, into: &buf)
+        FfiConverterUInt32.write(value.localWifiLinks, into: &buf)
+        FfiConverterTypeCoreRelayPathState.write(value.relay, into: &buf)
+        FfiConverterBool.write(value.validatedInternet, into: &buf)
+        FfiConverterUInt32.write(value.nearbyFriendCount, into: &buf)
+        FfiConverterInt64.write(value.checkingSinceMs, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealthInput_lift(_ buf: RustBuffer) throws -> CoreConnectionHealthInput {
+    return try FfiConverterTypeCoreConnectionHealthInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealthInput_lower(_ value: CoreConnectionHealthInput) -> RustBuffer {
+    return FfiConverterTypeCoreConnectionHealthInput.lower(value)
+}
+
+
+/**
+ * The whole answer: one state, its evidence, and at most one action.
+ */
+public struct CoreConnectionHealthReport {
+    public var state: CoreConnectionHealth
+    public var evidence: CoreConnectionEvidence
+    public var reason: CoreHealthReason?
+    public var action: CoreHealthAction?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: CoreConnectionHealth, evidence: CoreConnectionEvidence, reason: CoreHealthReason?, action: CoreHealthAction?) {
+        self.state = state
+        self.evidence = evidence
+        self.reason = reason
+        self.action = action
+    }
+}
+
+
+
+extension CoreConnectionHealthReport: Equatable, Hashable {
+    public static func ==(lhs: CoreConnectionHealthReport, rhs: CoreConnectionHealthReport) -> Bool {
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.evidence != rhs.evidence {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.action != rhs.action {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(state)
+        hasher.combine(evidence)
+        hasher.combine(reason)
+        hasher.combine(action)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreConnectionHealthReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreConnectionHealthReport {
+        return
+            try CoreConnectionHealthReport(
+                state: FfiConverterTypeCoreConnectionHealth.read(from: &buf),
+                evidence: FfiConverterTypeCoreConnectionEvidence.read(from: &buf),
+                reason: FfiConverterOptionTypeCoreHealthReason.read(from: &buf),
+                action: FfiConverterOptionTypeCoreHealthAction.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreConnectionHealthReport, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreConnectionHealth.write(value.state, into: &buf)
+        FfiConverterTypeCoreConnectionEvidence.write(value.evidence, into: &buf)
+        FfiConverterOptionTypeCoreHealthReason.write(value.reason, into: &buf)
+        FfiConverterOptionTypeCoreHealthAction.write(value.action, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealthReport_lift(_ buf: RustBuffer) throws -> CoreConnectionHealthReport {
+    return try FfiConverterTypeCoreConnectionHealthReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealthReport_lower(_ value: CoreConnectionHealthReport) -> RustBuffer {
+    return FfiConverterTypeCoreConnectionHealthReport.lower(value)
+}
+
+
+/**
+ * Everything the per-person delivery line consumes.
+ */
+public struct CoreDeliveryLineInput {
+    /**
+     * Rows still awaiting *relay upload* for this recipient, straight from
+     * the diagnostic relay-depth query. See
+     * [`core_relay_queue_reflects_delivery`] for why this number is only
+     * sometimes evidence about delivery.
+     */
+    public var queued: UInt32
+    /**
+     * This phone's own Shore Pass path, normalized
+     * ([`CoreConnectionEvidence::relay`]).
+     */
+    public var relay: CoreRelayPathState
+    /**
+     * This phone's own Shore Pass path can deliver right now
+     * ([`CoreConnectionEvidence::own_relay_usable`]).
+     */
+    public var ownRelayUsable: Bool
+    /**
+     * Their friend card carries an internet-delivery endpoint at all.
+     * Without one, no amount of internet on this phone reaches them.
+     */
+    public var contactHasRelayEndpoint: Bool
+    /**
+     * Their endpoint has been written off after authoritatively rejecting us
+     * (`core_contact_relay_endpoint_usable` said no), so it is not a route
+     * today.
+     */
+    public var contactRelayStale: Bool
+    /**
+     * A live direct link to this person exists right now.
+     */
+    public var directLink: Bool
+    /**
+     * The freshest thing recorded about this person is a delivery receipt --
+     * the page's own row says they received a message from us.
+     */
+    public var deliveryReceiptIsNewestEvidence: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Rows still awaiting *relay upload* for this recipient, straight from
+         * the diagnostic relay-depth query. See
+         * [`core_relay_queue_reflects_delivery`] for why this number is only
+         * sometimes evidence about delivery.
+         */queued: UInt32,
+        /**
+         * This phone's own Shore Pass path, normalized
+         * ([`CoreConnectionEvidence::relay`]).
+         */relay: CoreRelayPathState,
+        /**
+         * This phone's own Shore Pass path can deliver right now
+         * ([`CoreConnectionEvidence::own_relay_usable`]).
+         */ownRelayUsable: Bool,
+        /**
+         * Their friend card carries an internet-delivery endpoint at all.
+         * Without one, no amount of internet on this phone reaches them.
+         */contactHasRelayEndpoint: Bool,
+        /**
+         * Their endpoint has been written off after authoritatively rejecting us
+         * (`core_contact_relay_endpoint_usable` said no), so it is not a route
+         * today.
+         */contactRelayStale: Bool,
+        /**
+         * A live direct link to this person exists right now.
+         */directLink: Bool,
+        /**
+         * The freshest thing recorded about this person is a delivery receipt --
+         * the page's own row says they received a message from us.
+         */deliveryReceiptIsNewestEvidence: Bool) {
+        self.queued = queued
+        self.relay = relay
+        self.ownRelayUsable = ownRelayUsable
+        self.contactHasRelayEndpoint = contactHasRelayEndpoint
+        self.contactRelayStale = contactRelayStale
+        self.directLink = directLink
+        self.deliveryReceiptIsNewestEvidence = deliveryReceiptIsNewestEvidence
+    }
+}
+
+
+
+extension CoreDeliveryLineInput: Equatable, Hashable {
+    public static func ==(lhs: CoreDeliveryLineInput, rhs: CoreDeliveryLineInput) -> Bool {
+        if lhs.queued != rhs.queued {
+            return false
+        }
+        if lhs.relay != rhs.relay {
+            return false
+        }
+        if lhs.ownRelayUsable != rhs.ownRelayUsable {
+            return false
+        }
+        if lhs.contactHasRelayEndpoint != rhs.contactHasRelayEndpoint {
+            return false
+        }
+        if lhs.contactRelayStale != rhs.contactRelayStale {
+            return false
+        }
+        if lhs.directLink != rhs.directLink {
+            return false
+        }
+        if lhs.deliveryReceiptIsNewestEvidence != rhs.deliveryReceiptIsNewestEvidence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(queued)
+        hasher.combine(relay)
+        hasher.combine(ownRelayUsable)
+        hasher.combine(contactHasRelayEndpoint)
+        hasher.combine(contactRelayStale)
+        hasher.combine(directLink)
+        hasher.combine(deliveryReceiptIsNewestEvidence)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryLineInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryLineInput {
+        return
+            try CoreDeliveryLineInput(
+                queued: FfiConverterUInt32.read(from: &buf),
+                relay: FfiConverterTypeCoreRelayPathState.read(from: &buf),
+                ownRelayUsable: FfiConverterBool.read(from: &buf),
+                contactHasRelayEndpoint: FfiConverterBool.read(from: &buf),
+                contactRelayStale: FfiConverterBool.read(from: &buf),
+                directLink: FfiConverterBool.read(from: &buf),
+                deliveryReceiptIsNewestEvidence: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDeliveryLineInput, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.queued, into: &buf)
+        FfiConverterTypeCoreRelayPathState.write(value.relay, into: &buf)
+        FfiConverterBool.write(value.ownRelayUsable, into: &buf)
+        FfiConverterBool.write(value.contactHasRelayEndpoint, into: &buf)
+        FfiConverterBool.write(value.contactRelayStale, into: &buf)
+        FfiConverterBool.write(value.directLink, into: &buf)
+        FfiConverterBool.write(value.deliveryReceiptIsNewestEvidence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLineInput_lift(_ buf: RustBuffer) throws -> CoreDeliveryLineInput {
+    return try FfiConverterTypeCoreDeliveryLineInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryLineInput_lower(_ value: CoreDeliveryLineInput) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryLineInput.lower(value)
+}
+
+
+/**
  * One link found in a message body.
  *
  * The range is half-open in **UTF-16 code units** over the body that was
@@ -9656,6 +10220,341 @@ public func FfiConverterTypeCoreMessageTarget_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCoreMessageTarget_lower(_ value: CoreMessageTarget) -> RustBuffer {
     return FfiConverterTypeCoreMessageTarget.lower(value)
+}
+
+
+/**
+ * The People section, grouped and ordered. Blocked identities appear in
+ * none of these lists.
+ */
+public struct CorePeopleGroups {
+    public var needsAttention: [CorePersonPlacement]
+    public var reachableNow: [CorePersonPlacement]
+    public var otherPeople: [CorePersonPlacement]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(needsAttention: [CorePersonPlacement], reachableNow: [CorePersonPlacement], otherPeople: [CorePersonPlacement]) {
+        self.needsAttention = needsAttention
+        self.reachableNow = reachableNow
+        self.otherPeople = otherPeople
+    }
+}
+
+
+
+extension CorePeopleGroups: Equatable, Hashable {
+    public static func ==(lhs: CorePeopleGroups, rhs: CorePeopleGroups) -> Bool {
+        if lhs.needsAttention != rhs.needsAttention {
+            return false
+        }
+        if lhs.reachableNow != rhs.reachableNow {
+            return false
+        }
+        if lhs.otherPeople != rhs.otherPeople {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(needsAttention)
+        hasher.combine(reachableNow)
+        hasher.combine(otherPeople)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePeopleGroups: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePeopleGroups {
+        return
+            try CorePeopleGroups(
+                needsAttention: FfiConverterSequenceTypeCorePersonPlacement.read(from: &buf),
+                reachableNow: FfiConverterSequenceTypeCorePersonPlacement.read(from: &buf),
+                otherPeople: FfiConverterSequenceTypeCorePersonPlacement.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CorePeopleGroups, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCorePersonPlacement.write(value.needsAttention, into: &buf)
+        FfiConverterSequenceTypeCorePersonPlacement.write(value.reachableNow, into: &buf)
+        FfiConverterSequenceTypeCorePersonPlacement.write(value.otherPeople, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePeopleGroups_lift(_ buf: RustBuffer) throws -> CorePeopleGroups {
+    return try FfiConverterTypeCorePeopleGroups.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePeopleGroups_lower(_ value: CorePeopleGroups) -> RustBuffer {
+    return FfiConverterTypeCorePeopleGroups.lower(value)
+}
+
+
+/**
+ * One person's facts, as the shell already holds them.
+ */
+public struct CorePersonHealthInput {
+    public var userId: Data
+    /**
+     * The name the shell will render. Used only as a sort key; it is never
+     * echoed back.
+     */
+    public var displayName: String
+    /**
+     * This identity carries a block tombstone (`MessageStore::is_user_blocked`
+     * / the cached blocked set). A blocked person is dropped by
+     * [`core_group_people`] before any grouping happens.
+     */
+    public var blocked: Bool
+    /**
+     * A live direct link right now, and which radio it uses.
+     */
+    public var directLink: CoreDirectLink?
+    /**
+     * Relay presence last-seen, epoch ms; `0` when never seen.
+     */
+    public var presenceLastSeenMs: Int64
+    /**
+     * Freshest evidence of any kind that their device was alive (HELLO,
+     * message, receipt, presence), epoch ms; `0` when there is no history.
+     */
+    public var lastSeenMs: Int64
+    /**
+     * Why they need attention, when they do.
+     */
+    public var attention: CorePersonAttention?
+    /**
+     * Timestamp of the oldest affected user-visible message, epoch ms; `0`
+     * when unknown. Orders the Needs attention group after severity.
+     */
+    public var attentionSinceMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data,
+        /**
+         * The name the shell will render. Used only as a sort key; it is never
+         * echoed back.
+         */displayName: String,
+        /**
+         * This identity carries a block tombstone (`MessageStore::is_user_blocked`
+         * / the cached blocked set). A blocked person is dropped by
+         * [`core_group_people`] before any grouping happens.
+         */blocked: Bool,
+        /**
+         * A live direct link right now, and which radio it uses.
+         */directLink: CoreDirectLink?,
+        /**
+         * Relay presence last-seen, epoch ms; `0` when never seen.
+         */presenceLastSeenMs: Int64,
+        /**
+         * Freshest evidence of any kind that their device was alive (HELLO,
+         * message, receipt, presence), epoch ms; `0` when there is no history.
+         */lastSeenMs: Int64,
+        /**
+         * Why they need attention, when they do.
+         */attention: CorePersonAttention?,
+        /**
+         * Timestamp of the oldest affected user-visible message, epoch ms; `0`
+         * when unknown. Orders the Needs attention group after severity.
+         */attentionSinceMs: Int64) {
+        self.userId = userId
+        self.displayName = displayName
+        self.blocked = blocked
+        self.directLink = directLink
+        self.presenceLastSeenMs = presenceLastSeenMs
+        self.lastSeenMs = lastSeenMs
+        self.attention = attention
+        self.attentionSinceMs = attentionSinceMs
+    }
+}
+
+
+
+extension CorePersonHealthInput: Equatable, Hashable {
+    public static func ==(lhs: CorePersonHealthInput, rhs: CorePersonHealthInput) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.displayName != rhs.displayName {
+            return false
+        }
+        if lhs.blocked != rhs.blocked {
+            return false
+        }
+        if lhs.directLink != rhs.directLink {
+            return false
+        }
+        if lhs.presenceLastSeenMs != rhs.presenceLastSeenMs {
+            return false
+        }
+        if lhs.lastSeenMs != rhs.lastSeenMs {
+            return false
+        }
+        if lhs.attention != rhs.attention {
+            return false
+        }
+        if lhs.attentionSinceMs != rhs.attentionSinceMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(displayName)
+        hasher.combine(blocked)
+        hasher.combine(directLink)
+        hasher.combine(presenceLastSeenMs)
+        hasher.combine(lastSeenMs)
+        hasher.combine(attention)
+        hasher.combine(attentionSinceMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonHealthInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonHealthInput {
+        return
+            try CorePersonHealthInput(
+                userId: FfiConverterData.read(from: &buf),
+                displayName: FfiConverterString.read(from: &buf),
+                blocked: FfiConverterBool.read(from: &buf),
+                directLink: FfiConverterOptionTypeCoreDirectLink.read(from: &buf),
+                presenceLastSeenMs: FfiConverterInt64.read(from: &buf),
+                lastSeenMs: FfiConverterInt64.read(from: &buf),
+                attention: FfiConverterOptionTypeCorePersonAttention.read(from: &buf),
+                attentionSinceMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CorePersonHealthInput, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterString.write(value.displayName, into: &buf)
+        FfiConverterBool.write(value.blocked, into: &buf)
+        FfiConverterOptionTypeCoreDirectLink.write(value.directLink, into: &buf)
+        FfiConverterInt64.write(value.presenceLastSeenMs, into: &buf)
+        FfiConverterInt64.write(value.lastSeenMs, into: &buf)
+        FfiConverterOptionTypeCorePersonAttention.write(value.attention, into: &buf)
+        FfiConverterInt64.write(value.attentionSinceMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonHealthInput_lift(_ buf: RustBuffer) throws -> CorePersonHealthInput {
+    return try FfiConverterTypeCorePersonHealthInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonHealthInput_lower(_ value: CorePersonHealthInput) -> RustBuffer {
+    return FfiConverterTypeCorePersonHealthInput.lower(value)
+}
+
+
+/**
+ * Where one person lands, and what the row should say about reachability.
+ *
+ * Carries the user id rather than the name: the shell already has the name,
+ * and this record travels through logs and tests where a name should not.
+ */
+public struct CorePersonPlacement {
+    public var userId: Data
+    public var group: CorePersonGroup
+    public var reach: CorePersonReach
+    public var attention: CorePersonAttention?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(userId: Data, group: CorePersonGroup, reach: CorePersonReach, attention: CorePersonAttention?) {
+        self.userId = userId
+        self.group = group
+        self.reach = reach
+        self.attention = attention
+    }
+}
+
+
+
+extension CorePersonPlacement: Equatable, Hashable {
+    public static func ==(lhs: CorePersonPlacement, rhs: CorePersonPlacement) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.group != rhs.group {
+            return false
+        }
+        if lhs.reach != rhs.reach {
+            return false
+        }
+        if lhs.attention != rhs.attention {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(group)
+        hasher.combine(reach)
+        hasher.combine(attention)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonPlacement: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonPlacement {
+        return
+            try CorePersonPlacement(
+                userId: FfiConverterData.read(from: &buf),
+                group: FfiConverterTypeCorePersonGroup.read(from: &buf),
+                reach: FfiConverterTypeCorePersonReach.read(from: &buf),
+                attention: FfiConverterOptionTypeCorePersonAttention.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CorePersonPlacement, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterTypeCorePersonGroup.write(value.group, into: &buf)
+        FfiConverterTypeCorePersonReach.write(value.reach, into: &buf)
+        FfiConverterOptionTypeCorePersonAttention.write(value.attention, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonPlacement_lift(_ buf: RustBuffer) throws -> CorePersonPlacement {
+    return try FfiConverterTypeCorePersonPlacement.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonPlacement_lower(_ value: CorePersonPlacement) -> RustBuffer {
+    return FfiConverterTypeCorePersonPlacement.lower(value)
 }
 
 
@@ -14630,6 +15529,348 @@ extension CoreBackupError: Foundation.LocalizedError {
     }
 }
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The overall interpretation shown by the connection health card -- and, once
+ * the shells are pointed at it, by the in-chat status pill, so the two can
+ * never disagree.
+ */
+
+public enum CoreConnectionHealth {
+
+    /**
+     * Startup or an active check, with no verdict yet. Bounded by
+     * [`CONNECTION_CHECKING_TIMEOUT_MS`].
+     */
+    case checking
+    /**
+     * Running with at least one path able to carry a message, and nothing
+     * degraded.
+     */
+    case ready
+    /**
+     * Running with at least one useful path, but another expected path is
+     * unavailable or temporarily degraded.
+     */
+    case limited
+    /**
+     * A person needs to do something, or nothing can carry a message at all.
+     */
+    case needsAttention
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreConnectionHealth: FfiConverterRustBuffer {
+    typealias SwiftType = CoreConnectionHealth
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreConnectionHealth {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .checking
+
+        case 2: return .ready
+
+        case 3: return .limited
+
+        case 4: return .needsAttention
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreConnectionHealth, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .checking:
+            writeInt(&buf, Int32(1))
+
+
+        case .ready:
+            writeInt(&buf, Int32(2))
+
+
+        case .limited:
+            writeInt(&buf, Int32(3))
+
+
+        case .needsAttention:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealth_lift(_ buf: RustBuffer) throws -> CoreConnectionHealth {
+    return try FfiConverterTypeCoreConnectionHealth.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreConnectionHealth_lower(_ value: CoreConnectionHealth) -> RustBuffer {
+    return FfiConverterTypeCoreConnectionHealth.lower(value)
+}
+
+
+
+extension CoreConnectionHealth: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The user-visible meaning of messages still waiting for one person.
+ *
+ * Deliberately has no error member. Phase 1 reads only signals that already
+ * exist -- receipts, waiting work, and path state -- and none of those can
+ * prove a terminal failure. Waiting for a friend who is simply elsewhere is
+ * what this product does, so it is never dressed as a fault. The blocked and
+ * delayed reasons arrive with the per-recipient read model in Phase 2, which
+ * is also what will let this take a real age.
+ */
+
+public enum CoreDeliveryState {
+
+    /**
+     * A route to this person is usable now.
+     */
+    case sending
+    /**
+     * No route right now; the work travels at the next encounter.
+     */
+    case willDeliverWhenReconnected
+    /**
+     * Shore Pass is the only known route and this phone has no internet.
+     */
+    case waitingForInternet
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .sending
+
+        case 2: return .willDeliverWhenReconnected
+
+        case 3: return .waitingForInternet
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDeliveryState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .sending:
+            writeInt(&buf, Int32(1))
+
+
+        case .willDeliverWhenReconnected:
+            writeInt(&buf, Int32(2))
+
+
+        case .waitingForInternet:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryState_lift(_ buf: RustBuffer) throws -> CoreDeliveryState {
+    return try FfiConverterTypeCoreDeliveryState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryState_lower(_ value: CoreDeliveryState) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryState.lower(value)
+}
+
+
+
+extension CoreDeliveryState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which direct radio a live link to a person uses.
+ */
+
+public enum CoreDirectLink {
+
+    case bluetooth
+    case localWifi
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDirectLink: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDirectLink
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDirectLink {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .bluetooth
+
+        case 2: return .localWifi
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDirectLink, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .bluetooth:
+            writeInt(&buf, Int32(1))
+
+
+        case .localWifi:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDirectLink_lift(_ buf: RustBuffer) throws -> CoreDirectLink {
+    return try FfiConverterTypeCoreDirectLink.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDirectLink_lower(_ value: CoreDirectLink) -> RustBuffer {
+    return FfiConverterTypeCoreDirectLink.lower(value)
+}
+
+
+
+extension CoreDirectLink: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Availability of one of *this phone's* direct radio paths.
+ *
+ * "Available" is about the radio, not about company: Bluetooth with nobody
+ * in range is available and listening, which is the normal state of a phone
+ * in a cabin at night.
+ */
+
+public enum CoreDirectPathState {
+
+    /**
+     * Radio off, or the permission to use it was refused.
+     */
+    case off
+    /**
+     * Coming up; no verdict yet.
+     */
+    case starting
+    /**
+     * Up and able to carry a message the moment someone is in range.
+     */
+    case available
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDirectPathState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDirectPathState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDirectPathState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .off
+
+        case 2: return .starting
+
+        case 3: return .available
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDirectPathState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .off:
+            writeInt(&buf, Int32(1))
+
+
+        case .starting:
+            writeInt(&buf, Int32(2))
+
+
+        case .available:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDirectPathState_lift(_ buf: RustBuffer) throws -> CoreDirectPathState {
+    return try FfiConverterTypeCoreDirectPathState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDirectPathState_lower(_ value: CoreDirectPathState) -> RustBuffer {
+    return FfiConverterTypeCoreDirectPathState.lower(value)
+}
+
+
+
+extension CoreDirectPathState: Equatable, Hashable {}
+
+
+
 
 public enum CoreError {
 
@@ -14732,6 +15973,246 @@ extension CoreError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The single action the card may offer. `None` means the app has nothing
+ * honest to offer and should say only what is true.
+ */
+
+public enum CoreHealthAction {
+
+    case startMesh
+    case turnOnBluetooth
+    case manageShorePass
+    case howToFix
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreHealthAction: FfiConverterRustBuffer {
+    typealias SwiftType = CoreHealthAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreHealthAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .startMesh
+
+        case 2: return .turnOnBluetooth
+
+        case 3: return .manageShorePass
+
+        case 4: return .howToFix
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreHealthAction, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .startMesh:
+            writeInt(&buf, Int32(1))
+
+
+        case .turnOnBluetooth:
+            writeInt(&buf, Int32(2))
+
+
+        case .manageShorePass:
+            writeInt(&buf, Int32(3))
+
+
+        case .howToFix:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHealthAction_lift(_ buf: RustBuffer) throws -> CoreHealthAction {
+    return try FfiConverterTypeCoreHealthAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHealthAction_lower(_ value: CoreHealthAction) -> RustBuffer {
+    return FfiConverterTypeCoreHealthAction.lower(value)
+}
+
+
+
+extension CoreHealthAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why the state is not [`CoreConnectionHealth::Ready`].
+ *
+ * One reason, not a list: the card shows a single evidence line, and ranking
+ * the reasons here is what keeps both shells picking the same one. Raw
+ * per-fault detail stays in diagnostics.
+ */
+
+public enum CoreHealthReason {
+
+    /**
+     * The mesh service is not running.
+     */
+    case meshStopped
+    /**
+     * Bluetooth is off, so this phone cannot meet nearby phones.
+     */
+    case bluetoothOff
+    /**
+     * Our pass was turned off.
+     */
+    case passSuspended
+    /**
+     * Our pass has lapsed.
+     */
+    case passExpired
+    /**
+     * Our own saved setup was rejected.
+     */
+    case ownSetupRejected
+    /**
+     * Our family's hosted storage is full.
+     */
+    case storageFull
+    /**
+     * We have internet and the service did not answer.
+     */
+    case shorePassUnreachable
+    /**
+     * No validated internet, so the Shore Pass path is resting.
+     */
+    case waitingForInternet
+    /**
+     * The shared family limit slowed syncing; recovers by itself.
+     */
+    case shorePassSlowed
+    /**
+     * Nothing can carry a message right now, and no more specific reason
+     * applies (for example, a radio stuck coming up).
+     */
+    case noPathAvailable
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreHealthReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreHealthReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreHealthReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .meshStopped
+
+        case 2: return .bluetoothOff
+
+        case 3: return .passSuspended
+
+        case 4: return .passExpired
+
+        case 5: return .ownSetupRejected
+
+        case 6: return .storageFull
+
+        case 7: return .shorePassUnreachable
+
+        case 8: return .waitingForInternet
+
+        case 9: return .shorePassSlowed
+
+        case 10: return .noPathAvailable
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreHealthReason, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .meshStopped:
+            writeInt(&buf, Int32(1))
+
+
+        case .bluetoothOff:
+            writeInt(&buf, Int32(2))
+
+
+        case .passSuspended:
+            writeInt(&buf, Int32(3))
+
+
+        case .passExpired:
+            writeInt(&buf, Int32(4))
+
+
+        case .ownSetupRejected:
+            writeInt(&buf, Int32(5))
+
+
+        case .storageFull:
+            writeInt(&buf, Int32(6))
+
+
+        case .shorePassUnreachable:
+            writeInt(&buf, Int32(7))
+
+
+        case .waitingForInternet:
+            writeInt(&buf, Int32(8))
+
+
+        case .shorePassSlowed:
+            writeInt(&buf, Int32(9))
+
+
+        case .noPathAvailable:
+            writeInt(&buf, Int32(10))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHealthReason_lift(_ buf: RustBuffer) throws -> CoreHealthReason {
+    return try FfiConverterTypeCoreHealthReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreHealthReason_lower(_ value: CoreHealthReason) -> RustBuffer {
+    return FfiConverterTypeCoreHealthReason.lower(value)
+}
+
+
+
+extension CoreHealthReason: Equatable, Hashable {}
+
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -15069,6 +16550,378 @@ extension CoreLinkScheme: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Whether the mesh service itself is running.
+ *
+ * Mirrors Android's `MeshRuntimeState` and the iOS equivalent, minus their
+ * display labels -- the labels are shell resources.
+ */
+
+public enum CoreMeshRuntime {
+
+    /**
+     * Not running: nothing can be sent or received.
+     */
+    case stopped
+    /**
+     * Coming up. No verdict on anything yet.
+     */
+    case starting
+    /**
+     * Running with its radios in hand.
+     */
+    case active
+    /**
+     * Running, but Bluetooth is off, so its BLE roles carry nothing. Treated
+     * exactly like [`CoreDirectPathState::Off`] on the Bluetooth path.
+     */
+    case bluetoothOff
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMeshRuntime: FfiConverterRustBuffer {
+    typealias SwiftType = CoreMeshRuntime
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMeshRuntime {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .stopped
+
+        case 2: return .starting
+
+        case 3: return .active
+
+        case 4: return .bluetoothOff
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreMeshRuntime, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .stopped:
+            writeInt(&buf, Int32(1))
+
+
+        case .starting:
+            writeInt(&buf, Int32(2))
+
+
+        case .active:
+            writeInt(&buf, Int32(3))
+
+
+        case .bluetoothOff:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeshRuntime_lift(_ buf: RustBuffer) throws -> CoreMeshRuntime {
+    return try FfiConverterTypeCoreMeshRuntime.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeshRuntime_lower(_ value: CoreMeshRuntime) -> RustBuffer {
+    return FfiConverterTypeCoreMeshRuntime.lower(value)
+}
+
+
+
+extension CoreMeshRuntime: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a person needs the user's attention.
+ *
+ * Phase 1 shells supply only `None` or [`CorePersonAttention::SetupRejected`]
+ * -- the one per-person fault the app already tracks. The remaining variants
+ * exist so the per-recipient delivery read model can fill them in later
+ * without reshaping this API, which is also why the grouping call already
+ * takes them.
+ */
+
+public enum CorePersonAttention {
+
+    /**
+     * A usable route exists but nothing has progressed for the delayed
+     * window. The mildest reason: it often clears itself.
+     */
+    case delayed
+    /**
+     * A queued message exceeds the size cap and can never post as-is.
+     */
+    case messageTooLarge
+    /**
+     * Our own pass cannot post on their behalf (expired, suspended, or the
+     * family's storage is full).
+     */
+    case passBlocked
+    /**
+     * Their saved Shore Pass setup was rejected -- their friend card points
+     * at somewhere that will not serve them. The most severe, because it
+     * needs the *friend* to act first and nothing on this phone can fix it.
+     */
+    case setupRejected
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonAttention: FfiConverterRustBuffer {
+    typealias SwiftType = CorePersonAttention
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonAttention {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .delayed
+
+        case 2: return .messageTooLarge
+
+        case 3: return .passBlocked
+
+        case 4: return .setupRejected
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CorePersonAttention, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .delayed:
+            writeInt(&buf, Int32(1))
+
+
+        case .messageTooLarge:
+            writeInt(&buf, Int32(2))
+
+
+        case .passBlocked:
+            writeInt(&buf, Int32(3))
+
+
+        case .setupRejected:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonAttention_lift(_ buf: RustBuffer) throws -> CorePersonAttention {
+    return try FfiConverterTypeCorePersonAttention.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonAttention_lower(_ value: CorePersonAttention) -> RustBuffer {
+    return FfiConverterTypeCorePersonAttention.lower(value)
+}
+
+
+
+extension CorePersonAttention: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The three groups the People section renders, in page order.
+ */
+
+public enum CorePersonGroup {
+
+    case needsAttention
+    case reachableNow
+    case otherPeople
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonGroup: FfiConverterRustBuffer {
+    typealias SwiftType = CorePersonGroup
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonGroup {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .needsAttention
+
+        case 2: return .reachableNow
+
+        case 3: return .otherPeople
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CorePersonGroup, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .needsAttention:
+            writeInt(&buf, Int32(1))
+
+
+        case .reachableNow:
+            writeInt(&buf, Int32(2))
+
+
+        case .otherPeople:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonGroup_lift(_ buf: RustBuffer) throws -> CorePersonGroup {
+    return try FfiConverterTypeCorePersonGroup.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonGroup_lower(_ value: CorePersonGroup) -> RustBuffer {
+    return FfiConverterTypeCorePersonGroup.lower(value)
+}
+
+
+
+extension CorePersonGroup: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a person can be reached at this moment.
+ *
+ * This is a statement about now, not a prediction. A person with none of
+ * these is not broken -- store-and-forward delivery is what the product does,
+ * and waiting is the expected case.
+ */
+
+public enum CorePersonReach {
+
+    /**
+     * Live direct link over Bluetooth.
+     */
+    case directBluetooth
+    /**
+     * Live direct link over local Wi-Fi.
+     */
+    case directLocalWifi
+    /**
+     * No live link, but their relay presence is fresh and our own Shore Pass
+     * path works.
+     */
+    case relayPresence
+    /**
+     * Not reachable right now.
+     */
+    case none
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCorePersonReach: FfiConverterRustBuffer {
+    typealias SwiftType = CorePersonReach
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CorePersonReach {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .directBluetooth
+
+        case 2: return .directLocalWifi
+
+        case 3: return .relayPresence
+
+        case 4: return .none
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CorePersonReach, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .directBluetooth:
+            writeInt(&buf, Int32(1))
+
+
+        case .directLocalWifi:
+            writeInt(&buf, Int32(2))
+
+
+        case .relayPresence:
+            writeInt(&buf, Int32(3))
+
+
+        case .none:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonReach_lift(_ buf: RustBuffer) throws -> CorePersonReach {
+    return try FfiConverterTypeCorePersonReach.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCorePersonReach_lower(_ value: CorePersonReach) -> RustBuffer {
+    return FfiConverterTypeCorePersonReach.lower(value)
+}
+
+
+
+extension CorePersonReach: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * One structured relay rejection, classified. Ordered by nothing — use
  * [`relay_fault_rank`] when several faults from one sync pass compete for
  * the single status slot.
@@ -15193,6 +17046,171 @@ public func FfiConverterTypeCoreRelayFault_lower(_ value: CoreRelayFault) -> Rus
 
 
 extension CoreRelayFault: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * State of *this phone's* Shore Pass path.
+ *
+ * One variant per row the Paths section can show. `Message too large` is
+ * deliberately absent: an oversized envelope is a fact about one message and
+ * one recipient, not about whether this phone can reach the service, and
+ * putting it here is how the old page told people their pass was broken when
+ * it was fine.
+ */
+
+public enum CoreRelayPathState {
+
+    /**
+     * No pass saved. The free default -- nearby delivery still works, and
+     * this is never a fault.
+     */
+    case notSetUp
+    /**
+     * A pass is saved and the first check has not answered yet. Shells must
+     * only report this when no settled verdict exists; a routine background
+     * sync pass must keep reporting the last verdict, or the card flickers
+     * through Checking every minute.
+     */
+    case checking
+    /**
+     * The service answered and the pass is good.
+     */
+    case connected
+    /**
+     * The pass is fine; this phone has no validated internet right now.
+     * Expected at sea, and never an error.
+     */
+    case waitingForInternet
+    /**
+     * We have internet and the service did not answer. Transient.
+     */
+    case unreachable
+    /**
+     * Our pass has lapsed.
+     */
+    case passExpired
+    /**
+     * Our pass was turned off by the operator.
+     */
+    case passSuspended
+    /**
+     * Our own saved setup was rejected (HTTP 401/403 on our own token).
+     */
+    case setupRejected
+    /**
+     * Our family's hosted storage is full.
+     */
+    case storageFull
+    /**
+     * The shared family limit slowed syncing (HTTP 429). Recovers on its own
+     * and must never be presented as something to act on.
+     */
+    case syncingSlowed
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPathState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayPathState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPathState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .notSetUp
+
+        case 2: return .checking
+
+        case 3: return .connected
+
+        case 4: return .waitingForInternet
+
+        case 5: return .unreachable
+
+        case 6: return .passExpired
+
+        case 7: return .passSuspended
+
+        case 8: return .setupRejected
+
+        case 9: return .storageFull
+
+        case 10: return .syncingSlowed
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayPathState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .notSetUp:
+            writeInt(&buf, Int32(1))
+
+
+        case .checking:
+            writeInt(&buf, Int32(2))
+
+
+        case .connected:
+            writeInt(&buf, Int32(3))
+
+
+        case .waitingForInternet:
+            writeInt(&buf, Int32(4))
+
+
+        case .unreachable:
+            writeInt(&buf, Int32(5))
+
+
+        case .passExpired:
+            writeInt(&buf, Int32(6))
+
+
+        case .passSuspended:
+            writeInt(&buf, Int32(7))
+
+
+        case .setupRejected:
+            writeInt(&buf, Int32(8))
+
+
+        case .storageFull:
+            writeInt(&buf, Int32(9))
+
+
+        case .syncingSlowed:
+            writeInt(&buf, Int32(10))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPathState_lift(_ buf: RustBuffer) throws -> CoreRelayPathState {
+    return try FfiConverterTypeCoreRelayPathState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPathState_lower(_ value: CoreRelayPathState) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPathState.lower(value)
+}
+
+
+
+extension CoreRelayPathState: Equatable, Hashable {}
 
 
 
@@ -16908,6 +18926,102 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreDeliveryState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreDeliveryState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreDeliveryState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreDirectLink: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDirectLink?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreDirectLink.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreDirectLink.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreHealthAction: FfiConverterRustBuffer {
+    typealias SwiftType = CoreHealthAction?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreHealthAction.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreHealthAction.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreHealthReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreHealthReason?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreHealthReason.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreHealthReason.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreLinkScheme: FfiConverterRustBuffer {
     typealias SwiftType = CoreLinkScheme?
 
@@ -16924,6 +19038,30 @@ fileprivate struct FfiConverterOptionTypeCoreLinkScheme: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCoreLinkScheme.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCorePersonAttention: FfiConverterRustBuffer {
+    typealias SwiftType = CorePersonAttention?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCorePersonAttention.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCorePersonAttention.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -17371,6 +19509,56 @@ fileprivate struct FfiConverterSequenceTypeCoreMessageReceivedAt: FfiConverterRu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCoreMessageReceivedAt.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCorePersonHealthInput: FfiConverterRustBuffer {
+    typealias SwiftType = [CorePersonHealthInput]
+
+    public static func write(_ value: [CorePersonHealthInput], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCorePersonHealthInput.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CorePersonHealthInput] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CorePersonHealthInput]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCorePersonHealthInput.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCorePersonPlacement: FfiConverterRustBuffer {
+    typealias SwiftType = [CorePersonPlacement]
+
+    public static func write(_ value: [CorePersonPlacement], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCorePersonPlacement.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CorePersonPlacement] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CorePersonPlacement]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCorePersonPlacement.read(from: &buf))
         }
         return seq
     }
@@ -18068,6 +20256,84 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
 })
 }
 /**
+ * Classify this device's overall connection health.
+ *
+ * The order of the decision matters and is the specification's, not an
+ * implementation detail:
+ *
+ * 1. A stopped service is the one condition that beats everything, because
+ * nothing else is even being attempted.
+ * 2. Startup, and any state where nothing is usable *yet* while some path is
+ * still coming up, reports Checking -- but only inside
+ * [`CONNECTION_CHECKING_TIMEOUT_MS`]. A failure is never displayed before
+ * the check that would prove it has finished or run out.
+ * 3. With nothing able to carry a message, the state is NeedsAttention.
+ * 4. With something able to carry a message but an expected path missing or
+ * degraded, the state is Limited.
+ * 5. Otherwise Ready -- including with no friends nearby and no pass saved,
+ * which are ordinary conditions and not faults.
+ */
+public func coreClassifyConnectionHealth(input: CoreConnectionHealthInput) -> CoreConnectionHealthReport {
+    return try!  FfiConverterTypeCoreConnectionHealthReport.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_classify_connection_health(
+        FfiConverterTypeCoreConnectionHealthInput.lower(input),$0
+    )
+})
+}
+/**
+ * The delivery line for one person, or `None` when there is nothing honest to
+ * say.
+ *
+ * Nothing here is an error and nothing here is red. The old page's red
+ * `Pending relay upload` under every friend -- including friends who had
+ * already received the message -- is what this replaces.
+ */
+public func coreClassifyDeliveryLine(input: CoreDeliveryLineInput) -> CoreDeliveryState? {
+    return try!  FfiConverterOptionTypeCoreDeliveryState.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_classify_delivery_line(
+        FfiConverterTypeCoreDeliveryLineInput.lower(input),$0
+    )
+})
+}
+/**
+ * Is some path still coming up, with no verdict on it yet?
+ *
+ * Exported because both shells have to answer the same question *before* they
+ * call [`core_classify_connection_health`] -- they own the clock that records
+ * when the wait began, and the classification only bounds a wait it is told
+ * about. Answering it in Kotlin and again in Swift is how iOS came to omit
+ * the two radio cases and show `Needs attention` while its Bluetooth stack
+ * was still answering. One definition, used by the classifier itself below,
+ * makes that class of drift impossible.
+ */
+public func coreConnectionCheckPending(runtime: CoreMeshRuntime, bluetooth: CoreDirectPathState, localWifi: CoreDirectPathState, relay: CoreRelayPathState) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_connection_check_pending(
+        FfiConverterTypeCoreMeshRuntime.lower(runtime),
+        FfiConverterTypeCoreDirectPathState.lower(bluetooth),
+        FfiConverterTypeCoreDirectPathState.lower(localWifi),
+        FfiConverterTypeCoreRelayPathState.lower(relay),$0
+    )
+})
+}
+/**
+ * Has an unresolved check outlived [`CONNECTION_CHECKING_TIMEOUT_MS`]?
+ *
+ * `checking_since_ms <= 0` (nothing recorded) and a mark in the future (the
+ * clock moved backwards under us) both answer `true`. Both directions
+ * deliberately resolve rather than wait: the fallback is showing the
+ * best-supported real state, which is never worse than an endless spinner,
+ * whereas the other default can pin the card in Checking forever.
+ */
+public func coreConnectionCheckingExpired(checkingSinceMs: Int64, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_connection_checking_expired(
+        FfiConverterInt64.lower(checkingSinceMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * Narrow follow-up check for a relay-fetched envelope that deduped as
  * [`CoreInboundDisposition::Seen`]: [`core_should_ack_inbound`] can't vouch
  * for it (dedupe happens before a disposition is re-derived, so Seen alone
@@ -18322,6 +20588,25 @@ public func coreContactRelayUnreachableIsStale(unreachableStreak: Int64) -> Bool
 })
 }
 /**
+ * Is there a route to *this person* right now, by the specification's
+ * definition?
+ *
+ * A live direct link, or our own working Shore Pass path plus an endpoint of
+ * theirs that is not resting after rejecting us. Exported rather than spelled
+ * out in each shell so a later change to what counts as usable cannot land on
+ * one platform only.
+ */
+public func coreContactRouteUsable(directLink: Bool, ownRelayUsable: Bool, contactHasRelayEndpoint: Bool, contactRelayStale: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_contact_route_usable(
+        FfiConverterBool.lower(directLink),
+        FfiConverterBool.lower(ownRelayUsable),
+        FfiConverterBool.lower(contactHasRelayEndpoint),
+        FfiConverterBool.lower(contactRelayStale),$0
+    )
+})
+}
+/**
  * Find every link in `body`, in order, non-overlapping.
  *
  * Returns an empty list for a body with no links (including an empty body).
@@ -18443,6 +20728,34 @@ public func coreGroupFanoutRowsForCarried(originalMsgId: Data, memberUserIds: [D
         FfiConverterUInt8.lower(hopTtl),
         FfiConverterInt64.lower(expiry),
         FfiConverterData.lower(sealed),$0
+    )
+})
+}
+/**
+ * Group and order every person for the People section.
+ *
+ * Blocked identities are removed first, before anything else looks at them.
+ * That is structural on purpose: a block is a tombstone, and a UI-side filter
+ * applied after grouping is one forgotten call site away from putting a
+ * blocked person back on the screen.
+ *
+ * Ordering, per group:
+ *
+ * * **Needs attention**: severity ([`core_person_attention_rank`]), then the
+ * oldest affected message first, then name.
+ * * **Reachable now**: name.
+ * * **Other people**: freshest evidence first, with people who have no
+ * history at all last, then name.
+ *
+ * Names sort case-insensitively; ties break on user id so the order is
+ * stable across reloads rather than shuffling under the reader.
+ */
+public func coreGroupPeople(people: [CorePersonHealthInput], ownRelayUsable: Bool, nowMs: Int64) -> CorePeopleGroups {
+    return try!  FfiConverterTypeCorePeopleGroups.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_group_people(
+        FfiConverterSequenceTypeCorePersonHealthInput.lower(people),
+        FfiConverterBool.lower(ownRelayUsable),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -18693,6 +21006,54 @@ public func corePeerTransportIsObserved(transport: PeerConnectionTransport) -> B
     )
 })
 }
+/**
+ * Severity order inside the Needs attention group; higher shows first.
+ */
+public func corePersonAttentionRank(attention: CorePersonAttention) -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_person_attention_rank(
+        FfiConverterTypeCorePersonAttention.lower(attention),$0
+    )
+})
+}
+/**
+ * Is this person reachable right now, by the page's definition?
+ *
+ * Exported separately because the answer is useful on its own (a chat header,
+ * a badge) and must not be re-derived from [`CorePersonReach`] by hand in two
+ * languages.
+ */
+public func corePersonIsReachableNow(reach: CorePersonReach) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_person_is_reachable_now(
+        FfiConverterTypeCorePersonReach.lower(reach),$0
+    )
+})
+}
+/**
+ * How a person is reachable right now.
+ *
+ * A live direct link is reachability by observation. Relay presence is
+ * reachability by inference, and the inference only holds while *our* own
+ * Shore Pass path can actually deliver -- knowing their phone synced two
+ * minutes ago is useless if this phone cannot post anything. That
+ * conjunction is the whole point: it is what stops the page promising
+ * delivery over a path this device does not have.
+ *
+ * `own_relay_usable` comes from
+ * [`CoreConnectionEvidence::own_relay_usable`], so the People section and
+ * the health card cannot disagree about whether Shore Pass works.
+ */
+public func corePersonReach(directLink: CoreDirectLink?, presenceLastSeenMs: Int64, ownRelayUsable: Bool, nowMs: Int64) -> CorePersonReach {
+    return try!  FfiConverterTypeCorePersonReach.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_person_reach(
+        FfiConverterOptionTypeCoreDirectLink.lower(directLink),
+        FfiConverterInt64.lower(presenceLastSeenMs),
+        FfiConverterBool.lower(ownRelayUsable),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
 public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: Data) -> [CoreReactionTargetSummary] {
     return try!  FfiConverterSequenceTypeCoreReactionTargetSummary.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_reaction_summaries_by_target(
@@ -18714,6 +21075,37 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
     return try!  FfiConverterSequenceInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_relay_ack_ids(
         FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),$0
+    )
+})
+}
+/**
+ * Does the relay-upload backlog for this recipient say anything about
+ * *delivery*?
+ *
+ * Only when relay upload is the thing that would drain it. The backlog counts
+ * outbound rows whose upload timestamp is still unset, and that timestamp is
+ * set by one event only: a successful upload. Delivery receipts do not clear
+ * it, and neither does handing the message straight to the person over
+ * Bluetooth -- durable copies are left in place on purpose.
+ *
+ * So on a phone with no pass saved, or for a friend whose card carries no
+ * endpoint, or one whose endpoint has been written off, the number is not a
+ * backlog at all: it is every message written to that person inside the
+ * retention window, and it never goes down. Reading it as delivery state
+ * there produces exactly the contradiction this page exists to remove --
+ * `Received your message 12 min ago` with `Sending 12 messages…` underneath
+ * it, for a week.
+ *
+ * This is a Phase 1 honesty gate over an existing diagnostic query, not the
+ * per-recipient delivery read model. That model (Phase 2) replaces the whole
+ * question with a receipt-aware count and makes this function unnecessary.
+ */
+public func coreRelayQueueReflectsDelivery(relay: CoreRelayPathState, contactHasRelayEndpoint: Bool, contactRelayStale: Bool) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_queue_reflects_delivery(
+        FfiConverterTypeCoreRelayPathState.lower(relay),
+        FfiConverterBool.lower(contactHasRelayEndpoint),
+        FfiConverterBool.lower(contactRelayStale),$0
     )
 })
 }
@@ -20958,6 +23350,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_connection_health() != 10468) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_classify_delivery_line() != 45405) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_connection_check_pending() != 38815) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_connection_checking_expired() != 49423) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_consumed_seen_is_ackable() != 64469) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -20988,6 +23392,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_relay_unreachable_is_stale() != 17717) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_contact_route_usable() != 20984) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21004,6 +23411,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows_for_carried() != 44863) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_group_people() != 2035) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
@@ -21060,10 +23470,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_peer_transport_is_observed() != 43148) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_person_attention_rank() != 6449) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_person_is_reachable_now() != 46454) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_person_reach() != 15288) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_queue_reflects_delivery() != 16350) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {

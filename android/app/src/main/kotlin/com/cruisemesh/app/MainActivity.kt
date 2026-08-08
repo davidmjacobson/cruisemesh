@@ -291,7 +291,18 @@ fun CruiseMeshApp(
         composable("profile") { ProfileRoute(identity, navController) }
         composable("settings") { SettingsRoute(identity, navController) }
         composable("connectionDetails") {
-            ConnectionDetailsScreen(onBack = { navController.popOrExit(context) })
+            ConnectionDetailsScreen(
+                onBack = { navController.popOrExit(context) },
+                onStartMesh = { startMesh(context) },
+                onManageShorePass = { navController.navigate("shorePass") },
+                // The system Bluetooth settings screen rather than
+                // ACTION_REQUEST_ENABLE: the enable prompt needs
+                // BLUETOOTH_CONNECT, and a health card that offers an action
+                // must not be able to offer one that silently fails.
+                onTurnOnBluetooth = {
+                    context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
+                },
+            )
         }
         composable("internalTools") {
             InternalToolsScreen(onBack = { navController.popOrExit(context) })

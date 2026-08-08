@@ -268,7 +268,7 @@ struct ChatListView: View {
                 SettingsView(identity: identity, appModel: appModel)
             }
             .sheet(isPresented: $showConnectionDetails) {
-                ConnectionDetailsView()
+                ConnectionDetailsView(appModel: appModel)
             }
             .sheet(isPresented: $showShorePass, onDismiss: {
                 appModel.pendingRelayCard = nil
@@ -527,7 +527,7 @@ private struct MeshStatusSheet: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                     NavigationLink {
-                        ConnectionDetailsView()
+                        ConnectionDetailsView(appModel: appModel)
                     } label: {
                         Label("Connection details", systemImage: "point.3.connected.trianglepath.dotted")
                     }

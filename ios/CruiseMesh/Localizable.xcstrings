@@ -1,12 +1,92 @@
 {
   "sourceLanguage": "en",
   "strings": {
+    "%@ connected via %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ connected via %@ · %@"
+          }
+        }
+      }
+    },
+    "%@ connected · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ connected · %@"
+          }
+        }
+      }
+    },
+    "%@ disconnected via %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ disconnected via %@ · %@"
+          }
+        }
+      }
+    },
+    "%@ disconnected · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ disconnected · %@"
+          }
+        }
+      }
+    },
     "%@ expired": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "%@ expired"
+          }
+        }
+      }
+    },
+    "%@ received your message via %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ received your message via %@ · %@"
+          }
+        }
+      }
+    },
+    "%@ received your message · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ received your message · %@"
+          }
+        }
+      }
+    },
+    "%@ sent you a message via %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ sent you a message via %@ · %@"
+          }
+        }
+      }
+    },
+    "%@ sent you a message · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ sent you a message · %@"
           }
         }
       }
@@ -37,6 +117,198 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ suspended"
+          }
+        }
+      }
+    },
+    "%@ via %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ via %@"
+          }
+        }
+      }
+    },
+    "%@ was reachable via %@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ was reachable via %@ · %@"
+          }
+        }
+      }
+    },
+    "%@ was reachable · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ was reachable · %@"
+          }
+        }
+      }
+    },
+    "%@ · %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ · %@"
+          }
+        }
+      }
+    },
+    "%@. %@.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@. %@."
+          }
+        }
+      }
+    },
+    "%@. %@. %@.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@. %@. %@."
+          }
+        }
+      }
+    },
+    "%lld active connections": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld active connection"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld active connections"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld friends nearby": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld friend nearby"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld friends nearby"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld hours ago": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld hour ago"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld hours ago"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld messages waiting for internet": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld message waiting for internet"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld messages waiting for internet"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld messages will deliver when you reconnect": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld message will deliver when you reconnect"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld messages will deliver when you reconnect"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld min ago": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld min ago"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld min ago"
+                }
+              }
+            }
           }
         }
       }
@@ -301,6 +573,16 @@
         }
       }
     },
+    "Bluetooth is off": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth is off"
+          }
+        }
+      }
+    },
     "Bluetooth is turned off for CruiseMesh. Turn it on in Settings to reach people nearby without any network.": {
       "localizations": {
         "en": {
@@ -331,6 +613,16 @@
         }
       }
     },
+    "Captured diagnostics deleted.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Captured diagnostics deleted."
+          }
+        }
+      }
+    },
     "Check and save": {
       "localizations": {
         "en": {
@@ -341,12 +633,42 @@
         }
       }
     },
+    "Checking": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking"
+          }
+        }
+      }
+    },
+    "Checking Shore Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking Shore Pass"
+          }
+        }
+      }
+    },
     "Checking and saving…": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Checking and saving…"
+          }
+        }
+      }
+    },
+    "Checking connections…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Checking connections…"
           }
         }
       }
@@ -387,6 +709,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Clear connection history"
+          }
+        }
+      }
+    },
+    "Clear connection history?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Clear connection history?"
           }
         }
       }
@@ -457,6 +789,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Connect securely"
+          }
+        }
+      }
+    },
+    "Connected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connected"
+          }
+        }
+      }
+    },
+    "Connected now": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connected now"
           }
         }
       }
@@ -551,12 +903,378 @@
         }
       }
     },
+    "CruiseMesh is stopped": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh is stopped"
+          }
+        }
+      }
+    },
+    "Diagnostic logging": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging"
+          }
+        }
+      }
+    },
+    "Diagnostic logging is off. What was already captured is kept until you delete it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging is off. What was already captured is kept until you delete it."
+          }
+        }
+      }
+    },
+    "Diagnostic logging is on. Reproduce the problem, then return here to share it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostic logging is on. Reproduce the problem, then return here to share it."
+          }
+        }
+      }
+    },
+    "Friend": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Friend"
+          }
+        }
+      }
+    },
+    "How to fix": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "How to fix"
+          }
+        }
+      }
+    },
+    "Last connected %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Last connected %@"
+          }
+        }
+      }
+    },
+    "Last disconnected %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Last disconnected %@"
+          }
+        }
+      }
+    },
+    "Last synced %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Last synced %@"
+          }
+        }
+      }
+    },
+    "Listening": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Listening"
+          }
+        }
+      }
+    },
+    "Listening for nearby friends": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Listening for nearby friends"
+          }
+        }
+      }
+    },
+    "Manage Shore Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Manage Shore Pass"
+          }
+        }
+      }
+    },
+    "Needs attention": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Needs attention"
+          }
+        }
+      }
+    },
+    "No active connections": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No active connections"
+          }
+        }
+      }
+    },
+    "No connection history yet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "No connection history yet"
+          }
+        }
+      }
+    },
+    "Not set up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not set up"
+          }
+        }
+      }
+    },
+    "Off": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Off"
+          }
+        }
+      }
+    },
+    "Other people (%lld)": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Other people (%lld)"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Other people (%lld)"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Pass expired": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pass expired"
+          }
+        }
+      }
+    },
+    "Pass suspended": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pass suspended"
+          }
+        }
+      }
+    },
+    "Paths": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Paths"
+          }
+        }
+      }
+    },
+    "Reachable now (%lld)": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Reachable now (%lld)"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Reachable now (%lld)"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Received your message %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Received your message %@"
+          }
+        }
+      }
+    },
+    "Refreshing": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Refreshing"
+          }
+        }
+      }
+    },
+    "Seen %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seen %@"
+          }
+        }
+      }
+    },
+    "Seen online %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seen online %@"
+          }
+        }
+      }
+    },
+    "Sending %lld messages…": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Sending %lld message…"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Sending %lld messages…"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Sent you a message %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sent you a message %@"
+          }
+        }
+      }
+    },
+    "Setup rejected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Setup rejected"
+          }
+        }
+      }
+    },
+    "Sharing the radio with Bluetooth audio.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sharing the radio with Bluetooth audio."
+          }
+        }
+      }
+    },
     "Shore Pass": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Shore Pass"
+          }
+        }
+      }
+    },
+    "Shore Pass connected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass connected"
+          }
+        }
+      }
+    },
+    "Shore Pass didn't accept this phone's saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass didn't accept this phone's saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family."
+          }
+        }
+      }
+    },
+    "Shore Pass expired": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass expired"
           }
         }
       }
@@ -597,6 +1315,66 @@
           "stringUnit": {
             "state": "translated",
             "value": "Shore Pass is set up"
+          }
+        }
+      }
+    },
+    "Shore Pass not set up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass not set up"
+          }
+        }
+      }
+    },
+    "Shore Pass setup rejected": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass setup rejected"
+          }
+        }
+      }
+    },
+    "Shore Pass storage full": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass storage full"
+          }
+        }
+      }
+    },
+    "Shore Pass suspended": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass suspended"
+          }
+        }
+      }
+    },
+    "Shore Pass syncing slowed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass syncing slowed"
+          }
+        }
+      }
+    },
+    "Shore Pass unreachable": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass unreachable"
           }
         }
       }
@@ -1531,16 +2309,6 @@
         }
       }
     },
-    "Overview": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Overview"
-          }
-        }
-      }
-    },
     "Passphrase": {
       "localizations": {
         "en": {
@@ -1587,16 +2355,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Paste the setup card from your purchase email. CruiseMesh will test and save it automatically."
-          }
-        }
-      }
-    },
-    "People": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "People"
           }
         }
       }
@@ -2231,12 +2989,54 @@
         }
       }
     },
+    "Show %lld people": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Show %lld person"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Show %lld people"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "Show address QR": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Show address QR"
+          }
+        }
+      }
+    },
+    "Show all activity": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show all activity"
+          }
+        }
+      }
+    },
+    "Show less": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show less"
           }
         }
       }
@@ -2261,12 +3061,42 @@
         }
       }
     },
+    "Start mesh": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start mesh"
+          }
+        }
+      }
+    },
     "Start recording": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Start recording"
+          }
+        }
+      }
+    },
+    "Starting": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Starting"
+          }
+        }
+      }
+    },
+    "Starting up": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Starting up"
           }
         }
       }
@@ -2291,6 +3121,16 @@
         }
       }
     },
+    "Storage full": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Storage full"
+          }
+        }
+      }
+    },
     "Strength": {
       "localizations": {
         "en": {
@@ -2311,12 +3151,12 @@
         }
       }
     },
-    "Support": {
+    "Syncing slowed": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Support"
+            "value": "Syncing slowed"
           }
         }
       }
@@ -2611,12 +3451,32 @@
         }
       }
     },
+    "Troubleshooting & diagnostics": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Troubleshooting & diagnostics"
+          }
+        }
+      }
+    },
     "Try again": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Try again"
+          }
+        }
+      }
+    },
+    "Turn on Bluetooth": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Turn on Bluetooth"
           }
         }
       }
@@ -2651,6 +3511,16 @@
         }
       }
     },
+    "Unreachable": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unreachable"
+          }
+        }
+      }
+    },
     "Unsupported attachment": {
       "localizations": {
         "en": {
@@ -2681,6 +3551,60 @@
         }
       }
     },
+    "Updated %lld hours ago": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Updated %lld hour ago"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Updated %lld hours ago"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Updated %lld min ago": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Updated %lld min ago"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "Updated %lld min ago"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "Updated just now": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Updated just now"
+          }
+        }
+      }
+    },
     "Use a different Shore Pass": {
       "localizations": {
         "en": {
@@ -2707,6 +3631,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Voice memo"
+          }
+        }
+      }
+    },
+    "Waiting for internet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for internet"
           }
         }
       }
@@ -2751,6 +3685,26 @@
         }
       }
     },
+    "Working normally": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Working normally"
+          }
+        }
+      }
+    },
+    "Working, with limits": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Working, with limits"
+          }
+        }
+      }
+    },
     "You": {
       "localizations": {
         "en": {
@@ -2777,6 +3731,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do."
+          }
+        }
+      }
+    },
+    "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support."
           }
         }
       }
@@ -2867,6 +3831,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "You’re all set"
+          }
+        }
+      }
+    },
+    "just now": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "just now"
+          }
+        }
+      }
+    },
+    "local Wi-Fi": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "local Wi-Fi"
+          }
+        }
+      }
+    },
+    "on %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "on %@"
+          }
+        }
+      }
+    },
+    "yesterday at %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "yesterday at %@"
           }
         }
       }

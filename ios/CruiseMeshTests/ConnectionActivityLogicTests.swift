@@ -88,7 +88,7 @@ final class ConnectionActivityLogicTests: XCTestCase {
     }
 
     /// The screen chooses between "… via Bluetooth" and the wordless variant by
-    /// whether `transportLabel` returns a string. That must agree with core, or
+    /// whether `observedPath` returns a path. That must agree with core, or
     /// one surface names a path the other says was never seen. Every case is
     /// checked, so a transport added later cannot silently pick a default.
     func testAPathIsNamedExactlyWhenCoreSaysItWasObserved() {
@@ -96,15 +96,15 @@ final class ConnectionActivityLogicTests: XCTestCase {
         for transport in all {
             XCTAssertEqual(
                 corePeerTransportIsObserved(transport: transport),
-                ConnectionDetailsView.transportLabel(transport) != nil,
-                "transportLabel disagrees with core for \(transport)"
+                ConnectionDetailsLogic.observedPath(transport) != nil,
+                "observedPath disagrees with core for \(transport)"
             )
         }
     }
 
     func testACarriedMessageNamesNoPath() {
         XCTAssertNil(
-            ConnectionDetailsView.transportLabel(.carried),
+            ConnectionDetailsLogic.observedPath(.carried),
             "a message another device carried must not be labelled with a radio"
         )
     }
