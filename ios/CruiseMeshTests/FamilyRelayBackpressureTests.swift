@@ -105,50 +105,9 @@ final class FamilyRelayBackpressureTests: XCTestCase {
         XCTAssertEqual(seen.count, 3, "all three rerun branches must be reachable")
     }
 
-    func testHealthVectorsProjectOntoTheShellHealth() {
-        let nowMs: Int64 = 1_800_000_000_000
-        for vector in coreFamilyRelayHealthVectors() {
-            XCTAssertEqual(
-                RelayHealth.afterSyncPass(
-                    fault: vector.fault,
-                    ownRelaySucceeded: vector.ownRelaySucceeded,
-                    anyRelaySucceeded: vector.anyRelaySucceeded,
-                    nowMs: nowMs
-                ),
-                Self.expectedHealth(vector.expected, nowMs: nowMs),
-                vector.name
-            )
-        }
-    }
-
-    func testEveryCoreHealthHasADistinctProjection() {
-        // A `case` pointing at the wrong RelayHealth would still compile and
-        // would still be exhaustive. Two healths collapsing onto one display
-        // state is the shape that bug takes.
-        let all: [CoreRelayPassHealth] = [
-            .ok, .quotaFull, .messageTooLarge, .rateLimited,
-            .expired, .suspended, .tokenRejected, .failing,
-        ]
-        let projections = all.map { Self.expectedHealth($0, nowMs: 1) }
-        for (index, projection) in projections.enumerated() {
-            for other in projections[(index + 1)...] {
-                XCTAssertNotEqual(projection, other)
-            }
-        }
-    }
-
-    private static func expectedHealth(_ health: CoreRelayPassHealth, nowMs: Int64) -> RelayHealth {
-        switch health {
-        case .ok: return .ok(lastSyncMs: nowMs)
-        case .quotaFull: return .quotaFull(lastAttemptMs: nowMs)
-        case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
-        case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
-        case .expired: return .expired(lastAttemptMs: nowMs)
-        case .suspended: return .suspended(lastAttemptMs: nowMs)
-        case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
-        case .failing: return .failing(lastAttemptMs: nowMs)
-        }
-    }
+    // The pass health fold's vector table is consumed by `PassIndicatorTests`,
+    // which is this shell's twin of Android's RelayFaultPolicyTest and already
+    // owns the projection onto `RelayHealth`.
 
     func testConcurrentReservationsNeverCollideOnOneSlot() {
         // The controller paces from a detached task while other work runs. Two

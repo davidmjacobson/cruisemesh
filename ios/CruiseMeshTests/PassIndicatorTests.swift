@@ -1,9 +1,15 @@
 import XCTest
 @testable import CruiseMesh
 
-/// CP2b: pins the Shore Pass indicator mapping and the sync-pass fold to
-/// the core's transient/persistent classification, mirroring Android's
+/// The Shore Pass indicator mapping, and the projection of the core's pass
+/// health fold onto this shell's `RelayHealth`. Mirrors Android's
 /// PassIndicatorTest + RelayFaultPolicyTest.
+///
+/// The fold's precedence itself is not restated here -- it lives in
+/// `core/src/session/relay_policy.rs` and reaches this file only as the vector
+/// table the core exports, which the Rust and Android suites assert against
+/// too. What is asserted here is what is genuinely this shell's: the display
+/// mapping, and the heading rules the core does not carry.
 final class PassIndicatorTests: XCTestCase {
     private let now: Int64 = 1_800_000_000_000
 
@@ -49,77 +55,65 @@ final class PassIndicatorTests: XCTestCase {
         XCTAssertEqual(PassIndicator.actionRequired.systemImage, "exclamationmark.circle.fill")
     }
 
-    func testMailboxFaultsBeatASuccessfulPoll() {
-        // relayd keeps serving fetches while rejecting posts, so quota /
-        // oversized / rate-limited surface even when the pass succeeded.
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .mailboxFull, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
-            ),
-            .quotaFull(lastAttemptMs: now)
-        )
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .rateLimited, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
-            ),
-            .rateLimited(lastAttemptMs: now)
-        )
+    func testEveryCoreHealthVectorProjectsOntoTheShellHealth() {
+        // Why an expired pass beats a successful poll, and why a suspended one
+        // does not, is core policy and is pinned in
+        // `core/src/session/relay_policy.rs`. Restating it here would be a
+        // second source of truth on the platform whose suite cannot be run
+        // without a Mac -- and the copy that could not be re-run is the copy
+        // that would go stale. What is genuinely iOS's to prove is the
+        // projection: every health the core can return reaches the right
+        // `RelayHealth` with this shell's timestamp on it.
+        for vector in coreFamilyRelayHealthVectors() {
+            XCTAssertEqual(
+                RelayHealth.afterSyncPass(
+                    fault: vector.fault,
+                    ownRelaySucceeded: vector.ownRelaySucceeded,
+                    anyRelaySucceeded: vector.anyRelaySucceeded,
+                    nowMs: now
+                ),
+                Self.expectedHealth(vector.expected, nowMs: now),
+                vector.name
+            )
+        }
     }
 
-    func testAnExpiredPassBeatsASuccessfulPoll() {
-        // relayd gives an expired family a seven-day read-only grace
-        // (FAMILY_EXPIRY_GRACE_MS) in which fetch and ack still succeed and
-        // only POST takes the 403 -- so this exact combination is what a
-        // paying family sees for a week after their pass lapses. Folding it
-        // to .ok told them the Shore Pass was working while nothing they
-        // wrote left the phone.
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .passExpired, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
-            ),
-            .expired(lastAttemptMs: now)
-        )
-        // Past the grace window relayd rejects reads too -- the same answer
-        // by the other route.
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .passExpired, ownRelaySucceeded: false, anyRelaySucceeded: true, nowMs: now
-            ),
-            .expired(lastAttemptMs: now)
-        )
+    func testEveryCoreHealthHasADistinctProjection() {
+        // A `case` pointing at the wrong RelayHealth would still compile and
+        // would still be exhaustive. Two healths collapsing onto one display
+        // state is the shape that bug takes.
+        let all: [CoreRelayPassHealth] = [
+            .ok, .quotaFull, .messageTooLarge, .rateLimited,
+            .expired, .suspended, .tokenRejected, .failing,
+        ]
+        let projections = all.map { Self.expectedHealth($0, nowMs: now) }
+        for (index, projection) in projections.enumerated() {
+            for other in projections[(index + 1)...] {
+                XCTAssertNotEqual(projection, other)
+            }
+        }
     }
 
-    func testTheOtherCredentialFaultsKeepPreCP2bPrecedence() {
-        // Suspension and token rejection do not move up with expiry:
-        // relayd's authorize_family rejects every op for both, so neither
-        // can co-occur with a successful poll in the first place.
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .passSuspended, ownRelaySucceeded: true, anyRelaySucceeded: true, nowMs: now
-            ),
-            .ok(lastSyncMs: now)
-        )
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .passSuspended, ownRelaySucceeded: false, anyRelaySucceeded: false, nowMs: now
-            ),
-            .suspended(lastAttemptMs: now)
-        )
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: .tokenRejected, ownRelaySucceeded: false, anyRelaySucceeded: false, nowMs: now
-            ),
-            .tokenRejected(lastAttemptMs: now)
-        )
-        XCTAssertEqual(
-            RelayHealth.afterSyncPass(
-                fault: nil, ownRelaySucceeded: false, anyRelaySucceeded: true, nowMs: now
-            ),
-            .failing(lastAttemptMs: now)
-        )
+    /// The projection asserted above, written once. Exhaustive with no
+    /// `default`, so a health the core grows later stops compiling here rather
+    /// than silently falling into a catch-all.
+    private static func expectedHealth(_ health: CoreRelayPassHealth, nowMs: Int64) -> RelayHealth {
+        switch health {
+        case .ok: return .ok(lastSyncMs: nowMs)
+        case .quotaFull: return .quotaFull(lastAttemptMs: nowMs)
+        case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
+        case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
+        case .expired: return .expired(lastAttemptMs: nowMs)
+        case .suspended: return .suspended(lastAttemptMs: nowMs)
+        case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
+        case .failing: return .failing(lastAttemptMs: nowMs)
+        }
     }
 
     func testWorseFaultKeepsThePersistentCondition() {
+        // Order independence is a property of the fold, and the fold is what
+        // the controller calls repeatedly as a pass observes faults. Asserted
+        // through the shim because that is the call the controller makes.
         var fault: CoreRelayFault?
         fault = RelayHealth.worseFault(fault, .rateLimited)
         fault = RelayHealth.worseFault(fault, .mailboxFull)

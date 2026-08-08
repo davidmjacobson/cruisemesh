@@ -1297,6 +1297,11 @@ open class CoreFamilyRelayPacer:
     /**
      * The deployed pacer: [`FAMILY_RELAY_REQUEST_INTERVAL_MS`] between
      * requests.
+     *
+     * The only constructor a shell can reach, deliberately. The interval is
+     * the family's shared budget expressed as one number, and the exit
+     * criterion for this module is that the number exists once — so there is
+     * no exported door through which a platform could pass its own.
      */
 public convenience init() {
     let pointer =
@@ -1315,18 +1320,6 @@ public convenience init() {
         try! rustCall { uniffi_cruisemesh_core_fn_free_corefamilyrelaypacer(pointer, $0) }
     }
 
-
-    /**
-     * Test/diagnostic constructor. A negative interval is clamped to zero
-     * rather than allowed to run the reservation backwards.
-     */
-public static func withIntervalMs(intervalMs: Int64) -> CoreFamilyRelayPacer {
-    return try!  FfiConverterTypeCoreFamilyRelayPacer.lift(try! rustCall() {
-    uniffi_cruisemesh_core_fn_constructor_corefamilyrelaypacer_with_interval_ms(
-        FfiConverterInt64.lower(intervalMs),$0
-    )
-})
-}
 
 
 
@@ -28523,10 +28516,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaybackoff_new() != 58980) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaypacer_new() != 41076) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaypacer_with_interval_ms() != 43186) {
+    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaypacer_new() != 44011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corelanhealthtracker_new() != 56458) {

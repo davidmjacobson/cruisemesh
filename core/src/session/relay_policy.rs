@@ -117,19 +117,14 @@ pub struct CoreFamilyRelayPacer {
 impl CoreFamilyRelayPacer {
     /// The deployed pacer: [`FAMILY_RELAY_REQUEST_INTERVAL_MS`] between
     /// requests.
+    ///
+    /// The only constructor a shell can reach, deliberately. The interval is
+    /// the family's shared budget expressed as one number, and the exit
+    /// criterion for this module is that the number exists once — so there is
+    /// no exported door through which a platform could pass its own.
     #[uniffi::constructor]
     pub fn new() -> Self {
         Self::with_interval_ms(FAMILY_RELAY_REQUEST_INTERVAL_MS)
-    }
-
-    /// Test/diagnostic constructor. A negative interval is clamped to zero
-    /// rather than allowed to run the reservation backwards.
-    #[uniffi::constructor]
-    pub fn with_interval_ms(interval_ms: i64) -> Self {
-        Self {
-            interval_ms: interval_ms.max(0),
-            next_request_at_ms: std::sync::Mutex::new(0),
-        }
     }
 
     /// Claims the next request slot and returns the wait, in milliseconds,
@@ -147,6 +142,24 @@ impl CoreFamilyRelayPacer {
         let request_at_ms = now_ms.max(*next);
         *next = request_at_ms.saturating_add(self.interval_ms);
         request_at_ms.saturating_sub(now_ms)
+    }
+}
+
+impl CoreFamilyRelayPacer {
+    /// Rust-only constructor, used to test the reservation arithmetic at
+    /// intervals the deployed pacer never runs at. Kept out of the
+    /// `#[uniffi::export]` block above on purpose: exported, it would be a
+    /// second way to choose the pacing interval, reachable from either shell
+    /// and asserted by nothing — which is the divergence this module exists to
+    /// close, re-opened as a one-liner.
+    ///
+    /// A negative interval is clamped to zero rather than allowed to run the
+    /// reservation backwards.
+    pub(crate) fn with_interval_ms(interval_ms: i64) -> Self {
+        Self {
+            interval_ms: interval_ms.max(0),
+            next_request_at_ms: std::sync::Mutex::new(0),
+        }
     }
 }
 
@@ -442,6 +455,14 @@ pub fn core_relay_pass_health(
 // checked into `core/tests/` could not be read by an XCTest bundle without new
 // resource plumbing; a table that crosses UniFFI can be read by all three with
 // none. They are a few dozen rows and cost nothing at runtime.
+//
+// So the placement is deliberate and load-bearing, not an oversight: moving
+// them behind a `cfg`/feature to trim the shipped FFI surface would not fail
+// loudly, it would silently drop the Swift suite's only source of expectations
+// and end the three-way agreement. Anyone who wants them off the release
+// surface has to rehome the Android and Swift suites in the same change.
+// `CoreBindingSmokeTest.kt` / `CoreBindingSmokeTests.swift` cover these shapes
+// without reading a table, so that lowering coverage at least survives it.
 
 /// One row of the 429 backoff curve.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

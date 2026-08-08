@@ -2,21 +2,32 @@ package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreConnectionHealthInput
 import uniffi.cruisemesh_core.CoreDirectLink
 import uniffi.cruisemesh_core.CoreDirectPathState
+import uniffi.cruisemesh_core.CoreFamilyRelayBackoff
+import uniffi.cruisemesh_core.CoreFamilyRelayPacer
 import uniffi.cruisemesh_core.CoreMeshRuntime
 import uniffi.cruisemesh_core.CorePersonAttention
 import uniffi.cruisemesh_core.CorePersonHealthInput
 import uniffi.cruisemesh_core.CorePersonReach
+import uniffi.cruisemesh_core.CoreRelayFault
+import uniffi.cruisemesh_core.CoreRelayPassHealth
 import uniffi.cruisemesh_core.CoreRelayPathState
+import uniffi.cruisemesh_core.CoreRelayRerunAction
 import uniffi.cruisemesh_core.coreClassifyConnectionHealth
+import uniffi.cruisemesh_core.coreFamilyRelayBackoffDelayMs
+import uniffi.cruisemesh_core.coreFamilyRelayJitterMs
 import uniffi.cruisemesh_core.coreGroupPeople
 import uniffi.cruisemesh_core.corePersonAttentionRank
 import uniffi.cruisemesh_core.corePersonIsReachableNow
 import uniffi.cruisemesh_core.corePersonReach
+import uniffi.cruisemesh_core.coreRelayPassHealth
+import uniffi.cruisemesh_core.coreRelayRerunAction
 
 /**
  * The *shape* of the UniFFI boundary, not the policy behind it.
@@ -32,9 +43,10 @@ import uniffi.cruisemesh_core.corePersonReach
  * of an enum survives a trip through Rust, that an absent optional stays
  * absent and a present one keeps its value, that bytes come back byte-equal,
  * and that a record's fields land in the fields they left from. Every rule
- * about *what the answers mean* is tested in `core/src/connection_health.rs`
- * and must not be restated here. `CoreBindingSmokeTests.swift` is the same
- * file for the other shell.
+ * about *what the answers mean* is tested in the core module that owns it
+ * (`core/src/connection_health.rs`, `core/src/session/relay_policy.rs`) and
+ * must not be restated here. `CoreBindingSmokeTests.swift` is the same file
+ * for the other shell.
  *
  * The reverse is true too, and matters more: these are not a second drift
  * check. Both shells build their bindings fresh before tests run, so neither
@@ -160,6 +172,134 @@ class CoreBindingSmokeTest {
         assertEquals(3u, report.evidence.bluetoothLinks)
         assertEquals(UInt.MAX_VALUE, report.evidence.localWifiLinks)
         assertEquals(7u, report.evidence.nearbyFriendCount)
+    }
+
+    // -- relay policy shapes ------------------------------------------------
+    //
+    // `core/src/session/relay_policy.rs` added shapes none of the tests above
+    // reach: two objects that hold state across calls, two enums that are
+    // returned rather than passed, an optional enum *argument*, and a bare
+    // byte-array argument. The vector suites in FamilyRelayBackpressureTest /
+    // RelayRerunPolicyTest / RelayFaultPolicyTest do execute these lowering
+    // paths today, but they execute them by reading an exported table -- so if
+    // those tables are ever moved behind a feature or trimmed, the coverage
+    // leaves with them. These do not read a table, and so they stay.
+    //
+    // Same rule as everything above: nothing here asserts which answer means
+    // what. That is `RATE-01`, pinned in the core.
+
+    /**
+     * A `uniffi::Object` that holds state on the Rust side: the handle must
+     * survive between calls, or the second reservation would answer as if it
+     * were the first. Says nothing about the interval, only that the two calls
+     * reached the same instance.
+     */
+    @Test
+    fun `an object handle carries rust-side state between calls`() {
+        CoreFamilyRelayPacer().use { pacer ->
+            val first = pacer.reserve(0L)
+            val second = pacer.reserve(0L)
+            assertNotEquals(first, second)
+        }
+    }
+
+    /**
+     * The other object, plus the unsigned counter it returns: a fresh instance
+     * starts at zero, one call moves it, and the reset call moves it back --
+     * so `UInt` crosses in the returning direction and the handle is genuinely
+     * per-instance rather than shared.
+     */
+    @Test
+    fun `object state advances and resets through the boundary`() {
+        CoreFamilyRelayBackoff().use { backoff ->
+            assertEquals(0u, backoff.consecutiveRateLimits())
+            backoff.onRateLimited(0uL, ByteArray(0))
+            assertEquals(1u, backoff.consecutiveRateLimits())
+            CoreFamilyRelayBackoff().use { other ->
+                assertEquals(0u, other.consecutiveRateLimits())
+            }
+            backoff.onSuccessfulPass()
+            assertEquals(0u, backoff.consecutiveRateLimits())
+        }
+    }
+
+    /**
+     * An *optional enum argument* -- a lowering path no other smoke here
+     * covers -- and an enum returned by value. The absent form must not be
+     * confused with a present one, and a discriminant that shifted would land
+     * out of range in Rust and panic rather than answer.
+     */
+    @Test
+    fun `an optional enum argument lowers in both its forms`() {
+        val answers = listOf(
+            coreRelayPassHealth(null, ownRelaySucceeded = false, anyRelaySucceeded = false),
+            coreRelayPassHealth(CoreRelayFault.MAILBOX_FULL, ownRelaySucceeded = false, anyRelaySucceeded = false),
+            coreRelayPassHealth(CoreRelayFault.TOKEN_REJECTED, ownRelaySucceeded = false, anyRelaySucceeded = false),
+        )
+        assertEquals(3, answers.size)
+        assertEquals(3, answers.toSet().size)
+    }
+
+    /**
+     * Every declared variant of the returned enum is reachable, so none of the
+     * eight discriminants lifts onto another's name. Which input produces
+     * which is the core's business and is not asserted; only that the set is
+     * covered.
+     */
+    @Test
+    fun `every pass-health variant lifts back distinctly`() {
+        val produced = buildSet {
+            for (fault in listOf(null) + CoreRelayFault.entries) {
+                for (own in listOf(false, true)) {
+                    for (any in listOf(false, true)) {
+                        add(coreRelayPassHealth(fault, own, any))
+                    }
+                }
+            }
+        }
+        assertEquals(CoreRelayPassHealth.entries.toSet(), produced)
+    }
+
+    /** The third enum, lifted through a different signature. */
+    @Test
+    fun `every rerun action lifts back distinctly`() {
+        val produced = buildSet {
+            for (pending in listOf(false, true)) {
+                for (canSync in listOf(false, true)) {
+                    for (remaining in listOf(-1L, 0L, 30_000L)) {
+                        add(coreRelayRerunAction(pending, canSync, remaining))
+                    }
+                }
+            }
+        }
+        assertEquals(CoreRelayRerunAction.entries.toSet(), produced)
+    }
+
+    /**
+     * A bare byte-array argument, with the bytes a broken converter corrupts:
+     * `0x00`, `0x80`, `0xFF`. Reversing them must change the answer, which a
+     * buffer that arrived truncated, NUL-terminated, or empty could not do;
+     * and an empty array must be carried as empty rather than as garbage.
+     */
+    @Test
+    fun `a bare byte array argument crosses intact`() {
+        val awkward = byteArrayOf(0x00, 0x7F, 0x80.toByte(), 0xFF.toByte(), 0x01)
+        val reversed = awkward.reversedArray()
+        assertNotEquals(coreFamilyRelayJitterMs(awkward), coreFamilyRelayJitterMs(reversed))
+        assertEquals(coreFamilyRelayJitterMs(awkward), coreFamilyRelayJitterMs(awkward.copyOf()))
+        // Empty is a value, not a missing argument.
+        assertEquals(coreFamilyRelayJitterMs(ByteArray(0)), coreFamilyRelayJitterMs(ByteArray(0)))
+    }
+
+    /**
+     * `ULong` in both directions, at a value a signed 64-bit converter would
+     * deliver as -1. Asserts only that the top bit survived the trip, not what
+     * the arithmetic did with it.
+     */
+    @Test
+    fun `an unsigned 64-bit value keeps its top bit across the boundary`() {
+        val answer = coreFamilyRelayBackoffDelayMs(ULong.MAX_VALUE, 1u, 0uL)
+        assertTrue("top bit lost: $answer", answer > Long.MAX_VALUE.toULong())
     }
 
     private fun person(

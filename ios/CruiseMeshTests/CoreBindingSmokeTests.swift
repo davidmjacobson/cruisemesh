@@ -15,9 +15,10 @@ import XCTest
 /// an enum survives a trip through Rust, an absent optional stays absent and a
 /// present one keeps its value, bytes come back byte-equal, and a record's
 /// fields land in the fields they left from. Every rule about *what the
-/// answers mean* is tested in `core/src/connection_health.rs` and must not be
-/// restated here. `CoreBindingSmokeTest.kt` is the same file for the other
-/// shell.
+/// answers mean* is tested in the core module that owns it
+/// (`core/src/connection_health.rs`, `core/src/session/relay_policy.rs`) and
+/// must not be restated here. `CoreBindingSmokeTest.kt` is the same file for
+/// the other shell.
 ///
 /// The reverse is true too, and matters more: this is not a second drift
 /// check. `ios.yml` regenerates `Generated/` in `core/build-ios.sh` before
@@ -120,6 +121,126 @@ final class CoreBindingSmokeTests: XCTestCase {
         XCTAssertEqual(report.evidence.nearbyFriendCount, 7)
     }
 
+    // MARK: - Relay policy shapes
+
+    // `core/src/session/relay_policy.rs` added shapes none of the tests above
+    // reach: two objects that hold state across calls, two enums that are
+    // returned rather than passed, an optional enum *argument*, and a bare
+    // byte-array argument. The vector suites in FamilyRelayBackpressureTests /
+    // PassIndicatorTests do execute these lowering paths today, but they
+    // execute them by reading an exported table -- so if those tables are ever
+    // moved behind a feature or trimmed, the coverage leaves with them. These
+    // do not read a table, and so they stay.
+    //
+    // Same rule as everything above: nothing here asserts which answer means
+    // what. That is `RATE-01`, pinned in the core.
+
+    /// A `uniffi::Object` that holds state on the Rust side: the handle must
+    /// survive between calls, or the second reservation would answer as if it
+    /// were the first. Says nothing about the interval, only that the two
+    /// calls reached the same instance.
+    func testAnObjectHandleCarriesRustSideStateBetweenCalls() {
+        let pacer = CoreFamilyRelayPacer()
+        let first = pacer.reserve(nowMs: 0)
+        let second = pacer.reserve(nowMs: 0)
+        XCTAssertNotEqual(first, second)
+    }
+
+    /// The other object, plus the unsigned counter it returns: a fresh
+    /// instance starts at zero, one call moves it, and the reset call moves it
+    /// back -- so `UInt32` crosses in the returning direction and the handle
+    /// is genuinely per-instance rather than shared.
+    func testObjectStateAdvancesAndResetsThroughTheBoundary() {
+        let backoff = CoreFamilyRelayBackoff()
+        XCTAssertEqual(backoff.consecutiveRateLimits(), 0)
+        _ = backoff.onRateLimited(retryAfterMs: 0, identityPublicBytes: Data())
+        XCTAssertEqual(backoff.consecutiveRateLimits(), 1)
+        XCTAssertEqual(CoreFamilyRelayBackoff().consecutiveRateLimits(), 0)
+        backoff.onSuccessfulPass()
+        XCTAssertEqual(backoff.consecutiveRateLimits(), 0)
+    }
+
+    /// An *optional enum argument* -- a lowering path no other smoke here
+    /// covers -- and an enum returned by value. The absent form must not be
+    /// confused with a present one, and a discriminant that shifted would land
+    /// out of range in Rust and trap rather than answer.
+    func testAnOptionalEnumArgumentLowersInBothItsForms() {
+        let answers = [
+            coreRelayPassHealth(fault: nil, ownRelaySucceeded: false, anyRelaySucceeded: false),
+            coreRelayPassHealth(fault: .mailboxFull, ownRelaySucceeded: false, anyRelaySucceeded: false),
+            coreRelayPassHealth(fault: .tokenRejected, ownRelaySucceeded: false, anyRelaySucceeded: false),
+        ]
+        XCTAssertEqual(Set(answers).count, 3)
+    }
+
+    /// Every declared case of the returned enum is reachable, so none of the
+    /// eight discriminants lifts onto another's name. Which input produces
+    /// which is the core's business and is not asserted; only that the set is
+    /// covered.
+    func testEveryPassHealthCaseLiftsBackDistinctly() {
+        var faults: [CoreRelayFault?] = [nil]
+        for fault in Self.allRelayFaultCases { faults.append(fault) }
+        var produced = Set<CoreRelayPassHealth>()
+        for fault in faults {
+            for own in [false, true] {
+                for any in [false, true] {
+                    produced.insert(
+                        coreRelayPassHealth(fault: fault, ownRelaySucceeded: own, anyRelaySucceeded: any)
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(produced, Set(Self.allPassHealthCases))
+    }
+
+    /// The third enum, lifted through a different signature.
+    func testEveryRerunActionLiftsBackDistinctly() {
+        var produced = Set<CoreRelayRerunAction>()
+        for pending in [false, true] {
+            for canSync in [false, true] {
+                for remaining in [Int64(-1), 0, 30_000] {
+                    produced.insert(
+                        coreRelayRerunAction(
+                            pendingRequested: pending, canSync: canSync, backoffRemainingMs: remaining
+                        )
+                    )
+                }
+            }
+        }
+        XCTAssertEqual(produced, Set(Self.allRerunActionCases))
+    }
+
+    /// A bare `Data` argument, with the bytes a broken converter corrupts:
+    /// `0x00`, `0x80`, `0xFF`. Reversing them must change the answer, which a
+    /// buffer that arrived truncated, NUL-terminated, or empty could not do.
+    func testABareByteArrayArgumentCrossesIntact() {
+        let awkward = Data([0x00, 0x7F, 0x80, 0xFF, 0x01])
+        let reversed = Data(awkward.reversed())
+        XCTAssertNotEqual(
+            coreFamilyRelayJitterMs(identityPublicBytes: awkward),
+            coreFamilyRelayJitterMs(identityPublicBytes: reversed)
+        )
+        XCTAssertEqual(
+            coreFamilyRelayJitterMs(identityPublicBytes: awkward),
+            coreFamilyRelayJitterMs(identityPublicBytes: Data(awkward))
+        )
+        // Empty is a value, not a missing argument.
+        XCTAssertEqual(
+            coreFamilyRelayJitterMs(identityPublicBytes: Data()),
+            coreFamilyRelayJitterMs(identityPublicBytes: Data())
+        )
+    }
+
+    /// `UInt64` in both directions, at a value a signed 64-bit converter would
+    /// deliver as -1. Asserts only that the top bit survived the trip, not
+    /// what the arithmetic did with it.
+    func testAnUnsigned64BitValueKeepsItsTopBitAcrossTheBoundary() {
+        let answer = coreFamilyRelayBackoffDelayMs(
+            retryAfterMs: UInt64.max, consecutiveRateLimits: 1, jitterMs: 0
+        )
+        XCTAssertGreaterThan(answer, UInt64(Int64.max), "top bit lost")
+    }
+
     // MARK: - Helpers
 
     /// Swift's generated enums are not `CaseIterable`, so the lists are
@@ -141,6 +262,44 @@ final class CoreBindingSmokeTests: XCTestCase {
         for value in all {
             switch value {
             case .directBluetooth, .directLocalWifi, .relayPresence, .none: break
+            }
+        }
+        return all
+    }()
+
+    private static let allRelayFaultCases: [CoreRelayFault] = {
+        let all: [CoreRelayFault] = [
+            .passExpired, .passSuspended, .tokenRejected,
+            .mailboxFull, .messageTooLarge, .rateLimited, .outage,
+        ]
+        for value in all {
+            switch value {
+            case .passExpired, .passSuspended, .tokenRejected,
+                 .mailboxFull, .messageTooLarge, .rateLimited, .outage: break
+            }
+        }
+        return all
+    }()
+
+    private static let allPassHealthCases: [CoreRelayPassHealth] = {
+        let all: [CoreRelayPassHealth] = [
+            .ok, .quotaFull, .messageTooLarge, .rateLimited,
+            .expired, .suspended, .tokenRejected, .failing,
+        ]
+        for value in all {
+            switch value {
+            case .ok, .quotaFull, .messageTooLarge, .rateLimited,
+                 .expired, .suspended, .tokenRejected, .failing: break
+            }
+        }
+        return all
+    }()
+
+    private static let allRerunActionCases: [CoreRelayRerunAction] = {
+        let all: [CoreRelayRerunAction] = [.runAgain, .scheduleRateLimitRetry, .stop]
+        for value in all {
+            switch value {
+            case .runAgain, .scheduleRateLimitRetry, .stop: break
             }
         }
         return all
