@@ -54,8 +54,10 @@ import os.log
  pipeline touches is safe off the main thread on its own terms -- the Rust
  core's store/seen-set/trackers are `Mutex`-backed, `MeshRouter`,
  `ChatVisibility`, `ContactRelaySilence` and `RelaySweepSession` are
- `NSLock`-backed, `LanCapabilityStore`/`LanEndpointCache`/`ProfileStore` are
- `UserDefaults`, `LanTransportDiagnostics` publishes on main internally, and
+ `NSLock`-backed, `LanCapabilityStore`/`ProfileStore` are `UserDefaults`,
+ `LanEndpointCache` is `UserDefaults` plus its own `NSLock` (its save reads
+ the stored entry before rewriting it, and per-operation atomicity is not
+ enough for that), `LanTransportDiagnostics` publishes on main internally, and
  `BleTransport`/`LanTransport` each own a private queue.
 
  The relay sync *pass* itself is unchanged: it still runs in a detached task
