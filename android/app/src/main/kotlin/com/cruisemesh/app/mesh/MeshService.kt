@@ -1086,10 +1086,12 @@ class MeshService : Service() {
     }
 
     private fun recordPeerDisconnected(address: String) {
-        // The link's byte allowance goes with the link. The *peer's* cadence
-        // deliberately does not: dropping it here is exactly how reconnect
-        // churn would reset the gate that exists for reconnect churn.
-        SprayPolicy.forgetLink(address)
+        // Nothing is reset here. Neither the peer's cadence nor this link's
+        // byte allowance: a disconnect is what reconnect churn produces (477
+        // of them in 88 minutes was the recorded rate), so clearing either on
+        // one would hand the churn back the very bound it defeats. Core keeps
+        // both accruing against real time and prunes them on its own schedule.
+        SprayPolicy.noteLinkClosed(address)
         val userId = MeshRouter.userIdFor(address) ?: return
         val transport = MeshRouter.transportFor(address) ?: return
         if (store.getContact(userId) == null) return
@@ -1307,14 +1309,22 @@ class MeshService : Service() {
             return
         }
         Log.i(TAG, "Logical peer selected $address; resuming carry and digest sync")
-        // A digest this peer sent while its window was open is answered first:
+        // Our own digest is one small frame and it goes FIRST, ahead of every
+        // bulk lane below. Core's exchange window opens when the frame is
+        // enqueued, which is the only moment this shell can observe; queueing a
+        // full carried drain ahead of it would hold it in the GATT FIFO for
+        // ~10s on a slow link, and the peer's answering DIGEST would then land
+        // after the window it was supposed to arrive inside. The ordering is
+        // load-bearing, not cosmetic (#280).
+        sendDigestTo(address, peerUserId, identity)
+        // A digest this peer sent while its window was open is answered next:
         // its carried-copy confirmations retire envelopes the drain below would
         // otherwise re-offer, which is the spray the cooldown exists to reduce.
         takeGatedDigest(peerUserId)?.let { gated ->
             respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity, gate)
         }
-        envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId, gate.carriedBudgetBytes)
-        sendDigestTo(address, peerUserId, identity)
+        val drained = envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId, gate.carriedBudgetBytes) ?: 0L
+        SprayPolicy.noteBytesQueued(address, drained)
     }
 
     /**
@@ -1697,14 +1707,6 @@ class MeshService : Service() {
             return
         }
 
-        // Hand off anything we're muling for this peer (DESIGN.md §5.3 carry
-        // queue) before the digest sync. This runs for *any* peer, contact or
-        // not: we carry foreign envelopes for strangers too, and a stranger to
-        // us may still be the intended recipient of something we picked up.
-        if (syncDeferralMs <= 0L) {
-            envelopeProcessor?.drainCarriedEnvelopesTo(address, userId, gate.carriedBudgetBytes)
-        }
-
         if (syncDeferralMs > 0L) {
             Log.i(
                 TAG,
@@ -1714,7 +1716,21 @@ class MeshService : Service() {
             scheduleDeferredSpray(userId, syncDeferralMs)
             return
         }
+
+        // Digest first: it is one small frame, and core's exchange window is
+        // measured from the moment it is enqueued. Draining the carry queue
+        // ahead of it would put up to a full carried budget into this link's
+        // single FIFO first, so the frame would not reach the radio for ~10s
+        // and the peer's answer would arrive after the window had shut (#280).
         sendDigestTo(address, userId, identity)
+
+        // Then hand off anything we're muling for this peer (DESIGN.md §5.3
+        // carry queue). This runs for *any* peer, contact or not: we carry
+        // foreign envelopes for strangers too, and a stranger to us may still
+        // be the intended recipient of something we picked up. Its bytes are
+        // charged to the link because no spray plan accounts for them.
+        val drained = envelopeProcessor?.drainCarriedEnvelopesTo(address, userId, gate.carriedBudgetBytes) ?: 0L
+        SprayPolicy.noteBytesQueued(address, drained)
     }
 
     /**
@@ -1961,9 +1977,17 @@ class MeshService : Service() {
         identity: Identity,
         gate: CoreSprayGate,
     ) {
+        // Everything queued here that is not part of the spray plan -- the
+        // receipt repair pass, the per-missing-message re-send loop and the
+        // group catch-up -- is counted and charged against this link's burst
+        // allowance at the end. They are the encounter's LARGEST lanes, and
+        // while they went uncharged a second DIGEST arriving inside the
+        // exchange window could re-run all of them against an untouched
+        // allowance (#280).
+        var queuedBytes = 0L
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
-            envelopeProcessor?.syncReceiptsFirst(identity, contact, address)
+            queuedBytes += envelopeProcessor?.syncReceiptsFirst(identity, contact, address) ?: 0L
             val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
             val queuedByLamport = store
                 .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)
@@ -1987,15 +2011,19 @@ class MeshService : Service() {
                         if (UserIdHex.encode(outbound.msgId) in alreadyOffered) continue
                         newlyOffered += outbound.msgId
                     }
-                    sendStoredOutboundEnvelope(address, outbound)
+                    queuedBytes += sendStoredOutboundEnvelope(address, outbound)
                 }
             }
             MeshRouter.recordHiddenOffered(address, newlyOffered)
             // Group digests are not on the wire yet (1:1 digest only). At family
             // scale, re-offer every outbound group envelope we authored for
             // groups this peer is in; their insert is idempotent.
-            resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
+            queuedBytes += resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
         }
+        // Charged before the plan is built, so `sprayDigestPlanTo`'s own
+        // admission sees a link allowance that already reflects what this
+        // encounter has queued.
+        SprayPolicy.noteBytesQueued(address, queuedBytes)
         envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
@@ -2007,8 +2035,17 @@ class MeshService : Service() {
      * (and any queued pairwise invites addressed to this peer) for groups the
      * peer belongs to. Without per-group digests we resend from lamport 0;
      * duplicates are safe on the receiver.
+     *
+     * Returns the sealed bytes queued. This is the encounter's largest lane by
+     * some distance -- every group envelope this device ever authored, for
+     * every shared group -- and it is the one lane no spray plan can see, so
+     * the caller charges it against the link's burst allowance. It is not
+     * truncated: cutting it would make later envelopes unreachable, because
+     * the walk always restarts at lamport 0. Charging it means the *next*
+     * trigger on this link waits for the radio instead (#280).
      */
-    private fun resendGroupOutboundToPeer(address: String, peerUserId: ByteArray, identity: Identity) {
+    private fun resendGroupOutboundToPeer(address: String, peerUserId: ByteArray, identity: Identity): Long {
+        var queuedBytes = 0L
         for (group in store.listGroups()) {
             if (!group.memberUserIds.any { it.contentEquals(peerUserId) }) continue
             if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
@@ -2021,9 +2058,10 @@ class MeshService : Service() {
                 ) {
                     continue
                 }
-                sendStoredOutboundEnvelope(address, envelope)
+                queuedBytes += sendStoredOutboundEnvelope(address, envelope)
             }
         }
+        return queuedBytes
     }
 
     /**
@@ -2057,8 +2095,16 @@ class MeshService : Service() {
     }
 
     /** Sends one previously persisted outbound envelope on the exact link [address]. */
-    private fun sendStoredOutboundEnvelope(address: String, envelope: OutboundEnvelope) {
-        MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))
+    /**
+     * Queues one stored outbound envelope at [address] and reports the sealed
+     * bytes that cost, so the caller can charge them against the link's burst
+     * allowance. These re-sends are not part of any spray plan, and until they
+     * were charged the per-link cap bounded the plan rather than the link
+     * (#280).
+     */
+    private fun sendStoredOutboundEnvelope(address: String, envelope: OutboundEnvelope): Long {
+        if (!MeshRouter.sendToAddress(address, encodeOutboundEnvelopeFrame(envelope))) return 0L
+        return envelope.sealed.size.toLong()
     }
 
     private fun hasRequiredPermissions(): Boolean {

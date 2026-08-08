@@ -99,12 +99,22 @@ final class SprayPolicyTests: XCTestCase {
         XCTAssertEqual(answer.reason, .exchangeOpen)
     }
 
+    /// A one-lane plan (own outbound), for cases that are not about lanes.
+    private func ownLane(_ setDigest: UInt64, _ bytes: UInt64) -> CoreSprayPlanShape {
+        CoreSprayPlanShape(
+            carried: Self.emptyLane,
+            ownOutbound: CoreSprayLanePlan(setDigest: setDigest, bytes: bytes),
+            ownReceipts: Self.emptyLane
+        )
+    }
+
+    private static let emptyLane = CoreSprayLanePlan(setDigest: 0, bytes: 0)
+
     func testAnUnchangedAdvertisedSetIsNotRespayedAtFullSize() {
         let sent = SprayPolicy.admitPlan(
             peerUserId: peer,
             address: link,
-            setDigest: 0xABCD,
-            planBytes: 8_192,
+            lanes: ownLane(0xABCD, 8_192),
             nowMs: 0
         )
         XCTAssertTrue(sent.send)
@@ -113,8 +123,7 @@ final class SprayPolicyTests: XCTestCase {
         let repeated = SprayPolicy.admitPlan(
             peerUserId: peer,
             address: link,
-            setDigest: 0xABCD,
-            planBytes: 8_192,
+            lanes: ownLane(0xABCD, 8_192),
             nowMs: 60_000
         )
         XCTAssertFalse(repeated.send, "the 28 identical sprays")
@@ -124,25 +133,54 @@ final class SprayPolicyTests: XCTestCase {
         let changed = SprayPolicy.admitPlan(
             peerUserId: peer,
             address: link,
-            setDigest: 0x1234,
-            planBytes: 8_192,
+            lanes: ownLane(0x1234, 8_192),
             nowMs: 60_001
         )
         XCTAssertTrue(changed.send, "a set change sprays immediately")
     }
 
-    func testADisconnectFreesTheLinkBudgetButNotThePeerCadence() {
+    func testAnInvariantAuthoredLaneGoesQuietWhileTheCarriedWalkProceeds() {
+        // The recorded shape: authored invariant at 16 envelopes across every
+        // spray while the carried lane walked its cursor. `sprayDigestPlanTo`
+        // sends exactly the lanes this admission names, so the per-lane answer
+        // has to survive the crossing.
+        var carriedSends = 0
+        var authoredSends = 0
+        for round in 0..<6 {
+            let admission = SprayPolicy.admitPlan(
+                peerUserId: peer,
+                address: link,
+                lanes: CoreSprayPlanShape(
+                    carried: CoreSprayLanePlan(setDigest: UInt64(round) + 1, bytes: 8_192),
+                    ownOutbound: CoreSprayLanePlan(setDigest: 0xA17, bytes: 16_384),
+                    ownReceipts: Self.emptyLane
+                ),
+                nowMs: Int64(round) * 200
+            )
+            if admission.sendCarried { carriedSends += 1 }
+            if admission.sendOwnOutbound { authoredSends += 1 }
+        }
+        XCTAssertEqual(carriedSends, 6, "the carried walk must not be suppressed")
+        XCTAssertEqual(authoredSends, 1, "an invariant authored set is offered once")
+    }
+
+    func testADisconnectResetsNeitherThePeerCadenceNorTheLinkAllowance() {
         XCTAssertTrue(
             SprayPolicy.maySpray(peerUserId: peer, address: link, trigger: .firstContact, nowMs: 0).allow
         )
         SprayPolicy.noteDigestSent(peerUserId: peer, address: link, nowMs: 0)
-        // This is what MeshController.recordPeerDisconnected does. Forgetting
-        // the peer here instead would be how reconnect churn resets the gate
-        // that exists for reconnect churn.
-        SprayPolicy.forgetLink(address: link)
-        XCTAssertFalse(
-            SprayPolicy.maySpray(peerUserId: peer, address: link, trigger: .reconnect, nowMs: 100).allow
-        )
+        // Everything this encounter queued outside the plan -- the receipt
+        // repair pass, the per-missing-message re-send loop, the group catch-up
+        // and the carry drain -- is charged here, exactly as `respondToDigest`
+        // and `handleHello` do.
+        SprayPolicy.noteBytesQueued(address: link, bytes: 576 * 1024, nowMs: 0)
+        // This is what MeshController.recordPeerDisconnected does. It resets
+        // nothing: a disconnect is what reconnect churn produces.
+        SprayPolicy.noteLinkClosed(address: link, nowMs: 0)
+        let gate = SprayPolicy.maySpray(peerUserId: peer, address: link, trigger: .peerDigest, nowMs: 1)
+        XCTAssertFalse(gate.allow)
+        XCTAssertEqual(gate.reason, .linkBurstExhausted)
+        XCTAssertGreaterThan(gate.retryAfterMs, 0, "a denial must name its expiry")
     }
 
     func testProgressEvidenceClearsTheReceiptQuietBackoff() {
@@ -154,8 +192,7 @@ final class SprayPolicyTests: XCTestCase {
             _ = SprayPolicy.admitPlan(
                 peerUserId: peer,
                 address: link,
-                setDigest: UInt64(round),
-                planBytes: 1_024,
+                lanes: ownLane(UInt64(round), 1_024),
                 nowMs: now
             )
             now += 61_000

@@ -4,6 +4,7 @@ import android.os.SystemClock
 import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.CoreSprayAdmission
 import uniffi.cruisemesh_core.CoreSprayGate
+import uniffi.cruisemesh_core.CoreSprayPlanShape
 import uniffi.cruisemesh_core.CoreSprayPolicy
 import uniffi.cruisemesh_core.CoreSprayTrigger
 import uniffi.cruisemesh_core.coreSprayRetryArmMaxMs
@@ -62,20 +63,33 @@ object SprayPolicy {
     }
 
     /**
-     * A plan is built; does it go on the radio?
+     * A plan is built; which of its lanes go on the radio?
      *
-     * When this says no, the caller must not send, must not advance a carried
-     * cursor, and must not record hidden-kind offers -- a suppressed offer has
-     * to stay exactly as re-discoverable as it was.
+     * Per lane, not per plan: the recorded shape was an invariant authored set
+     * beside a carried set walking a cursor, and one digest over all three
+     * would change on every page turn and so suppress nothing.
+     *
+     * When a lane is refused the caller must not send it, must not advance a
+     * carried cursor, and must not record hidden-kind offers -- a suppressed
+     * offer has to stay exactly as re-discoverable as it was.
      */
     fun admitPlan(
         peerUserId: ByteArray,
         address: String,
-        setDigest: ULong,
-        planBytes: ULong,
+        lanes: CoreSprayPlanShape,
         nowMs: Long = nowMs(),
-    ): CoreSprayAdmission =
-        core.admitPlan(UserIdHex.encode(peerUserId), address, setDigest, planBytes, nowMs)
+    ): CoreSprayAdmission = core.admitPlan(UserIdHex.encode(peerUserId), address, lanes, nowMs)
+
+    /**
+     * Bytes this encounter queued at [address] outside a spray plan: the
+     * receipt repair pass, the per-missing-message re-send loop, the group
+     * catch-up and the carry drain. Pure accounting -- it refuses nothing, it
+     * changes what the next [maySpray] sees.
+     */
+    fun noteBytesQueued(address: String, bytes: Long, nowMs: Long = nowMs()) {
+        if (bytes <= 0L) return
+        core.noteBytesQueued(address, bytes.toULong(), nowMs)
+    }
 
     /**
      * Evidence that sprays toward this peer are achieving something: carried
@@ -89,8 +103,15 @@ object SprayPolicy {
     /** Longest deferral worth arming a timer for, from core. */
     fun retryArmMaxMs(): Long = coreSprayRetryArmMaxMs()
 
-    /** A link went away. Peer cadence deliberately survives it. */
-    fun forgetLink(address: String) = core.forgetLink(address)
+    /**
+     * A link went away. Nothing is reset: neither the peer's cadence nor this
+     * link's burst allowance. A disconnect is what reconnect churn produces --
+     * hundreds per hour in the field -- so clearing either on one would hand
+     * the churn back the bound it defeats.
+     */
+    fun noteLinkClosed(address: String, nowMs: Long = nowMs()) {
+        core.noteLinkClosed(address, nowMs)
+    }
 
     /** Mesh stopped; none of this is durable state. */
     fun reset() = core.clear()

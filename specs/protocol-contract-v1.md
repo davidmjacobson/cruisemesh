@@ -194,19 +194,32 @@ Four decisions carry that, all in `core/src/spray_policy.rs`:
   an interval. Core classifies first contact from its own record, so a shell
   that labels every reconnect as a fresh encounter is silently downgraded
   rather than believed.
-- **Identical-set suppression.** Core digests the `msg_id` set a plan
-  advertises. An unchanged set toward the same peer is not re-sprayed until a
-  bounded re-offer interval lapses — aligned with the carried re-walk interval,
-  because both exist so that a frame lost in a link's FIFO is eventually found
-  again. Any change to the set sprays immediately.
+- **Identical-set suppression, per lane.** Core digests the `msg_id` set each
+  of the three lanes advertises — foreign carry, own outbound, own receipts —
+  and decides each on its own. The union would be the wrong unit: the recorded
+  shape was an authored set invariant at 16 envelopes across 28 consecutive
+  sprays beside a carried lane walking a cursor, and any carried page turn
+  changes a union digest, so a union would suppress nothing. An unchanged lane
+  is not re-offered until a bounded re-offer interval lapses — aligned with the
+  carried re-walk interval, because both exist so that a frame lost in a link's
+  FIFO is eventually found again. Any change sprays that lane immediately, and
+  a lane that selected nothing is neither suppressed nor remembered as offered.
 - **Byte budgets.** The three per-encounter budgets are core constants, and a
   per-link allowance bounds what may be *queued* at one link across every lane
-  and every trigger. A link that has been quiet is not throttled; a second
-  encounter's worth of bytes in the same breath waits for the radio.
-- **Receipt-quiet backoff.** A link whose sprays keep producing no evidence of
+  and every trigger. It is charged for everything the shells queue, not only
+  the plan: the receipt repair pass, the per-missing-message re-send loop, the
+  group catch-up that restarts at lamport 0 and the carry drain are all larger
+  than the plan and none of them appear in it. The allowance is not reset by a
+  disconnect either, because a disconnect is exactly what reconnect churn
+  produces. A link that has been quiet is not throttled; a second encounter's
+  worth of bytes in the same breath waits for the radio.
+- **Receipt-quiet backoff.** A peer whose sprays keep producing no evidence of
   progress waits longer, up to a ceiling. This **caps waste; it never concludes
   brokenness** — a courier holding mail for someone who is not present produces
-  no receipts and is behaving correctly.
+  no receipts and is behaving correctly. It stretches only sprays *we* start:
+  the peer's own digest keeps the base interval, because that is the one path
+  that sends the receipts we owe it and the backlog its watermark asked for,
+  and quietness on the foreign-carry lane says nothing about either.
 
 Every one of those is a *delay with a computable expiry*, never a drop. A
 suppressed offer advances no cursor, records no hidden-kind offer, removes
@@ -757,7 +770,7 @@ against the tree as it stands. Labels:
 | Connection and delivery health classification | consumes core (#281, #282) | consumes core (#281, #282) | `connection_health.rs` owns classification, per-recipient delivery, receipt-gated lines | presentation-only | stays core; shells render |
 | Failover resume debounce | `mesh/FailoverResumeDebounce.kt` — thin wrapper | equivalent wrapper | `transport_policy.rs` owns the window and coalescing (#269) | presentation-only | stays core; wrappers are adapters |
 | Peripheral link admission and the post-reject spray cooldown | `mesh/PeripheralLinkAdmission.kt`, spray cooldown classes (#277) | not yet extracted | none — but the byte and cadence half of `SPRAY-01` is now core (#280), and this brake composes with it rather than duplicating it | hoist-later | `mesh_meet.rs` when D2 lands; what remains here is the notify-reject window itself |
-| Per-encounter spray byte budgets and cadence | `mesh/SprayPolicy.kt` — thin delegate; the three constants are gone from `InboundEnvelopeProcessor.kt` | `Mesh/SprayPolicy.swift` — thin delegate; the three constants are gone from `Core/ProtocolKinds.swift` | `spray_policy.rs` owns the budgets, the per-link burst allowance, the cadence gate, identical-set suppression and the receipt-quiet backoff; `core_digest_spray_plan` reports the advertised-set digest and plan bytes it spent | presentation-only | done (#280); stays core, and D2 absorbs the delegates rather than unwinding them |
+| Per-encounter spray byte budgets and cadence | `mesh/SprayPolicy.kt` — thin delegate; the three constants are gone from `InboundEnvelopeProcessor.kt` | `Mesh/SprayPolicy.swift` — thin delegate; the three constants are gone from `Core/ProtocolKinds.swift` | `spray_policy.rs` owns the budgets, the per-link burst allowance, the cadence gate, per-lane identical-set suppression and the receipt-quiet backoff; `core_digest_spray_plan` reports each lane's advertised-set digest and byte cost, and the shells charge the lanes no plan can see | presentation-only | done (#280); stays core, and D2 absorbs the delegates rather than unwinding them |
 | Inbound envelope disposition | `mesh/InboundEnvelopeProcessor.kt` | `processInboundEnvelope` and handlers in `MeshController.swift` | crypto/store primitives and ack eligibility in `engine.rs` / `store.rs` | hoist-now | `mesh_receive.rs`; D0/D1 |
 | HELLO / digest / carry encounter | `MeshService.kt` + `InboundEnvelopeProcessor.kt` | `MeshController.swift` | digest and spray planning in `engine.rs`, session state in `transport_policy.rs`, and every spray decision (whether, how often, how much) in `spray_policy.rs` (#280) | hoist-now | `mesh_meet.rs`; D2/D3, which absorbs `spray_policy.rs` rather than re-deciding it |
 | Logical peer routing | `MeshRouter.kt` / `MeshRouterState.kt` | `MeshRouter.swift` / `MeshRouterState.swift` | `CoreMeshRouterState` in `transport_policy.rs`; peer collapse is core (#266) | hoist-later | extend the existing core router; D2 |
@@ -805,11 +818,16 @@ Recorded so a reader does not have to diff two documents:
   owns two copies, not one, and a hoist that moves only the Kotlin file
   leaves `ENDPOINT-01`'s authoring half exactly as split as it is today.
 - The per-encounter spray byte budgets are **core constants** (#280), beside
-  the per-link burst allowance, the cadence gate, identical-set suppression and
-  the receipt-quiet backoff. Both shells deleted their copies and now receive
-  budgets from core; each keeps a thin delegate (`SprayPolicy.kt`,
-  `SprayPolicy.swift`) that maps keys and picks the monotonic clock, and
-  decides nothing.
+  the per-link burst allowance, the cadence gate, per-lane identical-set
+  suppression and the receipt-quiet backoff. Both shells deleted their copies
+  and now receive budgets from core; each keeps a thin delegate
+  (`SprayPolicy.kt`, `SprayPolicy.swift`) that maps keys, picks the monotonic
+  clock and reports bytes queued, and decides nothing. What the shells still
+  own is the *shape* of the encounter — which lanes run, and in which order —
+  and one ordering there is load-bearing rather than cosmetic: the digest frame
+  is enqueued ahead of every bulk lane, because core's exchange window is
+  measured from that enqueue and a carried drain queued first would hold it in
+  the FIFO past the window's own width.
 - Stage 7 is not one order. Android walks the mailbox and then syncs
   presence; iOS syncs presence and then walks. Section 5.2 carries this and
   the presence-failure difference beside it.

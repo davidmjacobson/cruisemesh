@@ -42,10 +42,11 @@ use cruisemesh_core::{
     relay_cursor_advance, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
     relay_mailbox_walk_action, relay_retry_after_ms, CarriedEnvelope, Contact,
     CoreInboundDisposition, CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState,
-    CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore, RelayMailboxWalkAction,
-    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
-    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS,
-    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
+    CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
+    RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
+    LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
+    OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -1105,36 +1106,86 @@ fn spray_01_one_peer_is_bounded_in_bytes_and_its_re_offers_are_cadence_gated() {
         "the per-encounter byte budgets are core's numbers, not a shell constant"
     );
 
-    // The recorded failure: 34 triggers inside one second toward one peer.
-    // Bytes, not frames, is what has to be bounded -- 34 frames sounded
-    // modest and was ~639 KB.
+    // Cadence, asserted on its own so the byte bound below cannot be the only
+    // thing holding this row up. Our digest goes out at t=0; a shell claiming
+    // a fresh encounter one millisecond later is downgraded from core's own
+    // record and refused, with a finite expiry.
+    policy.note_digest_sent(peer.clone(), link.clone(), 0);
+    let second = policy.may_spray(
+        peer.clone(),
+        link.clone(),
+        CoreSprayTrigger::FirstContact,
+        1,
+    );
+    contract_assert!(
+        id,
+        !second.allow && second.retry_after_ms > 0,
+        "a re-offer one millisecond later must be refused, and name a finite expiry"
+    );
+
+    // The recorded failure: 34 triggers inside one second toward one peer,
+    // ~639 KB. Bytes, not frames, is what has to be bounded -- 34 frames
+    // sounded modest.
+    //
+    // Driven through the one path the cadence gate deliberately exempts: the
+    // peer answering inside the exchange window our own digest just opened.
+    // That isolates the per-link burst allowance, which is what SPRAY-01's
+    // statement names, from the cadence gate asserted above. Every round also
+    // advertises a DIFFERENT set, so identical-set suppression cannot stand in
+    // for the byte cap either -- with those two neutralised, deleting the cap
+    // makes this fail rather than leaving it green.
+    // All 34 in the same millisecond, as the field recorded (~100ms), so no
+    // allowance accrues mid-burst to muddy the arithmetic.
     let frame_bytes = 18_795_u64;
     let mut queued = 0_u64;
+    let mut refused = false;
     for round in 0..34_u64 {
-        let now = round as i64 * 30;
-        let gate = policy.may_spray(
-            peer.clone(),
-            link.clone(),
-            CoreSprayTrigger::FirstContact,
-            now,
-        );
+        let gate = policy.may_spray(peer.clone(), link.clone(), CoreSprayTrigger::PeerDigest, 0);
         if !gate.allow {
             contract_assert!(
                 id,
                 gate.retry_after_ms > 0,
                 "every refusal names a finite expiry -- a gate here is a delay, never a drop"
             );
+            refused = true;
             continue;
         }
-        let admitted = policy.admit_plan(peer.clone(), link.clone(), 0xfeed, frame_bytes, now);
-        if admitted.send {
-            queued += admitted.charged_bytes;
-        }
+        // A conforming caller plans inside the budget core handed it.
+        let admitted = policy.admit_plan(
+            peer.clone(),
+            link.clone(),
+            CoreSprayPlanShape {
+                carried: CoreSprayLanePlan {
+                    set_digest: round,
+                    bytes: frame_bytes.min(gate.carried_budget_bytes),
+                },
+                own_outbound: CoreSprayLanePlan {
+                    set_digest: 0,
+                    bytes: 0,
+                },
+                own_receipts: CoreSprayLanePlan {
+                    set_digest: 0,
+                    bytes: 0,
+                },
+            },
+            0,
+        );
+        queued += admitted.charged_bytes;
     }
+    contract_assert!(
+        id,
+        refused,
+        "the per-link byte allowance must actually run out inside one second of this"
+    );
     contract_assert!(
         id,
         queued <= LINK_BURST_BYTES,
         "one peer's burst must stay inside the per-link byte allowance"
+    );
+    contract_assert!(
+        id,
+        queued < 34 * frame_bytes,
+        "the recorded 639 KB one-second burst toward one peer must be impossible"
     );
 
     // And the rate limit is never a give-up: a peer that produces no receipt

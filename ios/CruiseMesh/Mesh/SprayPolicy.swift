@@ -64,25 +64,40 @@ enum SprayPolicy {
         )
     }
 
-    /// A plan is built; does it go on the radio?
+    /// A plan is built; which of its lanes go on the radio?
     ///
-    /// When this says no, the caller must not send, must not advance a carried
-    /// cursor, and must not record hidden-kind offers — a suppressed offer has
-    /// to stay exactly as re-discoverable as it was.
+    /// Per lane, not per plan: the recorded shape was an invariant authored set
+    /// beside a carried set walking a cursor, and one digest over all three
+    /// would change on every page turn and so suppress nothing.
+    ///
+    /// When a lane is refused the caller must not send it, must not advance a
+    /// carried cursor, and must not record hidden-kind offers — a suppressed
+    /// offer has to stay exactly as re-discoverable as it was.
     static func admitPlan(
         peerUserId: Data,
         address: String,
-        setDigest: UInt64,
-        planBytes: UInt64,
+        lanes: CoreSprayPlanShape,
         nowMs: Int64 = SprayPolicy.nowMs
     ) -> CoreSprayAdmission {
         core.admitPlan(
             peerKey: UserIdHex.encode(peerUserId),
             linkKey: address,
-            setDigest: setDigest,
-            planBytes: planBytes,
+            lanes: lanes,
             nowMs: nowMs
         )
+    }
+
+    /// Bytes this encounter queued at `address` outside a spray plan: the
+    /// receipt repair pass, the per-missing-message re-send loop, the group
+    /// catch-up and the carry drain. Pure accounting — it refuses nothing, it
+    /// changes what the next `maySpray` sees.
+    static func noteBytesQueued(
+        address: String,
+        bytes: Int,
+        nowMs: Int64 = SprayPolicy.nowMs
+    ) {
+        guard bytes > 0 else { return }
+        core.noteBytesQueued(linkKey: address, bytes: UInt64(bytes), nowMs: nowMs)
     }
 
     /// Evidence that sprays toward this peer are achieving something: carried
@@ -98,9 +113,12 @@ enum SprayPolicy {
     /// Longest deferral worth arming a timer for, from core.
     static var retryArmMaxMs: Int64 { coreSprayRetryArmMaxMs() }
 
-    /// A link went away. Peer cadence deliberately survives it.
-    static func forgetLink(address: String) {
-        core.forgetLink(linkKey: address)
+    /// A link went away. Nothing is reset: neither the peer's cadence nor this
+    /// link's burst allowance. A disconnect is what reconnect churn produces —
+    /// hundreds per hour in the field — so clearing either on one would hand
+    /// the churn back the bound it defeats.
+    static func noteLinkClosed(address: String, nowMs: Int64 = SprayPolicy.nowMs) {
+        core.noteLinkClosed(linkKey: address, nowMs: nowMs)
     }
 
     /// Mesh stopped; none of this is durable state.

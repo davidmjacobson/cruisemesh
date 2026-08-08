@@ -1951,29 +1951,35 @@ public func FfiConverterTypeCoreReconnectBackoffTracker_lower(_ value: CoreRecon
 public protocol CoreSprayPolicyProtocol : AnyObject {
 
     /**
-     * A plan has been built. Does it go on the radio, and what does it cost?
+     * A plan has been built. Which of its lanes go on the radio, and what does
+     * that cost?
      *
-     * `set_digest` is [`crate::CoreDigestSprayPlan::advertised_set_digest`] —
-     * core computed it while selecting, so the shells never hash anything.
-     * `plan_bytes` is the same plan's `plan_bytes`.
+     * `lanes` is [`crate::CoreDigestSprayPlan::lanes`] — core computed both
+     * the per-lane digests and the per-lane byte counts while selecting, so
+     * the shells never hash or measure anything.
      *
-     * A suppressed plan must leave the world untouched: the caller must not
-     * advance a carried cursor, must not record hidden-kind offers, and must
-     * not send. Nothing here removes or acks anything either way.
+     * A suppressed lane must leave the world untouched: the caller must not
+     * advance a carried cursor when the carried lane is refused, must not
+     * record hidden-kind offers when the own-outbound lane is refused, and
+     * must not send either lane's frames. Nothing here removes or acks
+     * anything either way, so `CARRY-01` and `ACK-01` are unaffected.
+     *
+     * Calling this always arms the peer's cadence, even when every lane comes
+     * back empty. The encounter really happened — the shells run a receipt
+     * repair pass, a per-missing-message re-send and a group catch-up around
+     * this call, none of which the plan can see — so treating "the plan
+     * selected nothing" as "nothing happened" left a hole that re-ran all of
+     * that on every trigger inside the exchange window.
+     *
+     * It deliberately does **not** re-open the exchange window; only
+     * [`Self::note_digest_sent`] does. See [`SPRAY_EXCHANGE_WINDOW_MS`].
      */
-    func admitPlan(peerKey: String, linkKey: String, setDigest: UInt64, planBytes: UInt64, nowMs: Int64)  -> CoreSprayAdmission
+    func admitPlan(peerKey: String, linkKey: String, lanes: CoreSprayPlanShape, nowMs: Int64)  -> CoreSprayAdmission
 
     /**
      * Mesh stopped. Everything is scheduling state; none of it survives.
      */
     func clear()
-
-    /**
-     * A link went away for good. Peer cadence is deliberately NOT dropped
-     * with it: forgetting the peer on disconnect is exactly how reconnect
-     * churn would reset the gate it exists to enforce.
-     */
-    func forgetLink(linkKey: String)
 
     /**
      * Bytes this link may currently have queued at it. Diagnostics and tests.
@@ -1992,6 +1998,22 @@ public protocol CoreSprayPolicyProtocol : AnyObject {
     func maySpray(peerKey: String, linkKey: String, trigger: CoreSprayTrigger, nowMs: Int64)  -> CoreSprayGate
 
     /**
+     * Bytes the shell queued at this link outside a spray plan.
+     *
+     * The digest-time encounter's largest lanes are not in the plan at all:
+     * the receipt repair pass, the per-missing-message re-send loop, the group
+     * catch-up that re-sends every authored group envelope from lamport 0, and
+     * the carry drain. Until they were charged, the "per-link byte cap" capped
+     * the plan rather than the link, and a second trigger inside the exchange
+     * window could re-run all of them against an untouched allowance. This is
+     * how the shells report them.
+     *
+     * It is pure accounting: it never refuses anything. What it changes is
+     * what [`Self::may_spray`] sees next time.
+     */
+    func noteBytesQueued(linkKey: String, bytes: UInt64, nowMs: Int64)
+
+    /**
      * A DIGEST frame actually went out to this peer.
      *
      * This is what arms the cadence for the *small* half of the exchange. It
@@ -2003,13 +2025,30 @@ public protocol CoreSprayPolicyProtocol : AnyObject {
     func noteDigestSent(peerKey: String, linkKey: String, nowMs: Int64)
 
     /**
+     * A link went away.
+     *
+     * Nothing is dropped. Neither the peer's cadence nor the link's burst
+     * allowance is reset, because a disconnect is exactly the event reconnect
+     * churn produces: 477 of them in 88 minutes was the recorded rate, and
+     * clearing either record on each one would reset the very gates that churn
+     * is what they exist to bound. The bucket keeps accruing against real time
+     * and a reconnect to the same address inherits it; retention pruning is
+     * what eventually collects it.
+     *
+     * The call is kept (rather than deleted) so the shells have one place to
+     * keep the accrual clock anchored to real time across a gap.
+     */
+    func noteLinkClosed(linkKey: String, nowMs: Int64)
+
+    /**
      * Evidence that sprays toward this peer are achieving something: a
      * receipt consumed from it, or carried copies it confirmed holding.
      *
      * Resets the receipt-quiet backoff. Absence of this is not evidence of a
      * fault — a courier for an absent recipient legitimately never produces
      * it — which is exactly why the backoff has a ceiling and no give-up
-     * state.
+     * state, and why the peer's own digest is exempt from the stretch (see
+     * [`Self::interval_for`]).
      */
     func noteReceiptProgress(peerKey: String, nowMs: Int64)
 
@@ -2088,23 +2127,35 @@ public convenience init() {
 
 
     /**
-     * A plan has been built. Does it go on the radio, and what does it cost?
+     * A plan has been built. Which of its lanes go on the radio, and what does
+     * that cost?
      *
-     * `set_digest` is [`crate::CoreDigestSprayPlan::advertised_set_digest`] —
-     * core computed it while selecting, so the shells never hash anything.
-     * `plan_bytes` is the same plan's `plan_bytes`.
+     * `lanes` is [`crate::CoreDigestSprayPlan::lanes`] — core computed both
+     * the per-lane digests and the per-lane byte counts while selecting, so
+     * the shells never hash or measure anything.
      *
-     * A suppressed plan must leave the world untouched: the caller must not
-     * advance a carried cursor, must not record hidden-kind offers, and must
-     * not send. Nothing here removes or acks anything either way.
+     * A suppressed lane must leave the world untouched: the caller must not
+     * advance a carried cursor when the carried lane is refused, must not
+     * record hidden-kind offers when the own-outbound lane is refused, and
+     * must not send either lane's frames. Nothing here removes or acks
+     * anything either way, so `CARRY-01` and `ACK-01` are unaffected.
+     *
+     * Calling this always arms the peer's cadence, even when every lane comes
+     * back empty. The encounter really happened — the shells run a receipt
+     * repair pass, a per-missing-message re-send and a group catch-up around
+     * this call, none of which the plan can see — so treating "the plan
+     * selected nothing" as "nothing happened" left a hole that re-ran all of
+     * that on every trigger inside the exchange window.
+     *
+     * It deliberately does **not** re-open the exchange window; only
+     * [`Self::note_digest_sent`] does. See [`SPRAY_EXCHANGE_WINDOW_MS`].
      */
-open func admitPlan(peerKey: String, linkKey: String, setDigest: UInt64, planBytes: UInt64, nowMs: Int64) -> CoreSprayAdmission {
+open func admitPlan(peerKey: String, linkKey: String, lanes: CoreSprayPlanShape, nowMs: Int64) -> CoreSprayAdmission {
     return try!  FfiConverterTypeCoreSprayAdmission.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corespraypolicy_admit_plan(self.uniffiClonePointer(),
         FfiConverterString.lower(peerKey),
         FfiConverterString.lower(linkKey),
-        FfiConverterUInt64.lower(setDigest),
-        FfiConverterUInt64.lower(planBytes),
+        FfiConverterTypeCoreSprayPlanShape.lower(lanes),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -2115,18 +2166,6 @@ open func admitPlan(peerKey: String, linkKey: String, setDigest: UInt64, planByt
      */
 open func clear() {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corespraypolicy_clear(self.uniffiClonePointer(),$0
-    )
-}
-}
-
-    /**
-     * A link went away for good. Peer cadence is deliberately NOT dropped
-     * with it: forgetting the peer on disconnect is exactly how reconnect
-     * churn would reset the gate it exists to enforce.
-     */
-open func forgetLink(linkKey: String) {try! rustCall() {
-    uniffi_cruisemesh_core_fn_method_corespraypolicy_forget_link(self.uniffiClonePointer(),
-        FfiConverterString.lower(linkKey),$0
     )
 }
 }
@@ -2164,6 +2203,29 @@ open func maySpray(peerKey: String, linkKey: String, trigger: CoreSprayTrigger, 
 }
 
     /**
+     * Bytes the shell queued at this link outside a spray plan.
+     *
+     * The digest-time encounter's largest lanes are not in the plan at all:
+     * the receipt repair pass, the per-missing-message re-send loop, the group
+     * catch-up that re-sends every authored group envelope from lamport 0, and
+     * the carry drain. Until they were charged, the "per-link byte cap" capped
+     * the plan rather than the link, and a second trigger inside the exchange
+     * window could re-run all of them against an untouched allowance. This is
+     * how the shells report them.
+     *
+     * It is pure accounting: it never refuses anything. What it changes is
+     * what [`Self::may_spray`] sees next time.
+     */
+open func noteBytesQueued(linkKey: String, bytes: UInt64, nowMs: Int64) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_note_bytes_queued(self.uniffiClonePointer(),
+        FfiConverterString.lower(linkKey),
+        FfiConverterUInt64.lower(bytes),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
      * A DIGEST frame actually went out to this peer.
      *
      * This is what arms the cadence for the *small* half of the exchange. It
@@ -2182,13 +2244,36 @@ open func noteDigestSent(peerKey: String, linkKey: String, nowMs: Int64) {try! r
 }
 
     /**
+     * A link went away.
+     *
+     * Nothing is dropped. Neither the peer's cadence nor the link's burst
+     * allowance is reset, because a disconnect is exactly the event reconnect
+     * churn produces: 477 of them in 88 minutes was the recorded rate, and
+     * clearing either record on each one would reset the very gates that churn
+     * is what they exist to bound. The bucket keeps accruing against real time
+     * and a reconnect to the same address inherits it; retention pruning is
+     * what eventually collects it.
+     *
+     * The call is kept (rather than deleted) so the shells have one place to
+     * keep the accrual clock anchored to real time across a gap.
+     */
+open func noteLinkClosed(linkKey: String, nowMs: Int64) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corespraypolicy_note_link_closed(self.uniffiClonePointer(),
+        FfiConverterString.lower(linkKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+
+    /**
      * Evidence that sprays toward this peer are achieving something: a
      * receipt consumed from it, or carried copies it confirmed holding.
      *
      * Resets the receipt-quiet backoff. Absence of this is not evidence of a
      * fault — a courier for an absent recipient legitimately never produces
      * it — which is exactly why the backoff has a ceiling and no give-up
-     * state.
+     * state, and why the peer's own digest is exempt from the stretch (see
+     * [`Self::interval_for`]).
      */
 open func noteReceiptProgress(peerKey: String, nowMs: Int64) {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corespraypolicy_note_receipt_progress(self.uniffiClonePointer(),
@@ -10319,17 +10404,21 @@ public struct CoreDigestSprayPlan {
      */
     public var carriedExhausted: Bool
     /**
-     * Stable, order-independent digest of the `msg_id` set this plan
-     * advertises, across all three lanes. Handed straight to
-     * [`crate::CoreSprayPolicy::admit_plan`], which suppresses a set the peer
-     * was already offered inside the re-offer interval -- the 28 consecutive
-     * byte-identical sprays of issue #280. Computed here rather than in the
-     * shells so both platforms compare the same thing.
+     * What each lane advertises and what it would cost, handed straight to
+     * [`crate::CoreSprayPolicy::admit_plan`]. That call suppresses, per lane,
+     * a set the peer was already offered inside the re-offer interval -- the
+     * 28 consecutive byte-identical sprays of issue #280. Computed here
+     * rather than in the shells so both platforms compare the same thing, and
+     * kept per lane rather than folded into one digest because the recorded
+     * shape was an invariant authored lane beside a carried lane walking a
+     * cursor: a union digest changes on every page turn and so suppresses
+     * nothing. See [`crate::CoreSprayLanePlan`].
      */
-    public var advertisedSetDigest: UInt64
+    public var lanes: CoreSprayPlanShape
     /**
-     * Total sealed bytes this plan would put on the wire. What the per-link
-     * burst allowance is charged.
+     * Total sealed bytes this plan would put on the wire, across all lanes.
+     * Diagnostics: what the per-link burst allowance is actually charged is
+     * the admitted lanes' bytes, which `admit_plan` computes from `lanes`.
      */
     public var planBytes: UInt64
 
@@ -10355,16 +10444,20 @@ public struct CoreDigestSprayPlan {
          * the lane can park until the re-walk cooldown elapses.
          */carriedExhausted: Bool,
         /**
-         * Stable, order-independent digest of the `msg_id` set this plan
-         * advertises, across all three lanes. Handed straight to
-         * [`crate::CoreSprayPolicy::admit_plan`], which suppresses a set the peer
-         * was already offered inside the re-offer interval -- the 28 consecutive
-         * byte-identical sprays of issue #280. Computed here rather than in the
-         * shells so both platforms compare the same thing.
-         */advertisedSetDigest: UInt64,
+         * What each lane advertises and what it would cost, handed straight to
+         * [`crate::CoreSprayPolicy::admit_plan`]. That call suppresses, per lane,
+         * a set the peer was already offered inside the re-offer interval -- the
+         * 28 consecutive byte-identical sprays of issue #280. Computed here
+         * rather than in the shells so both platforms compare the same thing, and
+         * kept per lane rather than folded into one digest because the recorded
+         * shape was an invariant authored lane beside a carried lane walking a
+         * cursor: a union digest changes on every page turn and so suppresses
+         * nothing. See [`crate::CoreSprayLanePlan`].
+         */lanes: CoreSprayPlanShape,
         /**
-         * Total sealed bytes this plan would put on the wire. What the per-link
-         * burst allowance is charged.
+         * Total sealed bytes this plan would put on the wire, across all lanes.
+         * Diagnostics: what the per-link burst allowance is actually charged is
+         * the admitted lanes' bytes, which `admit_plan` computes from `lanes`.
          */planBytes: UInt64) {
         self.carriedFrames = carriedFrames
         self.ownOutboundFrames = ownOutboundFrames
@@ -10372,7 +10465,7 @@ public struct CoreDigestSprayPlan {
         self.offeredHiddenMsgIds = offeredHiddenMsgIds
         self.nextCarriedCursor = nextCarriedCursor
         self.carriedExhausted = carriedExhausted
-        self.advertisedSetDigest = advertisedSetDigest
+        self.lanes = lanes
         self.planBytes = planBytes
     }
 }
@@ -10399,7 +10492,7 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         if lhs.carriedExhausted != rhs.carriedExhausted {
             return false
         }
-        if lhs.advertisedSetDigest != rhs.advertisedSetDigest {
+        if lhs.lanes != rhs.lanes {
             return false
         }
         if lhs.planBytes != rhs.planBytes {
@@ -10415,7 +10508,7 @@ extension CoreDigestSprayPlan: Equatable, Hashable {
         hasher.combine(offeredHiddenMsgIds)
         hasher.combine(nextCarriedCursor)
         hasher.combine(carriedExhausted)
-        hasher.combine(advertisedSetDigest)
+        hasher.combine(lanes)
         hasher.combine(planBytes)
     }
 }
@@ -10434,7 +10527,7 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
                 offeredHiddenMsgIds: FfiConverterSequenceData.read(from: &buf),
                 nextCarriedCursor: FfiConverterOptionTypeCoreCarriedCursor.read(from: &buf),
                 carriedExhausted: FfiConverterBool.read(from: &buf),
-                advertisedSetDigest: FfiConverterUInt64.read(from: &buf),
+                lanes: FfiConverterTypeCoreSprayPlanShape.read(from: &buf),
                 planBytes: FfiConverterUInt64.read(from: &buf)
         )
     }
@@ -10446,7 +10539,7 @@ public struct FfiConverterTypeCoreDigestSprayPlan: FfiConverterRustBuffer {
         FfiConverterSequenceData.write(value.offeredHiddenMsgIds, into: &buf)
         FfiConverterOptionTypeCoreCarriedCursor.write(value.nextCarriedCursor, into: &buf)
         FfiConverterBool.write(value.carriedExhausted, into: &buf)
-        FfiConverterUInt64.write(value.advertisedSetDigest, into: &buf)
+        FfiConverterTypeCoreSprayPlanShape.write(value.lanes, into: &buf)
         FfiConverterUInt64.write(value.planBytes, into: &buf)
     }
 }
@@ -12590,27 +12683,59 @@ public func FfiConverterTypeCoreReplyMetadata_lower(_ value: CoreReplyMetadata) 
  * The answer to "this is what the plan came out as; does it go on the radio?".
  */
 public struct CoreSprayAdmission {
+    /**
+     * True when any lane was admitted. A caller with nothing else to do can
+     * read this alone and skip the whole send.
+     */
     public var send: Bool
+    /**
+     * Per-lane verdicts. A caller must send exactly the admitted lanes' frames
+     * and leave every suppressed lane's bookkeeping alone: no carried cursor
+     * advance when `send_carried` is false, no hidden-kind offer recorded when
+     * `send_own_outbound` is false. A suppressed lane has to stay exactly as
+     * re-discoverable as it was.
+     */
+    public var sendCarried: Bool
+    public var sendOwnOutbound: Bool
+    public var sendOwnReceipts: Bool
     public var reason: CoreSprayAdmissionReason
     /**
-     * Bytes charged against this link's burst allowance. Zero when suppressed.
+     * Bytes charged against this link's burst allowance: the admitted lanes'
+     * bytes, and nothing for the suppressed ones.
      */
     public var chargedBytes: UInt64
     /**
-     * When a suppressed set becomes offerable again, or 0 when it was sent.
+     * Soonest a suppressed lane becomes offerable again, or 0 when every
+     * non-empty lane went out.
      */
     public var reofferInMs: Int64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(send: Bool, reason: CoreSprayAdmissionReason,
+    public init(
         /**
-         * Bytes charged against this link's burst allowance. Zero when suppressed.
+         * True when any lane was admitted. A caller with nothing else to do can
+         * read this alone and skip the whole send.
+         */send: Bool,
+        /**
+         * Per-lane verdicts. A caller must send exactly the admitted lanes' frames
+         * and leave every suppressed lane's bookkeeping alone: no carried cursor
+         * advance when `send_carried` is false, no hidden-kind offer recorded when
+         * `send_own_outbound` is false. A suppressed lane has to stay exactly as
+         * re-discoverable as it was.
+         */sendCarried: Bool, sendOwnOutbound: Bool, sendOwnReceipts: Bool, reason: CoreSprayAdmissionReason,
+        /**
+         * Bytes charged against this link's burst allowance: the admitted lanes'
+         * bytes, and nothing for the suppressed ones.
          */chargedBytes: UInt64,
         /**
-         * When a suppressed set becomes offerable again, or 0 when it was sent.
+         * Soonest a suppressed lane becomes offerable again, or 0 when every
+         * non-empty lane went out.
          */reofferInMs: Int64) {
         self.send = send
+        self.sendCarried = sendCarried
+        self.sendOwnOutbound = sendOwnOutbound
+        self.sendOwnReceipts = sendOwnReceipts
         self.reason = reason
         self.chargedBytes = chargedBytes
         self.reofferInMs = reofferInMs
@@ -12622,6 +12747,15 @@ public struct CoreSprayAdmission {
 extension CoreSprayAdmission: Equatable, Hashable {
     public static func ==(lhs: CoreSprayAdmission, rhs: CoreSprayAdmission) -> Bool {
         if lhs.send != rhs.send {
+            return false
+        }
+        if lhs.sendCarried != rhs.sendCarried {
+            return false
+        }
+        if lhs.sendOwnOutbound != rhs.sendOwnOutbound {
+            return false
+        }
+        if lhs.sendOwnReceipts != rhs.sendOwnReceipts {
             return false
         }
         if lhs.reason != rhs.reason {
@@ -12638,6 +12772,9 @@ extension CoreSprayAdmission: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(send)
+        hasher.combine(sendCarried)
+        hasher.combine(sendOwnOutbound)
+        hasher.combine(sendOwnReceipts)
         hasher.combine(reason)
         hasher.combine(chargedBytes)
         hasher.combine(reofferInMs)
@@ -12653,6 +12790,9 @@ public struct FfiConverterTypeCoreSprayAdmission: FfiConverterRustBuffer {
         return
             try CoreSprayAdmission(
                 send: FfiConverterBool.read(from: &buf),
+                sendCarried: FfiConverterBool.read(from: &buf),
+                sendOwnOutbound: FfiConverterBool.read(from: &buf),
+                sendOwnReceipts: FfiConverterBool.read(from: &buf),
                 reason: FfiConverterTypeCoreSprayAdmissionReason.read(from: &buf),
                 chargedBytes: FfiConverterUInt64.read(from: &buf),
                 reofferInMs: FfiConverterInt64.read(from: &buf)
@@ -12661,6 +12801,9 @@ public struct FfiConverterTypeCoreSprayAdmission: FfiConverterRustBuffer {
 
     public static func write(_ value: CoreSprayAdmission, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.send, into: &buf)
+        FfiConverterBool.write(value.sendCarried, into: &buf)
+        FfiConverterBool.write(value.sendOwnOutbound, into: &buf)
+        FfiConverterBool.write(value.sendOwnReceipts, into: &buf)
         FfiConverterTypeCoreSprayAdmissionReason.write(value.reason, into: &buf)
         FfiConverterUInt64.write(value.chargedBytes, into: &buf)
         FfiConverterInt64.write(value.reofferInMs, into: &buf)
@@ -12823,6 +12966,177 @@ public func FfiConverterTypeCoreSprayGate_lift(_ buf: RustBuffer) throws -> Core
 #endif
 public func FfiConverterTypeCoreSprayGate_lower(_ value: CoreSprayGate) -> RustBuffer {
     return FfiConverterTypeCoreSprayGate.lower(value)
+}
+
+
+/**
+ * One lane of a built plan: what it advertises, and what it would cost.
+ *
+ * Suppression is decided **per lane**, not on the union of the three. The
+ * union is the wrong unit for the shape the field recorded: 28 consecutive
+ * sprays whose authored lane was invariant at 16 envelopes across all of them,
+ * alongside a carried lane walking a cursor (21 → 75 rows) and so changing
+ * every round. Any carried page turn changes a union digest, so a union
+ * digest re-sprays the invariant authored set at full size on every admitted
+ * encounter — precisely what issue #280's second ask exists to stop. Per lane,
+ * the carried walk proceeds (it is doing real work) and the authored lane goes
+ * quiet until it changes or the re-offer interval lapses.
+ */
+public struct CoreSprayLanePlan {
+    /**
+     * Stable, order-independent digest of the `msg_id`s this lane advertises.
+     */
+    public var setDigest: UInt64
+    /**
+     * Sealed bytes this lane would put on the wire. Zero means the lane
+     * selected nothing, which is neither suppressed nor charged.
+     */
+    public var bytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Stable, order-independent digest of the `msg_id`s this lane advertises.
+         */setDigest: UInt64,
+        /**
+         * Sealed bytes this lane would put on the wire. Zero means the lane
+         * selected nothing, which is neither suppressed nor charged.
+         */bytes: UInt64) {
+        self.setDigest = setDigest
+        self.bytes = bytes
+    }
+}
+
+
+
+extension CoreSprayLanePlan: Equatable, Hashable {
+    public static func ==(lhs: CoreSprayLanePlan, rhs: CoreSprayLanePlan) -> Bool {
+        if lhs.setDigest != rhs.setDigest {
+            return false
+        }
+        if lhs.bytes != rhs.bytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(setDigest)
+        hasher.combine(bytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayLanePlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayLanePlan {
+        return
+            try CoreSprayLanePlan(
+                setDigest: FfiConverterUInt64.read(from: &buf),
+                bytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSprayLanePlan, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.setDigest, into: &buf)
+        FfiConverterUInt64.write(value.bytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayLanePlan_lift(_ buf: RustBuffer) throws -> CoreSprayLanePlan {
+    return try FfiConverterTypeCoreSprayLanePlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayLanePlan_lower(_ value: CoreSprayLanePlan) -> RustBuffer {
+    return FfiConverterTypeCoreSprayLanePlan.lower(value)
+}
+
+
+/**
+ * The three lanes of one built plan. Comes straight off
+ * [`crate::CoreDigestSprayPlan::lanes`], so the shells never hash anything.
+ */
+public struct CoreSprayPlanShape {
+    public var carried: CoreSprayLanePlan
+    public var ownOutbound: CoreSprayLanePlan
+    public var ownReceipts: CoreSprayLanePlan
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(carried: CoreSprayLanePlan, ownOutbound: CoreSprayLanePlan, ownReceipts: CoreSprayLanePlan) {
+        self.carried = carried
+        self.ownOutbound = ownOutbound
+        self.ownReceipts = ownReceipts
+    }
+}
+
+
+
+extension CoreSprayPlanShape: Equatable, Hashable {
+    public static func ==(lhs: CoreSprayPlanShape, rhs: CoreSprayPlanShape) -> Bool {
+        if lhs.carried != rhs.carried {
+            return false
+        }
+        if lhs.ownOutbound != rhs.ownOutbound {
+            return false
+        }
+        if lhs.ownReceipts != rhs.ownReceipts {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(carried)
+        hasher.combine(ownOutbound)
+        hasher.combine(ownReceipts)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSprayPlanShape: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSprayPlanShape {
+        return
+            try CoreSprayPlanShape(
+                carried: FfiConverterTypeCoreSprayLanePlan.read(from: &buf),
+                ownOutbound: FfiConverterTypeCoreSprayLanePlan.read(from: &buf),
+                ownReceipts: FfiConverterTypeCoreSprayLanePlan.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSprayPlanShape, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreSprayLanePlan.write(value.carried, into: &buf)
+        FfiConverterTypeCoreSprayLanePlan.write(value.ownOutbound, into: &buf)
+        FfiConverterTypeCoreSprayLanePlan.write(value.ownReceipts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayPlanShape_lift(_ buf: RustBuffer) throws -> CoreSprayPlanShape {
+    return try FfiConverterTypeCoreSprayPlanShape.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSprayPlanShape_lower(_ value: CoreSprayPlanShape) -> RustBuffer {
+    return FfiConverterTypeCoreSprayPlanShape.lower(value)
 }
 
 
@@ -19021,16 +19335,18 @@ public enum CoreSprayAdmissionReason {
      */
     case empty
     /**
-     * The advertised set differs from the one last sprayed to this peer.
+     * At least one lane advertises a set that differs from the one last
+     * sprayed to this peer on that lane.
      */
     case setChanged
     /**
-     * Same set, but the re-offer interval has lapsed: DTN re-discovery.
+     * Same set on every lane that had anything, but the re-offer interval has
+     * lapsed: DTN re-discovery.
      */
     case reofferLapsed
     /**
-     * Byte-identical to the set this peer was last offered, inside the
-     * re-offer interval.
+     * Every non-empty lane is byte-identical to what this peer was last
+     * offered on it, inside the re-offer interval.
      */
     case identicalSuppressed
 }
@@ -26292,13 +26608,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_retry_delay_ms() != 40354) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_admit_plan() != 25274) {
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_admit_plan() != 64273) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_clear() != 37090) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_forget_link() != 53938) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_link_allowance_bytes() != 15213) {
@@ -26307,10 +26620,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_may_spray() != 34513) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_bytes_queued() != 47664) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_digest_sent() != 10759) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_receipt_progress() != 3726) {
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_link_closed() != 17327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_note_receipt_progress() != 38513) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_quiet_rounds() != 64566) {

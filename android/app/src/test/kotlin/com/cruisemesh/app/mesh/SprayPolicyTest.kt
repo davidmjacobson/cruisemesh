@@ -7,6 +7,8 @@ import org.junit.Before
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreSprayAdmissionReason
 import uniffi.cruisemesh_core.CoreSprayGateReason
+import uniffi.cruisemesh_core.CoreSprayLanePlan
+import uniffi.cruisemesh_core.CoreSprayPlanShape
 import uniffi.cruisemesh_core.CoreSprayTrigger
 
 /**
@@ -34,6 +36,15 @@ class SprayPolicyTest {
         val OTHER_PEER = ByteArray(16) { 0x22 }
         const val LINK = "AA:BB:CC:DD:EE:01"
         const val OTHER_LINK = "AA:BB:CC:DD:EE:02"
+
+        val EMPTY_LANE = CoreSprayLanePlan(setDigest = 0uL, bytes = 0uL)
+
+        /** A one-lane plan (own outbound), for cases that are not about lanes. */
+        fun ownLane(setDigest: ULong, bytes: ULong) = CoreSprayPlanShape(
+            carried = EMPTY_LANE,
+            ownOutbound = CoreSprayLanePlan(setDigest, bytes),
+            ownReceipts = EMPTY_LANE,
+        )
     }
 
     @Before
@@ -90,28 +101,60 @@ class SprayPolicyTest {
 
     @Test
     fun `an unchanged advertised set is not re-sprayed at full size`() {
-        val sent = SprayPolicy.admitPlan(PEER, LINK, setDigest = 0xABCDuL, planBytes = 8_192uL, nowMs = 0)
+        val sent = SprayPolicy.admitPlan(PEER, LINK, ownLane(0xABCDuL, 8_192uL), nowMs = 0)
         assertTrue(sent.send)
         assertEquals(CoreSprayAdmissionReason.SET_CHANGED, sent.reason)
 
-        val repeat = SprayPolicy.admitPlan(PEER, LINK, setDigest = 0xABCDuL, planBytes = 8_192uL, nowMs = 60_000)
+        val repeat = SprayPolicy.admitPlan(PEER, LINK, ownLane(0xABCDuL, 8_192uL), nowMs = 60_000)
         assertFalse("the 28 identical sprays", repeat.send)
         assertEquals(CoreSprayAdmissionReason.IDENTICAL_SUPPRESSED, repeat.reason)
         assertTrue("suppression must expire", repeat.reofferInMs > 0)
 
-        val changed = SprayPolicy.admitPlan(PEER, LINK, setDigest = 0x1234uL, planBytes = 8_192uL, nowMs = 60_001)
+        val changed = SprayPolicy.admitPlan(PEER, LINK, ownLane(0x1234uL, 8_192uL), nowMs = 60_001)
         assertTrue("a set change sprays immediately", changed.send)
     }
 
     @Test
-    fun `a disconnect frees the link budget but not the peer cadence`() {
+    fun `an invariant authored lane goes quiet while the carried walk proceeds`() {
+        // The recorded shape: authored invariant at 16 envelopes across every
+        // spray while the carried lane walked its cursor. InboundEnvelopeProcessor
+        // sends exactly the lanes this admission names, so the per-lane answer
+        // has to survive the crossing.
+        var carriedSends = 0
+        var authoredSends = 0
+        repeat(6) { round ->
+            val admission = SprayPolicy.admitPlan(
+                PEER,
+                LINK,
+                CoreSprayPlanShape(
+                    carried = CoreSprayLanePlan(setDigest = round.toULong() + 1uL, bytes = 8_192uL),
+                    ownOutbound = CoreSprayLanePlan(setDigest = 0xA17uL, bytes = 16_384uL),
+                    ownReceipts = EMPTY_LANE,
+                ),
+                nowMs = round * 200L,
+            )
+            if (admission.sendCarried) carriedSends++
+            if (admission.sendOwnOutbound) authoredSends++
+        }
+        assertEquals("the carried walk must not be suppressed", 6, carriedSends)
+        assertEquals("an invariant authored set is offered once", 1, authoredSends)
+    }
+
+    @Test
+    fun `a disconnect resets neither the peer cadence nor the link allowance`() {
         assertTrue(SprayPolicy.maySpray(PEER, LINK, CoreSprayTrigger.FIRST_CONTACT, nowMs = 0).allow)
         SprayPolicy.noteDigestSent(PEER, LINK, nowMs = 0)
-        // This is what MeshService.recordPeerDisconnected does. Forgetting the
-        // peer here instead would be how reconnect churn resets the gate that
-        // exists for reconnect churn.
-        SprayPolicy.forgetLink(LINK)
-        assertFalse(SprayPolicy.maySpray(PEER, LINK, CoreSprayTrigger.RECONNECT, nowMs = 100).allow)
+        // Everything this encounter queued outside the plan -- the receipt
+        // repair pass, the per-missing-message re-send loop, the group catch-up
+        // and the carry drain -- is charged here, exactly as MeshService does.
+        SprayPolicy.noteBytesQueued(LINK, 576L * 1024, nowMs = 0)
+        // This is what MeshService.recordPeerDisconnected does. It resets
+        // nothing: a disconnect is what reconnect churn produces.
+        SprayPolicy.noteLinkClosed(LINK, nowMs = 0)
+        val gate = SprayPolicy.maySpray(PEER, LINK, CoreSprayTrigger.PEER_DIGEST, nowMs = 1)
+        assertFalse(gate.allow)
+        assertEquals(CoreSprayGateReason.LINK_BURST_EXHAUSTED, gate.reason)
+        assertTrue("a denial must name its expiry", gate.retryAfterMs > 0)
     }
 
     @Test
@@ -120,7 +163,7 @@ class SprayPolicyTest {
         var now = 0L
         // Four receipt-free sprays: the cadence stretches.
         repeat(4) { round ->
-            SprayPolicy.admitPlan(PEER, LINK, setDigest = round.toULong(), planBytes = 1_024uL, nowMs = now)
+            SprayPolicy.admitPlan(PEER, LINK, ownLane(round.toULong(), 1_024uL), nowMs = now)
             now += 61_000
         }
         val stretched = SprayPolicy.maySpray(PEER, LINK, CoreSprayTrigger.RECONNECT, now)
