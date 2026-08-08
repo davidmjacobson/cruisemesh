@@ -558,6 +558,10 @@ class MeshService : Service() {
         identity = loadedIdentity
         MeshRouter.setLocalUserId(loadedIdentity.userId)
         store = AppStore.get(this)
+        // Spray decisions carry no store of their own, so this is where they
+        // find the protocol-event ring. Before the mesh roles come up, so the
+        // first reconnect of the session is already recorded.
+        SprayPolicy.attachEventJournal(store)
         // FA3: was a synchronous main-thread call here (full outbound-envelope
         // scans for every contact/group plus carried ids) -- now dispatched to
         // storeExecutor without blocking the mesh-role startup below on it.

@@ -7,6 +7,7 @@ import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.CoreSprayPlanShape
 import uniffi.cruisemesh_core.CoreSprayPolicy
 import uniffi.cruisemesh_core.CoreSprayTrigger
+import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreSprayRetryArmMaxMs
 
 /**
@@ -112,6 +113,17 @@ object SprayPolicy {
     fun noteLinkClosed(address: String, nowMs: Long = nowMs()) {
         core.noteLinkClosed(address, nowMs)
     }
+
+    /**
+     * Route this policy's decisions into the store's protocol-event ring, so a
+     * shared diagnostics archive can show why a peer was sprayed, suppressed
+     * or backed off.
+     *
+     * Idempotent, and safe to call late: an unattached policy behaves exactly
+     * as it did before the ring existed. Core builds the records and redacts
+     * them; nothing here composes an event.
+     */
+    fun attachEventJournal(store: MessageStore) = core.attachEventJournal(store)
 
     /** Mesh stopped; none of this is durable state. */
     fun reset() = core.clear()

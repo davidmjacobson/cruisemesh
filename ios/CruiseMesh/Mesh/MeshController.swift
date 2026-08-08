@@ -242,6 +242,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         isRunning = true
         onMain { MeshRuntimeStatus.shared.markStarting() }
+        // Spray decisions carry no store of their own, so this is where they
+        // find the protocol-event ring. Before the transports come up, so the
+        // first reconnect of the session is already recorded. Android does the
+        // same, in `MeshService`.
+        SprayPolicy.attachEventJournal(store: store)
 
         MeshRouter.registerCentral { [weak self] address, frame in
             self?.transport.sendAsCentral(address: address, frame: frame)

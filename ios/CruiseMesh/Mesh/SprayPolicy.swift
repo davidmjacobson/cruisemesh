@@ -121,6 +121,17 @@ enum SprayPolicy {
         core.noteLinkClosed(linkKey: address, nowMs: nowMs)
     }
 
+    /// Route this policy's decisions into the store's protocol-event ring, so
+    /// a shared diagnostics archive can show why a peer was sprayed,
+    /// suppressed or backed off.
+    ///
+    /// Idempotent, and safe to call late: an unattached policy behaves exactly
+    /// as it did before the ring existed. Core builds the records and redacts
+    /// them; nothing here composes an event.
+    static func attachEventJournal(store: MessageStore) {
+        core.attachEventJournal(store: store)
+    }
+
     /// Mesh stopped; none of this is durable state.
     static func reset() {
         core.clear()
