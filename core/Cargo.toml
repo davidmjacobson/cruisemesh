@@ -14,6 +14,14 @@ name = "uniffi-bindgen"
 path = "uniffi-bindgen.rs"
 required-features = ["uniffi/cli"]
 
+# The replay/validate command from the field-evidence work. No extra
+# dependencies: it reads the same JSONL the core library already parses, so
+# `cargo run -p cruisemesh-core --bin protocol-replay -- <file>` works in a
+# clean checkout with nothing installed.
+[[bin]]
+name = "protocol-replay"
+path = "src/bin/protocol_replay.rs"
+
 [dependencies]
 uniffi = { version = "0.28" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

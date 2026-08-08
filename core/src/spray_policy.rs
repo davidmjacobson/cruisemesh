@@ -443,6 +443,10 @@ struct PeerState {
     exchange_open_until_ms: i64,
     /// Consecutive admitted sprays with no evidence of progress since.
     quiet_rounds: u32,
+    /// The `quiet_rounds` value the ring has already been told about, so a
+    /// deferral is recorded when the backoff *changes* and not on every tick
+    /// that it holds. See [`CoreSprayPolicy::note_quiet_backoff`].
+    journaled_quiet_rounds: Option<u32>,
     /// Per-lane record of the last set actually sprayed, and when.
     lanes: [LaneState; 3],
     /// Last time anything touched this record; drives retention pruning.
@@ -459,6 +463,7 @@ impl PeerState {
             last_spray_at_ms: i64::MIN,
             exchange_open_until_ms: i64::MIN,
             quiet_rounds: 0,
+            journaled_quiet_rounds: None,
             lanes: [LaneState::default(); 3],
             touched_at_ms: now_ms,
         }
@@ -482,6 +487,10 @@ struct LinkState {
     tokens: u64,
     last_refill_ms: i64,
     touched_at_ms: i64,
+    /// Whether the ring has already been told this link ran dry. Cleared the
+    /// moment it has a usable burst again, so a reconnect storm records one
+    /// exhaustion per episode rather than one per reconnect.
+    journaled_exhausted: bool,
 }
 
 impl LinkState {
@@ -490,6 +499,7 @@ impl LinkState {
             tokens: capacity,
             last_refill_ms: now_ms,
             touched_at_ms: now_ms,
+            journaled_exhausted: false,
         }
     }
 }
@@ -548,6 +558,18 @@ struct SprayState {
 pub struct CoreSprayPolicy {
     config: SprayPolicyConfig,
     state: Mutex<SprayState>,
+    /// Where spray decisions go when someone is listening.
+    ///
+    /// A weak-ish attachment rather than a constructor argument on purpose:
+    /// both shells build this policy inside the singleton that owns their
+    /// router state, and that happens before the store is necessarily open.
+    /// Unattached, every emit is a lock and a `None` check.
+    ///
+    /// The lock is never held across a store call. Drafts are built while the
+    /// spray state is held, the guard is dropped, and only then is the store
+    /// touched -- so the spray mutex can never be the outer half of a lock
+    /// ordering with the store's.
+    journal: Mutex<Option<std::sync::Arc<crate::store::MessageStore>>>,
 }
 
 impl Default for CoreSprayPolicy {
@@ -561,7 +583,29 @@ impl CoreSprayPolicy {
         Self {
             config,
             state: Mutex::new(SprayState::default()),
+            journal: Mutex::new(None),
         }
+    }
+
+    /// Write `drafts` to the attached ring, if there is one.
+    ///
+    /// Call only with no spray lock held.
+    fn journal(&self, drafts: Vec<crate::protocol_event::ProtocolEventDraft>) {
+        if drafts.is_empty() {
+            return;
+        }
+        let store = {
+            let guard = self
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        let Some(store) = store else { return };
+        // A diagnostics ring that could fail a spray would be worse than no
+        // ring: the store is full, or locked, and the answer to that is to
+        // carry on delivering messages.
+        let _ = store.record_protocol_events(&drafts);
     }
 
     fn locked(&self) -> std::sync::MutexGuard<'_, SprayState> {
@@ -738,6 +782,12 @@ fn admit_lane(
     (true, reason, 0)
 }
 
+/// Counts are non-negative integers on the wire; a byte figure that somehow
+/// exceeded `i64::MAX` is clamped rather than dropped.
+fn saturate(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[uniffi::export]
 impl CoreSprayPolicy {
     #[uniffi::constructor]
@@ -759,12 +809,116 @@ impl CoreSprayPolicy {
         trigger: CoreSprayTrigger,
         now_ms: i64,
     ) -> CoreSprayGate {
+        let (gate, record) = self.decide_spray(peer_key.clone(), link_key, trigger, now_ms);
+        // `decide_spray` has already released the spray lock, and it decided
+        // under that lock whether this is a crossing worth recording. This
+        // method runs on every reconnect and every maintenance tick, and almost
+        // all of those record nothing -- so the common path must not pay for a
+        // store read that is about to be thrown away.
+        if let Some(record) = record {
+            let mut event =
+                crate::protocol_event::ProtocolEventDraft::new(record.code, now_ms, record.outcome)
+                    .actor(self.peer_pseudonym(&peer_key))
+                    .invariants(&["SPRAY-01"])
+                    .count("retry_after_ms", gate.retry_after_ms.max(0));
+            for (key, value) in record.counts {
+                event = event.count(key, value);
+            }
+            self.journal(vec![event]);
+        }
+        gate
+    }
+
+    /// Attach this policy's decisions to a store's protocol-event ring.
+    ///
+    /// One call per process, wherever the shell already builds both. Optional
+    /// by design -- an unattached policy behaves exactly as it did before this
+    /// existed, which is what keeps the tests that predate the ring honest.
+    pub fn attach_event_journal(&self, store: std::sync::Arc<crate::store::MessageStore>) {
+        let mut guard = self
+            .journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(store);
+    }
+}
+
+impl CoreSprayPolicy {
+    /// The archive-local name for a peer, or a placeholder when nothing is
+    /// listening. Never the raw key.
+    fn peer_pseudonym(&self, peer_key: &str) -> String {
+        let store = {
+            let guard = self
+                .journal
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.clone()
+        };
+        match store {
+            Some(store) => store
+                .protocol_event_pseudonym("peer", peer_key.as_bytes())
+                .unwrap_or_else(|_| "peer-0".to_string()),
+            None => "peer-0".to_string(),
+        }
+    }
+
+    /// What one admitted (or suppressed) plan is worth recording.
+    ///
+    /// One record per encounter, never one per envelope: this runs after the
+    /// plan is built, which is once per digest exchange with a peer. The
+    /// `watchdog-spray` incident is a sequence of these with a large
+    /// `charged_bytes`, and `carry-storm` is a sequence of them whose carried
+    /// lane never changes -- both readable without any per-row event.
+    fn admission_events(
+        &self,
+        admission: &CoreSprayAdmission,
+        lanes: &CoreSprayPlanShape,
+        peer_key: &str,
+        now_ms: i64,
+    ) -> Vec<crate::protocol_event::ProtocolEventDraft> {
+        use crate::protocol_event::{ProtocolEventCode, ProtocolEventDraft};
+        if admission.reason == CoreSprayAdmissionReason::Empty {
+            return Vec::new();
+        }
+        let peer = self.peer_pseudonym(peer_key);
+
+        let (code, outcome) = if admission.send {
+            (
+                ProtocolEventCode::SprayAdmitted,
+                match admission.reason {
+                    CoreSprayAdmissionReason::ReofferLapsed => "reoffer_interval_lapsed",
+                    _ => "advertised_set_changed",
+                },
+            )
+        } else {
+            (
+                ProtocolEventCode::SpraySuppressed,
+                "every_lane_identical_to_the_last_offer",
+            )
+        };
+        vec![ProtocolEventDraft::new(code, now_ms, outcome)
+            .actor(peer)
+            .invariants(&["SPRAY-01"])
+            .count("charged_bytes", saturate(admission.charged_bytes))
+            .count("carried_bytes", saturate(lanes.carried.bytes))
+            .count("own_outbound_bytes", saturate(lanes.own_outbound.bytes))
+            .count("own_receipt_bytes", saturate(lanes.own_receipts.bytes))
+            .count("reoffer_in_ms", admission.reoffer_in_ms.max(0))]
+    }
+
+    fn decide_spray(
+        &self,
+        peer_key: String,
+        link_key: String,
+        trigger: CoreSprayTrigger,
+        now_ms: i64,
+    ) -> (CoreSprayGate, Option<GateRecord>) {
         let mut state = self.locked();
         Self::prune(&mut state, now_ms, self.config.retention_ms);
         let allowance = self.allowance(&mut state, &link_key, now_ms);
         let peer = state
             .peers
-            .entry(peer_key)
+            .entry(peer_key.clone())
             .or_insert_with(|| PeerState::new(now_ms));
         peer.touched_at_ms = now_ms;
         let peer = peer.clone();
@@ -802,7 +956,18 @@ impl CoreSprayPolicy {
             let retry = interval
                 .saturating_sub(peer.since_last_spray_ms(now_ms))
                 .max(1);
-            return gate_denied(reason, retry);
+            let record = if matches!(reason, CoreSprayGateReason::ReceiptQuietBackoff) {
+                Self::note_quiet_backoff(&mut state, &peer_key)
+            } else {
+                None
+            };
+            return (gate_denied(reason, retry), record);
+        }
+        // The cadence let this peer through, so whatever backoff level was
+        // last recorded is over; the next entry into backoff is a new crossing
+        // and deserves its own record.
+        if let Some(peer) = state.peers.get_mut(&peer_key) {
+            peer.journaled_quiet_rounds = None;
         }
 
         // Deliberately not `allowance > 0`. A trickle of allowance is worse
@@ -813,21 +978,93 @@ impl CoreSprayPolicy {
         let target = MIN_USEFUL_BURST_BYTES.min(self.config.link_burst_bytes);
         if allowance < target {
             let retry = self.ms_to_accrue(allowance, target);
-            return gate_denied(CoreSprayGateReason::LinkBurstExhausted, retry.max(1));
+            let record = Self::note_burst_exhausted(&mut state, &link_key);
+            return (
+                gate_denied(CoreSprayGateReason::LinkBurstExhausted, retry.max(1)),
+                record,
+            );
+        }
+        if let Some(link) = state.links.get_mut(&link_key) {
+            link.journaled_exhausted = false;
         }
 
         let (carried, outbound, receipts) = self.lane_budgets(allowance);
-        CoreSprayGate {
-            allow: true,
-            reason,
-            carried_budget_bytes: carried,
-            own_outbound_budget_bytes: outbound,
-            own_receipt_budget_bytes: receipts,
-            retry_after_ms: 0,
-            retry_worth_arming: false,
-        }
+        (
+            CoreSprayGate {
+                allow: true,
+                reason,
+                carried_budget_bytes: carried,
+                own_outbound_budget_bytes: outbound,
+                own_receipt_budget_bytes: receipts,
+                retry_after_ms: 0,
+                retry_worth_arming: false,
+            },
+            None,
+        )
     }
 
+    /// Record entering — or deepening — the receipt-quiet backoff, once.
+    ///
+    /// The crossing, not the state, and this is the difference between an
+    /// archive that answers "messages stopped arriving yesterday afternoon"
+    /// and one that cannot. `may_spray` is consulted for every selected route
+    /// on every maintenance tick, and a backed-off peer is denied on nearly
+    /// all of them: eight quiet peers on a minute tick write about 11,500
+    /// records a day, which is the entire 2,000-record ring replaced every
+    /// four hours by one repeated non-event, taking every frontier, sweep and
+    /// retirement record from the incident with it.
+    ///
+    /// So a deferral is written when the backoff *changes* — entering it, and
+    /// each doubling of the interval after that. Those are the decisions; the
+    /// ticks in between are the same decision being re-asked. `endpoint_rested`
+    /// is crossing-only for exactly this reason, and a plain cadence gate is
+    /// not recorded at all.
+    fn note_quiet_backoff(state: &mut SprayState, peer_key: &str) -> Option<GateRecord> {
+        let peer = state.peers.get_mut(peer_key)?;
+        if peer.journaled_quiet_rounds == Some(peer.quiet_rounds) {
+            return None;
+        }
+        peer.journaled_quiet_rounds = Some(peer.quiet_rounds);
+        Some(GateRecord {
+            code: crate::protocol_event::ProtocolEventCode::SprayDeferred,
+            outcome: "backed_off_for_want_of_receipts",
+            counts: vec![("quiet_rounds", i64::from(peer.quiet_rounds))],
+        })
+    }
+
+    /// Record a link running out of burst allowance, once per episode.
+    ///
+    /// Same argument as [`Self::note_quiet_backoff`]: during a BLE reconnect
+    /// storm an exhausted link is re-asked on every reconnect, and the answer
+    /// does not change until the bucket refills. Cleared as soon as the link
+    /// has a usable burst again, so the next dry spell records again.
+    fn note_burst_exhausted(state: &mut SprayState, link_key: &str) -> Option<GateRecord> {
+        let link = state.links.get_mut(link_key)?;
+        if link.journaled_exhausted {
+            return None;
+        }
+        link.journaled_exhausted = true;
+        Some(GateRecord {
+            code: crate::protocol_event::ProtocolEventCode::SprayBudgetExhausted,
+            outcome: "link_burst_allowance_spent",
+            counts: Vec::new(),
+        })
+    }
+}
+
+/// A gate decision worth writing to the ring.
+///
+/// Built only at a crossing — see [`CoreSprayPolicy::note_quiet_backoff`] —
+/// and built under the spray lock, because "has this already been recorded?"
+/// is part of the same decision. The event itself is written outside the lock.
+struct GateRecord {
+    code: crate::protocol_event::ProtocolEventCode,
+    outcome: &'static str,
+    counts: Vec<(&'static str, i64)>,
+}
+
+#[uniffi::export]
+impl CoreSprayPolicy {
     /// A DIGEST frame actually went out to this peer.
     ///
     /// This is what arms the cadence for the *small* half of the exchange. It
@@ -879,6 +1116,7 @@ impl CoreSprayPolicy {
         lanes: CoreSprayPlanShape,
         now_ms: i64,
     ) -> CoreSprayAdmission {
+        let peer_key_for_event = peer_key.clone();
         let mut state = self.locked();
         Self::prune(&mut state, now_ms, self.config.retention_ms);
         let reoffer_interval = self.config.reoffer_interval_ms;
@@ -932,7 +1170,7 @@ impl CoreSprayPolicy {
             self.debit(&mut state, &link_key, charged_bytes, now_ms);
         }
 
-        CoreSprayAdmission {
+        let admission = CoreSprayAdmission {
             send: sent.iter().any(|lane| *lane),
             send_carried: sent[LANE_CARRIED],
             send_own_outbound: sent[LANE_OWN_OUTBOUND],
@@ -940,7 +1178,11 @@ impl CoreSprayPolicy {
             reason,
             charged_bytes,
             reoffer_in_ms: if any_suppressed { soonest_reoffer } else { 0 },
-        }
+        };
+        // The spray lock goes before the store is touched. See `journal`.
+        drop(state);
+        self.journal(self.admission_events(&admission, &lanes, &peer_key_for_event, now_ms));
+        admission
     }
 
     /// Bytes the shell queued at this link outside a spray plan.
@@ -980,6 +1222,7 @@ impl CoreSprayPolicy {
             .entry(peer_key)
             .or_insert_with(|| PeerState::new(now_ms));
         peer.quiet_rounds = 0;
+        peer.journaled_quiet_rounds = None;
         peer.touched_at_ms = now_ms;
     }
 

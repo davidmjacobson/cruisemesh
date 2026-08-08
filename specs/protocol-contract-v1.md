@@ -62,7 +62,7 @@ of it: the gap is now countable.
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
-| `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | `core/tests/protocol_contract.rs` fixture canary scan |
+| `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 
 ### 1.1 What each rule means, for someone reading it cold
 
@@ -333,6 +333,26 @@ raw friend card, no message plaintext, no private key material, and no
 endpoint-bearing body. Redaction may keep length, digest, kind, and a stable
 archive-local pseudonym. A test scans serialised records for known canaries
 rather than trusting the authoring code.
+
+The rule covers the live event ring as well as the checked-in corpus, and it
+is enforced in three places rather than one, because a redaction that depends
+on every call site being careful is not a rule:
+
+- **By construction.** A `ProtocolEventDraft` has no field a payload can
+  arrive in. Its outcome, its count keys and its invariant ids are
+  `&'static str` chosen at the call site; its actor can only come from the
+  pseudonym allocator. The single exception is the generic violation hook,
+  whose outcome is gated on being a short lowercase token.
+- **Before storage.** `core/src/protocol_event.rs` scans each serialised
+  record for the canary list below, and a record that trips one is replaced by
+  an `invariant_violation` naming `SECRET-01`. The attempt survives; its
+  contents do not.
+- **On the corpus and on live exports.**
+  `core/tests/protocol_contract.rs` scans every fixture, and
+  `core/tests/protocol_event_ring.rs` plants a token in a relay config key, a
+  contact id and a message payload, drives the real emit points, and proves
+  none of it reaches the archive — with a negative control that tampers with a
+  clean archive and requires the scanner to fail.
 
 ## 2. Frames, envelopes, kinds, and limits
 
@@ -710,7 +730,14 @@ Exactly one, and it is the first line.
 | `origin` | yes | `synthetic` or `redacted-field-archive` |
 | `public_reference` | no | a public PR or issue reference, e.g. `#283` |
 | `pseudonyms` | yes | every archive-local actor name events may use |
-| `expect_invariants` | yes | non-empty; every id must exist in section 1 |
+| `expect_invariants` | yes | every id must exist in section 1; non-empty for a fixture, and may be empty for a `redacted-field-archive` that recorded nothing invariant-tagged |
+| `first_seq` | no | the sequence number of the first surviving record; absent means 1 |
+
+`first_seq` exists because the live ring evicts. A device's sequence is its
+own monotonic counter and is never renumbered on export: an archive that
+silently restarted at 1 after eviction would read as a fresh phone rather than
+as a phone that dropped its oldest evidence. Every checked-in fixture omits
+the field and therefore means exactly what it did before the field existed.
 
 ### 6.2 Event record
 
@@ -725,6 +752,7 @@ Exactly one, and it is the first line.
 | `record` | yes | `event` |
 | `seq` | yes | starts at 1, strictly `+1` per record |
 | `at_ms` | yes | explicit time, non-decreasing |
+| `inferred_at` | no | `true` when `at_ms` was borrowed from the previous record rather than measured; absent means the time was observed |
 | `code` | yes | from the registry in 6.3 |
 | `session`, `pass` | no | opaque short ids |
 | `action` | no | non-negative integer |
@@ -735,21 +763,21 @@ Exactly one, and it is the first line.
 
 ### 6.3 Stable event codes
 
-Codes are API. Prose log messages are not.
-
-`pass_start`, `pass_finish`, `action_emitted`, `action_result_accepted`,
-`action_result_stale_ignored`, `rate_limit_abort`, `frontier_held`,
-`frontier_advanced`, `continuation_scheduled`, `endpoint_rested`,
-`endpoint_recovered`, `carried_row_marked`, `budget_yield`,
-`shadow_mismatch`, `invariant_violation`, `page_ingested`,
-`receipt_watermark_observed`, `outbound_queue_scanned`, `spray_planned`,
-`silence_observed`, `request_rejected`.
+Codes are API. Prose log messages are not. The table is section 7, and
+`core/src/protocol_event.rs` owns the list; a test fails if the two disagree.
 
 ### 6.4 Redaction rules
 
 Every identity in a checked-in fixture is synthetic. Field-derived fixtures
 carry archive-local pseudonyms, never a real user id — not even a hashed one,
 because a hash of a stable id is still a stable id.
+
+The closed key set is the structural half of this rule and applies to every
+file the validator reads, not only to the checked-in corpus: a line carrying a
+key that section 6.1 or 6.2 does not declare is rejected, so a leak cannot be
+smuggled in under a field name nobody recognises. One list in
+`core/src/protocol_event.rs` backs both the command and the corpus test, and a
+test pins those tables against it.
 
 The validator rejects a fixture that contains any of: a token prefix
 (`cmdep1-`), a friend-card prefix (`CMFRIEND`), a deep-link scheme
@@ -773,6 +801,122 @@ bytes.
 | `contact-silence-no-proof.jsonl` | a silent contact endpoint with no proof of own connectivity | `SILENCE-01` |
 | `pending-rerun-during-backoff.jsonl` | a pending nudge trying to start a pass inside the quiet window | `RATE-01`, `PROGRESS-01` |
 | `zombie-outbound-queue.jsonl` | an outbound queue that never retires anything (#283) | `QUEUE-01`, `LIVE-01` |
+
+## 7. Event code table
+
+Codes are API. A renamed code breaks the replay command, the fixture corpus,
+and every archive already sitting in somebody's mail, so renaming one is a
+contract change and adding one is not. `core/src/protocol_event.rs` owns the
+list; a test in `core/tests/protocol_contract.rs` fails if this table and that
+enum disagree.
+
+Prose log lines remain non-API. They may be reworded freely, and nothing may
+parse them.
+
+The **emitter** column is the honest part. A code with no emitter yet is still
+API: the fixture corpus uses several of them to describe incidents that
+predate the ring, and the package that will emit each one is named here rather
+than left to be discovered.
+
+| Code | What it records | Emitter today | Typical invariants |
+|---|---|---|---|
+| `action_emitted` | an external request was handed to a driver | none yet — package C0 | `LIVE-01`, `RATE-01` |
+| `action_result_accepted` | a driver's result was applied | none yet — package C0 | `IDEMP-01` |
+| `action_result_stale_ignored` | a duplicate, late or wrong-pass result changed nothing | none yet — package C0 | `IDEMP-01` |
+| `budget_yield` | a pass stopped inside a declared budget rather than at the end of its work | none yet — package C0 | `LIVE-01`, `PROGRESS-01` |
+| `carried_row_marked` | a relay-uploaded carried row was durably marked | none yet — package C3 | `MARK-01`, `CARRY-01` |
+| `continuation_scheduled` | a pass scheduled more work, with its progress reason | none yet — package C0 | `PROGRESS-01` |
+| `endpoint_recovered` | a contact endpoint answered again and its streak cleared | `store.rs` `clear_contact_relay_unreachable` | `SILENCE-01` |
+| `endpoint_rested` | a no-answer streak reached the rest threshold | `store.rs` `note_contact_relay_unreachable` | `SILENCE-01` |
+| `frontier_advanced` | a mailbox frontier moved forward over a fully processed page | `store.rs` `advance_relay_fetch_cursor` | `CURSOR-01` |
+| `frontier_held` | a page moved neither the frontier nor the sweep cursor | `store.rs` cursor methods | `CURSOR-01`, `PAGE-01`, `PROGRESS-01` |
+| `frontier_lowered` | a completed sweep proved the frontier sat above the top of the mailbox | `store.rs` `note_relay_sweep_completed` | `CURSOR-01` |
+| `invariant_violation` | a named Contract v1 rule did not hold here | `store.rs` `note_invariant_violation`, and the ring's own redaction backstop | any |
+| `outbound_queue_scanned` | the launch-time receipt-coverage sweep ran | `store.rs` `open` | `QUEUE-01` |
+| `outbound_row_retired` | proof of delivery removed queued rows | `store.rs` `record_receipt` | `QUEUE-01`, `CARRY-01` |
+| `outbound_row_superseded` | a newer generation of a snapshot kind replaced queued ones | `authoring.rs` `insert_authored_rows` | `QUEUE-01` |
+| `page_ingested` | a relay page was durably consumed | none yet — package C4 | `PAGE-01`, `TXN-01` |
+| `pass_finish` | a relay pass ended, with its work counts | none yet — package C0 | `LIVE-01` |
+| `pass_start` | a relay pass began, and why | none yet — package C0 | `LIVE-01` |
+| `rate_limit_abort` | a family 429 ended the pass's remaining network work | `store.rs` `note_relay_rate_limit_abort`, called by the shells until package B0 owns the decision | `RATE-01`, `LIVE-01` |
+| `receipt_watermark_observed` | a peer's receipt watermark was read during repair | none yet — package D2 | `WM-01` |
+| `request_rejected` | an endpoint answered authoritatively that it would not serve us | `store.rs` `note_contact_relay_rejected` | `SILENCE-01`, `RATE-01` |
+| `shadow_mismatch` | a migration shadow planner disagreed with the live engine | none yet — package C1 | any |
+| `silence_observed` | contact silence advanced with same-pass proof | none yet — package C3 | `SILENCE-01` |
+| `spray_admitted` | a built spray plan went onto the radio | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
+| `spray_budget_exhausted` | a link ran out of burst allowance — once per dry spell, not per reconnect | `spray_policy.rs` `may_spray` | `SPRAY-01`, `LIVE-01` |
+| `spray_deferred` | the receipt-quiet backoff took hold or deepened — on the crossing, not on every tick it holds | `spray_policy.rs` `may_spray` | `SPRAY-01` |
+| `spray_planned` | a plan was built, before admission | none yet — package D2 | `SPRAY-01` |
+| `spray_suppressed` | every lane advertised the set the peer was last offered | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
+| `sweep_completed` | a walk from 0 reached the empty page | `store.rs` `note_relay_sweep_completed` | `CURSOR-01`, `PROGRESS-01` |
+| `sweep_restarted` | remembered sweep progress was thrown away, and why | `store.rs` `reset_relay_sweep_progress` | `PROGRESS-01` |
+| `sweep_resumed` | a sweep already under way moved further up the mailbox | `store.rs` `advance_relay_sweep_cursor` | `CURSOR-01`, `PROGRESS-01` |
+| `sweep_started` | a sweep's first page moved it off 0 | `store.rs` `advance_relay_sweep_cursor` | `CURSOR-01`, `PROGRESS-01` |
+
+### 7.1 The ring, and what it costs
+
+The ring is FIFO and capped at **both** 2,000 records and 1 MiB, evicting
+oldest-first when either cap is reached. Two caps, because the records are not
+one size: 2,000 spray decisions are small and 2,000 page ingests are not, and
+an archive a family member is asked to send over ship wi-fi has a size budget
+as well as a usefulness budget.
+
+Granularity is a hard rule, not a preference. This store has an ANR history,
+so an event is written per page, per pass, or per encounter decision — never
+per envelope and never inside a hot loop. A delivered watermark that retires
+200 rows is one record, not 200. A repeating condition is recorded when it
+*changes* — entering the receipt-quiet backoff, deepening it, a link running
+dry — never once per tick that it holds; a policy re-asked every minute would
+otherwise replace the whole ring with one repeated non-event and evict the
+evidence of the incident being investigated. Appends are batched, run against
+a table that cannot exceed 2,000 rows, and never hold the store mutex across
+anything that waits.
+
+An append is atomic. Its rows, its evictions and its bookkeeping row land
+together or not at all, inside a savepoint that nests under whatever
+transaction the caller already has open — because rows committing while the
+sequence counter does not would leave every later append failing its primary
+key. The ring also reconciles its counter against the table it describes and
+repairs a disagreement rather than jamming.
+
+The ring is never the reason anything else fails. Every operational call site
+emits best-effort: a full disk or a locked table costs a diagnostics record,
+not a receipt, a page ingest, an authored message, or the store opening at
+all.
+
+Time in a record is clamped forward to the newest record already stored. Two
+things make that necessary rather than defensive: a phone's wall clock can
+step backwards mid-cruise, and a few decision points genuinely have no clock
+in hand — `MessageStore::open` runs before anything has told core the time.
+Such a record reads as "no earlier than the one before it", which is exactly
+what is known, and it keeps "time never runs backwards" a property of the ring
+rather than a hope about every caller. A record whose time was borrowed this
+way says so with `inferred_at`, and the replay command reports those separately
+and excludes them from a transcript's span: a borrowed timestamp read as a
+measured one would tell a support reader that a frontier was held at a minute
+nothing observed.
+
+Export is manual. Nothing samples, schedules, or uploads it. The ring is
+produced in full when a person taps share on the Advanced diagnostics screen,
+and clearing captured diagnostics clears it.
+
+### 7.2 The replay command
+
+`cargo run -p cruisemesh-core --bin protocol-replay -- <file>` accepts a
+checked-in fixture, a simulation transcript, or a diagnostics archive
+straight out of the zip — one format, no conversion step.
+
+At this revision it validates the schema — including the closed key set of
+6.4, so it is no weaker on a real archive than the corpus test is on a
+fixture — plus ordering and redaction, checks
+every declared invariant id against section 1, walks the transcript for the
+first place it contradicts itself (a pass that starts twice, one that keeps
+working after its own rate-limit abort or after finishing, a frontier that
+claims to advance without moving), and prints a redacted summary. It does
+**not** re-execute the decisions against a `MessageStore`. A clean run means
+"nothing in this file contradicts itself", not "this device behaved
+correctly". Behavioural replay lands with the core relay session in package
+C0, and until then `--help` says exactly this.
 
 ## Appendix A — ownership inventory
 
@@ -812,7 +956,7 @@ against the tree as it stands. Labels:
 | Push, OS polling, background wake | `relay/RelayPushClient.kt` + service scheduling | `Relay/RelayPushClient.swift` + controller scheduling | none | shell-forever | push stays a pass nudge only |
 | Outbound queue retirement | no policy — `respondToDigest` in `MeshService.kt` calls the core re-seal | no policy — `handleDigest` in `MeshController.swift` calls the same | `outbound_retirement.rs` owns coverage retirement, supersession, per-kind expiry and whether a re-seal rejoins the queue; `store.rs` executes them at receipt time and on open (#283) | presentation-only | stays core; no shell decides any of it, and the digest responders' re-seal loop is the one caller that must stay a caller |
 | Delivery / transport / health UI | Compose status surfaces | SwiftUI status surfaces | semantic facts in `connection_health.rs` / `semantic.rs` | presentation-only | core facts, native presentation; D3 |
-| Field diagnostics archive | `debug/DiagnosticsShare.kt` | `UI/DiagnosticsArchive.swift` | delivery metrics only | hoist-now | shared event JSONL + native wrappers; B1 |
+| Field diagnostics archive | `debug/DiagnosticsShare.kt` + `debug/ProtocolEventExport.kt`, a wrapper that writes one file | `UI/DiagnosticsArchive.swift` + `ProtocolEventExport` in `UI/FieldMetricsExport.swift`, the same wrapper | `protocol_event.rs` owns the schema, the ring, redaction, export and replay; `store.rs`, `authoring.rs` and `spray_policy.rs` emit | presentation-only | done (B1); neither shell decides anything about an event, they attach a file to a share sheet |
 | Multi-node orchestration test | n/a | n/a | `core/tests/mesh_sim.rs` reimplements receive and meet | delete | production `mesh_receive` / `mesh_meet`; D0/D2 |
 | Generated bindings | ignored `kotlin-gen/` | checked-in `ios/CruiseMesh/Generated/` | `core/src/lib.rs` exports | shell-forever (mechanism) | drift is blocking in the Rust workflow (#269); keep it blocking |
 

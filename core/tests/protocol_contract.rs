@@ -213,7 +213,10 @@ const CONTRACT: &[Invariant] = &[
         id: "SECRET-01",
         statement: "Events, fixtures, summaries, and exported diagnostics carry no tokens, \
                     friend cards, plaintext, keys, or endpoint-bearing bodies.",
-        owner: Owner::Core("core/tests/protocol_contract.rs fixture canary scan"),
+        owner: Owner::Core(
+            "core/src/protocol_event.rs ring redaction + core/tests/protocol_event_ring.rs \
+             live-store canary + core/tests/protocol_contract.rs fixture canary scan",
+        ),
     },
 ];
 
@@ -1422,54 +1425,26 @@ const FIXTURES: &[&str] = &[
 ];
 
 /// Stable event codes. Codes are API; prose log messages are not.
-const EVENT_CODES: &[&str] = &[
-    "action_emitted",
-    "action_result_accepted",
-    "action_result_stale_ignored",
-    "budget_yield",
-    "carried_row_marked",
-    "continuation_scheduled",
-    "endpoint_recovered",
-    "endpoint_rested",
-    "frontier_advanced",
-    "frontier_held",
-    "invariant_violation",
-    "outbound_queue_scanned",
-    "page_ingested",
-    "pass_finish",
-    "pass_start",
-    "rate_limit_abort",
-    "receipt_watermark_observed",
-    "shadow_mismatch",
-    "silence_observed",
-    "spray_planned",
-    "request_rejected",
-];
+///
+/// The list itself moved into `core/src/protocol_event.rs` when the ring
+/// landed, because the emitter and the validator disagreeing about what a code
+/// is called is exactly the failure this file exists to prevent. Three places
+/// now have to agree, and two tests below make that a build failure rather
+/// than a code review: the Rust enum, this corpus validator, and the code
+/// table in section 7 of the contract document.
+fn event_codes() -> Vec<&'static str> {
+    cruisemesh_core::protocol_event_codes()
+}
 
-const HEADER_KEYS: &[&str] = &[
-    "schema",
-    "record",
-    "fixture",
-    "title",
-    "origin",
-    "public_reference",
-    "pseudonyms",
-    "expect_invariants",
-];
-
-const EVENT_KEYS: &[&str] = &[
-    "record",
-    "seq",
-    "at_ms",
-    "code",
-    "session",
-    "pass",
-    "action",
-    "actor",
-    "invariants",
-    "counts",
-    "outcome",
-];
+/// The closed key sets, borrowed from core rather than restated here.
+///
+/// They used to be a second copy, and the copy drifted the moment the live
+/// ring gained a header field: this corpus would have rejected the very file
+/// the plan says it must accept — a redacted field archive checked in as a
+/// fixture. Worse, the validator that gates *real* archives would have been
+/// the weaker of the two. One list, used by both.
+const HEADER_KEYS: &[&str] = cruisemesh_core::PROTOCOL_EVENT_HEADER_KEYS;
+const EVENT_KEYS: &[&str] = cruisemesh_core::PROTOCOL_EVENT_RECORD_KEYS;
 
 /// Substrings that must never appear in anything exportable. Checked against
 /// the raw file bytes, not the parsed model, so a leak in an unexpected place
@@ -1691,7 +1666,7 @@ fn every_fixture_matches_the_versioned_schema() {
                 .as_str()
                 .unwrap_or_else(|| panic!("{stem}.jsonl line {line}: code must be a string"));
             assert!(
-                EVENT_CODES.contains(&code),
+                event_codes().contains(&code),
                 "{stem}.jsonl line {line}: {code} is not a stable event code"
             );
 
@@ -1855,6 +1830,111 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
             "{} has no incident fixture. Either add one or add it to NO_FIXTURE_NEEDED with a \
              reason.",
             entry.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The event ring, the contract document, and this registry must agree
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_documented_event_codes_are_exactly_the_ones_core_can_emit() {
+    let mut documented: Vec<String> = CONTRACT_DOC
+        .split_once("## 7. Event code table")
+        .expect("the contract document must have a section 7")
+        .1
+        .lines()
+        .take_while(|line| !line.starts_with("## "))
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| line.split('`').nth(1).map(|code| code.to_string()))
+        .collect();
+    documented.sort();
+    documented.dedup();
+
+    let owned: Vec<String> = event_codes().iter().map(|code| code.to_string()).collect();
+    assert_eq!(
+        documented, owned,
+        "section 7 of specs/protocol-contract-v1.md and core/src/protocol_event.rs disagree \
+         about the stable event codes"
+    );
+}
+
+/// The header and record field tables in section 6 are the schema as a person
+/// reads it; `PROTOCOL_EVENT_HEADER_KEYS`/`_RECORD_KEYS` are the schema as the
+/// validator enforces it. Nothing but this test made them agree, and they had
+/// already drifted once: `first_seq` was documented and emitted while the
+/// closed key set had never heard of it.
+#[test]
+fn the_documented_schema_fields_are_exactly_the_keys_the_validator_allows() {
+    for (section, next, keys) in [
+        ("### 6.1 Header record", "### 6.2", HEADER_KEYS),
+        ("### 6.2 Event record", "### 6.3", EVENT_KEYS),
+    ] {
+        let mut documented: Vec<String> = CONTRACT_DOC
+            .split_once(section)
+            .unwrap_or_else(|| panic!("the contract document must have a {section}"))
+            .1
+            .lines()
+            .take_while(|line| !line.starts_with(next))
+            // Field rows only: the table's first cell is one or more
+            // backticked keys, e.g. "| `session`, `pass` | no | ... |".
+            .filter(|line| line.starts_with("| `"))
+            .flat_map(|line| {
+                line.split('|')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|cell| cell.trim().trim_matches('`').to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        documented.sort();
+        documented.dedup();
+
+        let mut allowed: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        allowed.sort();
+        assert_eq!(
+            documented, allowed,
+            "{section} of specs/protocol-contract-v1.md and core/src/protocol_event.rs disagree \
+             about which keys the schema declares"
+        );
+    }
+}
+
+#[test]
+fn the_invariant_ids_core_knows_are_exactly_the_ones_in_this_registry() {
+    // The replay command checks a record's declared invariant ids without
+    // linking this test crate, so it carries its own copy of the id list. That
+    // copy is a mirror, and this is the mirror's test: adding an invariant here
+    // without adding it there would let a transcript declare an id the command
+    // silently accepted as unknown-but-fine.
+    let mut registry: Vec<&str> = CONTRACT.iter().map(|entry| entry.id).collect();
+    registry.sort_unstable();
+    let mut mirrored: Vec<&str> = cruisemesh_core::PROTOCOL_INVARIANT_IDS.to_vec();
+    mirrored.sort_unstable();
+    assert_eq!(
+        registry, mirrored,
+        "core/src/protocol_event.rs PROTOCOL_INVARIANT_IDS has drifted from the registry"
+    );
+}
+
+#[test]
+fn every_checked_in_fixture_passes_the_replay_command_s_own_validator() {
+    // The corpus above is validated by this file's rules. This asserts the
+    // *other* implementation -- the one the command and the live export share
+    // -- accepts exactly the same files, so "run the fixture through the
+    // command" is never a different question from "is the fixture valid".
+    for stem in FIXTURES {
+        let raw = read_fixture(stem);
+        let archive = cruisemesh_core::validate(&raw)
+            .unwrap_or_else(|defects| panic!("{stem}.jsonl: {defects:?}"));
+        assert_eq!(archive.header.fixture, *stem);
+        let summary = cruisemesh_core::replay(&archive);
+        assert!(
+            summary.divergence.is_none(),
+            "{stem}.jsonl replays with a divergence: {:?}",
+            summary.divergence
         );
     }
 }

@@ -1133,8 +1133,9 @@ struct ConnectionDetailsView: View {
     /// CSV, and redacted stream-conflict summaries.
     ///
     /// The artifacts answer different questions -- what the radios did, why a
-    /// launch died, whether messages actually arrived, and whether a sender
-    /// stream fork was quarantined -- and none is derivable from the others,
+    /// launch died, whether messages actually arrived, whether a sender stream
+    /// fork was quarantined, and what the protocol itself decided at each
+    /// step -- and none is derivable from the others,
     /// so splitting them across buttons only meant getting a partial answer
     /// from whoever tapped the obvious one.
     ///
@@ -1146,6 +1147,7 @@ struct ConnectionDetailsView: View {
         urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
         if let url = FieldMetricsExport.writeCSVFile() { urls.append(url) }
         if let url = ConflictDiagnosticsExport.writeCSVFile() { urls.append(url) }
+        if let url = ProtocolEventExport.writeJSONLFile() { urls.append(url) }
         hasDiagnosticArchive = !urls.isEmpty
         if urls.isEmpty {
             supportMessage = String(localized: "No diagnostics captured yet.")
@@ -1184,7 +1186,8 @@ struct ConnectionDetailsView: View {
         if DiagnosticLogExport.hasArchive() { return true }
         if !DiagnosticLogExport.metricKitFileURLs().isEmpty { return true }
         if FieldMetricsExport.hasCapturedMetrics() { return true }
-        return ConflictDiagnosticsExport.hasCapturedConflicts()
+        if ConflictDiagnosticsExport.hasCapturedConflicts() { return true }
+        return ProtocolEventExport.hasCapturedEvents()
     }
 
     /// Erases everything `shareEverything` would send. Anything left behind
@@ -1206,6 +1209,10 @@ struct ConnectionDetailsView: View {
                 FieldMetricsExport.deleteExportedCSV()
                 try? AppStore.get().clearMessageConflicts()
                 ConflictDiagnosticsExport.deleteExportedCSV()
+                // Both halves, or the next share rebuilds the file that was
+                // just deleted from the ring that was not.
+                try? AppStore.get().clearProtocolEvents()
+                ProtocolEventExport.deleteExportedJSONL()
                 // The last share left a zip holding copies of all of the above.
                 DiagnosticsArchive.deleteArchives()
             }.value
