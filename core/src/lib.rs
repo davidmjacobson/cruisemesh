@@ -29,6 +29,7 @@ mod relay_setup;
 mod relay_status;
 mod relay_wire;
 mod semantic;
+mod session;
 mod spray_policy;
 mod store;
 mod transport_policy;
@@ -167,6 +168,16 @@ pub use semantic::{
     core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,
     core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
+};
+pub use session::relay_policy::{
+    core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
+    core_family_relay_backoff_vectors, core_family_relay_health_vectors,
+    core_family_relay_jitter_ms, core_family_relay_jitter_vectors, core_family_relay_pacer_vectors,
+    core_family_relay_rerun_vectors, core_relay_pass_health, core_relay_rerun_action,
+    core_worse_relay_fault, CoreFamilyRelayBackoff, CoreFamilyRelayPacer, CoreRelayBackoffVector,
+    CoreRelayHealthVector, CoreRelayJitterVector, CoreRelayPacerVector, CoreRelayPassHealth,
+    CoreRelayRerunAction, CoreRelayRerunVector, FAMILY_RELAY_BACKOFF_BASE_MS,
+    FAMILY_RELAY_BACKOFF_CAP_MS, FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
 };
 pub use spray_policy::{
     core_spray_retry_arm_max_ms, CoreSprayAdmission, CoreSprayAdmissionReason, CoreSprayGate,

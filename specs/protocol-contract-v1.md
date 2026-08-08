@@ -49,7 +49,7 @@ of it: the gap is now countable.
 | `CARRY-01` | Sending or relay-uploading a carried row does not remove it. Only verified peer digest/receipt proof or expiry permits removal. | core | `core/src/engine.rs` confirm-carried tests, `core/src/store.rs` carry tests; index re-asserts upload-then-survive |
 | `CURSOR-01` | A frontier advances only across a fully processed page whose required acks succeeded, and never moves backward on a normal pass. | core | `core/src/relay_cursor.rs` advance tests; index re-asserts `relay_cursor_advance` |
 | `PAGE-01` | Only an empty page is EOF. A short page continues. A non-empty non-advancing page terminates safely without unsafe advancement. | core | `core/src/relay_cursor.rs` walk-continuation tests; index re-asserts `relay_fetch_walk_continues` |
-| `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | hoist-pending | floor clamp is core (`relay_retry_after_ms`); pacing, backoff and rerun still shell-owned |
+| `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | core | `core/src/session/relay_policy.rs` owns request pacing, the exponential curve and its cap, the `Retry-After` floor, the stable identity jitter, the pending-rerun decision and the pass health fold; `relay_status.rs` owns the header clamp and the classification. Both shells delegate. The first clause — aborting the remaining stages — is completed by C0's pass |
 | `ENDPOINT-01` | A phone advertises only its own endpoint. A discovered or third-party address is never forwarded to anyone. | hoist-pending | receive-side scoping is core; hint authoring is shell-owned |
 | `SILENCE-01` | Contact silence advances only with same-pass proof that another relay answered; authoritative rejection does not require that proof. | core | `core/src/contact_relay_health.rs` silence tests; index re-asserts the delta rule |
 | `UI-01` | Delivery and via-transport claims require persisted arrival or receipt evidence, never a current-link guess. | core | `core/src/connection_health.rs` delivery tests; index re-asserts the queue-honesty gate |
@@ -114,6 +114,21 @@ during the window is deferred into it rather than starting a fresh pass. A
 pending rerun that ignores the window turns a rate limit into a hot loop —
 the exact shape of the re-upload storm fixed in #222 and the abort fixed in
 #260/#261.
+
+Each phone adds a small stable offset to the window so a family's phones do
+not wake in lockstep and re-collide. The offset is derived in core from the
+*public* user id under a BLAKE2b domain-separation context, and that is a
+change of substance rather than of address: both shells were previously
+seeding it from a platform hash of their own — Android from
+`ByteArray.contentHashCode()`, iOS from a hand-written FNV-1a added because
+Swift's `hashValue` is process-randomized and would not have been stable at
+all. Two shells hashing the same identity two ways is two answers to one
+protocol rule, and neither answer was written down anywhere. The window's
+shape is unchanged; which phone draws which offset inside it moves once.
+
+The offset takes a public value on purpose. It is observable in request
+timing, so anything secret fed into it would leak at whatever rate the phone
+gets rate limited.
 
 #### `ENDPOINT-01` — every phone advertises only itself
 
@@ -631,21 +646,37 @@ pass); rewalk decision before the walks; silence commit after the walks.
 
 ### 5.2 Known cross-shell divergences inside a stage
 
-Places where reading the two shells gave two answers. They are recorded rather
-than resolved: this revision changes no behaviour, and picking a winner is a
-migration with a canary, not a documentation edit. Each row names the package
-that must choose. The list is what reading the stages for this revision turned
-up; it is append-only, and finding another one is a finding, not a failure.
+Places where reading the two shells gave two answers. A row stays here until a
+package resolves it, and a resolved row keeps its history rather than being
+deleted: the value of this table is that it says a difference *existed*. Each
+open row names the package that must choose. The list is append-only, and
+finding another one is a finding, not a failure.
 
 | Divergence | Android today | iOS today | Whose choice |
 |---|---|---|---|
 | Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | C0 pins one in the stage enum and migrates the other shell in the same PR |
 | What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | C0, with the same stage enum |
+| When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | C0, when the pass owns its own abort; both are floors, but only Android's survives a pass that ends abnormally |
+| Where the pending-rerun decision is made | explicit at the rerun point (`relayRerunAction`), which re-arms the coalesced retry timer for the remaining window | implicit: the pending nudge re-enters the front door, which drops it, and the retry armed when the 429 was recorded is what actually fires | B0 — resolved toward Android: both shells now call `core_relay_rerun_action` at the rerun point, so the deferral is a decision rather than a side effect of two gates agreeing |
+| What seeds the anti-lockstep jitter | `ByteArray.contentHashCode()` — `java.util.Arrays.hashCode`, a 31-multiply over the user id | a hand-written FNV-1a over the user id, added because Swift's `hashValue` is process-randomized | B0 — resolved: neither. Core derives it from the public user id under a BLAKE2b context, and no shell computes a hash for this any more |
 
-Neither is known to be load-bearing, which is the point: an undocumented
-difference cannot be reasoned about, and a migration that quietly changes
-Android's deployed ordering to match a written stage enum would otherwise
-land with no invariant, no fixture, and no row saying it was ever different.
+The first two are not known to be load-bearing, which is the point: an
+undocumented difference cannot be reasoned about, and a migration that quietly
+changes Android's deployed ordering to match a written stage enum would
+otherwise land with no invariant, no fixture, and no row saying it was ever
+different.
+
+The jitter row was load-bearing in a small way and worth stating plainly. The
+offset's *purpose* is that two phones in one family draw different values; two
+shells drawing from different functions satisfied that by accident while
+guaranteeing nothing, and no test on either side could have caught a change to
+the other. It is one function now, with vectors both shells assert.
+
+One difference that is deliberately **not** a divergence: the clock each shell
+feeds the pacer. Android reads `SystemClock.elapsedRealtime()` and iOS reads
+`DispatchTime.now()`; both are monotonic, which is the only property the pacer
+requires, and choosing a monotonic source is exactly the kind of platform
+decision the shells are supposed to keep.
 
 ## 6. Fixture and event schema — `cruisemesh.protocol-event/v1`
 
@@ -758,15 +789,15 @@ against the tree as it stands. Labels:
 
 | Concern | Android today | iOS today | Shared today | Label | Destination |
 |---|---|---|---|---|---|
-| Family request pacing and 429 backoff | `mesh/FamilyRelayBackpressure.kt` | `Relay/FamilyRelayBackpressure.swift` | fault classification and the `Retry-After` clamp in `relay_status.rs` | hoist-now | `relay_policy.rs`; B0/B2 |
-| Pending relay rerun | `mesh/RelayRerunPolicy.kt` + `RelaySyncEngine.kt` | rerun path in `MeshController.swift` | none | hoist-now | `relay_policy.rs`, then `relay_pass.rs`; B0/C0 |
+| Family request pacing and 429 backoff | `mesh/FamilyRelayBackpressure.kt` — delegating shim, no constants and no math | `Relay/FamilyRelayBackpressure.swift` — delegating shim, no constants and no math | `session/relay_policy.rs` owns the pacer, the exponential curve, its cap, the `Retry-After` floor and the stable identity jitter; `relay_status.rs` owns the header clamp and the classification | delete | done in B0; the shims survive only until B2's canary evidence permits deleting them |
+| Pending relay rerun | `mesh/RelayRerunPolicy.kt` — delegating shim | `finishRelaySync` in `MeshController.swift` calls core at the rerun point | `session/relay_policy.rs` owns `core_relay_rerun_action` | delete | done in B0; orchestration moves to `relay_pass.rs` in C0 |
 | Mailbox per-pass work/yield budget | none — `RelayMailboxWalkBudget.kt` was removed outright in #270; only the call-through `RelayMailboxWalkBudgetTest.kt` remains | none — `Relay/RelayMailboxWalk.swift` calls `relayMailboxWalkAction` directly and never had a local copy | `relay_cursor.rs` owns pages, envelopes, continuation delay (#270) | delete | already done in #270; nothing left to remove, and the Kotlin test stays as the guard that Android still reaches core |
 | Mailbox walk execution | `mesh/RelayMailboxWalker.kt` (#276) | `Relay/RelayMailboxWalk.swift` (#276) | walk action, sweep due, resume, frontier in `relay_cursor.rs` | hoist-now | `relay_pass.rs`; C4 |
 | Relay pass stage order | `mesh/RelaySyncEngine.kt` | `relaySyncBlocking` region of `MeshController.swift` | none — and the two shells already disagree inside stage 7, see 5.2 | hoist-now | `relay_pass.rs`; C0–C5, which must resolve the 5.2 rows explicitly rather than by picking whichever shell it reads first |
 | Relay HTTP execution and page-size cap | `relay/RelayClient.kt` | `Relay/RelayClient.swift` | codecs, caps and status classification in `relay_wire.rs` / `relay_status.rs` | hoist-now (semantics) / shell-forever (transport) | core request/response semantics, native execution; C0–C2 |
 | Sweep, frontier, ack, continuation | `RelaySyncEngine.kt` + `RelayMailboxWalker.kt` | `MeshController.swift` + `Relay/RelaySweepSession.swift` | `relay_cursor.rs` + `store.rs` helpers; frontier lowering is core (#279) | hoist-now | `relay_pass.rs` + a transactional store API; C4 |
 | Contact rejection / silence / rest | `mesh/ContactRelaySilence.kt` + engine | `ContactRelaySilence` in `RelaySweepSession.swift` + controller | `contact_relay_health.rs` + persisted store state | hoist-now | policy in B0, orchestration in C3/C4 |
-| Relay pass health fold | `mesh/RelayFaultPolicy.kt` + `MeshConnectivityStatus.kt` | `MeshConnectivityStatus.swift` + controller | rank and classification in `relay_status.rs` | hoist-now | core snapshot and reason codes; B0/D3 |
+| Relay pass health fold | `mesh/RelayFaultPolicy.kt` — maps the core fold onto the shell's `RelayHealth` and adds the timestamp | `MeshConnectivityStatus.swift` — the same mapping | `session/relay_policy.rs` owns the worst-of fold and `CoreRelayPassHealth`; `relay_status.rs` owns the rank and the classification | presentation-only | done in B0; what is left on each shell is attaching a clock reading and choosing a display type, and D3 keeps it that way |
 | Connection and delivery health classification | consumes core (#281, #282) | consumes core (#281, #282) | `connection_health.rs` owns classification, per-recipient delivery, receipt-gated lines | presentation-only | stays core; shells render |
 | Failover resume debounce | `mesh/FailoverResumeDebounce.kt` — thin wrapper | equivalent wrapper | `transport_policy.rs` owns the window and coalescing (#269) | presentation-only | stays core; wrappers are adapters |
 | Peripheral link admission and the post-reject spray cooldown | `mesh/PeripheralLinkAdmission.kt`, spray cooldown classes (#277) | not yet extracted | none — but the byte and cadence half of `SPRAY-01` is now core (#280), and this brake composes with it rather than duplicating it | hoist-later | `mesh_meet.rs` when D2 lands; what remains here is the notify-reject window itself |
@@ -789,6 +820,19 @@ against the tree as it stands. Labels:
 
 Recorded so a reader does not have to diff two documents:
 
+- Family request pacing, the 429 backoff curve, the stable jitter offset, the
+  pending-rerun decision and the pass health fold are **core** now, in
+  `core/src/session/relay_policy.rs` (package B0). Both shells kept their type
+  names and every call site and became delegating shims with no constant and
+  no arithmetic of their own. They are deliberately *not* deleted: deletion is
+  B2's job and it is gated on paired-platform canary evidence, not on the
+  hoist compiling. Three test suites — Rust, Android JVM and Swift XCTest —
+  assert the same vectors, and the vectors cross UniFFI rather than living in
+  a file each platform reads its own way, so a marshalling bug at either
+  boundary shows up as a vector mismatch instead of as a platform test that
+  quietly asserts something slightly different.
+- The anti-lockstep jitter no longer comes from a platform hash on either
+  shell. Section 5.2 records what each was doing and why neither survived.
 - The mailbox walk budget and the sweep resume policy are **core** now
   (#270), and the Android class did not become a shim — `RelayMailboxWalkBudget.kt`
   was deleted outright in that PR. What survives is

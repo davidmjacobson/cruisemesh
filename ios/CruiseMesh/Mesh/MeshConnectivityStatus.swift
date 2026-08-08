@@ -33,45 +33,43 @@ enum RelayHealth: Equatable {
     /// to act on.
     case rateLimited(lastAttemptMs: Int64)
 
-    /// The health one completed sync pass earns. Mirrors Android's
-    /// `relayHealthAfterSyncPass` (RelayFaultPolicy.kt): the mailbox-level
-    /// faults (quota, oversized, rate-limited) surface even when polling
-    /// succeeded, because relayd keeps serving fetches while rejecting
-    /// posts. `.passExpired` is in that group too: for relayd's seven-day
-    /// `FAMILY_EXPIRY_GRACE_MS` an expired pass still fetches and acks and
-    /// only POSTs take the 403, so the success flags read "reachable" for a
-    /// week while every new message is rejected. `.passSuspended` and
-    /// `.tokenRejected` keep the pre-CP2b precedence because relayd rejects
-    /// every op for both, so neither can co-occur with a successful poll.
-    /// Classification itself lives in the core (`core/src/relay_status.rs`).
+    /// The health one completed sync pass earns.
+    ///
+    /// The fold itself is core policy (`core/src/session/relay_policy.rs`,
+    /// invariant `RATE-01`), and the reasoning behind its precedence -- why an
+    /// expired pass beats a successful poll and a suspended one does not --
+    /// lives with it. What happens here is projection: attaching this shell's
+    /// clock reading, which the core has no business inventing, and choosing
+    /// this shell's display type, which the core does not carry. Android does
+    /// the same mapping in RelayFaultPolicy.kt.
     static func afterSyncPass(
         fault: CoreRelayFault?,
         ownRelaySucceeded: Bool,
         anyRelaySucceeded: Bool,
         nowMs: Int64
     ) -> RelayHealth {
-        switch fault {
-        case .mailboxFull: return .quotaFull(lastAttemptMs: nowMs)
+        let health = coreRelayPassHealth(
+            fault: fault,
+            ownRelaySucceeded: ownRelaySucceeded,
+            anyRelaySucceeded: anyRelaySucceeded
+        )
+        switch health {
+        case .ok: return .ok(lastSyncMs: nowMs)
+        case .quotaFull: return .quotaFull(lastAttemptMs: nowMs)
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
-        case .passExpired: return .expired(lastAttemptMs: nowMs)
-        default: break
-        }
-        if ownRelaySucceeded && anyRelaySucceeded { return .ok(lastSyncMs: nowMs) }
-        switch fault {
-        case .passSuspended: return .suspended(lastAttemptMs: nowMs)
+        case .expired: return .expired(lastAttemptMs: nowMs)
+        case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
-        default: return .failing(lastAttemptMs: nowMs)
+        case .failing: return .failing(lastAttemptMs: nowMs)
         }
     }
 
     /// Worst-of fold for the faults one pass observed against our OWN saved
-    /// config, using the core's shared ranking so both shells keep the same
-    /// answer. `.outage` is deliberately never folded in by the caller -- an
+    /// config. `.outage` is deliberately never folded in by the caller -- an
     /// unstructured failure is what the success flags already express.
     static func worseFault(_ current: CoreRelayFault?, _ observed: CoreRelayFault) -> CoreRelayFault {
-        guard let current else { return observed }
-        return relayFaultRank(fault: observed) > relayFaultRank(fault: current) ? observed : current
+        coreWorseRelayFault(current: current, observed: observed)
     }
 }
 
