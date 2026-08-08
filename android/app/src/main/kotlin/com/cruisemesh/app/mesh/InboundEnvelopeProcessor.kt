@@ -191,7 +191,13 @@ internal class InboundEnvelopeProcessor(
     interface LanHooks {
         fun sendLanEndpointHintTo(address: String)
         fun connectToLanHint(hint: Frame.LanEndpoint, peerUserId: ByteArray)
-        fun saveLanEndpoint(networkId: String?, userId: ByteArray, endpoint: LanManualEndpoint)
+        /**
+         * Files an address a contact claimed in a hint. Unproven by
+         * definition -- nothing here has reached it -- so it is cached as
+         * [uniffi.cruisemesh_core.LanEndpointProvenance.HINTED] and stays
+         * subject to the same-network rule every time it is read back.
+         */
+        fun saveHintedLanEndpoint(networkId: String?, userId: ByteArray, endpoint: LanManualEndpoint)
         fun currentLanNetworkId(): String?
 
         /**
@@ -984,7 +990,7 @@ internal class InboundEnvelopeProcessor(
         // dialed -- saving first would re-file a long-dead address and reset
         // its seven-day cache clock on every replay.
         if (content.expiresAtMs > now) {
-            lan.saveLanEndpoint(hintedNetworkId, senderUserId, endpoint)
+            lan.saveHintedLanEndpoint(hintedNetworkId, senderUserId, endpoint)
             // The network fingerprint is stored with the cached endpoint but
             // deliberately does NOT gate this dial: requiring an exact match
             // silently disabled fresh hints on routed multi-subnet LANs -- the

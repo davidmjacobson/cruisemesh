@@ -11609,6 +11609,91 @@ public func FfiConverterTypeIntroductionTicket_lower(_ value: IntroductionTicket
 
 
 /**
+ * One entry of the per-network LAN endpoint cache, as both apps hold it.
+ */
+public struct LanEndpointCacheEntry {
+    public var host: String
+    public var port: UInt16
+    public var savedAtMs: Int64
+    public var provenance: LanEndpointProvenance
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(host: String, port: UInt16, savedAtMs: Int64, provenance: LanEndpointProvenance) {
+        self.host = host
+        self.port = port
+        self.savedAtMs = savedAtMs
+        self.provenance = provenance
+    }
+}
+
+
+
+extension LanEndpointCacheEntry: Equatable, Hashable {
+    public static func ==(lhs: LanEndpointCacheEntry, rhs: LanEndpointCacheEntry) -> Bool {
+        if lhs.host != rhs.host {
+            return false
+        }
+        if lhs.port != rhs.port {
+            return false
+        }
+        if lhs.savedAtMs != rhs.savedAtMs {
+            return false
+        }
+        if lhs.provenance != rhs.provenance {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(host)
+        hasher.combine(port)
+        hasher.combine(savedAtMs)
+        hasher.combine(provenance)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointCacheEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointCacheEntry {
+        return
+            try LanEndpointCacheEntry(
+                host: FfiConverterString.read(from: &buf),
+                port: FfiConverterUInt16.read(from: &buf),
+                savedAtMs: FfiConverterInt64.read(from: &buf),
+                provenance: FfiConverterTypeLanEndpointProvenance.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LanEndpointCacheEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.host, into: &buf)
+        FfiConverterUInt16.write(value.port, into: &buf)
+        FfiConverterInt64.write(value.savedAtMs, into: &buf)
+        FfiConverterTypeLanEndpointProvenance.write(value.provenance, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheEntry_lift(_ buf: RustBuffer) throws -> LanEndpointCacheEntry {
+    return try FfiConverterTypeLanEndpointCacheEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheEntry_lower(_ value: LanEndpointCacheEntry) -> RustBuffer {
+    return FfiConverterTypeLanEndpointCacheEntry.lower(value)
+}
+
+
+/**
  * Short-lived endpoint candidate sent inside a sealed `kind = 8` message.
  * `network_id` is a hashed local-network fingerprint, never a raw SSID.
  */
@@ -15730,6 +15815,172 @@ extension IncomingMessageInsertOutcome: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a shell should do with an entry it just read off disk.
+ */
+
+public enum LanEndpointCacheDecision {
+
+    /**
+     * Dial it.
+     */
+    case use
+    /**
+     * Do not dial it, but leave it stored -- this load could not judge it.
+     */
+    case skip
+    /**
+     * Delete it. It can never be dialed successfully from here again.
+     */
+    case evict
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointCacheDecision: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointCacheDecision
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointCacheDecision {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .use
+
+        case 2: return .skip
+
+        case 3: return .evict
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LanEndpointCacheDecision, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .use:
+            writeInt(&buf, Int32(1))
+
+
+        case .skip:
+            writeInt(&buf, Int32(2))
+
+
+        case .evict:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheDecision_lift(_ buf: RustBuffer) throws -> LanEndpointCacheDecision {
+    return try FfiConverterTypeLanEndpointCacheDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointCacheDecision_lower(_ value: LanEndpointCacheDecision) -> RustBuffer {
+    return FfiConverterTypeLanEndpointCacheDecision.lower(value)
+}
+
+
+
+extension LanEndpointCacheDecision: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a cached LAN endpoint came to be known.
+ *
+ * The distinction exists because the two are worth very different amounts.
+ * A hint is a claim the contact made about an address; an authenticated
+ * entry is an address this phone reached and completed a Noise handshake
+ * with. Only the second is evidence, so only the second may sit in the cache
+ * on a subnet this phone cannot see itself on -- a routed LAN carries TCP
+ * where mDNS cannot, and a peer proven there is legitimately cross-subnet.
+ */
+
+public enum LanEndpointProvenance {
+
+    /**
+     * The address arrived in a contact's endpoint hint and nothing has
+     * confirmed it. Values written before provenance was recorded decode as
+     * this: the conservative reading, since a pre-provenance build filed
+     * hints and proven addresses through the same door.
+     */
+    case hinted
+    /**
+     * The address completed a Noise handshake with this phone.
+     */
+    case authenticated
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanEndpointProvenance: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointProvenance
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanEndpointProvenance {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .hinted
+
+        case 2: return .authenticated
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LanEndpointProvenance, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .hinted:
+            writeInt(&buf, Int32(1))
+
+
+        case .authenticated:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointProvenance_lift(_ buf: RustBuffer) throws -> LanEndpointProvenance {
+    return try FfiConverterTypeLanEndpointProvenance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanEndpointProvenance_lower(_ value: LanEndpointProvenance) -> RustBuffer {
+    return FfiConverterTypeLanEndpointProvenance.lower(value)
+}
+
+
+
+extension LanEndpointProvenance: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  *
@@ -16409,6 +16660,30 @@ fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeGroup.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLanEndpointCacheEntry: FfiConverterRustBuffer {
+    typealias SwiftType = LanEndpointCacheEntry?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLanEndpointCacheEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLanEndpointCacheEntry.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -19152,6 +19427,106 @@ public func lanDefaultTcpPort() -> UInt16 {
     )
 })
 }
+/**
+ * What to do with a cache entry read back on this phone's current network.
+ *
+ * `local_host` is this phone's own LAN address, or `None` when it has none to
+ * compare with.
+ *
+ * Shipped builds filed a hinted address under this phone's network id
+ * whatever subnet the address was on, so a phone that ever received such a
+ * hint burns one connect timeout per Wi-Fi join for the seven days the entry
+ * lives. Freshness and the host rule alone could not clear those: an address
+ * that authenticated on a routed LAN is a legitimate cross-subnet entry and
+ * looks identical without provenance. With provenance recorded, the rule is
+ * finally expressible -- an unproven address must be on the network we are
+ * on, a proven one need not be.
+ *
+ * The two "cannot tell" cases are deliberately not the same answer. When
+ * *this phone* has no address that can fingerprint a network, the load itself
+ * is uninformative, so an unproven entry is skipped and left alone: not
+ * dialing is enough to stop the loop, and the next load on a readable
+ * interface can still judge it. When the *entry's* host is the unprovable one
+ * (a link-local IPv6 address, identical on every link there has ever been) no
+ * future load can judge it either -- unprovable is exactly what #271 said may
+ * not be remembered -- so that is a terminal answer and the entry goes.
+ *
+ * Nothing here discovers or forwards an address; every value examined is one
+ * this phone already holds.
+ */
+public func lanEndpointCacheDecision(entry: LanEndpointCacheEntry, localHost: String?, nowMs: Int64) -> LanEndpointCacheDecision {
+    return try!  FfiConverterTypeLanEndpointCacheDecision.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_decision(
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),
+        FfiConverterOptionString.lower(localHost),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Parses a stored cache value, or `None` when it cannot be trusted at all.
+ *
+ * A legacy three-field value parses as [`LanEndpointProvenance::Hinted`].
+ * That is the conservative reading and the whole point of the migration: the
+ * builds that wrote those values filed cross-subnet hints, so treating them
+ * as proven would preserve exactly the entries this is meant to clear.
+ * An unrecognised provenance field is read as `Hinted` for the same reason.
+ *
+ * Fields past the fourth are ignored rather than rejected. Both shells delete
+ * a value this returns `None` for, so being strict about length would mean
+ * that appending a fifth field later silently wipes the whole cache -- proven
+ * cross-subnet entries included -- on any phone that rolls back to this build.
+ * Ignoring the tail costs nothing and makes the next append survivable.
+ */
+public func lanEndpointCacheDecode(value: String) -> LanEndpointCacheEntry? {
+    return try!  FfiConverterOptionTypeLanEndpointCacheEntry.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_decode(
+        FfiConverterString.lower(value),$0
+    )
+})
+}
+/**
+ * Serialises a cache entry to the single string both shells persist.
+ *
+ * The shape is `base64url(host)|port|savedAtMs|provenance`, extending the
+ * three-field value shipped builds wrote by appending a field rather than
+ * changing one, so the three fields those builds wrote keep their meaning and
+ * their position. The host is encoded because it can contain the separator
+ * (an IPv6 literal) and a zone suffix.
+ *
+ * That only buys forward compatibility because [`lan_endpoint_cache_decode`]
+ * ignores fields it does not know: shipped builds did **not** -- their
+ * three-field parsers rejected anything longer, and the shells delete a value
+ * they cannot parse. So a phone that rolls back past this change loses its
+ * cache; a phone that rolls back past a *later* appended field does not.
+ */
+public func lanEndpointCacheEncode(entry: LanEndpointCacheEntry) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_encode(
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),$0
+    )
+})
+}
+/**
+ * The value to store for `entry`, given whatever is already stored under the
+ * same key (`None` when nothing is).
+ *
+ * This exists so a save never silently *demotes* a proven address. A contact
+ * keeps resending its endpoint hint, and if that hint names the address this
+ * phone already authenticated, rewriting the entry as merely hinted would
+ * hand it back to the eviction rule below and drop a working cross-subnet
+ * peer on the next Wi-Fi join. A hint about an already-proven address
+ * refreshes its clock and keeps the proof; anything else -- a different
+ * address, or a fresh handshake -- writes what the caller passed.
+ */
+public func lanEndpointCacheEncodeUpdate(existingValue: String?, entry: LanEndpointCacheEntry) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_encode_update(
+        FfiConverterOptionString.lower(existingValue),
+        FfiConverterTypeLanEndpointCacheEntry.lower(entry),$0
+    )
+})
+}
 public func lanEndpointCacheIsFresh(savedAtMs: Int64, nowMs: Int64) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_endpoint_cache_is_fresh(
@@ -20863,6 +21238,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decision() != 52054) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decode() != 30229) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_encode() != 20029) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_encode_update() != 62187) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_is_fresh() != 25415) {

@@ -54,8 +54,10 @@ import os.log
  pipeline touches is safe off the main thread on its own terms -- the Rust
  core's store/seen-set/trackers are `Mutex`-backed, `MeshRouter`,
  `ChatVisibility`, `ContactRelaySilence` and `RelaySweepSession` are
- `NSLock`-backed, `LanCapabilityStore`/`LanEndpointCache`/`ProfileStore` are
- `UserDefaults`, `LanTransportDiagnostics` publishes on main internally, and
+ `NSLock`-backed, `LanCapabilityStore`/`ProfileStore` are `UserDefaults`,
+ `LanEndpointCache` is `UserDefaults` plus its own `NSLock` (its save reads
+ the stored entry before rewriting it, and per-operation atomicity is not
+ enough for that), `LanTransportDiagnostics` publishes on main internally, and
  `BleTransport`/`LanTransport` each own a private queue.
 
  The relay sync *pass* itself is unchanged: it still runs in a detached task
@@ -266,7 +268,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self.currentLanInstanceToken = instanceToken
                 self.currentLanNetworkId = networkId
                 for contact in (try? self.store.listContacts()) ?? [] {
-                    if let cached = LanEndpointCache.load(networkId: networkId, userId: contact.userId) {
+                    // This phone's own address on the network it just joined
+                    // is what lets the cache throw out an unproven entry that
+                    // belongs to some other subnet -- the entries shipped
+                    // builds filed, each of which costs a connect timeout on
+                    // every join until it does.
+                    if let cached = LanEndpointCache.load(
+                        networkId: networkId,
+                        userId: contact.userId,
+                        localHost: endpoint.host
+                    ) {
                         lan.connect(cached, cached: true)
                     }
                 }
@@ -282,7 +293,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 }
             }
         }
-        lan.onAuthenticated = { [weak self] address, userId in
+        lan.onAuthenticated = { [weak self] address, userId, dialedEndpoint in
             self?.meshQueue.async {
                 guard let self, self.isRunning else { return }
                 let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
@@ -305,6 +316,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         userId: userId,
                         transport: .lan,
                         kind: .connected
+                    )
+                }
+                // A completed Noise handshake is the proof a hint never had,
+                // so the address is filed as authenticated -- promoting
+                // whatever unproven entry was already there. That, and only
+                // that, lets it survive a later load on a routed LAN where
+                // this phone cannot see itself on the peer's subnet. It
+                // mirrors `isSingleShotLanConnectKey`'s rule above: an
+                // address that answered is evidence, a claim about one is not.
+                if let dialedEndpoint {
+                    LanEndpointCache.save(
+                        networkId: self.currentLanNetworkId,
+                        userId: userId,
+                        endpoint: dialedEndpoint,
+                        provenance: .authenticated
                     )
                 }
                 LanTransportDiagnostics.shared.authenticated(address: address, peerName: name)
@@ -705,10 +731,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             localHost: currentLanEndpoint?.host,
             candidateHost: endpoint.host
         ) {
+            // Still only a claim until a handshake completes, so it is filed
+            // unproven and re-checked against the network on every load.
             LanEndpointCache.save(
                 networkId: currentLanNetworkId,
                 userId: userId,
-                endpoint: endpoint
+                endpoint: endpoint,
+                provenance: .hinted
             )
         }
         queueCurrentLanEndpoint(to: userId)
@@ -2200,7 +2229,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // saved nor dialed -- saving first would re-file a long-dead address
         // and reset its seven-day cache clock on every replay.
         if hint.expiresAtMs > now {
-            LanEndpointCache.save(networkId: networkId, userId: senderUserId, endpoint: endpoint)
+            LanEndpointCache.save(
+                networkId: networkId,
+                userId: senderUserId,
+                endpoint: endpoint,
+                provenance: .hinted
+            )
             // The network fingerprint is stored with the cached endpoint but
             // deliberately does NOT gate this dial: requiring an exact match
             // silently disabled fresh hints on routed multi-subnet LANs --
