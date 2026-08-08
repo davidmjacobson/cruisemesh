@@ -66,6 +66,46 @@ cargo run -p cruisemesh-core --bin uniffi-bindgen --features cruisemesh-core/cli
 as modified (line endings only). Compiling the Swift itself still needs a Mac or
 the `ios.yml` runner.
 
+### Never hand-edit `ios/CruiseMesh/Generated/`
+
+Regenerate, always — including for a change that looks cosmetic. UniFFI verifies
+a per-function checksum at *runtime*, so a stale or edited binding is not a
+compile error: it is a `fatalError` the moment the app launches, which is how two
+launch crashes shipped. Since UniFFI 0.28.3 a function's doc comment feeds that
+checksum, so even a comment-only edit in `core/` invalidates the committed Swift.
+
+`rust.yml` holds the one authoritative gate on this. It regenerates the bindings
+and then runs, blocking, on every PR with no path filter:
+
+```powershell
+git diff --exit-code --ignore-all-space ios/CruiseMesh/Generated
+```
+
+`--ignore-all-space` is load-bearing: the committed copies are the generator's
+output with trailing whitespace stripped, which is what the editors in this
+project do on save. Signature and checksum drift — the thing that crashes the app
+— is not whitespace, so it still fails. `ios.yml` deliberately carries no drift
+check of its own; it regenerates before compiling, so it proves the complementary
+half (a freshly generated binding builds and its tests pass). Do not add a second
+gate there.
+
+Reproduce the gate locally with the two generation commands above followed by
+that `git diff`. To confirm it still has teeth, *commit* a one-character change to
+a checksum constant in `Generated/cruisemesh_core.swift`, regenerate, and check
+the diff comes back non-empty — a working-tree-only edit proves nothing, since
+regeneration overwrites it.
+
+Drift is only half the problem: a binding that matches can still marshal a value
+wrongly, and nothing compiled catches that either.
+`android/app/src/test/kotlin/com/cruisemesh/app/mesh/CoreBindingSmokeTest.kt` and
+`ios/CruiseMeshTests/CoreBindingSmokeTests.swift` execute the boundary itself —
+enum discriminants, optionals present and absent, byte arrays, nested record
+round trips — as *shape* checks only. When an exported enum or record lands with
+a shape those files do not already cover, extend them. Never restate in them the
+policy the core's own tests own.
+
+## iOS build and simulator
+
 `core/build-ios.sh` must run on a Mac. From `ios/`, `xcodegen generate` produces
 the Xcode project; run the test suite against an available simulator with
 `xcodebuild test -project CruiseMesh.xcodeproj -scheme CruiseMesh -destination

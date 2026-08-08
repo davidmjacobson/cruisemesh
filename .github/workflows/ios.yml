@@ -67,16 +67,22 @@ jobs:
       - name: Build core + Swift bindings + xcframework
         run: bash core/build-ios.sh
 
-      # The committed bindings under ios/CruiseMesh/Generated are generated
-      # from the pinned uniffi version, so a fresh generation must match what's
-      # in the tree. Mirrors rust.yml's kotlin-gen drift check. Non-blocking
-      # for now: swiftformat isn't run by either generator host, so trivial
-      # formatting could differ between a dev's machine and the runner --
-      # tighten to a hard failure once the diff is confirmed empty on macOS.
-      - name: Generated Swift bindings drift check
-        continue-on-error: true
-        run: git diff --stat --exit-code -- ios/CruiseMesh/Generated
-
+      # There is deliberately NO binding drift check here. rust.yml owns the
+      # one authoritative, blocking gate for ios/CruiseMesh/Generated: it runs
+      # on every PR with no path filter, on a Linux runner, without waiting for
+      # Xcode, three cross-compiles and an xcframework -- so it fails far
+      # faster than this job could. A second copy here would either duplicate
+      # that verdict or, as the `continue-on-error` version it replaces did,
+      # sit permanently red and teach everyone to ignore it. (That step
+      # compared with plain `git diff`, which trips on the trailing whitespace
+      # the committed copies have stripped, so it could never have gone green
+      # as written.) The step above still REGENERATES the bindings before
+      # compiling, so what this job proves is the complementary half: that a
+      # freshly generated binding actually builds and its tests pass.
+      #
+      # If macOS generation ever diverges from Linux generation, fix it by
+      # making rust.yml's gate reproduce the difference -- do not re-add a
+      # second gate here.
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate
