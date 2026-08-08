@@ -143,8 +143,9 @@ pub use protocol::{
 pub use protocol_event::{
     is_known_invariant, protocol_event_codes, redaction_defect, replay, validate, ProtocolEvent,
     ProtocolEventArchive, ProtocolEventCode, ProtocolEventDefect, ProtocolEventHeader,
-    ReplaySummary, PROTOCOL_EVENT_ARCHIVE_STEM, PROTOCOL_EVENT_MAX_BYTES,
-    PROTOCOL_EVENT_MAX_RECORDS, PROTOCOL_EVENT_SCHEMA, PROTOCOL_INVARIANT_IDS,
+    ReplaySummary, PROTOCOL_EVENT_ARCHIVE_STEM, PROTOCOL_EVENT_HEADER_KEYS,
+    PROTOCOL_EVENT_MAX_BYTES, PROTOCOL_EVENT_MAX_RECORDS, PROTOCOL_EVENT_RECORD_KEYS,
+    PROTOCOL_EVENT_SCHEMA, PROTOCOL_INVARIANT_IDS,
 };
 pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
 pub use relay_cursor::{

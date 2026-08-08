@@ -36,14 +36,15 @@ OPTIONS:
     -h, --help     Print this help.
 
 WHAT IT CHECKS
-    * the versioned schema, including header fields and per-record keys;
+    * the versioned schema: every required field, and no key on any line that
+      the schema does not declare — a leak cannot be smuggled in under a field
+      name nobody recognises;
     * sequence numbers, which run consecutively from the header's first_seq
       (absent means 1; an exported ring that has evicted its oldest records
       says so here rather than renumbering and pretending to be new);
     * that time never runs backwards;
     * redaction: no relay token, friend card, deep link, URL, credential
-      header, key block or private-address literal, and no key outside the
-      schema;
+      header, key block or private-address literal;
     * that every invariant id a record claims exists in Contract v1 and is
       declared in the header;
     * transcript self-consistency: a pass that starts twice, one that works on
@@ -159,8 +160,8 @@ fn render(archive: &ProtocolEventArchive, summary: &ReplaySummary) -> String {
     ));
     if summary.undated_records > 0 {
         out.push_str(&format!(
-            "  {} record(s) predate anything telling the ring the time; they are ordered, not              dated
-",
+            "  {} record(s) carry an inferred timestamp: nothing told the ring the time at that \
+             point, so they are ordered, not dated, and the span above excludes them\n",
             summary.undated_records
         ));
     }

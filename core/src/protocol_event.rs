@@ -35,6 +35,13 @@
 //! `invariant_violation` naming `SECRET-01` instead, so the *fact* that
 //! something tried survives even though its contents do not.
 //!
+//! The closed key sets ([`PROTOCOL_EVENT_HEADER_KEYS`],
+//! [`PROTOCOL_EVENT_RECORD_KEYS`]) are the structural half of the same rule,
+//! and [`validate`] enforces them on every file it reads. The canary list
+//! catches a leak that looks like something already known to be secret; this
+//! catches one smuggled in under a field name nobody declared, which is the
+//! shape a leak of ordinary message prose would actually take.
+//!
 //! # The ring
 //!
 //! FIFO, capped at both 2,000 events and 1 MiB, evicting oldest-first when
@@ -50,6 +57,13 @@
 //! `first_seq` is how the reader tells those apart, and it defaults to 1 when
 //! absent, so every checked-in fixture means exactly what it did before this
 //! field existed.
+//!
+//! Two properties make the ring safe to have at all. An [`append`] is atomic
+//! — see [`with_savepoint`] — because rows committing while the sequence
+//! counter does not would jam every later append on its primary key. And no
+//! operational call site may fail because of it: they emit through [`note`]
+//! and [`note_for`], which return nothing. A full disk costs a diagnostics
+//! record, never a receipt, a page ingest, or the store opening at all.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -338,6 +352,10 @@ impl ProtocolEventDraft {
 pub struct ProtocolEvent {
     pub seq: i64,
     pub at_ms: i64,
+    /// True when `at_ms` was borrowed from the record before this one rather
+    /// than measured. Absent in a file means false — a record that says
+    /// nothing about its clock was told the time.
+    pub inferred_at: bool,
     pub code: ProtocolEventCode,
     pub session: Option<String>,
     pub pass: Option<String>,
@@ -379,12 +397,15 @@ fn json_string(value: &str) -> String {
 /// Serialize one record. Keys are emitted in schema order rather than
 /// alphabetically, because a person reads these files far more often than a
 /// parser does, and empty fields are omitted rather than sent as `null`.
-fn draft_to_line(seq: i64, draft: &ProtocolEventDraft) -> String {
+fn draft_to_line(seq: i64, draft: &ProtocolEventDraft, inferred_at: bool) -> String {
     let mut line = String::with_capacity(160);
     line.push_str("{\"record\":\"event\",\"seq\":");
     line.push_str(&seq.to_string());
     line.push_str(",\"at_ms\":");
     line.push_str(&draft.at_ms.to_string());
+    if inferred_at {
+        line.push_str(",\"inferred_at\":true");
+    }
     line.push_str(",\"code\":");
     line.push_str(&json_string(draft.code.as_str()));
     if let Some(session) = &draft.session {
@@ -497,6 +518,58 @@ pub fn redaction_defect(text: &str) -> Option<&'static str> {
         .iter()
         .find(|(canary, _)| text.contains(canary))
         .map(|(_, what)| *what)
+}
+
+/// Every key a header line may carry, and the whole list of them.
+///
+/// The closed key set is half of `SECRET-01`, and the more important half: the
+/// canary scan catches a leak that looks like something already known to be
+/// secret, and this catches a leak smuggled in under a field name nobody
+/// declared. Both halves have to run over real exported archives, not only
+/// over the checked-in corpus, which is why the lists live here beside
+/// [`validate`] rather than in the test that reads the fixtures.
+pub const PROTOCOL_EVENT_HEADER_KEYS: &[&str] = &[
+    "schema",
+    "record",
+    "fixture",
+    "title",
+    "origin",
+    "public_reference",
+    "pseudonyms",
+    "expect_invariants",
+    "first_seq",
+];
+
+/// Every key an event line may carry. See [`PROTOCOL_EVENT_HEADER_KEYS`].
+pub const PROTOCOL_EVENT_RECORD_KEYS: &[&str] = &[
+    "record",
+    "seq",
+    "at_ms",
+    "inferred_at",
+    "code",
+    "session",
+    "pass",
+    "action",
+    "actor",
+    "invariants",
+    "counts",
+    "outcome",
+];
+
+/// Keys in one JSONL line that the schema does not declare.
+///
+/// A line this cannot parse reports nothing; the caller's parse step is what
+/// reports that, and reporting it twice would be noise.
+fn foreign_keys(line: &str, allowed: &[&str]) -> Vec<String> {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(line)
+    else {
+        return Vec::new();
+    };
+    object
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .collect()
 }
 
 /// Short stable tokens only: lowercase, digits, underscore, at most 48 bytes.
@@ -623,6 +696,92 @@ fn ring_state(conn: &Connection) -> Result<RingState, CoreError> {
     })
 }
 
+/// Run `work` so that either all of its statements land or none of them do.
+///
+/// A savepoint rather than a transaction because both are true of these call
+/// sites: some hand us a raw connection in autocommit mode, and some hand us
+/// one already inside their own transaction. A savepoint nests under either.
+///
+/// This is not tidiness. The ring's row inserts and its bookkeeping row are a
+/// read-modify-write of one counter, and if the rows commit while the counter
+/// does not, `next_seq` is left below `MAX(seq) + 1` and every later append
+/// fails its primary key — permanently, on a store that is otherwise fine.
+/// [`reconciled_ring_state`] can repair that state; this is what stops it
+/// being created.
+fn with_savepoint<T>(
+    conn: &Connection,
+    work: impl FnOnce(&Connection) -> Result<T, CoreError>,
+) -> Result<T, CoreError> {
+    conn.execute_batch("SAVEPOINT cruisemesh_protocol_event")
+        .map_err(store_err)?;
+    match work(conn) {
+        Ok(value) => {
+            conn.execute_batch("RELEASE cruisemesh_protocol_event")
+                .map_err(store_err)?;
+            Ok(value)
+        }
+        Err(error) => {
+            // The rollback's own failure must not replace the real reason.
+            let _ = conn.execute_batch(
+                "ROLLBACK TO cruisemesh_protocol_event; RELEASE cruisemesh_protocol_event;",
+            );
+            Err(error)
+        }
+    }
+}
+
+/// The bookkeeping row, checked against the table it describes and repaired if
+/// they disagree.
+///
+/// `MIN(seq)` and `MAX(seq)` on an `INTEGER PRIMARY KEY` are two index seeks,
+/// so the healthy path costs the same on a full ring as on an empty one and
+/// the expensive `COUNT`/`SUM` repair runs only when something is actually
+/// wrong. Something can be wrong despite [`with_savepoint`]: a store written
+/// by an older build, a file restored from a backup, or a row somebody deleted
+/// by hand. The ring recovering by itself matters more here than in most
+/// places, because the alternative is a diagnostics table jamming the store
+/// methods that emit into it.
+fn reconciled_ring_state(conn: &Connection) -> Result<RingState, CoreError> {
+    let state = ring_state(conn)?;
+    let (min_seq, max_seq): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT MIN(seq), MAX(seq) FROM protocol_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(store_err)?;
+
+    let agrees = match (min_seq, max_seq) {
+        (Some(min), Some(max)) => state.first_seq == min && state.next_seq == max.saturating_add(1),
+        _ => state.first_seq == state.next_seq && state.total_bytes == 0,
+    };
+    if agrees {
+        return Ok(state);
+    }
+
+    let (bytes, newest): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(bytes), 0), COALESCE(MAX(at_ms), 0) FROM protocol_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(store_err)?;
+    // A sequence never runs backwards, even to repair itself: an archive
+    // already exported carries the numbers it carried.
+    let next_seq = max_seq.map_or(state.next_seq, |max| {
+        state.next_seq.max(max.saturating_add(1))
+    });
+    let repaired = RingState {
+        next_seq,
+        first_seq: min_seq.unwrap_or(next_seq),
+        total_bytes: bytes,
+        next_actor: state.next_actor,
+        last_at_ms: state.last_at_ms.max(newest),
+    };
+    write_ring_state(conn, repaired)?;
+    Ok(repaired)
+}
+
 fn write_ring_state(conn: &Connection, state: RingState) -> Result<(), CoreError> {
     conn.execute(
         "UPDATE protocol_event_state
@@ -649,6 +808,14 @@ fn write_ring_state(conn: &Connection, state: RingState) -> Result<(), CoreError
 /// this function: only their salted hash is stored, and only the name is
 /// returned.
 pub(crate) fn actor_pseudonym(
+    conn: &Connection,
+    kind: &'static str,
+    raw: &[u8],
+) -> Result<String, CoreError> {
+    with_savepoint(conn, |conn| actor_pseudonym_inner(conn, kind, raw))
+}
+
+fn actor_pseudonym_inner(
     conn: &Connection,
     kind: &'static str,
     raw: &[u8],
@@ -691,24 +858,61 @@ pub(crate) fn actor_pseudonym(
         params![actor_key, name],
     )
     .map_err(store_err)?;
-    write_ring_state(
-        conn,
-        RingState {
-            next_actor: state.next_actor.saturating_add(1),
-            ..state
-        },
-    )?;
+    // Only the actor counter, rather than the whole bookkeeping row: naming a
+    // pseudonym has nothing to say about the sequence, and writing back the
+    // values this function happened to read would let it undo a repair
+    // [`reconciled_ring_state`] had just made.
+    conn.execute(
+        "UPDATE protocol_event_state SET next_actor = ?1 WHERE id = 0",
+        params![state.next_actor.saturating_add(1)],
+    )
+    .map_err(store_err)?;
     Ok(name)
+}
+
+/// Emit from an operational call site, and never let the ring be the reason
+/// anything else fails.
+///
+/// This is the rule for the whole subsystem, and the reason it is a function
+/// rather than a convention: a diagnostics ring that could roll back a
+/// receipt, refuse a page ingest, fail message authoring, or stop the store
+/// opening at all would be far worse than no ring. [`append`] does its work
+/// inside a savepoint, so a failure here leaves the caller's own transaction
+/// exactly as it was.
+///
+/// Explicit diagnostics entry points — `record_protocol_events`,
+/// `note_invariant_violation` — keep their `Result`: there the ring *is* the
+/// operation, and its caller is the one entitled to hear about a failure.
+pub(crate) fn note(conn: &Connection, drafts: &[ProtocolEventDraft]) {
+    let _ = append(conn, drafts);
+}
+
+/// [`note`], for the common case of one pseudonym shared by the batch.
+///
+/// Allocating a pseudonym is itself a write, so it can fail for the same
+/// reasons an append can; folding it in here keeps every operational call site
+/// down to one infallible line.
+pub(crate) fn note_for(
+    conn: &Connection,
+    kind: &'static str,
+    raw: &[u8],
+    build: impl FnOnce(String) -> Vec<ProtocolEventDraft>,
+) {
+    let Ok(actor) = actor_pseudonym(conn, kind, raw) else {
+        return;
+    };
+    note(conn, &build(actor));
 }
 
 /// Append a batch of records, evicting oldest-first until both caps hold.
 ///
-/// One transaction for the whole batch, and nothing in it waits on anything:
-/// the callers already hold the store's connection lock when they reach here,
-/// and the work is a handful of single-row statements against a table capped
-/// at 2,000 rows. That is the whole performance contract — this store has an
-/// ANR history, so a ring write that could block a page ingest would be worse
-/// than no ring at all.
+/// One savepoint for the whole batch — rows, evictions and the bookkeeping row
+/// land together or not at all — and nothing in it waits on anything: the
+/// callers already hold the store's connection lock when they reach here, and
+/// the work is a handful of single-row statements against a table capped at
+/// 2,000 rows. That is the whole performance contract — this store has an ANR
+/// history, so a ring write that could block a page ingest would be worse than
+/// no ring at all.
 ///
 /// A record that fails its own shape or redaction checks is not stored.
 /// Whatever it was, it is replaced by an `invariant_violation` naming
@@ -718,7 +922,11 @@ pub(crate) fn append(conn: &Connection, drafts: &[ProtocolEventDraft]) -> Result
     if drafts.is_empty() {
         return Ok(());
     }
-    let mut state = ring_state(conn)?;
+    with_savepoint(conn, |conn| append_inner(conn, drafts))
+}
+
+fn append_inner(conn: &Connection, drafts: &[ProtocolEventDraft]) -> Result<(), CoreError> {
+    let mut state = reconciled_ring_state(conn)?;
 
     {
         let mut insert = conn
@@ -728,17 +936,24 @@ pub(crate) fn append(conn: &Connection, drafts: &[ProtocolEventDraft]) -> Result
             .map_err(store_err)?;
         for draft in drafts {
             let seq = state.next_seq;
+            // A call site with no clock in hand passes 0. The stored time is
+            // then borrowed from the record before it, which keeps the ring
+            // ordered — but a borrowed timestamp read as a measured one is a
+            // support reader being quietly misled about when something
+            // happened, so the record says which it is.
+            let inferred = draft.at_ms <= 0;
             let at_ms = draft.at_ms.max(0).max(state.last_at_ms);
             let clamped = ProtocolEventDraft {
                 at_ms,
                 ..draft.clone()
             };
-            let line = match sanitized_line(seq, &clamped) {
+            let line = match sanitized_line(seq, &clamped, inferred) {
                 Ok(line) => line,
                 Err(reason) => draft_to_line(
                     seq,
                     &ProtocolEventDraft::new(ProtocolEventCode::InvariantViolation, at_ms, reason)
                         .invariants(&["SECRET-01"]),
+                    inferred,
                 ),
             };
             let bytes = line.len() as i64;
@@ -757,7 +972,11 @@ pub(crate) fn append(conn: &Connection, drafts: &[ProtocolEventDraft]) -> Result
 }
 
 /// Serialize a draft, or say why it may not be stored.
-fn sanitized_line(seq: i64, draft: &ProtocolEventDraft) -> Result<String, &'static str> {
+fn sanitized_line(
+    seq: i64,
+    draft: &ProtocolEventDraft,
+    inferred_at: bool,
+) -> Result<String, &'static str> {
     if !is_stable_token(&draft.outcome) {
         return Err("outcome_not_a_stable_token");
     }
@@ -780,7 +999,7 @@ fn sanitized_line(seq: i64, draft: &ProtocolEventDraft) -> Result<String, &'stat
             return Err("id_not_opaque");
         }
     }
-    let line = draft_to_line(seq, draft);
+    let line = draft_to_line(seq, draft, inferred_at);
     if line.len() > MAX_RECORD_BYTES {
         return Err("record_over_size_cap");
     }
@@ -976,6 +1195,10 @@ fn parse_event(line: &str) -> Result<ProtocolEvent, String> {
     Ok(ProtocolEvent {
         seq,
         at_ms,
+        inferred_at: object
+            .get("inferred_at")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         code,
         session: text("session"),
         pass: text("pass"),
@@ -1078,6 +1301,14 @@ pub fn validate(text: &str) -> Result<ProtocolEventArchive, Vec<ProtocolEventDef
         }
     };
 
+    let foreign = foreign_keys(first, PROTOCOL_EVENT_HEADER_KEYS);
+    if !foreign.is_empty() {
+        defects.push(ProtocolEventDefect::new(
+            1,
+            format!("SECRET-01 violated: header carries keys outside the schema: {foreign:?}"),
+        ));
+    }
+
     if header.title.len() <= 20 {
         defects.push(ProtocolEventDefect::new(
             1,
@@ -1131,6 +1362,13 @@ pub fn validate(text: &str) -> Result<ProtocolEventArchive, Vec<ProtocolEventDef
         if raw.trim().is_empty() {
             defects.push(ProtocolEventDefect::new(number, "JSONL has no blank lines"));
             continue;
+        }
+        let foreign = foreign_keys(raw, PROTOCOL_EVENT_RECORD_KEYS);
+        if !foreign.is_empty() {
+            defects.push(ProtocolEventDefect::new(
+                number,
+                format!("SECRET-01 violated: record carries keys outside the schema: {foreign:?}"),
+            ));
         }
         let event = match parse_event(raw) {
             Ok(event) => event,
@@ -1248,8 +1486,10 @@ pub struct ReplaySummary {
     pub first_seq: i64,
     pub last_seq: i64,
     pub span_ms: i64,
-    /// Records written before anything told the ring what time it was. They
-    /// are ordered correctly; they are simply not dated.
+    /// Records whose timestamp the ring inferred rather than measured: a
+    /// decision point with no clock in hand, whose stored time is borrowed
+    /// from the record before it. They are ordered correctly; they are not
+    /// dated, and they are excluded from `span_ms` for that reason.
     pub undated_records: usize,
     /// Records per code, for the redacted summary the command prints.
     pub by_code: BTreeMap<&'static str, usize>,
@@ -1359,22 +1599,22 @@ pub fn replay(archive: &ProtocolEventArchive) -> ReplaySummary {
     if let Some(first) = archive.events.first() {
         summary.first_seq = first.seq;
     }
-    // From the first record that carries a real clock, not from the first
-    // record. A ring can open with undated records -- a decision point with no
-    // clock argument reads as 0 until something later gives the ring a time --
-    // and measuring from those would report a span of fifty-four years.
+    // From records that carry a real clock, and only those. A decision point
+    // with no clock argument passes 0; the ring stores the previous record's
+    // time so the transcript stays ordered, and says so with `inferred_at`.
+    // Measuring a span across such a record would report either fifty-four
+    // years (before anything dated the ring) or, worse, a plausible time that
+    // nothing actually observed.
     let dated: Vec<i64> = archive
         .events
         .iter()
+        .filter(|event| event.at_ms > 0 && !event.inferred_at)
         .map(|event| event.at_ms)
-        .filter(|at_ms| *at_ms > 0)
         .collect();
     if let (Some(first), Some(last)) = (dated.first(), dated.last()) {
         summary.span_ms = last.saturating_sub(*first);
-        summary.undated_records = archive.events.len() - dated.len();
-    } else {
-        summary.undated_records = archive.events.len();
     }
+    summary.undated_records = archive.events.len() - dated.len();
     summary.invariants_exercised = exercised.into_iter().collect();
     summary
 }
@@ -1622,5 +1862,170 @@ mod tests {
                 .any(|defect| defect.detail.contains("SECRET-01")),
             "{defects:?}"
         );
+    }
+
+    #[test]
+    fn secret_01_a_key_the_schema_never_declared_is_a_leak_and_is_rejected() {
+        // The structural half of SECRET-01, on the path that reads *real*
+        // archives rather than the checked-in corpus. Both lines here carry a
+        // sentence under a field name nobody declared, which is exactly how a
+        // leak would arrive: not as a token the canary list recognises, but as
+        // prose in a field that was never part of the schema.
+        let text = concat!(
+            r#"{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"t","#,
+            r#""title":"An archive with prose smuggled in under undeclared keys","#,
+            r#""origin":"synthetic","pseudonyms":["mailbox-a"],"expect_invariants":["CURSOR-01"],"#,
+            r#""note":"the passphrase and where to meet"}"#,
+            "\n",
+            r#"{"record":"event","seq":1,"at_ms":1,"code":"frontier_held","invariants":["CURSOR-01"],"#,
+            r#""body":"we docked at four and the children are fine"}"#,
+            "\n",
+        );
+        let defects = validate(text).expect_err("an undeclared key must fail validation");
+        let joined = format!("{defects:?}");
+        assert!(joined.contains("note"), "{joined}");
+        assert!(joined.contains("body"), "{joined}");
+        assert!(
+            defects
+                .iter()
+                .filter(|defect| defect.detail.contains("SECRET-01"))
+                .count()
+                >= 2,
+            "both the header and the record must be reported: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_key_lists_stay_a_superset_of_what_the_ring_actually_writes() {
+        // The other direction of the same rule: a field added to the writer
+        // and not to the list would make the ring's own export fail the
+        // validator that gates it.
+        let conn = new_conn();
+        let mut rich = draft(1, "ok");
+        rich.session = Some("s1".to_string());
+        rich.pass = Some("p1".to_string());
+        rich.action = Some(3);
+        rich.actor = Some(actor_pseudonym(&conn, "peer", b"whoever").expect("pseudonym"));
+        rich.invariants = vec!["CURSOR-01"];
+        rich.counts = vec![("rows", 2)];
+        append(&conn, &[rich]).expect("append");
+        // And one with no clock, which is the only field the writer adds on
+        // its own rather than at a call site's request.
+        append(&conn, &[draft(0, "clockless")]).expect("append");
+
+        let text = export_jsonl(&conn).expect("export");
+        assert!(text.contains("\"inferred_at\":true"), "{text}");
+        validate(&text).unwrap_or_else(|defects| panic!("{defects:?}"));
+    }
+
+    #[test]
+    fn a_sequence_counter_left_behind_its_rows_repairs_itself_rather_than_jamming() {
+        // The state a torn write used to leave behind: rows durably committed,
+        // the counter that names the next one still pointing inside them.
+        // Every later append then failed its primary key, forever — and the
+        // store methods that emit are the mailbox walk, so the frontier would
+        // stop advancing for the life of the install.
+        let conn = new_conn();
+        append(&conn, &[draft(10, "first"), draft(20, "second")]).expect("append");
+        conn.execute(
+            "UPDATE protocol_event_state SET next_seq = 1, first_seq = 1, total_bytes = 0
+             WHERE id = 0",
+            [],
+        )
+        .expect("poison the counter");
+
+        append(&conn, &[draft(30, "third")]).expect("a stale counter must not jam the ring");
+        append(&conn, &[draft(40, "fourth")]).expect("and must not jam it on the call after");
+
+        let text = export_jsonl(&conn).expect("export");
+        let archive = validate(&text).unwrap_or_else(|defects| panic!("{defects:?}"));
+        assert_eq!(archive.events.len(), 4, "nothing was lost by the repair");
+        let (records, bytes) = ring_size(&conn).expect("size");
+        assert_eq!(records, 4);
+        let state = ring_state(&conn).expect("state");
+        assert_eq!(state.total_bytes, bytes, "the byte count was repaired too");
+        assert_eq!(state.next_seq, 5);
+        assert_eq!(state.first_seq, 1);
+    }
+
+    #[test]
+    fn a_batch_that_fails_part_way_leaves_the_ring_exactly_as_it_was() {
+        // Fault injection at the one place a partial write can happen. A
+        // trigger that aborts the third insert stands in for the disk filling
+        // up or the process being killed: the earlier rows of the same batch
+        // must not survive it, or the counter and the table part company
+        // again.
+        let conn = new_conn();
+        append(&conn, &[draft(1, "before")]).expect("append");
+        let before = export_jsonl(&conn).expect("export");
+        conn.execute_batch(
+            "CREATE TRIGGER boom BEFORE INSERT ON protocol_events WHEN NEW.seq = 3
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .expect("trigger");
+
+        append(&conn, &[draft(2, "a"), draft(3, "b"), draft(4, "c")])
+            .expect_err("the injected failure must surface");
+        assert_eq!(
+            export_jsonl(&conn).expect("export"),
+            before,
+            "a failed batch leaves no partial records behind"
+        );
+
+        conn.execute_batch("DROP TRIGGER boom").expect("drop");
+        append(&conn, &[draft(5, "after")]).expect("the ring still works");
+        let archive = validate(&export_jsonl(&conn).expect("export"))
+            .unwrap_or_else(|defects| panic!("{defects:?}"));
+        assert_eq!(archive.events.len(), 2);
+    }
+
+    #[test]
+    fn a_failed_append_leaves_the_callers_own_transaction_intact() {
+        // The rule the whole subsystem turns on: the ring is never the reason
+        // anything else fails. The caller's row is written inside its own
+        // transaction, the ring is broken under it, and the commit still
+        // holds what the caller put there.
+        let conn = new_conn();
+        conn.execute_batch("CREATE TABLE caller_work (id INTEGER PRIMARY KEY)")
+            .expect("caller table");
+        conn.execute_batch("DROP TABLE protocol_events")
+            .expect("break the ring");
+
+        conn.execute_batch("BEGIN").expect("begin");
+        conn.execute("INSERT INTO caller_work (id) VALUES (1)", [])
+            .expect("caller work");
+        note(&conn, &[draft(1, "ok")]);
+        note_for(&conn, "peer", b"whoever", |peer| {
+            vec![draft(2, "ok").actor(peer)]
+        });
+        conn.execute_batch("COMMIT").expect("commit");
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM caller_work", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(
+            rows, 1,
+            "a diagnostics failure must not roll back real work"
+        );
+    }
+
+    #[test]
+    fn a_borrowed_timestamp_is_reported_as_borrowed_and_left_out_of_the_span() {
+        let conn = new_conn();
+        append(&conn, &[draft(1_700_000_000_000, "clocked")]).expect("append");
+        // No clock in hand: stored ordered, marked, and not counted as a
+        // measurement of when anything happened.
+        append(&conn, &[draft(0, "clockless")]).expect("append");
+        append(&conn, &[draft(1_700_000_060_000, "clocked_again")]).expect("append");
+
+        let archive = validate(&export_jsonl(&conn).expect("export"))
+            .unwrap_or_else(|defects| panic!("{defects:?}"));
+        assert!(archive.events[1].inferred_at);
+        assert_eq!(archive.events[1].at_ms, archive.events[0].at_ms);
+        assert!(!archive.events[0].inferred_at);
+
+        let summary = replay(&archive);
+        assert_eq!(summary.undated_records, 1);
+        assert_eq!(summary.span_ms, 60_000);
     }
 }

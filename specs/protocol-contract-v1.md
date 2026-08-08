@@ -62,7 +62,7 @@ of it: the gap is now countable.
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
-| `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | `core/tests/protocol_contract.rs` fixture canary scan |
+| `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 
 ### 1.1 What each rule means, for someone reading it cold
 
@@ -752,6 +752,7 @@ the field and therefore means exactly what it did before the field existed.
 | `record` | yes | `event` |
 | `seq` | yes | starts at 1, strictly `+1` per record |
 | `at_ms` | yes | explicit time, non-decreasing |
+| `inferred_at` | no | `true` when `at_ms` was borrowed from the previous record rather than measured; absent means the time was observed |
 | `code` | yes | from the registry in 6.3 |
 | `session`, `pass` | no | opaque short ids |
 | `action` | no | non-negative integer |
@@ -770,6 +771,13 @@ Codes are API. Prose log messages are not. The table is section 7, and
 Every identity in a checked-in fixture is synthetic. Field-derived fixtures
 carry archive-local pseudonyms, never a real user id — not even a hashed one,
 because a hash of a stable id is still a stable id.
+
+The closed key set is the structural half of this rule and applies to every
+file the validator reads, not only to the checked-in corpus: a line carrying a
+key that section 6.1 or 6.2 does not declare is rejected, so a leak cannot be
+smuggled in under a field name nobody recognises. One list in
+`core/src/protocol_event.rs` backs both the command and the corpus test, and a
+test pins those tables against it.
 
 The validator rejects a fixture that contains any of: a token prefix
 (`cmdep1-`), a friend-card prefix (`CMFRIEND`), a deep-link scheme
@@ -836,8 +844,8 @@ than left to be discovered.
 | `shadow_mismatch` | a migration shadow planner disagreed with the live engine | none yet — package C1 | any |
 | `silence_observed` | contact silence advanced with same-pass proof | none yet — package C3 | `SILENCE-01` |
 | `spray_admitted` | a built spray plan went onto the radio | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
-| `spray_budget_exhausted` | a link had no burst allowance left | `spray_policy.rs` `may_spray` | `SPRAY-01`, `LIVE-01` |
-| `spray_deferred` | a spray was held back by the receipt-quiet backoff | `spray_policy.rs` `may_spray` | `SPRAY-01` |
+| `spray_budget_exhausted` | a link ran out of burst allowance — once per dry spell, not per reconnect | `spray_policy.rs` `may_spray` | `SPRAY-01`, `LIVE-01` |
+| `spray_deferred` | the receipt-quiet backoff took hold or deepened — on the crossing, not on every tick it holds | `spray_policy.rs` `may_spray` | `SPRAY-01` |
 | `spray_planned` | a plan was built, before admission | none yet — package D2 | `SPRAY-01` |
 | `spray_suppressed` | every lane advertised the set the peer was last offered | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
 | `sweep_completed` | a walk from 0 reached the empty page | `store.rs` `note_relay_sweep_completed` | `CURSOR-01`, `PROGRESS-01` |
@@ -856,9 +864,25 @@ as well as a usefulness budget.
 Granularity is a hard rule, not a preference. This store has an ANR history,
 so an event is written per page, per pass, or per encounter decision — never
 per envelope and never inside a hot loop. A delivered watermark that retires
-200 rows is one record, not 200. Appends are batched into one transaction,
-run against a table that cannot exceed 2,000 rows, and never hold the store
-mutex across anything that waits.
+200 rows is one record, not 200. A repeating condition is recorded when it
+*changes* — entering the receipt-quiet backoff, deepening it, a link running
+dry — never once per tick that it holds; a policy re-asked every minute would
+otherwise replace the whole ring with one repeated non-event and evict the
+evidence of the incident being investigated. Appends are batched, run against
+a table that cannot exceed 2,000 rows, and never hold the store mutex across
+anything that waits.
+
+An append is atomic. Its rows, its evictions and its bookkeeping row land
+together or not at all, inside a savepoint that nests under whatever
+transaction the caller already has open — because rows committing while the
+sequence counter does not would leave every later append failing its primary
+key. The ring also reconciles its counter against the table it describes and
+repairs a disagreement rather than jamming.
+
+The ring is never the reason anything else fails. Every operational call site
+emits best-effort: a full disk or a locked table costs a diagnostics record,
+not a receipt, a page ingest, an authored message, or the store opening at
+all.
 
 Time in a record is clamped forward to the newest record already stored. Two
 things make that necessary rather than defensive: a phone's wall clock can
@@ -866,7 +890,11 @@ step backwards mid-cruise, and a few decision points genuinely have no clock
 in hand — `MessageStore::open` runs before anything has told core the time.
 Such a record reads as "no earlier than the one before it", which is exactly
 what is known, and it keeps "time never runs backwards" a property of the ring
-rather than a hope about every caller.
+rather than a hope about every caller. A record whose time was borrowed this
+way says so with `inferred_at`, and the replay command reports those separately
+and excludes them from a transcript's span: a borrowed timestamp read as a
+measured one would tell a support reader that a frontier was held at a minute
+nothing observed.
 
 Export is manual. Nothing samples, schedules, or uploads it. The ring is
 produced in full when a person taps share on the Advanced diagnostics screen,
@@ -878,7 +906,9 @@ and clearing captured diagnostics clears it.
 checked-in fixture, a simulation transcript, or a diagnostics archive
 straight out of the zip — one format, no conversion step.
 
-At this revision it validates the schema, ordering, and redaction, checks
+At this revision it validates the schema — including the closed key set of
+6.4, so it is no weaker on a real archive than the corpus test is on a
+fixture — plus ordering and redaction, checks
 every declared invariant id against section 1, walks the transcript for the
 first place it contradicts itself (a pass that starts twice, one that keeps
 working after its own rate-limit abort or after finishing, a frontier that

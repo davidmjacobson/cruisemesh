@@ -214,7 +214,8 @@ const CONTRACT: &[Invariant] = &[
         statement: "Events, fixtures, summaries, and exported diagnostics carry no tokens, \
                     friend cards, plaintext, keys, or endpoint-bearing bodies.",
         owner: Owner::Core(
-            "core/src/protocol_event.rs ring redaction + core/tests/protocol_event_ring.rs              live-store canary + core/tests/protocol_contract.rs fixture canary scan",
+            "core/src/protocol_event.rs ring redaction + core/tests/protocol_event_ring.rs \
+             live-store canary + core/tests/protocol_contract.rs fixture canary scan",
         ),
     },
 ];
@@ -1435,30 +1436,15 @@ fn event_codes() -> Vec<&'static str> {
     cruisemesh_core::protocol_event_codes()
 }
 
-const HEADER_KEYS: &[&str] = &[
-    "schema",
-    "record",
-    "fixture",
-    "title",
-    "origin",
-    "public_reference",
-    "pseudonyms",
-    "expect_invariants",
-];
-
-const EVENT_KEYS: &[&str] = &[
-    "record",
-    "seq",
-    "at_ms",
-    "code",
-    "session",
-    "pass",
-    "action",
-    "actor",
-    "invariants",
-    "counts",
-    "outcome",
-];
+/// The closed key sets, borrowed from core rather than restated here.
+///
+/// They used to be a second copy, and the copy drifted the moment the live
+/// ring gained a header field: this corpus would have rejected the very file
+/// the plan says it must accept — a redacted field archive checked in as a
+/// fixture. Worse, the validator that gates *real* archives would have been
+/// the weaker of the two. One list, used by both.
+const HEADER_KEYS: &[&str] = cruisemesh_core::PROTOCOL_EVENT_HEADER_KEYS;
+const EVENT_KEYS: &[&str] = cruisemesh_core::PROTOCOL_EVENT_RECORD_KEYS;
 
 /// Substrings that must never appear in anything exportable. Checked against
 /// the raw file bytes, not the parsed model, so a leak in an unexpected place
@@ -1869,8 +1855,51 @@ fn the_documented_event_codes_are_exactly_the_ones_core_can_emit() {
     let owned: Vec<String> = event_codes().iter().map(|code| code.to_string()).collect();
     assert_eq!(
         documented, owned,
-        "section 7 of specs/protocol-contract-v1.md and          core/src/protocol_event.rs disagree about the stable event codes"
+        "section 7 of specs/protocol-contract-v1.md and core/src/protocol_event.rs disagree \
+         about the stable event codes"
     );
+}
+
+/// The header and record field tables in section 6 are the schema as a person
+/// reads it; `PROTOCOL_EVENT_HEADER_KEYS`/`_RECORD_KEYS` are the schema as the
+/// validator enforces it. Nothing but this test made them agree, and they had
+/// already drifted once: `first_seq` was documented and emitted while the
+/// closed key set had never heard of it.
+#[test]
+fn the_documented_schema_fields_are_exactly_the_keys_the_validator_allows() {
+    for (section, next, keys) in [
+        ("### 6.1 Header record", "### 6.2", HEADER_KEYS),
+        ("### 6.2 Event record", "### 6.3", EVENT_KEYS),
+    ] {
+        let mut documented: Vec<String> = CONTRACT_DOC
+            .split_once(section)
+            .unwrap_or_else(|| panic!("the contract document must have a {section}"))
+            .1
+            .lines()
+            .take_while(|line| !line.starts_with(next))
+            // Field rows only: the table's first cell is one or more
+            // backticked keys, e.g. "| `session`, `pass` | no | ... |".
+            .filter(|line| line.starts_with("| `"))
+            .flat_map(|line| {
+                line.split('|')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|cell| cell.trim().trim_matches('`').to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        documented.sort();
+        documented.dedup();
+
+        let mut allowed: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        allowed.sort();
+        assert_eq!(
+            documented, allowed,
+            "{section} of specs/protocol-contract-v1.md and core/src/protocol_event.rs disagree \
+             about which keys the schema declares"
+        );
+    }
 }
 
 #[test]

@@ -346,6 +346,120 @@ fn a_spray_gate_never_blocks_on_the_ring() {
 }
 
 #[test]
+fn a_quiet_fleet_ticking_for_a_day_does_not_evict_the_incident_it_was_meant_to_explain() {
+    // The failure this guards against is not a crash; it is an archive that
+    // arrives full and says nothing. `may_spray` is consulted for every
+    // selected route on every maintenance tick, a receipt-quiet peer is denied
+    // on nearly all of them, and recording the denial each time filled the
+    // whole 2,000-record ring with one repeated non-event in about four hours
+    // -- taking every frontier, sweep and retirement record from the incident
+    // with it.
+    //
+    // So this drives the real policy the way an idle family fleet drives it:
+    // eight quiet peers, a minute apart, for a day.
+    let store = store();
+    store.clear_protocol_events().expect("clear");
+    let policy = CoreSprayPolicy::new();
+    policy.attach_event_journal(Arc::clone(&store));
+
+    let start = 1_700_000_000_000i64;
+    // Arm each peer's backoff first: an admitted spray with no receipt
+    // afterwards is what `quiet_rounds` counts.
+    for peer in 0..8 {
+        policy.admit_plan(
+            format!("peer-{peer}"),
+            format!("link-{peer}"),
+            CoreSprayPlanShape {
+                carried: CoreSprayLanePlan {
+                    set_digest: 1,
+                    bytes: 1_024,
+                },
+                own_outbound: CoreSprayLanePlan {
+                    set_digest: 0,
+                    bytes: 0,
+                },
+                own_receipts: CoreSprayLanePlan {
+                    set_digest: 0,
+                    bytes: 0,
+                },
+            },
+            start,
+        );
+    }
+    for tick in 1..=1_440i64 {
+        let now = start + tick * 60_000;
+        for peer in 0..8 {
+            policy.may_spray(
+                format!("peer-{peer}"),
+                format!("link-{peer}"),
+                CoreSprayTrigger::Maintenance,
+                now,
+            );
+        }
+    }
+
+    let text = store.export_protocol_events_jsonl().expect("export");
+    let archive = validate(&text).unwrap_or_else(|defects| panic!("{defects:?}"));
+    let deferred = archive
+        .events
+        .iter()
+        .filter(|event| event.code.as_str() == "spray_deferred")
+        .count();
+    // One per peer per change of backoff level, and the backoff has a
+    // ceiling: a day of ticks is a couple of dozen records, not eleven
+    // thousand.
+    assert!(
+        deferred <= 8 * 16,
+        "a day of quiet ticks wrote {deferred} deferral records"
+    );
+    assert!(
+        deferred > 0,
+        "entering the backoff is still worth recording"
+    );
+    assert_eq!(
+        archive.header.first_seq, 1,
+        "nothing was evicted, so the day's real decisions are all still here"
+    );
+    assert!(replay(&archive).divergence.is_none());
+}
+
+#[test]
+fn a_reconnect_storm_records_one_exhausted_link_not_one_per_reconnect() {
+    // The same argument for the other repeating denial. A BLE reconnect storm
+    // re-asks an exhausted link on every reconnect, and the answer does not
+    // change until the bucket refills.
+    let store = store();
+    store.clear_protocol_events().expect("clear");
+    let policy = CoreSprayPolicy::new();
+    policy.attach_event_journal(Arc::clone(&store));
+
+    let start = 1_700_000_000_000i64;
+    // Spend the link's burst allowance, then hammer the gate at a cadence
+    // that cannot refill it.
+    policy.note_bytes_queued("link-storm".to_string(), 8_000_000, start);
+    for round in 0..400i64 {
+        policy.may_spray(
+            "storm-peer".to_string(),
+            "link-storm".to_string(),
+            CoreSprayTrigger::FirstContact,
+            start + round,
+        );
+    }
+
+    let text = store.export_protocol_events_jsonl().expect("export");
+    let archive = validate(&text).unwrap_or_else(|defects| panic!("{defects:?}"));
+    let exhausted = archive
+        .events
+        .iter()
+        .filter(|event| event.code.as_str() == "spray_budget_exhausted")
+        .count();
+    assert_eq!(
+        exhausted, 1,
+        "one record per dry spell, not one per reconnect"
+    );
+}
+
+#[test]
 fn a_long_running_device_never_exceeds_either_cap_and_stays_valid() {
     // The soak at the store level rather than the ring level: 6,000 real emit
     // points, three times the record cap, through the same locked path a page
