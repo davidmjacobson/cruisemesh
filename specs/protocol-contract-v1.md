@@ -57,7 +57,7 @@ of it: the gap is now countable.
 | `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | unimplemented | package C0; walk-budget half is already core |
 | `MARK-01` | A successfully relay-uploaded carried row is durably marked before the pass ends; the marker survives restart and suppresses repeat upload for its lifetime. | core | `core/src/store.rs` upload-marker tests; index re-asserts first-writer-wins |
 | `WM-01` | Receipt repair has a reachable, bounded path from every supported stored state; a peer watermark of zero cannot permanently gate repair. | hoist-pending | shell repair planners |
-| `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | hoist-pending | core spends a per-encounter byte budget, but every budget number is a shell constant; the per-second cadence gate is not built at all |
+| `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | core | `core/src/spray_policy.rs` owns cadence, identical-set suppression, the three per-encounter byte budgets, a per-link burst allowance, and the receipt-quiet backoff (#280); both shells consult it and hold no spray constant of their own |
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
@@ -184,6 +184,50 @@ bound has two parts: a byte budget per encounter, and a cadence gate that
 stops the same offer being re-queued while an earlier copy is still in
 flight. Neither may starve receive work, and neither may exceed what the
 platform's radio callbacks can drain before a watchdog fires.
+
+Four decisions carry that, all in `core/src/spray_policy.rs`:
+
+- **Cadence.** A verified first encounter is never gated — two phones meeting
+  and beginning to sync is the product, and delaying it would break the thing
+  the mesh is for. Everything else is: a reconnect, a peer digest outside the
+  exchange window our own spray opened, and the maintenance tick each wait out
+  an interval. Core classifies first contact from its own record, so a shell
+  that labels every reconnect as a fresh encounter is silently downgraded
+  rather than believed.
+- **Identical-set suppression, per lane.** Core digests the `msg_id` set each
+  of the three lanes advertises — foreign carry, own outbound, own receipts —
+  and decides each on its own. The union would be the wrong unit: the recorded
+  shape was an authored set invariant at 16 envelopes across 28 consecutive
+  sprays beside a carried lane walking a cursor, and any carried page turn
+  changes a union digest, so a union would suppress nothing. An unchanged lane
+  is not re-offered until a bounded re-offer interval lapses — aligned with the
+  carried re-walk interval, because both exist so that a frame lost in a link's
+  FIFO is eventually found again. Any change sprays that lane immediately, and
+  a lane that selected nothing is neither suppressed nor remembered as offered.
+- **Byte budgets.** The three per-encounter budgets are core constants, and a
+  per-link allowance bounds what may be *queued* at one link across every lane
+  and every trigger. It is charged for everything the shells queue, not only
+  the plan: the receipt repair pass, the per-missing-message re-send loop, the
+  group catch-up that restarts at lamport 0 and the carry drain are all larger
+  than the plan and none of them appear in it. The allowance is not reset by a
+  disconnect either, because a disconnect is exactly what reconnect churn
+  produces. A link that has been quiet is not throttled; a second encounter's
+  worth of bytes in the same breath waits for the radio.
+- **Receipt-quiet backoff.** A peer whose sprays keep producing no evidence of
+  progress waits longer, up to a ceiling. This **caps waste; it never concludes
+  brokenness** — a courier holding mail for someone who is not present produces
+  no receipts and is behaving correctly. It stretches only sprays *we* start:
+  the peer's own digest keeps the base interval, because that is the one path
+  that sends the receipts we owe it and the backlog its watermark asked for,
+  and quietness on the foreign-carry lane says nothing about either.
+
+Every one of those is a *delay with a computable expiry*, never a drop. A
+suppressed offer advances no cursor, records no hidden-kind offer, removes
+nothing and acks nothing: `CARRY-01` and `ACK-01` are untouched by all of it.
+Three gates now stand between a peer and a spray — the post-reject cooldown
+(#277), the failover debounce (#269), and this cadence gate — and the core
+suite carries a simulation proving their composition cannot starve a
+legitimate peer.
 
 #### `HELLO-01` — the legacy handshake is frozen
 
@@ -725,10 +769,10 @@ against the tree as it stands. Labels:
 | Relay pass health fold | `mesh/RelayFaultPolicy.kt` + `MeshConnectivityStatus.kt` | `MeshConnectivityStatus.swift` + controller | rank and classification in `relay_status.rs` | hoist-now | core snapshot and reason codes; B0/D3 |
 | Connection and delivery health classification | consumes core (#281, #282) | consumes core (#281, #282) | `connection_health.rs` owns classification, per-recipient delivery, receipt-gated lines | presentation-only | stays core; shells render |
 | Failover resume debounce | `mesh/FailoverResumeDebounce.kt` — thin wrapper | equivalent wrapper | `transport_policy.rs` owns the window and coalescing (#269) | presentation-only | stays core; wrappers are adapters |
-| Peripheral link admission and spray cooldown | `mesh/PeripheralLinkAdmission.kt`, spray cooldown classes (#277) | not yet extracted | none | hoist-later | `mesh_meet.rs` when D2 lands; the byte/cadence half is `SPRAY-01` |
-| Per-encounter spray byte budgets | three constants in `mesh/InboundEnvelopeProcessor.kt` (carried 256 KiB, own outbound 256 KiB, receipts 64 KiB) | the same three in `Core/ProtocolKinds.swift` | `core_digest_spray_plan` spends the budgets and resumes from a carried cursor, but every value is passed in by the shell | hoist-now | the numbers belong beside the plan in `mesh_meet.rs`; D2. Equal today, and nothing makes them stay equal |
+| Peripheral link admission and the post-reject spray cooldown | `mesh/PeripheralLinkAdmission.kt`, spray cooldown classes (#277) | not yet extracted | none — but the byte and cadence half of `SPRAY-01` is now core (#280), and this brake composes with it rather than duplicating it | hoist-later | `mesh_meet.rs` when D2 lands; what remains here is the notify-reject window itself |
+| Per-encounter spray byte budgets and cadence | `mesh/SprayPolicy.kt` — thin delegate; the three constants are gone from `InboundEnvelopeProcessor.kt` | `Mesh/SprayPolicy.swift` — thin delegate; the three constants are gone from `Core/ProtocolKinds.swift` | `spray_policy.rs` owns the budgets, the per-link burst allowance, the cadence gate, per-lane identical-set suppression and the receipt-quiet backoff; `core_digest_spray_plan` reports each lane's advertised-set digest and byte cost, and the shells charge the lanes no plan can see | presentation-only | done (#280); stays core, and D2 absorbs the delegates rather than unwinding them |
 | Inbound envelope disposition | `mesh/InboundEnvelopeProcessor.kt` | `processInboundEnvelope` and handlers in `MeshController.swift` | crypto/store primitives and ack eligibility in `engine.rs` / `store.rs` | hoist-now | `mesh_receive.rs`; D0/D1 |
-| HELLO / digest / carry encounter | `MeshService.kt` + `InboundEnvelopeProcessor.kt` | `MeshController.swift` | digest and spray planning in `engine.rs`, session state in `transport_policy.rs` | hoist-now | `mesh_meet.rs`; D2/D3 |
+| HELLO / digest / carry encounter | `MeshService.kt` + `InboundEnvelopeProcessor.kt` | `MeshController.swift` | digest and spray planning in `engine.rs`, session state in `transport_policy.rs`, and every spray decision (whether, how often, how much) in `spray_policy.rs` (#280) | hoist-now | `mesh_meet.rs`; D2/D3, which absorbs `spray_policy.rs` rather than re-deciding it |
 | Logical peer routing | `MeshRouter.kt` / `MeshRouterState.kt` | `MeshRouter.swift` / `MeshRouterState.swift` | `CoreMeshRouterState` in `transport_policy.rs`; peer collapse is core (#266) | hoist-later | extend the existing core router; D2 |
 | LAN endpoint cache and provenance | `mesh/LanEndpointCache.kt` | `LanEndpointStore.swift` | `lan_util.rs` owns provenance, eviction and same-network checks (#271, #278) | presentation-only | stays core |
 | LAN endpoint hint authoring | `mesh/LanEndpointSender.kt` + `LanEndpointSendPolicy.kt` | full twin: `Mesh/LanEndpointSender.swift`, plus `sendLanEndpointHint` / `queueCurrentLanEndpoint` in `MeshController.swift` | encoder and host validation in `protocol.rs` | hoist-later | `ENDPOINT-01`'s authoring half; D2/D3 must move **both** copies |
@@ -764,14 +808,26 @@ Recorded so a reader does not have to diff two documents:
   per-recipient delivery status, and receipt-gated delivery lines — so
   `UI-01` has a real core owner rather than only native UI tests.
 - Peripheral link admission and the notify-reject spray brake are **plain
-  shell classes** (#277) with no core owner yet.
+  shell classes** (#277) with no core owner yet. They compose with the core
+  cadence gate below rather than duplicating it: all three brakes are delays
+  with finite expiries, and the core suite proves their composition cannot
+  starve a peer.
 - LAN endpoint hint authoring is **not** Android-only. iOS carries a full
   twin — `Mesh/LanEndpointSender.swift` for the kind-8 hint envelope, and
   `sendLanEndpointHint` in `MeshController.swift` for the `0x04` frame. D2/D3
   owns two copies, not one, and a hoist that moves only the Kotlin file
   leaves `ENDPOINT-01`'s authoring half exactly as split as it is today.
-- The per-encounter spray byte budgets are still duplicated constants on both
-  shells. Core spends them; neither shell reads its numbers from core.
+- The per-encounter spray byte budgets are **core constants** (#280), beside
+  the per-link burst allowance, the cadence gate, per-lane identical-set
+  suppression and the receipt-quiet backoff. Both shells deleted their copies
+  and now receive budgets from core; each keeps a thin delegate
+  (`SprayPolicy.kt`, `SprayPolicy.swift`) that maps keys, picks the monotonic
+  clock and reports bytes queued, and decides nothing. What the shells still
+  own is the *shape* of the encounter — which lanes run, and in which order —
+  and one ordering there is load-bearing rather than cosmetic: the digest frame
+  is enqueued ahead of every bulk lane, because core's exchange window is
+  measured from that enqueue and a carried drain queued first would hold it in
+  the FIFO past the window's own width.
 - Stage 7 is not one order. Android walks the mailbox and then syncs
   presence; iOS syncs presence and then walks. Section 5.2 carries this and
   the presence-failure difference beside it.

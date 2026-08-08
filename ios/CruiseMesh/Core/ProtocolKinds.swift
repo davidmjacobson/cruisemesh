@@ -31,17 +31,17 @@ enum MeshDefaults {
     // behind `store.coreDigestAdvertisedMsgIds()`), so both platforms share
     // one source of truth instead of two constants that could drift.
     static let relayStoreBatchLimit: UInt64 = 128
-    static let ownOutboundSprayBudgetBytes: UInt64 = 256 * 1024
-    static let ownReceiptSprayBudgetBytes: UInt64 = 64 * 1024
-    // Per-encounter budget for spraying *foreign* carried envelopes onward,
-    // the same size as ownOutboundSprayBudgetBytes. A phone that has been
-    // muling for a busy fleet can be holding the whole
-    // foreignCarryBudgetBytes of third-party traffic; offering all of it on
-    // one encounter fills a BLE link's single FIFO for minutes, with live
-    // replies to real contacts stuck behind it. Nothing is dropped by the
-    // cut: the carry queue is untouched and the periodic re-digest re-offers
-    // the remainder, oldest first.
-    static let carriedSprayBudgetBytes: UInt64 = 256 * 1024
+    // The three per-encounter spray byte budgets that used to live here --
+    // own outbound 256 KiB, receipts 64 KiB, carried 256 KiB -- are gone.
+    // Android carried the same three numbers in InboundEnvelopeProcessor.kt;
+    // they were equal, and nothing made them stay equal. They now live in
+    // `core/src/spray_policy.rs` beside the plan that spends them, and arrive
+    // at the call sites inside a `CoreSprayGate` already scaled by what the
+    // link can take (#280, ledger row SPRAY-01).
+    //
+    // foreignCarryBudgetBytes above is deliberately NOT one of them: it bounds
+    // how much foreign traffic this device *stores*, not how much it offers in
+    // one encounter.
 }
 
 func isVisibleChatKind(_ kind: UInt8) -> Bool {

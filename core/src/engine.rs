@@ -168,6 +168,20 @@ pub struct CoreDigestSprayPlan {
     /// i.e. this peer has now been offered everything it is eligible for, so
     /// the lane can park until the re-walk cooldown elapses.
     pub carried_exhausted: bool,
+    /// What each lane advertises and what it would cost, handed straight to
+    /// [`crate::CoreSprayPolicy::admit_plan`]. That call suppresses, per lane,
+    /// a set the peer was already offered inside the re-offer interval -- the
+    /// 28 consecutive byte-identical sprays of issue #280. Computed here
+    /// rather than in the shells so both platforms compare the same thing, and
+    /// kept per lane rather than folded into one digest because the recorded
+    /// shape was an invariant authored lane beside a carried lane walking a
+    /// cursor: a union digest changes on every page turn and so suppresses
+    /// nothing. See [`crate::CoreSprayLanePlan`].
+    pub lanes: crate::CoreSprayPlanShape,
+    /// Total sealed bytes this plan would put on the wire, across all lanes.
+    /// Diagnostics: what the per-link burst allowance is actually charged is
+    /// the admitted lanes' bytes, which `admit_plan` computes from `lanes`.
+    pub plan_bytes: u64,
 }
 
 /// One relay-post row of a group message's per-member fan-out
@@ -533,6 +547,27 @@ fn frame_receipt(envelope: OutgoingReceiptEnvelope) -> Vec<u8> {
     )
 }
 
+/// Summarise one spray lane: what it advertises, and what it would cost.
+///
+/// Split per lane rather than folded into one figure because
+/// [`crate::CoreSprayPolicy::admit_plan`] suppresses per lane -- see
+/// [`crate::CoreSprayLanePlan`] for why the union is the wrong unit.
+fn lane_plan<'a, I>(rows: I) -> crate::CoreSprayLanePlan
+where
+    I: Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+{
+    let mut msg_ids: Vec<&[u8]> = Vec::new();
+    let mut bytes = 0_u64;
+    for (msg_id, sealed) in rows {
+        msg_ids.push(msg_id.as_slice());
+        bytes = bytes.saturating_add(sealed.len() as u64);
+    }
+    crate::CoreSprayLanePlan {
+        set_digest: crate::spray_policy::spray_set_digest(msg_ids),
+        bytes,
+    }
+}
+
 fn select_own_outbound(
     pending_by_recipient: Vec<Vec<OutboundEnvelope>>,
     peer_known_msg_ids: &HashSet<Vec<u8>>,
@@ -713,6 +748,22 @@ impl MessageStore {
         // a budget-evicted hidden envelope stays eligible next digest.
         let selected_ids: HashSet<&Vec<u8>> = own_outbound.iter().map(|e| &e.msg_id).collect();
         offered_hidden_msg_ids.retain(|id| selected_ids.contains(id));
+
+        // Identify each lane's advertised set before the rows are consumed
+        // into frames. Sealed bytes (not frame bytes) are what every budget in
+        // this function is denominated in, so the charge reported to the spray
+        // policy uses the same unit as the budgets it spent.
+        let lanes = crate::CoreSprayPlanShape {
+            carried: lane_plan(carried.rows.iter().map(|row| (&row.msg_id, &row.sealed))),
+            own_outbound: lane_plan(own_outbound.iter().map(|row| (&row.msg_id, &row.sealed))),
+            own_receipts: lane_plan(own_receipts.iter().map(|row| (&row.msg_id, &row.sealed))),
+        };
+        let plan_bytes = lanes
+            .carried
+            .bytes
+            .saturating_add(lanes.own_outbound.bytes)
+            .saturating_add(lanes.own_receipts.bytes);
+
         Ok(CoreDigestSprayPlan {
             carried_frames: carried.rows.into_iter().map(frame_carried).collect(),
             own_outbound_frames: own_outbound.into_iter().map(frame_outbound).collect(),
@@ -720,6 +771,8 @@ impl MessageStore {
             offered_hidden_msg_ids,
             next_carried_cursor: carried.next,
             carried_exhausted: carried.exhausted,
+            lanes,
+            plan_bytes,
         })
     }
 
@@ -2364,6 +2417,63 @@ mod tests {
                 "every offered frame is whole -- the budget never truncates one"
             );
         }
+    }
+
+    #[test]
+    fn the_plan_reports_the_set_it_advertises_and_what_it_costs() {
+        // The identical-set suppression in `spray_policy` is only as honest as
+        // this digest: it must change when the advertised set changes and must
+        // not change when the same set is re-planned. `plan_bytes` must be the
+        // sealed bytes actually offered, because that is what the per-link
+        // burst allowance is charged.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let now_ms = 1_700_000_000_000_i64;
+        seed_carried(&store, 3, 100, now_ms);
+
+        let plan_for = |budget: u64| {
+            store
+                .core_digest_spray_plan(
+                    vec![1_u8; 16],
+                    vec![9_u8; 16],
+                    vec![],
+                    vec![],
+                    now_ms,
+                    budget,
+                    0,
+                    0,
+                    0,
+                    true,
+                    vec![],
+                    None,
+                )
+                .unwrap()
+        };
+
+        let two = plan_for(250);
+        assert_eq!(two.carried_frames.len(), 2);
+        assert_eq!(two.plan_bytes, 200, "two 100-byte sealed payloads");
+        assert_eq!(two.lanes.carried.bytes, 200);
+        // Re-planning the same store gives the same answer, so a re-offer of
+        // an unchanged set is recognisable as one.
+        assert_eq!(plan_for(250).lanes.carried, two.lanes.carried);
+
+        let three = plan_for(1_000);
+        assert_eq!(three.carried_frames.len(), 3);
+        assert_eq!(three.plan_bytes, 300);
+        assert_ne!(
+            three.lanes.carried.set_digest, two.lanes.carried.set_digest,
+            "a wider set must not look identical to a narrower one"
+        );
+        // A lane that selected nothing must be reported as empty rather than
+        // as an unchanging set: `admit_plan` neither suppresses nor charges an
+        // empty lane, and must not remember it as already offered.
+        assert_eq!(three.lanes.own_outbound.bytes, 0);
+        assert_eq!(three.lanes.own_receipts.bytes, 0);
+
+        let empty = plan_for(0);
+        assert_eq!(empty.plan_bytes, 0);
+        assert_eq!(empty.lanes.carried.bytes, 0);
+        assert!(empty.carried_frames.is_empty());
     }
 
     #[test]
