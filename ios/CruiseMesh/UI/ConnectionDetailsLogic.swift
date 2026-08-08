@@ -58,14 +58,20 @@ enum PersonStatus: Equatable {
 }
 
 /**
- The user-visible meaning of messages still waiting for this person.
+ The informational expansion under a person row.
 
- The states themselves are the core's (`CoreDeliveryState`); this record only
- carries one to the renderer with its count.
+ Everything here is a restatement, never a control: the spec forbids a manual
+ transport picker, and `bestRoute` in particular is the core's routing answer
+ (`corePersonBestRoute`) rather than anything this page worked out. A page that
+ re-derived reachability from "can I poll them" would report post-only friend
+ cards as broken, which is the failure the core answer exists to prevent.
  */
-struct DeliveryLine: Equatable {
-    let kind: CoreDeliveryState
-    let count: Int
+struct PersonDetail: Equatable {
+    let bestRoute: CorePersonRoute
+    /// Freshest evidence their device was alive, epoch ms; `0` when none.
+    let lastSeenMs: Int64
+    /// Their delivery receipt for one of our messages, epoch ms; `0` when none.
+    let lastDeliveredMs: Int64
 }
 
 struct ConnectionPersonRow: Equatable {
@@ -73,7 +79,18 @@ struct ConnectionPersonRow: Equatable {
     let name: String
     let status: PersonStatus
     let badge: ConnectionPathBadge?
-    let delivery: DeliveryLine?
+    /**
+     What is still outstanding for this person, as the core classified it
+     (`coreClassifyRecipientDelivery`); nil when there is nothing to say.
+     */
+    let delivery: CoreDeliveryLine?
+    /**
+     Why they are in Needs attention. The same verdict as `delivery`'s, since
+     both come out of the one classification, so a row cannot sit in Needs
+     attention over a problem its own delivery line does not mention.
+     */
+    let attention: CorePersonAttention?
+    let detail: PersonDetail
 }
 
 struct ConnectionActivityRow: Equatable {
@@ -113,9 +130,18 @@ struct PathsCardState: Equatable {
     let relayLastSyncMs: Int64
 }
 
-struct ConnectionDetailsState {
+/**
+ Everything the page renders, as one finished value.
+
+ `Equatable` on purpose: this is republished whenever any observable moves, and
+ at mesh-flood rates most of those moves change nothing anybody can see. An
+ equal rebuild is dropped rather than redrawing the whole page for a last-seen
+ timestamp that rounds to the same minute.
+ */
+struct ConnectionDetailsState: Equatable {
     let health: HealthCardState
     let paths: PathsCardState
+    let needsAttention: [ConnectionPersonRow]
     let reachableNow: [ConnectionPersonRow]
     let otherPeople: [ConnectionPersonRow]
     let hasContacts: Bool
@@ -123,6 +149,41 @@ struct ConnectionDetailsState {
     /// Epoch ms the snapshot behind this state was loaded; `0` before the first load.
     let updatedAtMs: Int64
     let refreshing: Bool
+
+    /**
+     What the page shows before anything has been classified.
+
+     Deliberately `checking` rather than `ready`: the model derives the real
+     state the moment it starts, and a placeholder that claimed the phone was
+     working normally would be a verdict nobody has reached yet. `updatedAtMs`
+     of zero keeps the freshness label and the "no friends added yet" line off
+     the screen until a snapshot actually exists.
+     */
+    static let checking = ConnectionDetailsState(
+        health: HealthCardState(
+            state: .checking,
+            nearbyFriendCount: 0,
+            bluetooth: .starting,
+            relay: .checking,
+            reason: nil,
+            action: nil
+        ),
+        paths: PathsCardState(
+            bluetooth: .starting,
+            bluetoothLinks: 0,
+            bluetoothAudioActive: false,
+            localWifiLinks: 0,
+            relay: .checking,
+            relayLastSyncMs: 0
+        ),
+        needsAttention: [],
+        reachableNow: [],
+        otherPeople: [],
+        hasContacts: false,
+        activity: [],
+        updatedAtMs: 0,
+        refreshing: false
+    )
 }
 
 // MARK: - Store snapshot (produced off the main actor, consumed here)
@@ -141,6 +202,38 @@ struct PersonEvidence: Equatable {
     let atMs: Int64
 }
 
+/**
+ What one person's outgoing mail looks like, straight from the core's
+ per-recipient read model (`MessageStore.recipientDeliveryStatus`).
+
+ Facts only, and every one of them is passed to the core untouched. In
+ particular the four endpoint-health numbers are *not* interpreted here: the
+ streak thresholds and rest windows belong to `contact_relay_health`, and a
+ shell that reproduced any of them would be the start of the next drift.
+ */
+struct PersonDeliveryFacts: Equatable {
+    let waitingCount: Int
+    let oldestWaitingMs: Int64
+    let lastProgressMs: Int64
+    let oversizedWaiting: Bool
+    let relayRejectStreak: Int64
+    let relayRejectedAtMs: Int64
+    let relayUnreachableStreak: Int64
+    let relayUnreachableAtMs: Int64
+
+    /// Nothing outstanding and no endpoint trouble: the ordinary case.
+    static let none = PersonDeliveryFacts(
+        waitingCount: 0,
+        oldestWaitingMs: 0,
+        lastProgressMs: 0,
+        oversizedWaiting: false,
+        relayRejectStreak: 0,
+        relayRejectedAtMs: 0,
+        relayUnreachableStreak: 0,
+        relayUnreachableAtMs: 0
+    )
+}
+
 /// One person as the background load found them.
 struct ConnectionPerson: Equatable {
     let userId: Data
@@ -149,10 +242,11 @@ struct ConnectionPerson: Equatable {
     let blocked: Bool
     /// Their friend card carries an internet-delivery endpoint.
     let hasRelayEndpoint: Bool
-    /// User-visible messages still waiting to go out to them.
-    let queued: Int
+    let delivery: PersonDeliveryFacts
     /// Newest recorded evidence across every path, or nil when there is none.
     let latest: PersonEvidence?
+    /// Their newest delivery receipt for one of our messages; `0` when none.
+    let lastDeliveredMs: Int64
 }
 
 /**
@@ -359,6 +453,24 @@ enum FreshnessLabel: Equatable {
     case hours(Int)
 }
 
+/**
+ How long a message has been waiting, for the `· 14 min` half of a delayed or
+ blocked delivery line.
+
+ Deliberately not `EventTime`: that renders a *moment* ("14 min ago",
+ "yesterday at 8:03 PM"), and an age is a duration. Reusing it would put "ago"
+ inside a sentence that already reads as elapsed time, and would eventually put
+ a calendar date there -- `2 messages delayed · on 3/14/26` says nothing a
+ reader can use.
+ */
+enum WaitingAge: Equatable {
+    /// Unusable or under a minute. The line renders with no age at all.
+    case unknown
+    case minutes(Int)
+    case hours(Int)
+    case days(Int)
+}
+
 /// How a recorded moment reads in a person row or an activity line.
 enum EventTime: Equatable {
     /// Zero, negative, or otherwise unusable. Renders as no time at all.
@@ -412,6 +524,23 @@ enum ConnectionTimes {
         }
         if atMs >= startOfTodayMs - dayMs { return .yesterday }
         return .older
+    }
+
+    /**
+     How long something queued at `sinceMs` has been waiting.
+
+     An unset stamp and a stamp in the future both come back `.unknown`: the
+     second is a clock artifact, and the alternative is a negative age rendered
+     as an enormous one. Under a minute is `.unknown` too, because `2 messages
+     delayed · 0 min` reads as a bug.
+     */
+    static func waitingAge(sinceMs: Int64, nowMs: Int64) -> WaitingAge {
+        if sinceMs <= 0 || nowMs < sinceMs { return .unknown }
+        let age = nowMs - sinceMs
+        if age < minuteMs { return .unknown }
+        if age < hourMs { return .minutes(Int(age / minuteMs)) }
+        if age < dayMs { return .hours(Int(age / hourMs)) }
+        return .days(Int(age / dayMs))
     }
 }
 
@@ -511,55 +640,113 @@ final class StoreChangeCoalescer {
 
 enum DeliveryPresentation {
     /**
-     The neutral delivery line for one person, or nil when there is nothing
-     honest to say.
+     The delivery verdict for one person, or nil when there is nothing honest
+     to say.
 
-     The decision is the core's (`coreClassifyDeliveryLine`) -- including the
-     route-usability predicate and the rule that decides whether the
-     relay-upload backlog says anything about delivery at all. All that happens
-     here is handing over this platform's facts and pairing the answer with its
-     count.
+     Every part of the decision is the core's (`coreClassifyRecipientDelivery`)
+     -- the route-usability predicate, the delayed window, which faults become
+     an error row, and which of those puts a person in Needs attention. All
+     that happens here is handing over the store's facts and this device's path
+     state.
 
-     Note what `queued` is *not*: it is not receipt-aware. It counts outbound
-     rows whose upload stamp is unset, and only an upload sets that stamp --
-     not a delivery receipt, and not handing the message over in person. The
-     core gates on that; see `core_relay_queue_reflects_delivery`.
+     The count arriving here is already receipt-aware, which is what makes
+     "Received your message 12 min ago" and a waiting line unable to appear
+     together: not a special case that suppresses the second, but nothing left
+     to count. The Phase 1 front end that had to suppress it by hand
+     (`coreClassifyDeliveryLine`) is now called by neither shell; it stays
+     exported, and pinned by its own Rust test, as the documented narrow door
+     onto the one decision procedure.
 
-     - Parameter routeIsDirect: a live direct link to this person exists right now.
+     - Parameter directLink: a live direct link to this person exists right now.
      - Parameter ownRelayUsable: our own Shore Pass path can deliver
        (`CoreConnectionEvidence.ownRelayUsable`).
-     - Parameter contactHasRelayEndpoint: their friend card carries an
-       internet-delivery endpoint at all. Without one, no amount of internet on
-       this phone reaches them.
-     - Parameter contactRelayStale: their endpoint has been written off after
-       authoritatively rejecting us, so it is not a usable route today.
-     - Parameter receiptIsNewestEvidence: the freshest thing recorded about
-       this person is a delivery receipt -- their row already says they
-       received a message from us.
+     - Parameter relay: this phone's normalized Shore Pass path
+       (`CoreConnectionEvidence.relay`).
      */
     static func line(
-        queued: Int,
-        routeIsDirect: Bool,
+        person: ConnectionPerson,
+        directLink: Bool,
         ownRelayUsable: Bool,
-        contactHasRelayEndpoint: Bool,
-        contactRelayStale: Bool,
         relay: CoreRelayPathState,
-        receiptIsNewestEvidence: Bool
-    ) -> DeliveryLine? {
-        if queued <= 0 { return nil }
-        let state = coreClassifyDeliveryLine(
-            input: CoreDeliveryLineInput(
-                queued: UInt32(queued),
+        nowMs: Int64
+    ) -> CoreDeliveryLine? {
+        coreClassifyRecipientDelivery(
+            input: CoreRecipientDeliveryInput(
+                // Clamped rather than wrapped: the core counts up from zero,
+                // and a shell that let a negative fold into an unsigned value
+                // would put an absurd number under someone's name.
+                waitingCount: UInt32(clamping: person.delivery.waitingCount),
+                oldestWaitingMs: person.delivery.oldestWaitingMs,
+                lastProgressMs: person.delivery.lastProgressMs,
+                oversizedWaiting: person.delivery.oversizedWaiting,
+                relayRejectStreak: person.delivery.relayRejectStreak,
+                relayRejectedAtMs: person.delivery.relayRejectedAtMs,
+                relayUnreachableStreak: person.delivery.relayUnreachableStreak,
+                relayUnreachableAtMs: person.delivery.relayUnreachableAtMs,
                 relay: relay,
                 ownRelayUsable: ownRelayUsable,
-                contactHasRelayEndpoint: contactHasRelayEndpoint,
-                contactRelayStale: contactRelayStale,
-                directLink: routeIsDirect,
-                deliveryReceiptIsNewestEvidence: receiptIsNewestEvidence
+                contactHasRelayEndpoint: person.hasRelayEndpoint,
+                directLink: directLink,
+                nowMs: nowMs
             )
         )
-        guard let state = state else { return nil }
-        return DeliveryLine(kind: state, count: queued)
+    }
+
+    /**
+     How a message to this person would travel right now, asked of the core
+     rather than worked out here.
+
+     The endpoint-resting half is `coreContactEndpointResting`, the same
+     predicate the delivery classification consults, so the person detail's
+     route sentence and the delivery line under their name are two readings of
+     one answer.
+     */
+    static func bestRoute(
+        person: ConnectionPerson,
+        directLink: CoreDirectLink?,
+        ownRelayUsable: Bool,
+        nowMs: Int64
+    ) -> CorePersonRoute {
+        corePersonBestRoute(
+            directLink: directLink,
+            ownRelayUsable: ownRelayUsable,
+            contactHasRelayEndpoint: person.hasRelayEndpoint,
+            contactEndpointResting: coreContactEndpointResting(
+                relayRejectStreak: person.delivery.relayRejectStreak,
+                relayRejectedAtMs: person.delivery.relayRejectedAtMs,
+                relayUnreachableStreak: person.delivery.relayUnreachableStreak,
+                relayUnreachableAtMs: person.delivery.relayUnreachableAtMs,
+                nowMs: nowMs
+            )
+        )
+    }
+}
+
+/**
+ What a `How to fix` control opens onto.
+
+ Two sources, one destination: the health card's device-wide fault and a person
+ row's per-recipient one. They are separate types in the core because one is
+ about this phone and the other about one friend -- the distinction that stops
+ a friend's broken card turning the whole page red -- and the shell keeps them
+ apart for the same reason rather than flattening them into a single reason
+ enum.
+ */
+enum HowToFixTopic: Equatable, Identifiable {
+    /// A fault with this device's own connection.
+    case device(CoreHealthReason)
+    /// A fault stopping delivery to one friend, named so the copy can say who.
+    case person(reason: CoreDeliveryBlockedReason, name: String)
+
+    /// SwiftUI presents a sheet from an `Identifiable` item; the identity is
+    /// the topic itself, so re-tapping the same reason does not re-present.
+    var id: String {
+        switch self {
+        case .device(let reason):
+            return "device-\(reason)"
+        case .person(let reason, let name):
+            return "person-\(reason)-\(name)"
+        }
     }
 }
 
@@ -577,22 +764,33 @@ let connectionActivityPreviewCount = 10
 /// Rows shown before Other people collapses behind a `Show N people` control.
 let connectionOtherPeopleCollapseAt = 5
 
+/**
+ Recent events shown inside one person's expansion.
+
+ The spec's number, and it is also why this query is not part of the page
+ reload: five rows for one person, read once when a reader asks for them, is a
+ bounded cost that does not multiply by the address book.
+ */
+let connectionPersonEventLimit: UInt32 = 5
+
 enum ConnectionDetailsLogic {
 
     /**
      Turn live signals plus the last store snapshot into everything the page
      renders.
 
-     Both classifications come from the core and neither is second-guessed
+     All three classifications come from the core and none is second-guessed
      here. In particular the relay state the health card reports is the
      *normalized* one from the core's evidence, and the Paths row renders that
      same value -- which is what stops the page claiming Shore Pass is
      connected on a phone that has been offline for an hour.
 
-     Phase 1 supplies no per-person attention reason, so the core's Needs
-     attention group is structurally empty and the page shows two groups. The
-     machinery that fills it in is the per-recipient delivery read model, which
-     is Phase 2.
+     The order below is load-bearing. Each person's delivery is classified
+     *before* the grouping call, and the attention it produces is what the
+     grouping is given. That is what makes a Needs attention row and its own
+     delivery line the same verdict rather than two judgements that can
+     disagree -- a person cannot be filed under a problem their row does not
+     state.
      */
     static func buildState(
         runtimeState: MeshRuntimeState,
@@ -602,7 +800,6 @@ enum ConnectionDetailsLogic {
         relayConfigured: Bool,
         lanListening: Bool,
         bluetoothAudioActive: Bool,
-        staleRelayContacts: Set<Data>,
         presenceLastSeen: [Data: Int64],
         contactLastSeen: [Data: Int64],
         snapshot: ConnectionStoreSnapshot,
@@ -642,18 +839,32 @@ enum ConnectionDetailsLogic {
         let report = coreClassifyConnectionHealth(input: input)
         let evidence = report.evidence
 
+        // Classified once per person per reload, and reused for the grouping,
+        // the row, and the expansion -- not recomputed at each of those points,
+        // which would be three FFI calls per friend.
+        var deliveryById: [Data: CoreDeliveryLine] = [:]
+        for person in people {
+            let line = DeliveryPresentation.line(
+                person: person,
+                directLink: directPaths[person.userId] != nil,
+                ownRelayUsable: evidence.ownRelayUsable,
+                relay: evidence.relay,
+                nowMs: nowMs
+            )
+            if let line = line { deliveryById[person.userId] = line }
+        }
+
         let inputs: [CorePersonHealthInput] = people.map { person in
-            CorePersonHealthInput(
+            let delivery = deliveryById[person.userId]
+            return CorePersonHealthInput(
                 userId: person.userId,
                 displayName: person.name,
                 blocked: person.blocked,
                 directLink: ConnectionInputs.directLink(directPaths[person.userId]),
                 presenceLastSeenMs: presenceLastSeen[person.userId] ?? 0,
                 lastSeenMs: max(contactLastSeen[person.userId] ?? 0, person.latest?.atMs ?? 0),
-                // Phase 1 has no per-person attention machinery; see the doc
-                // comment above.
-                attention: nil,
-                attentionSinceMs: 0
+                attention: delivery?.attention,
+                attentionSinceMs: delivery?.oldestWaitingMs ?? 0
             )
         }
         let placements = coreGroupPeople(
@@ -672,9 +883,18 @@ enum ConnectionDetailsLogic {
                     person: person,
                     reach: placement.reach,
                     presenceLastSeenMs: presenceLastSeen[person.userId] ?? 0,
-                    ownRelayUsable: evidence.ownRelayUsable,
-                    relay: evidence.relay,
-                    stale: staleRelayContacts.contains(person.userId)
+                    delivery: deliveryById[person.userId],
+                    bestRoute: DeliveryPresentation.bestRoute(
+                        person: person,
+                        directLink: ConnectionInputs.directLink(directPaths[person.userId]),
+                        ownRelayUsable: evidence.ownRelayUsable,
+                        nowMs: nowMs
+                    ),
+                    lastSeenMs: max(
+                        contactLastSeen[person.userId] ?? 0,
+                        presenceLastSeen[person.userId] ?? 0,
+                        person.latest?.atMs ?? 0
+                    )
                 )
             }
         }
@@ -698,9 +918,7 @@ enum ConnectionDetailsLogic {
         return ConnectionDetailsState(
             health: health,
             paths: paths,
-            // Needs attention is empty by construction in Phase 1; if a later
-            // change ever fills it, surfacing it here beside Reachable now
-            // would be wrong, so it is deliberately not merged in.
+            needsAttention: rows(for: placements.needsAttention),
             reachableNow: rows(for: placements.reachableNow),
             otherPeople: rows(for: placements.otherPeople),
             hasContacts: people.contains { !$0.blocked },
@@ -714,9 +932,9 @@ enum ConnectionDetailsLogic {
         person: ConnectionPerson,
         reach: CorePersonReach,
         presenceLastSeenMs: Int64,
-        ownRelayUsable: Bool,
-        relay: CoreRelayPathState,
-        stale: Bool
+        delivery: CoreDeliveryLine?,
+        bestRoute: CorePersonRoute,
+        lastSeenMs: Int64
     ) -> ConnectionPersonRow {
         let status: PersonStatus
         let badge: ConnectionPathBadge?
@@ -742,20 +960,17 @@ enum ConnectionDetailsLogic {
                 badge = nil
             }
         }
-        let isDirect = reach == .directBluetooth || reach == .directLocalWifi
         return ConnectionPersonRow(
             userIdHex: person.userIdHex,
             name: person.name,
             status: status,
             badge: badge,
-            delivery: DeliveryPresentation.line(
-                queued: person.queued,
-                routeIsDirect: isDirect,
-                ownRelayUsable: ownRelayUsable,
-                contactHasRelayEndpoint: person.hasRelayEndpoint,
-                contactRelayStale: stale,
-                relay: relay,
-                receiptIsNewestEvidence: person.latest?.evidence == .messageDelivered
+            delivery: delivery,
+            attention: delivery?.attention,
+            detail: PersonDetail(
+                bestRoute: bestRoute,
+                lastSeenMs: lastSeenMs,
+                lastDeliveredMs: person.lastDeliveredMs
             )
         )
     }

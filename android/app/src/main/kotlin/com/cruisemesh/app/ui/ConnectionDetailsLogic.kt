@@ -649,8 +649,10 @@ object DeliveryPresentation {
      * The count arriving here is already receipt-aware, which is what makes
      * "Received your message 12 min ago" and a waiting line unable to appear
      * together: not a special case that suppresses the second, but nothing
-     * left to count. The Phase 1 front end that had to suppress it by hand is
-     * still exported for the other shell and is not used here.
+     * left to count. The Phase 1 front end that had to suppress it by hand
+     * (`core_classify_delivery_line`) stays exported, and pinned by its own
+     * Rust test, as the documented narrow door onto the one decision
+     * procedure; neither shell calls it any more.
      *
      * @param directLink a live direct link to this person exists right now.
      * @param ownRelayUsable our own Shore Pass path can deliver

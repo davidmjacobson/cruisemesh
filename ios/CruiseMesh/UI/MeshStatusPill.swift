@@ -1,36 +1,91 @@
 import SwiftUI
 
+/**
+ The home screen's one-line connection summary.
+
+ Its severity is the core's verdict, reached through `MeshStatusPillLogic
+ .build` -- the same classification the Connection details health card renders,
+ so the two can never disagree about the same phone. Everything it observes is
+ already observable state: the runtime, the direct links, our pass health, the
+ 30-second connectivity clock, and the local Wi-Fi *listening flag* (mapped and
+ deduplicated by `LanListeningSignal`, never the whole LAN snapshot).
+ */
 struct MeshStatusPill: View {
     @ObservedObject var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    @ObservedObject private var lan = LanListeningSignal.shared
+    @ObservedObject private var bluetooth = BluetoothAccess.shared
+    @ObservedObject private var clock = ConnectivityClock.shared
     @State private var pulse = false
+    /// Held across renders so the core's bounded-Checking window is measured
+    /// from when the wait actually began; a mark restamped on every render can
+    /// never expire.
+    @State private var checkingClock = CheckingClock()
     let onTap: () -> Void
 
-    /// Set only when internet delivery has stopped in a way that needs the
-    /// person to act -- see `MeshStatusPillLogic`. Nil the rest of the time,
+    /// True only when internet delivery has stopped in a way that needs the
+    /// person to act -- see `MeshStatusPillLogic`. False the rest of the time,
     /// which is nearly always.
-    private var faultSuffix: String? {
+    private func hasActionableFault(_ service: InternetDeliveryService?) -> Bool {
         MeshStatusPillLogic.faultSuffix(
             runtimeState: runtime.state,
             relayHealth: connectivity.relay,
-            service: InternetDeliveryService.of(RelayConfigStore.load())
+            service: service
+        ) != nil
+    }
+
+    private func status(service: InternetDeliveryService?) -> MeshStatusPillStatus {
+        let availability = BluetoothAvailability.observed(
+            authorizationBlocked: bluetooth.isAuthorizationBlocked,
+            radioState: bluetooth.radioState
+        )
+        let relay = ConnectionInputs.relay(connectivity.relay, configured: service != nil)
+        // The same instant the classification is given: a mark stamped from a
+        // fresher clock than `nowMs` would look like it came from the future
+        // and resolve the bound instantly, so Checking would never be shown.
+        let checkingSinceMs = checkingClock.mark(
+            pending: connectionCheckPending(
+                runtime: ConnectionInputs.runtime(runtime.state, bluetooth: availability),
+                bluetooth: ConnectionInputs.bluetooth(
+                    runtime.state,
+                    availability: availability
+                ),
+                localWifi: ConnectionInputs.localWifi(
+                    runtime.state,
+                    listening: lan.isListening
+                ),
+                relay: relay
+            ),
+            nowMs: clock.nowMs
+        )
+        return MeshStatusPillLogic.build(
+            runtimeState: runtime.state,
+            runtimeText: runtime.pillText,
+            nearbyCount: connectivity.nearbyPeerIds.count,
+            bluetooth: availability,
+            lanListening: lan.isListening,
+            relayHealth: connectivity.relay,
+            service: service,
+            checkingSinceMs: checkingSinceMs,
+            nowMs: clock.nowMs
         )
     }
 
-    private var pillText: String {
-        guard let faultSuffix else { return runtime.pillText }
-        return "\(runtime.pillText) · \(faultSuffix)"
-    }
-
     var body: some View {
-        Button(action: onTap) {
+        // Read once per render, not once per property: a saved pass changes
+        // only from the Shore Pass screen, and decoding it twice for one pill
+        // is work nobody asked for.
+        let service = InternetDeliveryService.of(RelayConfigStore.load())
+        let status = self.status(service: service)
+        let pulsing = shouldPulse(service: service)
+        return Button(action: onTap) {
             HStack(spacing: 6) {
                 Circle()
-                    .fill(dotColor)
+                    .fill(color(for: status.dot))
                     .frame(width: 8, height: 8)
-                    .scaleEffect(shouldPulse ? (pulse ? 1.22 : 0.84) : 1)
-                    .opacity(shouldPulse ? (pulse ? 1 : 0.62) : 1)
-                Text(pillText)
+                    .scaleEffect(pulsing ? (pulse ? 1.22 : 0.84) : 1)
+                    .opacity(pulsing ? (pulse ? 1 : 0.62) : 1)
+                Text(status.text)
                     .font(.caption.weight(.medium))
             }
             .padding(.horizontal, 12)
@@ -45,26 +100,26 @@ struct MeshStatusPill: View {
         }
     }
 
-    private var shouldPulse: Bool {
-        // A steady red reads as a state to deal with; a pulsing one reads as
-        // work in progress, which this is not.
-        if faultSuffix != nil { return false }
+    private func shouldPulse(service: InternetDeliveryService?) -> Bool {
+        // A steady dot reads as a state to deal with; a pulsing one reads as
+        // work in progress, which a fault is not.
+        if hasActionableFault(service) { return false }
         switch runtime.state {
         case .starting, .meshing: return true
         case .stopped, .syncingViaRelay: return false
         }
     }
 
-    private var dotColor: Color {
-        // A fault the person must act on outranks the runtime colour: green
-        // beside "Shore Pass expired" would undercut the words next to it.
-        // Red matches `PassIndicator.actionRequired`'s tint in Settings.
-        if faultSuffix != nil { return .red }
-        switch runtime.state {
-        case .stopped: return .gray
-        case .starting: return .orange
-        case .meshing: return .green
-        case .syncingViaRelay: return .blue
+    /// The four semantic colors, painted. Amber covers both degraded verdicts
+    /// because that is the core's own severity split and what the same verdict
+    /// draws on Android; the words beside the dot still name the fault, so
+    /// nothing here is communicated by color alone.
+    private func color(for dot: MeshStatusDotColor) -> Color {
+        switch dot {
+        case .green: return .green
+        case .blue: return .blue
+        case .amber: return .orange
+        case .neutral: return .gray
         }
     }
 }

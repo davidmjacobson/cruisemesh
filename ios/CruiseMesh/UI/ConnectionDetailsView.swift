@@ -86,17 +86,87 @@ enum ConnectionCopy {
         }
     }
 
-    /// The How-to-fix explanation for the reasons this release can offer one
-    /// for. Written for someone who will not open a settings screen on their
-    /// own.
+    // MARK: How to fix
+
+    /**
+     The How-to-fix explanation for a device-wide fault.
+
+     Every one of these is written for someone who will not open a settings
+     screen on their own, and each ends by saying what still works, because
+     none of these faults stops delivery when the two phones are near each
+     other.
+     */
     static func howToFix(_ reason: CoreHealthReason) -> String? {
         switch reason {
         case .ownSetupRejected:
             return String(localized: "Shore Pass didn't accept this phone's saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.")
         case .storageFull:
             return String(localized: "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.")
+        case .passExpired:
+            return String(localized: "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.")
+        case .passSuspended:
+            return String(localized: "Your Shore Pass has been turned off, so messages can't travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.")
         default:
             return nil
+        }
+    }
+
+    /**
+     The How-to-fix explanation for a fault stopping delivery to one friend.
+
+     Every reason has one. A blocked row offers the control unconditionally, so
+     a reason with nothing behind it would open an empty sheet -- which is
+     worse than the silence it replaced.
+
+     The order-sensitive one is the friend's rejected card: a card shared before
+     the friend has fixed their own pass carries the same broken setup, so a
+     reader who does these out of order fixes nothing and has to start again.
+     The steps are numbered and the warning sits directly under them.
+     */
+    static func howToFix(_ reason: CoreDeliveryBlockedReason, name: String) -> String {
+        switch reason {
+        case .contactSetupRejected:
+            return String(localized: "\(name)'s phone saved a Shore Pass setup that isn't accepting messages, so yours are waiting.\n\nDo these three things in this order:\n\n1. Ask \(name) to open Shore Pass on their own phone and get it working again. This has to happen first.\n2. After that is working, ask them to share their friend card with you again.\n3. Scan the new card they send you.\n\nThe order matters. A friend card shared before their Shore Pass is fixed carries the same setup, so the messages keep waiting and you have to start over.\n\nUntil then, your messages still reach \(name) whenever the two of you are near each other.")
+        // The limit is MAX_ENVELOPE_SEALED_BYTES (512 KB); keep this copy in
+        // step with core/src/limits.rs.
+        case .messageTooLarge:
+            return String(localized: "Something you sent to \(name) is too big to travel. Messages, including photos and voice notes, can be up to about 500 KB.\n\nOpen your conversation with \(name), delete the message that won't send, and send a shorter voice note or a smaller photo instead.")
+        case .passExpired:
+            return String(localized: "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.")
+        case .passSuspended:
+            return String(localized: "Your Shore Pass has been turned off, so messages can't travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.")
+        case .storageFull:
+            return String(localized: "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.")
+        case .ownSetupRejected:
+            return String(localized: "Shore Pass didn't accept this phone's saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.")
+        }
+    }
+
+    /// Only reachable if a new fault ships without its instructions. Says so
+    /// plainly rather than opening an empty sheet.
+    static func howToFixUnknown() -> String {
+        String(localized: "CruiseMesh doesn't have step-by-step help for this one yet. Open Troubleshooting & diagnostics, share diagnostics, and contact support.")
+    }
+
+    /// Does this fault have a button on it, and does that button do something?
+    static func offersManageShorePass(_ reason: CoreDeliveryBlockedReason) -> Bool {
+        switch reason {
+        case .passExpired, .passSuspended, .ownSetupRejected:
+            return true
+        // Nothing on the Shore Pass screen repairs a friend's card, an
+        // oversized message, or a full mailbox, and a button that leads
+        // somewhere useless costs a reader more than no button at all.
+        case .contactSetupRejected, .storageFull, .messageTooLarge:
+            return false
+        }
+    }
+
+    static func offersManageShorePass(_ reason: CoreHealthReason) -> Bool {
+        switch reason {
+        case .passExpired, .passSuspended, .ownSetupRejected:
+            return true
+        default:
+            return false
         }
     }
 
@@ -178,6 +248,12 @@ enum ConnectionCopy {
 
     // MARK: People
 
+    /// Needs attention leads the page when it has anyone in it, and is omitted
+    /// entirely when it does not.
+    static func needsAttentionHeading(_ count: Int) -> String {
+        String(localized: "Needs attention (\(count))")
+    }
+
     static func reachableNowHeading(_ count: Int) -> String {
         String(localized: "Reachable now (\(count))")
     }
@@ -223,18 +299,101 @@ enum ConnectionCopy {
         }
     }
 
-    /// Waiting messages, in outcome terms. None of these is a failure: a
-    /// message waiting for a friend who is ashore is this app working.
-    static func delivery(_ line: DeliveryLine) -> String {
-        switch line.kind {
+    /**
+     One person's waiting work, as one sentence.
+
+     The precedence is the core record's own: a blocking fault, then a stall on
+     a working path, then where the work is going. The last of those is always
+     true underneath the other two -- an expired pass stops the internet route,
+     but the messages really will go the moment the friend is nearby -- which is
+     why the fault is a *different* sentence beneath this one rather than a
+     replacement for it.
+
+     The age is appended when there is an honest one to append. `· 14 min` on a
+     delayed row is the difference between a reader thinking something is stuck
+     and knowing how stuck.
+     */
+    static func delivery(_ line: CoreDeliveryLine, nowMs: Int64) -> String {
+        let count = Int(line.count)
+        let headline: String
+        if line.blockedReason != nil {
+            headline = String(localized: "\(count) messages can't be sent")
+        } else if line.delayed {
+            headline = String(localized: "\(count) messages delayed")
+        } else {
+            headline = movement(line.state, count: count)
+        }
+        // Routine states carry no age on purpose: "3 messages will deliver when
+        // you reconnect · 2 days" turns a promise into an accusation.
+        if line.blockedReason == nil && !line.delayed { return headline }
+        guard let age = waitingAge(line.oldestWaitingMs, nowMs: nowMs) else { return headline }
+        return String(localized: "\(headline) · \(age)")
+    }
+
+    /// Where the work is going. None of these is a failure: a message waiting
+    /// for a friend who is ashore is this app working.
+    private static func movement(_ state: CoreDeliveryState, count: Int) -> String {
+        switch state {
         case .sending:
-            return String(localized: "Sending \(line.count) messages…")
+            return String(localized: "Sending \(count) messages…")
         case .willDeliverWhenReconnected:
-            return String(localized: "\(line.count) messages will deliver when you reconnect")
+            return String(localized: "\(count) messages will deliver when you reconnect")
         case .waitingForInternet:
-            return String(localized: "\(line.count) messages waiting for internet")
+            return String(localized: "\(count) messages waiting for internet")
         }
     }
+
+    /// How long the oldest waiting message has been waiting, or nil when there
+    /// is no honest answer. A duration, never a moment: it must not read "ago"
+    /// and must never become a calendar date.
+    static func waitingAge(_ oldestWaitingMs: Int64, nowMs: Int64) -> String? {
+        switch ConnectionTimes.waitingAge(sinceMs: oldestWaitingMs, nowMs: nowMs) {
+        case .unknown:
+            return nil
+        case .minutes(let value):
+            return String(localized: "\(value) min")
+        case .hours(let value):
+            return String(localized: "\(value) hours")
+        case .days(let value):
+            return String(localized: "\(value) days")
+        }
+    }
+
+    /// Why an error row is an error row. The person's name is already above the
+    /// line, so these do not repeat it.
+    static func deliveryReason(_ reason: CoreDeliveryBlockedReason) -> String {
+        switch reason {
+        case .contactSetupRejected:
+            return String(localized: "Their saved Shore Pass setup was rejected")
+        case .passExpired:
+            return String(localized: "Your Shore Pass has expired")
+        case .passSuspended:
+            return String(localized: "Your Shore Pass is suspended")
+        case .storageFull:
+            return String(localized: "Your family's Shore Pass storage is full")
+        case .ownSetupRejected:
+            return String(localized: "Shore Pass didn't accept this phone's saved setup")
+        case .messageTooLarge:
+            return String(localized: "A message is too large to send")
+        }
+    }
+
+    // MARK: Person detail
+
+    /// The core's routing answer, restated. Never re-derived here; see the spec.
+    static func bestRoute(_ route: CorePersonRoute) -> String {
+        switch route {
+        case .directBluetooth: return String(localized: "Bluetooth")
+        case .directLocalWifi: return String(localized: "Local Wi-Fi")
+        case .shorePass: return String(localized: "Shore Pass")
+        case .noneNow:
+            return String(localized: "Nothing right now — messages travel when you next meet")
+        }
+    }
+
+    static func personDetailNever() -> String { String(localized: "No record yet") }
+
+    static func nothingWaiting() -> String { String(localized: "Nothing waiting") }
 
     // MARK: Recent activity
 
@@ -310,6 +469,23 @@ enum ConnectionCopy {
         String(localized: "\(first). \(second). \(third).")
     }
 
+    /**
+     Several facts as one announced sentence run.
+
+     A person row has a variable number of them -- the delivery line and its
+     reason come and go -- so the fixed-arity templates above cannot cover it,
+     and joining with a literal `". "` here would hard-code English punctuation
+     into the one path a screen-reader user depends on.
+     */
+    static func sentences(_ parts: [String]) -> String {
+        let sentences = parts.map { String(localized: "\($0).") }
+        guard var run = sentences.first else { return "" }
+        for next in sentences.dropFirst() {
+            run = String(localized: "\(run) \(next)")
+        }
+        return run
+    }
+
     static func viaPath(_ status: String, _ path: String) -> String {
         String(localized: "\(status) via \(path)")
     }
@@ -346,10 +522,6 @@ enum ConnectionCopy {
 struct ConnectionDetailsView: View {
     @ObservedObject var appModel: AppModel
 
-    @ObservedObject private var runtime = MeshRuntimeStatus.shared
-    @ObservedObject private var connectivity = MeshConnectivityStatus.shared
-    @ObservedObject private var lan = LanTransportDiagnostics.shared
-    @ObservedObject private var bluetooth = BluetoothAccess.shared
     @StateObject private var model = ConnectionDetailsModel()
 
     @Environment(\.dismiss) private var dismiss
@@ -361,11 +533,13 @@ struct ConnectionDetailsView: View {
     @State private var activityExpanded = false
     @State private var showAllActivity = false
     @State private var troubleshootingExpanded = false
-    @State private var howToFixReason: CoreHealthReason?
+    /// A sheet rather than a scroll target. The spec forbids dropping a reader
+    /// at the top of a long section to hunt for their answer, and a sheet is
+    /// the only arrangement where "the explanation is on screen" is guaranteed
+    /// rather than dependent on measured heights and where the list happened to
+    /// be scrolled.
+    @State private var howToFix: HowToFixTopic?
     @State private var showShorePass = false
-    /// Read once rather than on every render: a saved pass changes only from
-    /// the Shore Pass screen, and this page must not re-decode it per frame.
-    @State private var relayConfigured = RelayConfigStore.load() != nil
 
     @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
     @State private var hasDiagnosticArchive = DiagnosticLogExport.hasArchive()
@@ -373,7 +547,9 @@ struct ConnectionDetailsView: View {
     @State private var supportMessage: String?
 
     var body: some View {
-        let state = currentState()
+        // Derived once per change in `ConnectionDetailsModel`, not once per
+        // body evaluation. This view reads a finished value and renders it.
+        let state = model.state
         let times = ConnectionTimeContext(
             nowMs: model.nowMs,
             startOfTodayMs: ConnectionClock.startOfDayMs(model.nowMs)
@@ -382,6 +558,16 @@ struct ConnectionDetailsView: View {
             List {
                 healthSection(state)
                 pathsSection(state.paths, times: times)
+                // Needs attention comes first because it is the only group
+                // anyone has to do something about; the spec's order, not a
+                // layout preference.
+                if !state.needsAttention.isEmpty {
+                    peopleSection(
+                        heading: ConnectionCopy.needsAttentionHeading(state.needsAttention.count),
+                        rows: state.needsAttention,
+                        times: times
+                    )
+                }
                 if !state.reachableNow.isEmpty {
                     peopleSection(
                         heading: ConnectionCopy.reachableNowHeading(state.reachableNow.count),
@@ -413,8 +599,7 @@ struct ConnectionDetailsView: View {
             }
             .refreshable { await model.refreshFromPull() }
             .onAppear {
-                relayConfigured = RelayConfigStore.load() != nil
-                model.start()
+                model.start(ownUserId: appModel.identity.userId)
                 // Two of the four probes behind this reach the store, and the
                 // rule on this page is that no store query runs on the main
                 // actor -- ever. During a flood the write lock is held by the
@@ -423,16 +608,11 @@ struct ConnectionDetailsView: View {
                 Task { await refreshCapturedDiagnostics() }
             }
             .onDisappear { model.stop() }
-            // The store-change signal the spec asks for. It fires per message
-            // and per receipt, so at mesh-flood rates it arrives thousands of
-            // times a minute -- which is exactly what the coalescer is for:
-            // each of these costs one comparison, not one reload.
-            .onReceive(ChatEvents.subject) { _ in model.signalStoreChanged() }
             // A backgrounded app never sends onDisappear, and a diagnostics
             // page polling from the background earns nothing but battery.
             .onChange(of: scenePhase) { phase in
                 if phase == .active {
-                    model.start()
+                    model.start(ownUserId: appModel.identity.userId)
                 } else {
                     model.stop()
                 }
@@ -460,62 +640,40 @@ struct ConnectionDetailsView: View {
                 ActivityShareView(items: file.urls)
             }
             .sheet(isPresented: $showShorePass, onDismiss: {
-                relayConfigured = RelayConfigStore.load() != nil
+                model.refreshRelayConfigured()
             }) {
                 NavigationStack {
                     ShorePassView(initialCard: nil, appModel: appModel)
                 }
             }
         }
+        // On the navigation stack rather than the list: four sheet modifiers
+        // stacked on one view is more than SwiftUI reliably presents, and these
+        // two are the ones a reader reaches most.
+        .sheet(item: $howToFix) { topic in
+            HowToFixSheet(
+                topic: topic,
+                onManageShorePass: {
+                    howToFix = nil
+                    showShorePass = true
+                }
+            )
+        }
+        .sheet(isPresented: personSheetBinding) {
+            PersonDetailSheet(
+                row: model.selectedPerson,
+                events: model.selectedPersonEvents,
+                times: times
+            )
+        }
     }
 
-    // MARK: - View state
-
-    /**
-     Live signals plus the last store snapshot, interpreted by the core.
-
-     The `CheckingClock` mark uses the same instant the classification is
-     given: a mark stamped from a fresher clock than `nowMs` would look like it
-     came from the future and resolve the bound instantly, so `Checking` would
-     never be shown at all.
-     */
-    private func currentState() -> ConnectionDetailsState {
-        let availability = BluetoothAvailability.observed(
-            authorizationBlocked: bluetooth.isAuthorizationBlocked,
-            radioState: bluetooth.radioState
-        )
-        let coreRuntime = ConnectionInputs.runtime(runtime.state, bluetooth: availability)
-        let coreRelay = ConnectionInputs.relay(connectivity.relay, configured: relayConfigured)
-        // Only whether a listening socket exists. The endpoint itself never
-        // reaches the view state, let alone the screen.
-        let lanListening = lan.snapshot.localEndpoint != nil
-        let checkingSinceMs = model.checkingClock.mark(
-            pending: connectionCheckPending(
-                runtime: coreRuntime,
-                bluetooth: ConnectionInputs.bluetooth(
-                    runtime.state,
-                    availability: availability
-                ),
-                localWifi: ConnectionInputs.localWifi(runtime.state, listening: lanListening),
-                relay: coreRelay
-            ),
-            nowMs: model.nowMs
-        )
-        return ConnectionDetailsLogic.buildState(
-            runtimeState: runtime.state,
-            bluetoothAvailability: availability,
-            directPaths: connectivity.directPaths,
-            relayHealth: connectivity.relay,
-            relayConfigured: relayConfigured,
-            lanListening: lanListening,
-            bluetoothAudioActive: runtime.bluetoothAudioConnected,
-            staleRelayContacts: connectivity.staleRelayContacts,
-            presenceLastSeen: connectivity.presenceLastSeen,
-            contactLastSeen: connectivity.contactLastSeen,
-            snapshot: model.snapshot,
-            checkingSinceMs: checkingSinceMs,
-            refreshing: model.isRefreshing,
-            nowMs: model.nowMs
+    /// Open while a person is selected; closing it clears the selection and
+    /// cancels the events query behind it.
+    private var personSheetBinding: Binding<Bool> {
+        Binding(
+            get: { model.selectedPersonHex != nil },
+            set: { presented in if !presented { model.selectPerson(nil) } }
         )
     }
 
@@ -727,7 +885,9 @@ struct ConnectionDetailsView: View {
     private func personRow(_ row: ConnectionPersonRow, times: ConnectionTimeContext) -> some View {
         let status = ConnectionCopy.personStatus(row.status, times: times)
         let badge = row.badge.map { ConnectionCopy.pathName($0) }
-        let delivery = row.delivery.map { ConnectionCopy.delivery($0) }
+        let delivery = row.delivery.map { ConnectionCopy.delivery($0, nowMs: times.nowMs) }
+        let blockedReason: CoreDeliveryBlockedReason? = row.delivery?.blockedReason
+        let reason = blockedReason.map { ConnectionCopy.deliveryReason($0) }
         // One sentence per fact, in the order they are read on screen. The
         // delivery line has to be in here: the row replaces its children's
         // labels with this one, and anything left out is silent.
@@ -737,43 +897,82 @@ struct ConnectionDetailsView: View {
         // the kind of divergence this page was built to close.
         let statusPhrase = row.badge
             .map { ConnectionCopy.viaPath(status, ConnectionCopy.pathName($0)) } ?? status
-        let label = delivery
-            .map { ConnectionCopy.threeSentences(row.name, statusPhrase, $0) }
-            ?? ConnectionCopy.twoSentences(row.name, statusPhrase)
+        let label = ConnectionCopy.sentences(
+            [row.name, statusPhrase] + [delivery, reason].compactMap { $0 }
+        )
         VStack(alignment: .leading, spacing: 3) {
-            if dynamicTypeSize.isAccessibilitySize {
-                Text(row.name)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let badge = badge {
-                    PathBadgeLabel(text: badge)
-                }
-            } else {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(row.name)
+            // The whole row opens the person's detail, so it is a button; the
+            // How-to-fix control below keeps its own label and its own tap
+            // target rather than being swallowed by it.
+            Button {
+                model.selectPerson(row.userIdHex)
+            } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    if dynamicTypeSize.isAccessibilitySize {
+                        Text(row.name)
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let badge = badge {
+                            PathBadgeLabel(text: badge)
+                        }
+                    } else {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(row.name)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            if let badge = badge {
+                                PathBadgeLabel(text: badge)
+                            }
+                        }
+                    }
+                    Text(status)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 8)
-                    if let badge = badge {
-                        PathBadgeLabel(text: badge)
+                    if let delivery = delivery {
+                        // Error color only when something has to change before
+                        // the message can go; caution when a working path has
+                        // stalled; otherwise the ordinary secondary color,
+                        // because waiting is what this product does and the old
+                        // page's red line under every friend is the bug being
+                        // removed. Every one of these is paired with words that
+                        // say the same thing.
+                        Text(delivery)
+                            .font(.subheadline)
+                            .foregroundStyle(deliveryStyle(row.delivery))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let reason = reason {
+                        Text(reason)
+                            .font(.subheadline)
+                            .foregroundStyle(Color.red)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            Text(status)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if let delivery = delivery {
-                // Neutral, always. Waiting is what this product does; the old
-                // page's red line under every friend is the bug being removed.
-                Text(delivery)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            .buttonStyle(.plain)
+            .frame(minHeight: 44)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(label))
+            if let blocked = blockedReason {
+                HStack {
+                    Spacer(minLength: 0)
+                    Button(ConnectionCopy.healthAction(.howToFix)) {
+                        howToFix = .person(reason: blocked, name: row.name)
+                    }
+                    .buttonStyle(.borderless)
+                    .frame(minHeight: 44)
+                }
             }
         }
         .padding(.vertical, 2)
-        .frame(minHeight: 44)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(Text(label))
+    }
+
+    /// The color of a delivery line; see the comment at its call site.
+    private func deliveryStyle(_ line: CoreDeliveryLine?) -> Color {
+        if line?.blockedReason != nil { return .red }
+        if line?.delayed == true { return .orange }
+        return .secondary
     }
 
     // MARK: - Recent activity
@@ -840,11 +1039,6 @@ struct ConnectionDetailsView: View {
     private func troubleshootingSection() -> some View {
         Section {
             DisclosureGroup(isExpanded: $troubleshootingExpanded) {
-                if let reason = howToFixReason, let text = ConnectionCopy.howToFix(reason) {
-                    Text(text)
-                        .font(.subheadline)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
                 Toggle("Diagnostic logging", isOn: $diagnosticLogging)
                     .onChange(of: diagnosticLogging) { enabled in
                         DiagnosticLogExport.setEnabled(enabled)
@@ -903,14 +1097,13 @@ struct ConnectionDetailsView: View {
             // iOS has no "turn Bluetooth on" API; Settings is the only place a
             // person can do it, and this is the same route the home-screen
             // banner already takes.
-            bluetooth.openSystemSettings()
+            BluetoothAccess.shared.openSystemSettings()
         case .manageShorePass:
             showShorePass = true
         case .howToFix:
             // Never drop someone at the top of a long section to hunt for the
-            // answer: expand it *and* name the reason inside it.
-            howToFixReason = reason
-            troubleshootingExpanded = true
+            // answer: put it in front of them.
+            if let reason = reason { howToFix = .device(reason) }
         }
     }
 
@@ -997,6 +1190,161 @@ struct ConnectionDetailsView: View {
             }.value
             model.signalStoreChanged()
         }
+    }
+}
+
+/**
+ The How-to-fix content, on a sheet.
+
+ A sheet rather than a scrolled-to paragraph inside Troubleshooting: the spec
+ forbids dropping a reader at the top of a long section to find their own
+ answer, and a sheet is the only arrangement that puts the explanation in front
+ of them without depending on measured heights or scroll position.
+ */
+private struct HowToFixSheet: View {
+    let topic: HowToFixTopic
+    let onManageShorePass: () -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let explanation: String?
+        let showManage: Bool
+        switch topic {
+        case .device(let reason):
+            explanation = ConnectionCopy.howToFix(reason)
+            showManage = ConnectionCopy.offersManageShorePass(reason)
+        case .person(let reason, let name):
+            explanation = ConnectionCopy.howToFix(reason, name: name)
+            showManage = ConnectionCopy.offersManageShorePass(reason)
+        }
+        return NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    // A fault with no written remedy is not a blank sheet. The
+                    // core only offers this control for faults that have one,
+                    // so reaching here means a new reason arrived without its
+                    // copy -- say so and point at the one thing that still
+                    // helps.
+                    Text(explanation ?? ConnectionCopy.howToFixUnknown())
+                        .font(.body)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if showManage {
+                        Button(ConnectionCopy.healthAction(.manageShorePass)) {
+                            onManageShorePass()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+            }
+            .navigationTitle(ConnectionCopy.healthAction(.howToFix))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+/**
+ One person's detail sheet.
+
+ Informational, by design and by specification -- CruiseMesh chooses the path,
+ and offering a choice here would imply the choice matters. "Best route now" is
+ the core's routing answer restated, never re-derived: a page that worked out
+ reachability from "can I poll them" would report post-only friend cards as
+ broken.
+ */
+private struct PersonDetailSheet: View {
+    /// Nil when the open person left the address book mid-reload.
+    let row: ConnectionPersonRow?
+    /// Nil while the bounded events query is still running.
+    let events: [ConnectionActivityRow]?
+    let times: ConnectionTimeContext
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let row = row {
+                    Section {
+                        detailFact(
+                            label: String(localized: "Best route now"),
+                            value: ConnectionCopy.bestRoute(row.detail.bestRoute)
+                        )
+                        detailFact(
+                            label: String(localized: "Last seen"),
+                            value: ConnectionCopy.eventTime(row.detail.lastSeenMs, times: times)
+                                ?? ConnectionCopy.personDetailNever()
+                        )
+                        detailFact(
+                            label: String(localized: "Last received your message"),
+                            value: ConnectionCopy.eventTime(
+                                row.detail.lastDeliveredMs,
+                                times: times
+                            ) ?? ConnectionCopy.personDetailNever()
+                        )
+                        detailFact(
+                            label: String(localized: "Waiting"),
+                            value: row.delivery
+                                .map { ConnectionCopy.delivery($0, nowMs: times.nowMs) }
+                                ?? ConnectionCopy.nothingWaiting()
+                        )
+                    }
+                    Section {
+                        if let rows = events {
+                            if rows.isEmpty {
+                                Text("No connection events recorded yet.")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(Array(rows.enumerated()), id: \.offset) { _, event in
+                                    if let line = ConnectionCopy.activityLine(event, times: times) {
+                                        Text(line)
+                                            .font(.subheadline)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                            }
+                        } else {
+                            // The query is still running. Saying "no events
+                            // recorded" before it returns would be a claim the
+                            // page cannot support, and for anyone with history
+                            // it would be wrong.
+                            ProgressView()
+                                .accessibilityLabel(Text(ConnectionCopy.refreshing()))
+                        }
+                    } header: {
+                        Text("Recent events")
+                    }
+                }
+            }
+            .navigationTitle(row?.name ?? String(localized: "Connection details"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private func detailFact(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(ConnectionCopy.twoSentences(label, value)))
     }
 }
 
