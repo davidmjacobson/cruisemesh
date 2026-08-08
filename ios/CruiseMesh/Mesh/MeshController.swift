@@ -3475,13 +3475,35 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// `RATE-01`'s second clause: a nudge that arrived while the pass was in
+    /// flight may not start a fresh pass inside the quiet window that pass
+    /// recorded.
+    ///
+    /// The decision is the core's (`core_relay_rerun_action`), and asking it
+    /// here is a change of kind rather than of behaviour. It used to be
+    /// implicit: the pending nudge re-entered `runRelaySync`, whose front-door
+    /// gate dropped it, and what actually re-ran the pass was the retry work
+    /// item armed when the 429 was recorded. Two gates agreeing is not the same
+    /// as a decision, and Android had already made it one
+    /// (`relayRerunAction`). Now both shells ask the same function at the same
+    /// point, and the deferral re-arms the coalesced retry rather than relying
+    /// on a timer set elsewhere still being alive.
     private func finishRelaySync() {
         relaySyncInFlight = false
-        if relaySyncPending, isRunning {
-            relaySyncPending = false
+        let pending = relaySyncPending
+        relaySyncPending = false
+        let backoffRemainingMs = relayRateLimitedUntilMs
+            - Int64(Date().timeIntervalSince1970 * 1_000)
+        switch coreRelayRerunAction(
+            pendingRequested: pending,
+            canSync: isRunning,
+            backoffRemainingMs: backoffRemainingMs
+        ) {
+        case .runAgain:
             runRelaySync()
-        } else {
-            relaySyncPending = false
+        case .scheduleRateLimitRetry:
+            scheduleRelayRateLimitRetry(afterMs: backoffRemainingMs)
+        case .stop:
             refreshNearby()
         }
     }
@@ -3633,9 +3655,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             guard fault != .outage else { return }
             ownRelayFault = RelayHealth.worseFault(ownRelayFault, fault)
         }
-        let identityHash = familyRelayIdentityHash(identity.userId)
+        // The core derives this pass's anti-lockstep offset from the PUBLIC
+        // user id (see FamilyRelayBackpressure.swift); no hash is computed on
+        // this side any more.
+        let identityPublicBytes = identity.userId
         func relayRequest<T>(_ operation: () throws -> T) throws -> T {
-            let monotonicNowMs = DispatchTime.now().uptimeNanoseconds / 1_000_000
+            // Monotonic on purpose: the pacer's reservation must not be
+            // rewound by a wall-clock correction.
+            let monotonicNowMs = Int64(clamping: DispatchTime.now().uptimeNanoseconds / 1_000_000)
             let waitMs = familyRelayRequestPacer.reserve(nowMs: monotonicNowMs)
             if waitMs > 0 {
                 Thread.sleep(forTimeInterval: Double(waitMs) / 1_000)
@@ -3651,7 +3678,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 let advertisedMs = relayRetryAfterMs(retryAfterHeader: relay.retryAfter)
                 let delayMs = familyRelayBackoff.onRateLimited(
                     retryAfterMs: advertisedMs,
-                    identityHash: identityHash
+                    identityPublicBytes: identityPublicBytes
                 )
                 // A 429 is a family-token budget verdict even when this
                 // particular request used a contact-resolved config. Surface
@@ -4363,22 +4390,33 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func noteRelayRateLimit(fault: CoreRelayFault?, retryAfterMs: UInt64) {
         if fault == .rateLimited {
             relayRateLimitedUntilMs = Int64(Date().timeIntervalSince1970 * 1_000) + Int64(retryAfterMs)
-            relayRateLimitRetryWorkItem?.cancel()
-            let retry = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.relayRateLimitRetryWorkItem = nil
-                self.runRelaySync()
-            }
-            relayRateLimitRetryWorkItem = retry
-            meshQueue.asyncAfter(
-                deadline: .now() + .milliseconds(Int(clamping: retryAfterMs)),
-                execute: retry
-            )
+            scheduleRelayRateLimitRetry(afterMs: Int64(clamping: retryAfterMs))
         } else {
             relayRateLimitedUntilMs = 0
             relayRateLimitRetryWorkItem?.cancel()
             relayRateLimitRetryWorkItem = nil
         }
+    }
+
+    /// Arms the one coalesced retry that ends a quiet window. Exactly one is
+    /// ever outstanding, whatever number of nudges arrived during the window --
+    /// that coalescing is the whole point of `RATE-01`'s deferral, and it is
+    /// why a pending rerun is cheap to defer and expensive to honour.
+    ///
+    /// `afterMs` may be zero or negative if the window has already elapsed, in
+    /// which case the retry runs at the next opportunity rather than never.
+    private func scheduleRelayRateLimitRetry(afterMs: Int64) {
+        relayRateLimitRetryWorkItem?.cancel()
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.relayRateLimitRetryWorkItem = nil
+            self.runRelaySync()
+        }
+        relayRateLimitRetryWorkItem = retry
+        meshQueue.asyncAfter(
+            deadline: .now() + .milliseconds(Int(clamping: max(afterMs, 0))),
+            execute: retry
+        )
     }
 
     /// Records that a friend's own message landed on this phone, for the

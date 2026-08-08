@@ -1,55 +1,61 @@
 package com.cruisemesh.app.mesh
 
-import kotlin.math.max
-
-/** Conservative per-phone share of a family's relay request budget. */
-internal const val FAMILY_RELAY_REQUEST_INTERVAL_MS = 500L
-internal const val FAMILY_RELAY_BACKOFF_BASE_MS = 1_000L
-internal const val FAMILY_RELAY_BACKOFF_CAP_MS = 60_000L
-internal const val FAMILY_RELAY_JITTER_WINDOW_MS = 1_000L
-
-/** Serial request pacer; the caller performs the returned wait. */
-internal class FamilyRelayRequestPacer(
-    private val intervalMs: Long = FAMILY_RELAY_REQUEST_INTERVAL_MS,
-) {
-    private var nextRequestAtMs = 0L
-
-    @Synchronized
-    fun reserve(nowMs: Long): Long {
-        val requestAtMs = max(nowMs, nextRequestAtMs)
-        nextRequestAtMs = requestAtMs + intervalMs
-        return requestAtMs - nowMs
-    }
-}
+import uniffi.cruisemesh_core.CoreFamilyRelayBackoff
+import uniffi.cruisemesh_core.CoreFamilyRelayPacer
 
 /**
- * Retry-After is a floor. Repeated 429s widen the quiet period, while a stable
- * per-identity offset keeps phones in one family from waking in lockstep.
+ * Delegating shims over the family relay backpressure policy, which lives in
+ * the core (`core/src/session/relay_policy.rs`).
+ *
+ * A CruiseMesh family shares one relay request budget, so how fast a phone may
+ * ask and what it does when the relay says "too fast" are protocol decisions,
+ * not Android decisions. This file used to hold the interval, the exponential
+ * curve, the cap, the jitter window and the arithmetic joining them, with a
+ * second copy of all of it in Swift. It now holds none of that: no constant,
+ * no formula, no branch. What is left is the shape Android's sync engine calls
+ * -- a class it can hold as a field, and Kotlin's `Long` where the core speaks
+ * `ULong`.
+ *
+ * The one behaviour change the hoist carried is the jitter input. This shell
+ * used to seed the per-phone offset from `ByteArray.contentHashCode()`, a
+ * platform hash that iOS could not possibly agree with (it used its own
+ * FNV-1a). The core derives it from the public user id under a documented
+ * BLAKE2b context instead, so both shells draw from one function -- see
+ * `RATE-01` in specs/protocol-contract-v1.md.
+ *
+ * Deliberately still here rather than deleted: removing the wrappers and
+ * calling core straight from `RelaySyncEngine` is a separate step, gated on
+ * paired-platform canary evidence.
  */
-internal fun familyRelayBackoffDelayMs(
-    retryAfterMs: Long,
-    consecutiveRateLimits: Int,
-    identityHash: Int,
-): Long {
-    val exponent = (consecutiveRateLimits - 1).coerceIn(0, 6)
-    val exponentialMs = (FAMILY_RELAY_BACKOFF_BASE_MS shl exponent)
-        .coerceAtMost(FAMILY_RELAY_BACKOFF_CAP_MS)
-    val floorMs = max(retryAfterMs, exponentialMs)
-    val unsignedHash = identityHash.toLong() and 0xffff_ffffL
-    val jitterMs = unsignedHash % (FAMILY_RELAY_JITTER_WINDOW_MS + 1L)
-    return floorMs + jitterMs
+
+/** Serial request pacer; the caller performs the returned wait. */
+internal class FamilyRelayRequestPacer {
+    private val core = CoreFamilyRelayPacer()
+
+    /**
+     * @param nowMs a MONOTONIC reading (`SystemClock.elapsedRealtime()`), not
+     *   wall clock: a pacer that can be rewound by a time correction would
+     *   hand out a wait as long as the correction.
+     */
+    fun reserve(nowMs: Long): Long = core.reserve(nowMs)
 }
 
+/** Consecutive-429 counter and the quiet window each refusal earns. */
 internal class FamilyRelayBackoff {
-    var consecutiveRateLimits: Int = 0
-        private set
+    private val core = CoreFamilyRelayBackoff()
 
-    fun onRateLimited(retryAfterMs: Long, identityHash: Int): Long {
-        consecutiveRateLimits += 1
-        return familyRelayBackoffDelayMs(retryAfterMs, consecutiveRateLimits, identityHash)
-    }
+    val consecutiveRateLimits: Int
+        get() = core.consecutiveRateLimits().toInt()
 
-    fun onSuccessfulPass() {
-        consecutiveRateLimits = 0
-    }
+    /**
+     * @param retryAfterMs the already-clamped advertised window from
+     *   `relayRetryAfterMs`, never a raw header value.
+     * @param identityPublicBytes this device's public user id, which is what
+     *   the core's stable anti-lockstep offset is derived from. Public on
+     *   purpose: the offset is observable in request timing.
+     */
+    fun onRateLimited(retryAfterMs: Long, identityPublicBytes: ByteArray): Long =
+        core.onRateLimited(retryAfterMs.coerceAtLeast(0L).toULong(), identityPublicBytes).toLong()
+
+    fun onSuccessfulPass() = core.onSuccessfulPass()
 }

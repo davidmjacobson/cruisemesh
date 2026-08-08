@@ -1043,6 +1043,364 @@ public func FfiConverterTypeCoreFailoverResumeDebounce_lower(_ value: CoreFailov
 
 
 
+/**
+ * Consecutive-429 counter plus the curve. One instance per relay-syncing
+ * engine; the count is what makes repeated refusals widen the window, and
+ * [`CoreFamilyRelayBackoff::on_successful_pass`] is what stops a phone
+ * carrying a punishment it has already served.
+ */
+public protocol CoreFamilyRelayBackoffProtocol : AnyObject {
+
+    func consecutiveRateLimits()  -> UInt32
+
+    /**
+     * Records one family 429 and returns the quiet window it earns.
+     *
+     * `retry_after_ms` is the already-clamped advertised window from
+     * [`crate::relay_retry_after_ms`]; passing a raw header value here would
+     * let a malformed header collapse or inflate the floor.
+     */
+    func onRateLimited(retryAfterMs: UInt64, identityPublicBytes: Data)  -> UInt64
+
+    /**
+     * A pass that finished with no new 429 clears the streak. Only a whole
+     * completed pass counts: clearing per successful *request* would reset
+     * the widening on the first request after every refusal and flatten the
+     * curve back to the base window.
+     */
+    func onSuccessfulPass()
+
+}
+
+/**
+ * Consecutive-429 counter plus the curve. One instance per relay-syncing
+ * engine; the count is what makes repeated refusals widen the window, and
+ * [`CoreFamilyRelayBackoff::on_successful_pass`] is what stops a phone
+ * carrying a punishment it has already served.
+ */
+open class CoreFamilyRelayBackoff:
+    CoreFamilyRelayBackoffProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corefamilyrelaybackoff(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corefamilyrelaybackoff_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corefamilyrelaybackoff(pointer, $0) }
+    }
+
+
+
+
+open func consecutiveRateLimits() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefamilyrelaybackoff_consecutive_rate_limits(self.uniffiClonePointer(),$0
+    )
+})
+}
+
+    /**
+     * Records one family 429 and returns the quiet window it earns.
+     *
+     * `retry_after_ms` is the already-clamped advertised window from
+     * [`crate::relay_retry_after_ms`]; passing a raw header value here would
+     * let a malformed header collapse or inflate the floor.
+     */
+open func onRateLimited(retryAfterMs: UInt64, identityPublicBytes: Data) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefamilyrelaybackoff_on_rate_limited(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(retryAfterMs),
+        FfiConverterData.lower(identityPublicBytes),$0
+    )
+})
+}
+
+    /**
+     * A pass that finished with no new 429 clears the streak. Only a whole
+     * completed pass counts: clearing per successful *request* would reset
+     * the widening on the first request after every refusal and flatten the
+     * curve back to the base window.
+     */
+open func onSuccessfulPass() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefamilyrelaybackoff_on_successful_pass(self.uniffiClonePointer(),$0
+    )
+}
+}
+
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyRelayBackoff: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreFamilyRelayBackoff
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFamilyRelayBackoff {
+        return CoreFamilyRelayBackoff(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreFamilyRelayBackoff) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyRelayBackoff {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreFamilyRelayBackoff, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyRelayBackoff_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFamilyRelayBackoff {
+    return try FfiConverterTypeCoreFamilyRelayBackoff.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyRelayBackoff_lower(_ value: CoreFamilyRelayBackoff) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreFamilyRelayBackoff.lower(value)
+}
+
+
+
+
+/**
+ * Serial request pacer. Reserves the next slot and reports how long the
+ * caller must wait for it; performing the wait is the shell's job, because
+ * only the shell knows whether it is holding a thread, a queue or a timer.
+ *
+ * Reservation, not throttling: the answer is computed and committed in one
+ * step, so two racing callers get two different slots rather than the same
+ * one twice.
+ */
+public protocol CoreFamilyRelayPacerProtocol : AnyObject {
+
+    /**
+     * Claims the next request slot and returns the wait, in milliseconds,
+     * before it may be used. Never negative.
+     *
+     * `now_ms` must come from a monotonic source — see the module docs.
+     */
+    func reserve(nowMs: Int64)  -> Int64
+
+}
+
+/**
+ * Serial request pacer. Reserves the next slot and reports how long the
+ * caller must wait for it; performing the wait is the shell's job, because
+ * only the shell knows whether it is holding a thread, a queue or a timer.
+ *
+ * Reservation, not throttling: the answer is computed and committed in one
+ * step, so two racing callers get two different slots rather than the same
+ * one twice.
+ */
+open class CoreFamilyRelayPacer:
+    CoreFamilyRelayPacerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corefamilyrelaypacer(self.pointer, $0) }
+    }
+    /**
+     * The deployed pacer: [`FAMILY_RELAY_REQUEST_INTERVAL_MS`] between
+     * requests.
+     */
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corefamilyrelaypacer_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corefamilyrelaypacer(pointer, $0) }
+    }
+
+
+    /**
+     * Test/diagnostic constructor. A negative interval is clamped to zero
+     * rather than allowed to run the reservation backwards.
+     */
+public static func withIntervalMs(intervalMs: Int64) -> CoreFamilyRelayPacer {
+    return try!  FfiConverterTypeCoreFamilyRelayPacer.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corefamilyrelaypacer_with_interval_ms(
+        FfiConverterInt64.lower(intervalMs),$0
+    )
+})
+}
+
+
+
+    /**
+     * Claims the next request slot and returns the wait, in milliseconds,
+     * before it may be used. Never negative.
+     *
+     * `now_ms` must come from a monotonic source — see the module docs.
+     */
+open func reserve(nowMs: Int64) -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corefamilyrelaypacer_reserve(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyRelayPacer: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreFamilyRelayPacer
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFamilyRelayPacer {
+        return CoreFamilyRelayPacer(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreFamilyRelayPacer) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyRelayPacer {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreFamilyRelayPacer, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyRelayPacer_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreFamilyRelayPacer {
+    return try FfiConverterTypeCoreFamilyRelayPacer.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyRelayPacer_lower(_ value: CoreFamilyRelayPacer) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreFamilyRelayPacer.lower(value)
+}
+
+
+
+
 public protocol CoreLanHealthTrackerProtocol : AnyObject {
 
     func clear()
@@ -12179,6 +12537,105 @@ public func FfiConverterTypeCoreRecipientDeliveryStatus_lower(_ value: CoreRecip
 }
 
 
+/**
+ * One row of the 429 backoff curve.
+ */
+public struct CoreRelayBackoffVector {
+    /**
+     * Stable name, so a failure names the case rather than an index.
+     */
+    public var name: String
+    public var retryAfterMs: UInt64
+    public var consecutiveRateLimits: UInt32
+    public var jitterMs: UInt64
+    public var expectedDelayMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Stable name, so a failure names the case rather than an index.
+         */name: String, retryAfterMs: UInt64, consecutiveRateLimits: UInt32, jitterMs: UInt64, expectedDelayMs: UInt64) {
+        self.name = name
+        self.retryAfterMs = retryAfterMs
+        self.consecutiveRateLimits = consecutiveRateLimits
+        self.jitterMs = jitterMs
+        self.expectedDelayMs = expectedDelayMs
+    }
+}
+
+
+
+extension CoreRelayBackoffVector: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayBackoffVector, rhs: CoreRelayBackoffVector) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.retryAfterMs != rhs.retryAfterMs {
+            return false
+        }
+        if lhs.consecutiveRateLimits != rhs.consecutiveRateLimits {
+            return false
+        }
+        if lhs.jitterMs != rhs.jitterMs {
+            return false
+        }
+        if lhs.expectedDelayMs != rhs.expectedDelayMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(retryAfterMs)
+        hasher.combine(consecutiveRateLimits)
+        hasher.combine(jitterMs)
+        hasher.combine(expectedDelayMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayBackoffVector: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayBackoffVector {
+        return
+            try CoreRelayBackoffVector(
+                name: FfiConverterString.read(from: &buf),
+                retryAfterMs: FfiConverterUInt64.read(from: &buf),
+                consecutiveRateLimits: FfiConverterUInt32.read(from: &buf),
+                jitterMs: FfiConverterUInt64.read(from: &buf),
+                expectedDelayMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayBackoffVector, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterUInt64.write(value.retryAfterMs, into: &buf)
+        FfiConverterUInt32.write(value.consecutiveRateLimits, into: &buf)
+        FfiConverterUInt64.write(value.jitterMs, into: &buf)
+        FfiConverterUInt64.write(value.expectedDelayMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayBackoffVector_lift(_ buf: RustBuffer) throws -> CoreRelayBackoffVector {
+    return try FfiConverterTypeCoreRelayBackoffVector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayBackoffVector_lower(_ value: CoreRelayBackoffVector) -> RustBuffer {
+    return FfiConverterTypeCoreRelayBackoffVector.lower(value)
+}
+
+
 public struct CoreRelayEnvelopeDisposition {
     public var relayId: Int64
     /**
@@ -12465,6 +12922,256 @@ public func FfiConverterTypeCoreRelayFetchedEnvelope_lower(_ value: CoreRelayFet
 }
 
 
+/**
+ * One health fold.
+ */
+public struct CoreRelayHealthVector {
+    public var name: String
+    public var fault: CoreRelayFault?
+    public var ownRelaySucceeded: Bool
+    public var anyRelaySucceeded: Bool
+    public var expected: CoreRelayPassHealth
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, fault: CoreRelayFault?, ownRelaySucceeded: Bool, anyRelaySucceeded: Bool, expected: CoreRelayPassHealth) {
+        self.name = name
+        self.fault = fault
+        self.ownRelaySucceeded = ownRelaySucceeded
+        self.anyRelaySucceeded = anyRelaySucceeded
+        self.expected = expected
+    }
+}
+
+
+
+extension CoreRelayHealthVector: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayHealthVector, rhs: CoreRelayHealthVector) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.fault != rhs.fault {
+            return false
+        }
+        if lhs.ownRelaySucceeded != rhs.ownRelaySucceeded {
+            return false
+        }
+        if lhs.anyRelaySucceeded != rhs.anyRelaySucceeded {
+            return false
+        }
+        if lhs.expected != rhs.expected {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(fault)
+        hasher.combine(ownRelaySucceeded)
+        hasher.combine(anyRelaySucceeded)
+        hasher.combine(expected)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayHealthVector: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayHealthVector {
+        return
+            try CoreRelayHealthVector(
+                name: FfiConverterString.read(from: &buf),
+                fault: FfiConverterOptionTypeCoreRelayFault.read(from: &buf),
+                ownRelaySucceeded: FfiConverterBool.read(from: &buf),
+                anyRelaySucceeded: FfiConverterBool.read(from: &buf),
+                expected: FfiConverterTypeCoreRelayPassHealth.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayHealthVector, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterOptionTypeCoreRelayFault.write(value.fault, into: &buf)
+        FfiConverterBool.write(value.ownRelaySucceeded, into: &buf)
+        FfiConverterBool.write(value.anyRelaySucceeded, into: &buf)
+        FfiConverterTypeCoreRelayPassHealth.write(value.expected, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayHealthVector_lift(_ buf: RustBuffer) throws -> CoreRelayHealthVector {
+    return try FfiConverterTypeCoreRelayHealthVector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayHealthVector_lower(_ value: CoreRelayHealthVector) -> RustBuffer {
+    return FfiConverterTypeCoreRelayHealthVector.lower(value)
+}
+
+
+/**
+ * One jitter derivation. `expected_jitter_ms` is what BLAKE2b under
+ * [`FAMILY_RELAY_JITTER_CONTEXT`] produces; if a platform ever disagrees the
+ * binding is marshalling the byte array wrong.
+ */
+public struct CoreRelayJitterVector {
+    public var name: String
+    public var identityPublicBytes: Data
+    public var expectedJitterMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, identityPublicBytes: Data, expectedJitterMs: UInt64) {
+        self.name = name
+        self.identityPublicBytes = identityPublicBytes
+        self.expectedJitterMs = expectedJitterMs
+    }
+}
+
+
+
+extension CoreRelayJitterVector: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayJitterVector, rhs: CoreRelayJitterVector) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.identityPublicBytes != rhs.identityPublicBytes {
+            return false
+        }
+        if lhs.expectedJitterMs != rhs.expectedJitterMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(identityPublicBytes)
+        hasher.combine(expectedJitterMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayJitterVector: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayJitterVector {
+        return
+            try CoreRelayJitterVector(
+                name: FfiConverterString.read(from: &buf),
+                identityPublicBytes: FfiConverterData.read(from: &buf),
+                expectedJitterMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayJitterVector, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterData.write(value.identityPublicBytes, into: &buf)
+        FfiConverterUInt64.write(value.expectedJitterMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayJitterVector_lift(_ buf: RustBuffer) throws -> CoreRelayJitterVector {
+    return try FfiConverterTypeCoreRelayJitterVector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayJitterVector_lower(_ value: CoreRelayJitterVector) -> RustBuffer {
+    return FfiConverterTypeCoreRelayJitterVector.lower(value)
+}
+
+
+/**
+ * One step of a pacer sequence. Rows are applied in order to a single fresh
+ * [`CoreFamilyRelayPacer`]; the state carried between them is the point.
+ */
+public struct CoreRelayPacerVector {
+    public var name: String
+    public var nowMs: Int64
+    public var expectedWaitMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, nowMs: Int64, expectedWaitMs: Int64) {
+        self.name = name
+        self.nowMs = nowMs
+        self.expectedWaitMs = expectedWaitMs
+    }
+}
+
+
+
+extension CoreRelayPacerVector: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayPacerVector, rhs: CoreRelayPacerVector) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        if lhs.expectedWaitMs != rhs.expectedWaitMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(nowMs)
+        hasher.combine(expectedWaitMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPacerVector: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPacerVector {
+        return
+            try CoreRelayPacerVector(
+                name: FfiConverterString.read(from: &buf),
+                nowMs: FfiConverterInt64.read(from: &buf),
+                expectedWaitMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayPacerVector, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+        FfiConverterInt64.write(value.expectedWaitMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPacerVector_lift(_ buf: RustBuffer) throws -> CoreRelayPacerVector {
+    return try FfiConverterTypeCoreRelayPacerVector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPacerVector_lower(_ value: CoreRelayPacerVector) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPacerVector.lower(value)
+}
+
+
 public struct CoreRelayPresence {
     public var hint: Data
     public var lastSeenMs: Int64
@@ -12594,6 +13301,99 @@ public func FfiConverterTypeCoreRelayPresencePage_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeCoreRelayPresencePage_lower(_ value: CoreRelayPresencePage) -> RustBuffer {
     return FfiConverterTypeCoreRelayPresencePage.lower(value)
+}
+
+
+/**
+ * One rerun decision.
+ */
+public struct CoreRelayRerunVector {
+    public var name: String
+    public var pendingRequested: Bool
+    public var canSync: Bool
+    public var backoffRemainingMs: Int64
+    public var expected: CoreRelayRerunAction
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, pendingRequested: Bool, canSync: Bool, backoffRemainingMs: Int64, expected: CoreRelayRerunAction) {
+        self.name = name
+        self.pendingRequested = pendingRequested
+        self.canSync = canSync
+        self.backoffRemainingMs = backoffRemainingMs
+        self.expected = expected
+    }
+}
+
+
+
+extension CoreRelayRerunVector: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayRerunVector, rhs: CoreRelayRerunVector) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.pendingRequested != rhs.pendingRequested {
+            return false
+        }
+        if lhs.canSync != rhs.canSync {
+            return false
+        }
+        if lhs.backoffRemainingMs != rhs.backoffRemainingMs {
+            return false
+        }
+        if lhs.expected != rhs.expected {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(pendingRequested)
+        hasher.combine(canSync)
+        hasher.combine(backoffRemainingMs)
+        hasher.combine(expected)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayRerunVector: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayRerunVector {
+        return
+            try CoreRelayRerunVector(
+                name: FfiConverterString.read(from: &buf),
+                pendingRequested: FfiConverterBool.read(from: &buf),
+                canSync: FfiConverterBool.read(from: &buf),
+                backoffRemainingMs: FfiConverterInt64.read(from: &buf),
+                expected: FfiConverterTypeCoreRelayRerunAction.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayRerunVector, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterBool.write(value.pendingRequested, into: &buf)
+        FfiConverterBool.write(value.canSync, into: &buf)
+        FfiConverterInt64.write(value.backoffRemainingMs, into: &buf)
+        FfiConverterTypeCoreRelayRerunAction.write(value.expected, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRerunVector_lift(_ buf: RustBuffer) throws -> CoreRelayRerunVector {
+    return try FfiConverterTypeCoreRelayRerunVector.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRerunVector_lower(_ value: CoreRelayRerunVector) -> RustBuffer {
+    return FfiConverterTypeCoreRelayRerunVector.lower(value)
 }
 
 
@@ -19160,6 +19960,141 @@ extension CoreRelayFault: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The health one completed relay pass earns, as a domain fact. The shells map
+ * it to their own display type and attach their own timestamp; nothing here
+ * is a string, and nothing here is localized.
+ */
+
+public enum CoreRelayPassHealth {
+
+    /**
+     * Our own relay answered and so did every other one we tried.
+     */
+    case ok
+    /**
+     * 507: the family's hosted storage is full.
+     */
+    case quotaFull
+    /**
+     * 413: one queued envelope can never post as-is.
+     */
+    case messageTooLarge
+    /**
+     * 429: self-healing, never an error to act on.
+     */
+    case rateLimited
+    /**
+     * 403 `family_expired`.
+     */
+    case expired
+    /**
+     * 403 `family_suspended`.
+     */
+    case suspended
+    /**
+     * Any other 401/403 against our own saved credential.
+     */
+    case tokenRejected
+    /**
+     * Something failed and said nothing structured about why.
+     */
+    case failing
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPassHealth: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayPassHealth
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPassHealth {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .ok
+
+        case 2: return .quotaFull
+
+        case 3: return .messageTooLarge
+
+        case 4: return .rateLimited
+
+        case 5: return .expired
+
+        case 6: return .suspended
+
+        case 7: return .tokenRejected
+
+        case 8: return .failing
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayPassHealth, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .ok:
+            writeInt(&buf, Int32(1))
+
+
+        case .quotaFull:
+            writeInt(&buf, Int32(2))
+
+
+        case .messageTooLarge:
+            writeInt(&buf, Int32(3))
+
+
+        case .rateLimited:
+            writeInt(&buf, Int32(4))
+
+
+        case .expired:
+            writeInt(&buf, Int32(5))
+
+
+        case .suspended:
+            writeInt(&buf, Int32(6))
+
+
+        case .tokenRejected:
+            writeInt(&buf, Int32(7))
+
+
+        case .failing:
+            writeInt(&buf, Int32(8))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPassHealth_lift(_ buf: RustBuffer) throws -> CoreRelayPassHealth {
+    return try FfiConverterTypeCoreRelayPassHealth.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPassHealth_lower(_ value: CoreRelayPassHealth) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPassHealth.lower(value)
+}
+
+
+
+extension CoreRelayPassHealth: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * State of *this phone's* Shore Pass path.
  *
  * One variant per row the Paths section can show. `Message too large` is
@@ -19319,6 +20254,91 @@ public func FfiConverterTypeCoreRelayPathState_lower(_ value: CoreRelayPathState
 
 
 extension CoreRelayPathState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a relay engine does with a nudge that arrived while a pass was already
+ * running.
+ */
+
+public enum CoreRelayRerunAction {
+
+    /**
+     * A nudge is pending and nothing forbids syncing: start another pass now.
+     */
+    case runAgain
+    /**
+     * A nudge is pending but the quiet window is still open: hand the nudge
+     * to the coalesced retry timer instead of starting a pass inside it.
+     */
+    case scheduleRateLimitRetry
+    /**
+     * Nothing pending, or syncing is impossible: release the worker.
+     */
+    case stop
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayRerunAction: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayRerunAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayRerunAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .runAgain
+
+        case 2: return .scheduleRateLimitRetry
+
+        case 3: return .stop
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayRerunAction, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .runAgain:
+            writeInt(&buf, Int32(1))
+
+
+        case .scheduleRateLimitRetry:
+            writeInt(&buf, Int32(2))
+
+
+        case .stop:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRerunAction_lift(_ buf: RustBuffer) throws -> CoreRelayRerunAction {
+    return try FfiConverterTypeCoreRelayRerunAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRerunAction_lower(_ value: CoreRelayRerunAction) -> RustBuffer {
+    return FfiConverterTypeCoreRelayRerunAction.lower(value)
+}
+
+
+
+extension CoreRelayRerunAction: Equatable, Hashable {}
 
 
 
@@ -21534,6 +22554,30 @@ fileprivate struct FfiConverterOptionTypeCorePersonAttention: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreRelayFault: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayFault?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreRelayFault.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreRelayFault.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreTransport: FfiConverterRustBuffer {
     typealias SwiftType = CoreTransport?
 
@@ -22106,6 +23150,31 @@ fileprivate struct FfiConverterSequenceTypeCoreRecipientDeliveryStatus: FfiConve
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayBackoffVector: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayBackoffVector]
+
+    public static func write(_ value: [CoreRelayBackoffVector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayBackoffVector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayBackoffVector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayBackoffVector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayBackoffVector.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreRelayEnvelopeDisposition: FfiConverterRustBuffer {
     typealias SwiftType = [CoreRelayEnvelopeDisposition]
 
@@ -22156,6 +23225,81 @@ fileprivate struct FfiConverterSequenceTypeCoreRelayFetchedEnvelope: FfiConverte
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayHealthVector: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayHealthVector]
+
+    public static func write(_ value: [CoreRelayHealthVector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayHealthVector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayHealthVector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayHealthVector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayHealthVector.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayJitterVector: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayJitterVector]
+
+    public static func write(_ value: [CoreRelayJitterVector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayJitterVector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayJitterVector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayJitterVector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayJitterVector.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayPacerVector: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayPacerVector]
+
+    public static func write(_ value: [CoreRelayPacerVector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayPacerVector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayPacerVector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayPacerVector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayPacerVector.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreRelayPresence: FfiConverterRustBuffer {
     typealias SwiftType = [CoreRelayPresence]
 
@@ -22173,6 +23317,31 @@ fileprivate struct FfiConverterSequenceTypeCoreRelayPresence: FfiConverterRustBu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCoreRelayPresence.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayRerunVector: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayRerunVector]
+
+    public static func write(_ value: [CoreRelayRerunVector], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayRerunVector.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayRerunVector] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayRerunVector]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayRerunVector.read(from: &buf))
         }
         return seq
     }
@@ -23185,6 +24354,114 @@ public func coreFailoverResumeWindowMs() -> Int64 {
     )
 })
 }
+/**
+ * The ceiling on the exponential term, for shells and tests that want to
+ * assert they are reading core's number rather than one of their own.
+ */
+public func coreFamilyRelayBackoffCapMs() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_backoff_cap_ms($0
+    )
+})
+}
+/**
+ * How long to stay quiet after a family 429.
+ *
+ * `Retry-After` is a floor and not a ceiling: the server states the minimum
+ * it will tolerate, and a client that has now been refused several times in a
+ * row has evidence the server's minimum is not enough. So the answer is the
+ * larger of the advertised window and this phone's exponential term, plus the
+ * phone's stable offset.
+ *
+ * `consecutive_rate_limits` is the count *including* the 429 being handled,
+ * so the first one yields [`FAMILY_RELAY_BACKOFF_BASE_MS`]. Zero is treated
+ * as one rather than rejected.
+ *
+ * `jitter_ms` is a separate argument rather than an identity so that the
+ * curve is exactly testable; [`CoreFamilyRelayBackoff::on_rate_limited`]
+ * composes it with [`core_family_relay_jitter_ms`].
+ */
+public func coreFamilyRelayBackoffDelayMs(retryAfterMs: UInt64, consecutiveRateLimits: UInt32, jitterMs: UInt64) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_backoff_delay_ms(
+        FfiConverterUInt64.lower(retryAfterMs),
+        FfiConverterUInt32.lower(consecutiveRateLimits),
+        FfiConverterUInt64.lower(jitterMs),$0
+    )
+})
+}
+/**
+ * The 429 curve, including the cases that used to be asserted separately in
+ * Kotlin and Swift.
+ */
+public func coreFamilyRelayBackoffVectors() -> [CoreRelayBackoffVector] {
+    return try!  FfiConverterSequenceTypeCoreRelayBackoffVector.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_backoff_vectors($0
+    )
+})
+}
+/**
+ * The pass health fold, including the expiry-in-grace case that a green check
+ * used to hide.
+ */
+public func coreFamilyRelayHealthVectors() -> [CoreRelayHealthVector] {
+    return try!  FfiConverterSequenceTypeCoreRelayHealthVector.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_health_vectors($0
+    )
+})
+}
+/**
+ * The stable anti-lockstep offset for one identity, in
+ * `0..=FAMILY_RELAY_JITTER_WINDOW_MS`.
+ *
+ * `identity_public_bytes` is a public value — the user id from a friend card.
+ * Passing a private key here would be a bug, not a stronger derivation: the
+ * offset is observable in request timing, so anything secret fed into it is
+ * leaked at whatever rate the phone gets rate limited.
+ *
+ * Empty input is answered rather than rejected, because an identity that has
+ * not loaded yet must still be able to back off; it simply shares the offset
+ * every other empty identity draws.
+ */
+public func coreFamilyRelayJitterMs(identityPublicBytes: Data) -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_jitter_ms(
+        FfiConverterData.lower(identityPublicBytes),$0
+    )
+})
+}
+/**
+ * Jitter draws. Distinct identities must draw distinct offsets far more often
+ * than not, every offset must sit inside the window, and the same bytes must
+ * always draw the same offset — including across a restart, which is what
+ * "stable" means here.
+ */
+public func coreFamilyRelayJitterVectors() -> [CoreRelayJitterVector] {
+    return try!  FfiConverterSequenceTypeCoreRelayJitterVector.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_jitter_vectors($0
+    )
+})
+}
+/**
+ * A pacer sequence: two requests inside one instant, one that only partly
+ * waits out the interval, and one that arrives after the reservation has
+ * lapsed. Applied in order to one pacer.
+ */
+public func coreFamilyRelayPacerVectors() -> [CoreRelayPacerVector] {
+    return try!  FfiConverterSequenceTypeCoreRelayPacerVector.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_pacer_vectors($0
+    )
+})
+}
+/**
+ * Rerun decisions, including the storm case (#222) that the rule exists for.
+ */
+public func coreFamilyRelayRerunVectors() -> [CoreRelayRerunVector] {
+    return try!  FfiConverterSequenceTypeCoreRelayRerunVector.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_family_relay_rerun_vectors($0
+    )
+})
+}
 public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_format_lan_endpoint(
@@ -23653,6 +24930,37 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
 })
 }
 /**
+ * Fold one pass's worst fault and its success flags into a single health.
+ *
+ * The mailbox-level faults (quota, oversized, rate-limited) surface even when
+ * polling succeeded, because relayd keeps serving fetches while rejecting
+ * posts; before that was true these rejections vanished into a green check
+ * and a silent retry loop.
+ *
+ * [`CoreRelayFault::PassExpired`] belongs in that same group and for the same
+ * reason. For relayd's seven-day `FAMILY_EXPIRY_GRACE_MS` an expired pass
+ * keeps fetching and acking so nobody's last messages are stranded
+ * mid-cruise, and only POSTs take the 403. So the success flags read
+ * "reachable" for a week while every new message is rejected, and folding
+ * expiry below them told a paying family their pass was working when nothing
+ * they wrote was leaving the phone.
+ *
+ * The other two credential faults keep the older precedence, and that is not
+ * an oversight: relayd rejects EVERY operation for a suspended family and for
+ * an unknown token, so neither can co-occur with a successful poll at all.
+ * Expiry-in-grace is the only credential fault that can, which is why it is
+ * the only one that moves.
+ */
+public func coreRelayPassHealth(fault: CoreRelayFault?, ownRelaySucceeded: Bool, anyRelaySucceeded: Bool) -> CoreRelayPassHealth {
+    return try!  FfiConverterTypeCoreRelayPassHealth.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_pass_health(
+        FfiConverterOptionTypeCoreRelayFault.lower(fault),
+        FfiConverterBool.lower(ownRelaySucceeded),
+        FfiConverterBool.lower(anyRelaySucceeded),$0
+    )
+})
+}
+/**
  * Does the relay-upload backlog for this recipient say anything about
  * *delivery*?
  *
@@ -23680,6 +24988,34 @@ public func coreRelayQueueReflectsDelivery(relay: CoreRelayPathState, contactHas
         FfiConverterTypeCoreRelayPathState.lower(relay),
         FfiConverterBool.lower(contactHasRelayEndpoint),
         FfiConverterBool.lower(contactRelayStale),$0
+    )
+})
+}
+/**
+ * `RATE-01`'s second clause, as one decision.
+ *
+ * The rate-limit gate at the front door of a sync request only guards the
+ * front door. A nudge that arrives while a pass is already in flight just
+ * sets a pending flag, and a pending rerun that starts immediately ignores
+ * the window the pass it followed had just recorded. On a phone with a deep
+ * carry queue that is back-to-back passes under a second apart, each
+ * re-posting a full batch into "too fast", around the clock — the re-upload
+ * storm of #222.
+ *
+ * So the rerun consults the same window the front door does. The pending
+ * nudge is never *lost*: `ScheduleRateLimitRetry` means it becomes the
+ * coalesced retry at the window's end, which is also why several nudges
+ * arriving during one window cost one pass rather than one pass each.
+ *
+ * `backoff_remaining_ms` may be negative — an elapsed window — and that reads
+ * as no window at all rather than as a very short one.
+ */
+public func coreRelayRerunAction(pendingRequested: Bool, canSync: Bool, backoffRemainingMs: Int64) -> CoreRelayRerunAction {
+    return try!  FfiConverterTypeCoreRelayRerunAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_rerun_action(
+        FfiConverterBool.lower(pendingRequested),
+        FfiConverterBool.lower(canSync),
+        FfiConverterInt64.lower(backoffRemainingMs),$0
     )
 })
 }
@@ -23805,6 +25141,24 @@ public func coreVisibleGapIndices(messages: [StoredMessage], consumedHiddenLampo
     uniffi_cruisemesh_core_fn_func_core_visible_gap_indices(
         FfiConverterSequenceTypeStoredMessage.lower(messages),
         FfiConverterSequenceTypeConsumedHiddenLamport.lower(consumedHiddenLamports),$0
+    )
+})
+}
+/**
+ * Worst-of fold for the faults one pass observed against our OWN saved
+ * config, using the shared ranking in [`relay_fault_rank`].
+ *
+ * [`CoreRelayFault::Outage`] is deliberately never folded in by callers: an
+ * unstructured failure is what the pass's success flags already express as
+ * [`CoreRelayPassHealth::Failing`], and admitting it here would let a single
+ * dead contact endpoint outrank nothing at all while still displacing the
+ * `None` that means "no structured rejection seen".
+ */
+public func coreWorseRelayFault(current: CoreRelayFault?, observed: CoreRelayFault) -> CoreRelayFault {
+    return try!  FfiConverterTypeCoreRelayFault.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_worse_relay_fault(
+        FfiConverterOptionTypeCoreRelayFault.lower(current),
+        FfiConverterTypeCoreRelayFault.lower(observed),$0
     )
 })
 }
@@ -25990,6 +27344,30 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_failover_resume_window_ms() != 41431) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_backoff_cap_ms() != 19912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_backoff_delay_ms() != 38769) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_backoff_vectors() != 15497) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_health_vectors() != 3077) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_jitter_ms() != 65248) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_jitter_vectors() != 13732) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_pacer_vectors() != 64326) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_family_relay_rerun_vectors() != 2548) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -26077,7 +27455,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_health() != 29254) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_queue_reflects_delivery() != 16350) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_rerun_action() != 50476) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {
@@ -26102,6 +27486,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_visible_gap_indices() != 52100) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_worse_relay_fault() != 23921) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_create_group() != 45726) {
@@ -26498,6 +27885,18 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_window_ms() != 26799) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefamilyrelaybackoff_consecutive_rate_limits() != 30487) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefamilyrelaybackoff_on_rate_limited() != 12711) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefamilyrelaybackoff_on_successful_pass() != 28888) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corefamilyrelaypacer_reserve() != 45522) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_clear() != 47217) {
@@ -27119,6 +28518,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corefailoverresumedebounce_with_window_ms() != 55154) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaybackoff_new() != 58980) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaypacer_new() != 41076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corefamilyrelaypacer_with_interval_ms() != 43186) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corelanhealthtracker_new() != 56458) {

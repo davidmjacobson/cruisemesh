@@ -2,49 +2,41 @@ package com.cruisemesh.app.mesh
 
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import uniffi.cruisemesh_core.coreFamilyRelayRerunVectors
 
+/**
+ * The rerun decision lives in the core
+ * (`core/src/session/relay_policy.rs::core_relay_rerun_action`), under
+ * `RATE-01`. This file proves Android's shim reaches it and maps the answer
+ * onto the enum `RelaySyncEngine`'s `when` reads -- including the storm case
+ * the rule exists for, which the core exports as a named vector rather than
+ * leaving each platform to re-type it.
+ */
 class RelayRerunPolicyTest {
 
     @Test
-    fun `pending nudge with no backoff runs another pass`() {
-        assertEquals(
-            RelayRerunAction.RUN_AGAIN,
-            relayRerunAction(pendingRequested = true, canSync = true, backoffRemainingMs = 0),
-        )
-        assertEquals(
-            RelayRerunAction.RUN_AGAIN,
-            relayRerunAction(pendingRequested = true, canSync = true, backoffRemainingMs = -5_000),
-        )
+    fun `every core rerun vector survives the shim`() {
+        for (vector in coreFamilyRelayRerunVectors()) {
+            assertEquals(
+                vector.name,
+                vector.expected,
+                relayRerunAction(
+                    pendingRequested = vector.pendingRequested,
+                    canSync = vector.canSync,
+                    backoffRemainingMs = vector.backoffRemainingMs,
+                ),
+            )
+        }
     }
 
     @Test
-    fun `pending nudge inside the advertised window coalesces into the retry timer`() {
-        // The storm case: the pass that just finished recorded a 429 window,
-        // and a nudge arrived while it was in flight. Re-running immediately
-        // is exactly what melted the family rate budget.
-        assertEquals(
-            RelayRerunAction.SCHEDULE_RATE_LIMIT_RETRY,
-            relayRerunAction(pendingRequested = true, canSync = true, backoffRemainingMs = 1),
-        )
-    }
-
-    @Test
-    fun `no pending nudge releases the thread regardless of backoff`() {
-        assertEquals(
-            RelayRerunAction.STOP,
-            relayRerunAction(pendingRequested = false, canSync = true, backoffRemainingMs = 0),
-        )
-        assertEquals(
-            RelayRerunAction.STOP,
-            relayRerunAction(pendingRequested = false, canSync = true, backoffRemainingMs = 9_999),
-        )
-    }
-
-    @Test
-    fun `a pending nudge is dropped when syncing is impossible`() {
-        assertEquals(
-            RelayRerunAction.STOP,
-            relayRerunAction(pendingRequested = true, canSync = false, backoffRemainingMs = 0),
-        )
+    fun `the engine's three branches are all reachable`() {
+        // The `when` in RelaySyncEngine is exhaustive over these three, and an
+        // enum discriminant that arrived scrambled from the FFI would land the
+        // pass in the wrong branch without failing to compile.
+        val actions = coreFamilyRelayRerunVectors().map { vector ->
+            relayRerunAction(vector.pendingRequested, vector.canSync, vector.backoffRemainingMs)
+        }
+        assertEquals(RelayRerunAction.entries.toSet(), actions.toSet())
     }
 }

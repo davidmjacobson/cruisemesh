@@ -464,7 +464,7 @@ internal class RelaySyncEngine(
     private fun performRelaySyncPass(reason: String) {
         val identity = identityProvider() ?: return
         val now = System.currentTimeMillis()
-        familyBackoffIdentityHash = identity.userId.contentHashCode()
+        familyBackoffIdentity = identity.userId
         mailboxContinuationNeeded = false
         store.pruneExpiredOutboundEnvelopes(now)
         store.pruneExpiredOutgoingReceiptEnvelopes(now)
@@ -1042,7 +1042,13 @@ internal class RelaySyncEngine(
     /** Epoch ms until which relayd asked us not to sync again; 0 = no backoff. */
     @Volatile private var rateLimitedUntilMs = 0L
 
-    private var familyBackoffIdentityHash = 0
+    /**
+     * This device's public user id, captured at the start of a pass so a 429
+     * anywhere inside it can draw the family's stable anti-lockstep offset.
+     * The offset itself is derived in the core; this shell no longer hashes
+     * anything (see [FamilyRelayBackoff]).
+     */
+    private var familyBackoffIdentity: ByteArray = ByteArray(0)
     private val familyRelayRequestPacer = FamilyRelayRequestPacer()
     private val familyRelayBackoff = FamilyRelayBackoff()
 
@@ -1061,7 +1067,7 @@ internal class RelaySyncEngine(
         } catch (error: RelayHttpException) {
             if (relayClassifyHttpError(error.code.toUShort(), error.relayCode) == CoreRelayFault.RATE_LIMITED) {
                 val retryAfterMs = relayRetryAfterMs(error.retryAfter).toLong()
-                val delayMs = familyRelayBackoff.onRateLimited(retryAfterMs, familyBackoffIdentityHash)
+                val delayMs = familyRelayBackoff.onRateLimited(retryAfterMs, familyBackoffIdentity)
                 rateLimitedUntilMs = maxOf(rateLimitedUntilMs, System.currentTimeMillis() + delayMs)
                 ownRelayFault = worseRelayFault(ownRelayFault, CoreRelayFault.RATE_LIMITED)
                 throw FamilyRateLimitAbort(error)

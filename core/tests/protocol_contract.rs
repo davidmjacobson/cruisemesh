@@ -35,18 +35,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use cruisemesh_core::{
-    authored_expiry, core_contact_relay_unreachable_delta, core_is_hidden_spray_kind,
+    authored_expiry, core_contact_relay_unreachable_delta, core_family_relay_backoff_cap_ms,
+    core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_is_hidden_spray_kind,
     core_kind_persists_msg_id_row, core_own_capabilities, core_relay_ack_ids,
-    core_relay_queue_reflects_delivery, core_should_ack_inbound, encode_hello, encode_hello2,
-    generate_identity, may_start_carried_offer, parse_frame, relay_classify_http_error,
-    relay_cursor_advance, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
-    relay_mailbox_walk_action, relay_retry_after_ms, CarriedEnvelope, Contact,
-    CoreInboundDisposition, CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState,
+    core_relay_queue_reflects_delivery, core_relay_rerun_action, core_should_ack_inbound,
+    encode_hello, encode_hello2, generate_identity, may_start_carried_offer, parse_frame,
+    relay_classify_http_error, relay_cursor_advance, relay_fetch_walk_continues,
+    relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
+    CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition,
+    CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState, CoreRelayRerunAction,
     CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
     RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
-    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
-    LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
-    OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
+    FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES,
+    MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,11 +106,10 @@ const CONTRACT: &[Invariant] = &[
         id: "RATE-01",
         statement: "The first family 429 ends remaining pass network work; Retry-After is a \
                     floor no pending nudge may bypass.",
-        owner: Owner::HoistPending {
-            shell_tests: "android FamilyRelayBackpressureTest.kt + RelayRerunPolicyTest.kt; \
-                          ios FamilyRelayBackpressureTests.swift",
-            package: "B0 (relay policy hoist), completed by C0's pass abort",
-        },
+        owner: Owner::Core(
+            "core/src/session/relay_policy.rs pacing, backoff, jitter, rerun and health-fold \
+             tests (B0); C0's pass abort completes the first clause",
+        ),
     },
     Invariant {
         id: "ENDPOINT-01",
@@ -1199,7 +1201,7 @@ fn spray_01_one_peer_is_bounded_in_bytes_and_its_re_offers_are_cadence_gated() {
 }
 
 #[test]
-fn rate_01_the_retry_after_floor_is_core_even_though_the_pacing_is_not() {
+fn rate_01_the_quiet_window_is_a_floor_no_nudge_may_bypass() {
     let id = lookup("RATE-01").id;
 
     contract_assert!(
@@ -1233,19 +1235,120 @@ fn rate_01_the_retry_after_floor_is_core_even_though_the_pacing_is_not() {
             == CoreRelayFault::RateLimited,
         "a 429 must classify as rate limited, which is the abort trigger"
     );
+
+    // --- The floor is a floor in both directions (B0) ---------------------
+    //
+    // The advertised window is the server's minimum, and the exponential term
+    // is this client's own evidence that the minimum was not enough. Neither
+    // may shorten the other, and jitter is added on top rather than folded in,
+    // so no combination of the three can produce a window shorter than the
+    // largest of them.
+    for retry_after_ms in [0u64, 1_000, 15_000, 30_000, 60_000, 90_000] {
+        for consecutive in [1u32, 2, 3, 6, 7, 100, u32::MAX] {
+            for jitter_ms in [0u64, 1, 500, FAMILY_RELAY_JITTER_WINDOW_MS] {
+                let delay =
+                    core_family_relay_backoff_delay_ms(retry_after_ms, consecutive, jitter_ms);
+                contract_assert!(
+                    id,
+                    delay >= retry_after_ms,
+                    "a {consecutive}x-refused client waited {delay}ms, under the advertised \
+                     {retry_after_ms}ms floor"
+                );
+                let exponential = FAMILY_RELAY_BACKOFF_BASE_MS
+                    .saturating_mul(1u64 << consecutive.saturating_sub(1).min(6))
+                    .min(core_family_relay_backoff_cap_ms());
+                contract_assert!(
+                    id,
+                    delay >= exponential,
+                    "the exponential term for {consecutive} refusals ({exponential}ms) was \
+                     shortened to {delay}ms"
+                );
+            }
+        }
+    }
+
+    // Repeated refusals must strictly widen, up to the cap. A curve that
+    // flattened early is a curve that keeps spending a shared family bucket.
+    let widening: Vec<u64> = (1u32..=7)
+        .map(|count| core_family_relay_backoff_delay_ms(0, count, 0))
+        .collect();
+    contract_assert!(
+        id,
+        widening.windows(2).all(|pair| pair[1] > pair[0]),
+        "repeated 429s must widen the quiet period: {widening:?}"
+    );
+    contract_assert!(
+        id,
+        core_family_relay_backoff_delay_ms(0, u32::MAX, 0) == core_family_relay_backoff_cap_ms(),
+        "the widening must stop at the cap rather than growing without bound"
+    );
+
+    // --- A pending nudge may not bypass the window ------------------------
+    //
+    // The re-upload storm of #222 was exactly this: a nudge that arrived while
+    // a pass was in flight, re-running the moment that pass ended, inside the
+    // window the pass had just recorded.
+    for remaining_ms in [1i64, 10, 1_000, 30_000, i64::MAX] {
+        contract_assert!(
+            id,
+            core_relay_rerun_action(true, true, remaining_ms)
+                == CoreRelayRerunAction::ScheduleRateLimitRetry,
+            "a pending nudge with {remaining_ms}ms of quiet window left must defer into the \
+             coalesced retry, never start a pass"
+        );
+    }
+    for remaining_ms in [0i64, -1, -30_000, i64::MIN] {
+        contract_assert!(
+            id,
+            core_relay_rerun_action(true, true, remaining_ms) == CoreRelayRerunAction::RunAgain,
+            "an elapsed window ({remaining_ms}ms) must not keep deferring a pending nudge; \
+             PROGRESS-01 forbids a rerun loop that never runs"
+        );
+    }
+
+    // --- Jitter is stable, bounded, and never a platform hash -------------
+    //
+    // Stable because a restarting phone must not draw a new offset and jump
+    // the queue; bounded because the offset lengthens a window and an
+    // unbounded one would stall sync; derived here because two shells hashing
+    // a user id their own way is two different answers to one protocol rule.
+    let identity: Vec<u8> = (0u8..32).collect();
+    contract_assert!(
+        id,
+        core_family_relay_jitter_ms(identity.clone()) == core_family_relay_jitter_ms(identity),
+        "the anti-lockstep offset must not move between calls"
+    );
+    for byte in 0u8..=255 {
+        contract_assert!(
+            id,
+            core_family_relay_jitter_ms(vec![byte; 32]) <= FAMILY_RELAY_JITTER_WINDOW_MS,
+            "an offset outside the jitter window can stall sync on its own"
+        );
+    }
+
+    // --- The pacer is bounded, monotone, and rollback-safe ----------------
+    let pacer = CoreFamilyRelayPacer::new();
+    let mut previous = -1i64;
+    for _ in 0..8 {
+        let wait = pacer.reserve(0);
+        contract_assert!(
+            id,
+            wait > previous,
+            "each reservation in one instant must be later than the last, or the pacer is not \
+             pacing"
+        );
+        previous = wait;
+    }
+    contract_assert!(
+        id,
+        pacer.reserve(i64::MAX) == 0 && pacer.reserve(0) >= 0,
+        "an absurd or rewound clock must saturate, never wrap a wait into the past"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Markers for what is not owned yet
 // ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "HOIST-PENDING: RATE-01 pacing, exponential backoff, stable jitter and pending-rerun \
-            are owned by android FamilyRelayBackpressureTest.kt + RelayRerunPolicyTest.kt and ios \
-            FamilyRelayBackpressureTests.swift; hoist in package B0"]
-fn rate_01_pacing_and_backoff_are_still_shell_owned() {
-    unimplemented!("package B0 moves the pacer, the backoff curve and the rerun action into core");
-}
 
 #[test]
 #[ignore = "HOIST-PENDING: ENDPOINT-01 hint authoring is owned by android LanEndpointSendPolicyTest.kt \
