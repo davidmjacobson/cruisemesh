@@ -127,7 +127,9 @@ struct HoldToRecordButton: View {
 
     private var elapsedLabel: String {
         let seconds = Int(elapsed)
-        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+        // Not String(format: "%d:%02d", ...): Int is 64-bit here and %d reads
+        // 32, which is the kind of thing that works until it does not.
+        return "\(seconds / 60):" + String(format: "%02d", seconds % 60)
     }
 
     private func elapsedMs() -> UInt32 {

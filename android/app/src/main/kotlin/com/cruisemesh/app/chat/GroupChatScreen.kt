@@ -77,7 +77,6 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
-import uniffi.cruisemesh_core.voiceCapturePlan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import androidx.core.content.ContextCompat
@@ -139,7 +138,7 @@ fun GroupChatScreen(
                 currentGroup,
                 AttachmentPayload(
                     mediaType = AttachmentPayload.MediaType.AUDIO,
-                    mimeType = voiceCapturePlan().mimeType,
+                    mimeType = VoiceRecorder.plan.mimeType,
                     durationMs = durationMs,
                     blob = bytes,
                 ),

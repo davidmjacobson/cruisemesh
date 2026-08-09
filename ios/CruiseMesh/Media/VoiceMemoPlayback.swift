@@ -143,12 +143,19 @@ final class VoiceMemoPlaybackController: ObservableObject {
         }
     }
 
+    /// Pauses and hands the audio session back.
+    ///
+    /// Holding a `.playback` session open would keep every other app's audio
+    /// ducked for as long as the message sits paused, which could be until the
+    /// user leaves the chat. The player itself is kept so resuming picks up
+    /// where it stopped instead of decoding the blob again.
     func pause() {
         guard let player, isPlaying else { return }
         player.pause()
         isPlaying = false
         elapsed = max(0, player.currentTime)
         progressTimer = nil
+        releaseAudioSession()
     }
 
     /// Stops and releases the player and the audio session.
@@ -157,6 +164,15 @@ final class VoiceMemoPlaybackController: ObservableObject {
     }
 
     private func resume(_ player: VoiceMemoAudioPlaying) {
+        do {
+            ownsAudioSession = true
+            try activateAudioSession()
+        } catch {
+            reset(clearFailure: false)
+            playbackFailed = true
+            Self.log.error("Could not reactivate the session to resume: \(error.localizedDescription, privacy: .public)")
+            return
+        }
         guard player.play() else {
             reset(clearFailure: false)
             playbackFailed = true
@@ -187,10 +203,13 @@ final class VoiceMemoPlaybackController: ObservableObject {
         if clearFailure {
             playbackFailed = false
         }
-        if ownsAudioSession {
-            ownsAudioSession = false
-            deactivateAudioSession()
-        }
+        releaseAudioSession()
+    }
+
+    private func releaseAudioSession() {
+        guard ownsAudioSession else { return }
+        ownsAudioSession = false
+        deactivateAudioSession()
     }
 
     deinit {

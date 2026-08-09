@@ -1105,7 +1105,7 @@ struct VoiceMemoPlayerView: View {
 
     private static func clock(_ seconds: TimeInterval) -> String {
         let whole = Int(seconds.rounded(.down))
-        return String(format: "%d:%02d", whole / 60, whole % 60)
+        return "\(whole / 60):" + String(format: "%02d", whole % 60)
     }
 }
 

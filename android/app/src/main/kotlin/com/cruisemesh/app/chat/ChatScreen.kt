@@ -151,7 +151,6 @@ import uniffi.cruisemesh_core.voiceCaptureCancel
 import uniffi.cruisemesh_core.voiceCaptureDrag
 import uniffi.cruisemesh_core.voiceCaptureElapsed
 import uniffi.cruisemesh_core.voiceCaptureFinish
-import uniffi.cruisemesh_core.voiceCapturePlan
 import uniffi.cruisemesh_core.voiceCapturePress
 import uniffi.cruisemesh_core.voiceCaptureRelease
 import java.io.File
@@ -274,7 +273,7 @@ fun ChatScreen(
             currentContact,
             AttachmentPayload(
                 mediaType = AttachmentPayload.MediaType.AUDIO,
-                mimeType = voiceCapturePlan().mimeType,
+                mimeType = VoiceRecorder.plan.mimeType,
                 durationMs = durationMs,
                 blob = bytes,
             ),
@@ -945,7 +944,7 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
  * Push-to-talk records while the mic is held and sends on release. Sliding
  * left cancels; sliding up locks the recording hands-free so the finger can
  * come off. Every threshold, the minimum hold that counts as speech, and the
- * duration bound belong to the core ([voiceCapturePlan], [voiceCapturePress]
+ * duration bound belong to the core ([VoiceRecorder.plan], [voiceCapturePress]
  * and friends), so this screen and the iOS composer cannot disagree about what
  * the gesture means. The recorder itself is owned by [ChatScreen]; this
  * composable only drives it through [onStartVoice] / [onStopVoice] /
@@ -1180,13 +1179,18 @@ internal fun MessageComposer(
  * preview screenshot renderer inflates it in a sandbox that cannot load the
  * native library. `MessageComposerCoreContractTest` asserts this stays equal to
  * `voiceCaptureIdleState()`.
+ *
+ * A `get()` rather than a stored value: the generated record's fields are `var`,
+ * and a shared instance handed to several composers would be one stray write
+ * away from a very confusing bug.
  */
-internal val IDLE_VOICE_CAPTURE = CoreVoiceCaptureState(
-    phase = VoiceCapturePhase.IDLE,
-    cancelArmed = false,
-    lockArmed = false,
-    elapsedMs = 0u,
-)
+internal val IDLE_VOICE_CAPTURE: CoreVoiceCaptureState
+    get() = CoreVoiceCaptureState(
+        phase = VoiceCapturePhase.IDLE,
+        cancelArmed = false,
+        lockArmed = false,
+        elapsedMs = 0u,
+    )
 
 /** Drains the rest of a pointer gesture this composer is not acting on. */
 private suspend fun AwaitPointerEventScope.waitForRelease(pointerId: PointerId) {

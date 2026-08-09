@@ -92,13 +92,15 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         let fake = FakeVoiceMemoAudioPlayer()
         fake.duration = 12.5
         var factoryCalls = 0
+        var activations = 0
+        var deactivations = 0
         let playback = VoiceMemoPlaybackController(
             playerFactory: { _, _ in
                 factoryCalls += 1
                 return fake
             },
-            activateAudioSession: {},
-            deactivateAudioSession: {}
+            activateAudioSession: { activations += 1 },
+            deactivateAudioSession: { deactivations += 1 }
         )
 
         playback.play(blob: Data([1]))
@@ -106,20 +108,26 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertEqual(playback.total, 12.5)
         XCTAssertEqual(playback.elapsed, 0)
 
-        // Pausing captures where the message got to, and resuming does not
-        // start it over.
+        // Pausing captures where the message got to and hands the audio session
+        // back, so a message left paused does not keep other apps ducked.
         fake.currentTime = 4
         playback.toggle(blob: Data([1]))
 
         XCTAssertFalse(playback.isPlaying)
         XCTAssertEqual(playback.elapsed, 4)
         XCTAssertEqual(factoryCalls, 1)
+        XCTAssertEqual(deactivations, 1)
 
+        // Resuming takes the session back and picks up where it stopped.
         playback.toggle(blob: Data([1]))
 
         XCTAssertTrue(playback.isPlaying)
+        XCTAssertEqual(activations, 2)
         XCTAssertEqual(factoryCalls, 1, "resuming must not decode the blob a second time")
         XCTAssertEqual(fake.currentTime, 4, "resuming must not rewind")
+
+        playback.stop()
+        XCTAssertEqual(deactivations, 2)
     }
 
     func testStoppingClearsProgress() {
