@@ -2301,6 +2301,14 @@ public protocol CoreRelayPassProtocol : AnyObject {
      * Idempotent, and safe at any point: nothing is mid-transaction, because
      * no transaction spans an action. Any result that arrives afterwards is
      * stale by definition.
+     *
+     * A cancelled pass commits the evidence it *earned* — an authoritative
+     * rejection, an endpoint that answered — and no silence at all. Silence
+     * is the absence of an answer, and a pass pulled mid-request never gave
+     * the endpoint its chance to answer; committing it would let an app that
+     * is backgrounded during relay passes rest a healthy contact endpoint
+     * one cancellation at a time, which is the same harm as the stale
+     * endpoint demotions in #182 and #207.
      */
     func cancel(nowMs: Int64)  -> CoreRelayPassSummary
     
@@ -2320,6 +2328,12 @@ public protocol CoreRelayPassProtocol : AnyObject {
      * restarting: a pass is a one-shot object, and a driver that re-entered
      * here would otherwise re-run stage 1's pruning against a store the
      * first call had already pruned.
+     *
+     * Calling it after [`CoreRelayPass::cancel`], or after the pass
+     * finished, returns that summary and does nothing else. A cancelled pass
+     * that could be started again would issue requests and touch the store
+     * with no summary willing to admit it: `cancel` freezes the summary, so
+     * every later request would be work no transcript records.
      */
     func start(nowMs: Int64)  -> CoreRelayAction
     
@@ -2374,9 +2388,21 @@ open class CoreRelayPass:
     /**
      * Build a pass from durable store markers and an explicit plan.
      *
-     * `pass_id` is chosen by the caller so a driver, a log and a transcript
-     * can be joined; it is validated to be a short opaque token because it
-     * reaches protocol events. Anything else is replaced by `p`.
+     * `pass_id` is a *label*, not the identity. It is what a driver, a log
+     * and a transcript are joined on, so it must be a short opaque token —
+     * it reaches protocol events, and a UUID or a device name in one would
+     * be both too long and a thing worth not printing.
+     *
+     * The id the pass actually carries is derived from it: the label if it
+     * is usable, `p` if it is not, plus a suffix that is unique in this
+     * process. That suffix is the load-bearing part. `IDEMP-01`'s wrong-pass
+     * half is a comparison against this id, and two live passes that shared
+     * one — which is what silently replacing every unusable label with the
+     * same constant produced — would leave that comparison deciding nothing,
+     * with action ids restarting at 1 in every pass to collide underneath
+     * it. A result belonging to the pass before can then be applied to the
+     * action outstanding now: a fetch's `200` marking an upload posted that
+     * was never sent.
      */
 public convenience init(store: MessageStore, plan: CoreRelayPassPlan, passId: String) {
     let pointer =
@@ -2407,6 +2433,14 @@ public convenience init(store: MessageStore, plan: CoreRelayPassPlan, passId: St
      * Idempotent, and safe at any point: nothing is mid-transaction, because
      * no transaction spans an action. Any result that arrives afterwards is
      * stale by definition.
+     *
+     * A cancelled pass commits the evidence it *earned* — an authoritative
+     * rejection, an endpoint that answered — and no silence at all. Silence
+     * is the absence of an answer, and a pass pulled mid-request never gave
+     * the endpoint its chance to answer; committing it would let an app that
+     * is backgrounded during relay passes rest a healthy contact endpoint
+     * one cancellation at a time, which is the same harm as the stale
+     * endpoint demotions in #182 and #207.
      */
 open func cancel(nowMs: Int64) -> CoreRelayPassSummary {
     return try!  FfiConverterTypeCoreRelayPassSummary.lift(try! rustCall() {
@@ -2438,6 +2472,12 @@ open func resumeHttp(result: CoreRelayHttpResult) -> CoreRelayAction {
      * restarting: a pass is a one-shot object, and a driver that re-entered
      * here would otherwise re-run stage 1's pruning against a store the
      * first call had already pruned.
+     *
+     * Calling it after [`CoreRelayPass::cancel`], or after the pass
+     * finished, returns that summary and does nothing else. A cancelled pass
+     * that could be started again would issue requests and touch the store
+     * with no summary willing to admit it: `cancel` freezes the summary, so
+     * every later request would be work no transcript records.
      */
 open func start(nowMs: Int64) -> CoreRelayAction {
     return try!  FfiConverterTypeCoreRelayAction.lift(try! rustCall() {
@@ -4228,9 +4268,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * acked: a header this device cannot accept is not proof it was the
      * payload's endpoint consumer, so the server's copy survives for
      * another client or another build. It is still a *terminal*
-     * disposition, and deliberately so — such a header will not become
-     * acceptable later, and holding the frontier on it would strand every
-     * row above it on every ordinary pass, forever.
+     * disposition, and deliberately so — holding the frontier on one would
+     * strand every row above it on every ordinary pass, forever.
+     *
+     * What makes that survivable is the periodic sweep, which walks the
+     * mailbox from zero rather than from the frontier: a row this build
+     * refused and a later build accepts is re-presented there, and the
+     * server's copy was never acked away, so nothing was lost. Note the
+     * shape of what is being said, though — "a newer sender's header can
+     * cost this device a delay until it sweeps or updates" is a behaviour
+     * statement neither shipped shell was confirmed to make. Package C4
+     * pins it against `relayd` end-to-end before any shell migrates onto
+     * this primitive.
      * * `Seen` — this device already has the envelope. Three routes reach
      * it: a `messages` row, the consumed-hidden set, or the carry queue
      * naming the same `msg_id`; and a fourth, narrower one — the carry
@@ -4249,7 +4298,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * the true endpoint for is carried rather than opened, which costs a
      * re-fetch and never a deletion — the safe direction.
      */
-    func ingestRelayPage(envelopes: [CoreRelayFetchedEnvelope], nowMs: Int64) throws  -> CoreRelayPageIngest
+    func ingestRelayPage(envelopes: [CoreRelayFetchedEnvelope], nowMs: Int64, passId: String?, actionId: Int64) throws  -> CoreRelayPageIngest
     
     /**
      * Insert an opened incoming message together with the envelope id used
@@ -6747,9 +6796,18 @@ open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
      * acked: a header this device cannot accept is not proof it was the
      * payload's endpoint consumer, so the server's copy survives for
      * another client or another build. It is still a *terminal*
-     * disposition, and deliberately so — such a header will not become
-     * acceptable later, and holding the frontier on it would strand every
-     * row above it on every ordinary pass, forever.
+     * disposition, and deliberately so — holding the frontier on one would
+     * strand every row above it on every ordinary pass, forever.
+     *
+     * What makes that survivable is the periodic sweep, which walks the
+     * mailbox from zero rather than from the frontier: a row this build
+     * refused and a later build accepts is re-presented there, and the
+     * server's copy was never acked away, so nothing was lost. Note the
+     * shape of what is being said, though — "a newer sender's header can
+     * cost this device a delay until it sweeps or updates" is a behaviour
+     * statement neither shipped shell was confirmed to make. Package C4
+     * pins it against `relayd` end-to-end before any shell migrates onto
+     * this primitive.
      * * `Seen` — this device already has the envelope. Three routes reach
      * it: a `messages` row, the consumed-hidden set, or the carry queue
      * naming the same `msg_id`; and a fourth, narrower one — the carry
@@ -6768,11 +6826,13 @@ open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
      * the true endpoint for is carried rather than opened, which costs a
      * re-fetch and never a deletion — the safe direction.
      */
-open func ingestRelayPage(envelopes: [CoreRelayFetchedEnvelope], nowMs: Int64)throws  -> CoreRelayPageIngest {
+open func ingestRelayPage(envelopes: [CoreRelayFetchedEnvelope], nowMs: Int64, passId: String?, actionId: Int64)throws  -> CoreRelayPageIngest {
     return try  FfiConverterTypeCoreRelayPageIngest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_ingest_relay_page(self.uniffiClonePointer(),
         FfiConverterSequenceTypeCoreRelayFetchedEnvelope.lower(envelopes),
-        FfiConverterInt64.lower(nowMs),$0
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterOptionString.lower(passId),
+        FfiConverterInt64.lower(actionId),$0
     )
 })
 }
@@ -14468,6 +14528,18 @@ public func FfiConverterTypeCoreRelayPageIngest_lower(_ value: CoreRelayPageInge
 /**
  * Every bound one pass declares. Rides in the plan and back out in the
  * summary, so a transcript can prove `LIVE-01` without reading the loop.
+ *
+ * `max_requests` is exact: no pass issues more, and the ack a consumed page
+ * earns is counted against it like everything else — a page that cannot
+ * afford its ack holds its frontier and comes back next pass rather than
+ * spending a request the budget does not have.
+ *
+ * `max_envelopes` and `max_response_bytes` are *admission* limits, and the
+ * difference is worth stating because a summary is read against these
+ * numbers. No request is admitted once either count has reached its bound,
+ * so a pass can end at most one page of rows, or one response body, past
+ * them. Bounding them exactly would mean predicting a page's size before
+ * asking for it, which no client can do.
  */
 public struct CoreRelayPassBudgets {
     public var maxRequests: UInt32
@@ -21745,11 +21817,24 @@ public enum CoreRelayActionKind {
     case http(request: CoreRelayHttpRequest
     )
     /**
-     * Wait until this absolute time and call `resume_sleep`. Emitted when a
-     * pass is asked to run inside a quiet window it must honour.
+     * **This pass is over.** It was asked to run inside a quiet window it
+     * must honour, so it spent nothing and ended; `until_ms` is when the
+     * window closes, which is advice to whatever schedules the next pass.
+     * There is no resume from here — [`CoreRelayPass::summary`] carries the
+     * result, and the next attempt is a new pass.
      */
     case sleep(untilMs: Int64
     )
+    /**
+     * Nothing has happened and nothing is outstanding: only
+     * [`CoreRelayPass::start`] moves a pass out of this state.
+     *
+     * Returned when a result arrives before the pass began — which a driver
+     * that persisted an in-flight result across a process restart and
+     * replayed it against a freshly built pass will do. The result mutated
+     * nothing and started nothing.
+     */
+    case notStarted
     case finished(summary: CoreRelayPassSummary
     )
 }
@@ -21771,7 +21856,9 @@ public struct FfiConverterTypeCoreRelayActionKind: FfiConverterRustBuffer {
         case 2: return .sleep(untilMs: try FfiConverterInt64.read(from: &buf)
         )
         
-        case 3: return .finished(summary: try FfiConverterTypeCoreRelayPassSummary.read(from: &buf)
+        case 3: return .notStarted
+        
+        case 4: return .finished(summary: try FfiConverterTypeCoreRelayPassSummary.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -21792,8 +21879,12 @@ public struct FfiConverterTypeCoreRelayActionKind: FfiConverterRustBuffer {
             FfiConverterInt64.write(untilMs, into: &buf)
             
         
-        case let .finished(summary):
+        case .notStarted:
             writeInt(&buf, Int32(3))
+        
+        
+        case let .finished(summary):
+            writeInt(&buf, Int32(4))
             FfiConverterTypeCoreRelayPassSummary.write(summary, into: &buf)
             
         }
@@ -30680,13 +30771,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_retry_delay_ms() != 40354) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corerelaypass_cancel() != 63949) {
+    if (uniffi_cruisemesh_core_checksum_method_corerelaypass_cancel() != 11198) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corerelaypass_resume_http() != 33224) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_corerelaypass_start() != 2819) {
+    if (uniffi_cruisemesh_core_checksum_method_corerelaypass_start() != 12217) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corerelaypass_summary() != 53381) {
@@ -30956,7 +31047,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 38253) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 35783) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 27136) {
@@ -31241,7 +31332,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 29344) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_constructor_corerelaypass_new() != 27250) {
+    if (uniffi_cruisemesh_core_checksum_constructor_corerelaypass_new() != 55714) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corespraypolicy_new() != 15233) {

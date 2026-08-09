@@ -6310,9 +6310,18 @@ impl MessageStore {
     ///   acked: a header this device cannot accept is not proof it was the
     ///   payload's endpoint consumer, so the server's copy survives for
     ///   another client or another build. It is still a *terminal*
-    ///   disposition, and deliberately so — such a header will not become
-    ///   acceptable later, and holding the frontier on it would strand every
-    ///   row above it on every ordinary pass, forever.
+    ///   disposition, and deliberately so — holding the frontier on one would
+    ///   strand every row above it on every ordinary pass, forever.
+    ///
+    ///   What makes that survivable is the periodic sweep, which walks the
+    ///   mailbox from zero rather than from the frontier: a row this build
+    ///   refused and a later build accepts is re-presented there, and the
+    ///   server's copy was never acked away, so nothing was lost. Note the
+    ///   shape of what is being said, though — "a newer sender's header can
+    ///   cost this device a delay until it sweeps or updates" is a behaviour
+    ///   statement neither shipped shell was confirmed to make. Package C4
+    ///   pins it against `relayd` end-to-end before any shell migrates onto
+    ///   this primitive.
     /// * `Seen` — this device already has the envelope. Three routes reach
     ///   it: a `messages` row, the consumed-hidden set, or the carry queue
     ///   naming the same `msg_id`; and a fourth, narrower one — the carry
@@ -6334,6 +6343,8 @@ impl MessageStore {
         &self,
         envelopes: Vec<CoreRelayFetchedEnvelope>,
         now_ms: i64,
+        pass_id: Option<String>,
+        action_id: i64,
     ) -> Result<CoreRelayPageIngest, CoreError> {
         let mut ingest = CoreRelayPageIngest {
             rows: Vec::with_capacity(envelopes.len()),
@@ -6376,6 +6387,14 @@ impl MessageStore {
             } else {
                 let size = carried.sealed.len() as i64;
                 let digest = carried_content_digest(&carried.recipient_hint, &carried.sealed);
+                // The stored `hop_ttl` is one less than the header's, exactly
+                // as `carriedHopTtl` on Android and `carriedHopTtl` on iOS
+                // apply it to a relay-fetched row. Fetching from the relay
+                // and handing the envelope on is a hop, so a row stored
+                // verbatim would report a single-mule delivery as zero hops
+                // taken and would re-flood with one hop of the sender's
+                // budget this device never paid for.
+                let carried_hop_ttl = carried.hop_ttl.saturating_sub(1);
                 let inserted = tx
                     .execute(
                         "INSERT OR IGNORE INTO carried_envelopes
@@ -6384,7 +6403,7 @@ impl MessageStore {
                          VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1, ?8)",
                         params![
                             carried.msg_id,
-                            carried.hop_ttl as i64,
+                            carried_hop_ttl as i64,
                             carried.expiry,
                             carried.recipient_hint,
                             carried.sealed,
@@ -6424,24 +6443,32 @@ impl MessageStore {
 
         {
             let conn: &Connection = &conn;
-            crate::protocol_event::note(
-                conn,
-                &[crate::protocol_event::ProtocolEventDraft::new(
-                    crate::protocol_event::ProtocolEventCode::PageIngested,
-                    now_ms,
-                    if ingest.rows_ingested > 0 {
-                        "page_consumed_before_any_ack"
-                    } else {
-                        "replay_applied_nothing"
-                    },
-                )
-                .invariants(&["PAGE-01", "TXN-01", "IDEMP-01"])
-                .count("rows_returned", i64::from(ingest.rows_returned))
-                .count("rows_ingested", i64::from(ingest.rows_ingested))
-                .count("rows_already_known", i64::from(ingest.rows_already_known))
-                .count("rows_expired", i64::from(ingest.rows_expired))
-                .count("transactions", 1)],
-            );
+            // Named by pass and action like every other record the pass
+            // emits. Without them the one record that says TXN-01's first
+            // transaction happened is the one a reader cannot join to the
+            // fetch above it or the ack below it.
+            let mut draft = crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::PageIngested,
+                now_ms,
+                if ingest.rows_ingested > 0 {
+                    "page_consumed_before_any_ack"
+                } else {
+                    "replay_applied_nothing"
+                },
+            )
+            .invariants(&["PAGE-01", "TXN-01", "IDEMP-01"])
+            .count("rows_returned", i64::from(ingest.rows_returned))
+            .count("rows_ingested", i64::from(ingest.rows_ingested))
+            .count("rows_already_known", i64::from(ingest.rows_already_known))
+            .count("rows_expired", i64::from(ingest.rows_expired))
+            .count("transactions", 1);
+            if let Some(pass_id) = pass_id {
+                draft = draft.pass(pass_id);
+            }
+            if action_id > 0 {
+                draft = draft.action(action_id);
+            }
+            crate::protocol_event::note(conn, &[draft]);
         }
         Ok(ingest)
     }

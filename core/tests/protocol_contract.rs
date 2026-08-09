@@ -49,13 +49,13 @@ use cruisemesh_core::{
     CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition, CoreRelayActionKind,
     CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
     CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayPass,
-    CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction,
-    CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
-    RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
-    FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES,
-    MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES,
-    RECEIPT_TYPE_DELIVERED,
+    CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan, CoreRelayPassSummary,
+    CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan, CoreSprayPlanShape,
+    CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore, RelayMailboxWalkAction,
+    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, FAMILY_RELAY_BACKOFF_BASE_MS,
+    FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT,
+    KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS,
+    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,7 +151,9 @@ const CONTRACT: &[Invariant] = &[
         statement: "Every pass terminates inside its declared request, envelope, byte, and \
                     time/yield budgets.",
         owner: Owner::Core(
-            "core/tests/relay_pass_replay.rs drives CoreRelayPass against a temp store, a fake              clock and a scripted driver: declared budgets, four hostile relays, and every              incident fixture; index re-asserts the budgets and termination",
+            "core/tests/relay_pass_replay.rs drives CoreRelayPass against a temp store, a fake \
+             clock and a scripted driver: budgets small enough to bite, four hostile relays, and \
+             every incident fixture; index re-asserts the budgets and termination",
         ),
     },
     Invariant {
@@ -159,7 +161,9 @@ const CONTRACT: &[Invariant] = &[
         statement: "A continuation must strictly advance a cursor or strictly increase a future \
                     deadline; unchanged-state reschedule loops are forbidden.",
         owner: Owner::Core(
-            "core/src/relay_cursor.rs walk-budget yield plus core/tests/relay_pass_replay.rs              continuation-reason tests; index re-asserts that a pass which advanced nothing              schedules nothing",
+            "core/src/relay_cursor.rs walk-budget yield plus core/tests/relay_pass_replay.rs \
+             continuation-reason tests; index re-asserts that a pass which advanced nothing \
+             schedules nothing",
         ),
     },
     Invariant {
@@ -203,7 +207,9 @@ const CONTRACT: &[Invariant] = &[
         statement: "Duplicate, late, or replayed external results cannot double-apply a \
                     mutation, regress a cursor, or consume a carried row.",
         owner: Owner::Core(
-            "core/tests/relay_pass_replay.rs result-permutation tests (duplicate, future id,              stale id, wrong pass, late-after-finish, cancellation); index re-asserts the              duplicate case",
+            "core/tests/relay_pass_replay.rs result-permutation tests (duplicate, future id, \
+             stale id, wrong pass with the outstanding action id, late-after-finish, \
+             cancellation, result-before-start); index re-asserts the mid-pass duplicate",
         ),
     },
     Invariant {
@@ -211,7 +217,9 @@ const CONTRACT: &[Invariant] = &[
         statement: "No store transaction spans external I/O; page consume and frontier \
                     advancement stay two short transactions.",
         owner: Owner::Core(
-            "core/src/store.rs ingest_relay_page (one transaction, committed before return) plus              core/tests/relay_pass_replay.rs restart-between-consume-and-ack fault injection;              index re-asserts the two-transaction shape",
+            "core/src/store.rs ingest_relay_page (one transaction, committed before return) plus \
+             core/tests/relay_pass_replay.rs restart-between-consume-and-ack fault injection; \
+             index re-asserts the two-transaction shape",
         ),
     },
     Invariant {
@@ -1403,6 +1411,24 @@ fn drive_relay_pass(
     store: &Arc<MessageStore>,
     pass_id: &str,
     now_ms: i64,
+    respond: impl FnMut(&CoreRelayHttpRequest) -> (u16, Vec<u8>),
+) -> (CoreRelayPassSummary, u32) {
+    drive_relay_pass_held_to(
+        store,
+        pass_id,
+        now_ms,
+        core_relay_pass_default_budgets(),
+        respond,
+    )
+}
+
+/// The same, with budgets the caller chooses, for the assertions about what a
+/// budget actually stops.
+fn drive_relay_pass_held_to(
+    store: &Arc<MessageStore>,
+    pass_id: &str,
+    now_ms: i64,
+    budgets: CoreRelayPassBudgets,
     mut respond: impl FnMut(&CoreRelayHttpRequest) -> (u16, Vec<u8>),
 ) -> (CoreRelayPassSummary, u32) {
     let plan = CoreRelayPassPlan {
@@ -1419,7 +1445,7 @@ fn drive_relay_pass(
         swept_this_session: true,
         consecutive_rate_limits: 0,
         quiet_until_ms: 0,
-        budgets: core_relay_pass_default_budgets(),
+        budgets,
     };
     let pass = CoreRelayPass::new(store.clone(), plan, pass_id.to_string());
     let mut action = pass.start(now_ms);
@@ -1433,6 +1459,9 @@ fn drive_relay_pass(
                     pass.summary().expect("a slept pass has a summary"),
                     answered,
                 )
+            }
+            CoreRelayActionKind::NotStarted => {
+                panic!("a started pass cannot answer NotStarted")
             }
             CoreRelayActionKind::Http { ref request } => {
                 assert!(
@@ -1535,6 +1564,105 @@ fn live_01_a_pass_declares_its_budgets_and_terminates_inside_them() {
         summary.budgets == budgets,
         "the summary must carry the budgets it was held to, or a transcript cannot check them"
     );
+
+    // The deployed numbers sit far above what a healthy mailbox reaches, so
+    // the assertions above would also pass with no budget gate at all: what
+    // stops that scenario is the per-mailbox walk budget underneath it. This
+    // is the one that can only pass if the *pass* budget bites. A pass held
+    // to three requests against a relay with endless mail issues three.
+    let tight_store =
+        Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let tight = CoreRelayPassBudgets {
+        max_requests: 3,
+        ..core_relay_pass_default_budgets()
+    };
+    let mut next_tight = 1i64;
+    let (held, _) = drive_relay_pass_held_to(&tight_store, "p2", now_ms, tight, |_request| {
+        let rows: Vec<String> = (0..4)
+            .map(|_| {
+                let row = next_tight;
+                next_tight += 1;
+                format!(
+                    "{{\"id\":{row},\"msg_id\":\"{}\",\"hop_ttl\":3,\"recipient_hint\":\"{}\",\
+                      \"sealed\":\"{}\",\"expiry_ms\":{}}}",
+                    BASE64URL_NOPAD.encode(&contract_msg_id(row)),
+                    BASE64URL_NOPAD.encode(&compute_recipient_hint((0u8..32).collect(), now_ms)),
+                    BASE64URL_NOPAD.encode(&contract_sealed(row)),
+                    now_ms + 6 * 24 * 60 * 60 * 1000
+                )
+            })
+            .collect();
+        (
+            200,
+            format!(
+                "{{\"envelopes\":[{}],\"next_cursor\":{}}}",
+                rows.join(","),
+                next_tight - 1
+            )
+            .into_bytes(),
+        )
+    });
+    contract_assert!(
+        id,
+        held.requests_issued == tight.max_requests,
+        "a pass held to {} requests issued {}",
+        tight.max_requests,
+        held.requests_issued
+    );
+    contract_assert!(
+        id,
+        held.outcome == CoreRelayPassOutcome::BudgetYield,
+        "a pass stopped by a budget must say so, got {:?}",
+        held.outcome
+    );
+
+    // And the wall clock is a budget too: a driver whose answers each take
+    // longer than the whole deadline ends the pass rather than the pass
+    // ending the driver.
+    let slow_store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let slow = CoreRelayPassBudgets {
+        deadline_ms: 10,
+        ..core_relay_pass_default_budgets()
+    };
+    let mut next_slow = 10_001i64;
+    let (timed, answered) = drive_relay_pass_held_to(&slow_store, "p3", now_ms, slow, |_request| {
+        let rows: Vec<String> = (0..4)
+            .map(|_| {
+                let row = next_slow;
+                next_slow += 1;
+                format!(
+                    "{{\"id\":{row},\"msg_id\":\"{}\",\"hop_ttl\":3,\"recipient_hint\":\"{}\",\
+                      \"sealed\":\"{}\",\"expiry_ms\":{}}}",
+                    BASE64URL_NOPAD.encode(&contract_msg_id(row)),
+                    BASE64URL_NOPAD.encode(&compute_recipient_hint((0u8..32).collect(), now_ms)),
+                    BASE64URL_NOPAD.encode(&contract_sealed(row)),
+                    now_ms + 6 * 24 * 60 * 60 * 1000
+                )
+            })
+            .collect();
+        (
+            200,
+            format!(
+                "{{\"envelopes\":[{}],\"next_cursor\":{}}}",
+                rows.join(","),
+                next_slow - 1
+            )
+            .into_bytes(),
+        )
+    });
+    contract_assert!(
+        id,
+        answered == 1,
+        "a 10ms deadline against a 25ms answer must end the pass after one request, got \
+         {answered}"
+    );
+    contract_assert!(
+        id,
+        timed.outcome == CoreRelayPassOutcome::BudgetYield
+            && timed.finished_at_ms >= timed.started_at_ms,
+        "an expired deadline must end the pass as a budget yield, got {:?}",
+        timed.outcome
+    );
 }
 
 #[test]
@@ -1582,6 +1710,36 @@ fn idemp_01_a_duplicate_result_changes_nothing() {
         quiet_until_ms: 0,
         budgets: core_relay_pass_default_budgets(),
     };
+    // The page has to leave an action outstanding, or both lies below land on
+    // a finished pass and are decided by a different guard than the one this
+    // row advertises. Rows this device has already durably consumed earn an
+    // ack, and the ack is what stays outstanding.
+    let hint = compute_recipient_hint((0u8..32).collect(), now_ms);
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    let rows: Vec<String> = (1..=6i64)
+        .map(|row| {
+            let recorded = store
+                .core_record_consumed_hidden_msg_id(
+                    contract_msg_id(row),
+                    KIND_RECEIPT,
+                    hint.clone(),
+                    expiry,
+                    (0u8..32).collect(),
+                    now_ms,
+                )
+                .expect("record consumed-hidden");
+            assert!(recorded, "the consumed set must vouch for the seeded row");
+            format!(
+                "{{\"id\":{row},\"msg_id\":\"{}\",\"hop_ttl\":3,\"recipient_hint\":\"{}\",\
+                  \"sealed\":\"{}\",\"expiry_ms\":{expiry}}}",
+                BASE64URL_NOPAD.encode(&contract_msg_id(row)),
+                BASE64URL_NOPAD.encode(&hint),
+                BASE64URL_NOPAD.encode(&contract_sealed(row)),
+            )
+        })
+        .collect();
+    let page = format!("{{\"envelopes\":[{}],\"next_cursor\":6}}", rows.join(",")).into_bytes();
+
     let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
     let action = pass.start(now_ms);
     let CoreRelayActionKind::Http { .. } = action.kind else {
@@ -1593,36 +1751,68 @@ fn idemp_01_a_duplicate_result_changes_nothing() {
         action_id: action.action_id,
         status: 200,
         headers: Vec::new(),
-        body: EMPTY_RELAY_PAGE.to_vec(),
+        body: page,
         error: None,
         completed_at_ms: now_ms + 10,
     };
     let next = pass.resume_http(result.clone());
-    // The same answer again. It names an action that is no longer
-    // outstanding, so it must mutate nothing and be counted.
+    let CoreRelayActionKind::Http { .. } = next.kind else {
+        panic!("{id} violated: the consumed page must leave its ack outstanding");
+    };
+    let cursor_key = relay_cursor_key(
+        "https://relay.example".to_string(),
+        "member-token-cccccccccccc".to_string(),
+    );
+    let cursor_before = store
+        .relay_fetch_cursor(cursor_key.clone())
+        .expect("cursor")
+        .after_id;
+
+    // Lie one: the same answer again, naming an action that is no longer
+    // outstanding.
     let echoed = pass.resume_http(result);
-    match (&next.kind, &echoed.kind) {
-        (CoreRelayActionKind::Finished { summary }, CoreRelayActionKind::Finished { .. }) => {
-            contract_assert!(
-                id,
-                summary.stale_results_ignored == 0,
-                "the first answer was not stale"
-            );
-        }
-        (CoreRelayActionKind::Http { .. }, CoreRelayActionKind::Http { .. }) => {
-            contract_assert!(
-                id,
-                echoed.action_id == next.action_id,
-                "a duplicate must restate the outstanding action, not emit a new one"
-            );
-        }
-        (first, second) => panic!("{id} violated: unexpected pair {first:?} / {second:?}"),
-    }
-    let summary = pass.summary().expect("the pass finished");
     contract_assert!(
         id,
-        summary.stale_results_ignored >= 1,
-        "the duplicate must be recorded as ignored rather than silently dropped"
+        echoed.action_id == next.action_id
+            && matches!(echoed.kind, CoreRelayActionKind::Http { .. }),
+        "a duplicate must restate the outstanding action, not emit a new one"
+    );
+
+    // Lie two: another pass's answer, carrying the action id that *is*
+    // outstanding. Ids restart at 1 in every pass, so this collision is the
+    // ordinary case rather than an exotic one, and only the pass id decides
+    // it.
+    let wrong_pass = pass.resume_http(CoreRelayHttpResult {
+        pass_id: "pz".to_string(),
+        action_id: next.action_id,
+        status: 200,
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        error: None,
+        completed_at_ms: now_ms + 20,
+    });
+    contract_assert!(
+        id,
+        wrong_pass.action_id == next.action_id
+            && matches!(wrong_pass.kind, CoreRelayActionKind::Http { .. }),
+        "a result from another pass must leave this pass waiting for the same request"
+    );
+    contract_assert!(
+        id,
+        store
+            .relay_fetch_cursor(cursor_key)
+            .expect("cursor")
+            .after_id
+            == cursor_before,
+        "neither lie may move a frontier: the ack they impersonated had not succeeded"
+    );
+
+    let summary = pass.cancel(now_ms + 30);
+    contract_assert!(
+        id,
+        summary.stale_results_ignored == 2,
+        "both lies must be recorded as ignored rather than silently dropped, got {}",
+        summary.stale_results_ignored
     );
 }
 
@@ -1652,7 +1842,7 @@ fn txn_01_a_page_is_consumed_in_a_transaction_that_closes_before_any_ack() {
         .collect();
 
     let first = store
-        .ingest_relay_page(envelopes.clone(), now_ms)
+        .ingest_relay_page(envelopes.clone(), now_ms, Some("p1-1".to_string()), 3)
         .expect("ingest");
     contract_assert!(
         id,
@@ -1678,7 +1868,7 @@ fn txn_01_a_page_is_consumed_in_a_transaction_that_closes_before_any_ack() {
     // A crash and a relaunch: the relay re-presents the same page and the
     // replay applies nothing.
     let replay = store
-        .ingest_relay_page(envelopes, now_ms)
+        .ingest_relay_page(envelopes, now_ms, Some("p2-1".to_string()), 3)
         .expect("re-ingest");
     contract_assert!(
         id,

@@ -171,6 +171,24 @@ times the driver reports, which is the correct division of labour — core
 cannot time out a socket it cannot see, so a pass whose driver has stopped
 answering is bounded by the driver's own timeout and by nothing here.
 
+Two of the numbers are *exact* and two are *admission* limits, and a summary
+is read against them differently. `max_requests` is exact: the ack a consumed
+page earns is counted against it like any other request, and a page that
+cannot afford one holds its frontier and comes back next pass rather than
+spending a request the budget does not have. `max_envelopes` and
+`max_response_bytes` are checked before a request is admitted, so the last
+page admitted can carry a pass past them — by at most that page, or that
+body. Bounding them exactly would require predicting a page's size before
+asking for it.
+
+The evidence has to be scenarios where the budget is the thing that stops the
+pass. At deployed settings the per-mailbox walk budget cuts in first, so a
+default-settings test proves nothing about the pass-level gate; the owning
+suite therefore holds passes to budgets small enough to bite — three
+requests against endless mail, ten envelopes at eight rows a page, a deadline
+shorter than one answer — and each of those scenarios fails if the gate is
+removed.
+
 #### `PROGRESS-01` — a continuation must buy something
 
 Rescheduling is permitted only when the reschedule strictly advances a
@@ -284,6 +302,23 @@ for, and any mismatch restates that action unchanged, counts the result in
 keeps moving after the pass has finished is deliberate: a driver whose socket
 completed twenty minutes late deserves to appear in the summary.
 
+The comparison is only as good as the id. Action ids restart at 1 in every
+pass, so the pass id is what separates a late answer from the pass before
+from the answer this pass is waiting for — which means two live passes must
+never share one. `CoreRelayPass::new` therefore *derives* the id it carries
+from the label it was given, with a suffix unique in the process, rather than
+using the label directly. The test that pins it keeps the outstanding action
+id and changes only the pass id, because a permutation that changes both is
+decided by the action id alone and proves nothing about this half.
+
+A result that arrives before `start` is inert in the same way and is *not*
+allowed to start the pass: `start` is what records the time the pass's
+deadlines are measured from and where the quiet window is honoured, so a
+replayed result that ran the stage machine would run a pass from time zero,
+straight through a window it was built inside. This is the restart-recovery
+shape — a driver that persisted an in-flight result and replays it against a
+freshly built pass after process death.
+
 #### `TXN-01` — never hold a transaction across the network
 
 No store transaction spans HTTP, Bluetooth, LAN, a timer, or a platform
@@ -300,7 +335,15 @@ across the wait. `MessageStore::ingest_relay_page` is the first transaction
 and `MessageStore::advance_relay_fetch_cursor` the second, and a failed ack
 runs the second one anyway — with `page_fully_processed` false, so it records
 `frontier_held` and moves nothing. Not-doing-it leaves no evidence; holding it
-explicitly does.
+explicitly does. Every ack failure runs it, including a `429`: a rate-limited
+pass is the transcript that most needs to explain itself, and it must not be
+the one where a consumed page's frontier goes unrecorded.
+
+`ingest_relay_page` takes the pass and action ids that asked for the page and
+puts them on the `page_ingested` record, so the one record that says the
+first transaction happened joins the `action_emitted` above it and the ack
+below it. A transcript that could not be read one pass at a time at exactly
+that point would be missing it where it matters most.
 
 #### `QUEUE-01` — a delivered message must be able to leave the queue
 
@@ -714,9 +757,15 @@ finding another one is a finding, not a failure.
 |---|---|---|---|
 | Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | **C0 — resolved toward iOS, which is also the order the plan pinned.** The walk is the budgeted, abortable stage; presence sits behind it under Android's order and is therefore never reached on a device whose walk exhausts its budget every pass, which is exactly the device whose presence matters. Presence is one fixed-cost request. Cost of the change: one extra round trip of latency before the first fetch on a shallow mailbox, paid only by devices for which the walk was never the constraint. C1/C2 migrate Android |
 | What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | **C0 — resolved toward iOS.** `SILENCE-01` needs same-pass evidence, and a swallowed failure destroys it: a config whose presence failed and whose walk then succeeded is *not* silent, and one where both failed is stronger evidence than the walk alone, but swallowing made the two indistinguishable. Recording never skips the walk on either reading. C1/C2 migrate Android |
-| When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | **C0 — resolved toward Android.** The deciding case is a pass that ends abnormally. iOS's window exists only in memory until the pass completes, so a pass killed after its `429` leaves no window and the next launch walks straight back into the rate limit — the shape of #222. Committing at the refusal also makes the window a floor a later, shorter one cannot lower, which is what `RATE-01` says it is. `CoreRelayPassSummary::quiet_until_ms` is therefore set the moment the refusal is seen, and `cancel` reports it. C1/C2 migrate iOS |
+| When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | **C0 — resolved toward Android.** The window is a floor a later, shorter one cannot lower, which is what `RATE-01` says it is, and it exists from the refusal onward rather than from the end. `CoreRelayPassSummary::quiet_until_ms` is set the moment the refusal is seen, so a pass *cancelled* afterwards — an app backgrounded mid-pass — still reports it, where an accumulate-at-the-end pass reports nothing. Scope, stated plainly: this does **not** survive process death. Nothing in core persists the window; it lives in the pass object and in the summary, and Android's `rateLimitedUntilMs` is an in-memory field too, so neither shell has that property today. Making the floor durable is adapter work — a shell persisting the summary — and belongs to C1/C2 with the migration |
+| Where presence is announced and queried | per poll config: a contact on another family's relay has their hint queried on that relay | own mailbox only | **C0 — resolved toward iOS, and it costs something.** Announcing this device's hints into another family's mailbox tells that family we exist, which is a privacy cost with no visible benefit; the query half carries no such cost but is dropped with it, so a contact reachable only through another family's relay stops resolving a last-seen time once the shells migrate. Recorded here rather than left in a code comment because it was found while writing `relay_pass.rs` and was not in this table before. C3 decides whether to reinstate the query alone before it migrates the shells |
 | Where the pending-rerun decision is made | explicit at the rerun point (`relayRerunAction`), which re-arms the coalesced retry timer for the remaining window | implicit: the pending nudge re-enters the front door, which drops it, and the retry armed when the 429 was recorded is what actually fires | B0 — resolved toward Android: both shells now call `core_relay_rerun_action` at the rerun point, so the deferral is a decision rather than a side effect of two gates agreeing |
 | What seeds the anti-lockstep jitter | `ByteArray.contentHashCode()` — `java.util.Arrays.hashCode`, a 31-multiply over the user id | a hand-written FNV-1a over the user id, added because Swift's `hashValue` is process-randomized | B0 — resolved: neither. Core derives it from the public user id under a BLAKE2b context, and no shell computes a hash for this any more |
+
+The presence-scope row is the one this table gained by being used: nobody
+recorded it as a difference, and it only surfaced because writing a single
+implementation forced someone to answer it. That is the argument for keeping
+the list append-only.
 
 The first two were not known to be load-bearing when they were written down,
 and that was the point of writing them down: an undocumented difference cannot
@@ -726,7 +775,7 @@ invariant, no fixture and no row saying it was ever different. Having to argue
 each one out is what turned the first into a liveness question and the second
 into a `SILENCE-01` question. Neither answer was obvious from the code.
 
-All three resolutions are *decisions in core only* at this revision. C0 is
+All four resolutions are *decisions in core only* at this revision. C0 is
 dark: no production path on either shell reaches `CoreRelayPass`, so nothing a
 person is running has changed. The rows stay here rather than being deleted,
 because the value of this table is that it records that a difference existed.
@@ -867,6 +916,15 @@ invariants the scenario is about; the scenario is the executable proof that it
 does not happen here. Outcome tokens and counts in a fixture are therefore not
 a golden trace, and a session emitting different ones for the same scenario is
 not by itself a disagreement.
+
+Not a golden trace is not the same as unchecked. The counts a fixture states
+that are *derived from a rule this repository owns* are checked against that
+rule: a page-shrink step must be the one `relay_fetch_shrunk_limit` produces,
+a frontier may not move backwards and a held one may not move at all, and a
+page cannot consume or ack more rows than it returned. That is the class of
+number a hand edit gets wrong, and it is how the one correction below was
+found -- by reading, which is not a regression test, so the runner now carries
+one.
 
 Two fixtures are mesh-shaped and a relay pass cannot drive them at all: there
 is no encounter, no peer link and no receipt-repair planner in one.

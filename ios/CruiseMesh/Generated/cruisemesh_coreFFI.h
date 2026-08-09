@@ -1124,7 +1124,7 @@ int8_t uniffi_cruisemesh_core_fn_method_messagestore_hint_matches_known_target(v
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_INGEST_RELAY_PAGE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_INGEST_RELAY_PAGE
-RustBuffer uniffi_cruisemesh_core_fn_method_messagestore_ingest_relay_page(void*_Nonnull ptr, RustBuffer envelopes, int64_t now_ms, RustCallStatus *_Nonnull out_status
+RustBuffer uniffi_cruisemesh_core_fn_method_messagestore_ingest_relay_page(void*_Nonnull ptr, RustBuffer envelopes, int64_t now_ms, RustBuffer pass_id, int64_t action_id, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_INSERT_INCOMING_MESSAGE

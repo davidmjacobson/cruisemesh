@@ -45,8 +45,13 @@
 //! result's `pass_id` and `action_id` against the single outstanding action
 //! and, on any mismatch, mutates nothing and emits
 //! `action_result_stale_ignored`. A parallel request queue would have made
-//! that a per-lane problem instead of a one-line comparison, which is why
-//! §3.1 of the plan starts here rather than with a generic effect framework.
+//! that a per-lane problem instead of a one-line comparison. One request
+//! outstanding, one result at a time, is the whole rule.
+//!
+//! The comparison is only as good as the id it compares, so the pass id an
+//! action carries is *derived* rather than taken: two passes in one process
+//! can never share one, whatever they were asked to be called. See
+//! [`CoreRelayPass::new`].
 //!
 //! # The ordered stages
 //!
@@ -79,12 +84,13 @@
 //! the refusal is real and discarding it would lose a rejection this device
 //! actually observed.
 //!
-//! # Three cross-shell divergences this module decides
+//! # Cross-shell divergences this module decides
 //!
 //! Section 5.2 of `specs/protocol-contract-v1.md` recorded places where
 //! reading the two shells gave two answers and named C0 as the package that
-//! must choose. All three are decided here, and the contract rows, the
-//! affected fixture and the reasons move in the same commit.
+//! must choose. All three are decided here, a fourth found while writing this
+//! module is recorded there too, and the contract rows, the affected fixture
+//! and the reasons move in the same commit.
 //!
 //! **Presence runs before the walk.** Android walked first; iOS synced
 //! presence first; neither ordering was written down as deliberate. The
@@ -108,20 +114,39 @@
 //! request failed and whose walk then succeeded is *not* silent, and one
 //! where both failed is stronger evidence than the walk alone. Swallowing
 //! made the two indistinguishable. A recorded presence failure never skips
-//! the walk, on either shell's reading; the walk still runs.
+//! the walk, on either shell's reading; the walk still runs, and
+//! [`PassState::apply`] leaves the config's walk unstarted for exactly that
+//! reason.
+//!
+//! **Presence is our own mailbox only.** Android groups contacts under their
+//! poll config and issues a presence sync per config, so a contact on another
+//! family's relay has their hint queried there. This module announces and
+//! queries only on this device's own mailbox. Announcing our hints into
+//! another family's mailbox tells that family we exist, which is a privacy
+//! cost this device cannot see the benefit of; the query half carries no such
+//! cost but is dropped with it here, so a contact reachable only through
+//! another family's relay loses their last-seen time once the shells migrate.
+//! That is the recorded cost of the decision, and C3 is the package that
+//! decides whether to reinstate the query on its own — the fourth 5.2 row.
 //!
 //! **The quiet window is committed at the refusal, not at the end.** Android
 //! wrote `max(existing, now + delay)` inside the failing request; iOS
 //! accumulated a maximum across the pass and overwrote at the end. Android's
-//! is adopted, and the deciding case is a pass that ends abnormally: process
-//! death, cancellation, a driver that stops answering. iOS's window exists
-//! only in memory until the pass completes, so a pass killed after its `429`
-//! leaves no window at all and the next launch walks straight back into the
-//! rate limit — which is the shape of the re-upload storm in #222. Committing
-//! at the refusal also makes the window a floor that a later, shorter one
-//! cannot lower, which is what `RATE-01` says it is. Here that means
+//! is adopted: the window is a floor that a later, shorter one cannot lower,
+//! which is what `RATE-01` says it is, and it exists from the refusal onward
+//! rather than from the end. Here that means
 //! [`CoreRelayPassSummary::quiet_until_ms`] is set the moment the `429` is
-//! seen, so [`CoreRelayPass::cancel`] reports it too.
+//! seen, so a pass that is *cancelled* after its refusal — an app
+//! backgrounded mid-pass, a driver pulled — still reports it, where an
+//! accumulate-and-overwrite-at-the-end pass would report nothing.
+//!
+//! What this does **not** yet do is survive process death. Nothing in core
+//! persists the window: it lives in this object and in the summary, so a
+//! process killed before the summary is read starts the next launch with no
+//! window at all. Android's `rateLimitedUntilMs` is an in-memory field too, so
+//! neither shell has that property today either. Making the floor durable is
+//! adapter-side work (the summary is what a shell persists) and is named in
+//! the contract's 5.2 row rather than claimed here.
 //!
 //! # Budgets are declared, not hoped for
 //!
@@ -130,6 +155,13 @@
 //! transcript rather than by reading the loop. Requests, envelopes, response
 //! bytes, uploads per lane and a wall-clock deadline are each a hard stop
 //! that ends the pass in `BudgetYield` rather than a target it tries to hit.
+//!
+//! Two of them are *admission* limits and say so in
+//! [`CoreRelayPassBudgets`]: no request is admitted once the envelope or byte
+//! count has reached its bound, so the last admitted page may carry the pass
+//! past it by at most that page. `max_requests` is the exception — it is
+//! exact, including the ack a page earns, which is why a page that cannot
+//! afford its ack holds its frontier instead of spending one more request.
 //!
 //! `PROGRESS-01` is the other half. A continuation is scheduled only when the
 //! pass strictly advanced something — a frontier, a sweep cursor, an ingested
@@ -222,6 +254,18 @@ pub const RELAY_PASS_DEADLINE_MS: i64 = 20_000;
 
 /// Every bound one pass declares. Rides in the plan and back out in the
 /// summary, so a transcript can prove `LIVE-01` without reading the loop.
+///
+/// `max_requests` is exact: no pass issues more, and the ack a consumed page
+/// earns is counted against it like everything else — a page that cannot
+/// afford its ack holds its frontier and comes back next pass rather than
+/// spending a request the budget does not have.
+///
+/// `max_envelopes` and `max_response_bytes` are *admission* limits, and the
+/// difference is worth stating because a summary is read against these
+/// numbers. No request is admitted once either count has reached its bound,
+/// so a pass can end at most one page of rows, or one response body, past
+/// them. Bounding them exactly would mean predicting a page's size before
+/// asking for it, which no client can do.
 #[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoreRelayPassBudgets {
     pub max_requests: u32,
@@ -368,11 +412,22 @@ pub enum CoreRelayActionKind {
     Http {
         request: CoreRelayHttpRequest,
     },
-    /// Wait until this absolute time and call `resume_sleep`. Emitted when a
-    /// pass is asked to run inside a quiet window it must honour.
+    /// **This pass is over.** It was asked to run inside a quiet window it
+    /// must honour, so it spent nothing and ended; `until_ms` is when the
+    /// window closes, which is advice to whatever schedules the next pass.
+    /// There is no resume from here — [`CoreRelayPass::summary`] carries the
+    /// result, and the next attempt is a new pass.
     Sleep {
         until_ms: i64,
     },
+    /// Nothing has happened and nothing is outstanding: only
+    /// [`CoreRelayPass::start`] moves a pass out of this state.
+    ///
+    /// Returned when a result arrives before the pass began — which a driver
+    /// that persisted an in-flight result across a process restart and
+    /// replayed it against a freshly built pass will do. The result mutated
+    /// nothing and started nothing.
+    NotStarted,
     Finished {
         summary: CoreRelayPassSummary,
     },
@@ -620,6 +675,16 @@ struct Outstanding {
     intent: ActionIntent,
 }
 
+/// Whether stage 8 may commit the silence it collected.
+///
+/// A pass that ran its walks to the end knows which endpoints stayed quiet. A
+/// cancelled one does not: it stopped asking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SilenceEvidence {
+    Commit,
+    Discard,
+}
+
 #[derive(Default, Clone, Copy)]
 struct Progress {
     cursor_advanced: bool,
@@ -710,16 +775,24 @@ pub struct CoreRelayPass {
 impl CoreRelayPass {
     /// Build a pass from durable store markers and an explicit plan.
     ///
-    /// `pass_id` is chosen by the caller so a driver, a log and a transcript
-    /// can be joined; it is validated to be a short opaque token because it
-    /// reaches protocol events. Anything else is replaced by `p`.
+    /// `pass_id` is a *label*, not the identity. It is what a driver, a log
+    /// and a transcript are joined on, so it must be a short opaque token —
+    /// it reaches protocol events, and a UUID or a device name in one would
+    /// be both too long and a thing worth not printing.
+    ///
+    /// The id the pass actually carries is derived from it: the label if it
+    /// is usable, `p` if it is not, plus a suffix that is unique in this
+    /// process. That suffix is the load-bearing part. `IDEMP-01`'s wrong-pass
+    /// half is a comparison against this id, and two live passes that shared
+    /// one — which is what silently replacing every unusable label with the
+    /// same constant produced — would leave that comparison deciding nothing,
+    /// with action ids restarting at 1 in every pass to collide underneath
+    /// it. A result belonging to the pass before can then be applied to the
+    /// action outstanding now: a fetch's `200` marking an upload posted that
+    /// was never sent.
     #[uniffi::constructor]
     pub fn new(store: Arc<MessageStore>, plan: CoreRelayPassPlan, pass_id: String) -> Self {
-        let pass_id = if crate::protocol_event::is_opaque_id(&pass_id) {
-            pass_id
-        } else {
-            "p".to_string()
-        };
+        let pass_id = derive_pass_id(&pass_id);
         CoreRelayPass {
             state: Mutex::new(PassState {
                 store,
@@ -773,9 +846,15 @@ impl CoreRelayPass {
     /// restarting: a pass is a one-shot object, and a driver that re-entered
     /// here would otherwise re-run stage 1's pruning against a store the
     /// first call had already pruned.
+    ///
+    /// Calling it after [`CoreRelayPass::cancel`], or after the pass
+    /// finished, returns that summary and does nothing else. A cancelled pass
+    /// that could be started again would issue requests and touch the store
+    /// with no summary willing to admit it: `cancel` freezes the summary, so
+    /// every later request would be work no transcript records.
     pub fn start(&self, now_ms: i64) -> CoreRelayAction {
         let mut state = self.lock();
-        if state.started {
+        if state.finished.is_some() || state.started {
             return state.restate_or_advance();
         }
         state.started = true;
@@ -876,6 +955,20 @@ impl CoreRelayPass {
                 .invariants(&["IDEMP-01"])
                 .count("mutations", 0),
             );
+            // A result for a pass that never began starts nothing. Only
+            // `start` may do that: it is what sets the clock the deadline is
+            // measured from, and it is where the quiet window is honoured, so
+            // a stale result that fell through to the stage machine would run
+            // a pass from time zero and straight through a `RATE-01` window
+            // this pass was built inside.
+            if !state.started {
+                return CoreRelayAction {
+                    pass_id: state.pass_id.clone(),
+                    action_id: 0,
+                    stage: state.stage,
+                    kind: CoreRelayActionKind::NotStarted,
+                };
+            }
             return state.restate_or_advance();
         }
 
@@ -893,6 +986,14 @@ impl CoreRelayPass {
     /// Idempotent, and safe at any point: nothing is mid-transaction, because
     /// no transaction spans an action. Any result that arrives afterwards is
     /// stale by definition.
+    ///
+    /// A cancelled pass commits the evidence it *earned* — an authoritative
+    /// rejection, an endpoint that answered — and no silence at all. Silence
+    /// is the absence of an answer, and a pass pulled mid-request never gave
+    /// the endpoint its chance to answer; committing it would let an app that
+    /// is backgrounded during relay passes rest a healthy contact endpoint
+    /// one cancellation at a time, which is the same harm as the stale
+    /// endpoint demotions in #182 and #207.
     pub fn cancel(&self, now_ms: i64) -> CoreRelayPassSummary {
         let mut state = self.lock();
         if let Some(summary) = &state.finished {
@@ -903,7 +1004,7 @@ impl CoreRelayPass {
         state.stopped_at = Some(state.stage);
         state.outstanding = None;
         let at_ms = state.now_ms;
-        state.commit_evidence(at_ms);
+        state.commit_evidence(at_ms, SilenceEvidence::Discard);
         state.finish(CoreRelayPassOutcome::Cancelled, at_ms)
     }
 
@@ -973,6 +1074,26 @@ impl PassState {
     /// done. Every iteration either emits an action, moves to a later stage,
     /// or finishes, so the loop cannot spin.
     fn advance(&mut self) -> CoreRelayAction {
+        // A finished pass has nothing left to run, and a pass nobody started
+        // must not be started from here: `start` is the only door in, because
+        // it is what records the time every deadline in this pass is measured
+        // from and the only place the quiet window is checked.
+        if let Some(summary) = self.finished.clone() {
+            return CoreRelayAction {
+                pass_id: self.pass_id.clone(),
+                action_id: 0,
+                stage: CoreRelayStage::Finish,
+                kind: CoreRelayActionKind::Finished { summary },
+            };
+        }
+        if !self.started {
+            return CoreRelayAction {
+                pass_id: self.pass_id.clone(),
+                action_id: 0,
+                stage: self.stage,
+                kind: CoreRelayActionKind::NotStarted,
+            };
+        }
         // One action outstanding, always. A stage that emitted while applying
         // a result -- the ack that follows a page ingest is the one that does
         // -- has already claimed the seam, and the loop below must hand that
@@ -1048,7 +1169,7 @@ impl PassState {
                 }
                 CoreRelayStage::CommitEvidence => {
                     let at_ms = self.now_ms;
-                    self.commit_evidence(at_ms);
+                    self.commit_evidence(at_ms, SilenceEvidence::Commit);
                     self.stage = CoreRelayStage::Finish;
                 }
                 CoreRelayStage::Finish => {
@@ -1343,12 +1464,17 @@ impl PassState {
             ) else {
                 continue;
             };
-            // Our own mailbox is already in the list; polling it once per
-            // contact who happens to share it is the same work several times.
-            if configs
-                .iter()
-                .any(|existing| existing.endpoint.url == endpoint.url)
-            {
+            // The same mailbox twice is the same work twice. A *mailbox* is
+            // the (url, token) pair, not the host: one relay hosts every
+            // family, so a contact whose card names our own host with their
+            // own family's credential is a different mailbox with different
+            // mail in it. Deduping on the host alone silently dropped exactly
+            // that contact — the legacy member-class card `resolved_contact_
+            // poll_relay` keeps working on purpose — and left the pass
+            // sending only our own token.
+            if configs.iter().any(|existing| {
+                existing.endpoint.url == endpoint.url && existing.endpoint.token == endpoint.token
+            }) {
                 continue;
             }
             configs.push(self.walk_config(Some(contact.user_id.clone()), endpoint));
@@ -1619,13 +1745,20 @@ impl PassState {
         }
         self.note(draft);
 
+        // Held before the rate-limit branch, not after it: a `429` on an ack
+        // is still an ack that did not succeed, and `CURSOR-01`'s claim is
+        // that the hold is *written down* rather than merely not-done. Held
+        // by falling out of the function early, the one transcript that most
+        // needs to explain itself — a rate-limited pass — would be the one
+        // where a consumed page's frontier goes unrecorded.
+        self.hold_frontier_if_ack_failed(&outstanding.intent);
+
         if fault == CoreRelayFault::RateLimited {
             let retry_after_ms = relay_retry_after_ms(header_value(&result.headers, "Retry-After"));
             self.abort_for_rate_limit(retry_after_ms);
             return;
         }
 
-        self.hold_frontier_if_ack_failed(&outstanding.intent);
         match &outstanding.intent {
             ActionIntent::Upload(upload) => {
                 // 413 is per-envelope and terminal for that row; the lane
@@ -1652,7 +1785,20 @@ impl PassState {
                         self.rejections.push(user_id);
                     }
                 }
-                if let Some(walk) = self.configs.get_mut(index).and_then(|c| c.walk.as_mut()) {
+                if matches!(outstanding.intent, ActionIntent::Presence { .. }) {
+                    // Decision (b) again, and the half that is easy to lose:
+                    // a recorded presence failure must not skip the walk.
+                    // Presence runs before the walk, so the config has no
+                    // walk yet — and fabricating a finished one here is how a
+                    // relay that answers `404` on `/presence` (an older
+                    // relayd, a proxy in front of one) would stop this device
+                    // fetching its own mail on every pass, forever, while the
+                    // summary said the pass completed.
+                    if let Some(config) = self.configs.get_mut(index) {
+                        config.walk = None;
+                    }
+                } else if let Some(walk) = self.configs.get_mut(index).and_then(|c| c.walk.as_mut())
+                {
                     walk.done = true;
                 } else if let Some(config) = self.configs.get_mut(index) {
                     config.walk = Some(WalkState {
@@ -1764,9 +1910,6 @@ impl PassState {
             | ActionIntent::Ack { config, .. } => {
                 let index = *config;
                 self.configs_faulted = self.configs_faulted.saturating_add(1);
-                if let Some(walk) = self.configs.get_mut(index).and_then(|c| c.walk.as_mut()) {
-                    walk.done = true;
-                }
                 if matches!(outstanding.intent, ActionIntent::Presence { .. }) {
                     // Decision (b): a presence failure is recorded, not
                     // swallowed — but it does not end the config's walk, and
@@ -1775,6 +1918,9 @@ impl PassState {
                     if let Some(config) = self.configs.get_mut(index) {
                         config.walk = None;
                     }
+                } else if let Some(walk) = self.configs.get_mut(index).and_then(|c| c.walk.as_mut())
+                {
+                    walk.done = true;
                 }
             }
         }
@@ -2016,7 +2162,16 @@ impl PassState {
 
         // TXN-01, first transaction. `ingest_relay_page` opens it, commits
         // it, and returns — before an ack request exists, let alone is sent.
-        let ingest = match self.store.ingest_relay_page(page.envelopes, self.now_ms) {
+        // The pass and action ids ride in so the `page_ingested` record joins
+        // the `action_emitted` above it and the ack below it: TXN-01's first
+        // transaction is the one point of a transcript that most needs to say
+        // which pass consumed the page.
+        let ingest = match self.store.ingest_relay_page(
+            page.envelopes,
+            self.now_ms,
+            Some(self.pass_id.clone()),
+            action_id,
+        ) {
             Ok(ingest) => ingest,
             Err(_) => {
                 // Nothing was persisted, so nothing may be acked and the
@@ -2059,6 +2214,29 @@ impl PassState {
             // Nothing earned an ack — a page of carried proxy copies, for
             // instance — so the frontier may move on the ingest alone.
             self.commit_page(config, page.next_cursor, ingest.fully_processed, rows);
+            return;
+        }
+
+        // `max_requests` is exact, and the ack is a request. A page that
+        // cannot afford one holds its frontier and comes back next pass —
+        // re-ingesting as nothing new — rather than spending a request the
+        // budget does not have. Without this the one request a pass can issue
+        // past its declared budget is the one nothing gates.
+        if self.requests_issued >= self.plan.budgets.max_requests {
+            self.budget_yield = true;
+            self.note_for(
+                config,
+                ProtocolEventDraft::new(
+                    ProtocolEventCode::BudgetYield,
+                    self.now_ms,
+                    "ack_deferred_request_budget",
+                )
+                .action(action_id)
+                .invariants(&["LIVE-01", "CURSOR-01"])
+                .count("requests_issued", i64::from(self.requests_issued))
+                .count("ack_ids", ack_ids.len() as i64),
+            );
+            self.commit_page(config, page.next_cursor, false, rows);
             return;
         }
 
@@ -2271,7 +2449,7 @@ impl PassState {
     // Stage 8: evidence
     // -----------------------------------------------------------------------
 
-    fn commit_evidence(&mut self, now_ms: i64) {
+    fn commit_evidence(&mut self, now_ms: i64, silence: SilenceEvidence) {
         // Silence evidence collected during the walks: a contact endpoint
         // this pass attempted and that never answered.
         self.provisional_silence.clear();
@@ -2296,7 +2474,30 @@ impl PassState {
             let _ = self.store.clear_contact_relay_unreachable(user_id);
         }
 
-        let silence = std::mem::take(&mut self.provisional_silence);
+        let provisional = std::mem::take(&mut self.provisional_silence);
+        if silence == SilenceEvidence::Discard {
+            // A cancelled pass. Every endpoint it was still waiting on was
+            // denied its answer by the cancellation rather than by anything
+            // the endpoint did, and there is no way from here to tell those
+            // two apart per config, so none of it is committed.
+            self.silence_discarded = self
+                .silence_discarded
+                .saturating_add(provisional.len() as u32);
+            if !provisional.is_empty() {
+                self.note(
+                    ProtocolEventDraft::new(
+                        ProtocolEventCode::SilenceObserved,
+                        now_ms,
+                        "silence_discarded_pass_cancelled",
+                    )
+                    .invariants(&["SILENCE-01"])
+                    .count("provisional", provisional.len() as i64)
+                    .count("committed", 0),
+                );
+            }
+            return;
+        }
+        let silence = provisional;
         if self.own_relay_succeeded {
             for (user_id, key) in silence {
                 if self
@@ -2311,7 +2512,7 @@ impl PassState {
             // SILENCE-01. Without proof another relay answered, "the contact
             // went quiet" and "this phone has no internet" are the same
             // observation, and acting on it writes off a healthy contact.
-            self.silence_discarded = silence.len() as u32;
+            self.silence_discarded = self.silence_discarded.saturating_add(silence.len() as u32);
             if !silence.is_empty() {
                 self.note(
                     ProtocolEventDraft::new(
@@ -2447,6 +2648,45 @@ impl PassState {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// The id a pass carries, derived from the label the caller asked for.
+///
+/// Two properties, and the second is the one with teeth:
+///
+/// * it is an opaque id — short, lowercase, no punctuation beyond `_-` —
+///   because it reaches protocol events, and
+/// * it is **unique in this process**, because it is half of `IDEMP-01`'s
+///   wrong-pass comparison. Action ids restart at 1 in every pass, so two
+///   passes sharing an id makes a late result from the first
+///   indistinguishable from the answer the second is waiting for.
+///
+/// A usable label is kept as the root so a transcript still reads the way the
+/// caller meant it to; anything else becomes `p`. Either way the suffix makes
+/// the result distinct, and the whole thing stays inside the opaque-id length.
+fn derive_pass_id(requested: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut suffix = String::new();
+    let mut value = sequence;
+    while {
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        suffix.insert(0, DIGITS[(value % 36) as usize] as char);
+        value /= 36;
+        value > 0
+    } {}
+
+    let root = if crate::protocol_event::is_opaque_id(requested) {
+        requested
+    } else {
+        "p"
+    };
+    // 24 is the opaque-id limit; leave room for the separator and the suffix.
+    let room = 24usize.saturating_sub(suffix.len() + 1);
+    let root = &root[..root.len().min(room)];
+    format!("{root}-{suffix}")
+}
 
 /// The headers every request carries. `Authorization` is the only place a
 /// token appears anywhere in this module.

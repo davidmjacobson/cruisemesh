@@ -40,14 +40,17 @@
 //!
 //! # Where a fixture disagreed with the session
 //!
-//! Two did, and both were corrected in the same commit as this runner rather
+//! One did, and it was corrected in the same commit as this runner rather
 //! than worked around. `oversize-shrink` claimed a 256-row page retried at 64
 //! rows; [`cruisemesh_core::relay_fetch_shrunk_limit`] halves, so the retry is
-//! 128 and a second refusal is what reaches 64. `short-page` counted an ack
-//! against rows it also described as freshly consumed; the session acks a
-//! re-presented page whose rows this device had already durably consumed,
-//! which is the same shape and is a state C0 can actually reach. Both
-//! corrections are recorded in the contract's §6.5 notes.
+//! 128 and a second refusal is what reaches 64. The correction and its reason
+//! are recorded in the contract's 6.6 notes.
+//!
+//! `short-page` was the other one read closely, because it counts an ack
+//! against rows it also calls freshly consumed. It does not disagree: the
+//! session acks a re-presented page whose rows this device had already
+//! durably consumed, which is the same shape and a state C0 reaches. It is
+//! unchanged, and no other fixture needed changing.
 //!
 //! # Honest scope
 //!
@@ -247,6 +250,9 @@ fn drive(
     loop {
         match action.kind {
             CoreRelayActionKind::Finished { summary } => return Run { requests, summary },
+            CoreRelayActionKind::NotStarted => {
+                panic!("drive() called start(), so the pass cannot be unstarted")
+            }
             CoreRelayActionKind::Sleep { until_ms } => {
                 // The only sleep this revision emits accompanies a finished
                 // pass that refused to run inside a quiet window.
@@ -821,14 +827,43 @@ fn a_family_429_mid_upload_ends_the_pass() {
     );
     assert_eq!(continuation.not_before_ms, run.summary.quiet_until_ms);
 
-    // The quiet window is committed at the refusal, not at the end, so a pass
-    // that dies afterwards still carries it. (Divergence 5.2, resolved toward
-    // Android.)
-    let cancelled = CoreRelayPass::new(store.clone(), base_plan(now), "p2".to_string());
-    let _ = cancelled.start(now);
-    // Nothing to drive: assert instead on the finished pass above, whose
-    // summary is what a killed process would have persisted.
-    assert!(cancelled.summary().is_none() || cancelled.summary().is_some());
+    // Divergence (c), resolved toward Android: the window is committed at the
+    // refusal, not at the end. The case that decides it is a pass that ends
+    // abnormally *after* its 429 -- here a cancellation, which is what an app
+    // backgrounded mid-pass does. A pass that accumulated the window and only
+    // wrote it at the end would report none at all from this path.
+    let cancelled_store = new_store();
+    seed_receipts(&cancelled_store, 3, now);
+    let cancelled = CoreRelayPass::new(cancelled_store.clone(), base_plan(now), "p2".to_string());
+    let action = cancelled.start(now);
+    assert!(
+        matches!(action.kind, CoreRelayActionKind::Http { .. }),
+        "the scenario needs a request to refuse"
+    );
+    let refused_at = now + 40;
+    let reply = Reply::rate_limited(45);
+    let _ = cancelled.resume_http(CoreRelayHttpResult {
+        pass_id: action.pass_id.clone(),
+        action_id: action.action_id,
+        status: reply.status,
+        headers: reply
+            .headers
+            .iter()
+            .map(|(name, value)| CoreRelayHeader {
+                name: name.to_string(),
+                value: value.clone(),
+            })
+            .collect(),
+        body: reply.body,
+        error: None,
+        completed_at_ms: refused_at,
+    });
+    let after_cancel = cancelled.cancel(refused_at + 5);
+    assert!(
+        after_cancel.quiet_until_ms >= refused_at + 45_000,
+        "RATE-01: a pass cancelled after its refusal still carries the window it recorded, got {}",
+        after_cancel.quiet_until_ms
+    );
 
     assert_no_violation_of(&store, &["RATE-01", "LIVE-01"]);
     assert_no_secrets(&store, &run.summary);
@@ -1327,7 +1362,11 @@ fn an_action_carries_its_pass_and_action_ids() {
     let store = new_store();
     let pass = CoreRelayPass::new(store, base_plan(T0), "p1".to_string());
     let action: CoreRelayAction = pass.start(T0);
-    assert_eq!(action.pass_id, "p1");
+    assert!(
+        action.pass_id.starts_with("p1-"),
+        "the label the caller asked for is the root of the derived id, got {}",
+        action.pass_id
+    );
     assert!(
         action.action_id >= 1 || matches!(action.kind, CoreRelayActionKind::Finished { .. }),
         "an emitted action's id starts at 1"
@@ -1340,11 +1379,11 @@ fn an_action_carries_its_pass_and_action_ids() {
 //
 // The fixtures above are the incidents that happened. This section is the
 // ones that have not: duplicated, late, out-of-order and replayed results;
-// cancellation; a restart between a page consume and its ack; a clock that
-// runs backwards; a relay that never stops answering; and bodies at and over
-// the declared cap. Section 8.2 of the plan requires each of them, and each
-// asserts end state, termination, work counts, progress and a secret-free
-// transcript rather than only "it did not crash".
+// a result that arrives before the pass began; cancellation; a restart
+// between a page consume and its ack; a clock that runs backwards; a relay
+// that never stops answering; budgets small enough to bite; and bodies at and
+// over the declared cap. Each asserts end state, termination, work counts,
+// progress and a secret-free transcript rather than only "it did not crash".
 
 /// How a driver can lie about which action it is answering.
 ///
@@ -1360,8 +1399,19 @@ enum Perturbation {
     FutureActionId,
     /// An answer to an action from earlier in this pass.
     StaleActionId,
-    /// An answer belonging to another pass entirely.
+    /// An answer belonging to another pass, whose action id is stale here too.
     WrongPass,
+    /// An answer belonging to another pass, carrying the action id that *is*
+    /// outstanding right now.
+    ///
+    /// This is the case the wrong-pass half of the guard exists for, and the
+    /// only permutation the action-id comparison cannot decide by itself.
+    /// Action ids restart at 1 in every pass, so a late answer from the pass
+    /// before collides with the action this one is waiting for by default
+    /// rather than by coincidence. Without the pass-id comparison, a fetch's
+    /// `200` from a dead pass lands on an upload this pass has outstanding
+    /// and marks a message posted that was never sent.
+    WrongPassOutstandingAction,
 }
 
 impl Perturbation {
@@ -1370,9 +1420,16 @@ impl Perturbation {
         Perturbation::FutureActionId,
         Perturbation::StaleActionId,
         Perturbation::WrongPass,
+        Perturbation::WrongPassOutstandingAction,
     ];
 
-    fn corrupt(self, mut result: CoreRelayHttpResult) -> CoreRelayHttpResult {
+    /// `outstanding` is the action the pass is waiting for *after* the honest
+    /// result was applied — what the last permutation impersonates.
+    fn corrupt(
+        self,
+        mut result: CoreRelayHttpResult,
+        outstanding: Option<u64>,
+    ) -> CoreRelayHttpResult {
         match self {
             Perturbation::Duplicate => result,
             Perturbation::FutureActionId => {
@@ -1385,6 +1442,13 @@ impl Perturbation {
             }
             Perturbation::WrongPass => {
                 result.pass_id = "pz".to_string();
+                result
+            }
+            Perturbation::WrongPassOutstandingAction => {
+                result.pass_id = "pz".to_string();
+                if let Some(action_id) = outstanding {
+                    result.action_id = action_id;
+                }
                 result
             }
         }
@@ -1433,6 +1497,9 @@ fn every_result_permutation_is_inert_and_leaves_the_same_store() {
             let request = match &action.kind {
                 CoreRelayActionKind::Finished { .. } => break,
                 CoreRelayActionKind::Sleep { .. } => break,
+                CoreRelayActionKind::NotStarted => {
+                    panic!("this pass was started, so it can never be unstarted")
+                }
                 CoreRelayActionKind::Http { request } => request.clone(),
             };
             let recorded = Recorded {
@@ -1463,9 +1530,14 @@ fn every_result_permutation_is_inert_and_leaves_the_same_store() {
 
             // ...then the lie. Every perturbation is stale by now: a
             // duplicate of a result already applied, an id from before or
-            // after the one outstanding, or another pass's answer entirely.
-            // None may move the seam or write anything.
-            let echoed = pass.resume_http(perturbation.corrupt(good));
+            // after the one outstanding, or another pass's answer — including
+            // one carrying the very action id this pass is now waiting for,
+            // which only the pass id can reject.
+            let outstanding = match &next.kind {
+                CoreRelayActionKind::Http { .. } => Some(next.action_id),
+                _ => None,
+            };
+            let echoed = pass.resume_http(perturbation.corrupt(good, outstanding));
             injected += 1;
             match &next.kind {
                 CoreRelayActionKind::Http { .. } => {
@@ -1484,6 +1556,9 @@ fn every_result_permutation_is_inert_and_leaves_the_same_store() {
                         matches!(echoed.kind, CoreRelayActionKind::Finished { .. }),
                         "{perturbation:?}: a finished pass answers with its summary"
                     );
+                }
+                CoreRelayActionKind::NotStarted => {
+                    panic!("{perturbation:?}: a started pass can never be unstarted")
                 }
             }
 
@@ -1668,13 +1743,24 @@ fn no_relay_can_make_a_pass_run_forever() {
 
     let stuck = new_store();
     let pass = CoreRelayPass::new(stuck.clone(), base_plan(now), "p1".to_string());
+    let mut stuck_requests = 0u32;
     let run = drive(&pass, now, |_request, _index| {
-        // A cursor that does not move past `after`. relayd cannot produce
-        // this; a broken or hostile server can, and a client that spun on it
-        // would never stop.
-        Reply::ok(b"{\"envelopes\":[],\"next_cursor\":0}".to_vec())
+        // A page with rows in it whose `next_cursor` does not move past the
+        // `after` that asked for them. relayd cannot produce this; a broken
+        // or hostile server can, and a client that re-asked from the same
+        // cursor would fetch the same row until the battery died. An empty
+        // page is a different branch -- that one is EOF -- so this scenario
+        // has to return something to be the scenario it claims to be.
+        stuck_requests += 1;
+        let mut rows = fresh_rows(1, 1, now);
+        rows[0].id = 0;
+        Reply::ok(page_body(&rows))
     });
     assert!(run.summary.requests_issued <= budgets.max_requests);
+    assert_eq!(
+        stuck_requests, 1,
+        "PAGE-01: a page that did not move the cursor ends the walk rather than being re-asked"
+    );
     assert_eq!(run.summary.frontier_advances, 0);
     assert!(run.summary.continuation.is_none());
 
@@ -1774,6 +1860,7 @@ fn a_clock_that_runs_backwards_cannot_rewind_a_deadline_or_a_window() {
         match action.kind {
             CoreRelayActionKind::Finished { summary } => break summary,
             CoreRelayActionKind::Sleep { .. } => break pass.summary().expect("summary"),
+            CoreRelayActionKind::NotStarted => panic!("this pass was started"),
             CoreRelayActionKind::Http { .. } => {
                 answered += 1;
                 // A driver on a phone whose wall clock stepped back a day
@@ -2153,4 +2240,644 @@ fn page_body_with_hop_ttls(rows: &[Row], hop_ttls: &[u8]) -> Vec<u8> {
         next_cursor
     )
     .into_bytes()
+}
+
+// ---------------------------------------------------------------------------
+// The seam's own rules: who may start a pass, and what a result may reach
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_passes_in_one_process_never_share_an_id() {
+    // The wrong-pass half of IDEMP-01 is a comparison against this id, so two
+    // live passes sharing one would leave it deciding nothing — with action
+    // ids restarting at 1 in every pass to collide underneath it. A caller
+    // that hands over a label this module cannot use (a UUID, a device name)
+    // used to get the same constant every time.
+    let store = new_store();
+    let first = CoreRelayPass::new(store.clone(), base_plan(T0), "PASS-A".to_string());
+    let second = CoreRelayPass::new(store.clone(), base_plan(T0), "PASS-B".to_string());
+    let same_label = CoreRelayPass::new(store.clone(), base_plan(T0), "p1".to_string());
+    let same_label_again = CoreRelayPass::new(store.clone(), base_plan(T0), "p1".to_string());
+
+    let a = first.start(T0);
+    let b = second.start(T0);
+    let c = same_label.start(T0);
+    let d = same_label_again.start(T0);
+    assert_ne!(
+        a.pass_id, b.pass_id,
+        "two passes built from unusable labels must not collapse onto one id"
+    );
+    assert_ne!(
+        c.pass_id, d.pass_id,
+        "two passes built from the same usable label must still be distinguishable"
+    );
+    for id in [&a.pass_id, &b.pass_id, &c.pass_id, &d.pass_id] {
+        assert!(
+            id.len() <= 24
+                && id.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || byte == b'_'
+                    || byte == b'-'),
+            "a pass id reaches protocol events, so it must stay an opaque token: {id}"
+        );
+    }
+
+    // And the collision the derivation prevents: A's answer, arriving late,
+    // named with A's id and the action id B is waiting for.
+    let late = second.resume_http(CoreRelayHttpResult {
+        pass_id: a.pass_id.clone(),
+        action_id: b.action_id,
+        status: 200,
+        headers: Vec::new(),
+        body: empty_page(),
+        error: None,
+        completed_at_ms: T0 + 50,
+    });
+    assert_eq!(
+        late.action_id, b.action_id,
+        "B must still be waiting for its own request"
+    );
+    assert!(matches!(late.kind, CoreRelayActionKind::Http { .. }));
+    let summary = second.cancel(T0 + 60);
+    assert_eq!(
+        summary.stale_results_ignored, 1,
+        "the other pass's answer must be counted as ignored, not applied"
+    );
+}
+
+#[test]
+fn a_result_before_start_starts_nothing_and_spends_nothing() {
+    // The restart-recovery shape: a driver persisted an in-flight result,
+    // the process died, and the replay arrives against a freshly built pass.
+    // The promise is that such a result performs no store mutation — and a
+    // pass it started would run from time zero, straight through the quiet
+    // window this plan was built inside.
+    let store = new_store();
+    let now = T0;
+    let rows = seed_consumed(&store, 1..11, now);
+    let mut plan = base_plan(now);
+    plan.quiet_until_ms = now + 600_000;
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let action = pass.resume_http(CoreRelayHttpResult {
+        pass_id: "p1-nope".to_string(),
+        action_id: 1,
+        status: 200,
+        headers: Vec::new(),
+        body: page_body(&rows),
+        error: None,
+        completed_at_ms: now + 10,
+    });
+    assert!(
+        matches!(action.kind, CoreRelayActionKind::NotStarted),
+        "only start() may start a pass, got {:?}",
+        action.kind
+    );
+    assert_eq!(action.action_id, 0, "nothing was emitted");
+    assert_eq!(
+        store.carried_len().expect("carry depth"),
+        0,
+        "IDEMP-01: a result nobody was waiting for reached the store"
+    );
+    assert_eq!(
+        store
+            .relay_fetch_cursor(own_cursor_key())
+            .expect("cursor")
+            .after_id,
+        0
+    );
+    assert!(
+        pass.summary().is_none(),
+        "the pass has neither started nor finished"
+    );
+
+    // And starting it properly still honours the window: the stale result did
+    // not consume the pass's one chance to refuse.
+    let started = pass.start(now + 20);
+    assert!(matches!(started.kind, CoreRelayActionKind::Sleep { .. }));
+    let summary = pass.summary().expect("a refused pass has a summary");
+    assert_eq!(summary.outcome, CoreRelayPassOutcome::RefusedQuietWindow);
+    assert_eq!(summary.requests_issued, 0, "RATE-01: nothing was spent");
+}
+
+#[test]
+fn a_cancelled_pass_cannot_be_started_again() {
+    // `cancel` freezes the summary. A pass that could be started afterwards
+    // would issue requests and touch the store with no summary willing to
+    // report any of it, and LIVE-01 stops being checkable from a transcript.
+    let store = new_store();
+    let now = T0;
+    seed_consumed(&store, 1..6, now);
+    let pass = CoreRelayPass::new(store.clone(), base_plan(now), "p1".to_string());
+
+    let cancelled = pass.cancel(now);
+    assert_eq!(cancelled.outcome, CoreRelayPassOutcome::Cancelled);
+    assert_eq!(cancelled.requests_issued, 0);
+
+    let after = pass.start(now + 5);
+    match after.kind {
+        CoreRelayActionKind::Finished { summary } => {
+            assert_eq!(summary.outcome, CoreRelayPassOutcome::Cancelled);
+            assert_eq!(summary.requests_issued, 0);
+        }
+        other => panic!("a cancelled pass must answer with its summary, got {other:?}"),
+    }
+    assert_eq!(
+        store
+            .relay_fetch_cursor(own_cursor_key())
+            .expect("cursor")
+            .after_id,
+        0,
+        "a resurrected pass would have walked the mailbox"
+    );
+}
+
+#[test]
+fn cancelling_a_pass_writes_no_contact_endpoint_off() {
+    // SILENCE-01. Silence is the absence of an answer; a pass pulled while a
+    // contact's request was still outstanding never gave the endpoint its
+    // chance to answer. An app backgrounded during relay passes would
+    // otherwise rest a healthy endpoint one cancellation at a time — the
+    // stale-endpoint demotion harm again, arriving through the cancel path.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: true,
+    }];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let mut action = pass.start(now);
+    let mut clock = now;
+    // Drive until the contact's mailbox is the outstanding request, answering
+    // our own mailbox honestly so `own_relay_succeeded` is true — which is
+    // exactly the state in which silence *would* otherwise be committed.
+    let cancelled_at = loop {
+        let CoreRelayActionKind::Http { ref request } = action.kind else {
+            panic!("the pass finished before the contact was asked anything");
+        };
+        if request.base_url == CONTACT_URL {
+            break clock + 10;
+        }
+        clock += 40;
+        action = pass.resume_http(CoreRelayHttpResult {
+            pass_id: action.pass_id.clone(),
+            action_id: action.action_id,
+            status: 200,
+            headers: Vec::new(),
+            body: empty_page(),
+            error: None,
+            completed_at_ms: clock,
+        });
+    };
+
+    let summary = pass.cancel(cancelled_at);
+    assert_eq!(summary.outcome, CoreRelayPassOutcome::Cancelled);
+    assert_eq!(
+        summary.silence_committed, 0,
+        "SILENCE-01: a cancellation is not evidence about an endpoint"
+    );
+    assert!(
+        store
+            .list_contact_relay_unreachable()
+            .expect("unreachable list")
+            .is_empty(),
+        "a healthy contact endpoint was rested because the app was backgrounded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Presence: recorded, never a reason to skip the walk
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_presence_failure_is_recorded_and_the_mailbox_is_still_walked() {
+    // Decision (b), and the half that is easy to lose. Presence runs before
+    // the walk (decision (a)), so a presence failure that ended the config
+    // would mean a device fetches no mail at all, on any pass, forever. A
+    // relay without the route answers 404; a proxy in front of one answers
+    // 502; relayd itself answers 400 on a malformed announce.
+    for status in [400u16, 404, 500, 503] {
+        let store = new_store();
+        let now = T0;
+        let rows = seed_consumed(&store, 1..6, now);
+        let mut plan = base_plan(now);
+        plan.presence_announce = vec![own_hint(now)];
+        plan.presence_query = vec![own_hint(now)];
+
+        let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+        let mut fetches = 0;
+        let run = drive(&pass, now, |request, _index| {
+            if request.request.operation == CoreRelayOperation::Presence {
+                return Reply::status(status, "boom");
+            }
+            if request.is_ack() {
+                return Reply::empty_ok();
+            }
+            fetches += 1;
+            if fetches == 1 {
+                Reply::ok(page_body(&rows))
+            } else {
+                Reply::ok(empty_page())
+            }
+        });
+
+        assert!(
+            !run.fetches().is_empty(),
+            "a {status} on /presence must not skip the walk: the device would never fetch its \
+             own mail again"
+        );
+        assert_eq!(
+            run.summary.rows_acked, 5,
+            "the walk ran to the end and did its work despite the presence fault"
+        );
+        assert_eq!(
+            store
+                .relay_fetch_cursor(own_cursor_key())
+                .expect("cursor")
+                .after_id,
+            5
+        );
+        assert_eq!(
+            run.summary.configs_faulted, 1,
+            "the presence fault is recorded rather than swallowed"
+        );
+    }
+
+    // A transport failure on presence was already handled this way; the two
+    // paths must not disagree about it.
+    let store = new_store();
+    let now = T0;
+    let rows = seed_consumed(&store, 1..6, now);
+    let mut plan = base_plan(now);
+    plan.presence_announce = vec![own_hint(now)];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p2".to_string());
+    let mut fetches = 0;
+    let run = drive(&pass, now, |request, _index| {
+        if request.request.operation == CoreRelayOperation::Presence {
+            return Reply::transport(cruisemesh_core::CoreRelayTransportError::ConnectionFailed);
+        }
+        if request.is_ack() {
+            return Reply::empty_ok();
+        }
+        fetches += 1;
+        if fetches == 1 {
+            Reply::ok(page_body(&rows))
+        } else {
+            Reply::ok(empty_page())
+        }
+    });
+    assert_eq!(run.summary.rows_acked, 5);
+}
+
+// ---------------------------------------------------------------------------
+// A mailbox is a (url, token) pair, not a host
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_mailboxes_on_one_host_are_both_walked() {
+    // One relay hosts every family, so a contact whose card names our own
+    // host with their own family's credential is a *different mailbox* with
+    // different mail in it — the legacy member-class card that
+    // `resolved_contact_poll_relay` deliberately keeps working. Deduping the
+    // walk list by host alone dropped exactly that contact and left the pass
+    // sending only our own token.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        // Same host as our own mailbox, different family credential.
+        relay_url: Some(OWN_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: true,
+    }];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |_request, _index| Reply::ok(empty_page()));
+
+    let tokens: Vec<String> = run
+        .requests
+        .iter()
+        .filter(|request| request.is_fetch())
+        .filter_map(|request| {
+            request
+                .request
+                .headers
+                .iter()
+                .find(|header| header.name == "Authorization")
+                .map(|header| header.value.clone())
+        })
+        .collect();
+    assert!(
+        tokens.contains(&format!("Bearer {OWN_TOKEN}")),
+        "our own mailbox must still be walked: {tokens:?}"
+    );
+    assert!(
+        tokens.contains(&format!("Bearer {CONTACT_TOKEN}")),
+        "a contact mailbox on the same host is a different mailbox and must be walked: {tokens:?}"
+    );
+    assert_eq!(run.summary.configs_walked, 2);
+}
+
+// ---------------------------------------------------------------------------
+// A relay-fetched row costs a hop
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_relay_fetched_row_is_carried_with_one_hop_already_spent() {
+    // Both shells store `carriedHopTtl(hop_ttl)` — one less than the header —
+    // for a relay-sourced carried row, precisely so a pure mule leg is
+    // counted. A row stored verbatim reports a single-mule delivery as zero
+    // hops taken and re-floods with a hop of the sender's budget this device
+    // never paid for.
+    let store = new_store();
+    let now = T0;
+    let rows = fresh_rows(1, 3, now);
+
+    let pass = CoreRelayPass::new(store.clone(), base_plan(now), "p1".to_string());
+    let mut fetches = 0;
+    let run = drive(&pass, now, |request, _index| {
+        if !request.is_fetch() {
+            return Reply::empty_ok();
+        }
+        fetches += 1;
+        if fetches == 1 {
+            // page_body writes hop_ttl 3 for every row.
+            Reply::ok(page_body(&rows))
+        } else {
+            Reply::ok(empty_page())
+        }
+    });
+    assert_eq!(run.summary.rows_ingested, 3);
+
+    let carried = store
+        .carried_envelopes_for_hints(vec![own_hint(now)], now)
+        .expect("carried rows");
+    assert_eq!(carried.len(), 3);
+    for row in carried {
+        assert_eq!(
+            row.hop_ttl, 2,
+            "a relay-fetched row is stored with one hop already spent, as both shells store it"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budgets that actually bite
+// ---------------------------------------------------------------------------
+
+/// The plan's budgets, cut down to whatever this scenario needs to reach.
+fn plan_held_to(now: i64, budgets: cruisemesh_core::CoreRelayPassBudgets) -> CoreRelayPassPlan {
+    let mut plan = base_plan(now);
+    plan.budgets = budgets;
+    plan
+}
+
+#[test]
+fn each_declared_budget_is_what_stops_the_pass() {
+    // LIVE-01's executable half, as evidence rather than assertion. The
+    // deployed budgets sit far above what the per-mailbox walk budget lets a
+    // pass reach, so a scenario at default settings proves nothing about the
+    // pass-level gate: remove the gate entirely and it still passes. These
+    // scenarios are the ones that go red.
+    let now = T0;
+    let default_budgets = core_relay_pass_default_budgets();
+
+    // 1. Requests. A relay with endless mail against a three-request pass.
+    let requests_store = new_store();
+    let plan = plan_held_to(
+        now,
+        cruisemesh_core::CoreRelayPassBudgets {
+            max_requests: 3,
+            ..default_budgets
+        },
+    );
+    let pass = CoreRelayPass::new(requests_store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |_request, index| {
+        Reply::ok(page_body(&fresh_rows(1 + index as i64 * 8, 8, now)))
+    });
+    assert_eq!(
+        run.summary.requests_issued, 3,
+        "the request budget is exact: {:?}",
+        run.summary
+    );
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::BudgetYield);
+
+    // 2. Requests, including the ack a consumed page earns. The ack is
+    // emitted from inside a result, so it is the one request nothing else
+    // gates; a page that cannot afford it holds its frontier instead.
+    let ack_store = new_store();
+    let rows = seed_consumed(&ack_store, 1..21, now);
+    let mut plan = plan_held_to(
+        now,
+        cruisemesh_core::CoreRelayPassBudgets {
+            max_requests: 2,
+            ..default_budgets
+        },
+    );
+    plan.presence_announce = vec![own_hint(now)];
+    let pass = CoreRelayPass::new(ack_store.clone(), plan, "p2".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_ack() {
+            return Reply::empty_ok();
+        }
+        if request.is_fetch() {
+            Reply::ok(page_body(&rows))
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.summary.requests_issued <= 2,
+        "a pass held to 2 requests issued {} — the ack bypassed the budget",
+        run.summary.requests_issued
+    );
+    assert_eq!(
+        run.acks().len(),
+        0,
+        "the page could not afford its ack, so none was sent"
+    );
+    assert_eq!(
+        ack_store
+            .relay_fetch_cursor(own_cursor_key())
+            .expect("cursor")
+            .after_id,
+        0,
+        "CURSOR-01: a page whose ack was never sent holds its frontier"
+    );
+    assert!(
+        run.summary.frontiers_held >= 1,
+        "the hold must be written down, not merely not-done"
+    );
+
+    // 3. Envelopes. An admission limit: no request is admitted once the count
+    // is reached, so the pass ends within one page of the bound.
+    let envelope_store = new_store();
+    let plan = plan_held_to(
+        now,
+        cruisemesh_core::CoreRelayPassBudgets {
+            max_envelopes: 10,
+            ..default_budgets
+        },
+    );
+    let pass = CoreRelayPass::new(envelope_store.clone(), plan, "p3".to_string());
+    let run = drive(&pass, now, |_request, index| {
+        Reply::ok(page_body(&fresh_rows(1 + index as i64 * 8, 8, now)))
+    });
+    assert!(
+        run.summary.envelopes_processed >= 10 && run.summary.envelopes_processed <= 10 + 256,
+        "the envelope budget must stop the pass within one page of itself, got {}",
+        run.summary.envelopes_processed
+    );
+    assert_eq!(
+        run.summary.requests_issued, 2,
+        "eight rows a page, ten allowed"
+    );
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::BudgetYield);
+
+    // 4. Response bytes, the same shape.
+    let byte_store = new_store();
+    let plan = plan_held_to(
+        now,
+        cruisemesh_core::CoreRelayPassBudgets {
+            max_response_bytes: 512,
+            ..default_budgets
+        },
+    );
+    let pass = CoreRelayPass::new(byte_store.clone(), plan, "p4".to_string());
+    let run = drive(&pass, now, |_request, index| {
+        Reply::ok(page_body(&fresh_rows(1 + index as i64 * 8, 8, now)))
+    });
+    assert!(
+        run.summary.response_bytes_read >= 512,
+        "the scenario must reach the byte budget"
+    );
+    assert!(
+        run.summary.requests_issued <= 3,
+        "the byte budget must stop the pass, got {} requests",
+        run.summary.requests_issued
+    );
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::BudgetYield);
+
+    // 5. The wall clock. A driver whose every answer takes longer than the
+    // whole deadline ends the pass after one of them.
+    let clock_store = new_store();
+    let plan = plan_held_to(
+        now,
+        cruisemesh_core::CoreRelayPassBudgets {
+            deadline_ms: 25,
+            ..default_budgets
+        },
+    );
+    let pass = CoreRelayPass::new(clock_store.clone(), plan, "p5".to_string());
+    let run = drive(&pass, now, |_request, index| {
+        let mut reply = Reply::ok(page_body(&fresh_rows(1 + index as i64 * 8, 8, now)));
+        reply.elapsed_ms = 900;
+        reply
+    });
+    assert_eq!(
+        run.summary.requests_issued, 1,
+        "a 25ms deadline against a 900ms answer must end the pass after one request"
+    );
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::BudgetYield);
+
+    // And every one of them still reports the budgets it was held to, which
+    // is what makes a transcript checkable without reading this file.
+    assert_eq!(run.summary.budgets.deadline_ms, 25);
+}
+
+// ---------------------------------------------------------------------------
+// A fixture's arithmetic is checkable even when its transcript is not
+// ---------------------------------------------------------------------------
+
+/// Fixture counts are not a golden trace — 6.6 of the contract says so, and
+/// says why — but the ones that are *derived from a core rule* can be checked
+/// against that rule, and those are exactly the ones a hand edit gets wrong.
+///
+/// The `oversize-shrink` correction in this package was found by reading:
+/// the fixture claimed a 256-row page retried at 64 rows, and
+/// [`cruisemesh_core::relay_fetch_shrunk_limit`] halves. Reading is not a
+/// regression test, so here is one. It is deliberately narrow: a rule this
+/// repository owns, applied to every fixture that states a number the rule
+/// produces.
+#[test]
+fn a_fixture_that_states_a_derived_number_states_the_one_core_would_produce() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures");
+    let mut checked = 0u32;
+    for entry in std::fs::read_dir(&dir)
+        .expect("fixtures directory")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let text = std::fs::read_to_string(&path).expect("fixture reads");
+        for line in text.lines().skip(1) {
+            let event: serde_json::Value = serde_json::from_str(line).expect("event line parses");
+            let Some(counts) = event.get("counts") else {
+                continue;
+            };
+            let count = |key: &str| counts.get(key).and_then(|value| value.as_i64());
+
+            // The page-shrink rule. A fixture may not invent a step.
+            if let (Some(requested), Some(retry)) = (count("requested_rows"), count("retry_rows")) {
+                let expected = cruisemesh_core::relay_fetch_shrunk_limit(requested as u32);
+                assert_eq!(
+                    Some(retry as u32),
+                    expected,
+                    "{name}: a retry of {retry} rows after {requested} is not the step \
+                     relay_fetch_shrunk_limit produces ({expected:?})"
+                );
+                checked += 1;
+            }
+
+            // A frontier never moves backwards, and a held one does not move
+            // at all. Both are CURSOR-01 stated as arithmetic.
+            if let (Some(before), Some(after)) = (count("frontier_before"), count("frontier_after"))
+            {
+                assert!(
+                    after >= before,
+                    "{name}: CURSOR-01 — a frontier moved backwards, {before} to {after}"
+                );
+                if event.get("code").and_then(|code| code.as_str()) == Some("frontier_held") {
+                    assert_eq!(
+                        before, after,
+                        "{name}: a held frontier that moved is not a held frontier"
+                    );
+                }
+                checked += 1;
+            }
+
+            // A page cannot consume or ack more rows than it returned.
+            if let Some(returned) = count("rows_returned") {
+                for key in ["rows_consumed", "rows_acked", "ack_ids", "rows_carried"] {
+                    if let Some(value) = count(key) {
+                        assert!(
+                            value <= returned,
+                            "{name}: {key} is {value} against a page of {returned} rows"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        checked >= 8,
+        "the guard must actually reach the corpus; it checked {checked} numbers"
+    );
 }
