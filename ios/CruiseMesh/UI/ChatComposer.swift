@@ -325,7 +325,11 @@ private struct AttachmentPickerModifiers: ViewModifier {
                     onSend: onVoiceSend,
                     onMicUnavailable: { onAttachmentError("Microphone unavailable") },
                     onRecordingFailed: {
-                        onAttachmentError("Couldn't record that voice message. Try again.")
+                        // `onAttachmentError` copy is shown via `Text(String)`, which
+                        // does not auto-localize, so resolve the catalog key here to
+                        // match the sibling `String(localized:)` use in
+                        // `HoldToRecordButton` for the same message.
+                        onAttachmentError(String(localized: "Couldn't record that voice message. Try again."))
                     }
                 )
             }

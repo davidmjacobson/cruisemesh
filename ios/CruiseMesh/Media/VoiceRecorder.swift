@@ -248,6 +248,16 @@ final class VoiceRecorder {
         capture.stop()
     }
 
+    /// Runs the finalize decision and delivers (or rejects) the recording.
+    ///
+    /// Threading invariant: this must only be called on the main thread, so the
+    /// two callers — the finalize timeout (scheduled on `DispatchQueue.main`)
+    /// and the capture's `onFinish` delegate — never race the shared state
+    /// (`pendingFinish`, `finalizingURL`, `capture`) and no lock is needed.
+    /// `AVAudioRecorderDelegate` callbacks are documented to be delivered on the
+    /// thread that started recording, which here is the main thread; the
+    /// `pendingFinish` nil-out at the top is the one-shot guard that makes
+    /// whichever caller arrives first win and the other a no-op.
     private func finish(success: Bool, requestedDurationMs requested: Int32) {
         guard let completion = pendingFinish else { return }
         pendingFinish = nil
@@ -342,7 +352,15 @@ final class VoiceRecorder {
     /// How long to wait for the finish delegate before finalizing from disk.
     /// Finalization is normally tens of milliseconds; this only bounds a
     /// delegate that never arrives so the UI cannot hang.
-    static let finalizeTimeoutSeconds: TimeInterval = 3
+    ///
+    /// There is a narrow false-negative window: if the delegate is merely very
+    /// late (a thermally throttled iPad whose finalize genuinely exceeds this
+    /// bound), the timeout runs `finish(success: true)`, the still-un-finalized
+    /// file fails the decode gate, is deleted, and the send is aborted with a
+    /// "try again". That is the safe failure — we would rather ask for a retry
+    /// than send a dead memo — and it is generously bounded here so only a
+    /// pathological stall reaches it for a short PTT recording.
+    static let finalizeTimeoutSeconds: TimeInterval = 8
 
     private func clampedDurationMs() -> Int32 {
         let bound = Double(Self.plan.maxDurationMs)
