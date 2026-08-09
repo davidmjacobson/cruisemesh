@@ -1,4 +1,4 @@
-//! Push-to-talk voice-message policy shared by both shells (`specs/voice-ptt.md`).
+//! Voice-message policy shared by both shells (`specs/voice-messages.md`).
 //!
 //! A voice message is an ordinary `AttachmentMediaType::Audio` attachment: it
 //! seals, fragments, carries, relays, and is receipt-covered like a photo.

@@ -53,7 +53,7 @@ class MessageComposerUiTest {
             }
         }
 
-        compose.onNodeWithContentDescription("Hold to talk").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Hold to record").assertIsDisplayed()
         compose.onNode(hasSetTextAction()).performTextInput("Meet by the pool")
         compose.onNodeWithContentDescription("Send")
             .assertIsDisplayed()
@@ -109,7 +109,7 @@ class MessageComposerUiTest {
             }
         }
 
-        listOf("Attach photo from library", "Take photo", "Hold to talk").forEach { label ->
+        listOf("Attach photo from library", "Take photo", "Hold to record").forEach { label ->
             compose.onNodeWithContentDescription(label)
                 .assertWidthIsAtLeast(48.dp)
                 .assertHeightIsAtLeast(48.dp)
@@ -127,7 +127,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        val mic = compose.onNodeWithContentDescription("Hold to talk")
+        val mic = compose.onNodeWithContentDescription("Hold to record")
         mic.performTouchInput { down(center) }
         recorder.clockMs += 2_000
         mic.performTouchInput { up() }
@@ -143,7 +143,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        val mic = compose.onNodeWithContentDescription("Hold to talk")
+        val mic = compose.onNodeWithContentDescription("Hold to record")
         mic.performTouchInput {
             down(center)
             moveTo(center + Offset(-400f, 0f))
@@ -162,7 +162,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        compose.onNodeWithContentDescription("Hold to talk").performTouchInput {
+        compose.onNodeWithContentDescription("Hold to record").performTouchInput {
             down(center)
             up()
         }
@@ -178,7 +178,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        val mic = compose.onNodeWithContentDescription("Hold to talk")
+        val mic = compose.onNodeWithContentDescription("Hold to record")
         mic.performTouchInput { down(center) }
         recorder.clockMs += 2_000
         mic.performTouchInput { up() }
@@ -187,7 +187,7 @@ class MessageComposerUiTest {
         assertEquals(0, recorder.stopped)
         assertEquals(0, recorder.cancelled)
         // Still the mic, never a recording pill.
-        compose.onNodeWithContentDescription("Hold to talk").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Hold to record").assertIsDisplayed()
     }
 
     /**
@@ -201,7 +201,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        compose.onNodeWithContentDescription("Hold to talk")
+        compose.onNodeWithContentDescription("Hold to record")
             .performSemanticsAction(SemanticsActions.OnClick)
         assertEquals(1, recorder.started)
 
@@ -218,7 +218,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        compose.onNodeWithContentDescription("Hold to talk")
+        compose.onNodeWithContentDescription("Hold to record")
             .performSemanticsAction(SemanticsActions.OnClick)
         compose.onNodeWithText("Cancel").performClick()
 
@@ -238,7 +238,7 @@ class MessageComposerUiTest {
 
         compose.setContent { ComposerUnderTest(recorder) }
 
-        compose.onNodeWithContentDescription("Hold to talk")
+        compose.onNodeWithContentDescription("Hold to record")
             .performSemanticsAction(SemanticsActions.OnClick)
         assertEquals(1, recorder.started)
         assertEquals(0, recorder.stopped)

@@ -1148,7 +1148,7 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Hold the mic to talk"
+            "value": "Hold the mic to record"
           }
         }
       }
@@ -2186,7 +2186,7 @@
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Hold to talk"
+            "value": "Hold to record"
           }
         }
       }
