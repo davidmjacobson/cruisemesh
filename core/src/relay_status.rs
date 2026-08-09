@@ -32,6 +32,13 @@ pub enum CoreRelayFault {
     /// `Retry-After` window ([`relay_retry_after_ms`]); the person holding
     /// the phone has nothing to do and must not be told to contact anyone.
     RateLimited,
+    /// 409 `msg_id_conflict`: a row with this envelope's public `msg_id`
+    /// already holds *different* sealed content, so the relay kept the first
+    /// writer's row and did not store this post. It is per-envelope and does
+    /// not mean the mailbox, the credential, or the endpoint is unhealthy —
+    /// so it must never retire the sender's retry state for this envelope,
+    /// which delivers by mesh/carry instead and resurfaces on a later pass.
+    MsgIdConflict,
     /// Any other non-2xx: a generic outage with no structured meaning.
     Outage,
 }
@@ -49,6 +56,7 @@ pub fn relay_classify_http_error(http_status: u16, relay_code: Option<String>) -
         Some("family_quota_exceeded") => return CoreRelayFault::MailboxFull,
         Some("envelope_too_large") => return CoreRelayFault::MessageTooLarge,
         Some("rate_limited") => return CoreRelayFault::RateLimited,
+        Some("msg_id_conflict") => return CoreRelayFault::MsgIdConflict,
         _ => {}
     }
     match http_status {
@@ -56,6 +64,7 @@ pub fn relay_classify_http_error(http_status: u16, relay_code: Option<String>) -
         507 => CoreRelayFault::MailboxFull,
         413 => CoreRelayFault::MessageTooLarge,
         429 => CoreRelayFault::RateLimited,
+        409 => CoreRelayFault::MsgIdConflict,
         _ => CoreRelayFault::Outage,
     }
 }
@@ -67,7 +76,13 @@ pub fn relay_classify_http_error(http_status: u16, relay_code: Option<String>) -
 #[uniffi::export]
 pub fn relay_fault_is_transient(fault: CoreRelayFault) -> bool {
     match fault {
-        CoreRelayFault::RateLimited | CoreRelayFault::Outage => true,
+        // A conflict is transient in the sense the indicator cares about:
+        // nobody holding the phone can act on it and it is never a support
+        // case — the envelope simply delivers another way and the id stops
+        // colliding once the in-flight copies drain.
+        CoreRelayFault::RateLimited | CoreRelayFault::MsgIdConflict | CoreRelayFault::Outage => {
+            true
+        }
         CoreRelayFault::PassExpired
         | CoreRelayFault::PassSuspended
         | CoreRelayFault::TokenRejected
@@ -84,13 +99,17 @@ pub fn relay_fault_is_transient(fault: CoreRelayFault) -> bool {
 #[uniffi::export]
 pub fn relay_fault_rank(fault: CoreRelayFault) -> u8 {
     match fault {
-        CoreRelayFault::PassSuspended => 6,
-        CoreRelayFault::PassExpired => 5,
-        CoreRelayFault::TokenRejected => 4,
-        CoreRelayFault::MailboxFull => 3,
-        CoreRelayFault::MessageTooLarge => 2,
-        CoreRelayFault::RateLimited => 1,
-        CoreRelayFault::Outage => 0,
+        CoreRelayFault::PassSuspended => 7,
+        CoreRelayFault::PassExpired => 6,
+        CoreRelayFault::TokenRejected => 5,
+        CoreRelayFault::MailboxFull => 4,
+        CoreRelayFault::MessageTooLarge => 3,
+        CoreRelayFault::RateLimited => 2,
+        CoreRelayFault::Outage => 1,
+        // Lowest: a per-envelope conflict says nothing about the mailbox's
+        // health, so anything else this pass observed should win the single
+        // status slot over it.
+        CoreRelayFault::MsgIdConflict => 0,
     }
 }
 
@@ -141,6 +160,10 @@ mod tests {
                 relay_classify_http_error(status, Some("rate_limited".into())),
                 CoreRelayFault::RateLimited
             );
+            assert_eq!(
+                relay_classify_http_error(status, Some("msg_id_conflict".into())),
+                CoreRelayFault::MsgIdConflict
+            );
         }
     }
 
@@ -166,6 +189,10 @@ mod tests {
             relay_classify_http_error(429, None),
             CoreRelayFault::RateLimited
         );
+        assert_eq!(
+            relay_classify_http_error(409, None),
+            CoreRelayFault::MsgIdConflict
+        );
     }
 
     #[test]
@@ -187,6 +214,7 @@ mod tests {
     fn transient_versus_persistent_split_matches_the_ux_spec() {
         // "?" states: self-healing, never a support case.
         assert!(relay_fault_is_transient(CoreRelayFault::RateLimited));
+        assert!(relay_fault_is_transient(CoreRelayFault::MsgIdConflict));
         assert!(relay_fault_is_transient(CoreRelayFault::Outage));
         // "!" states: persist until someone acts.
         assert!(!relay_fault_is_transient(CoreRelayFault::PassExpired));
@@ -199,6 +227,7 @@ mod tests {
     #[test]
     fn rank_orders_credential_then_persistent_then_transient() {
         let ordered = [
+            CoreRelayFault::MsgIdConflict,
             CoreRelayFault::Outage,
             CoreRelayFault::RateLimited,
             CoreRelayFault::MessageTooLarge,

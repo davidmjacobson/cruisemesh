@@ -48,14 +48,15 @@ use cruisemesh_core::{
     relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
     CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition, CoreRelayActionKind,
     CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
-    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayPass,
-    CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan, CoreRelayPassSummary,
-    CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan, CoreSprayPlanShape,
-    CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore, RelayMailboxWalkAction,
-    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, FAMILY_RELAY_BACKOFF_BASE_MS,
-    FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT,
-    KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS,
-    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
+    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayOperation,
+    CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan,
+    CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan,
+    CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
+    RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
+    FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES,
+    MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -252,6 +253,19 @@ const CONTRACT: &[Invariant] = &[
         owner: Owner::Core(
             "core/src/protocol_event.rs ring redaction + core/tests/protocol_event_ring.rs \
              live-store canary + core/tests/protocol_contract.rs fixture canary scan",
+        ),
+    },
+    Invariant {
+        id: "DEDUP-01",
+        statement: "A relay mailbox keeps the first ciphertext stored under a (family_token, \
+                    msg_id); an identical re-post dedupes, a differing-content re-post is a \
+                    reported conflict, and a conflict never retires the sender's retry state.",
+        owner: Owner::Core(
+            "relayd/src/lib.rs content-compare insert (both insert paths) returning 409 \
+             msg_id_conflict + relayd/tests/e2e_mailbox.rs conflict/dedupe e2e; \
+             core/src/relay_status.rs classifies it as CoreRelayFault::MsgIdConflict and \
+             core/src/session/relay_pass.rs keeps the row queued; \
+             core/tests/relay_pass_replay.rs proves the outbound row is not marked posted",
         ),
     },
 ];
@@ -1473,6 +1487,108 @@ fn rate_01_the_quiet_window_is_a_floor_no_nudge_may_bypass() {
     );
 }
 
+#[test]
+fn dedup_01_a_conflict_is_classified_apart_and_never_retires_a_send() {
+    let id = lookup("DEDUP-01").id;
+
+    // The stable code is authoritative whatever status a proxy stamped on it,
+    // and the 409 status classifies on its own for a client that only sees the
+    // status. Either way it must be its own fault, distinct from the dedupe
+    // success a 2xx would have meant.
+    for status in [200u16, 409, 500] {
+        contract_assert!(
+            id,
+            relay_classify_http_error(status, Some("msg_id_conflict".to_string()))
+                == CoreRelayFault::MsgIdConflict,
+            "the stable msg_id_conflict code must classify apart from a dedupe success, \
+             whatever status {status} a proxy stamped on it"
+        );
+    }
+    contract_assert!(
+        id,
+        relay_classify_http_error(409, None) == CoreRelayFault::MsgIdConflict,
+        "a bare 409 must classify as a conflict, not as a generic outage"
+    );
+    // It is not the 2xx range: a conflict can never flow to the success path
+    // that would mark a row posted.
+    contract_assert!(
+        id,
+        !(200..300).contains(&409u16),
+        "a conflict status must sit outside the 2xx range that retires a send"
+    );
+
+    // Drive a real pass with one authored envelope queued. The relay answers
+    // the upload with a 409 msg_id_conflict; the row must stay queued
+    // afterwards — a conflict is a non-2xx that never reaches the mark-posted
+    // path, so it never retires the send.
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let now_ms = 1_700_000_000_000i64;
+    let me = generate_identity();
+    let peer = generate_identity();
+    let peer_contact = Contact {
+        user_id: peer.user_id.clone(),
+        name: "Robin".to_string(),
+        sign_pk: peer.sign_pk.clone(),
+        agree_pk: peer.agree_pk.clone(),
+        relay_url: None,
+        relay_token: None,
+        nickname: None,
+    };
+    store
+        .upsert_contact(peer_contact.clone())
+        .expect("accept contact");
+    store
+        .author_pairwise_message(
+            me.clone(),
+            peer_contact,
+            KIND_TEXT,
+            b"the real message".to_vec(),
+            None,
+            now_ms,
+        )
+        .expect("author");
+    contract_assert!(
+        id,
+        store
+            .pending_relay_outbound_envelopes(64, now_ms, vec![])
+            .expect("pending before")
+            .len()
+            == 1,
+        "the scenario needs exactly one authored row queued for relay"
+    );
+
+    let mut saw_post = false;
+    let (summary, _) =
+        drive_relay_pass(&store, "dedup", now_ms, |request| match request.operation {
+            CoreRelayOperation::PostEnvelope => {
+                saw_post = true;
+                (409, br#"{"code":"msg_id_conflict"}"#.to_vec())
+            }
+            _ => (200, b"{\"envelopes\":[],\"next_cursor\":0}".to_vec()),
+        });
+    contract_assert!(
+        id,
+        saw_post,
+        "the scenario must have issued the authored upload"
+    );
+    contract_assert!(
+        id,
+        summary.authored_uploads == 0,
+        "a conflicted upload must not count as an accepted authored upload"
+    );
+
+    let still_queued = store
+        .pending_relay_outbound_envelopes(64, now_ms, vec![])
+        .expect("pending after")
+        .len();
+    contract_assert!(
+        id,
+        still_queued == 1,
+        "a msg_id conflict must not retire the send: the authored row must stay queued, found \
+         {still_queued} rows"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Markers for what is not owned yet
 // ---------------------------------------------------------------------------
@@ -2405,7 +2521,12 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // Fixtures are the field-evidence half of the contract. Not every rule
     // needs one (SECRET-01 is checked over the whole corpus rather than by a
     // trace of its own), but the mapping must be deliberate rather than
-    // accidental, so the exemptions are named here.
+    // accidental, so the exemptions are named here. DEDUP-01 is pinned by
+    // direct tests rather than an incident trace: the server enforcement lives
+    // in relayd's own suite (`relayd/tests/e2e_mailbox.rs` and the store unit
+    // tests), and the sender half is a classification plus a driven pass
+    // (`dedup_01_a_conflict_is_classified_apart_and_never_retires_a_send` here,
+    // and `relay_pass_replay.rs`), none of which is a JSONL replay fixture.
     const NO_FIXTURE_NEEDED: &[&str] = &[
         "ACK-01",
         "ACK-02",
@@ -2414,6 +2535,7 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         "HELLO-01",
         "ENDPOINT-01",
         "UI-01",
+        "DEDUP-01",
     ];
 
     let mut covered: BTreeMap<String, Vec<&str>> = BTreeMap::new();

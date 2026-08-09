@@ -1016,8 +1016,51 @@ pub struct StoredPresence {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuotaInsertResult {
-    Stored { id: i64 },
-    QuotaExceeded { usage_bytes: u64 },
+    Stored {
+        id: i64,
+    },
+    QuotaExceeded {
+        usage_bytes: u64,
+    },
+    /// A row with this `(family_token, msg_id)` already exists carrying
+    /// *different* sealed bytes. The stored (first) row is authoritative and
+    /// is left untouched; this post was NOT stored. See [`InsertOutcome`] for
+    /// why a differing-content re-post is not treated as a dedupe success.
+    MsgIdConflict,
+}
+
+/// Outcome of a plain (non-quota) envelope insert.
+///
+/// `msg_id` is a random public id an author generates and mesh headers carry
+/// in the clear, so any party can observe one in flight. The relay is a dumb
+/// content-agnostic mailbox and cannot tell which of two posts claiming one
+/// `msg_id` is authentic. It therefore keeps whichever content it stored
+/// first and refuses to overwrite it: a re-post carrying *identical* sealed
+/// bytes is a genuine idempotent dedupe (receipt retries, envelope
+/// re-uploads) and returns [`InsertOutcome::Stored`] naming the existing row;
+/// a re-post carrying *different* bytes under the same id is a distinct
+/// [`InsertOutcome::MsgIdConflict`] outcome, so the caller learns its content
+/// was not stored rather than mistaking the first row for its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertOutcome {
+    Stored {
+        id: i64,
+    },
+    /// The id already holds different content; the stored row is unchanged and
+    /// this post was not stored.
+    MsgIdConflict,
+}
+
+impl InsertOutcome {
+    /// The stored row id, or panic. Test convenience for the many call sites
+    /// that expect a fresh insert to have stored a row.
+    #[cfg(test)]
+    fn stored_id(&self) -> i64 {
+        match self {
+            InsertOutcome::Stored { id } => *id,
+            InsertOutcome::MsgIdConflict => panic!("expected a stored row, got a msg_id conflict"),
+        }
+    }
 }
 
 /// A provisioned (hosted / Shore Pass) family, stored in the `families`
@@ -1134,33 +1177,65 @@ impl RelayStore {
         sealed: Vec<u8>,
         expiry_ms: i64,
         created_at_ms: i64,
-    ) -> Result<i64, String> {
+    ) -> Result<InsertOutcome, String> {
         let expiry_ms = Self::effective_expiry(created_at_ms, expiry_ms);
-        let conn = self.conn.lock().expect("relay store mutex poisoned");
-        // ON CONFLICT: keep the row; take the longer hop budget / later
-        // expiry. Sealed bytes are intentionally NOT rewritten — re-posts
-        // of the same msg_id are treated as pure dedupe (receipt retries
-        // with a stable msg_id land here).
-        conn.query_row(
-            "INSERT INTO envelopes
-                (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(family_token, msg_id) DO UPDATE SET
-                hop_ttl = MAX(hop_ttl, excluded.hop_ttl),
-                expiry_ms = MAX(expiry_ms, excluded.expiry_ms)
-             RETURNING id",
-            params![
-                family_token,
-                msg_id,
-                hop_ttl as i64,
-                recipient_hint,
-                sealed,
-                expiry_ms,
-                created_at_ms,
-            ],
-            |row| row.get(0),
-        )
-        .map_err(|e| e.to_string())
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        // A conflict on `(family_token, msg_id)` is resolved by *content*, not
+        // by presence. The stored row is the first writer and the relay cannot
+        // know which post is authentic, so it never overwrites sealed bytes.
+        // An identical re-post is a dedupe: keep the row, take the longer hop
+        // budget / later expiry, return its id. A re-post carrying different
+        // sealed bytes is a genuine conflict: leave the stored row *entirely*
+        // unchanged (not even the hop/expiry bump) and report it, so the
+        // caller does not mistake someone else's row for its own delivered one.
+        let existing: Option<(i64, Vec<u8>)> = tx
+            .query_row(
+                "SELECT id, sealed FROM envelopes WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                params![family_token, msg_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        if let Some((id, stored_sealed)) = existing {
+            if stored_sealed != sealed {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(InsertOutcome::MsgIdConflict);
+            }
+            tx.execute(
+                "UPDATE envelopes SET
+                    hop_ttl = MAX(hop_ttl, ?3),
+                    expiry_ms = MAX(expiry_ms, ?4)
+                 WHERE family_token = ?1 AND msg_id = ?2",
+                params![family_token, msg_id, hop_ttl as i64, expiry_ms],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(InsertOutcome::Stored { id });
+        }
+
+        let id = tx
+            .query_row(
+                "INSERT INTO envelopes
+                    (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 RETURNING id",
+                params![
+                    family_token,
+                    msg_id,
+                    hop_ttl as i64,
+                    recipient_hint,
+                    sealed,
+                    expiry_ms,
+                    created_at_ms,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(InsertOutcome::Stored { id })
     }
 
     /// Atomically admit a new row under the per-family sealed-byte quota.
@@ -1188,15 +1263,24 @@ impl RelayStore {
         let mut conn = self.conn.lock().expect("relay store mutex poisoned");
         let tx = conn.transaction().map_err(|e| e.to_string())?;
 
-        let existing_id: Option<i64> = tx
+        // Resolve a same-id re-post by content, exactly as `insert_envelope`
+        // does: an identical re-post dedupes (and is exempt from the quota
+        // check below — it stores no new bytes), while a re-post carrying
+        // different sealed bytes is a conflict that leaves the stored row
+        // untouched and is reported rather than silently swallowed as success.
+        let existing: Option<(i64, Vec<u8>)> = tx
             .query_row(
-                "SELECT id FROM envelopes WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                "SELECT id, sealed FROM envelopes WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
                 params![family_token, msg_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|e| e.to_string())?;
-        if let Some(id) = existing_id {
+        if let Some((id, stored_sealed)) = existing {
+            if stored_sealed != sealed {
+                tx.commit().map_err(|e| e.to_string())?;
+                return Ok(QuotaInsertResult::MsgIdConflict);
+            }
             tx.execute(
                 "UPDATE envelopes SET
                     hop_ttl = MAX(hop_ttl, ?3),
@@ -1252,6 +1336,16 @@ impl RelayStore {
     /// does NOT enforce the per-family storage quota — that check needs a
     /// prune-then-recheck decision per row (see `post_envelope`), which
     /// doesn't make sense to run per-row inside one bulk transaction.
+    ///
+    /// A same-`(family_token, msg_id)` re-post is resolved by *content*, the
+    /// same rule `insert_envelope` and `insert_envelope_with_quota` enforce
+    /// (contract invariant DEDUP-01): an identical re-post dedupes (longer hop
+    /// budget / later expiry win), while a re-post carrying different sealed
+    /// bytes leaves the stored first-writer row entirely untouched. This path
+    /// has no per-row outcome to return, so a differing-content row is a no-op
+    /// rather than a signalled conflict — but it likewise never overwrites the
+    /// stored bytes, so no ingest path can silently replace one msg_id's
+    /// content with another's.
     pub fn insert_envelopes_batch(
         &self,
         rows: &[(String, Vec<u8>, u8, Vec<u8>, Vec<u8>, i64, i64)],
@@ -1268,28 +1362,58 @@ impl RelayStore {
         let mut conn = self.conn.lock().expect("relay store mutex poisoned");
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         {
-            let mut stmt = tx
+            let mut select = tx
+                .prepare(
+                    "SELECT sealed FROM envelopes
+                     WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut insert = tx
                 .prepare(
                     "INSERT INTO envelopes
                         (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(family_token, msg_id) DO UPDATE SET
-                        hop_ttl = MAX(hop_ttl, excluded.hop_ttl),
-                        expiry_ms = MAX(expiry_ms, excluded.expiry_ms)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut bump = tx
+                .prepare(
+                    "UPDATE envelopes SET
+                        hop_ttl = MAX(hop_ttl, ?3),
+                        expiry_ms = MAX(expiry_ms, ?4)
+                     WHERE family_token = ?1 AND msg_id = ?2",
                 )
                 .map_err(|e| e.to_string())?;
             for (family, msg_id, hop_ttl, hint, sealed, expiry_ms, created_at_ms) in rows {
                 let expiry_ms = Self::effective_expiry(*created_at_ms, *expiry_ms);
-                stmt.execute(params![
-                    family,
-                    msg_id,
-                    *hop_ttl as i64,
-                    hint,
-                    sealed,
-                    expiry_ms,
-                    created_at_ms,
-                ])
-                .map_err(|e| e.to_string())?;
+                let stored_sealed: Option<Vec<u8>> = select
+                    .query_row(params![family, msg_id], |row| row.get(0))
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                match stored_sealed {
+                    // Differing content under an existing id: leave the stored
+                    // first-writer row untouched, never overwrite (DEDUP-01).
+                    Some(stored) if stored != *sealed => {}
+                    // Identical re-post: idempotent dedupe, take the longer
+                    // hop budget / later expiry.
+                    Some(_) => {
+                        bump.execute(params![family, msg_id, *hop_ttl as i64, expiry_ms])
+                            .map_err(|e| e.to_string())?;
+                    }
+                    // New id: store it.
+                    None => {
+                        insert
+                            .execute(params![
+                                family,
+                                msg_id,
+                                *hop_ttl as i64,
+                                hint,
+                                sealed,
+                                expiry_ms,
+                                created_at_ms,
+                            ])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -2210,6 +2334,16 @@ async fn post_envelope(
                 usage_bytes,
                 access.quota_bytes,
             ));
+        }
+        QuotaInsertResult::MsgIdConflict => {
+            // Never log the msg_id or sealed bytes (FR2) — only the family
+            // prefix, so an operator can correlate without the semi-public id
+            // reaching the log.
+            warn!(
+                family = %token_prefix(&family_token),
+                "envelope rejected: msg_id already holds different content (409)"
+            );
+            return Err(ApiError::msg_id_conflict());
         }
     };
     // FR2: never log envelope contents (msg_id/sealed bytes) -- only the
@@ -3405,6 +3539,26 @@ impl ApiError {
                  {quota_bytes} byte quota (expired rows already pruned)"
             ),
             code: Some("family_quota_exceeded"),
+            retry_after_secs: None,
+        }
+    }
+
+    /// A row with this `(family_token, msg_id)` already holds *different*
+    /// sealed content. The stored row is the first writer and is authoritative;
+    /// the relay is content-agnostic and cannot know which post is genuine, so
+    /// it keeps the stored row unchanged and reports that this post was not
+    /// stored. 409 Conflict is the standard status for "the request conflicts
+    /// with the current state of the resource", and it is deliberately distinct
+    /// from a dedupe success: a caller must not retire its send state on this,
+    /// because its own content never reached the mailbox. The stable
+    /// `msg_id_conflict` code lets a client act on it exactly; an older client
+    /// that does not recognize the code still sees a non-2xx and treats the
+    /// post as not delivered, which is the safe degrade.
+    fn msg_id_conflict() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "msg_id already holds different content; this post was not stored".to_string(),
+            code: Some("msg_id_conflict"),
             retry_after_secs: None,
         }
     }
@@ -4712,7 +4866,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_post_by_msg_id_reuses_the_same_row() {
+    async fn identical_repost_by_msg_id_dedupes_to_the_same_row() {
+        // The load-bearing legit case: a receipt retry or an envelope
+        // re-upload posts the SAME sealed bytes under a stable msg_id. It must
+        // stay a pure idempotent dedupe — one row, same id, and the longer hop
+        // budget / later expiry win.
         let (_db, store) = test_store();
         let first_id = store
             .insert_envelope(
@@ -4724,20 +4882,21 @@ mod tests {
                 5_000,
                 1_000,
             )
-            .unwrap();
-        let second_id = store
+            .unwrap()
+            .stored_id();
+        let second = store
             .insert_envelope(
                 "family-a",
                 sample_msg_id(9),
                 7,
                 sample_hint(1),
-                sample_sealed(99), // different sealed — must not rewrite
+                sample_sealed(2), // identical sealed — genuine re-upload
                 9_000,
                 2_000,
             )
             .unwrap();
 
-        assert_eq!(first_id, second_id);
+        assert_eq!(second, InsertOutcome::Stored { id: first_id });
         assert_eq!(store.count_for_family("family-a").unwrap(), 1);
 
         let rows = store
@@ -4746,8 +4905,118 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hop_ttl, 7);
         assert_eq!(rows[0].expiry_ms, 9_000);
-        // Sealed stays from the first insert (idempotent re-upload).
         assert_eq!(rows[0].sealed, sample_sealed(2));
+    }
+
+    #[tokio::test]
+    async fn conflicting_content_under_one_msg_id_is_rejected_not_deduped() {
+        // The dedup-poisoning guard: a second post reuses a msg_id already in
+        // flight but carries DIFFERENT sealed bytes. The relay cannot know
+        // which is authentic, so it keeps the first row byte-for-byte and
+        // reports the conflict rather than returning a dedupe success. The
+        // second poster must not be able to believe its content was stored,
+        // and the first poster's content must survive untouched.
+        let (_db, store) = test_store();
+        let first_id = store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(9),
+                4,
+                sample_hint(1),
+                sample_sealed(2),
+                5_000,
+                1_000,
+            )
+            .unwrap()
+            .stored_id();
+        let conflict = store
+            .insert_envelope(
+                "family-a",
+                sample_msg_id(9),
+                7,
+                sample_hint(1),
+                sample_sealed(99), // different sealed under the same id
+                9_000,
+                2_000,
+            )
+            .unwrap();
+
+        assert_eq!(conflict, InsertOutcome::MsgIdConflict);
+        assert_eq!(store.count_for_family("family-a").unwrap(), 1);
+
+        // The stored row is entirely unchanged — not even the hop/expiry bump.
+        let rows = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], 0, 10, 2_000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, first_id);
+        assert_eq!(rows[0].hop_ttl, 4);
+        assert_eq!(rows[0].expiry_ms, 5_000);
+        assert_eq!(rows[0].sealed, sample_sealed(2));
+    }
+
+    #[tokio::test]
+    async fn quota_path_rejects_conflicting_content_and_dedupes_identical() {
+        // The quota insert path is a separate code path from `insert_envelope`
+        // and must enforce the same content rule.
+        let (_db, store) = test_store();
+        let quota = 1_000_000u64;
+        let first = store
+            .insert_envelope_with_quota(
+                "family-a",
+                sample_msg_id(9),
+                4,
+                sample_hint(1),
+                sample_sealed(2),
+                5_000,
+                1_000,
+                quota,
+            )
+            .unwrap();
+        let first_id = match first {
+            QuotaInsertResult::Stored { id } => id,
+            other => panic!("expected stored, got {other:?}"),
+        };
+
+        // Identical re-post still dedupes to the same row.
+        let dedupe = store
+            .insert_envelope_with_quota(
+                "family-a",
+                sample_msg_id(9),
+                7,
+                sample_hint(1),
+                sample_sealed(2),
+                9_000,
+                2_000,
+                quota,
+            )
+            .unwrap();
+        assert_eq!(dedupe, QuotaInsertResult::Stored { id: first_id });
+
+        // Different sealed under the same id is a conflict, and the stored row
+        // stays exactly as the first writer left it.
+        let conflict = store
+            .insert_envelope_with_quota(
+                "family-a",
+                sample_msg_id(9),
+                7,
+                sample_hint(1),
+                sample_sealed(99),
+                9_000,
+                2_000,
+                quota,
+            )
+            .unwrap();
+        assert_eq!(conflict, QuotaInsertResult::MsgIdConflict);
+
+        let rows = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], 0, 10, 2_000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sealed, sample_sealed(2));
+        // The identical re-post's hop/expiry bump is kept; the conflict's is not.
+        assert_eq!(rows[0].hop_ttl, 7);
+        assert_eq!(rows[0].expiry_ms, 9_000);
     }
 
     /// Fetch is not destructive: without an ack, the same rows reappear.
@@ -4948,6 +5217,76 @@ mod tests {
             plan.contains("idx_envelopes_family_hint_id")
                 || plan.to_ascii_lowercase().contains("using index"),
             "expected index at ~10k rows, got:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn batch_insert_resolves_same_msg_id_by_content() {
+        // DEDUP-01 for the bulk ingest path: an identical re-post dedupes and
+        // takes the longer hop budget / later expiry, while a re-post carrying
+        // different sealed bytes leaves the stored first-writer row untouched
+        // and never overwrites it.
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        let msg_id = sample_msg_id(9);
+        let hint = sample_hint(1);
+        let first = sample_sealed(1);
+        let garbage = sample_sealed(2);
+
+        // First write establishes the row with a modest hop budget/expiry.
+        store
+            .insert_envelopes_batch(&[(
+                "family-a".to_string(),
+                msg_id.clone(),
+                3u8,
+                hint.clone(),
+                first.clone(),
+                now + 10_000,
+                now,
+            )])
+            .unwrap();
+
+        // Identical re-post with a longer budget dedupes onto the same row;
+        // a differing-content re-post under the same id is a no-op that does
+        // NOT overwrite the stored bytes.
+        store
+            .insert_envelopes_batch(&[
+                (
+                    "family-a".to_string(),
+                    msg_id.clone(),
+                    7u8,
+                    hint.clone(),
+                    first.clone(),
+                    now + 60_000,
+                    now,
+                ),
+                (
+                    "family-a".to_string(),
+                    msg_id.clone(),
+                    9u8,
+                    hint.clone(),
+                    garbage.clone(),
+                    now + 999_000,
+                    now,
+                ),
+            ])
+            .unwrap();
+
+        let stored = store
+            .fetch_envelopes("family-a", vec![hint.clone()], 0, 100, now)
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "one row survives, no second content admitted"
+        );
+        assert_eq!(
+            stored[0].sealed, first,
+            "first-writer content is never overwritten by a conflicting re-post"
+        );
+        assert_eq!(
+            stored[0].hop_ttl, 7,
+            "identical re-post takes the longer hop budget"
         );
     }
 
@@ -5256,7 +5595,8 @@ mod tests {
                         now + 60_000,
                         now,
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .stored_id(),
             );
         }
 
@@ -5329,7 +5669,8 @@ mod tests {
                 now + 60_000,
                 now,
             )
-            .unwrap();
+            .unwrap()
+            .stored_id();
         let follower = store
             .insert_envelope(
                 "family-a",
@@ -5340,7 +5681,8 @@ mod tests {
                 now + 60_000,
                 now,
             )
-            .unwrap();
+            .unwrap()
+            .stored_id();
 
         let page = store
             .fetch_envelopes("family-a", vec![sample_hint(1)], 0, MAX_FETCH_LIMIT, now)

@@ -1246,6 +1246,56 @@ fn the_authored_lane_is_bounded_and_the_queue_it_reads_shrinks() {
     assert_no_secrets(&store, &run_one.summary);
 }
 
+/// DEDUP-01: a relay that answers an authored upload with a 409
+/// `msg_id_conflict` — the mailbox already holds a different ciphertext under
+/// this envelope's public msg_id — must not retire the send. A conflict is a
+/// non-2xx, so it never reaches the mark-posted path; the row stays queued for
+/// the next pass and for the mesh/carry paths, and the conflict is
+/// per-envelope, so the lane continues rather than writing off the mailbox.
+#[test]
+fn a_msg_id_conflict_leaves_the_authored_row_queued_and_continues_the_lane() {
+    let store = new_store();
+    let now = T0;
+    seed_authored(&store, 3, now);
+
+    let pass = CoreRelayPass::new(store.clone(), base_plan(now), "p1".to_string());
+    let mut posts = 0u32;
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_post() {
+            posts += 1;
+            // Every authored post to the own mailbox conflicts.
+            Reply::status(409, "msg_id_conflict")
+        } else if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    // The lane did not stop on the first conflict: all three rows were tried.
+    assert_eq!(
+        posts, 3,
+        "a per-envelope conflict is terminal for its row but must not end the lane"
+    );
+    // None was accepted, so none was marked posted.
+    assert_eq!(
+        run.summary.authored_uploads, 0,
+        "a conflicted upload must not count as an accepted authored upload"
+    );
+
+    // Every authored row is still queued — the send state was not retired.
+    let still_queued = store
+        .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+        .expect("pending outbound")
+        .len();
+    assert_eq!(
+        still_queued, 3,
+        "DEDUP-01: a msg_id conflict must leave every authored row queued to deliver another way"
+    );
+
+    assert_no_secrets(&store, &run.summary);
+}
+
 // ===========================================================================
 // Seeding helpers
 // ===========================================================================

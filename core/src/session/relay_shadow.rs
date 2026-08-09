@@ -458,16 +458,19 @@ impl MismatchTally {
 /// Whether the core engine would offer the next row of this lane to the same
 /// mailbox after this failure.
 ///
-/// The rule is `relay_pass`'s: a `413` is terminal for one row and says
-/// nothing about the mailbox, so the lane continues; everything else is
-/// evidence about the mailbox, so the lane stops spending on it. A family
-/// `429` ends the pass outright, which is a stronger form of the same answer.
+/// The rule is `relay_pass`'s: a `413` (too large) and a `409` (msg_id
+/// conflict) are terminal for one row and say nothing about the mailbox, so the
+/// lane continues; everything else is evidence about the mailbox, so the lane
+/// stops spending on it. A family `429` ends the pass outright, which is a
+/// stronger form of the same answer.
 fn core_continues_lane(step: &CoreRelayShadowStep) -> bool {
     if step.transport_error.is_some() {
         return false;
     }
-    relay_classify_http_error(step.status, step.relay_code.clone())
-        == CoreRelayFault::MessageTooLarge
+    matches!(
+        relay_classify_http_error(step.status, step.relay_code.clone()),
+        CoreRelayFault::MessageTooLarge | CoreRelayFault::MsgIdConflict
+    )
 }
 
 #[cfg(test)]

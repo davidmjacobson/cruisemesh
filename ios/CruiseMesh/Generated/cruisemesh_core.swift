@@ -23215,6 +23215,15 @@ public enum CoreRelayFault {
      */
     case rateLimited
     /**
+     * 409 `msg_id_conflict`: a row with this envelope's public `msg_id`
+     * already holds *different* sealed content, so the relay kept the first
+     * writer's row and did not store this post. It is per-envelope and does
+     * not mean the mailbox, the credential, or the endpoint is unhealthy —
+     * so it must never retire the sender's retry state for this envelope,
+     * which delivers by mesh/carry instead and resurfaces on a later pass.
+     */
+    case msgIdConflict
+    /**
      * Any other non-2xx: a generic outage with no structured meaning.
      */
     case outage
@@ -23243,7 +23252,9 @@ public struct FfiConverterTypeCoreRelayFault: FfiConverterRustBuffer {
         
         case 6: return .rateLimited
         
-        case 7: return .outage
+        case 7: return .msgIdConflict
+        
+        case 8: return .outage
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -23277,8 +23288,12 @@ public struct FfiConverterTypeCoreRelayFault: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
         
         
-        case .outage:
+        case .msgIdConflict:
             writeInt(&buf, Int32(7))
+        
+        
+        case .outage:
+            writeInt(&buf, Int32(8))
         
         }
     }

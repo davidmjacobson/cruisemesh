@@ -64,6 +64,10 @@ pub fn contact_relay_fault_is_authoritative(fault: CoreRelayFault) -> bool {
         CoreRelayFault::RateLimited
         | CoreRelayFault::MailboxFull
         | CoreRelayFault::MessageTooLarge
+        // A msg_id conflict is about one envelope's public id colliding, not
+        // about who we are: writing the card off for it would strand a healthy
+        // contact over a transient id clash.
+        | CoreRelayFault::MsgIdConflict
         | CoreRelayFault::Outage => false,
     }
 }
@@ -279,6 +283,7 @@ mod tests {
             CoreRelayFault::RateLimited,
             CoreRelayFault::MailboxFull,
             CoreRelayFault::MessageTooLarge,
+            CoreRelayFault::MsgIdConflict,
             CoreRelayFault::Outage,
         ] {
             assert!(!contact_relay_fault_is_authoritative(fault), "{fault:?}");

@@ -351,6 +351,98 @@ async fn msg_id_dedupe_within_family_and_cross_family_isolation() {
     assert_eq!(for_b_after["envelopes"].as_array().unwrap().len(), 1);
 }
 
+/// Raw POST that returns the full response, so a test can assert on a non-2xx
+/// status and its stable `code` — the shared `post_envelope` helper asserts
+/// 200 and cannot express a rejection.
+async fn post_raw(
+    app: &Router,
+    token: &str,
+    msg_id: &[u8],
+    recipient_hint: &[u8],
+    sealed: &[u8],
+    expiry_ms: i64,
+) -> Response {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/envelopes")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "msg_id": b64(msg_id),
+                "hop_ttl": DEFAULT_HOP_TTL,
+                "recipient_hint": b64(recipient_hint),
+                "sealed": b64(sealed),
+                "expiry_ms": expiry_ms,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    app.clone().oneshot(request).await.unwrap()
+}
+
+/// Dedup poisoning is closed: a second post reusing an in-flight msg_id but
+/// carrying different sealed content is rejected with a stable 409, the first
+/// writer's ciphertext survives untouched, and a genuine identical re-post is
+/// still an idempotent dedupe.
+#[tokio::test]
+async fn conflicting_content_under_one_msg_id_is_rejected_and_the_first_row_survives() {
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let (_db, app) = test_app(&["family-a"]);
+
+    let genuine = author_text(&alice, &bob, "the real message", 1);
+    let first = post_envelope(&app, "family-a", &genuine).await;
+    let first_id = first["id"].as_i64().unwrap();
+
+    // An attacker-shaped post: same msg_id and hint, different sealed bytes.
+    let mut forged_sealed = genuine.sealed.clone();
+    forged_sealed[0] ^= 0xFF;
+    let conflict = post_raw(
+        &app,
+        "family-a",
+        &genuine.msg_id,
+        &genuine.recipient_hint,
+        &forged_sealed,
+        genuine.expiry_ms,
+    )
+    .await;
+    assert_eq!(
+        conflict.status(),
+        StatusCode::CONFLICT,
+        "a differing-content re-post of one msg_id must not be accepted as a dedupe"
+    );
+    let body = body_json(conflict).await;
+    assert_eq!(body["code"], "msg_id_conflict");
+
+    // The stored ciphertext is still the genuine sender's, unchanged.
+    let stored = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&genuine.recipient_hint),
+        0,
+    )
+    .await;
+    let envelopes = stored["envelopes"].as_array().unwrap();
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0]["id"].as_i64().unwrap(), first_id);
+    assert_eq!(envelopes[0]["sealed"], b64(&genuine.sealed));
+
+    // The genuine sender's own retry (identical bytes) still dedupes to 200.
+    let retry = post_raw(
+        &app,
+        "family-a",
+        &genuine.msg_id,
+        &genuine.recipient_hint,
+        &genuine.sealed,
+        genuine.expiry_ms,
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::OK);
+    let retry_body = body_json(retry).await;
+    assert_eq!(retry_body["id"].as_i64().unwrap(), first_id);
+}
+
 #[tokio::test]
 async fn wrong_hint_sees_nothing_and_healthz_is_open() {
     let alice = generate_identity();
