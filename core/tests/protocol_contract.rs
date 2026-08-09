@@ -733,6 +733,7 @@ fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
             RECEIPT_TYPE_DELIVERED,
             covered_through,
             None,
+            None,
         )
         .expect("record receipt");
     let after = store

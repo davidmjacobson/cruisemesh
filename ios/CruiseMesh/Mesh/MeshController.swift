@@ -2207,12 +2207,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // exact link that delivered the message -- record that route against
         // the watermark so every acked message's Info pane can prove the
         // BLE/LAN/relay round trip, not just the one at the watermark lamport.
+        // `receivedAtMs` also lets core record the .messageDelivered half of
+        // the Connection details evidence, which is now the only place it is
+        // recorded. This shell used to write that event itself on every
+        // delivered receipt, which made the screen claim a friend had received
+        // a message when all their phone had acked was a profile-sync or
+        // friend-directory blob. Core records it only when the watermark newly
+        // covers a visible message we authored.
         try store.recordReceipt(
             chatId: envelopeSender,
             senderUserId: identity.userId,
             receiptType: receipt.receiptType,
             throughLamport: receipt.lamport,
-            viaTransport: arrival.transport
+            viaTransport: arrival.transport,
+            receivedAtMs: arrival.receivedAt
         )
         // V2 field metric: stamp delivery latency + route on the messages this
         // cumulative delivery receipt confirms.
@@ -2222,15 +2230,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 throughLamport: receipt.lamport,
                 deliveredAtMs: arrival.receivedAt,
                 viaTransport: arrival.transport
-            )
-            // .messageDelivered is the OUTBOUND direction: this receipt proves
-            // a message *we* sent reached them. The inbound direction is
-            // recorded in recordInboundChatArrival.
-            try? store.recordPeerConnectionEvent(
-                userId: envelopeSender,
-                transport: corePeerTransportForArrival(transport: arrival.transport),
-                kind: .messageDelivered,
-                occurredAtMs: arrival.receivedAt
             )
         }
         ChatEvents.notifyChatChanged(envelopeSender)

@@ -2023,12 +2023,21 @@ internal class InboundEnvelopeProcessor(
         // record that route against the watermark (T6) so every acknowledged
         // message's Info pane can prove LAN/BLE/relay delivery -- not just the
         // one at the exact watermark lamport.
+        //
+        // `receivedAtMs` also lets core record the MESSAGE_DELIVERED half of
+        // the Connection details evidence, which is the only place it is
+        // recorded. This shell used to write that event itself on every
+        // delivered receipt, which made the screen claim a friend had received
+        // a message when all their phone had acked was a profile-sync or
+        // friend-directory blob. Core records it only when the watermark newly
+        // covers a visible message we authored.
         store.recordReceipt(
             chatId = envelopeSenderUserId, // local convention: chat keyed by the other party -- see class KDoc
             senderUserId = identity.userId, // whose messages this receipt is about: ours
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
             viaTransport = arrival.transport,
+            receivedAtMs = arrival.receivedAt,
         )
         // V2 field metric: stamp delivery latency + route on the messages this
         // (cumulative) delivery receipt confirms. READ receipts imply delivery
@@ -2040,15 +2049,6 @@ internal class InboundEnvelopeProcessor(
                     throughLamport = receipt.lamport,
                     deliveredAtMs = arrival.receivedAt,
                     viaTransport = arrival.transport,
-                )
-                // MESSAGE_DELIVERED is the OUTBOUND direction: this receipt
-                // proves a message *we* sent reached them. The inbound
-                // direction is recorded in handleIncomingChatMessage.
-                store.recordPeerConnectionEvent(
-                    envelopeSenderUserId,
-                    corePeerTransportForArrival(arrival.transport),
-                    PeerConnectionEventKind.MESSAGE_DELIVERED,
-                    arrival.receivedAt,
                 )
             }
         }

@@ -751,6 +751,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 2,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -765,6 +766,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
                 4,
+                None,
                 None,
             )
             .unwrap();
@@ -788,6 +790,7 @@ mod tests {
                     RECEIPT_TYPE_DELIVERED,
                     through,
                     None,
+                    None,
                 )
                 .unwrap();
         }
@@ -809,6 +812,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_READ,
                 9,
+                None,
                 None,
             )
             .unwrap();
@@ -853,6 +857,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
                 profile,
+                None,
                 None,
             )
             .unwrap();
@@ -899,6 +904,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 9_999,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -932,6 +938,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
                 9_999,
+                None,
                 None,
             )
             .unwrap();
@@ -1119,6 +1126,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 6,
                 None,
+                None,
             )
             .unwrap();
         assert!(queued(&store, &me, &peer).is_empty());
@@ -1168,6 +1176,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
                 authored.envelope.lamport,
+                None,
                 None,
             )
             .unwrap();
@@ -1545,6 +1554,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 2,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1672,6 +1682,7 @@ mod tests {
                 me.user_id.clone(),
                 RECEIPT_TYPE_DELIVERED,
                 150,
+                None,
                 None,
             )
             .unwrap();

@@ -1096,6 +1096,7 @@ mod tests {
                 RECEIPT_TYPE_READ,
                 9,
                 None,
+                None,
             )
             .unwrap();
         let result = store
