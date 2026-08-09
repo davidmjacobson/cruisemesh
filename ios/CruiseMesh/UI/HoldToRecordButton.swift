@@ -258,11 +258,13 @@ struct HoldToRecordButton: View {
         withAnimation(.easeOut(duration: 0.15)) { capture = step.state }
         switch step.effect {
         case .send:
-            if let result = recorder.stop() {
-                onFinished(result.0, result.1)
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            } else {
-                onError(String(localized: "Could not save that voice message"))
+            recorder.stop { result in
+                if let result {
+                    onFinished(result.0, result.1)
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                } else {
+                    onError(String(localized: "Couldn't record that voice message. Try again."))
+                }
             }
         case .discardTooShort:
             recorder.cancel()

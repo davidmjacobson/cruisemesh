@@ -119,6 +119,7 @@ import com.cruisemesh.app.media.ChatImageDecoder
 import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.MediaCompressor
+import com.cruisemesh.app.media.VoicePlaybackDisplay
 import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
@@ -2070,9 +2071,10 @@ private fun VoiceMemoPlayer(
     var tempFile by remember(blob) { mutableStateOf<File?>(null) }
     var positionMs by remember(blob) { mutableIntStateOf(0) }
     // The sender's stated duration until the decoder reports its own, which is
-    // the honest one for the progress bar.
-    var totalMs by remember(blob) { mutableIntStateOf(durationMs) }
-    val couldNotPlay = stringResource(R.string.ui_could_not_play_voice_message)
+    // the honest one for the progress bar. A decode/prepare/playback failure
+    // raises `failed` but never blanks `totalMs`: the bubble keeps the manifest
+    // duration and shows a "couldn't play" line, the same as the iOS bubble.
+    var display by remember(blob) { mutableStateOf(VoicePlaybackDisplay.initial(durationMs)) }
     val audioManager = remember(context) {
         context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
@@ -2155,6 +2157,7 @@ private fun VoiceMemoPlayer(
         }
     }
 
+    Column {
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(
             onClick = {
@@ -2169,14 +2172,16 @@ private fun VoiceMemoPlayer(
                         } catch (_: IllegalStateException) {
                             // A player that errored mid-message is unusable;
                             // throw it away rather than crash the chat screen,
-                            // and let the next tap decode from scratch.
+                            // and let the next tap decode from scratch. Surface
+                            // the failure but keep the manifest duration.
                             releasePlayer()
-                            Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
+                            display = display.withFailure()
                         }
                     }
                     loading -> Unit
                     else -> {
                         loading = true
+                        display = display.retrying()
                         scope.launch {
                             // FA11: writing the blob to disk and MediaPlayer.prepare()
                             // (a blocking decode of the audio headers) both used to
@@ -2201,7 +2206,7 @@ private fun VoiceMemoPlayer(
                             }
                             loading = false
                             if (prepared == null) {
-                                Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
+                                display = display.withFailure()
                                 return@launch
                             }
                             val (temp, mp) = prepared
@@ -2222,10 +2227,10 @@ private fun VoiceMemoPlayer(
                                 // The player is in the Error state now; every
                                 // later call on it would throw.
                                 releasePlayer()
-                                Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
+                                display = display.withFailure()
                                 true
                             }
-                            if (mp.duration > 0) totalMs = mp.duration
+                            display = display.withDecoderDuration(mp.duration)
                             tempFile = temp
                             player = mp
                             positionMs = 0
@@ -2254,14 +2259,20 @@ private fun VoiceMemoPlayer(
                 text = stringResource(
                     R.string.ui_voice_message_progress,
                     formatDurationMs(positionMs),
-                    formatDurationMs(totalMs),
+                    formatDurationMs(display.totalMs),
                 ),
                 style = MaterialTheme.typography.bodyMedium,
                 color = contentColor,
             )
             Spacer(modifier = Modifier.height(4.dp))
             LinearProgressIndicator(
-                progress = { if (totalMs > 0) (positionMs.toFloat() / totalMs).coerceIn(0f, 1f) else 0f },
+                progress = {
+                    if (display.totalMs > 0) {
+                        (positionMs.toFloat() / display.totalMs).coerceIn(0f, 1f)
+                    } else {
+                        0f
+                    }
+                },
                 color = contentColor,
                 trackColor = contentColor.copy(alpha = 0.25f),
                 drawStopIndicator = {},
@@ -2274,6 +2285,15 @@ private fun VoiceMemoPlayer(
                     .clearAndSetSemantics {},
             )
         }
+    }
+    if (display.failed) {
+        Text(
+            text = stringResource(R.string.ui_could_not_play_voice_message),
+            style = MaterialTheme.typography.bodySmall,
+            color = contentColor.copy(alpha = 0.8f),
+            modifier = Modifier.padding(top = 2.dp),
+        )
+    }
     }
 }
 

@@ -164,6 +164,7 @@ struct VoiceMemoRecorderSheet: View {
     @Binding var isRecording: Bool
     let onSend: (URL, Int32) -> Void
     let onMicUnavailable: () -> Void
+    var onRecordingFailed: () -> Void = {}
 
     @State private var capture = voiceCaptureIdleState()
     @State private var startedAt: TimeInterval = 0
@@ -232,11 +233,19 @@ struct VoiceMemoRecorderSheet: View {
         capture = step.state
         switch step.effect {
         case .send:
-            if let (url, duration) = voiceRecorder.stop() {
-                onSend(url, duration)
-            }
             isRecording = false
-            isPresented = false
+            // Dismiss only once the file is finalized: the sheet's onDismiss
+            // calls `cancel()`, which would otherwise delete the recording out
+            // from under this finalize. By the time the completion runs the
+            // recorder has already cleared its state, so that cancel is a no-op.
+            voiceRecorder.stop { result in
+                if let (url, duration) = result {
+                    onSend(url, duration)
+                } else {
+                    onRecordingFailed()
+                }
+                isPresented = false
+            }
         case .discardTooShort, .discardCancelled:
             voiceRecorder.cancel()
             isRecording = false
@@ -314,7 +323,14 @@ private struct AttachmentPickerModifiers: ViewModifier {
                     isPresented: $showVoice,
                     isRecording: $voiceRecording,
                     onSend: onVoiceSend,
-                    onMicUnavailable: { onAttachmentError("Microphone unavailable") }
+                    onMicUnavailable: { onAttachmentError("Microphone unavailable") },
+                    onRecordingFailed: {
+                        // `onAttachmentError` copy is shown via `Text(String)`, which
+                        // does not auto-localize, so resolve the catalog key here to
+                        // match the sibling `String(localized:)` use in
+                        // `HoldToRecordButton` for the same message.
+                        onAttachmentError(String(localized: "Couldn't record that voice message. Try again."))
+                    }
                 )
             }
     }

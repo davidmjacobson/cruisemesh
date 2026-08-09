@@ -1073,6 +1073,16 @@
         }
       }
     },
+    "Couldn't record that voice message. Try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't record that voice message. Try again."
+          }
+        }
+      }
+    },
     "CruiseMesh doesn't have step-by-step help for this one yet. Open Troubleshooting & diagnostics, share diagnostics, and contact support.": {
       "localizations": {
         "en": {
