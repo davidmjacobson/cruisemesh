@@ -130,6 +130,41 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertEqual(deactivations, 2)
     }
 
+    /// Each voice bubble owns a controller, but the process owns one audio
+    /// session. Starting a second message must stop the first rather than play
+    /// over it and then have either one's pause deactivate the shared session.
+    func testStartingASecondMessageStopsTheFirst() {
+        let firstPlayer = FakeVoiceMemoAudioPlayer()
+        var firstDeactivations = 0
+        let first = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in firstPlayer },
+            activateAudioSession: {},
+            deactivateAudioSession: { firstDeactivations += 1 }
+        )
+        let secondPlayer = FakeVoiceMemoAudioPlayer()
+        let second = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in secondPlayer },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        first.play(blob: Data([1]))
+        XCTAssertTrue(first.isPlaying)
+
+        second.play(blob: Data([2]))
+
+        XCTAssertTrue(second.isPlaying)
+        XCTAssertFalse(first.isPlaying, "two voice messages must never play at once")
+        XCTAssertTrue(firstPlayer.stopped)
+        XCTAssertEqual(firstDeactivations, 1, "the first message hands the session over exactly once")
+
+        // And the handover is complete: pausing the message that no longer owns
+        // the session must not deactivate it under the one that does.
+        first.pause()
+        XCTAssertEqual(firstDeactivations, 1)
+        XCTAssertTrue(second.isPlaying)
+    }
+
     func testStoppingClearsProgress() {
         let fake = FakeVoiceMemoAudioPlayer()
         fake.duration = 8

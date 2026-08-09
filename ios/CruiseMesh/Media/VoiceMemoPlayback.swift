@@ -68,6 +68,20 @@ final class VoiceMemoPlaybackController: ObservableObject {
     /// Seconds the decoder reported, or 0 until a player exists.
     @Published private(set) var total: TimeInterval = 0
 
+    /// The controller currently holding the shared audio session, if any.
+    ///
+    /// Every voice bubble in the timeline owns its own controller, but the
+    /// process has exactly one `AVAudioSession`. Without an owner of record,
+    /// tapping a second message while a first one plays leaves both playing on
+    /// top of each other, and pausing either one deactivates the session out
+    /// from under the other. Taking the session stops whoever had it, so at most
+    /// one voice message is ever audible and `ownsAudioSession` is a true claim
+    /// rather than a hopeful one.
+    ///
+    /// Weak: a bubble that scrolls away deallocates, and a dead controller must
+    /// not keep the session reserved.
+    private static weak var sessionHolder: VoiceMemoPlaybackController?
+
     private let playerFactory: PlayerFactory
     private let activateAudioSession: () throws -> Void
     private let deactivateAudioSession: () -> Void
@@ -114,8 +128,7 @@ final class VoiceMemoPlaybackController: ObservableObject {
         do {
             Self.log.info("Preparing voice message playback (\(blob.count, privacy: .public) bytes, M4A)")
             let next = try playerFactory(blob, AVFileType.m4a.rawValue)
-            ownsAudioSession = true
-            try activateAudioSession()
+            try takeAudioSession()
 
             let token = UUID()
             playbackToken = token
@@ -165,8 +178,7 @@ final class VoiceMemoPlaybackController: ObservableObject {
 
     private func resume(_ player: VoiceMemoAudioPlaying) {
         do {
-            ownsAudioSession = true
-            try activateAudioSession()
+            try takeAudioSession()
         } catch {
             reset(clearFailure: false)
             playbackFailed = true
@@ -206,9 +218,25 @@ final class VoiceMemoPlaybackController: ObservableObject {
         releaseAudioSession()
     }
 
+    /// Claims the shared audio session for this message, stopping whichever
+    /// message had it. See [`sessionHolder`].
+    private func takeAudioSession() throws {
+        if let holder = Self.sessionHolder, holder !== self {
+            holder.stop()
+        }
+        // Claimed before activating, so a throw still leaves the failure path's
+        // `releaseAudioSession()` able to hand back a half-taken session.
+        ownsAudioSession = true
+        Self.sessionHolder = self
+        try activateAudioSession()
+    }
+
     private func releaseAudioSession() {
         guard ownsAudioSession else { return }
         ownsAudioSession = false
+        if Self.sessionHolder === self {
+            Self.sessionHolder = nil
+        }
         deactivateAudioSession()
     }
 
@@ -216,6 +244,8 @@ final class VoiceMemoPlaybackController: ObservableObject {
         progressTimer = nil
         player?.onFinish = nil
         player?.stop()
+        // No need to clear `sessionHolder` here: it is weak, so it has already
+        // zeroed itself by the time this runs.
         if ownsAudioSession {
             deactivateAudioSession()
         }
