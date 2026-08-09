@@ -1336,6 +1336,16 @@ impl RelayStore {
     /// does NOT enforce the per-family storage quota — that check needs a
     /// prune-then-recheck decision per row (see `post_envelope`), which
     /// doesn't make sense to run per-row inside one bulk transaction.
+    ///
+    /// A same-`(family_token, msg_id)` re-post is resolved by *content*, the
+    /// same rule `insert_envelope` and `insert_envelope_with_quota` enforce
+    /// (contract invariant DEDUP-01): an identical re-post dedupes (longer hop
+    /// budget / later expiry win), while a re-post carrying different sealed
+    /// bytes leaves the stored first-writer row entirely untouched. This path
+    /// has no per-row outcome to return, so a differing-content row is a no-op
+    /// rather than a signalled conflict — but it likewise never overwrites the
+    /// stored bytes, so no ingest path can silently replace one msg_id's
+    /// content with another's.
     pub fn insert_envelopes_batch(
         &self,
         rows: &[(String, Vec<u8>, u8, Vec<u8>, Vec<u8>, i64, i64)],
@@ -1352,28 +1362,58 @@ impl RelayStore {
         let mut conn = self.conn.lock().expect("relay store mutex poisoned");
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         {
-            let mut stmt = tx
+            let mut select = tx
+                .prepare(
+                    "SELECT sealed FROM envelopes
+                     WHERE family_token = ?1 AND msg_id = ?2 LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut insert = tx
                 .prepare(
                     "INSERT INTO envelopes
                         (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                     ON CONFLICT(family_token, msg_id) DO UPDATE SET
-                        hop_ttl = MAX(hop_ttl, excluded.hop_ttl),
-                        expiry_ms = MAX(expiry_ms, excluded.expiry_ms)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| e.to_string())?;
+            let mut bump = tx
+                .prepare(
+                    "UPDATE envelopes SET
+                        hop_ttl = MAX(hop_ttl, ?3),
+                        expiry_ms = MAX(expiry_ms, ?4)
+                     WHERE family_token = ?1 AND msg_id = ?2",
                 )
                 .map_err(|e| e.to_string())?;
             for (family, msg_id, hop_ttl, hint, sealed, expiry_ms, created_at_ms) in rows {
                 let expiry_ms = Self::effective_expiry(*created_at_ms, *expiry_ms);
-                stmt.execute(params![
-                    family,
-                    msg_id,
-                    *hop_ttl as i64,
-                    hint,
-                    sealed,
-                    expiry_ms,
-                    created_at_ms,
-                ])
-                .map_err(|e| e.to_string())?;
+                let stored_sealed: Option<Vec<u8>> = select
+                    .query_row(params![family, msg_id], |row| row.get(0))
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                match stored_sealed {
+                    // Differing content under an existing id: leave the stored
+                    // first-writer row untouched, never overwrite (DEDUP-01).
+                    Some(stored) if stored != *sealed => {}
+                    // Identical re-post: idempotent dedupe, take the longer
+                    // hop budget / later expiry.
+                    Some(_) => {
+                        bump.execute(params![family, msg_id, *hop_ttl as i64, expiry_ms])
+                            .map_err(|e| e.to_string())?;
+                    }
+                    // New id: store it.
+                    None => {
+                        insert
+                            .execute(params![
+                                family,
+                                msg_id,
+                                *hop_ttl as i64,
+                                hint,
+                                sealed,
+                                expiry_ms,
+                                created_at_ms,
+                            ])
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -5177,6 +5217,76 @@ mod tests {
             plan.contains("idx_envelopes_family_hint_id")
                 || plan.to_ascii_lowercase().contains("using index"),
             "expected index at ~10k rows, got:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn batch_insert_resolves_same_msg_id_by_content() {
+        // DEDUP-01 for the bulk ingest path: an identical re-post dedupes and
+        // takes the longer hop budget / later expiry, while a re-post carrying
+        // different sealed bytes leaves the stored first-writer row untouched
+        // and never overwrites it.
+        let (_db, store) = test_store();
+        let now = 1_700_000_000_000i64;
+        let msg_id = sample_msg_id(9);
+        let hint = sample_hint(1);
+        let first = sample_sealed(1);
+        let garbage = sample_sealed(2);
+
+        // First write establishes the row with a modest hop budget/expiry.
+        store
+            .insert_envelopes_batch(&[(
+                "family-a".to_string(),
+                msg_id.clone(),
+                3u8,
+                hint.clone(),
+                first.clone(),
+                now + 10_000,
+                now,
+            )])
+            .unwrap();
+
+        // Identical re-post with a longer budget dedupes onto the same row;
+        // a differing-content re-post under the same id is a no-op that does
+        // NOT overwrite the stored bytes.
+        store
+            .insert_envelopes_batch(&[
+                (
+                    "family-a".to_string(),
+                    msg_id.clone(),
+                    7u8,
+                    hint.clone(),
+                    first.clone(),
+                    now + 60_000,
+                    now,
+                ),
+                (
+                    "family-a".to_string(),
+                    msg_id.clone(),
+                    9u8,
+                    hint.clone(),
+                    garbage.clone(),
+                    now + 999_000,
+                    now,
+                ),
+            ])
+            .unwrap();
+
+        let stored = store
+            .fetch_envelopes("family-a", vec![hint.clone()], 0, 100, now)
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "one row survives, no second content admitted"
+        );
+        assert_eq!(
+            stored[0].sealed, first,
+            "first-writer content is never overwritten by a conflicting re-post"
+        );
+        assert_eq!(
+            stored[0].hop_ttl, 7,
+            "identical re-post takes the longer hop budget"
         );
     }
 
