@@ -39,23 +39,37 @@
 //! | [`CoreRelayShadowMismatchKind::SelectionSkipDiffers`] | Did one engine decline to post for a recipient the other would have posted for? |
 //!
 //! The destination and request axes are answered by calling the *same*
-//! functions the real pass calls ([`crate::session::relay_pass::shadow_upload_endpoint_for`],
-//! [`crate::session::relay_pass::shadow_upload_request`]), not by a second
-//! implementation of them. A canary that compared against a copy would be
-//! testing the copy.
+//! code the real pass calls ([`crate::session::relay_pass::shadow_upload_endpoint_for`]
+//! resolves the mailbox; [`crate::session::relay_pass::shadow_upload_encodable`]
+//! asks the one envelope validator that `relay_encode_post_envelope` itself
+//! runs), not by a second implementation of them. A canary that compared
+//! against a copy would be testing the copy.
 //!
 //! # Secrets
 //!
-//! A capture carries tokens and sealed bytes, because resolving a
-//! destination needs the credential and forming a request needs the body. A
+//! A capture carries tokens, because resolving a destination needs the
+//! credential. It does not carry payloads: a row is described by the *size*
+//! of its sealed body, which is all the encodability question needs. A
 //! [`CoreRelayShadowReport`] carries neither: every field in it is a count or
 //! an enum, and [`CoreRelayShadowMismatch`] has no free-text field at all. The
 //! report is the only thing that reaches the event ring, so `SECRET-01` holds
 //! by the shape of the type rather than by care at the call site.
+//!
+//! # What a comparison may cost
+//!
+//! Two bounds, both enforced here rather than by a shell, because a bound a
+//! shell applies is a bound the other shell can forget. A capture is clamped
+//! to [`RELAY_SHADOW_MAX_ROWS`] rows and [`RELAY_SHADOW_MAX_SKIPS`] skipped
+//! recipients before anything is compared, and the report names at most one
+//! mismatch per kind, carrying how many rows showed it. A device diverging
+//! systematically — which is what the currently open divergences guarantee —
+//! therefore costs the protocol event ring a fixed handful of records per
+//! sample instead of one per row, and cannot evict the operational evidence
+//! the ring exists to carry.
 
 use crate::relay_status::{relay_classify_http_error, CoreRelayFault};
 use crate::session::relay_pass::{
-    shadow_upload_endpoint_for, shadow_upload_request, CoreRelayContactConfig,
+    shadow_upload_encodable, shadow_upload_endpoint_for, CoreRelayContactConfig,
     CoreRelayEndpointConfig, CoreRelayTransportError,
 };
 
@@ -67,6 +81,12 @@ use crate::session::relay_pass::{
 /// happens on one pass in a thousand is not the class of defect this is
 /// looking for, and a canary that costs a person battery is one they turn
 /// off.
+///
+/// "Day" is the UTC calendar day the clock reads, not a rolling twenty-four
+/// hours, so a window straddling midnight can hold up to twice this. That is
+/// the cheaper of the two to state honestly: a rolling window needs the
+/// timestamps of every sample kept, and the number that matters here is the
+/// order of magnitude.
 pub const RELAY_SHADOW_MAX_SAMPLES_PER_DAY: u32 = 12;
 
 /// The quiet time between two samples. Relay passes arrive in bursts — a push
@@ -75,10 +95,15 @@ pub const RELAY_SHADOW_MAX_SAMPLES_PER_DAY: u32 = 12;
 /// evidence.
 pub const RELAY_SHADOW_MIN_INTERVAL_MS: i64 = 15 * 60 * 1_000;
 
-/// Rows one sampled pass may capture. The cap is on memory, not on interest:
-/// a sealed payload can be half a megabyte, and a capture is held whole while
-/// it is compared.
+/// Rows one sampled pass may capture. A shell stops recording at this many so
+/// it never holds more, and [`core_relay_shadow_compare`] clamps to it again
+/// so a shell that did not is still bounded here.
 pub const RELAY_SHADOW_MAX_ROWS: u32 = 16;
+
+/// Skipped recipients one sampled pass may report. A family is small; a list
+/// longer than this is a bug or a device with a very long contact list, and
+/// neither is worth a proportional number of diagnostics records.
+pub const RELAY_SHADOW_MAX_SKIPS: u32 = 32;
 
 /// [`RELAY_SHADOW_MAX_ROWS`], for a shell. A `const` does not cross UniFFI,
 /// and a shell that wrote the number down itself would be a second place it is
@@ -86,6 +111,12 @@ pub const RELAY_SHADOW_MAX_ROWS: u32 = 16;
 #[uniffi::export]
 pub fn core_relay_shadow_max_rows() -> u32 {
     RELAY_SHADOW_MAX_ROWS
+}
+
+/// [`RELAY_SHADOW_MAX_SKIPS`], for a shell, for the same reason.
+#[uniffi::export]
+pub fn core_relay_shadow_max_skips() -> u32 {
+    RELAY_SHADOW_MAX_SKIPS
 }
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
@@ -166,8 +197,8 @@ pub enum CoreRelayShadowLane {
 /// One row the legacy engine handled, and what happened to it.
 ///
 /// These are *observations*, not instructions: nothing here is acted on, and
-/// the only reason the sealed bytes are present is that forming the request
-/// core would have sent requires them.
+/// there is no payload — [`Self::sealed_len`] is the size of the sealed body,
+/// which is the whole of what "could core have encoded this row" turns on.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreRelayShadowStep {
     pub lane: CoreRelayShadowLane,
@@ -177,7 +208,12 @@ pub struct CoreRelayShadowStep {
     /// Who the row is addressed to, which is what a destination is resolved
     /// from.
     pub recipient_user_id: Vec<u8>,
-    pub sealed: Vec<u8>,
+    /// How many bytes the sealed payload was. The bytes themselves are
+    /// deliberately not captured: sixteen half-megabyte rows held whole,
+    /// copied across the language boundary and cloned again to build a body
+    /// that is immediately thrown away is tens of megabytes on a phone, for a
+    /// question about a length.
+    pub sealed_len: u64,
     pub expiry_ms: i64,
     /// The mailbox the legacy engine resolved for this row, or `None` when it
     /// declined to post at all.
@@ -195,6 +231,10 @@ pub struct CoreRelayShadowStep {
 }
 
 /// Everything one sampled legacy pass is asked to remember.
+///
+/// Both lists are clamped by [`core_relay_shadow_compare`] before anything is
+/// read, so an over-long capture costs a truncated comparison rather than an
+/// unbounded one.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreRelayShadowCapture {
     pub own: Option<CoreRelayEndpointConfig>,
@@ -245,7 +285,15 @@ impl CoreRelayShadowMismatchKind {
     }
 }
 
-/// One disagreement, named by kind and located by position.
+/// One *kind* of disagreement, with how many rows showed it.
+///
+/// Deliberately not one entry per row. The divergences a canary finds are
+/// overwhelmingly systematic — a rule one engine applies and the other does
+/// not shows up on every row it touches — so a per-row list is the same fact
+/// repeated at the cost of the diagnostics ring, where every record it writes
+/// evicts an older one carrying something nobody else recorded. A kind, the
+/// first place it was seen, and a count answer every question a per-row list
+/// would have, in a bounded number of records.
 ///
 /// There is no field here that could hold a message, an endpoint or a
 /// credential, and that is the whole design: this is the type that reaches
@@ -253,18 +301,29 @@ impl CoreRelayShadowMismatchKind {
 #[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CoreRelayShadowMismatch {
     pub kind: CoreRelayShadowMismatchKind,
-    /// Index into [`CoreRelayShadowCapture::steps`], or into
+    /// The first index that showed this kind: into
+    /// [`CoreRelayShadowCapture::steps`], or into
     /// [`CoreRelayShadowCapture::skipped_recipients`] for a
     /// [`CoreRelayShadowMismatchKind::SelectionSkipDiffers`].
-    pub index: u32,
+    pub first_index: u32,
+    /// How many rows (or skipped recipients) showed it. Never zero.
+    pub rows: u32,
 }
 
 /// What one comparison found. Counts and enums only.
+///
+/// [`Self::mismatches`] holds at most one entry per
+/// [`CoreRelayShadowMismatchKind`], so a report is bounded by the number of
+/// kinds however badly a device diverges.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreRelayShadowReport {
     pub steps_compared: u32,
     pub rows_unshadowed: u32,
     pub skips_compared: u32,
+    /// Rows and skipped recipients the capture carried past the caps and this
+    /// comparison therefore did not look at. Counted rather than dropped, for
+    /// the same reason as [`CoreRelayShadowCapture::rows_unshadowed`].
+    pub rows_truncated: u32,
     pub mismatches: Vec<CoreRelayShadowMismatch>,
 }
 
@@ -276,12 +335,21 @@ pub struct CoreRelayShadowReport {
 ///
 /// Pure: no store, no clock, no network. Called after the legacy pass has
 /// already finished, so nothing it returns can change what that pass did.
+///
+/// The capture is clamped to [`RELAY_SHADOW_MAX_ROWS`] and
+/// [`RELAY_SHADOW_MAX_SKIPS`] here, so the work and the report are bounded by
+/// this function rather than by whichever shell built the capture.
 #[uniffi::export]
 pub fn core_relay_shadow_compare(capture: CoreRelayShadowCapture) -> CoreRelayShadowReport {
-    let mut mismatches: Vec<CoreRelayShadowMismatch> = Vec::new();
+    let mut found = MismatchTally::default();
     let mut seen_authored = false;
 
-    for (index, step) in capture.steps.iter().enumerate() {
+    let step_limit = (RELAY_SHADOW_MAX_ROWS as usize).min(capture.steps.len());
+    let skip_limit = (RELAY_SHADOW_MAX_SKIPS as usize).min(capture.skipped_recipients.len());
+    let rows_truncated =
+        (capture.steps.len() - step_limit) + (capture.skipped_recipients.len() - skip_limit);
+
+    for (index, step) in capture.steps.iter().take(step_limit).enumerate() {
         let index = index as u32;
 
         // Fairness order. Core runs the whole receipt lane before the first
@@ -291,10 +359,7 @@ pub fn core_relay_shadow_compare(capture: CoreRelayShadowCapture) -> CoreRelaySh
             CoreRelayShadowLane::Authored => seen_authored = true,
             CoreRelayShadowLane::Receipt => {
                 if seen_authored {
-                    mismatches.push(CoreRelayShadowMismatch {
-                        kind: CoreRelayShadowMismatchKind::LaneOrderDiffers,
-                        index,
-                    });
+                    found.note(CoreRelayShadowMismatchKind::LaneOrderDiffers, index);
                 }
             }
         }
@@ -313,67 +378,80 @@ pub fn core_relay_shadow_compare(capture: CoreRelayShadowCapture) -> CoreRelaySh
             _ => false,
         };
         if !agrees {
-            mismatches.push(CoreRelayShadowMismatch {
-                kind: CoreRelayShadowMismatchKind::DestinationDiffers,
-                index,
-            });
+            found.note(CoreRelayShadowMismatchKind::DestinationDiffers, index);
         }
 
         // Only a row the legacy engine actually posted can be asked whether
         // core could have posted it: a row neither engine sends is not a
         // request-formation question.
         if legacy.is_some() {
-            let constructible = planned.as_ref().is_some_and(|endpoint| {
-                shadow_upload_request(
-                    endpoint,
-                    step.msg_id.clone(),
-                    step.hop_ttl,
-                    step.recipient_hint.clone(),
-                    step.sealed.clone(),
-                    step.expiry_ms,
-                )
-                .is_some()
-            });
+            let constructible = planned.is_some()
+                && shadow_upload_encodable(&step.msg_id, &step.recipient_hint, step.sealed_len);
             if !constructible {
-                mismatches.push(CoreRelayShadowMismatch {
-                    kind: CoreRelayShadowMismatchKind::RequestNotConstructible,
-                    index,
-                });
+                found.note(CoreRelayShadowMismatchKind::RequestNotConstructible, index);
             }
         }
 
         let succeeded = step.transport_error.is_none() && (200..300).contains(&step.status);
         if succeeded != step.legacy_marked_posted && legacy.is_some() {
-            mismatches.push(CoreRelayShadowMismatch {
-                kind: CoreRelayShadowMismatchKind::SuccessMarkingDiffers,
-                index,
-            });
+            found.note(CoreRelayShadowMismatchKind::SuccessMarkingDiffers, index);
         }
 
         if legacy.is_some() && !succeeded && core_continues_lane(step) != step.legacy_continued_lane
         {
-            mismatches.push(CoreRelayShadowMismatch {
-                kind: CoreRelayShadowMismatchKind::FaultConsequenceDiffers,
-                index,
-            });
+            found.note(CoreRelayShadowMismatchKind::FaultConsequenceDiffers, index);
         }
     }
 
-    for (index, recipient) in capture.skipped_recipients.iter().enumerate() {
+    for (index, recipient) in capture
+        .skipped_recipients
+        .iter()
+        .take(skip_limit)
+        .enumerate()
+    {
         if shadow_upload_endpoint_for(&capture.contacts, capture.own.as_ref(), recipient).is_some()
         {
-            mismatches.push(CoreRelayShadowMismatch {
-                kind: CoreRelayShadowMismatchKind::SelectionSkipDiffers,
-                index: index as u32,
-            });
+            found.note(
+                CoreRelayShadowMismatchKind::SelectionSkipDiffers,
+                index as u32,
+            );
         }
     }
 
     CoreRelayShadowReport {
-        steps_compared: capture.steps.len() as u32,
+        steps_compared: step_limit as u32,
         rows_unshadowed: capture.rows_unshadowed,
-        skips_compared: capture.skipped_recipients.len() as u32,
-        mismatches,
+        skips_compared: skip_limit as u32,
+        rows_truncated: rows_truncated as u32,
+        mismatches: found.into_vec(),
+    }
+}
+
+/// One entry per kind, in the order the kinds were first seen.
+///
+/// A `Vec` rather than a map because there are six kinds: the linear scan is
+/// cheaper than hashing, and the insertion order is what makes a report read
+/// in the order a person watching the pass would have seen the trouble.
+#[derive(Default)]
+struct MismatchTally {
+    entries: Vec<CoreRelayShadowMismatch>,
+}
+
+impl MismatchTally {
+    fn note(&mut self, kind: CoreRelayShadowMismatchKind, index: u32) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.kind == kind) {
+            entry.rows = entry.rows.saturating_add(1);
+            return;
+        }
+        self.entries.push(CoreRelayShadowMismatch {
+            kind,
+            first_index: index,
+            rows: 1,
+        });
+    }
+
+    fn into_vec(self) -> Vec<CoreRelayShadowMismatch> {
+        self.entries
     }
 }
 
@@ -410,7 +488,7 @@ mod tests {
             hop_ttl: 3,
             recipient_hint: vec![2u8; 8],
             recipient_user_id: recipient.to_vec(),
-            sealed: vec![3u8; 64],
+            sealed_len: 64,
             expiry_ms: 1_000,
             legacy_endpoint: Some(endpoint("https://relay.example", "member-token")),
             status: 200,
@@ -455,7 +533,8 @@ mod tests {
             kinds(&report),
             vec![CoreRelayShadowMismatchKind::LaneOrderDiffers]
         );
-        assert_eq!(report.mismatches[0].index, 1);
+        assert_eq!(report.mismatches[0].first_index, 1);
+        assert_eq!(report.mismatches[0].rows, 1);
     }
 
     #[test]
@@ -543,6 +622,70 @@ mod tests {
         let mut taken = capture(Vec::new());
         taken.rows_unshadowed = 4;
         assert_eq!(core_relay_shadow_compare(taken).rows_unshadowed, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a diverging device may cost
+    // -----------------------------------------------------------------------
+
+    /// A row that diverges on every axis at once, so one row contributes one
+    /// entry of each kind rather than a list per row.
+    fn diverging(lane: CoreRelayShadowLane) -> CoreRelayShadowStep {
+        let mut row = step(lane, b"contact");
+        row.legacy_endpoint = Some(endpoint("https://elsewhere.example", "other-token"));
+        row.msg_id = Vec::new();
+        row.status = 507;
+        row.relay_code = Some("mailbox_full".to_string());
+        row.legacy_marked_posted = true;
+        row.legacy_continued_lane = true;
+        row
+    }
+
+    #[test]
+    fn a_systematically_diverging_pass_reports_one_entry_per_kind() {
+        let rows: Vec<CoreRelayShadowStep> =
+            std::iter::once(diverging(CoreRelayShadowLane::Authored))
+                .chain((0..40).map(|_| diverging(CoreRelayShadowLane::Receipt)))
+                .collect();
+        let mut taken = capture(rows);
+        taken.skipped_recipients = (0..200u32).map(|i| i.to_be_bytes().to_vec()).collect();
+
+        let report = core_relay_shadow_compare(taken);
+
+        // Every kind at most once, whatever the row count.
+        let mut seen = kinds(&report);
+        let before = seen.len();
+        seen.sort_unstable_by_key(|kind| kind.as_token());
+        seen.dedup();
+        assert_eq!(seen.len(), before, "a kind was reported more than once");
+        assert!(report.mismatches.len() <= 6);
+
+        // And the counts still say how widespread each one was.
+        let lane_order = report
+            .mismatches
+            .iter()
+            .find(|m| m.kind == CoreRelayShadowMismatchKind::LaneOrderDiffers)
+            .expect("receipts behind an authored row");
+        assert_eq!(lane_order.first_index, 1);
+        assert_eq!(lane_order.rows, RELAY_SHADOW_MAX_ROWS - 1);
+    }
+
+    #[test]
+    fn an_over_long_capture_is_clamped_rather_than_compared_whole() {
+        let rows: Vec<CoreRelayShadowStep> = (0..2_000)
+            .map(|_| step(CoreRelayShadowLane::Authored, b"contact"))
+            .collect();
+        let mut taken = capture(rows);
+        taken.skipped_recipients = (0..500u32).map(|i| i.to_be_bytes().to_vec()).collect();
+
+        let report = core_relay_shadow_compare(taken);
+
+        assert_eq!(report.steps_compared, RELAY_SHADOW_MAX_ROWS);
+        assert_eq!(report.skips_compared, RELAY_SHADOW_MAX_SKIPS);
+        assert_eq!(
+            report.rows_truncated,
+            (2_000 - RELAY_SHADOW_MAX_ROWS) + (500 - RELAY_SHADOW_MAX_SKIPS),
+        );
     }
 
     // -----------------------------------------------------------------------

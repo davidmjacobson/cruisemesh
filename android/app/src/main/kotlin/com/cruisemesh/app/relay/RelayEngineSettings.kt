@@ -1,6 +1,7 @@
 package com.cruisemesh.app.relay
 
 import android.content.Context
+import uniffi.cruisemesh_core.CoreRelayShadowSampler
 
 /**
  * Which engine runs a relay pass.
@@ -29,12 +30,13 @@ enum class RelayPassEngine {
  * than convenient. The whole selection has to be removable once the legacy
  * engine is deleted, and a flag that had earned a column in the store's schema
  * would not be: schemas here are forward-only, so removing it later would mean
- * either a migration to drop nothing or a dead column kept forever. Two
- * preference keys simply stop being read.
+ * either a migration to drop nothing or a dead column kept forever. A handful
+ * of preference keys simply stop being read.
  *
- * There is no user-facing string here and no screen: this is an internal
- * switch for a closed-test canary. If it ever grows a control in Advanced, its
- * label goes through `strings.xml` like every other piece of copy.
+ * The engine switch is reachable from the internal tools screen, behind the
+ * same door as the manual relay fields. It has to be: a closed-test build is
+ * release-signed, `run-as` is refused on it, and a canary whose flag can only
+ * be set by a JVM test can never produce the evidence it exists to produce.
  */
 object RelayEngineSettings {
 
@@ -44,6 +46,10 @@ object RelayEngineSettings {
     private const val PREF_PASS_ENGINE = "pass_engine_core"
 
     private const val PREF_SHADOW_ENABLED = "pass_engine_shadow"
+
+    private const val PREF_SHADOW_DAY = "pass_engine_shadow_day"
+    private const val PREF_SHADOW_COUNT = "pass_engine_shadow_count"
+    private const val PREF_SHADOW_LAST_MS = "pass_engine_shadow_last_ms"
 
     /**
      * The engine the *next* pass will use.
@@ -73,15 +79,45 @@ object RelayEngineSettings {
     /**
      * Whether the migration canary may sample legacy passes.
      *
-     * Defaults to on, because a canary nobody switches on is not a canary. It
-     * costs a bounded handful of comparisons a day and no network at all; see
-     * `RelayShadowAdapter`.
+     * Defaults to **on**, and that is worth stating plainly rather than
+     * filing under "the default path is unchanged": a shipped device runs the
+     * canary. What it does not do is change anything the device sends,
+     * receives, marks or stores -- it reads what the pass already observed and
+     * writes one bounded diagnostics record on a handful of passes a day. The
+     * mail-moving path is byte-identical with it on or off; that is the claim,
+     * and it is the one the tests pin.
      */
     fun shadowEnabled(context: Context): Boolean =
         prefs(context).getBoolean(PREF_SHADOW_ENABLED, true)
 
     fun setShadowEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(PREF_SHADOW_ENABLED, enabled).apply()
+    }
+
+    /**
+     * The canary's sampling state, across process launches.
+     *
+     * Three integers, in the file the engine flag already lives in, and they
+     * are what makes "a bounded number of samples a day" true. Held only in
+     * memory, the count resets to zero on every service start and a fresh
+     * sampler always samples its first pass -- so a phone whose foreground
+     * service Android keeps killing and restarting would sample nearly every
+     * pass, which is the opposite of a bound.
+     */
+    fun shadowSampler(context: Context): CoreRelayShadowSampler = prefs(context).let {
+        CoreRelayShadowSampler(
+            dayIndex = it.getLong(PREF_SHADOW_DAY, 0L),
+            samplesToday = it.getInt(PREF_SHADOW_COUNT, 0).coerceAtLeast(0).toUInt(),
+            lastSampleAtMs = it.getLong(PREF_SHADOW_LAST_MS, 0L),
+        )
+    }
+
+    fun setShadowSampler(context: Context, state: CoreRelayShadowSampler) {
+        prefs(context).edit()
+            .putLong(PREF_SHADOW_DAY, state.dayIndex)
+            .putInt(PREF_SHADOW_COUNT, state.samplesToday.toInt())
+            .putLong(PREF_SHADOW_LAST_MS, state.lastSampleAtMs)
+            .apply()
     }
 
     private fun prefs(context: Context) =

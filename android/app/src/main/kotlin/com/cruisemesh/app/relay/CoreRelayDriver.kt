@@ -113,7 +113,7 @@ object CoreRelayDriver {
                 result
             }
         } catch (e: Exception) {
-            val error = classify(e)
+            val error = relayClassifyTransportError(e)
             // The path only, never the query: a fetch path carries recipient
             // hints and this log is shared with whoever is helping.
             RelayClient.logFailure(
@@ -182,28 +182,6 @@ object CoreRelayDriver {
         connection.getHeaderField(name)?.let { CoreRelayHeader(name, it) }
     }
 
-    /**
-     * Which typed failure this was.
-     *
-     * [RelayResponseStalledException] maps to the same answer as an oversize
-     * body on purpose: the relay answered and then the body stopped arriving,
-     * which on a link that will not carry a full page is the same permanent
-     * stall from the same cursor, and asking for fewer rows is the same fix.
-     * A timeout while *connecting* or waiting for the status line says nothing
-     * about page size and stays a plain timeout.
-     */
-    internal fun classify(error: Exception): CoreRelayTransportError = when (error) {
-        is RelayPageTooBigException -> CoreRelayTransportError.BODY_TOO_LARGE
-        is SSLException -> CoreRelayTransportError.TLS
-        is SocketTimeoutException -> CoreRelayTransportError.TIMEOUT
-        is InterruptedException -> CoreRelayTransportError.CANCELLED
-        is IOException -> CoreRelayTransportError.CONNECTION_FAILED
-        else -> {
-            Log.w(TAG, "Relay driver saw an unexpected failure: ${error.javaClass.simpleName}")
-            CoreRelayTransportError.OTHER
-        }
-    }
-
     private fun failure(
         passId: String,
         actionId: ULong,
@@ -221,4 +199,33 @@ object CoreRelayDriver {
         error = error,
         completedAtMs = nowMs,
     )
+}
+
+/**
+ * Which typed failure a thrown exception was.
+ *
+ * A free function rather than a member of [CoreRelayDriver], and that is not
+ * tidiness. The migration canary needs this mapping to describe a failure the
+ * *legacy* engine saw, and reaching it through the driver would put the object
+ * that opens sockets inside the canary's reach -- one line from a comparison
+ * to a live request. The classification is a pure function of an exception and
+ * belongs to neither engine, so it lives beside both.
+ *
+ * [RelayPageTooBigException] maps to the same answer as an oversize body on
+ * purpose: the relay answered and then the body stopped arriving, which on a
+ * link that will not carry a full page is the same permanent stall from the
+ * same cursor, and asking for fewer rows is the same fix. A timeout while
+ * *connecting* or waiting for the status line says nothing about page size and
+ * stays a plain timeout.
+ */
+internal fun relayClassifyTransportError(error: Exception): CoreRelayTransportError = when (error) {
+    is RelayPageTooBigException -> CoreRelayTransportError.BODY_TOO_LARGE
+    is SSLException -> CoreRelayTransportError.TLS
+    is SocketTimeoutException -> CoreRelayTransportError.TIMEOUT
+    is InterruptedException -> CoreRelayTransportError.CANCELLED
+    is IOException -> CoreRelayTransportError.CONNECTION_FAILED
+    else -> {
+        Log.w("MeshService", "Relay saw an unexpected failure: ${error.javaClass.simpleName}")
+        CoreRelayTransportError.OTHER
+    }
 }

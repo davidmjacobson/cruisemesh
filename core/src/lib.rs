@@ -194,8 +194,6 @@ pub use session::relay_pass::{
     RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES, RELAY_PASS_MAX_RECEIPT_UPLOADS,
     RELAY_PASS_MAX_REQUESTS, RELAY_PASS_MAX_RESPONSE_BYTES,
 };
-// Package C1's migration canary. Pure comparison over captured values, and
-// removed with the legacy engine it exists to check.
 pub use session::relay_policy::{
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
     core_family_relay_backoff_vectors, core_family_relay_health_vectors,
@@ -206,12 +204,14 @@ pub use session::relay_policy::{
     CoreRelayRerunAction, CoreRelayRerunVector, FAMILY_RELAY_BACKOFF_BASE_MS,
     FAMILY_RELAY_BACKOFF_CAP_MS, FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
 };
+// The migration canary. Pure comparison over captured values, and removed
+// with the legacy engine it exists to check.
 pub use session::relay_shadow::{
-    core_relay_shadow_compare, core_relay_shadow_max_rows, core_relay_shadow_sample,
-    CoreRelayShadowCapture, CoreRelayShadowLane, CoreRelayShadowMismatch,
+    core_relay_shadow_compare, core_relay_shadow_max_rows, core_relay_shadow_max_skips,
+    core_relay_shadow_sample, CoreRelayShadowCapture, CoreRelayShadowLane, CoreRelayShadowMismatch,
     CoreRelayShadowMismatchKind, CoreRelayShadowReport, CoreRelayShadowSample,
     CoreRelayShadowSampler, CoreRelayShadowStep, RELAY_SHADOW_MAX_ROWS,
-    RELAY_SHADOW_MAX_SAMPLES_PER_DAY, RELAY_SHADOW_MIN_INTERVAL_MS,
+    RELAY_SHADOW_MAX_SAMPLES_PER_DAY, RELAY_SHADOW_MAX_SKIPS, RELAY_SHADOW_MIN_INTERVAL_MS,
 };
 pub use spray_policy::{
     core_spray_retry_arm_max_ms, CoreSprayAdmission, CoreSprayAdmissionReason, CoreSprayGate,

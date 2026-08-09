@@ -55,6 +55,8 @@ import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.RelayEngineSettings
+import com.cruisemesh.app.relay.RelayPassEngine
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -270,6 +272,40 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),
             )
+
+            // The relay engine switch. It lives here, behind the same door as
+            // the manual relay fields, because a closed-test build is
+            // release-signed and cannot be reached with `run-as` -- so a flag
+            // settable only from a unit test could never produce the on-device
+            // evidence the migration needs before its default may move.
+            var rebuiltRelayEngine by remember {
+                mutableStateOf(RelayEngineSettings.passEngine(context) == RelayPassEngine.CORE)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.ui_rebuilt_internet_sync),
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = rebuiltRelayEngine,
+                    onCheckedChange = {
+                        rebuiltRelayEngine = it
+                        RelayEngineSettings.setPassEngine(
+                            context,
+                            if (it) RelayPassEngine.CORE else RelayPassEngine.LEGACY,
+                        )
+                    },
+                )
+            }
+            Text(stringResource(R.string.ui_rebuilt_internet_sync_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
             Button(
                 onClick = {
                     val intent = DebugFileLog.shareIntent(context)

@@ -146,7 +146,7 @@ class RelayAdapterVectorsTest {
 
     private companion object {
         const val TOKEN = "member-token"
-        const val AFTER_ID = 17L
+        const val AFTER_ID = 8L
         const val LIMIT = 256
         val HINT_A = ByteArray(8) { 0x22 }
         val HINT_B = ByteArray(8) { 0x44 }

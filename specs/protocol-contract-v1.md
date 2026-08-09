@@ -992,7 +992,7 @@ than left to be discovered.
 | `rate_limit_abort` | a family 429 ended the pass's remaining network work | `store.rs` `note_relay_rate_limit_abort`, called by the shells until package B0 owns the decision | `RATE-01`, `LIVE-01` |
 | `receipt_watermark_observed` | a peer's receipt watermark was read during repair | none yet — package D2 | `WM-01` |
 | `request_rejected` | an endpoint answered authoritatively that it would not serve us, or answered nothing at all | `store.rs` `note_contact_relay_rejected`; `session/relay_pass.rs` (dark) | `SILENCE-01`, `RATE-01` |
-| `shadow_mismatch` | one sampled comparison between the live engine and the read-only migration planner: one summary record per sample, whether or not it found anything, then one record per disagreement | `store.rs` `note_relay_shadow_report`, called by Android's `RelayShadowAdapter` (C1) | any |
+| `shadow_mismatch` | one sampled comparison between the live engine and the read-only migration planner: one summary record per sample, whether or not it found anything, then one record per *kind* of disagreement carrying how many rows showed it — bounded by kind rather than by row, so a systematically diverging device cannot evict the ring | `store.rs` `note_relay_shadow_report`, called by Android's `RelayShadowAdapter` (C1) | any |
 | `silence_observed` | contact silence was weighed at the end of a pass, with or without same-pass proof | `session/relay_pass.rs` (dark) | `SILENCE-01` |
 | `spray_admitted` | a built spray plan went onto the radio | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
 | `spray_budget_exhausted` | a link ran out of burst allowance — once per dry spell, not per reconnect | `spray_policy.rs` `may_spray` | `SPRAY-01`, `LIVE-01` |
@@ -1208,20 +1208,42 @@ Recorded so a reader does not have to diff two documents:
   a shared table the Android suite asserts against requests recorded off a real
   server from both engines — so "the same bytes" is a comparison rather than
   two files agreeing.
-- The canary is deliberately narrow and deliberately loud about it. It samples
-  a bounded few legacy passes a day, captures the receipt and authored lanes as
-  values, asks `session/relay_shadow.rs` what core would have planned, and
-  records the disagreements in the event ring. It opens no socket — the types
-  it is built from hold no endpoint, no connection and no callback, which a
-  reflection test pins — writes nothing but diagnostics, and refuses to run at
-  all when the core engine is the one moving mail. Every row it cannot speak
-  for is counted, so a report of no disagreements never reads as a claim about
-  rows nobody compared. It is removed with the legacy engine in C5.
-- Three things must close before the Android default may move, and they are
+- The canary is deliberately narrow and deliberately loud about it. It is
+  **on by default**, which is worth saying plainly rather than filing under
+  "nothing changed": a shipped device runs it. What it does not do is change
+  anything the device sends, receives, marks or stores. It samples a bounded
+  few legacy passes a day — the state behind that bound is persisted, so it is
+  a bound per day rather than per process launch — and it spends a sample on
+  the first row worth comparing rather than at the top of a pass, so the common
+  poll tick with an empty queue costs nothing. It captures the receipt and
+  authored lanes as values, holding sizes rather than payloads, asks
+  `session/relay_shadow.rs` what core would have planned, and records what it
+  found. It opens no socket — the types it is built from hold no endpoint, no
+  connection and no callback — and it cannot write anything operational,
+  because it is handed one bounded diagnostics sink rather than the store; a
+  reflection test pins both. It refuses to run at all when the core engine is
+  the one moving mail. Every row it cannot speak for is counted, including the
+  carried and group-fan-out rows it does not model, so a report of no
+  disagreements never reads as a claim about rows nobody compared. Its cost to
+  the event ring is bounded by kind rather than by row — a systematically
+  diverging device spends a summary plus at most one record per kind of
+  disagreement per sample — because a per-row emitter would evict the
+  operational evidence the ring exists to carry. It is removed with the legacy
+  engine in C5.
+- Four things must close before the Android default may move, and they are
   written down rather than discovered by flipping the switch. Two are the open
-  5.2 rows above — group fan-out, and a contact endpoint resting for silence —
-  and the third is that a page `CoreRelayPass` ingests is persisted but never
+  5.2 rows above — group fan-out, and a contact endpoint resting for silence.
+  The third is that a page `CoreRelayPass` ingests is persisted but never
   handed to the shell's inbound processor, so nothing raises a notification for
-  it. That third one is not a divergence between shells; it is simply the work
-  package C4 exists to do, and it is named here so "the core engine is wired
-  and tested" is not read as "the core engine is ready to be the default".
+  it. The fourth is that the presence answer core decodes is never projected
+  back onto the connectivity surface, so contact "last seen" would stop moving.
+  Neither of the last two is a divergence between shells; both are simply the
+  work package C4 exists to do, and they are named here so "the core engine is
+  wired and tested" is not read as "the core engine is ready to be the
+  default".
+- What is deliberately *not* on that list is anything the shell still owns on
+  both paths. The prunes, the pre-upload receipt backfill, the contact-silence
+  breaker's pass boundaries and the endpoint announcement all run on the core
+  path exactly as they run on the legacy one, because they are inputs core
+  reads rather than decisions core makes. Leaving one out would not be a
+  divergence to measure later; it would be a lane that quietly stopped.

@@ -4638,17 +4638,26 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * This is the only store call the canary is permitted to make, and it
      * touches exactly one table: the bounded diagnostics ring. No message,
-     * no cursor, no marker, no health row. That is what makes "production
-     * store writes come from one engine per pass" a property of the
-     * available surface rather than a rule someone has to remember — a
-     * shadow adapter holding this store has no operational write it could
-     * reach for even if it wanted one, because the report it holds cannot be
-     * turned back into a row.
+     * no cursor, no marker, no health row. It is deliberately a method
+     * narrow enough that a shell can hand the canary *this call alone* —
+     * Android passes it as a one-method sink rather than passing the store —
+     * so "production store writes come from one engine per pass" is a
+     * property of what the canary can reach rather than a rule someone has
+     * to remember. The report it takes cannot be turned back into a row.
      *
      * Every sampled comparison records one summary line whether or not it
      * found anything, because "the canary ran and agreed" and "the canary
      * never ran" are the two readings a release archive most needs to tell
-     * apart. Each disagreement then gets its own record.
+     * apart. Each *kind* of disagreement then gets one record carrying how
+     * many rows showed it.
+     *
+     * One record per kind rather than per row is what keeps this affordable.
+     * The ring holds a couple of thousand events and every append evicts the
+     * oldest, so an emitter whose volume scales with a device's rows can
+     * quietly become the only thing in a support archive — and a diverging
+     * device diverges *systematically*, so the hundredth copy of a finding
+     * carries nothing the first did not. That caps one sampled pass at seven
+     * records however badly the two engines disagree.
      *
      * `SECRET-01` is structural here: a [`CoreRelayShadowReport`] has no
      * field that can hold a token, an endpoint or a payload.
@@ -7400,17 +7409,26 @@ open func noteRelayRateLimitAbort(mailboxKey: String, retryAfterMs: Int64, reque
      *
      * This is the only store call the canary is permitted to make, and it
      * touches exactly one table: the bounded diagnostics ring. No message,
-     * no cursor, no marker, no health row. That is what makes "production
-     * store writes come from one engine per pass" a property of the
-     * available surface rather than a rule someone has to remember — a
-     * shadow adapter holding this store has no operational write it could
-     * reach for even if it wanted one, because the report it holds cannot be
-     * turned back into a row.
+     * no cursor, no marker, no health row. It is deliberately a method
+     * narrow enough that a shell can hand the canary *this call alone* —
+     * Android passes it as a one-method sink rather than passing the store —
+     * so "production store writes come from one engine per pass" is a
+     * property of what the canary can reach rather than a rule someone has
+     * to remember. The report it takes cannot be turned back into a row.
      *
      * Every sampled comparison records one summary line whether or not it
      * found anything, because "the canary ran and agreed" and "the canary
      * never ran" are the two readings a release archive most needs to tell
-     * apart. Each disagreement then gets its own record.
+     * apart. Each *kind* of disagreement then gets one record carrying how
+     * many rows showed it.
+     *
+     * One record per kind rather than per row is what keeps this affordable.
+     * The ring holds a couple of thousand events and every append evicts the
+     * oldest, so an emitter whose volume scales with a device's rows can
+     * quietly become the only thing in a support archive — and a diverging
+     * device diverges *systematically*, so the hundredth copy of a finding
+     * carries nothing the first did not. That caps one sampled pass at seven
+     * records however badly the two engines disagree.
      *
      * `SECRET-01` is structural here: a [`CoreRelayShadowReport`] has no
      * field that can hold a token, an endpoint or a payload.
@@ -15497,6 +15515,10 @@ public func FfiConverterTypeCoreRelayRerunVector_lower(_ value: CoreRelayRerunVe
 
 /**
  * Everything one sampled legacy pass is asked to remember.
+ *
+ * Both lists are clamped by [`core_relay_shadow_compare`] before anything is
+ * read, so an over-long capture costs a truncated comparison rather than an
+ * unbounded one.
  */
 public struct CoreRelayShadowCapture {
     public var own: CoreRelayEndpointConfig?
@@ -15613,7 +15635,15 @@ public func FfiConverterTypeCoreRelayShadowCapture_lower(_ value: CoreRelayShado
 
 
 /**
- * One disagreement, named by kind and located by position.
+ * One *kind* of disagreement, with how many rows showed it.
+ *
+ * Deliberately not one entry per row. The divergences a canary finds are
+ * overwhelmingly systematic — a rule one engine applies and the other does
+ * not shows up on every row it touches — so a per-row list is the same fact
+ * repeated at the cost of the diagnostics ring, where every record it writes
+ * evicts an older one carrying something nobody else recorded. A kind, the
+ * first place it was seen, and a count answer every question a per-row list
+ * would have, in a bounded number of records.
  *
  * There is no field here that could hold a message, an endpoint or a
  * credential, and that is the whole design: this is the type that reaches
@@ -15622,22 +15652,32 @@ public func FfiConverterTypeCoreRelayShadowCapture_lower(_ value: CoreRelayShado
 public struct CoreRelayShadowMismatch {
     public var kind: CoreRelayShadowMismatchKind
     /**
-     * Index into [`CoreRelayShadowCapture::steps`], or into
+     * The first index that showed this kind: into
+     * [`CoreRelayShadowCapture::steps`], or into
      * [`CoreRelayShadowCapture::skipped_recipients`] for a
      * [`CoreRelayShadowMismatchKind::SelectionSkipDiffers`].
      */
-    public var index: UInt32
+    public var firstIndex: UInt32
+    /**
+     * How many rows (or skipped recipients) showed it. Never zero.
+     */
+    public var rows: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(kind: CoreRelayShadowMismatchKind, 
         /**
-         * Index into [`CoreRelayShadowCapture::steps`], or into
+         * The first index that showed this kind: into
+         * [`CoreRelayShadowCapture::steps`], or into
          * [`CoreRelayShadowCapture::skipped_recipients`] for a
          * [`CoreRelayShadowMismatchKind::SelectionSkipDiffers`].
-         */index: UInt32) {
+         */firstIndex: UInt32, 
+        /**
+         * How many rows (or skipped recipients) showed it. Never zero.
+         */rows: UInt32) {
         self.kind = kind
-        self.index = index
+        self.firstIndex = firstIndex
+        self.rows = rows
     }
 }
 
@@ -15648,7 +15688,10 @@ extension CoreRelayShadowMismatch: Equatable, Hashable {
         if lhs.kind != rhs.kind {
             return false
         }
-        if lhs.index != rhs.index {
+        if lhs.firstIndex != rhs.firstIndex {
+            return false
+        }
+        if lhs.rows != rhs.rows {
             return false
         }
         return true
@@ -15656,7 +15699,8 @@ extension CoreRelayShadowMismatch: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(kind)
-        hasher.combine(index)
+        hasher.combine(firstIndex)
+        hasher.combine(rows)
     }
 }
 
@@ -15669,13 +15713,15 @@ public struct FfiConverterTypeCoreRelayShadowMismatch: FfiConverterRustBuffer {
         return
             try CoreRelayShadowMismatch(
                 kind: FfiConverterTypeCoreRelayShadowMismatchKind.read(from: &buf), 
-                index: FfiConverterUInt32.read(from: &buf)
+                firstIndex: FfiConverterUInt32.read(from: &buf), 
+                rows: FfiConverterUInt32.read(from: &buf)
         )
     }
 
     public static func write(_ value: CoreRelayShadowMismatch, into buf: inout [UInt8]) {
         FfiConverterTypeCoreRelayShadowMismatchKind.write(value.kind, into: &buf)
-        FfiConverterUInt32.write(value.index, into: &buf)
+        FfiConverterUInt32.write(value.firstIndex, into: &buf)
+        FfiConverterUInt32.write(value.rows, into: &buf)
     }
 }
 
@@ -15697,19 +15743,35 @@ public func FfiConverterTypeCoreRelayShadowMismatch_lower(_ value: CoreRelayShad
 
 /**
  * What one comparison found. Counts and enums only.
+ *
+ * [`Self::mismatches`] holds at most one entry per
+ * [`CoreRelayShadowMismatchKind`], so a report is bounded by the number of
+ * kinds however badly a device diverges.
  */
 public struct CoreRelayShadowReport {
     public var stepsCompared: UInt32
     public var rowsUnshadowed: UInt32
     public var skipsCompared: UInt32
+    /**
+     * Rows and skipped recipients the capture carried past the caps and this
+     * comparison therefore did not look at. Counted rather than dropped, for
+     * the same reason as [`CoreRelayShadowCapture::rows_unshadowed`].
+     */
+    public var rowsTruncated: UInt32
     public var mismatches: [CoreRelayShadowMismatch]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(stepsCompared: UInt32, rowsUnshadowed: UInt32, skipsCompared: UInt32, mismatches: [CoreRelayShadowMismatch]) {
+    public init(stepsCompared: UInt32, rowsUnshadowed: UInt32, skipsCompared: UInt32, 
+        /**
+         * Rows and skipped recipients the capture carried past the caps and this
+         * comparison therefore did not look at. Counted rather than dropped, for
+         * the same reason as [`CoreRelayShadowCapture::rows_unshadowed`].
+         */rowsTruncated: UInt32, mismatches: [CoreRelayShadowMismatch]) {
         self.stepsCompared = stepsCompared
         self.rowsUnshadowed = rowsUnshadowed
         self.skipsCompared = skipsCompared
+        self.rowsTruncated = rowsTruncated
         self.mismatches = mismatches
     }
 }
@@ -15727,6 +15789,9 @@ extension CoreRelayShadowReport: Equatable, Hashable {
         if lhs.skipsCompared != rhs.skipsCompared {
             return false
         }
+        if lhs.rowsTruncated != rhs.rowsTruncated {
+            return false
+        }
         if lhs.mismatches != rhs.mismatches {
             return false
         }
@@ -15737,6 +15802,7 @@ extension CoreRelayShadowReport: Equatable, Hashable {
         hasher.combine(stepsCompared)
         hasher.combine(rowsUnshadowed)
         hasher.combine(skipsCompared)
+        hasher.combine(rowsTruncated)
         hasher.combine(mismatches)
     }
 }
@@ -15752,6 +15818,7 @@ public struct FfiConverterTypeCoreRelayShadowReport: FfiConverterRustBuffer {
                 stepsCompared: FfiConverterUInt32.read(from: &buf), 
                 rowsUnshadowed: FfiConverterUInt32.read(from: &buf), 
                 skipsCompared: FfiConverterUInt32.read(from: &buf), 
+                rowsTruncated: FfiConverterUInt32.read(from: &buf), 
                 mismatches: FfiConverterSequenceTypeCoreRelayShadowMismatch.read(from: &buf)
         )
     }
@@ -15760,6 +15827,7 @@ public struct FfiConverterTypeCoreRelayShadowReport: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.stepsCompared, into: &buf)
         FfiConverterUInt32.write(value.rowsUnshadowed, into: &buf)
         FfiConverterUInt32.write(value.skipsCompared, into: &buf)
+        FfiConverterUInt32.write(value.rowsTruncated, into: &buf)
         FfiConverterSequenceTypeCoreRelayShadowMismatch.write(value.mismatches, into: &buf)
     }
 }
@@ -15940,8 +16008,8 @@ public func FfiConverterTypeCoreRelayShadowSampler_lower(_ value: CoreRelayShado
  * One row the legacy engine handled, and what happened to it.
  *
  * These are *observations*, not instructions: nothing here is acted on, and
- * the only reason the sealed bytes are present is that forming the request
- * core would have sent requires them.
+ * there is no payload — [`Self::sealed_len`] is the size of the sealed body,
+ * which is the whole of what "could core have encoded this row" turns on.
  */
 public struct CoreRelayShadowStep {
     public var lane: CoreRelayShadowLane
@@ -15953,7 +16021,14 @@ public struct CoreRelayShadowStep {
      * from.
      */
     public var recipientUserId: Data
-    public var sealed: Data
+    /**
+     * How many bytes the sealed payload was. The bytes themselves are
+     * deliberately not captured: sixteen half-megabyte rows held whole,
+     * copied across the language boundary and cloned again to build a body
+     * that is immediately thrown away is tens of megabytes on a phone, for a
+     * question about a length.
+     */
+    public var sealedLen: UInt64
     public var expiryMs: Int64
     /**
      * The mailbox the legacy engine resolved for this row, or `None` when it
@@ -15985,7 +16060,14 @@ public struct CoreRelayShadowStep {
         /**
          * Who the row is addressed to, which is what a destination is resolved
          * from.
-         */recipientUserId: Data, sealed: Data, expiryMs: Int64, 
+         */recipientUserId: Data, 
+        /**
+         * How many bytes the sealed payload was. The bytes themselves are
+         * deliberately not captured: sixteen half-megabyte rows held whole,
+         * copied across the language boundary and cloned again to build a body
+         * that is immediately thrown away is tens of megabytes on a phone, for a
+         * question about a length.
+         */sealedLen: UInt64, expiryMs: Int64, 
         /**
          * The mailbox the legacy engine resolved for this row, or `None` when it
          * declined to post at all.
@@ -16008,7 +16090,7 @@ public struct CoreRelayShadowStep {
         self.hopTtl = hopTtl
         self.recipientHint = recipientHint
         self.recipientUserId = recipientUserId
-        self.sealed = sealed
+        self.sealedLen = sealedLen
         self.expiryMs = expiryMs
         self.legacyEndpoint = legacyEndpoint
         self.status = status
@@ -16038,7 +16120,7 @@ extension CoreRelayShadowStep: Equatable, Hashable {
         if lhs.recipientUserId != rhs.recipientUserId {
             return false
         }
-        if lhs.sealed != rhs.sealed {
+        if lhs.sealedLen != rhs.sealedLen {
             return false
         }
         if lhs.expiryMs != rhs.expiryMs {
@@ -16071,7 +16153,7 @@ extension CoreRelayShadowStep: Equatable, Hashable {
         hasher.combine(hopTtl)
         hasher.combine(recipientHint)
         hasher.combine(recipientUserId)
-        hasher.combine(sealed)
+        hasher.combine(sealedLen)
         hasher.combine(expiryMs)
         hasher.combine(legacyEndpoint)
         hasher.combine(status)
@@ -16095,7 +16177,7 @@ public struct FfiConverterTypeCoreRelayShadowStep: FfiConverterRustBuffer {
                 hopTtl: FfiConverterUInt8.read(from: &buf), 
                 recipientHint: FfiConverterData.read(from: &buf), 
                 recipientUserId: FfiConverterData.read(from: &buf), 
-                sealed: FfiConverterData.read(from: &buf), 
+                sealedLen: FfiConverterUInt64.read(from: &buf), 
                 expiryMs: FfiConverterInt64.read(from: &buf), 
                 legacyEndpoint: FfiConverterOptionTypeCoreRelayEndpointConfig.read(from: &buf), 
                 status: FfiConverterUInt16.read(from: &buf), 
@@ -16112,7 +16194,7 @@ public struct FfiConverterTypeCoreRelayShadowStep: FfiConverterRustBuffer {
         FfiConverterUInt8.write(value.hopTtl, into: &buf)
         FfiConverterData.write(value.recipientHint, into: &buf)
         FfiConverterData.write(value.recipientUserId, into: &buf)
-        FfiConverterData.write(value.sealed, into: &buf)
+        FfiConverterUInt64.write(value.sealedLen, into: &buf)
         FfiConverterInt64.write(value.expiryMs, into: &buf)
         FfiConverterOptionTypeCoreRelayEndpointConfig.write(value.legacyEndpoint, into: &buf)
         FfiConverterUInt16.write(value.status, into: &buf)
@@ -28686,10 +28768,17 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
  *
  * One table, consumed by the Android JVM suite and — when C2 lands — the
  * Swift one, so "byte-exact" is a thing both adapters check against the same
- * bytes rather than each against its own reading of this module. The vectors
- * are built by the same functions the running pass uses, so a change to a
- * path, a header or an encoding moves the table with it and both adapter
- * suites go red in the same commit.
+ * bytes rather than each against its own reading of this module.
+ *
+ * Every vector here is built by the *same* function the running pass calls to
+ * form that request — [`shadow_upload_request`], [`build_fetch_request`],
+ * [`build_ack_request`], [`build_presence_request`] — so a change to a path,
+ * a header, a wanted response header or an encoding moves the table with it
+ * and both adapter suites go red in the same commit. A vector written out
+ * here as its own literal would be a second reading of the pass, and the
+ * suites would stay green describing a request core had stopped sending;
+ * `relay_shadow_canary.rs` pins each of the four against a request a live
+ * pass actually emitted so this stays true.
  *
  * What a vector deliberately does *not* carry is the transport headers a
  * shell adds around every relay call — a user agent, a tunnel-bypass hint.
@@ -28810,6 +28899,10 @@ public func coreRelayRerunAction(pendingRequested: Bool, canSync: Bool, backoffR
  *
  * Pure: no store, no clock, no network. Called after the legacy pass has
  * already finished, so nothing it returns can change what that pass did.
+ *
+ * The capture is clamped to [`RELAY_SHADOW_MAX_ROWS`] and
+ * [`RELAY_SHADOW_MAX_SKIPS`] here, so the work and the report are bounded by
+ * this function rather than by whichever shell built the capture.
  */
 public func coreRelayShadowCompare(capture: CoreRelayShadowCapture) -> CoreRelayShadowReport {
     return try!  FfiConverterTypeCoreRelayShadowReport.lift(try! rustCall() {
@@ -28826,6 +28919,15 @@ public func coreRelayShadowCompare(capture: CoreRelayShadowCapture) -> CoreRelay
 public func coreRelayShadowMaxRows() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_relay_shadow_max_rows($0
+    )
+})
+}
+/**
+ * [`RELAY_SHADOW_MAX_SKIPS`], for a shell, for the same reason.
+ */
+public func coreRelayShadowMaxSkips() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_shadow_max_skips($0
     )
 })
 }
@@ -31281,7 +31383,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_adapter_vectors() != 46260) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_adapter_vectors() != 50015) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_default_budgets() != 26530) {
@@ -31296,10 +31398,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_rerun_action() != 50476) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_compare() != 20773) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_compare() != 59769) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_max_rows() != 40010) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_max_skips() != 53920) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
@@ -32217,7 +32322,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_rate_limit_abort() != 1228) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_shadow_report() != 41785) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_shadow_report() != 51923) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_note_relay_sweep_completed() != 29578) {

@@ -518,10 +518,18 @@ internal class RelaySyncEngine(
         // remember to announce, and none can be missed. `announceIfChanged` is
         // idempotent, so the periodic poll re-entering here costs nothing.
         RelayUpdateSender.announceIfChanged(context, store, identity)
+        // Taken *before* the uploads, because that is the moment core plans
+        // from: `CoreRelayPassPlan.contacts` is built once at the top of a
+        // pass, while both breakers this reads are advanced by the loops below
+        // as rows fail. Reading them afterwards would score legacy's
+        // per-row decisions against an end-of-pass plan core would never have
+        // made, and the first contact whose streak tipped mid-pass would
+        // report a destination divergence that never happened.
+        val shadowContacts = shadowContacts(contacts)
         try {
             uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network, shadow)
             uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network, shadow)
-            uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network)
+            uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network, shadow)
         } finally {
             // Compared here rather than at the end of the pass: the two lanes
             // this slice speaks for are done, and everything after them
@@ -529,7 +537,7 @@ internal class RelaySyncEngine(
             // limit unwinds straight out of those loops, and a sample spent on
             // a pass that was cut short is still evidence about the rows it
             // did reach. Nothing the comparison finds can change any of it.
-            shadowAdapter.finishPass(shadow, fallbackConfig, shadowContacts(contacts), now)
+            shadowAdapter.finishPass(shadow, fallbackConfig, shadowContacts, now)
         }
 
         // Gaining a contact or a group widens the fetch-hint set, and relayd's
@@ -628,7 +636,7 @@ internal class RelaySyncEngine(
      * a continuation.
      *
      * Off by default. [RelayEngineSettings.passEngine] selects it, and until
-     * canary evidence says otherwise the answer is the legacy engine. Three
+     * canary evidence says otherwise the answer is the legacy engine. Four
      * known gaps have to close before that default may move, and they are
      * named here rather than left for someone to find by flipping it:
      *
@@ -636,13 +644,22 @@ internal class RelaySyncEngine(
      *    being fanned out per member, so a group's mail would not arrive;
      *  - a contact endpoint resting for *silence* falls back to this device's
      *    own mailbox rather than being left alone, and the posted marker is
-     *    terminal, so that misroute is permanent rather than a retry; and
+     *    terminal, so that misroute is permanent rather than a retry;
      *  - a page ingested by core is persisted but never handed to
-     *    [processRelayEnvelope], so nothing raises a notification for it.
+     *    [processRelayEnvelope], so nothing raises a notification for it; and
+     *  - the presence answer core decodes is not projected back onto
+     *    [MeshConnectivityStatus], so contact "last seen" would stop moving.
      *
      * The first two are recorded as open divergences in
-     * `specs/protocol-contract-v1.md` §5.2 and belong to package C3; the third
-     * is the work package C4 exists to do.
+     * `specs/protocol-contract-v1.md` §5.2 and belong to package C3; the last
+     * two are the work package C4 exists to do.
+     *
+     * What is deliberately *not* on that list is anything the shell still owns
+     * on both paths. The prunes, the receipt backfill, the silence breaker's
+     * pass boundaries and the announce are all run here exactly as the legacy
+     * pass runs them, because they are inputs core reads rather than decisions
+     * core makes; leaving one out would not be a divergence to measure, it
+     * would be a lane that quietly stopped.
      */
     private fun performCoreRelaySyncPass(identity: Identity, reason: String) {
         val now = System.currentTimeMillis()
@@ -655,12 +672,36 @@ internal class RelaySyncEngine(
         contactRelayUnreachable = store.listContactRelayUnreachable()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         contactRelayCountedThisPass.clear()
+        // The silence breaker is state this shell keeps, and core's
+        // `endpoint_usable` reads it. Without the restore it holds nothing, so
+        // every rested endpoint answers "still answering" and a retired
+        // friend-card host is re-dialled on every pass; without the pass
+        // boundary an observation from an earlier pass can suppress an
+        // endpoint that is now healthy.
+        contactRelaySilence.restore(contactRelayUnreachable.values)
+        contactRelaySilence.beginPass()
         anyRelayConfigKnown = fallbackConfig != null ||
             contacts.any { resolvedPollRelayConfig(it, fallbackConfig) != null }
         if (fallbackConfig == null && !anyRelayConfigKnown!!) {
             MeshConnectivityStatus.setRelayHealth(RelayHealth.NoConfig)
             return
         }
+        publishStaleContactRelays()
+        // The only producer of relay-uploadable outgoing receipt envelopes,
+        // and it belongs to neither engine: it refreshes the durable receipt
+        // envelope for the current delivered/read watermarks and records the
+        // ids in the seen set so our own receipts coming back off the relay
+        // dedupe instead of being re-carried as foreign mail. Core's prune
+        // stage only prunes. Skipping it here would silently stop delivered
+        // and read ticks from propagating over the relay while the pass
+        // reported a healthy, empty receipt lane.
+        backfillOutgoingReceipts(identity, now)
+        // Read before the announce, not after: `announceIfChanged` is what
+        // *records* the epoch as announced, so asking afterwards always
+        // answers "nothing changed" and core's announce stage would be
+        // unreachable from this shell.
+        val ownEndpointChanged = RelayConfigStore.relayEpoch(context) >
+            RelayConfigStore.announcedRelayEpoch(context)
         RelayUpdateSender.announceIfChanged(context, store, identity)
 
         val network = relayBindTarget()
@@ -682,8 +723,7 @@ internal class RelaySyncEngine(
                 emptyList()
             },
             presenceQuery = dedupeHints(contacts.flatMap { recentPresenceHintsFor(it.userId, now) }),
-            ownEndpointChanged = RelayConfigStore.relayEpoch(context) >
-                RelayConfigStore.announcedRelayEpoch(context),
+            ownEndpointChanged = ownEndpointChanged,
             sweptThisSession = coreEngineSweptThisSession,
             consecutiveRateLimits = familyRelayBackoff.consecutiveRateLimits.toUInt(),
             quietUntilMs = rateLimitedUntilMs,
@@ -706,7 +746,15 @@ internal class RelaySyncEngine(
             isCancelled = { !isRunning() || !hasValidatedInternet() },
         )
         val summary = runner.run(plan, "cp")
-        coreEngineSweptThisSession = true
+        // Only a pass that ran every stage to the end has actually swept every
+        // mailbox, and `relay_sweep_due` answers "no" for a device that has
+        // never swept once this says yes. A pass cancelled before its first
+        // fetch, refused inside a quiet window, or cut short by a 429 has swept
+        // nothing; marking it swept anyway would leave a fresh install unable
+        // to reach anything below its frontier for the life of the process.
+        if (summary.outcome == CoreRelayPassOutcome.COMPLETED) {
+            coreEngineSweptThisSession = true
+        }
 
         MeshConnectivityStatus.setRelayHealth(relayHealthFor(summary.health, now))
         // The quiet window core recorded at the refusal, adopted as a floor
@@ -715,9 +763,25 @@ internal class RelaySyncEngine(
         if (summary.quietUntilMs > 0L) {
             rateLimitedUntilMs = maxOf(rateLimitedUntilMs, summary.quietUntilMs)
         }
-        if (summary.outcome != CoreRelayPassOutcome.RATE_LIMITED) {
-            familyRelayBackoff.onSuccessfulPass()
-            if (summary.quietUntilMs <= System.currentTimeMillis()) rateLimitedUntilMs = 0L
+        // `RATE-01`'s escalation lives in a counter this shell holds and core
+        // reads back through the plan, so a core pass has to keep it moving on
+        // both sides. Only these two outcomes may touch it: a completed pass is
+        // the one thing that proves the punishment has been served, and any
+        // other ending -- a refusal inside the quiet window, a cancellation, a
+        // budget yield -- is a pass that spent nothing and learned nothing.
+        // Clearing on those would let every pending nudge inside a rate-limit
+        // window re-zero the streak, so a relay that kept refusing would be
+        // answered with the base delay forever instead of a widening one.
+        when (summary.outcome) {
+            CoreRelayPassOutcome.RATE_LIMITED ->
+                // For the count alone; core already decided the window this
+                // refusal earns and put it in the summary.
+                familyRelayBackoff.onRateLimited(0L, familyBackoffIdentity)
+            CoreRelayPassOutcome.COMPLETED -> {
+                familyRelayBackoff.onSuccessfulPass()
+                if (summary.quietUntilMs <= System.currentTimeMillis()) rateLimitedUntilMs = 0L
+            }
+            else -> Unit
         }
         contactRelayRejections = store.listContactRelayRejections()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
@@ -790,20 +854,20 @@ internal class RelaySyncEngine(
                 // Declined, with the reason captured as "no mailbox resolved"
                 // rather than as nothing at all: a row one engine posts and
                 // the other silently drops is exactly what the canary is for.
-                shadow?.noteDeclined(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry)
+                shadow?.noteDeclined(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry)
                 continue
             }
             try {
                 val relayId = relayRequest { RelayClient.postReceiptEnvelope(config, envelope, network) }
                 store.markOutgoingReceiptEnvelopeRelayPosted(envelope.msgId, now)
                 noteContactRelaySuccess(contact, config, fallbackConfig)
-                shadow?.noteSucceeded(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry, config)
+                shadow?.noteSucceeded(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry, config)
                 Log.i(
                     TAG,
                     "Uploaded receipt envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
-                shadow?.noteFailed(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry, config, e, continuedLane = !abortsPass(e))
+                shadow?.noteFailed(CoreRelayShadowLane.RECEIPT, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry, config, e)
                 rethrowFamilyRateLimit(e)
                 noteOwnRelayFault(config, fallbackConfig, e)
                 noteContactRelayFault(contact, config, fallbackConfig, e)
@@ -854,8 +918,11 @@ internal class RelaySyncEngine(
                 // do not decompose a group-addressed row into member rows, so
                 // there is no core plan to compare a fan-out against; counting
                 // it keeps a clean report from reading as a claim about groups.
-                shadow?.noteUnshadowed(1)
+                // Counted in *posted rows* rather than in queue entries: one
+                // group envelope becomes one row per member on the wire, and a
+                // report that could not speak for twelve rows must not say one.
                 val group = store.getGroup(envelope.recipientUserId)
+                shadow?.noteUnshadowed(group?.memberUserIds?.size?.coerceAtLeast(1) ?: 1)
                 val config = relayConfigForGroupRecipient(envelope.recipientUserId, contacts, fallbackConfig)
                     ?: continue
                 if (group == null) {
@@ -905,20 +972,20 @@ internal class RelaySyncEngine(
             }
             val config = resolvedRelayConfig(contact, fallbackConfig)
             if (config == null) {
-                shadow?.noteDeclined(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry)
+                shadow?.noteDeclined(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry)
                 continue
             }
             try {
                 val relayId = relayRequest { RelayClient.postOutboundEnvelope(config, envelope, network) }
                 store.markOutboundEnvelopeRelayPosted(envelope.msgId, now)
                 noteContactRelaySuccess(contact, config, fallbackConfig)
-                shadow?.noteSucceeded(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry, config)
+                shadow?.noteSucceeded(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry, config)
                 Log.i(
                     TAG,
                     "Uploaded outbound envelope ${UserIdHex.encode(envelope.msgId)} to relay ${config.relayUrl} as id=$relayId",
                 )
             } catch (e: Exception) {
-                shadow?.noteFailed(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed, envelope.expiry, config, e, continuedLane = !abortsPass(e))
+                shadow?.noteFailed(CoreRelayShadowLane.AUTHORED, envelope.msgId, envelope.hopTtl, envelope.recipientHint, envelope.recipientUserId, envelope.sealed.size, envelope.expiry, config, e)
                 rethrowFamilyRateLimit(e)
                 noteOwnRelayFault(config, fallbackConfig, e)
                 noteContactRelayFault(contact, config, fallbackConfig, e)
@@ -968,6 +1035,7 @@ internal class RelaySyncEngine(
         fallbackConfig: RelayConfig?,
         now: Long,
         network: Network?,
+        shadow: RelayShadowPassCapture?,
     ) {
         // Carried mail starves like the outbound and receipt queues: a failed
         // upload leaves the row unmarked, so under flat order one unreachable
@@ -977,6 +1045,13 @@ internal class RelaySyncEngine(
         for (envelope in store.familyCarriedEnvelopes(RELAY_STORE_BATCH_LIMIT, now, skipRecipients)) {
             val contact = store.contactMatchingHint(envelope.recipientHint, now)
             if (contact == null) {
+                // A group-hinted carried row fans out per member, and this
+                // lane has no shadow at all: counted so a mule's report never
+                // reads as agreement about rows nobody compared.
+                shadow?.noteUnshadowed(
+                    store.groupMatchingHint(envelope.recipientHint, now)
+                        ?.memberUserIds?.size?.coerceAtLeast(1) ?: 1,
+                )
                 // Group-hinted carried envelope: previously skipped entirely
                 // (no contact match). A member mule can now decompose it into
                 // per-member fan-out rows (specs/group-relay-durability.md
@@ -1011,6 +1086,10 @@ internal class RelaySyncEngine(
                 }
                 continue
             }
+            // A carried 1:1 row: one row on the wire, and one this slice's
+            // canary does not model. Carried uploads belong to a later
+            // package.
+            shadow?.noteUnshadowed(1)
             val config = resolvedRelayConfig(contact, fallbackConfig) ?: continue
             try {
                 val relayId = relayRequest { RelayClient.postCarriedEnvelope(config, envelope, network) }
@@ -1296,9 +1375,13 @@ internal class RelaySyncEngine(
      * the core engine is the one moving mail. See [RelayShadowAdapter].
      */
     private val shadowAdapter = RelayShadowAdapter(
-        store = store,
+        // The store's one diagnostics write, and not the store: what the
+        // canary cannot reach, it cannot become a second writer through.
+        sink = store::noteRelayShadowReport,
         passEngine = { RelayEngineSettings.passEngine(context) },
         shadowEnabled = { RelayEngineSettings.shadowEnabled(context) },
+        loadSampler = { RelayEngineSettings.shadowSampler(context) },
+        saveSampler = { RelayEngineSettings.setShadowSampler(context, it) },
     )
 
     /**

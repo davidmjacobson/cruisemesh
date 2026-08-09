@@ -196,8 +196,8 @@ use crate::relay_status::{relay_classify_http_error, relay_retry_after_ms, CoreR
 use crate::relay_wire::{
     relay_build_fetch_path, relay_decode_fetch_page, relay_encode_ack_request,
     relay_encode_post_envelope, relay_encode_presence_request, relay_fetch_batch_limit,
-    relay_fetch_shrunk_limit, relay_max_response_bytes, resolved_contact_poll_relay,
-    resolved_contact_relay, RelayEndpoint,
+    relay_fetch_shrunk_limit, relay_max_response_bytes, relay_validate_envelope_sizes,
+    resolved_contact_poll_relay, resolved_contact_relay, RelayEndpoint,
 };
 use crate::session::relay_policy::{
     core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_relay_pass_health,
@@ -1494,25 +1494,16 @@ impl PassState {
             self.configs[index].presence_done = true;
             return None;
         }
-        let Ok(body) = relay_encode_presence_request(
+        let endpoint = self.configs[index].endpoint.clone();
+        let Some(request) = build_presence_request(
+            &endpoint,
             self.plan.presence_announce.clone(),
             self.plan.presence_query.clone(),
         ) else {
             self.configs[index].presence_done = true;
             return None;
         };
-        let endpoint = self.configs[index].endpoint.clone();
         self.configs[index].presence_done = true;
-        let request = CoreRelayHttpRequest {
-            operation: CoreRelayOperation::Presence,
-            method: "POST".to_string(),
-            base_url: endpoint.url,
-            path: "/presence".to_string(),
-            headers: auth_headers(&endpoint.token, true),
-            body,
-            max_response_bytes: relay_max_response_bytes(),
-            response_headers_wanted: vec!["Retry-After".to_string()],
-        };
         let at_ms = self.now_ms;
         let actor = self.configs[index].actor.clone();
         let mut draft =
@@ -1552,21 +1543,12 @@ impl PassState {
         }
         let after_id = walk.after_id;
         let limit = walk.limit;
-        let Ok(path) = relay_build_fetch_path(self.plan.fetch_hints.clone(), after_id, limit)
+        let endpoint = self.configs[index].endpoint.clone();
+        let Some(request) =
+            build_fetch_request(&endpoint, self.plan.fetch_hints.clone(), after_id, limit)
         else {
             self.configs[index].walk.as_mut()?.done = true;
             return None;
-        };
-        let endpoint = self.configs[index].endpoint.clone();
-        let request = CoreRelayHttpRequest {
-            operation: CoreRelayOperation::FetchPage,
-            method: "GET".to_string(),
-            base_url: endpoint.url,
-            path,
-            headers: auth_headers(&endpoint.token, false),
-            body: Vec::new(),
-            max_response_bytes: relay_max_response_bytes(),
-            response_headers_wanted: vec!["Retry-After".to_string()],
         };
         let at_ms = self.now_ms;
         let actor = self.configs[index].actor.clone();
@@ -2211,20 +2193,10 @@ impl PassState {
             return;
         }
 
-        let Ok(body) = relay_encode_ack_request(ack_ids.clone()) else {
+        let endpoint = self.configs[config].endpoint.clone();
+        let Some(request) = build_ack_request(&endpoint, ack_ids.clone()) else {
             self.commit_page(config, page.next_cursor, false, rows);
             return;
-        };
-        let endpoint = self.configs[config].endpoint.clone();
-        let request = CoreRelayHttpRequest {
-            operation: CoreRelayOperation::AckPage,
-            method: "POST".to_string(),
-            base_url: endpoint.url,
-            path: "/envelopes/ack".to_string(),
-            headers: auth_headers(&endpoint.token, true),
-            body,
-            max_response_bytes: relay_max_response_bytes(),
-            response_headers_wanted: vec!["Retry-After".to_string()],
         };
         let actor = self.configs[config].actor.clone();
         let mut draft =
@@ -2719,6 +2691,82 @@ pub(crate) fn shadow_upload_request(
     })
 }
 
+/// Whether an envelope with these field sizes can be encoded for posting.
+///
+/// The same validator [`relay_encode_post_envelope`] runs, asked without the
+/// payload. The canary needs the answer, not the bytes: a captured row's
+/// sealed body can be half a megabyte and holding sixteen of them whole,
+/// copying them across a language boundary and cloning them again to encode
+/// a body that is immediately discarded costs tens of megabytes on a phone
+/// for a question about lengths. Because it is the one validator rather than
+/// a second reading of it, a rule that changes changes both answers.
+pub(crate) fn shadow_upload_encodable(
+    msg_id: &[u8],
+    recipient_hint: &[u8],
+    sealed_len: u64,
+) -> bool {
+    relay_validate_envelope_sizes(msg_id.len(), recipient_hint.len(), sealed_len).is_ok()
+}
+
+/// The complete fetch request for one step of a mailbox walk, or `None` when
+/// the cursor or hint set cannot form a path.
+pub(crate) fn build_fetch_request(
+    endpoint: &RelayEndpoint,
+    hints: Vec<Vec<u8>>,
+    after_id: i64,
+    limit: u32,
+) -> Option<CoreRelayHttpRequest> {
+    let path = relay_build_fetch_path(hints, after_id, limit).ok()?;
+    Some(CoreRelayHttpRequest {
+        operation: CoreRelayOperation::FetchPage,
+        method: "GET".to_string(),
+        base_url: endpoint.url.clone(),
+        path,
+        headers: auth_headers(&endpoint.token, false),
+        body: Vec::new(),
+        max_response_bytes: relay_max_response_bytes(),
+        response_headers_wanted: vec!["Retry-After".to_string()],
+    })
+}
+
+/// The complete ack request for one page's ids, or `None` when they cannot be
+/// encoded.
+pub(crate) fn build_ack_request(
+    endpoint: &RelayEndpoint,
+    ack_ids: Vec<i64>,
+) -> Option<CoreRelayHttpRequest> {
+    let body = relay_encode_ack_request(ack_ids).ok()?;
+    Some(CoreRelayHttpRequest {
+        operation: CoreRelayOperation::AckPage,
+        method: "POST".to_string(),
+        base_url: endpoint.url.clone(),
+        path: "/envelopes/ack".to_string(),
+        headers: auth_headers(&endpoint.token, true),
+        body,
+        max_response_bytes: relay_max_response_bytes(),
+        response_headers_wanted: vec!["Retry-After".to_string()],
+    })
+}
+
+/// The complete presence request, or `None` when the hints cannot be encoded.
+pub(crate) fn build_presence_request(
+    endpoint: &RelayEndpoint,
+    announce: Vec<Vec<u8>>,
+    query: Vec<Vec<u8>>,
+) -> Option<CoreRelayHttpRequest> {
+    let body = relay_encode_presence_request(announce, query).ok()?;
+    Some(CoreRelayHttpRequest {
+        operation: CoreRelayOperation::Presence,
+        method: "POST".to_string(),
+        base_url: endpoint.url.clone(),
+        path: "/presence".to_string(),
+        headers: auth_headers(&endpoint.token, true),
+        body,
+        max_response_bytes: relay_max_response_bytes(),
+        response_headers_wanted: vec!["Retry-After".to_string()],
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Adapter vectors
 // ---------------------------------------------------------------------------
@@ -2734,10 +2782,17 @@ pub struct CoreRelayAdapterVector {
 ///
 /// One table, consumed by the Android JVM suite and — when C2 lands — the
 /// Swift one, so "byte-exact" is a thing both adapters check against the same
-/// bytes rather than each against its own reading of this module. The vectors
-/// are built by the same functions the running pass uses, so a change to a
-/// path, a header or an encoding moves the table with it and both adapter
-/// suites go red in the same commit.
+/// bytes rather than each against its own reading of this module.
+///
+/// Every vector here is built by the *same* function the running pass calls to
+/// form that request — [`shadow_upload_request`], [`build_fetch_request`],
+/// [`build_ack_request`], [`build_presence_request`] — so a change to a path,
+/// a header, a wanted response header or an encoding moves the table with it
+/// and both adapter suites go red in the same commit. A vector written out
+/// here as its own literal would be a second reading of the pass, and the
+/// suites would stay green describing a request core had stopped sending;
+/// `relay_shadow_canary.rs` pins each of the four against a request a live
+/// pass actually emitted so this stays true.
 ///
 /// What a vector deliberately does *not* carry is the transport headers a
 /// shell adds around every relay call — a user agent, a tunnel-bypass hint.
@@ -2767,51 +2822,28 @@ pub fn core_relay_adapter_vectors() -> Vec<CoreRelayAdapterVector> {
         });
     }
 
-    if let Ok(path) = relay_build_fetch_path(vec![vec![0x22; 8], vec![0x44; 8]], 17, 256) {
+    if let Some(request) =
+        build_fetch_request(&endpoint, vec![vec![0x22; 8], vec![0x44; 8]], 8, 256)
+    {
         vectors.push(CoreRelayAdapterVector {
             name: "fetch-page".to_string(),
-            request: CoreRelayHttpRequest {
-                operation: CoreRelayOperation::FetchPage,
-                method: "GET".to_string(),
-                base_url: endpoint.url.clone(),
-                path,
-                headers: auth_headers(&endpoint.token, false),
-                body: Vec::new(),
-                max_response_bytes: relay_max_response_bytes(),
-                response_headers_wanted: vec!["Retry-After".to_string()],
-            },
+            request,
         });
     }
 
-    if let Ok(body) = relay_encode_ack_request(vec![3, 5, 8]) {
+    if let Some(request) = build_ack_request(&endpoint, vec![3, 5, 8]) {
         vectors.push(CoreRelayAdapterVector {
             name: "ack-page".to_string(),
-            request: CoreRelayHttpRequest {
-                operation: CoreRelayOperation::AckPage,
-                method: "POST".to_string(),
-                base_url: endpoint.url.clone(),
-                path: "/envelopes/ack".to_string(),
-                headers: auth_headers(&endpoint.token, true),
-                body,
-                max_response_bytes: relay_max_response_bytes(),
-                response_headers_wanted: vec!["Retry-After".to_string()],
-            },
+            request,
         });
     }
 
-    if let Ok(body) = relay_encode_presence_request(vec![vec![0x22; 8]], vec![vec![0x44; 8]]) {
+    if let Some(request) =
+        build_presence_request(&endpoint, vec![vec![0x22; 8]], vec![vec![0x44; 8]])
+    {
         vectors.push(CoreRelayAdapterVector {
             name: "presence".to_string(),
-            request: CoreRelayHttpRequest {
-                operation: CoreRelayOperation::Presence,
-                method: "POST".to_string(),
-                base_url: endpoint.url,
-                path: "/presence".to_string(),
-                headers: auth_headers(&endpoint.token, true),
-                body,
-                max_response_bytes: relay_max_response_bytes(),
-                response_headers_wanted: vec!["Retry-After".to_string()],
-            },
+            request,
         });
     }
 

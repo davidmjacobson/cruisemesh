@@ -1965,6 +1965,12 @@ uint32_t uniffi_cruisemesh_core_fn_func_core_relay_shadow_max_rows(RustCallStatu
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RELAY_SHADOW_MAX_SKIPS
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RELAY_SHADOW_MAX_SKIPS
+uint32_t uniffi_cruisemesh_core_fn_func_core_relay_shadow_max_skips(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RELAY_SHADOW_SAMPLE
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RELAY_SHADOW_SAMPLE
 RustBuffer uniffi_cruisemesh_core_fn_func_core_relay_shadow_sample(RustBuffer state, int64_t now_ms, RustCallStatus *_Nonnull out_status
@@ -3373,6 +3379,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_core_relay_shadow_compare(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RELAY_SHADOW_MAX_ROWS
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RELAY_SHADOW_MAX_ROWS
 uint16_t uniffi_cruisemesh_core_checksum_func_core_relay_shadow_max_rows(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RELAY_SHADOW_MAX_SKIPS
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RELAY_SHADOW_MAX_SKIPS
+uint16_t uniffi_cruisemesh_core_checksum_func_core_relay_shadow_max_skips(void
     
 );
 #endif

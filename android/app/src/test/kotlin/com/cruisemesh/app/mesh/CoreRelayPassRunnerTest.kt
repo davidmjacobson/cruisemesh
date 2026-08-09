@@ -15,8 +15,10 @@ import uniffi.cruisemesh_core.CoreRelayPassOutcome
 import uniffi.cruisemesh_core.CoreRelayPassPlan
 import uniffi.cruisemesh_core.CoreRelayTransportError
 import uniffi.cruisemesh_core.MessageStore
+import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.coreRelayPassDefaultBudgets
 import uniffi.cruisemesh_core.generateIdentity
+import uniffi.cruisemesh_core.relayCursorKey
 
 /**
  * A whole core relay pass, driven end to end by the code that will drive it on
@@ -167,6 +169,67 @@ class CoreRelayPassRunnerTest {
     }
 
     // -----------------------------------------------------------------------
+    // The walk: the lanes an upload-only pass never reaches
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a walk fetches a page over a real socket, acks what it consumed, and moves the frontier`() {
+        // Everything the upload lane cannot exercise: a GET carrying a query
+        // string the driver must not mangle, a decoded page, the ack POST that
+        // follows it, and the cursor the pair earns.
+        val relay = FakeRelay()
+        relay.start()
+        try {
+            val fixture = Fixture(relay.baseUrl(), hinted = true)
+            val page = fixture.consumedPage(listOf(3L, 5L, 8L))
+            relay.fetchBody = page
+
+            val summary = fixture.run()
+
+            assertEquals(CoreRelayPassOutcome.COMPLETED, summary.outcome)
+            assertTrue("the walk must have fetched, saw ${relay.fetchPaths}", relay.fetchPaths.isNotEmpty())
+            val first = relay.fetchPaths.first()
+            assertTrue("a fetch must carry its hints and cursor, got $first", first.startsWith("/envelopes?hints="))
+            assertTrue("a fetch must carry its cursor, got $first", first.contains("&after=0&limit="))
+            assertEquals("the page's rows must earn exactly one ack", 1, relay.acks)
+            assertTrue("the ack must name the ids the page carried", relay.ackBody.contains("[3,5,8]"))
+            assertEquals(3u, summary.rowsAcked)
+            // CURSOR-01: the frontier moves once the ack it was waiting on
+            // succeeded, and not before.
+            assertEquals(8L, fixture.frontier())
+        } finally {
+            relay.shutdown()
+        }
+    }
+
+    @Test
+    fun `a rate limit on a fetch is read from the header that fetch answered with`() {
+        // The `Retry-After` selection on a GET, which no post-only pass
+        // reaches: the driver must hand back the one header core asked for
+        // from a non-2xx answer, or `RATE-01` measures a window from nothing.
+        val relay = FakeRelay()
+        relay.fetchResponse = {
+            MockResponse().setResponseCode(429)
+                .setHeader("Retry-After", "45")
+                .setBody("""{"code":"rate_limited"}""")
+        }
+        relay.start()
+        try {
+            val fixture = Fixture(relay.baseUrl(), hinted = true)
+
+            val summary = fixture.run()
+
+            assertEquals(CoreRelayPassOutcome.RATE_LIMITED, summary.outcome)
+            assertTrue(
+                "the quiet window must be at least the advertised 45s, got ${summary.quietUntilMs - NOW}",
+                summary.quietUntilMs >= NOW + 45_000,
+            )
+        } finally {
+            relay.shutdown()
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Harness
     // -----------------------------------------------------------------------
 
@@ -175,6 +238,7 @@ class CoreRelayPassRunnerTest {
         private val baseUrl: String,
         private val cancelled: Boolean = false,
         private val quietUntilMs: Long = 0L,
+        private val hinted: Boolean = false,
     ) {
         private val identity = generateIdentity()
         private val peer = generateIdentity()
@@ -191,6 +255,38 @@ class CoreRelayPassRunnerTest {
         init {
             store.upsertContact(contact)
         }
+
+        private fun ownHint(): ByteArray = computeRecipientHint(identity.userId, NOW)
+
+        /**
+         * A relay page of rows this device has already durably consumed.
+         *
+         * Consumed rather than fresh because `ACK-01` forbids acking a carried
+         * copy: a row nobody here consumed is one this device is only muling,
+         * and acking it would delete another person's mail. A re-presented
+         * consumed row is the one shape that legitimately earns an ack.
+         */
+        fun consumedPage(ids: List<Long>): String {
+            val b64 = java.util.Base64.getUrlEncoder().withoutPadding()
+            val hint = ownHint()
+            val expiry = NOW + 6 * 24 * 60 * 60 * 1000L
+            val rows = ids.joinToString(",") { id ->
+                val msgId = ByteArray(16).also {
+                    it[0] = id.toByte()
+                    it[8] = 0xA5.toByte()
+                }
+                val sealed = ByteArray(96) { id.toByte() }
+                check(
+                    store.coreRecordConsumedHiddenMsgId(msgId, KIND_RECEIPT, hint, expiry, identity.userId, NOW),
+                ) { "the consumed set must vouch for the seeded row" }
+                """{"id":$id,"msg_id":"${b64.encodeToString(msgId)}","hop_ttl":3,""" +
+                    """"recipient_hint":"${b64.encodeToString(hint)}",""" +
+                    """"sealed":"${b64.encodeToString(sealed)}","expiry_ms":$expiry}"""
+            }
+            return """{"envelopes":[$rows],"next_cursor":${ids.last()}}"""
+        }
+
+        fun frontier(): Long = store.relayFetchCursor(relayCursorKey(baseUrl, "member-token")).afterId
 
         fun queueAuthored(count: Int) {
             repeat(count) { index ->
@@ -221,7 +317,7 @@ class CoreRelayPassRunnerTest {
             own = CoreRelayEndpointConfig(baseUrl, "member-token"),
             contacts = emptyList(),
             ownUserId = identity.userId,
-            fetchHints = emptyList(),
+            fetchHints = if (hinted) listOf(ownHint()) else emptyList(),
             presenceAnnounce = emptyList(),
             presenceQuery = emptyList(),
             ownEndpointChanged = false,
@@ -241,13 +337,35 @@ class CoreRelayPassRunnerTest {
         private val server = MockWebServer()
         var posts = 0
             private set
+        var acks = 0
+            private set
+        var ackBody = ""
+            private set
+        val fetchPaths = mutableListOf<String>()
+
+        /** The page a fetch answers with; an empty mailbox by default. */
+        var fetchBody = """{"envelopes":[],"next_cursor":0}"""
+
+        /** Overrides [fetchBody] entirely when a fetch must fail. */
+        var fetchResponse: (() -> MockResponse)? = null
 
         fun start() {
             server.dispatcher = object : Dispatcher() {
                 override fun dispatch(request: RecordedRequest): MockResponse {
-                    if (request.path == "/envelopes" && request.method == "POST") {
+                    val path = request.path.orEmpty()
+                    if (path == "/envelopes" && request.method == "POST") {
                         posts++
                         return postResponse()
+                    }
+                    if (path == "/envelopes/ack" && request.method == "POST") {
+                        acks++
+                        ackBody = request.body.readUtf8()
+                        return MockResponse().setResponseCode(200).setBody("{}")
+                    }
+                    if (path.startsWith("/envelopes?") && request.method == "GET") {
+                        fetchPaths += path
+                        return fetchResponse?.invoke()
+                            ?: MockResponse().setResponseCode(200).setBody(fetchBody)
                     }
                     return MockResponse().setResponseCode(200).setBody("{}")
                 }
