@@ -115,9 +115,9 @@ use crate::groups::{canonicalize_members, validate_group};
 use crate::limits::MAX_ENVELOPE_SEALED_BYTES;
 use crate::{
     core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
-    CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, FriendDirectoryContent, Group,
-    IntroductionTicket, RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
-    MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, CoreRelayShadowReport,
+    FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
+    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -6518,6 +6518,59 @@ impl MessageStore {
     pub(crate) fn protocol_pseudonym(&self, kind: &'static str, raw: &[u8]) -> Option<String> {
         let conn = lock_conn(&self.conn);
         crate::protocol_event::actor_pseudonym(&conn, kind, raw).ok()
+    }
+}
+
+/// The migration canary's one write.
+#[uniffi::export]
+impl MessageStore {
+    /// Record what a shadow comparison found, and nothing else.
+    ///
+    /// This is the only store call the canary is permitted to make, and it
+    /// touches exactly one table: the bounded diagnostics ring. No message,
+    /// no cursor, no marker, no health row. That is what makes "production
+    /// store writes come from one engine per pass" a property of the
+    /// available surface rather than a rule someone has to remember — a
+    /// shadow adapter holding this store has no operational write it could
+    /// reach for even if it wanted one, because the report it holds cannot be
+    /// turned back into a row.
+    ///
+    /// Every sampled comparison records one summary line whether or not it
+    /// found anything, because "the canary ran and agreed" and "the canary
+    /// never ran" are the two readings a release archive most needs to tell
+    /// apart. Each disagreement then gets its own record.
+    ///
+    /// `SECRET-01` is structural here: a [`CoreRelayShadowReport`] has no
+    /// field that can hold a token, an endpoint or a payload.
+    pub fn note_relay_shadow_report(&self, report: CoreRelayShadowReport, now_ms: i64) {
+        let mut drafts = Vec::with_capacity(report.mismatches.len() + 1);
+        drafts.push(
+            crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::ShadowMismatch,
+                now_ms,
+                if report.mismatches.is_empty() {
+                    "shadow_agreed"
+                } else {
+                    "shadow_diverged"
+                },
+            )
+            .count("steps_compared", i64::from(report.steps_compared))
+            .count("skips_compared", i64::from(report.skips_compared))
+            .count("rows_unshadowed", i64::from(report.rows_unshadowed))
+            .count("mismatches", report.mismatches.len() as i64),
+        );
+        for mismatch in &report.mismatches {
+            drafts.push(
+                crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::ShadowMismatch,
+                    now_ms,
+                    mismatch.kind.as_token(),
+                )
+                .count("index", i64::from(mismatch.index)),
+            );
+        }
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::note(&conn, &drafts);
     }
 }
 
