@@ -106,6 +106,7 @@ class ReceiptRelayRoundTripTest {
             receiptType = receipt.receiptType,
             throughLamport = receipt.lamport,
             viaTransport = 2u, // relay-carried in this round-trip
+            receivedAtMs = 1_700_000_000_000L,
         )
     }
 

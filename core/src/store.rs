@@ -240,11 +240,18 @@ pub fn core_peer_transport_is_observed(transport: PeerConnectionTransport) -> bo
 /// getting them the wrong way round is a user-visible lie, since the
 /// Connection details screen names them:
 /// - [`PeerConnectionEventKind::MessageDelivered`]: a message *we sent* reached
-///   *them*. Recorded when their delivery receipt comes back, so the peer named
-///   on the event is the one who received our message.
+///   *them*. Recorded in [`MessageStore::record_receipt`], and only when their
+///   delivery receipt newly covers a genuinely visible message we authored --
+///   never for a receipt that merely acks profile sync, the friend directory,
+///   an endpoint hint or a relay-change notice, and never twice for the same
+///   proof. The peer named on the event is the one who received our message.
 /// - [`PeerConnectionEventKind::MessageReceived`]: a message *they sent* reached
 ///   *us*. Recorded where a genuinely visible inbound chat message is stored,
 ///   never for receipts, profile sync, relay updates or any other hidden kind.
+///
+/// Both directions ask the same question of a kind --
+/// [`crate::core_is_visible_chat_kind`] -- and each has exactly one recording
+/// site. Adding a second is how one of these starts lying.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerConnectionEventKind {
     Connected,
@@ -811,6 +818,198 @@ pub struct MessageStore {
     pub(crate) sealed_reads: std::sync::atomic::AtomicU64,
 }
 
+/// Transaction-scoped body of [`MessageStore::record_peer_connection_event`], so a
+/// store write that already holds a transaction can record its evidence in
+/// the same atomic step instead of reaching back through `&self` for a
+/// second lock on the same connection (which would deadlock).
+fn record_peer_connection_event_tx(
+    tx: &Transaction<'_>,
+    user_id: &[u8],
+    transport: PeerConnectionTransport,
+    kind: PeerConnectionEventKind,
+    occurred_at_ms: i64,
+) -> Result<(), CoreError> {
+    let transport_value = peer_transport_value(transport);
+    let kind_value = peer_event_kind_value(kind);
+    tx.execute(
+        "INSERT INTO peer_connection_events
+            (user_id, transport, kind, occurred_at_ms)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (
+            SELECT 1 FROM peer_connection_events
+            WHERE user_id = ?1 AND transport = ?2 AND kind = ?3
+              AND occurred_at_ms >= ?4 - 30000
+         )",
+        params![&user_id, transport_value, kind_value, occurred_at_ms],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "INSERT INTO peer_connection_summary
+            (user_id, transport, last_connected_at_ms,
+             last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms,
+             last_received_at_ms)
+         VALUES (
+            ?1, ?2,
+            CASE WHEN ?3 = 0 THEN ?4 END,
+            CASE WHEN ?3 = 1 THEN ?4 END,
+            CASE WHEN ?3 = 2 THEN ?4 END,
+            CASE WHEN ?3 = 3 THEN ?4 END,
+            CASE WHEN ?3 = 4 THEN ?4 END
+         )
+         ON CONFLICT(user_id, transport) DO UPDATE SET
+            last_connected_at_ms = COALESCE(
+                MAX(last_connected_at_ms, excluded.last_connected_at_ms),
+                last_connected_at_ms, excluded.last_connected_at_ms),
+            last_disconnected_at_ms = COALESCE(
+                MAX(last_disconnected_at_ms, excluded.last_disconnected_at_ms),
+                last_disconnected_at_ms, excluded.last_disconnected_at_ms),
+            last_seen_at_ms = COALESCE(
+                MAX(last_seen_at_ms, excluded.last_seen_at_ms),
+                last_seen_at_ms, excluded.last_seen_at_ms),
+            last_delivered_at_ms = COALESCE(
+                MAX(last_delivered_at_ms, excluded.last_delivered_at_ms),
+                last_delivered_at_ms, excluded.last_delivered_at_ms),
+            last_received_at_ms = COALESCE(
+                MAX(last_received_at_ms, excluded.last_received_at_ms),
+                last_received_at_ms, excluded.last_received_at_ms)",
+        params![&user_id, transport_value, kind_value, occurred_at_ms],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "DELETE FROM peer_connection_events WHERE occurred_at_ms < ?1",
+        params![occurred_at_ms.saturating_sub(30 * 24 * 60 * 60 * 1000)],
+    )
+    .map_err(store_err)?;
+    tx.execute(
+        "DELETE FROM peer_connection_events
+         WHERE id NOT IN (
+            SELECT id FROM peer_connection_events
+            ORDER BY occurred_at_ms DESC, id DESC LIMIT 1000
+         )",
+        [],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
+/// Does a delivered watermark moving from `previous_through` to
+/// `effective_through` newly prove that a message *a person can see*
+/// reached the peer?
+///
+/// Three conditions, all necessary:
+/// - the watermark **strictly advanced**. A duplicate or replayed receipt
+///   re-covers lamports already proved delivered and proves nothing new; so
+///   does a restored backup replaying receipts against a watermark the
+///   restored `receipts` row already holds.
+/// - the newly covered range contains a row in this chat **authored by
+///   us** (`sender_user_id` is our own id on the receipt path -- a receipt
+///   only ever acks messages we wrote).
+/// - at least one such row is a **visible** kind, by
+///   [`crate::core_is_visible_chat_kind`] -- the same single predicate the
+///   inbound direction and both chat screens use. Hidden service kinds
+///   (profile sync, friend directory, LAN endpoint hints, relay-change
+///   notices) get `messages` rows and advance the peer's watermark exactly
+///   like real messages do, so without this the screen reports a delivery
+///   for traffic no human ever authored.
+///
+/// The scan is bounded by the newly covered range and rides the
+/// `UNIQUE(chat_id, sender_user_id, lamport)` index; it stops at the first
+/// visible row.
+fn receipt_newly_covers_visible_authored_message(
+    tx: &Transaction<'_>,
+    chat_id: &[u8],
+    sender_user_id: &[u8],
+    previous_through: u64,
+    effective_through: u64,
+) -> Result<bool, CoreError> {
+    if effective_through <= previous_through {
+        return Ok(false);
+    }
+    let mut stmt = tx
+        .prepare(
+            "SELECT kind FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2
+               AND lamport > ?3 AND lamport <= ?4
+             ORDER BY lamport ASC",
+        )
+        .map_err(store_err)?;
+    let mut rows = stmt
+        .query(params![
+            chat_id,
+            sender_user_id,
+            previous_through as i64,
+            effective_through as i64
+        ])
+        .map_err(store_err)?;
+    while let Some(row) = rows.next().map_err(store_err)? {
+        let kind: i64 = row.get(0).map_err(store_err)?;
+        if u8::try_from(kind).is_ok_and(crate::core_is_visible_chat_kind) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Record the outbound half of the Connection details evidence -- "they
+/// received your message" -- for a delivered receipt that
+/// [`receipt_newly_covers_visible_authored_message`] accepts.
+///
+/// The peer named is `chat_id`, which on the 1:1 receipt path is the friend
+/// who sent the receipt. A chat id that is not an accepted contact (a
+/// group, or someone since removed) records nothing: the screen only ever
+/// lists friends, so an event for anyone else could never be shown against
+/// a name -- the same skip the inbound direction makes.
+///
+/// An unknown return route claims no path rather than guessing one.
+/// [`PeerConnectionTransport::Carried`] is how this store already spells
+/// "evidence, but no path we observed", and surfaces render it without a
+/// "via ..." clause.
+fn record_delivered_evidence(
+    tx: &Transaction<'_>,
+    chat_id: &[u8],
+    sender_user_id: &[u8],
+    previous_through: u64,
+    effective_through: u64,
+    via_transport: Option<u8>,
+    received_at_ms: i64,
+) -> Result<(), CoreError> {
+    if received_at_ms < 0 {
+        return Ok(());
+    }
+    if !receipt_newly_covers_visible_authored_message(
+        tx,
+        chat_id,
+        sender_user_id,
+        previous_through,
+        effective_through,
+    )? {
+        return Ok(());
+    }
+    let is_contact: bool = tx
+        .query_row(
+            "SELECT 1 FROM contacts WHERE user_id = ?1",
+            params![chat_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(store_err)?
+        .unwrap_or(false);
+    if !is_contact {
+        return Ok(());
+    }
+    let transport = match via_transport {
+        Some(value) => core_peer_transport_for_arrival(value),
+        None => PeerConnectionTransport::Carried,
+    };
+    record_peer_connection_event_tx(
+        tx,
+        chat_id,
+        transport,
+        PeerConnectionEventKind::MessageDelivered,
+        received_at_ms,
+    )
+}
+
 #[uniffi::export]
 impl MessageStore {
     /// Open (creating if needed) the message store at `path`. Pass
@@ -1082,68 +1281,9 @@ impl MessageStore {
                 "connection event time cannot be negative".into(),
             ));
         }
-        let transport_value = peer_transport_value(transport);
-        let kind_value = peer_event_kind_value(kind);
         let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO peer_connection_events
-                (user_id, transport, kind, occurred_at_ms)
-             SELECT ?1, ?2, ?3, ?4
-             WHERE NOT EXISTS (
-                SELECT 1 FROM peer_connection_events
-                WHERE user_id = ?1 AND transport = ?2 AND kind = ?3
-                  AND occurred_at_ms >= ?4 - 30000
-             )",
-            params![&user_id, transport_value, kind_value, occurred_at_ms],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "INSERT INTO peer_connection_summary
-                (user_id, transport, last_connected_at_ms,
-                 last_disconnected_at_ms, last_seen_at_ms, last_delivered_at_ms,
-                 last_received_at_ms)
-             VALUES (
-                ?1, ?2,
-                CASE WHEN ?3 = 0 THEN ?4 END,
-                CASE WHEN ?3 = 1 THEN ?4 END,
-                CASE WHEN ?3 = 2 THEN ?4 END,
-                CASE WHEN ?3 = 3 THEN ?4 END,
-                CASE WHEN ?3 = 4 THEN ?4 END
-             )
-             ON CONFLICT(user_id, transport) DO UPDATE SET
-                last_connected_at_ms = COALESCE(
-                    MAX(last_connected_at_ms, excluded.last_connected_at_ms),
-                    last_connected_at_ms, excluded.last_connected_at_ms),
-                last_disconnected_at_ms = COALESCE(
-                    MAX(last_disconnected_at_ms, excluded.last_disconnected_at_ms),
-                    last_disconnected_at_ms, excluded.last_disconnected_at_ms),
-                last_seen_at_ms = COALESCE(
-                    MAX(last_seen_at_ms, excluded.last_seen_at_ms),
-                    last_seen_at_ms, excluded.last_seen_at_ms),
-                last_delivered_at_ms = COALESCE(
-                    MAX(last_delivered_at_ms, excluded.last_delivered_at_ms),
-                    last_delivered_at_ms, excluded.last_delivered_at_ms),
-                last_received_at_ms = COALESCE(
-                    MAX(last_received_at_ms, excluded.last_received_at_ms),
-                    last_received_at_ms, excluded.last_received_at_ms)",
-            params![&user_id, transport_value, kind_value, occurred_at_ms],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM peer_connection_events WHERE occurred_at_ms < ?1",
-            params![occurred_at_ms.saturating_sub(30 * 24 * 60 * 60 * 1000)],
-        )
-        .map_err(store_err)?;
-        tx.execute(
-            "DELETE FROM peer_connection_events
-             WHERE id NOT IN (
-                SELECT id FROM peer_connection_events
-                ORDER BY occurred_at_ms DESC, id DESC LIMIT 1000
-             )",
-            [],
-        )
-        .map_err(store_err)?;
+        record_peer_connection_event_tx(&tx, &user_id, transport, kind, occurred_at_ms)?;
         tx.commit().map_err(store_err)
     }
 
@@ -3453,6 +3593,24 @@ impl MessageStore {
     /// notices a hole still gets the envelope rebuilt by the digest responder.
     /// See `crate::outbound_retirement` for the full predicate and its
     /// reasoning.
+    ///
+    /// **A delivered receipt is also the sole author of
+    /// [`PeerConnectionEventKind::MessageDelivered`]**, and only when it newly
+    /// covers a message a person can actually see. Both shells used to record
+    /// that event unconditionally on every delivered receipt, which made the
+    /// Connection details screen say "Received your message yesterday" about
+    /// contacts nobody had written to in days: the app authors hidden service
+    /// messages (profile sync, the friend directory, LAN endpoint hints,
+    /// relay-change notices) into the same lamport stream, and a cumulative
+    /// receipt covers those too. The inbound direction has always been narrow
+    /// this way; this is its twin. See
+    /// [`receipt_newly_covers_visible_authored_message`].
+    ///
+    /// `received_at_ms` is when this receipt reached this device -- the moment
+    /// the event is dated with. `None` means the caller has no arrival to date
+    /// the evidence by, and then no connection event is recorded at all: a
+    /// wrong timestamp on a screen whose entire content is timestamps is worse
+    /// than a missing line.
     pub fn record_receipt(
         &self,
         chat_id: Vec<u8>,
@@ -3460,10 +3618,21 @@ impl MessageStore {
         receipt_type: u8,
         through_lamport: u64,
         via_transport: Option<u8>,
+        received_at_ms: Option<i64>,
     ) -> Result<(), CoreError> {
         validate_receipt_watermark(receipt_type, through_lamport)?;
         let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
+        let previous_through: i64 = tx
+            .query_row(
+                "SELECT through_lamport FROM receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![&chat_id, &sender_user_id, receipt_type as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
         tx.execute(
             "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport, via_transport)
                 VALUES (?1, ?2, ?3, ?4, ?5)
@@ -3521,6 +3690,17 @@ impl MessageStore {
                     .count("rows_retired", i64::try_from(retired).unwrap_or(i64::MAX))
                     .count("through_lamport", effective.max(0))]
                 });
+            }
+            if let Some(received_at_ms) = received_at_ms {
+                record_delivered_evidence(
+                    &tx,
+                    &chat_id,
+                    &sender_user_id,
+                    previous_through.max(0) as u64,
+                    effective.max(0) as u64,
+                    via_transport,
+                    received_at_ms,
+                )?;
             }
         }
         tx.commit().map_err(store_err)?;
@@ -8165,6 +8345,350 @@ mod tests {
         assert_eq!(summaries[0].last_connected_at_ms, None);
     }
 
+    /// A 1:1 chat with one accepted contact and this device as the author,
+    /// laid out the way the receipt path sees it: `chat_id` is the friend,
+    /// `sender_user_id` on every row is us.
+    fn chat_with_authored_kinds(kinds: &[(u64, u8)]) -> (MessageStore, Vec<u8>, Vec<u8>) {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let friend = test_user_id(b"friend");
+        let me = test_user_id(b"me");
+        store.upsert_contact(contact(&friend, "Friend")).unwrap();
+        for (lamport, kind) in kinds {
+            let mut row = msg(&friend, &me, *lamport, "payload");
+            row.kind = *kind;
+            store.insert_message(row).unwrap();
+        }
+        (store, friend, me)
+    }
+
+    fn delivered_events(store: &MessageStore, friend: &[u8]) -> Vec<PeerConnectionEvent> {
+        store
+            .peer_connection_events(Some(friend.to_vec()), 50)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == PeerConnectionEventKind::MessageDelivered)
+            .collect()
+    }
+
+    /// The bug this gate exists for. The app writes profile sync, the friend
+    /// directory, LAN endpoint hints and relay-change notices into the same
+    /// lamport stream as real messages, and a cumulative delivery receipt
+    /// covers them all. Before the gate, a contact whose phone merely acked a
+    /// friend-directory blob read as "Received your message yesterday" on the
+    /// Connection details screen -- about a conversation nobody had touched in
+    /// days.
+    #[test]
+    fn a_delivered_receipt_covering_only_service_traffic_records_no_delivery() {
+        let (store, friend, me) = chat_with_authored_kinds(&[
+            (1, crate::KIND_PROFILE_SYNC),
+            (2, crate::KIND_FRIEND_DIRECTORY),
+            (3, crate::KIND_LAN_ENDPOINT_HINT),
+            (4, crate::KIND_RELAY_UPDATE),
+            (5, crate::KIND_REACTION),
+        ]);
+
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                5,
+                Some(3),
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        assert!(delivered_events(&store, &friend).is_empty());
+        assert!(store.peer_connection_summaries().unwrap().is_empty());
+    }
+
+    /// The honest case: a receipt that newly covers something a person wrote
+    /// and can see is exactly what "Received your message" means. The event
+    /// carries the route the receipt came back on and the moment it arrived.
+    #[test]
+    fn a_delivered_receipt_covering_a_visible_message_records_the_delivery() {
+        let (store, friend, me) =
+            chat_with_authored_kinds(&[(1, crate::KIND_PROFILE_SYNC), (2, crate::KIND_TEXT)]);
+
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                Some(3), // local Wi-Fi
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        let events = delivered_events(&store, &friend);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].transport, PeerConnectionTransport::LocalWifi);
+        assert_eq!(events[0].occurred_at_ms, 1_700_000_000_000);
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries[0].last_delivered_at_ms, Some(1_700_000_000_000));
+    }
+
+    /// Every visible kind counts, and only the visible kinds do -- the same
+    /// single predicate the chat screens and the inbound direction use.
+    #[test]
+    fn the_visible_set_is_the_one_shared_predicate() {
+        for kind in 0u8..=32 {
+            let (store, friend, me) = chat_with_authored_kinds(&[(1, kind)]);
+            store
+                .record_receipt(
+                    friend.clone(),
+                    me,
+                    RECEIPT_TYPE_DELIVERED,
+                    1,
+                    Some(3),
+                    Some(1_700_000_000_000),
+                )
+                .unwrap();
+            assert_eq!(
+                !delivered_events(&store, &friend).is_empty(),
+                crate::core_is_visible_chat_kind(kind),
+                "kind {kind} recorded a delivery it should not have, or missed one it should"
+            );
+        }
+    }
+
+    /// A receipt that re-covers lamports already proved delivered proves
+    /// nothing new. Under DTN the same receipt is replayed routinely -- over
+    /// BLE, off a relay, out of a mule's carry queue -- and each replay used
+    /// to stamp a fresh "just now" onto the screen.
+    #[test]
+    fn a_replayed_delivered_receipt_records_no_second_delivery() {
+        let (store, friend, me) = chat_with_authored_kinds(&[(1, crate::KIND_TEXT)]);
+        let first = 1_700_000_000_000;
+        // Far past the 30s coalescing window, so a second event would show.
+        let much_later = first + 3 * 24 * 60 * 60 * 1000;
+
+        for at in [first, much_later] {
+            store
+                .record_receipt(
+                    friend.clone(),
+                    me.clone(),
+                    RECEIPT_TYPE_DELIVERED,
+                    1,
+                    Some(3),
+                    Some(at),
+                )
+                .unwrap();
+        }
+
+        let events = delivered_events(&store, &friend);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].occurred_at_ms, first);
+    }
+
+    /// Restoring a backup replays receipts the restored `receipts` rows
+    /// already cover. The watermark cannot advance, so no evidence is
+    /// fabricated and the screen keeps saying what it said before the restore.
+    #[test]
+    fn a_restored_store_replaying_old_receipts_records_no_fresh_delivery() {
+        let (store, friend, me) = chat_with_authored_kinds(&[(1, crate::KIND_TEXT)]);
+        let long_ago = 1_700_000_000_000;
+        store
+            .record_receipt(
+                friend.clone(),
+                me.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                Some(3),
+                Some(long_ago),
+            )
+            .unwrap();
+
+        // The restore hands the same watermark back, dated "now".
+        let now = long_ago + 30 * 24 * 60 * 60 * 1000;
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                Some(0),
+                Some(now),
+            )
+            .unwrap();
+
+        let events = delivered_events(&store, &friend);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].occurred_at_ms, long_ago);
+        let summaries = store.peer_connection_summaries().unwrap();
+        assert_eq!(summaries[0].last_delivered_at_ms, Some(long_ago));
+    }
+
+    /// One receipt is one decision, however many messages it covers. A
+    /// watermark that jumps over a run of service traffic and two real
+    /// messages records a single delivery, not one per row.
+    #[test]
+    fn a_watermark_advancing_over_a_mix_records_one_delivery() {
+        let (store, friend, me) = chat_with_authored_kinds(&[
+            (1, crate::KIND_PROFILE_SYNC),
+            (2, crate::KIND_TEXT),
+            (3, crate::KIND_RELAY_UPDATE),
+            (4, crate::KIND_ATTACHMENT_MANIFEST),
+        ]);
+
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                4,
+                Some(3),
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        assert_eq!(delivered_events(&store, &friend).len(), 1);
+    }
+
+    /// Only the newly covered span is examined. A visible message already
+    /// proved delivered cannot make a later service-only advance claim a
+    /// second delivery.
+    #[test]
+    fn an_advance_over_service_traffic_alone_adds_nothing_after_a_real_delivery() {
+        let (store, friend, me) =
+            chat_with_authored_kinds(&[(1, crate::KIND_TEXT), (2, crate::KIND_FRIEND_DIRECTORY)]);
+        let first = 1_700_000_000_000;
+        store
+            .record_receipt(
+                friend.clone(),
+                me.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                Some(3),
+                Some(first),
+            )
+            .unwrap();
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                Some(3),
+                Some(first + 3 * 24 * 60 * 60 * 1000),
+            )
+            .unwrap();
+
+        let events = delivered_events(&store, &friend);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].occurred_at_ms, first);
+    }
+
+    /// A read receipt has never recorded connection evidence and still
+    /// doesn't; the delivered watermark is the one this screen measures.
+    #[test]
+    fn a_read_receipt_records_no_delivery_evidence() {
+        let (store, friend, me) = chat_with_authored_kinds(&[(1, crate::KIND_TEXT)]);
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_READ,
+                1,
+                Some(3),
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+        assert!(store
+            .peer_connection_events(Some(friend), 50)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// An unknown return route names no path. `Carried` is how this store
+    /// spells "evidence, but nothing we observed", and the surfaces drop the
+    /// "via ..." clause for it rather than guessing Bluetooth or Wi-Fi.
+    #[test]
+    fn a_delivered_receipt_with_an_unknown_route_claims_no_path() {
+        let (store, friend, me) = chat_with_authored_kinds(&[(1, crate::KIND_TEXT)]);
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                None,
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        let events = delivered_events(&store, &friend);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].transport, PeerConnectionTransport::Carried);
+        assert!(!crate::core_peer_transport_is_observed(events[0].transport));
+    }
+
+    /// No arrival to date the evidence by, no evidence. Every line on the
+    /// Connection details screen is a timestamp; a guessed one is worse than
+    /// a missing row.
+    #[test]
+    fn a_delivered_receipt_with_no_arrival_time_records_nothing() {
+        let (store, friend, me) = chat_with_authored_kinds(&[(1, crate::KIND_TEXT)]);
+        store
+            .record_receipt(friend.clone(), me, RECEIPT_TYPE_DELIVERED, 1, Some(3), None)
+            .unwrap();
+        assert!(delivered_events(&store, &friend).is_empty());
+    }
+
+    /// The screen only ever lists friends, so a chat that is not an accepted
+    /// contact -- a group id, or someone since removed -- could never show the
+    /// row anyway. Same skip the inbound direction makes.
+    #[test]
+    fn a_delivered_receipt_for_a_chat_that_is_not_a_contact_records_nothing() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let group_id = test_user_id(b"group");
+        let me = test_user_id(b"me");
+        let mut row = msg(&group_id, &me, 1, "hello everyone");
+        row.kind = crate::KIND_TEXT;
+        store.insert_message(row).unwrap();
+
+        store
+            .record_receipt(
+                group_id.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                Some(3),
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        assert!(delivered_events(&store, &group_id).is_empty());
+    }
+
+    /// A receipt only ever acks messages *we* wrote. Their own inbound
+    /// messages sit in the same chat under their own sender id and must not
+    /// satisfy the gate.
+    #[test]
+    fn a_receipt_is_not_satisfied_by_the_friends_own_messages() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let friend = test_user_id(b"friend");
+        let me = test_user_id(b"me");
+        store.upsert_contact(contact(&friend, "Friend")).unwrap();
+        store
+            .insert_message(msg(&friend, &friend, 1, "hi"))
+            .unwrap();
+
+        store
+            .record_receipt(
+                friend.clone(),
+                me,
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                Some(3),
+                Some(1_700_000_000_000),
+            )
+            .unwrap();
+
+        assert!(delivered_events(&store, &friend).is_empty());
+    }
+
     /// Summaries are ordered by the newest evidence of ANY kind. The old
     /// COALESCE-based ordering picked the first non-null column instead, so a
     /// row with stale delivery evidence outranked a row seen seconds ago.
@@ -8971,10 +9495,11 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 i64::MAX as u64 + 1,
                 None,
+                None
             )
             .is_err());
         assert!(store
-            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1, None)
+            .record_receipt(b"chat-a".to_vec(), b"alice".to_vec(), 0xff, 1, None, None)
             .is_err());
         assert!(store
             .upsert_outgoing_receipt_envelope(
@@ -9490,6 +10015,7 @@ mod tests {
                 b"self".to_vec(),
                 crate::RECEIPT_TYPE_READ,
                 2,
+                None,
                 None,
             )
             .unwrap();
@@ -10203,6 +10729,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         let bob = delivery_status(&store, BOB);
@@ -10217,6 +10744,7 @@ mod tests {
                 ALICE.to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9_999,
+                None,
                 None,
             )
             .unwrap();
@@ -10437,6 +10965,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 2,
                 None,
+                None,
             )
             .unwrap();
         assert!(!delivery_status(&store, BOB).oversized_waiting);
@@ -10506,6 +11035,7 @@ mod tests {
                 ALICE.to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 2,
+                None,
                 None,
             )
             .unwrap();
@@ -13132,6 +13662,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 777,
                 Some(2),
+                None,
             )
             .unwrap();
         store
@@ -13560,6 +14091,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -13672,6 +14204,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -13714,6 +14247,7 @@ mod tests {
                 b"me".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
                 None,
             )
             .unwrap();
@@ -13902,6 +14436,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -13949,6 +14484,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -13985,6 +14521,7 @@ mod tests {
                 b"carol".to_vec(),
                 RECEIPT_TYPE_DELIVERED,
                 1,
+                None,
                 None,
             )
             .unwrap();
@@ -14103,6 +14640,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 5,
                 None,
+                None,
             )
             .unwrap();
 
@@ -14126,6 +14664,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 5,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14134,6 +14673,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
                 None,
             )
             .unwrap();
@@ -14158,6 +14698,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 None,
+                None,
             )
             .unwrap();
         // A stale/replayed receipt (lower, or the same, value) must not undo progress.
@@ -14168,6 +14709,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 3,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14176,6 +14718,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
                 None,
             )
             .unwrap();
@@ -14246,6 +14789,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9_999,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14285,6 +14829,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 1,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14310,6 +14855,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 5,
                 Some(2),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14332,6 +14878,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 Some(0),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14356,6 +14903,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 Some(3), // local Wi-Fi confirmed the watermark first
+                None,
             )
             .unwrap();
         // A re-sent receipt for the same watermark on a different link must not
@@ -14367,6 +14915,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 Some(2),
+                None,
             )
             .unwrap();
         // A watermark-advancing receipt whose return route is unknown keeps the
@@ -14377,6 +14926,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 12,
+                None,
                 None,
             )
             .unwrap();
@@ -14419,6 +14969,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14441,6 +14992,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 Some(0),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14472,6 +15024,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
+                None,
                 None,
             )
             .unwrap();
@@ -14555,6 +15108,7 @@ mod tests {
                 RECEIPT_TYPE_DELIVERED,
                 5,
                 Some(0),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -14578,6 +15132,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14586,6 +15141,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_READ,
                 4,
+                None,
                 None,
             )
             .unwrap();
@@ -14622,6 +15178,7 @@ mod tests {
                 crate::RECEIPT_TYPE_DELIVERED,
                 9,
                 None,
+                None,
             )
             .unwrap();
         store
@@ -14630,6 +15187,7 @@ mod tests {
                 b"alice".to_vec(),
                 crate::RECEIPT_TYPE_DELIVERED,
                 2,
+                None,
                 None,
             )
             .unwrap();

@@ -472,6 +472,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
                 content.receipt_type,
                 content.lamport,
                 None,
+                None,
             )
             .unwrap();
         bob.store.remove_carried_envelope(envelope.msg_id).unwrap();

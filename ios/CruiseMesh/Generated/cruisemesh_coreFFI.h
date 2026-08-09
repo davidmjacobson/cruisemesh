@@ -1409,7 +1409,7 @@ void uniffi_cruisemesh_core_fn_method_messagestore_record_peer_connection_event(
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_RECORD_RECEIPT
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_RECORD_RECEIPT
-void uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(void*_Nonnull ptr, RustBuffer chat_id, RustBuffer sender_user_id, uint8_t receipt_type, uint64_t through_lamport, RustBuffer via_transport, RustCallStatus *_Nonnull out_status
+void uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(void*_Nonnull ptr, RustBuffer chat_id, RustBuffer sender_user_id, uint8_t receipt_type, uint64_t through_lamport, RustBuffer via_transport, RustBuffer received_at_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_MESSAGESTORE_RECORD_SENT_METRIC
