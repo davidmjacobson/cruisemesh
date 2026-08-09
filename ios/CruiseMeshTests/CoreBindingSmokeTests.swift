@@ -270,12 +270,12 @@ final class CoreBindingSmokeTests: XCTestCase {
     private static let allRelayFaultCases: [CoreRelayFault] = {
         let all: [CoreRelayFault] = [
             .passExpired, .passSuspended, .tokenRejected,
-            .mailboxFull, .messageTooLarge, .rateLimited, .outage,
+            .mailboxFull, .messageTooLarge, .rateLimited, .msgIdConflict, .outage,
         ]
         for value in all {
             switch value {
             case .passExpired, .passSuspended, .tokenRejected,
-                 .mailboxFull, .messageTooLarge, .rateLimited, .outage: break
+                 .mailboxFull, .messageTooLarge, .rateLimited, .msgIdConflict, .outage: break
             }
         }
         return all
