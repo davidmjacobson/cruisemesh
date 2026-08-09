@@ -115,9 +115,9 @@ use crate::groups::{canonicalize_members, validate_group};
 use crate::limits::MAX_ENVELOPE_SEALED_BYTES;
 use crate::{
     core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
-    CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, FriendDirectoryContent, Group,
-    IntroductionTicket, RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
-    MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, CoreRelayShadowReport,
+    FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
+    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -6698,6 +6698,70 @@ impl MessageStore {
     pub(crate) fn protocol_pseudonym(&self, kind: &'static str, raw: &[u8]) -> Option<String> {
         let conn = lock_conn(&self.conn);
         crate::protocol_event::actor_pseudonym(&conn, kind, raw).ok()
+    }
+}
+
+/// The migration canary's one write.
+#[uniffi::export]
+impl MessageStore {
+    /// Record what a shadow comparison found, and nothing else.
+    ///
+    /// This is the only store call the canary is permitted to make, and it
+    /// touches exactly one table: the bounded diagnostics ring. No message,
+    /// no cursor, no marker, no health row. It is deliberately a method
+    /// narrow enough that a shell can hand the canary *this call alone* —
+    /// Android passes it as a one-method sink rather than passing the store —
+    /// so "production store writes come from one engine per pass" is a
+    /// property of what the canary can reach rather than a rule someone has
+    /// to remember. The report it takes cannot be turned back into a row.
+    ///
+    /// Every sampled comparison records one summary line whether or not it
+    /// found anything, because "the canary ran and agreed" and "the canary
+    /// never ran" are the two readings a release archive most needs to tell
+    /// apart. Each *kind* of disagreement then gets one record carrying how
+    /// many rows showed it.
+    ///
+    /// One record per kind rather than per row is what keeps this affordable.
+    /// The ring holds a couple of thousand events and every append evicts the
+    /// oldest, so an emitter whose volume scales with a device's rows can
+    /// quietly become the only thing in a support archive — and a diverging
+    /// device diverges *systematically*, so the hundredth copy of a finding
+    /// carries nothing the first did not. That caps one sampled pass at seven
+    /// records however badly the two engines disagree.
+    ///
+    /// `SECRET-01` is structural here: a [`CoreRelayShadowReport`] has no
+    /// field that can hold a token, an endpoint or a payload.
+    pub fn note_relay_shadow_report(&self, report: CoreRelayShadowReport, now_ms: i64) {
+        let mut drafts = Vec::with_capacity(report.mismatches.len() + 1);
+        drafts.push(
+            crate::protocol_event::ProtocolEventDraft::new(
+                crate::protocol_event::ProtocolEventCode::ShadowMismatch,
+                now_ms,
+                if report.mismatches.is_empty() {
+                    "shadow_agreed"
+                } else {
+                    "shadow_diverged"
+                },
+            )
+            .count("steps_compared", i64::from(report.steps_compared))
+            .count("skips_compared", i64::from(report.skips_compared))
+            .count("rows_unshadowed", i64::from(report.rows_unshadowed))
+            .count("rows_truncated", i64::from(report.rows_truncated))
+            .count("mismatch_kinds", report.mismatches.len() as i64),
+        );
+        for mismatch in &report.mismatches {
+            drafts.push(
+                crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::ShadowMismatch,
+                    now_ms,
+                    mismatch.kind.as_token(),
+                )
+                .count("first_index", i64::from(mismatch.first_index))
+                .count("rows", i64::from(mismatch.rows)),
+            );
+        }
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::note(&conn, &drafts);
     }
 }
 

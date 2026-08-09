@@ -39,7 +39,17 @@ fun relayHealthAfterSyncPass(
     ownRelaySucceeded: Boolean,
     anyRelaySucceeded: Boolean,
     now: Long,
-): RelayHealth = when (coreRelayPassHealth(fault, ownRelaySucceeded, anyRelaySucceeded)) {
+): RelayHealth = relayHealthFor(coreRelayPassHealth(fault, ownRelaySucceeded, anyRelaySucceeded), now)
+
+/**
+ * The same projection, for a pass that folded its own health.
+ *
+ * `CoreRelayPassSummary` already carries a [CoreRelayPassHealth] the session
+ * decided from everything it observed, so the core engine has no flags left
+ * for the fold above. Both engines end on one mapping rather than two: a
+ * display type and a clock reading are all this shell adds in either case.
+ */
+fun relayHealthFor(health: CoreRelayPassHealth, now: Long): RelayHealth = when (health) {
     CoreRelayPassHealth.OK -> RelayHealth.Ok(now)
     CoreRelayPassHealth.QUOTA_FULL -> RelayHealth.QuotaFull(now)
     CoreRelayPassHealth.MESSAGE_TOO_LARGE -> RelayHealth.MessageTooLarge(now)

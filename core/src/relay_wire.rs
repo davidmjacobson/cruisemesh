@@ -766,14 +766,31 @@ pub fn relay_decode_presence_page(body: Vec<u8>) -> Result<CoreRelayPresencePage
 }
 
 fn validate_envelope(msg_id: &[u8], hint: &[u8], sealed: &[u8]) -> Result<(), CoreError> {
-    if msg_id.len() != 16 {
+    relay_validate_envelope_sizes(msg_id.len(), hint.len(), sealed.len() as u64)
+}
+
+/// Everything [`validate_envelope`] checks, expressed over sizes alone.
+///
+/// The whole of that check *is* about sizes, so this is the rule itself rather
+/// than a summary of it — `validate_envelope` delegates here, so there is one
+/// place where "what may be posted" is decided. Callers that only need the
+/// answer (the migration canary asking whether a captured row could have been
+/// encoded) get it without holding the payload.
+pub(crate) fn relay_validate_envelope_sizes(
+    msg_id_len: usize,
+    hint_len: usize,
+    sealed_len: u64,
+) -> Result<(), CoreError> {
+    if msg_id_len != 16 {
         return Err(malformed("relay msg_id must be 16 bytes"));
     }
-    validate_hint(hint)?;
-    if sealed.is_empty() {
+    if hint_len != 8 {
+        return Err(malformed("relay recipient hint must be 8 bytes"));
+    }
+    if sealed_len == 0 {
         return Err(malformed("relay sealed payload cannot be empty"));
     }
-    if sealed.len() > RELAY_MAX_SEALED_BYTES {
+    if sealed_len > RELAY_MAX_SEALED_BYTES as u64 {
         return Err(malformed("relay sealed payload is too large"));
     }
     Ok(())

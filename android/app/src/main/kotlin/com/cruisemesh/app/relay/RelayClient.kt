@@ -312,13 +312,31 @@ object RelayClient {
      * still lists an associated-but-dead Wi‑Fi as the system default network.
      */
     private fun openConnection(url: String, method: String, config: RelayConfig, network: Network?): HttpURLConnection {
+        val connection = openTransport(url, method, network)
+        connection.setRequestProperty("Authorization", "Bearer ${config.relayToken}")
+        connection.setRequestProperty("Accept", "application/json")
+        return connection
+    }
+
+    /**
+     * The transport substrate, with no protocol opinion in it: the socket, the
+     * [Network] pin, the timeouts, and the two headers that belong to this
+     * HTTP client rather than to the relay protocol -- the user agent that
+     * identifies the client, and the tunnel-bypass hint a development relay
+     * needs.
+     *
+     * Split out so a second engine cannot end up with a second transport. The
+     * core relay driver forms its own protocol headers (core decides those)
+     * and gets everything below them from here, which is what makes "the two
+     * engines put the same bytes on the wire" a property of there being one
+     * connection opener rather than of two files agreeing.
+     */
+    internal fun openTransport(url: String, method: String, network: Network?): HttpURLConnection {
         val parsed = URL(url)
         val connection = (network?.openConnection(parsed) ?: parsed.openConnection()) as HttpURLConnection
         connection.requestMethod = method
         connection.connectTimeout = CONNECT_TIMEOUT_MS
         connection.readTimeout = READ_TIMEOUT_MS
-        connection.setRequestProperty("Authorization", "Bearer ${config.relayToken}")
-        connection.setRequestProperty("Accept", "application/json")
         connection.setRequestProperty("User-Agent", RELAY_USER_AGENT)
         connection.setRequestProperty("bypass-tunnel-reminder", RELAY_BYPASS_TUNNEL_REMINDER)
         return connection

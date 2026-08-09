@@ -181,17 +181,18 @@ pub use semantic::{
     core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
-// Package C0. Exported so the C1/C2 driver adapters have a surface to
-// compile against; deliberately unreachable from either shell today, and the
-// only caller in this repository is `core/tests/relay_pass_replay.rs`.
+// Package C0, driven from Android by package C1. Android reaches it only
+// behind a whole-pass engine selection that defaults to the legacy engine;
+// iOS does not reach it at all yet and compiles against this surface.
 pub use session::relay_pass::{
-    core_relay_pass_default_budgets, CoreRelayAction, CoreRelayActionKind, CoreRelayContactConfig,
-    CoreRelayContinuation, CoreRelayEndpointConfig, CoreRelayHeader, CoreRelayHttpRequest,
-    CoreRelayHttpResult, CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets,
-    CoreRelayPassOutcome, CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayProgressReason,
-    CoreRelayStage, CoreRelayTransportError, RELAY_PASS_DEADLINE_MS,
-    RELAY_PASS_MAX_AUTHORED_UPLOADS, RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES,
-    RELAY_PASS_MAX_RECEIPT_UPLOADS, RELAY_PASS_MAX_REQUESTS, RELAY_PASS_MAX_RESPONSE_BYTES,
+    core_relay_adapter_vectors, core_relay_pass_default_budgets, CoreRelayAction,
+    CoreRelayActionKind, CoreRelayAdapterVector, CoreRelayContactConfig, CoreRelayContinuation,
+    CoreRelayEndpointConfig, CoreRelayHeader, CoreRelayHttpRequest, CoreRelayHttpResult,
+    CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome,
+    CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayProgressReason, CoreRelayStage,
+    CoreRelayTransportError, RELAY_PASS_DEADLINE_MS, RELAY_PASS_MAX_AUTHORED_UPLOADS,
+    RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES, RELAY_PASS_MAX_RECEIPT_UPLOADS,
+    RELAY_PASS_MAX_REQUESTS, RELAY_PASS_MAX_RESPONSE_BYTES,
 };
 pub use session::relay_policy::{
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
@@ -202,6 +203,15 @@ pub use session::relay_policy::{
     CoreRelayHealthVector, CoreRelayJitterVector, CoreRelayPacerVector, CoreRelayPassHealth,
     CoreRelayRerunAction, CoreRelayRerunVector, FAMILY_RELAY_BACKOFF_BASE_MS,
     FAMILY_RELAY_BACKOFF_CAP_MS, FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
+};
+// The migration canary. Pure comparison over captured values, and removed
+// with the legacy engine it exists to check.
+pub use session::relay_shadow::{
+    core_relay_shadow_compare, core_relay_shadow_max_rows, core_relay_shadow_max_skips,
+    core_relay_shadow_sample, CoreRelayShadowCapture, CoreRelayShadowLane, CoreRelayShadowMismatch,
+    CoreRelayShadowMismatchKind, CoreRelayShadowReport, CoreRelayShadowSample,
+    CoreRelayShadowSampler, CoreRelayShadowStep, RELAY_SHADOW_MAX_ROWS,
+    RELAY_SHADOW_MAX_SAMPLES_PER_DAY, RELAY_SHADOW_MAX_SKIPS, RELAY_SHADOW_MIN_INTERVAL_MS,
 };
 pub use spray_policy::{
     core_spray_retry_arm_max_ms, CoreSprayAdmission, CoreSprayAdmissionReason, CoreSprayGate,

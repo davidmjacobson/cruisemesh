@@ -14,8 +14,16 @@
 //! [`relay_pass`] owns the relay pass itself: the ordered stages, request
 //! formation, response decoding, store transactions, ack eligibility, cursor
 //! advancement, silence evidence, budgets and continuation. It consumes
-//! `relay_policy`'s decisions rather than repeating them, and it is dark —
-//! no production code path on either shell reaches it yet.
+//! `relay_policy`'s decisions rather than repeating them, and on Android it
+//! is reachable only behind a whole-pass engine selection that defaults to
+//! the legacy engine.
+//!
+//! [`relay_shadow`] is the migration canary's read-only planner: pure
+//! functions over values a shell captured from a legacy pass, so the two
+//! engines can be compared without either of them running twice. It calls
+//! `relay_pass`'s own planning helpers rather than restating them, and it is
+//! deleted with the legacy engine it exists to check.
 
 pub mod relay_pass;
 pub mod relay_policy;
+pub mod relay_shadow;

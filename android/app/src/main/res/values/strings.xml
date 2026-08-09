@@ -74,6 +74,8 @@
     <string name="ui_diagnostic_logging_disabled_message">Diagnostic logging is off. What was already captured is kept until you delete it.</string>
     <string name="ui_delete_captured_diagnostics">Delete captured diagnostics</string>
     <string name="ui_diagnostics_deleted">Captured diagnostics deleted.</string>
+    <string name="ui_rebuilt_internet_sync">Rebuilt internet sync</string>
+    <string name="ui_rebuilt_internet_sync_desc">Sends and receives over the internet using the rebuilt code. Leave this off unless you have been asked to turn it on for testing. It applies from the next sync.</string>
     <string name="ui_display_name">Display name</string>
     <string name="ui_done">Done</string>
     <string name="ui_family_token">Family token</string>
