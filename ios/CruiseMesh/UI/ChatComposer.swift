@@ -76,7 +76,7 @@ struct ChatComposerBar: View {
                         Label("Take photo", systemImage: "camera")
                     }
                     Button { showVoice = true } label: {
-                        Label("Voice memo", systemImage: "mic")
+                        Label("Voice message", systemImage: "mic")
                     }
                 } label: {
                     Image(systemName: "plus.circle.fill")
@@ -156,9 +156,9 @@ struct VoiceMemoRecorderSheet: View {
                 Image(systemName: isRecording ? "waveform.circle.fill" : "mic.circle")
                     .font(.system(size: 72))
                     .foregroundStyle(isRecording ? Color.red : Color.accentColor)
-                Text(isRecording ? "Recording…" : "Voice memo")
+                Text(isRecording ? "Recording…" : "Voice message")
                     .font(.title2.weight(.semibold))
-                Text("Voice memos stop automatically after \(Int(VoiceRecorder.maxDurationSeconds)) seconds.")
+                Text("Voice messages stop automatically after \(Int(VoiceRecorder.maxDurationSeconds)) seconds.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -185,7 +185,7 @@ struct VoiceMemoRecorderSheet: View {
                 Spacer()
             }
             .padding(24)
-            .navigationTitle("Voice memo")
+            .navigationTitle("Voice message")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

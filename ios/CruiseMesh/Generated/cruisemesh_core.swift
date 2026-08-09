@@ -495,6 +495,22 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterBool : FfiConverter {
     typealias FfiType = Int8
     typealias SwiftType = Bool
@@ -16868,6 +16884,314 @@ public func FfiConverterTypeCoreTransportRoute_lower(_ value: CoreTransportRoute
 
 
 /**
+ * How the shells should configure the recorder, and the bounds they must
+ * enforce around it.
+ */
+public struct CoreVoiceCapturePlan {
+    public var sampleRateHz: UInt32
+    public var bitrateBps: UInt32
+    public var mimeType: String
+    /**
+     * Longest recording that still fits one attachment envelope, with margin.
+     */
+    public var maxDurationMs: UInt32
+    /**
+     * Shorter recordings are discarded as accidental.
+     */
+    public var minDurationMs: UInt32
+    /**
+     * Horizontal slide (toward the start edge) that arms cancel.
+     */
+    public var cancelSlideDp: Float
+    /**
+     * Upward slide that arms hands-free lock.
+     */
+    public var lockSlideDp: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sampleRateHz: UInt32, bitrateBps: UInt32, mimeType: String, 
+        /**
+         * Longest recording that still fits one attachment envelope, with margin.
+         */maxDurationMs: UInt32, 
+        /**
+         * Shorter recordings are discarded as accidental.
+         */minDurationMs: UInt32, 
+        /**
+         * Horizontal slide (toward the start edge) that arms cancel.
+         */cancelSlideDp: Float, 
+        /**
+         * Upward slide that arms hands-free lock.
+         */lockSlideDp: Float) {
+        self.sampleRateHz = sampleRateHz
+        self.bitrateBps = bitrateBps
+        self.mimeType = mimeType
+        self.maxDurationMs = maxDurationMs
+        self.minDurationMs = minDurationMs
+        self.cancelSlideDp = cancelSlideDp
+        self.lockSlideDp = lockSlideDp
+    }
+}
+
+
+
+extension CoreVoiceCapturePlan: Equatable, Hashable {
+    public static func ==(lhs: CoreVoiceCapturePlan, rhs: CoreVoiceCapturePlan) -> Bool {
+        if lhs.sampleRateHz != rhs.sampleRateHz {
+            return false
+        }
+        if lhs.bitrateBps != rhs.bitrateBps {
+            return false
+        }
+        if lhs.mimeType != rhs.mimeType {
+            return false
+        }
+        if lhs.maxDurationMs != rhs.maxDurationMs {
+            return false
+        }
+        if lhs.minDurationMs != rhs.minDurationMs {
+            return false
+        }
+        if lhs.cancelSlideDp != rhs.cancelSlideDp {
+            return false
+        }
+        if lhs.lockSlideDp != rhs.lockSlideDp {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sampleRateHz)
+        hasher.combine(bitrateBps)
+        hasher.combine(mimeType)
+        hasher.combine(maxDurationMs)
+        hasher.combine(minDurationMs)
+        hasher.combine(cancelSlideDp)
+        hasher.combine(lockSlideDp)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreVoiceCapturePlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreVoiceCapturePlan {
+        return
+            try CoreVoiceCapturePlan(
+                sampleRateHz: FfiConverterUInt32.read(from: &buf), 
+                bitrateBps: FfiConverterUInt32.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                maxDurationMs: FfiConverterUInt32.read(from: &buf), 
+                minDurationMs: FfiConverterUInt32.read(from: &buf), 
+                cancelSlideDp: FfiConverterFloat.read(from: &buf), 
+                lockSlideDp: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreVoiceCapturePlan, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.sampleRateHz, into: &buf)
+        FfiConverterUInt32.write(value.bitrateBps, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterUInt32.write(value.maxDurationMs, into: &buf)
+        FfiConverterUInt32.write(value.minDurationMs, into: &buf)
+        FfiConverterFloat.write(value.cancelSlideDp, into: &buf)
+        FfiConverterFloat.write(value.lockSlideDp, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCapturePlan_lift(_ buf: RustBuffer) throws -> CoreVoiceCapturePlan {
+    return try FfiConverterTypeCoreVoiceCapturePlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCapturePlan_lower(_ value: CoreVoiceCapturePlan) -> RustBuffer {
+    return FfiConverterTypeCoreVoiceCapturePlan.lower(value)
+}
+
+
+/**
+ * The gesture's whole state. A record rather than an object so both shells can
+ * hold it in their own idiomatic state container (Compose `mutableStateOf`,
+ * SwiftUI `@State`) and reduce it with the free functions below.
+ */
+public struct CoreVoiceCaptureState {
+    public var phase: VoiceCapturePhase
+    /**
+     * Releasing now would cancel rather than send.
+     */
+    public var cancelArmed: Bool
+    /**
+     * Releasing now would switch to hands-free rather than send.
+     */
+    public var lockArmed: Bool
+    /**
+     * Elapsed recording time the shell last reported, for the on-screen pip.
+     */
+    public var elapsedMs: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(phase: VoiceCapturePhase, 
+        /**
+         * Releasing now would cancel rather than send.
+         */cancelArmed: Bool, 
+        /**
+         * Releasing now would switch to hands-free rather than send.
+         */lockArmed: Bool, 
+        /**
+         * Elapsed recording time the shell last reported, for the on-screen pip.
+         */elapsedMs: UInt32) {
+        self.phase = phase
+        self.cancelArmed = cancelArmed
+        self.lockArmed = lockArmed
+        self.elapsedMs = elapsedMs
+    }
+}
+
+
+
+extension CoreVoiceCaptureState: Equatable, Hashable {
+    public static func ==(lhs: CoreVoiceCaptureState, rhs: CoreVoiceCaptureState) -> Bool {
+        if lhs.phase != rhs.phase {
+            return false
+        }
+        if lhs.cancelArmed != rhs.cancelArmed {
+            return false
+        }
+        if lhs.lockArmed != rhs.lockArmed {
+            return false
+        }
+        if lhs.elapsedMs != rhs.elapsedMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(phase)
+        hasher.combine(cancelArmed)
+        hasher.combine(lockArmed)
+        hasher.combine(elapsedMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreVoiceCaptureState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreVoiceCaptureState {
+        return
+            try CoreVoiceCaptureState(
+                phase: FfiConverterTypeVoiceCapturePhase.read(from: &buf), 
+                cancelArmed: FfiConverterBool.read(from: &buf), 
+                lockArmed: FfiConverterBool.read(from: &buf), 
+                elapsedMs: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreVoiceCaptureState, into buf: inout [UInt8]) {
+        FfiConverterTypeVoiceCapturePhase.write(value.phase, into: &buf)
+        FfiConverterBool.write(value.cancelArmed, into: &buf)
+        FfiConverterBool.write(value.lockArmed, into: &buf)
+        FfiConverterUInt32.write(value.elapsedMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCaptureState_lift(_ buf: RustBuffer) throws -> CoreVoiceCaptureState {
+    return try FfiConverterTypeCoreVoiceCaptureState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCaptureState_lower(_ value: CoreVoiceCaptureState) -> RustBuffer {
+    return FfiConverterTypeCoreVoiceCaptureState.lower(value)
+}
+
+
+/**
+ * A reduced state plus the side effect it asks the shell to perform.
+ */
+public struct CoreVoiceCaptureStep {
+    public var state: CoreVoiceCaptureState
+    public var effect: VoiceCaptureEffect
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: CoreVoiceCaptureState, effect: VoiceCaptureEffect) {
+        self.state = state
+        self.effect = effect
+    }
+}
+
+
+
+extension CoreVoiceCaptureStep: Equatable, Hashable {
+    public static func ==(lhs: CoreVoiceCaptureStep, rhs: CoreVoiceCaptureStep) -> Bool {
+        if lhs.state != rhs.state {
+            return false
+        }
+        if lhs.effect != rhs.effect {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(state)
+        hasher.combine(effect)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreVoiceCaptureStep: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreVoiceCaptureStep {
+        return
+            try CoreVoiceCaptureStep(
+                state: FfiConverterTypeCoreVoiceCaptureState.read(from: &buf), 
+                effect: FfiConverterTypeVoiceCaptureEffect.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreVoiceCaptureStep, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreVoiceCaptureState.write(value.state, into: &buf)
+        FfiConverterTypeVoiceCaptureEffect.write(value.effect, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCaptureStep_lift(_ buf: RustBuffer) throws -> CoreVoiceCaptureStep {
+    return try FfiConverterTypeCoreVoiceCaptureStep.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreVoiceCaptureStep_lower(_ value: CoreVoiceCaptureStep) -> RustBuffer {
+    return FfiConverterTypeCoreVoiceCaptureStep.lower(value)
+}
+
+
+/**
  * One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
  * messages in this chat contiguously through `through_lamport`."
  */
@@ -25368,6 +25692,192 @@ extension RelayMailboxWalkAction: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What the shell must do as a result of the last gesture event.
+ */
+
+public enum VoiceCaptureEffect {
+    
+    /**
+     * Nothing to do beyond re-rendering the state.
+     */
+    case none
+    /**
+     * Start the recorder.
+     */
+    case start
+    /**
+     * Stop the recorder and send what was captured.
+     */
+    case send
+    /**
+     * Stop the recorder and throw the audio away: too short to be speech.
+     */
+    case discardTooShort
+    /**
+     * Stop the recorder and throw the audio away: the user cancelled.
+     */
+    case discardCancelled
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVoiceCaptureEffect: FfiConverterRustBuffer {
+    typealias SwiftType = VoiceCaptureEffect
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VoiceCaptureEffect {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .start
+        
+        case 3: return .send
+        
+        case 4: return .discardTooShort
+        
+        case 5: return .discardCancelled
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: VoiceCaptureEffect, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .start:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .send:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .discardTooShort:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .discardCancelled:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVoiceCaptureEffect_lift(_ buf: RustBuffer) throws -> VoiceCaptureEffect {
+    return try FfiConverterTypeVoiceCaptureEffect.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVoiceCaptureEffect_lower(_ value: VoiceCaptureEffect) -> RustBuffer {
+    return FfiConverterTypeVoiceCaptureEffect.lower(value)
+}
+
+
+
+extension VoiceCaptureEffect: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where a hold-to-talk gesture currently stands.
+ */
+
+public enum VoiceCapturePhase {
+    
+    /**
+     * Not recording.
+     */
+    case idle
+    /**
+     * Recording while the finger is down.
+     */
+    case holding
+    /**
+     * Recording hands-free after a slide-up lock; the finger has let go.
+     */
+    case locked
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeVoiceCapturePhase: FfiConverterRustBuffer {
+    typealias SwiftType = VoiceCapturePhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> VoiceCapturePhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .idle
+        
+        case 2: return .holding
+        
+        case 3: return .locked
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: VoiceCapturePhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .idle:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .holding:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .locked:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVoiceCapturePhase_lift(_ buf: RustBuffer) throws -> VoiceCapturePhase {
+    return try FfiConverterTypeVoiceCapturePhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeVoiceCapturePhase_lower(_ value: VoiceCapturePhase) -> RustBuffer {
+    return FfiConverterTypeVoiceCapturePhase.lower(value)
+}
+
+
+
+extension VoiceCapturePhase: Equatable, Hashable {}
+
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -31210,6 +31720,133 @@ public func verifySharedFriendCard(shared: SharedFriendCard, sharerSignPk: Data,
     )
 })
 }
+/**
+ * Explicit cancel: the cancel control, a failed recorder, or leaving the chat.
+ */
+public func voiceCaptureCancel(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_cancel(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),$0
+    )
+})
+}
+/**
+ * Finger moved `dx`/`dy` from where it went down, in dp/points, screen
+ * coordinates (left and up are negative).
+ */
+public func voiceCaptureDrag(state: CoreVoiceCaptureState, dx: Float, dy: Float) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_drag(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),
+        FfiConverterFloat.lower(dx),
+        FfiConverterFloat.lower(dy),$0
+    )
+})
+}
+/**
+ * The shell's recording clock ticked. Reaching the duration bound sends what
+ * was said rather than failing — clip, don't fail.
+ */
+public func voiceCaptureElapsed(state: CoreVoiceCaptureState, elapsedMs: UInt32) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_elapsed(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),
+        FfiConverterUInt32.lower(elapsedMs),$0
+    )
+})
+}
+/**
+ * The hands-free "Stop and send" control.
+ */
+public func voiceCaptureFinish(state: CoreVoiceCaptureState, elapsedMs: UInt32) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_finish(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),
+        FfiConverterUInt32.lower(elapsedMs),$0
+    )
+})
+}
+public func voiceCaptureIdleState() -> CoreVoiceCaptureState {
+    return try!  FfiConverterTypeCoreVoiceCaptureState.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_idle_state($0
+    )
+})
+}
+/**
+ * The single source of truth for recorder configuration on both shells.
+ *
+ * The duration bound is *derived*, not asserted, so the two numbers cannot
+ * drift apart the way they did before this existed — Android and iOS both
+ * recorded 60 s at 32 kbps, which is 240 KB, and every recording past ~46 s
+ * was rejected as too large *after* the user had already spoken it.
+ *
+ * The arithmetic:
+ *
+ * ```text
+ * usable  = (cap - container_overhead) * (100 - headroom%) / 100
+ * = (184320 - 8192) * 90 / 100            = 158,515 bytes
+ * max_ms  = usable * 8 * 1000 / bitrate
+ * = 158515 * 8000 / 20000                 =  63,406 ms
+ * bound   = min(max_ms, ceiling)                  =  60,000 ms
+ * ```
+ *
+ * The ceiling binds, not the cap, which is the configuration we want: a
+ * full-length 60 s burst is ~158 KB of the 180 KiB budget. If the bitrate ever
+ * rises far enough for the cap to bind instead, the recording time shortens on
+ * its own and [`voice_duration_fits_attachment`] still holds.
+ */
+public func voiceCapturePlan() -> CoreVoiceCapturePlan {
+    return try!  FfiConverterTypeCoreVoiceCapturePlan.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_plan($0
+    )
+})
+}
+/**
+ * Finger down on the mic button.
+ */
+public func voiceCapturePress(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_press(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),$0
+    )
+})
+}
+/**
+ * Finger lifted. `elapsed_ms` is the true held duration, which may be shorter
+ * than any tick ever reported for a quick tap.
+ */
+public func voiceCaptureRelease(state: CoreVoiceCaptureState, elapsedMs: UInt32) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_release(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),
+        FfiConverterUInt32.lower(elapsedMs),$0
+    )
+})
+}
+/**
+ * True when a recording of `duration_ms` is expected to fit one envelope.
+ */
+public func voiceDurationFitsAttachment(durationMs: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_duration_fits_attachment(
+        FfiConverterUInt32.lower(durationMs),$0
+    )
+})
+}
+/**
+ * Expected encoded size of a recording of `duration_ms`, container included.
+ *
+ * The shells use this to warn *before* recording rather than discovering the
+ * overflow afterwards; the post-encode size check stays as the real gate,
+ * because an encoder is free to ignore the bitrate we asked for.
+ */
+public func voiceEstimatedBlobBytes(durationMs: UInt32) -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_estimated_blob_bytes(
+        FfiConverterUInt32.lower(durationMs),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -31854,6 +32491,36 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_verify_shared_friend_card() != 27605) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_cancel() != 42180) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_drag() != 42242) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_elapsed() != 57789) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_finish() != 9039) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_idle_state() != 13858) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_plan() != 39091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_press() != 57222) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_release() != 25036) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_duration_fits_attachment() != 41587) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_voice_estimated_blob_bytes() != 49079) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {

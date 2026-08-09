@@ -68,7 +68,7 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         playback.toggle(blob: Data([1]))
 
         XCTAssertFalse(playback.isPlaying)
-        XCTAssertTrue(fake.stopped)
+        XCTAssertTrue(fake.paused)
     }
 
     func testDecoderFailureIsVisibleAfterPlaybackStarts() {
@@ -85,14 +85,70 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertFalse(playback.isPlaying)
         XCTAssertTrue(playback.playbackFailed)
     }
+
+    /// The bubble shows elapsed over total, so the total has to be the
+    /// decoder's, not the duration the sender claimed.
+    func testTotalComesFromTheDecoderAndElapsedTracksPlayback() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 12.5
+        var factoryCalls = 0
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in
+                factoryCalls += 1
+                return fake
+            },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(blob: Data([1]))
+
+        XCTAssertEqual(playback.total, 12.5)
+        XCTAssertEqual(playback.elapsed, 0)
+
+        // Pausing captures where the message got to, and resuming does not
+        // start it over.
+        fake.currentTime = 4
+        playback.toggle(blob: Data([1]))
+
+        XCTAssertFalse(playback.isPlaying)
+        XCTAssertEqual(playback.elapsed, 4)
+        XCTAssertEqual(factoryCalls, 1)
+
+        playback.toggle(blob: Data([1]))
+
+        XCTAssertTrue(playback.isPlaying)
+        XCTAssertEqual(factoryCalls, 1, "resuming must not decode the blob a second time")
+        XCTAssertEqual(fake.currentTime, 4, "resuming must not rewind")
+    }
+
+    func testStoppingClearsProgress() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 8
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(blob: Data([1]))
+        playback.stop()
+
+        XCTAssertEqual(playback.elapsed, 0)
+        XCTAssertEqual(playback.total, 0)
+        XCTAssertFalse(playback.isPlaying)
+    }
 }
 
 private final class FakeVoiceMemoAudioPlayer: VoiceMemoAudioPlaying {
     var onFinish: ((Bool) -> Void)?
     var canPrepare = true
     var canPlay = true
+    var currentTime: TimeInterval = 0
+    var duration: TimeInterval = 0
     private(set) var prepared = false
     private(set) var played = false
+    private(set) var paused = false
     private(set) var stopped = false
 
     func prepareToPlay() -> Bool {
@@ -103,6 +159,10 @@ private final class FakeVoiceMemoAudioPlayer: VoiceMemoAudioPlaying {
     func play() -> Bool {
         played = true
         return canPlay
+    }
+
+    func pause() {
+        paused = true
     }
 
     func stop() {

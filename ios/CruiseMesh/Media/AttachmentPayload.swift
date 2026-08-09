@@ -53,7 +53,7 @@ struct AttachmentPayload: Equatable {
             return payload.caption.isEmpty ? "📷 Photo" : "📷 \(payload.caption)"
         case .audio:
             let secs = max(1, Int((payload.durationMs + 500) / 1000))
-            return payload.caption.isEmpty ? "🎤 Voice memo (\(secs) s)" : "🎤 \(payload.caption)"
+            return payload.caption.isEmpty ? "🎤 Voice message (\(secs) s)" : "🎤 \(payload.caption)"
         }
     }
 

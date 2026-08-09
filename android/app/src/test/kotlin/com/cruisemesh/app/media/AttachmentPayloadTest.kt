@@ -66,7 +66,7 @@ class AttachmentPayloadTest {
             blob = byteArrayOf(1),
         )
         assertEquals("📷 Photo", AttachmentPayload.previewLabel(photo))
-        assertTrue(AttachmentPayload.previewLabel(voice).startsWith("🎤 Voice memo"))
+        assertTrue(AttachmentPayload.previewLabel(voice).startsWith("🎤 Voice message"))
         assertEquals(
             "📷 Photo",
             AttachmentPayload.previewLabelFromRaw(KIND_ATTACHMENT_MANIFEST, photo.encode()),

@@ -34,6 +34,7 @@ mod session;
 mod spray_policy;
 mod store;
 mod transport_policy;
+mod voice;
 
 pub use authoring::{AuthoredEnvelope, AuthoredGroupMetadataUpdate, AuthoredReceipt};
 pub use backup::{
@@ -241,4 +242,10 @@ pub use transport_policy::{
     CoreTransport, CoreTransportRoute, CARRIED_REWALK_MIN_INTERVAL_MS, DEFAULT_INITIAL_BACKOFF_MS,
     DEFAULT_LAN_HEALTH_MAX_TIMEOUTS, DEFAULT_LAN_HEALTH_TIMEOUT_MS, DEFAULT_MAX_BACKOFF_MS,
     DEFAULT_MAX_CONSECUTIVE_FAILURES, MAX_CONCURRENT_CARRIED_OFFERS,
+};
+pub use voice::{
+    voice_capture_cancel, voice_capture_drag, voice_capture_elapsed, voice_capture_finish,
+    voice_capture_idle_state, voice_capture_plan, voice_capture_press, voice_capture_release,
+    voice_duration_fits_attachment, voice_estimated_blob_bytes, CoreVoiceCapturePlan,
+    CoreVoiceCaptureState, CoreVoiceCaptureStep, VoiceCaptureEffect, VoiceCapturePhase,
 };

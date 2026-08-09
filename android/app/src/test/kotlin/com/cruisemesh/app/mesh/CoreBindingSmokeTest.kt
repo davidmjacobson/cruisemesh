@@ -28,6 +28,10 @@ import uniffi.cruisemesh_core.corePersonIsReachableNow
 import uniffi.cruisemesh_core.corePersonReach
 import uniffi.cruisemesh_core.coreRelayPassHealth
 import uniffi.cruisemesh_core.coreRelayRerunAction
+import uniffi.cruisemesh_core.voiceCaptureDrag
+import uniffi.cruisemesh_core.voiceCapturePlan
+import uniffi.cruisemesh_core.voiceCapturePress
+import uniffi.cruisemesh_core.voiceCaptureIdleState
 
 /**
  * The *shape* of the UniFFI boundary, not the policy behind it.
@@ -300,6 +304,21 @@ class CoreBindingSmokeTest {
     fun `an unsigned 64-bit value keeps its top bit across the boundary`() {
         val answer = coreFamilyRelayBackoffDelayMs(ULong.MAX_VALUE, 1u, 0uL)
         assertTrue("top bit lost: $answer", answer > Long.MAX_VALUE.toULong())
+    }
+
+    /**
+     * `Float` in both directions, and a record nested inside a record beside an
+     * enum. The voice-capture plan is the first exported surface here to carry
+     * a float at all, so this executes the lowering rather than trusting it.
+     */
+    @Test
+    fun `a float crosses the boundary and lands in a nested record`() {
+        val plan = voiceCapturePlan()
+        assertTrue("cancel threshold arrived as ${plan.cancelSlideDp}", plan.cancelSlideDp > 1f)
+
+        val holding = voiceCapturePress(voiceCaptureIdleState()).state
+        assertTrue(voiceCaptureDrag(holding, -(plan.cancelSlideDp + 1f), 0f).state.cancelArmed)
+        assertTrue(!voiceCaptureDrag(holding, -(plan.cancelSlideDp - 1f), 0f).state.cancelArmed)
     }
 
     private fun person(

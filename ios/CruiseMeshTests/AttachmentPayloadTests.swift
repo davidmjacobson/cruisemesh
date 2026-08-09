@@ -46,6 +46,6 @@ final class AttachmentPayloadTests: XCTestCase {
         let photo = AttachmentPayload(mediaType: .image, mimeType: "image/jpeg", durationMs: 0, blob: Data([1]))
         XCTAssertEqual(AttachmentPayload.previewLabel(photo), "📷 Photo")
         let voice = AttachmentPayload(mediaType: .audio, mimeType: "audio/mp4", durationMs: 4_200, blob: Data([1]))
-        XCTAssertTrue(AttachmentPayload.previewLabel(voice).hasPrefix("🎤 Voice memo"))
+        XCTAssertTrue(AttachmentPayload.previewLabel(voice).hasPrefix("🎤 Voice message"))
     }
 }

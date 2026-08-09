@@ -57,6 +57,14 @@ val ComposerSendIcon: ImageVector by lazy {
     )
 }
 
+/** Filled "pause" glyph (voice-message playback). */
+val ComposerPauseIcon: ImageVector by lazy {
+    materialIcon(
+        name = "ComposerPause",
+        pathData = "M6,19h4V5H6v14zM14,5v14h4V5h-4z",
+    )
+}
+
 /** Filled "reply" glyph (used by swipe-to-reply, T1). */
 val ReplyIcon: ImageVector by lazy {
     materialIcon(

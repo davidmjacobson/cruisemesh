@@ -92,7 +92,7 @@ data class AttachmentPayload(
             MediaType.IMAGE -> if (payload.caption.isNotBlank()) "📷 ${payload.caption}" else "📷 Photo"
             MediaType.AUDIO -> {
                 val secs = ((payload.durationMs + 500) / 1000).coerceAtLeast(1)
-                if (payload.caption.isNotBlank()) "🎤 ${payload.caption}" else "🎤 Voice memo ($secs s)"
+                if (payload.caption.isNotBlank()) "🎤 ${payload.caption}" else "🎤 Voice message ($secs s)"
             }
             null -> "Attachment"
         }
