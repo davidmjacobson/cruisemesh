@@ -1066,7 +1066,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 entries: gated.entries,
                 recentMsgIds: gated.recentMsgIds,
                 identity: identity,
-                gate: gate
+                gate: gate,
+                peerAuthenticated: gated.peerAuthenticated
             )
         }
         let drained = drainCarriedEnvelopesTo(
@@ -1088,15 +1089,26 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// is what `coreConfirmCarriedDeliveries` needs to retire carried rows the
     /// peer just proved it holds; discarding those leaves the rows in our carry
     /// store to be re-offered. #241 is what a stuck receipt watermark costs.
+    ///
+    /// `peerAuthenticated` is captured at ARRIVAL (CARRY-02) and replayed
+    /// unchanged so a BLE-sourced digest can never be treated as authenticated
+    /// merely because it is answered on a later-elected LAN link.
     private struct GatedDigest {
         let entries: [DigestEntry]
         let recentMsgIds: [Data]
+        let peerAuthenticated: Bool
     }
 
-    private func stashGatedDigest(peerUserId: Data, entries: [DigestEntry], recentMsgIds: [Data]) {
+    private func stashGatedDigest(
+        peerUserId: Data,
+        entries: [DigestEntry],
+        recentMsgIds: [Data],
+        peerAuthenticated: Bool
+    ) {
         gatedDigests[UserIdHex.encode(peerUserId)] = GatedDigest(
             entries: entries,
-            recentMsgIds: recentMsgIds
+            recentMsgIds: recentMsgIds,
+            peerAuthenticated: peerAuthenticated
         )
     }
 
@@ -1205,6 +1217,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.warning("Dropping DIGEST from \(address, privacy: .public)")
             return
         }
+        // CARRY-02: the authentication of a carried-delivery confirmation must
+        // bind to the transport the digest ARRIVED on, not the link we happen
+        // to answer on. It is captured here, at arrival, and carried unchanged
+        // through any stash and replay; deriving it later from the elected
+        // route would let a digest that arrived over unauthenticated Bluetooth
+        // be answered on a freshly-elected LAN link and have its advertised ids
+        // laundered into an authenticated removal. A `.lan` transport is filed
+        // only after a completed Noise handshake whose static key matched an
+        // accepted contact (`lan.onAuthenticated`); a Bluetooth link is not.
+        let peerAuthenticated = MeshRouter.transportFor(address: address) == .lan
         // Cadence gate (#280). This is the larger outbound half of the
         // exchange, so leaving it ungated would brake nothing. It is normally
         // allowed: our own just-sent digest opened core's exchange window, and
@@ -1219,7 +1241,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.info("Holding the digest response for \(address, privacy: .public): retry in \(gate.retryAfterMs)ms")
             // Held, not discarded -- see `GatedDigest`. `resumeLogicalPeerSync`
             // replays it, which is what `rearmGatedSpray` schedules.
-            stashGatedDigest(peerUserId: peerUserId, entries: entries, recentMsgIds: recentMsgIds)
+            stashGatedDigest(
+                peerUserId: peerUserId,
+                entries: entries,
+                recentMsgIds: recentMsgIds,
+                peerAuthenticated: peerAuthenticated
+            )
             rearmGatedSpray(peerUserId: peerUserId, gate: gate)
             return
         }
@@ -1229,7 +1256,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             entries: entries,
             recentMsgIds: recentMsgIds,
             identity: identity,
-            gate: gate
+            gate: gate,
+            peerAuthenticated: peerAuthenticated
         )
     }
 
@@ -1240,13 +1268,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// `address` is passed rather than re-derived: on the replay path the
     /// elected route may have moved since the digest arrived, and what the peer
     /// told us about its own state is true whichever link we answer on.
+    ///
+    /// `peerAuthenticated` is likewise passed, not re-derived: it must reflect
+    /// the transport the digest ARRIVED on (CARRY-02), which on the replay path
+    /// may differ from `address`'s current transport.
     private func respondToDigest(
         address: String,
         peerUserId: Data,
         entries: [DigestEntry],
         recentMsgIds: [Data],
         identity: Identity,
-        gate: CoreSprayGate
+        gate: CoreSprayGate,
+        peerAuthenticated: Bool
     ) {
         // Everything queued here that is not part of the spray plan -- the
         // receipt repair pass, the per-missing-message re-send loop and the
@@ -1308,7 +1341,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             peerUserId: peerUserId,
             peerKnownIds: recentMsgIds,
             identity: identity,
-            gate: gate
+            gate: gate,
+            peerAuthenticated: peerAuthenticated
         )
     }
 
@@ -3218,7 +3252,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         peerUserId: Data,
         peerKnownIds: [Data],
         identity: Identity,
-        gate: CoreSprayGate
+        gate: CoreSprayGate,
+        peerAuthenticated: Bool
     ) {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery of
@@ -3226,9 +3261,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // has BEFORE building the spray plan below, so a just-confirmed
         // carried envelope isn't immediately re-sprayed back at the peer who
         // just told us they have it.
+        //
+        // CARRY-02: durable removal of a carried row is only permitted when the
+        // peer identity is authenticated. `peerAuthenticated` is passed in, not
+        // re-derived from `address`, because it must reflect the transport the
+        // digest ARRIVED on -- a `.lan` transport filed only after a completed
+        // Noise handshake whose static key matched an accepted contact
+        // (`lan.onAuthenticated`) -- and NOT the link this response is answered
+        // on. On the gated-then-replayed path the elected route may have moved
+        // to LAN since a Bluetooth digest arrived; re-deriving here would
+        // launder that digest's unsigned, spoofable userId and advertised
+        // msg_ids into an authenticated removal. For an unauthenticated peer
+        // this call deletes nothing and only lets the spray plan skip the ids
+        // the peer named for this one encounter.
         if let confirmed = try? store.coreConfirmCarriedDeliveries(
             peerUserId: peerUserId,
             peerKnownMsgIds: peerKnownIds,
+            peerAuthenticated: peerAuthenticated,
             nowMs: now
         ), confirmed > 0 {
             log.info("Confirmed delivery of \(confirmed) carried envelope(s) to \(UserIdHex.encode(peerUserId), privacy: .public); dropped our copy")

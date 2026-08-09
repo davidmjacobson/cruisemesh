@@ -2211,6 +2211,7 @@ internal class InboundEnvelopeProcessor(
         peerKnownMsgIds: List<ByteArray>,
         identity: Identity,
         gate: CoreSprayGate,
+        peerAuthenticated: Boolean,
     ) {
         val now = System.currentTimeMillis()
         var carriedReservation: CarriedOfferEpochGate.Reservation? = null
@@ -2220,7 +2221,26 @@ internal class InboundEnvelopeProcessor(
             // already has BEFORE building the spray plan below, so a
             // just-confirmed carried envelope isn't immediately re-sprayed
             // back at the peer who just told us they have it.
-            val confirmed = store.coreConfirmCarriedDeliveries(peerUserId, peerKnownMsgIds, now)
+            //
+            // CARRY-02: durable removal of a carried row is only permitted when
+            // the peer identity is authenticated. [peerAuthenticated] is passed
+            // in, not re-derived from [address], because it must reflect the
+            // transport the digest ARRIVED on -- a LAN link registered only
+            // after a completed Noise handshake whose static key matched an
+            // accepted contact ([MeshService.onLanPeerAuthenticated]) -- and NOT
+            // the link this response is answered on. On the gated-then-replayed
+            // path the elected route may have moved to LAN since a BLE digest
+            // arrived; re-deriving here would launder that BLE digest's unsigned,
+            // spoofable userId and advertised msg_ids into an authenticated
+            // removal. For an unauthenticated peer this call deletes nothing and
+            // only leaves the spray plan to skip the ids the peer named for this
+            // one encounter.
+            val confirmed = store.coreConfirmCarriedDeliveries(
+                peerUserId,
+                peerKnownMsgIds,
+                peerAuthenticated,
+                now,
+            )
             if (confirmed > 0uL) {
                 Log.i(TAG, "Confirmed delivery of $confirmed carried envelope(s) to ${UserIdHex.encode(peerUserId)}; dropped our copy")
                 // Hard evidence that sprays to this peer are landing: it just

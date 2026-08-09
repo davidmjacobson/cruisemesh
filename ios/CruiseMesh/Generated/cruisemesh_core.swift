@@ -3755,9 +3755,32 @@ public protocol MessageStoreProtocol : AnyObject {
      * [`Self::carried_envelopes_for_hints`] already excludes anything past
      * its own `expiry` as of `now_ms`.
      *
+     * **Authenticated-peer gate (CARRY-02).** Removing a carried row is a
+     * destructive, irreversible action: for multi-hop-muled 1:1 mail this
+     * device may hold the *sole* remaining copy, so a wrongful removal is a
+     * silent, targeted denial of delivery. It may therefore be driven only
+     * by an *authenticated* peer identity. `peer_authenticated` must be
+     * `true` only when the `peer_user_id`/`peer_known_msg_ids` pair came from
+     * a cryptographically bound source: a Noise-authenticated LAN session
+     * whose static key matched an accepted contact (`lan_session.rs`), or a
+     * signed delivery receipt. It must be `false` for anything a peer merely
+     * *claimed* -- above all a bare BLE HELLO/DIGEST, which is unauthenticated
+     * cleartext link chatter (`protocol.rs`): the `user_id` it names and the
+     * `msg_id`s it advertises are unsigned and trivially spoofable, so a
+     * forged HELLO claiming a victim's `user_id` plus an observed `msg_id`
+     * must never be able to make a mule delete that victim's mail.
+     *
+     * When `peer_authenticated` is `false` this call removes nothing and
+     * returns 0. That is not a lost suppression: an unauthenticated peer's
+     * advertised ids are still honoured *ephemerally* for the encounter by
+     * [`Self::core_digest_spray_plan`], which excludes `peer_known_msg_ids`
+     * from what it offers -- so a lying peer can at most decline the mail it
+     * falsely claims to hold, never destroy this device's durable copy of it.
+     * Only an authenticated confirm retires (removes) a carried row.
+     *
      * Returns the number of carried envelopes removed, for caller logging.
      */
-    func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], nowMs: Int64) throws  -> UInt64
+    func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], peerAuthenticated: Bool, nowMs: Int64) throws  -> UInt64
     
     /**
      * Build the exact `recent_msg_id` list this device advertises in its
@@ -3873,9 +3896,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * 60s poll pass instead of waiting out the full expiry window.
      *
      * Per item:
-     * - [`CoreInboundDisposition::Consumed`] or
-     * [`CoreInboundDisposition::Expired`]: ack (same as
-     * [`core_relay_ack_ids`]).
+     * - [`CoreInboundDisposition::Consumed`]: ack (same as
+     * [`core_relay_ack_ids`]). [`CoreInboundDisposition::Expired`] does
+     * NOT ack (ACK-02): expiry is computed from the client clock and is no
+     * proof this device consumed anything, so a skewed clock must not be
+     * able to delete a shared row for everyone; `relayd` prunes truly-dead
+     * rows by its own server clock instead.
      * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
      * the durable fallback until the real recipient (or another proxy)
      * fetches it.
@@ -3909,8 +3935,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * of this device's imported groups' recent-day hints names a legacy
      * shared-mailbox row that EVERY member fetches -- so it is never acked
      * (not even on `Consumed`: this device is only one of several endpoint
-     * consumers), except when `Expired`, which is dead weight for every
-     * member alike. New-style group mail never trips this rule: per-member
+     * consumers). Since ACK-02 there is no `Expired` escape from this rule
+     * either: expiry never acks, so a legacy row is only ever deleted by
+     * `relayd`'s server-clock prune, which is correct for every member at
+     * once. New-style group mail never trips this rule: per-member
      * fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
      * OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
      * is correct precisely because each row has exactly one reader. Legacy
@@ -6110,13 +6138,37 @@ open func contactRelayEpoch(userId: Data)throws  -> Int64 {
      * [`Self::carried_envelopes_for_hints`] already excludes anything past
      * its own `expiry` as of `now_ms`.
      *
+     * **Authenticated-peer gate (CARRY-02).** Removing a carried row is a
+     * destructive, irreversible action: for multi-hop-muled 1:1 mail this
+     * device may hold the *sole* remaining copy, so a wrongful removal is a
+     * silent, targeted denial of delivery. It may therefore be driven only
+     * by an *authenticated* peer identity. `peer_authenticated` must be
+     * `true` only when the `peer_user_id`/`peer_known_msg_ids` pair came from
+     * a cryptographically bound source: a Noise-authenticated LAN session
+     * whose static key matched an accepted contact (`lan_session.rs`), or a
+     * signed delivery receipt. It must be `false` for anything a peer merely
+     * *claimed* -- above all a bare BLE HELLO/DIGEST, which is unauthenticated
+     * cleartext link chatter (`protocol.rs`): the `user_id` it names and the
+     * `msg_id`s it advertises are unsigned and trivially spoofable, so a
+     * forged HELLO claiming a victim's `user_id` plus an observed `msg_id`
+     * must never be able to make a mule delete that victim's mail.
+     *
+     * When `peer_authenticated` is `false` this call removes nothing and
+     * returns 0. That is not a lost suppression: an unauthenticated peer's
+     * advertised ids are still honoured *ephemerally* for the encounter by
+     * [`Self::core_digest_spray_plan`], which excludes `peer_known_msg_ids`
+     * from what it offers -- so a lying peer can at most decline the mail it
+     * falsely claims to hold, never destroy this device's durable copy of it.
+     * Only an authenticated confirm retires (removes) a carried row.
+     *
      * Returns the number of carried envelopes removed, for caller logging.
      */
-open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], nowMs: Int64)throws  -> UInt64 {
+open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], peerAuthenticated: Bool, nowMs: Int64)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_confirm_carried_deliveries(self.uniffiClonePointer(),
         FfiConverterData.lower(peerUserId),
         FfiConverterSequenceData.lower(peerKnownMsgIds),
+        FfiConverterBool.lower(peerAuthenticated),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -6269,9 +6321,12 @@ open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint:
      * 60s poll pass instead of waiting out the full expiry window.
      *
      * Per item:
-     * - [`CoreInboundDisposition::Consumed`] or
-     * [`CoreInboundDisposition::Expired`]: ack (same as
-     * [`core_relay_ack_ids`]).
+     * - [`CoreInboundDisposition::Consumed`]: ack (same as
+     * [`core_relay_ack_ids`]). [`CoreInboundDisposition::Expired`] does
+     * NOT ack (ACK-02): expiry is computed from the client clock and is no
+     * proof this device consumed anything, so a skewed clock must not be
+     * able to delete a shared row for everyone; `relayd` prunes truly-dead
+     * rows by its own server clock instead.
      * - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
      * the durable fallback until the real recipient (or another proxy)
      * fetches it.
@@ -6305,8 +6360,10 @@ open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint:
      * of this device's imported groups' recent-day hints names a legacy
      * shared-mailbox row that EVERY member fetches -- so it is never acked
      * (not even on `Consumed`: this device is only one of several endpoint
-     * consumers), except when `Expired`, which is dead weight for every
-     * member alike. New-style group mail never trips this rule: per-member
+     * consumers). Since ACK-02 there is no `Expired` escape from this rule
+     * either: expiry never acks, so a legacy row is only ever deleted by
+     * `relayd`'s server-clock prune, which is correct for every member at
+     * once. New-style group mail never trips this rule: per-member
      * fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
      * OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
      * is correct precisely because each row has exactly one reader. Legacy
@@ -29506,9 +29563,8 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
  * (deleted from the relay mailbox) on the strength of the disposition
  * alone.
  *
- * Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
- * did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
- * of who it was for) are safe to remove this way. A `Rejected` envelope is
+ * [`CoreInboundDisposition::Consumed`] (it was ours to open, and we did) is
+ * the only disposition safe to remove this way. A `Rejected` envelope is
  * not ackable: its public header is invalid locally, but this device has not
  * proven it was the sealed payload's sole true endpoint consumer.
  * [`CoreInboundDisposition::Carried`] must NOT be acked: relay
@@ -29523,6 +29579,21 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
  * [`MessageStore::core_relay_ack_ids_with_consumed`] for the two narrow,
  * independently store-verified cases where a Seen copy is still safe to
  * ack -- this function alone can't tell, since it has no store access.
+ *
+ * **`Expired` is deliberately NOT ackable (ACK-02).** The `Expired`
+ * disposition is set by [`MessageStore::ingest_relay_page`] purely from the
+ * *client's* wall clock (`expiry_ms <= now_ms`), with no proof this device
+ * ever consumed the row. Acking it would let a single phone whose clock is
+ * fast or has jumped forward (a bad restore, a manual clock set, an NTP
+ * step) issue a server DELETE for still-live mail in a shared family
+ * mailbox, dropping it for every family member whose clock is correct. A
+ * server delete is irreversible; a client clock is not authority over it.
+ * Genuinely expired rows are still cleaned up -- `relayd` prunes by its own
+ * server clock (`relayd/src/lib.rs` `prune_expired_on`), which is the single
+ * authority for expiry-based deletion. Client expiry-acking was therefore
+ * redundant as well as unsafe. A row this device *both* expired *and*
+ * durably consumed still acks -- but on its `Consumed` disposition, not its
+ * expiry, so the durable-consumption proof is what authorizes the delete.
  *
  * A `Consumed` group envelope was historically ackable here even though
  * this device is only ONE of several endpoint consumers of the family's
@@ -32100,7 +32171,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 5043) {
+    if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 65218) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_spray_retry_arm_max_ms() != 63580) {
@@ -32853,7 +32924,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_relay_epoch() != 12666) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 38296) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 7270) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
@@ -32865,7 +32936,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 30982) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 44389) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 9888) {
