@@ -4984,8 +4984,26 @@ public protocol MessageStoreProtocol : AnyObject {
      * notices a hole still gets the envelope rebuilt by the digest responder.
      * See `crate::outbound_retirement` for the full predicate and its
      * reasoning.
+     *
+     * **A delivered receipt is also the sole author of
+     * [`PeerConnectionEventKind::MessageDelivered`]**, and only when it newly
+     * covers a message a person can actually see. Both shells used to record
+     * that event unconditionally on every delivered receipt, which made the
+     * Connection details screen say "Received your message yesterday" about
+     * contacts nobody had written to in days: the app authors hidden service
+     * messages (profile sync, the friend directory, LAN endpoint hints,
+     * relay-change notices) into the same lamport stream, and a cumulative
+     * receipt covers those too. The inbound direction has always been narrow
+     * this way; this is its twin. See
+     * [`receipt_newly_covers_visible_authored_message`].
+     *
+     * `received_at_ms` is when this receipt reached this device -- the moment
+     * the event is dated with. `None` means the caller has no arrival to date
+     * the evidence by, and then no connection event is recorded at all: a
+     * wrong timestamp on a screen whose entire content is timestamps is worse
+     * than a missing line.
      */
-    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
+    func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?, receivedAtMs: Int64?) throws 
     
     /**
      * V2 field metric: record that this device authored an outbound message
@@ -7910,14 +7928,33 @@ open func recordPeerConnectionEvent(userId: Data, transport: PeerConnectionTrans
      * notices a hole still gets the envelope rebuilt by the digest responder.
      * See `crate::outbound_retirement` for the full predicate and its
      * reasoning.
+     *
+     * **A delivered receipt is also the sole author of
+     * [`PeerConnectionEventKind::MessageDelivered`]**, and only when it newly
+     * covers a message a person can actually see. Both shells used to record
+     * that event unconditionally on every delivered receipt, which made the
+     * Connection details screen say "Received your message yesterday" about
+     * contacts nobody had written to in days: the app authors hidden service
+     * messages (profile sync, the friend directory, LAN endpoint hints,
+     * relay-change notices) into the same lamport stream, and a cumulative
+     * receipt covers those too. The inbound direction has always been narrow
+     * this way; this is its twin. See
+     * [`receipt_newly_covers_visible_authored_message`].
+     *
+     * `received_at_ms` is when this receipt reached this device -- the moment
+     * the event is dated with. `None` means the caller has no arrival to date
+     * the evidence by, and then no connection event is recorded at all: a
+     * wrong timestamp on a screen whose entire content is timestamps is worse
+     * than a missing line.
      */
-open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+open func recordReceipt(chatId: Data, senderUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?, receivedAtMs: Int64?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_receipt(self.uniffiClonePointer(),
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt8.lower(receiptType),
         FfiConverterUInt64.lower(throughLamport),
-        FfiConverterOptionUInt8.lower(viaTransport),$0
+        FfiConverterOptionUInt8.lower(viaTransport),
+        FfiConverterOptionInt64.lower(receivedAtMs),$0
     )
 }
 }
@@ -24046,11 +24083,18 @@ extension LanEndpointProvenance: Equatable, Hashable {}
  * getting them the wrong way round is a user-visible lie, since the
  * Connection details screen names them:
  * - [`PeerConnectionEventKind::MessageDelivered`]: a message *we sent* reached
- * *them*. Recorded when their delivery receipt comes back, so the peer named
- * on the event is the one who received our message.
+ * *them*. Recorded in [`MessageStore::record_receipt`], and only when their
+ * delivery receipt newly covers a genuinely visible message we authored --
+ * never for a receipt that merely acks profile sync, the friend directory,
+ * an endpoint hint or a relay-change notice, and never twice for the same
+ * proof. The peer named on the event is the one who received our message.
  * - [`PeerConnectionEventKind::MessageReceived`]: a message *they sent* reached
  * *us*. Recorded where a genuinely visible inbound chat message is stored,
  * never for receipts, profile sync, relay updates or any other hidden kind.
+ *
+ * Both directions ask the same question of a kind --
+ * [`crate::core_is_visible_chat_kind`] -- and each has exactly one recording
+ * site. Adding a second is how one of these starts lying.
  */
 
 public enum PeerConnectionEventKind {
@@ -31215,7 +31259,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_peer_connection_event() != 36800) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 9025) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_receipt() != 9377) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_sent_metric() != 27687) {
