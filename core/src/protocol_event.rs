@@ -336,6 +336,23 @@ impl ProtocolEventDraft {
         self
     }
 
+    /// Tag every record a relay pass emits with that pass's opaque id, so a
+    /// transcript can be read one pass at a time. Rejected rather than
+    /// truncated if it is not a short opaque token — [`sanitized_line`] would
+    /// refuse the record outright, and losing the whole event because an id
+    /// was malformed is worse than losing the id.
+    pub fn pass(mut self, pass: String) -> Self {
+        if is_opaque_id(&pass) {
+            self.pass = Some(pass);
+        }
+        self
+    }
+
+    pub fn action(mut self, action: i64) -> Self {
+        self.action = Some(action);
+        self
+    }
+
     pub fn invariants(mut self, ids: &[&'static str]) -> Self {
         self.invariants = ids.to_vec();
         self
@@ -584,7 +601,7 @@ pub fn is_stable_token(text: &str) -> bool {
 }
 
 /// Pass and session ids may also carry digits and hyphens (`p1`, `s-3`).
-fn is_opaque_id(text: &str) -> bool {
+pub(crate) fn is_opaque_id(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= 24
         && text.bytes().all(|byte| {

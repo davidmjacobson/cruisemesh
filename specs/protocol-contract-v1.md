@@ -53,14 +53,14 @@ of it: the gap is now countable.
 | `ENDPOINT-01` | A phone advertises only its own endpoint. A discovered or third-party address is never forwarded to anyone. | hoist-pending | receive-side scoping is core; hint authoring is shell-owned |
 | `SILENCE-01` | Contact silence advances only with same-pass proof that another relay answered; authoritative rejection does not require that proof. | core | `core/src/contact_relay_health.rs` silence tests; index re-asserts the delta rule |
 | `UI-01` | Delivery and via-transport claims require persisted arrival or receipt evidence, never a current-link guess. | core | `core/src/connection_health.rs` delivery tests; index re-asserts the queue-honesty gate |
-| `LIVE-01` | Every pass terminates inside its declared request, envelope, byte, and time/yield budgets. | unimplemented | package C0 (`CoreRelayPass` + replay runner) |
-| `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | unimplemented | package C0; walk-budget half is already core |
+| `LIVE-01` | Every pass terminates inside its declared request, envelope, byte, and time/yield budgets. | core | `core/src/session/relay_pass.rs` declares the budgets and carries them in every summary; `core/tests/relay_pass_replay.rs` drives a real pass against four hostile relays (endless mail, a cursor that never moves, silence, blanket rejection) and every incident fixture |
+| `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | core | `core/src/relay_cursor.rs` walk-budget yield plus `core/src/session/relay_pass.rs`, which can only emit a continuation carrying a `CoreRelayProgressReason`; `core/tests/relay_pass_replay.rs` gathers the continuations several passes produce and checks the rule across all of them |
 | `MARK-01` | A successfully relay-uploaded carried row is durably marked before the pass ends; the marker survives restart and suppresses repeat upload for its lifetime. | core | `core/src/store.rs` upload-marker tests; index re-asserts first-writer-wins |
 | `WM-01` | Receipt repair has a reachable, bounded path from every supported stored state; a peer watermark of zero cannot permanently gate repair. | hoist-pending | shell repair planners |
 | `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | core | `core/src/spray_policy.rs` owns cadence, identical-set suppression, the three per-encounter byte budgets, a per-link burst allowance, and the receipt-quiet backoff (#280); both shells consult it and hold no spray constant of their own |
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
-| `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | unimplemented | package C0 |
-| `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | unimplemented | package C0 |
+| `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | core | `CoreRelayPass::resume_http` compares `pass_id`/`action_id` against the single outstanding action; `core/tests/relay_pass_replay.rs` permutes duplicate, future-id, stale-id, wrong-pass, late-after-finish and cancellation against a clean run and requires an identical store |
+| `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | core | `MessageStore::ingest_relay_page` is one transaction that commits before it returns, and the action/result seam makes the boundary structural; `core/tests/relay_pass_replay.rs` kills a pass between the consume and its ack and relaunches |
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 
@@ -164,12 +164,26 @@ It terminates inside them. "Terminates eventually" is not the property; a
 pass that runs for minutes has already failed, because on a phone it is
 competing with a watchdog.
 
+The budgets are values, not comments: `CoreRelayPassBudgets` rides into a pass
+in its plan and back out in its summary, so a transcript proves the bound
+rather than a reader inferring it. The wall-clock half is measured from the
+times the driver reports, which is the correct division of labour — core
+cannot time out a socket it cannot see, so a pass whose driver has stopped
+answering is bounded by the driver's own timeout and by nothing here.
+
 #### `PROGRESS-01` — a continuation must buy something
 
 Rescheduling is permitted only when the reschedule strictly advances a
 frontier or work cursor, or strictly increases a future deadline or backoff.
 A continuation that leaves state unchanged is a livelock with good manners,
 and it is exactly what emptied batteries before #270.
+
+`CoreRelayPass` is deliberately stricter than the rule. A continuation exists
+only when the pass strictly advanced a cursor, durably ingested rows, or wrote
+an upload marker — or when it is deferring into a quiet window strictly later
+than the one in force when it began. A pass that did neither ends with no
+continuation at all, so an unchanged-state reschedule is unrepresentable
+rather than merely forbidden.
 
 #### `MARK-01` — upload once, and remember it across a reboot
 
@@ -262,6 +276,14 @@ names an action that is no longer outstanding performs no store mutation. It
 cannot double-apply, regress a cursor, or consume a carried row. It emits a
 stable diagnostic code and is otherwise inert.
 
+One action is outstanding at a time, which is what makes this one comparison
+rather than a per-lane problem: `CoreRelayPass::resume_http` checks the
+result's `pass_id` and `action_id` against the single action it is waiting
+for, and any mismatch restates that action unchanged, counts the result in
+`stale_results_ignored`, and emits `action_result_stale_ignored`. A count that
+keeps moving after the pass has finished is deliberate: a driver whose socket
+completed twenty minutes late deserves to appear in the summary.
+
 #### `TXN-01` — never hold a transaction across the network
 
 No store transaction spans HTTP, Bluetooth, LAN, a timer, or a platform
@@ -269,6 +291,16 @@ callback. Page ingestion and frontier advancement are deliberately two
 separate short transactions with the network ack between them, so a crash at
 any point replays safely: a consumed-but-unacked page re-presents and the
 frontier stays put.
+
+The action/result seam makes this structural rather than remembered. Every
+store call a pass makes happens between an action being emitted and the next
+being formed; the function that opened a transaction has returned before the
+driver is handed anything, so there is no shape in which one can be held
+across the wait. `MessageStore::ingest_relay_page` is the first transaction
+and `MessageStore::advance_relay_fetch_cursor` the second, and a failed ack
+runs the second one anyway — with `page_fully_processed` false, so it records
+`frontier_held` and moves nothing. Not-doing-it leaves no evidence; holding it
+explicitly does.
 
 #### `QUEUE-01` — a delivered message must be able to leave the queue
 
@@ -613,14 +645,17 @@ licenses lowering a frontier.
 
 ## 5. Ordered relay pass stages
 
-This is the deployed order, read from the Android engine and the iOS
-controller as they stand. Package C0 pins it as an explicit stage enum; until
-then it is documented here so a change is visible as a change.
+This is the order, and since package C0 it is an executable one:
+`CoreRelayStage` in `core/src/session/relay_pass.rs` is the enum, and
+`CoreRelayPass` walks it. The shells still run their own engines — C0 is dark,
+and C1–C5 migrate them — so until then this section describes two
+implementations that agree with the enum and, in three places, did not agree
+with each other.
 
-The two shells do not agree everywhere. Where they differ, this section states
-both and section 5.2 records the divergence as a row, because a contract that
-silently writes down one shell's behaviour hides exactly the change it exists
-to make visible.
+Where the shells differ, section 5.2 records the divergence as a row, because
+a contract that silently writes down one shell's behaviour hides exactly the
+change it exists to make visible. C0 owned three of those rows and decided
+them; the decisions and their reasons are in the table there.
 
 1. **Prune and repair local state.** Expire outbound envelopes, outgoing
    receipt envelopes, carried rows, and consumed-hidden records. Restore
@@ -636,12 +671,15 @@ to make visible.
    (`MARK-01`).
 6. **Decide hint-triggered rewalk.** If the hint source set changed, drop
    frontiers so the walks below start at zero.
-7. **For each eligible config: presence, and the mailbox page
-   walk/process/ack.** The two run in the opposite order on the two shells
-   today — iOS presence first, Android walk first — and they treat a presence
-   failure differently as well. Neither ordering is written down anywhere as
-   deliberate. See 5.2; C0 has to choose one, migrate the other shell onto
-   it, and say so in the same PR.
+7. **For each eligible config: presence, then the mailbox page
+   walk/process/ack.** Presence first is now pinned (C0). The walk is the
+   budgeted, abortable, unbounded-input stage — it yields on
+   `relay_mailbox_walk_action`, a `429` cuts it short, and on a phone with a
+   deep mailbox it reaches its budget every pass — so a device that runs the
+   walk first never announces presence at all. Presence is one fixed-cost
+   request that has already happened before anything can consume the budget.
+   A presence failure is recorded against the config and does not skip the
+   walk. See 5.2.
 8. **Commit silence and rejection evidence and fold pass health.** Silence
    may only be committed now, because only now is it known whether this
    device's own mailbox answered (`SILENCE-01`).
@@ -652,7 +690,7 @@ to make visible.
 
 | Point | Trigger | Effect |
 |---|---|---|
-| **Family rate-limit abort** | first `429` on family work, any stage | Ends all remaining network stages of the pass. Records the quiet window. Not an error state for the person holding the phone. |
+| **Family rate-limit abort** | first `429` on family work, any stage | Ends all remaining network stages of the pass. Records the quiet window *at the refusal*, as a floor (5.2). Stage 8 still runs, because evidence gathered before the refusal is real. Not an error state for the person holding the phone. |
 | **Per-config fault** | a non-abort failure against one relay config | That config is skipped; remaining configs still run. A contact's stale credential must not stop this device polling its own mailbox. |
 | **Walk budget yield** | pages or envelopes for this pass exhausted | The walk stops mid-mailbox, records its resume position, and requests a continuation. |
 | **No configs** | no own pass and no contact endpoint | Pass ends immediately in a no-config state. |
@@ -674,17 +712,24 @@ finding another one is a finding, not a failure.
 
 | Divergence | Android today | iOS today | Whose choice |
 |---|---|---|---|
-| Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | C0 pins one in the stage enum and migrates the other shell in the same PR |
-| What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | C0, with the same stage enum |
-| When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | C0, when the pass owns its own abort; both are floors, but only Android's survives a pass that ends abnormally |
+| Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | **C0 — resolved toward iOS, which is also the order the plan pinned.** The walk is the budgeted, abortable stage; presence sits behind it under Android's order and is therefore never reached on a device whose walk exhausts its budget every pass, which is exactly the device whose presence matters. Presence is one fixed-cost request. Cost of the change: one extra round trip of latency before the first fetch on a shallow mailbox, paid only by devices for which the walk was never the constraint. C1/C2 migrate Android |
+| What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | **C0 — resolved toward iOS.** `SILENCE-01` needs same-pass evidence, and a swallowed failure destroys it: a config whose presence failed and whose walk then succeeded is *not* silent, and one where both failed is stronger evidence than the walk alone, but swallowing made the two indistinguishable. Recording never skips the walk on either reading. C1/C2 migrate Android |
+| When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | **C0 — resolved toward Android.** The deciding case is a pass that ends abnormally. iOS's window exists only in memory until the pass completes, so a pass killed after its `429` leaves no window and the next launch walks straight back into the rate limit — the shape of #222. Committing at the refusal also makes the window a floor a later, shorter one cannot lower, which is what `RATE-01` says it is. `CoreRelayPassSummary::quiet_until_ms` is therefore set the moment the refusal is seen, and `cancel` reports it. C1/C2 migrate iOS |
 | Where the pending-rerun decision is made | explicit at the rerun point (`relayRerunAction`), which re-arms the coalesced retry timer for the remaining window | implicit: the pending nudge re-enters the front door, which drops it, and the retry armed when the 429 was recorded is what actually fires | B0 — resolved toward Android: both shells now call `core_relay_rerun_action` at the rerun point, so the deferral is a decision rather than a side effect of two gates agreeing |
 | What seeds the anti-lockstep jitter | `ByteArray.contentHashCode()` — `java.util.Arrays.hashCode`, a 31-multiply over the user id | a hand-written FNV-1a over the user id, added because Swift's `hashValue` is process-randomized | B0 — resolved: neither. Core derives it from the public user id under a BLAKE2b context, and no shell computes a hash for this any more |
 
-The first two are not known to be load-bearing, which is the point: an
-undocumented difference cannot be reasoned about, and a migration that quietly
-changes Android's deployed ordering to match a written stage enum would
-otherwise land with no invariant, no fixture, and no row saying it was ever
-different.
+The first two were not known to be load-bearing when they were written down,
+and that was the point of writing them down: an undocumented difference cannot
+be reasoned about, and a migration that quietly changed Android's deployed
+ordering to match a written stage enum would otherwise have landed with no
+invariant, no fixture and no row saying it was ever different. Having to argue
+each one out is what turned the first into a liveness question and the second
+into a `SILENCE-01` question. Neither answer was obvious from the code.
+
+All three resolutions are *decisions in core only* at this revision. C0 is
+dark: no production path on either shell reaches `CoreRelayPass`, so nothing a
+person is running has changed. The rows stay here rather than being deleted,
+because the value of this table is that it records that a difference existed.
 
 The jitter row was load-bearing in a small way and worth stating plainly. The
 offset's *purpose* is that two phones in one family draw different values; two
@@ -706,9 +751,9 @@ fixtures, simulation and decision-shadow transcripts, and the redacted
 archive a person exports from Advanced diagnostics — so an exported archive
 is accepted by the replay command with no conversion step.
 
-At this revision the validator enforces schema, redaction, ordering, and
-declared invariant ids. Behaviour execution arrives with the replay runner in
-package C0.
+The validator enforces schema, redaction, ordering, and declared invariant
+ids. Since package C0 the relay-shaped fixtures are also **executed**: see 6.6
+for what that means and for which two are not.
 
 ### 6.1 Header record
 
@@ -788,19 +833,55 @@ bytes.
 
 ### 6.5 Named incident fixtures
 
-| Fixture | Incident | Declares |
-|---|---|---|
-| `sweep-livelock.jsonl` | a sweep that rescheduled forever without advancing (#270) | `PROGRESS-01`, `LIVE-01`, `CURSOR-01` |
-| `carry-storm.jsonl` | carried rows re-uploaded every launch for want of a marker (#222) | `MARK-01`, `CARRY-01`, `LIVE-01` |
-| `watermark-lock.jsonl` | receipt repair self-gated at a zero watermark (#241) | `WM-01`, `PROGRESS-01` |
-| `watchdog-spray.jsonl` | carried-first spray large enough to trip a watchdog (#280) | `SPRAY-01`, `LIVE-01` |
-| `429-mid-receipts.jsonl` | a family rate limit arriving mid-upload (#260, #261) | `RATE-01`, `LIVE-01` |
-| `short-page.jsonl` | a server-clamped page mistaken for EOF | `PAGE-01`, `CURSOR-01` |
-| `ack-fail-after-consume.jsonl` | durable consume, then a failed ack, then a restart | `TXN-01`, `CURSOR-01`, `IDEMP-01` |
-| `oversize-shrink.jsonl` | a page over the response cap, retried smaller | `PAGE-01`, `LIVE-01` |
-| `contact-silence-no-proof.jsonl` | a silent contact endpoint with no proof of own connectivity | `SILENCE-01` |
-| `pending-rerun-during-backoff.jsonl` | a pending nudge trying to start a pass inside the quiet window | `RATE-01`, `PROGRESS-01` |
-| `zombie-outbound-queue.jsonl` | an outbound queue that never retires anything (#283) | `QUEUE-01`, `LIVE-01` |
+| Fixture | Incident | Declares | Executed |
+|---|---|---|---|
+| `sweep-livelock.jsonl` | a sweep that rescheduled forever without advancing (#270) | `PROGRESS-01`, `LIVE-01`, `CURSOR-01` | yes |
+| `carry-storm.jsonl` | carried rows re-uploaded every launch for want of a marker (#222) | `MARK-01`, `CARRY-01`, `LIVE-01` | yes |
+| `watermark-lock.jsonl` | receipt repair self-gated at a zero watermark (#241) | `WM-01`, `PROGRESS-01` | no — package D2 |
+| `watchdog-spray.jsonl` | carried-first spray large enough to trip a watchdog (#280) | `SPRAY-01`, `LIVE-01` | no — package D2 |
+| `429-mid-receipts.jsonl` | a family rate limit arriving mid-upload (#260, #261) | `RATE-01`, `LIVE-01` | yes |
+| `short-page.jsonl` | a server-clamped page mistaken for EOF | `PAGE-01`, `CURSOR-01` | yes |
+| `ack-fail-after-consume.jsonl` | durable consume, then a failed ack, then a restart | `TXN-01`, `CURSOR-01`, `IDEMP-01` | yes |
+| `oversize-shrink.jsonl` | a page over the response cap, retried smaller | `PAGE-01`, `LIVE-01` | yes |
+| `contact-silence-no-proof.jsonl` | a silent contact endpoint with no proof of own connectivity | `SILENCE-01` | yes |
+| `pending-rerun-during-backoff.jsonl` | a pending nudge trying to start a pass inside the quiet window | `RATE-01`, `PROGRESS-01` | yes |
+| `zombie-outbound-queue.jsonl` | an outbound queue that never retires anything (#283) | `QUEUE-01`, `LIVE-01` | yes |
+
+### 6.6 What "executed" means, and what it deliberately does not mean
+
+`core/tests/relay_pass_replay.rs` is the runner. For an executed fixture it
+builds the scenario the fixture's title describes in a temporary
+`MessageStore`, drives a real `CoreRelayPass` through it against a fake clock
+and a scripted driver, and asserts the end state, the work counts, and that
+every invariant the fixture declares held — in particular that the session
+emitted no `invariant_violation` naming one of them.
+
+It does **not** replay the fixture's event stream and require the session to
+reproduce it, and that distinction is the whole point rather than a shortcut.
+Most of this corpus is a transcript of a *bug*: `carry-storm`,
+`sweep-livelock`, `watchdog-spray`, `watermark-lock` and
+`zombie-outbound-queue` all contain `invariant_violation` records. A session
+that reproduced them would be the incident happening again. So the fixture
+stays the readable record of what went wrong and the index of which
+invariants the scenario is about; the scenario is the executable proof that it
+does not happen here. Outcome tokens and counts in a fixture are therefore not
+a golden trace, and a session emitting different ones for the same scenario is
+not by itself a disagreement.
+
+Two fixtures are mesh-shaped and a relay pass cannot drive them at all: there
+is no encounter, no peer link and no receipt-repair planner in one.
+`watchdog-spray` and `watermark-lock` stay validate-only and are named to
+package D2 (`mesh_meet`) in the runner's own scope list, which a test checks
+against the fixture directory so a new fixture cannot be added without a
+decision about whether it executes.
+
+One fixture was corrected in the same commit as the runner, with the reason
+recorded here because the plan requires it: `oversize-shrink` claimed a
+256-row page was retried at 64 rows. `relay_fetch_shrunk_limit` halves, so the
+retry is 128 and a second refusal is what reaches 64. The fixture had invented
+a shrink step core's own rule does not produce, and it also carried a
+`budget_yield` for a pass that respected its byte budget rather than yielding
+on it. Both are fixed; the incident it describes is unchanged.
 
 ## 7. Event code table
 
@@ -820,12 +901,12 @@ than left to be discovered.
 
 | Code | What it records | Emitter today | Typical invariants |
 |---|---|---|---|
-| `action_emitted` | an external request was handed to a driver | none yet — package C0 | `LIVE-01`, `RATE-01` |
-| `action_result_accepted` | a driver's result was applied | none yet — package C0 | `IDEMP-01` |
-| `action_result_stale_ignored` | a duplicate, late or wrong-pass result changed nothing | none yet — package C0 | `IDEMP-01` |
-| `budget_yield` | a pass stopped inside a declared budget rather than at the end of its work | none yet — package C0 | `LIVE-01`, `PROGRESS-01` |
-| `carried_row_marked` | a relay-uploaded carried row was durably marked | none yet — package C3 | `MARK-01`, `CARRY-01` |
-| `continuation_scheduled` | a pass scheduled more work, with its progress reason | none yet — package C0 | `PROGRESS-01` |
+| `action_emitted` | an external request was handed to a driver | `session/relay_pass.rs` (dark) | `LIVE-01`, `RATE-01` |
+| `action_result_accepted` | a driver's result was applied | `session/relay_pass.rs` (dark) | `IDEMP-01` |
+| `action_result_stale_ignored` | a duplicate, late or wrong-pass result changed nothing | `session/relay_pass.rs` (dark) | `IDEMP-01` |
+| `budget_yield` | a pass stopped inside a declared budget rather than at the end of its work | `session/relay_pass.rs` (dark) | `LIVE-01`, `PROGRESS-01` |
+| `carried_row_marked` | a relay-uploaded carried row was durably marked | `session/relay_pass.rs` (dark), for the announce-time wholesale clear; C3 adds the per-row record | `MARK-01`, `CARRY-01` |
+| `continuation_scheduled` | a pass scheduled more work, with its progress reason | `session/relay_pass.rs` (dark) | `PROGRESS-01` |
 | `endpoint_recovered` | a contact endpoint answered again and its streak cleared | `store.rs` `clear_contact_relay_unreachable` | `SILENCE-01` |
 | `endpoint_rested` | a no-answer streak reached the rest threshold | `store.rs` `note_contact_relay_unreachable` | `SILENCE-01` |
 | `frontier_advanced` | a mailbox frontier moved forward over a fully processed page | `store.rs` `advance_relay_fetch_cursor` | `CURSOR-01` |
@@ -835,14 +916,14 @@ than left to be discovered.
 | `outbound_queue_scanned` | the launch-time receipt-coverage sweep ran | `store.rs` `open` | `QUEUE-01` |
 | `outbound_row_retired` | proof of delivery removed queued rows | `store.rs` `record_receipt` | `QUEUE-01`, `CARRY-01` |
 | `outbound_row_superseded` | a newer generation of a snapshot kind replaced queued ones | `authoring.rs` `insert_authored_rows` | `QUEUE-01` |
-| `page_ingested` | a relay page was durably consumed | none yet — package C4 | `PAGE-01`, `TXN-01` |
-| `pass_finish` | a relay pass ended, with its work counts | none yet — package C0 | `LIVE-01` |
-| `pass_start` | a relay pass began, and why | none yet — package C0 | `LIVE-01` |
+| `page_ingested` | a relay page was durably consumed | `store.rs` `ingest_relay_page`, called by `session/relay_pass.rs` (dark) | `PAGE-01`, `TXN-01` |
+| `pass_finish` | a relay pass ended, with its work counts | `session/relay_pass.rs` (dark) | `LIVE-01` |
+| `pass_start` | a relay pass began, and why | `session/relay_pass.rs` (dark) | `LIVE-01` |
 | `rate_limit_abort` | a family 429 ended the pass's remaining network work | `store.rs` `note_relay_rate_limit_abort`, called by the shells until package B0 owns the decision | `RATE-01`, `LIVE-01` |
 | `receipt_watermark_observed` | a peer's receipt watermark was read during repair | none yet — package D2 | `WM-01` |
-| `request_rejected` | an endpoint answered authoritatively that it would not serve us | `store.rs` `note_contact_relay_rejected` | `SILENCE-01`, `RATE-01` |
+| `request_rejected` | an endpoint answered authoritatively that it would not serve us, or answered nothing at all | `store.rs` `note_contact_relay_rejected`; `session/relay_pass.rs` (dark) | `SILENCE-01`, `RATE-01` |
 | `shadow_mismatch` | a migration shadow planner disagreed with the live engine | none yet — package C1 | any |
-| `silence_observed` | contact silence advanced with same-pass proof | none yet — package C3 | `SILENCE-01` |
+| `silence_observed` | contact silence was weighed at the end of a pass, with or without same-pass proof | `session/relay_pass.rs` (dark) | `SILENCE-01` |
 | `spray_admitted` | a built spray plan went onto the radio | `spray_policy.rs` `admit_plan` | `SPRAY-01` |
 | `spray_budget_exhausted` | a link ran out of burst allowance — once per dry spell, not per reconnect | `spray_policy.rs` `may_spray` | `SPRAY-01`, `LIVE-01` |
 | `spray_deferred` | the receipt-quiet backoff took hold or deepened — on the crossing, not on every tick it holds | `spray_policy.rs` `may_spray` | `SPRAY-01` |
@@ -906,17 +987,23 @@ and clearing captured diagnostics clears it.
 checked-in fixture, a simulation transcript, or a diagnostics archive
 straight out of the zip — one format, no conversion step.
 
-At this revision it validates the schema — including the closed key set of
-6.4, so it is no weaker on a real archive than the corpus test is on a
-fixture — plus ordering and redaction, checks
-every declared invariant id against section 1, walks the transcript for the
-first place it contradicts itself (a pass that starts twice, one that keeps
-working after its own rate-limit abort or after finishing, a frontier that
-claims to advance without moving), and prints a redacted summary. It does
-**not** re-execute the decisions against a `MessageStore`. A clean run means
-"nothing in this file contradicts itself", not "this device behaved
-correctly". Behavioural replay lands with the core relay session in package
-C0, and until then `--help` says exactly this.
+It validates the schema — including the closed key set of 6.4, so it is no
+weaker on a real archive than the corpus test is on a fixture — plus ordering
+and redaction, checks every declared invariant id against section 1, walks the
+transcript for the first place it contradicts itself (a pass that starts
+twice, one that keeps working after its own rate-limit abort or after
+finishing, a frontier that claims to advance without moving), and prints a
+redacted summary.
+
+It does not re-execute an *arbitrary* archive against a store, and it is worth
+being exact about why that is not the same gap it was before C0. A field
+archive is a redacted record of decisions, not the inputs that produced them:
+it has no mailbox, no page bodies and no store to replay into. What executes
+is the checked-in scenario corpus, in `core/tests/relay_pass_replay.rs`, where
+the inputs exist. So a clean run of this command still means "nothing in this
+file contradicts itself" — and the behaviour those files describe is now
+separately proven by a suite that drives the real session. `--help` says
+exactly this.
 
 ## Appendix A — ownership inventory
 
@@ -934,13 +1021,13 @@ against the tree as it stands. Labels:
 | Concern | Android today | iOS today | Shared today | Label | Destination |
 |---|---|---|---|---|---|
 | Family request pacing and 429 backoff | `mesh/FamilyRelayBackpressure.kt` — delegating shim, no constants and no math | `Relay/FamilyRelayBackpressure.swift` — delegating shim, no constants and no math | `session/relay_policy.rs` owns the pacer, the exponential curve, its cap, the `Retry-After` floor and the stable identity jitter; `relay_status.rs` owns the header clamp and the classification | delete | done in B0; the shims survive only until B2's canary evidence permits deleting them |
-| Pending relay rerun | `mesh/RelayRerunPolicy.kt` — delegating shim | `finishRelaySync` in `MeshController.swift` calls core at the rerun point | `session/relay_policy.rs` owns `core_relay_rerun_action` | delete | done in B0; orchestration moves to `relay_pass.rs` in C0 |
+| Pending relay rerun | `mesh/RelayRerunPolicy.kt` — delegating shim | `finishRelaySync` in `MeshController.swift` calls core at the rerun point | `session/relay_policy.rs` owns `core_relay_rerun_action`; `session/relay_pass.rs` refuses to start inside a quiet window and reports when it ends — **core (dark)** | delete | done in B0; the orchestration half is in `relay_pass.rs` and switches on in C1/C2 |
 | Mailbox per-pass work/yield budget | none — `RelayMailboxWalkBudget.kt` was removed outright in #270; only the call-through `RelayMailboxWalkBudgetTest.kt` remains | none — `Relay/RelayMailboxWalk.swift` calls `relayMailboxWalkAction` directly and never had a local copy | `relay_cursor.rs` owns pages, envelopes, continuation delay (#270) | delete | already done in #270; nothing left to remove, and the Kotlin test stays as the guard that Android still reaches core |
-| Mailbox walk execution | `mesh/RelayMailboxWalker.kt` (#276) | `Relay/RelayMailboxWalk.swift` (#276) | walk action, sweep due, resume, frontier in `relay_cursor.rs` | hoist-now | `relay_pass.rs`; C4 |
-| Relay pass stage order | `mesh/RelaySyncEngine.kt` | `relaySyncBlocking` region of `MeshController.swift` | none — and the two shells already disagree inside stage 7, see 5.2 | hoist-now | `relay_pass.rs`; C0–C5, which must resolve the 5.2 rows explicitly rather than by picking whichever shell it reads first |
-| Relay HTTP execution and page-size cap | `relay/RelayClient.kt` | `Relay/RelayClient.swift` | codecs, caps and status classification in `relay_wire.rs` / `relay_status.rs` | hoist-now (semantics) / shell-forever (transport) | core request/response semantics, native execution; C0–C2 |
-| Sweep, frontier, ack, continuation | `RelaySyncEngine.kt` + `RelayMailboxWalker.kt` | `MeshController.swift` + `Relay/RelaySweepSession.swift` | `relay_cursor.rs` + `store.rs` helpers; frontier lowering is core (#279) | hoist-now | `relay_pass.rs` + a transactional store API; C4 |
-| Contact rejection / silence / rest | `mesh/ContactRelaySilence.kt` + engine | `ContactRelaySilence` in `RelaySweepSession.swift` + controller | `contact_relay_health.rs` + persisted store state | hoist-now | policy in B0, orchestration in C3/C4 |
+| Mailbox walk execution | `mesh/RelayMailboxWalker.kt` (#276) | `Relay/RelayMailboxWalk.swift` (#276) | walk action, sweep due, resume, frontier in `relay_cursor.rs`; the walk itself is in `session/relay_pass.rs` — **core (dark)** | hoist-now | `relay_pass.rs`; C4 |
+| Relay pass stage order | `mesh/RelaySyncEngine.kt` | `relaySyncBlocking` region of `MeshController.swift` | `session/relay_pass.rs` owns the order as `CoreRelayStage` — **core (dark)**, no shell call site — and the three 5.2 rows are decided there with reasons | hoist-now | `relay_pass.rs`; C1–C5 migrate the shells onto it and delete their copies |
+| Relay HTTP execution and page-size cap | `relay/RelayClient.kt` | `Relay/RelayClient.swift` | codecs, caps and status classification in `relay_wire.rs` / `relay_status.rs`; `session/relay_pass.rs` now forms complete requests (method, path, headers, body, declared max response bytes, and the response headers it wants back) and decodes the answers — **core (dark)** | hoist-now (semantics) / shell-forever (transport) | core request/response semantics, native execution; C1–C2 |
+| Sweep, frontier, ack, continuation | `RelaySyncEngine.kt` + `RelayMailboxWalker.kt` | `MeshController.swift` + `Relay/RelaySweepSession.swift` | `relay_cursor.rs` + `store.rs` helpers; frontier lowering is core (#279); `store.rs` `ingest_relay_page` is the transactional page ingest and `session/relay_pass.rs` orchestrates walk, ack, frontier and continuation — **core (dark)** | hoist-now | `relay_pass.rs` + the transactional store API; C4 makes the shells use it |
+| Contact rejection / silence / rest | `mesh/ContactRelaySilence.kt` + engine | `ContactRelaySilence` in `RelaySweepSession.swift` + controller | `contact_relay_health.rs` + persisted store state; the same-pass proof gate is stage 8 of `session/relay_pass.rs` — **core (dark)** | hoist-now | policy in B0, orchestration in C3/C4 |
 | Relay pass health fold | `mesh/RelayFaultPolicy.kt` — maps the core fold onto the shell's `RelayHealth` and adds the timestamp | `MeshConnectivityStatus.swift` — the same mapping | `session/relay_policy.rs` owns the worst-of fold and `CoreRelayPassHealth`; `relay_status.rs` owns the rank and the classification | presentation-only | done in B0; what is left on each shell is attaching a clock reading and choosing a display type, and D3 keeps it that way |
 | Connection and delivery health classification | consumes core (#281, #282) | consumes core (#281, #282) | `connection_health.rs` owns classification, per-recipient delivery, receipt-gated lines | presentation-only | stays core; shells render |
 | Failover resume debounce | `mesh/FailoverResumeDebounce.kt` — thin wrapper | equivalent wrapper | `transport_policy.rs` owns the window and coalescing (#269) | presentation-only | stays core; wrappers are adapters |
@@ -1019,6 +1106,21 @@ Recorded so a reader does not have to diff two documents:
 - Stage 7 is not one order. Android walks the mailbox and then syncs
   presence; iOS syncs presence and then walks. Section 5.2 carries this and
   the presence-failure difference beside it.
+- The relay pass itself is **core (dark)** as of package C0:
+  `core/src/session/relay_pass.rs` owns the stage order, request formation,
+  response decoding, response caps, store transactions, ack eligibility,
+  cursor advancement, silence evidence, budgets and continuation, behind the
+  one-action-at-a-time driver seam. Nothing on either shell reaches it — it is
+  exported over UniFFI so the C1/C2 adapters have a surface to compile
+  against, and its only caller in this repository is
+  `core/tests/relay_pass_replay.rs`. The Appendix A rows above say `core
+  (dark)` rather than `core` for exactly that reason: the decision has one
+  home, and the two shells are still running their own.
+- The three open 5.2 rows are **decided** (C0) and their reasons are recorded
+  in that table: presence before the walk, a presence failure recorded rather
+  than swallowed, and the quiet window committed at the refusal. C1/C2 migrate
+  the shells onto those decisions, so no deployed behaviour changed in the
+  package that made them.
 - Outbound queue retirement is **core** (#283) and never was split: neither
   shell held a copy of it, so `outbound_retirement.rs` had nothing to hoist,
   only a gap to fill. Both shells got the smaller queue with no code change,

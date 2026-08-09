@@ -114,9 +114,10 @@ use std::sync::{Mutex, MutexGuard};
 use crate::groups::{canonicalize_members, validate_group};
 use crate::limits::MAX_ENVELOPE_SEALED_BYTES;
 use crate::{
-    core_is_visible_chat_kind, verify_introduction_ticket, CoreError, FriendDirectoryContent,
-    Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
-    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
+    CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, FriendDirectoryContent, Group,
+    IntroductionTicket, RelayUpdateContent, SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST,
+    MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -6282,6 +6283,232 @@ impl MessageStore {
             .map_err(store_err)?;
         Ok(changed as u64)
     }
+
+    /// Durably ingest one fetched relay page inside **one** transaction, and
+    /// report what each row's disposition was.
+    ///
+    /// This is `TXN-01`'s first half as a store primitive. The transaction
+    /// opened here commits before this call returns, and therefore *before*
+    /// any ack request is constructed, let alone sent. The second short
+    /// transaction is the frontier advance
+    /// ([`MessageStore::advance_relay_fetch_cursor`]), which the caller
+    /// performs only after the ack succeeded. A crash anywhere between the two
+    /// leaves a consumed-but-unacked page that the relay re-presents and this
+    /// method re-ingests as nothing new, with the frontier still where it was.
+    ///
+    /// ## What "ingest" means at this revision, stated plainly
+    ///
+    /// Opening a sealed payload needs the device identity and the crypto path,
+    /// and moving that decision into core is package D0 (`mesh_receive`). So
+    /// the dispositions this method can honestly derive are the ones that need
+    /// no key:
+    ///
+    /// * `Expired` — the envelope's own public expiry has passed. Nothing is
+    ///   left to preserve, so it is ack-eligible.
+    /// * `Rejected` — the public header failed local validation (an
+    ///   impossible `hop_ttl`, an expiry outside the accepted window). Never
+    ///   acked: a header this device cannot accept is not proof it was the
+    ///   payload's endpoint consumer, so the server's copy survives for
+    ///   another client or another build. It is still a *terminal*
+    ///   disposition, and deliberately so — such a header will not become
+    ///   acceptable later, and holding the frontier on it would strand every
+    ///   row above it on every ordinary pass, forever.
+    /// * `Seen` — this device already has the envelope. Three routes reach
+    ///   it: a `messages` row, the consumed-hidden set, or the carry queue
+    ///   naming the same `msg_id`; and a fourth, narrower one — the carry
+    ///   queue's unique `content_digest` index refusing a row whose
+    ///   `(recipient_hint, sealed)` pair it already holds under a different
+    ///   `msg_id`, which is the same envelope arriving twice with two ids.
+    ///   None of those routes acks anything by itself: ack eligibility for a
+    ///   `Seen` row is [`MessageStore::core_relay_ack_ids_with_consumed`]'s
+    ///   question alone, and it asks for evidence naming *that* `msg_id`, so
+    ///   the digest-collision route cannot produce an ack.
+    /// * `Carried` — newly persisted as a relay-sourced carried row, so it is
+    ///   delivered over the mesh and never re-uploaded. Never acked
+    ///   (`ACK-01`): muling is not consuming.
+    ///
+    /// `Consumed` is deliberately absent. Until D0 lands, a row this device is
+    /// the true endpoint for is carried rather than opened, which costs a
+    /// re-fetch and never a deletion — the safe direction.
+    pub fn ingest_relay_page(
+        &self,
+        envelopes: Vec<CoreRelayFetchedEnvelope>,
+        now_ms: i64,
+    ) -> Result<CoreRelayPageIngest, CoreError> {
+        let mut ingest = CoreRelayPageIngest {
+            rows: Vec::with_capacity(envelopes.len()),
+            rows_returned: envelopes.len() as u32,
+            rows_ingested: 0,
+            rows_already_known: 0,
+            rows_expired: 0,
+            rows_rejected: 0,
+            fully_processed: true,
+        };
+        if envelopes.is_empty() {
+            return Ok(ingest);
+        }
+
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        for envelope in envelopes {
+            let carried = CarriedEnvelope {
+                msg_id: envelope.msg_id.clone(),
+                hop_ttl: envelope.hop_ttl,
+                expiry: envelope.expiry_ms,
+                recipient_hint: envelope.recipient_hint.clone(),
+                sealed: envelope.sealed.clone(),
+            };
+            let disposition = if envelope.expiry_ms <= now_ms {
+                ingest.rows_expired += 1;
+                CoreInboundDisposition::Expired
+            } else if validate_carried_envelope(&carried, now_ms).is_err() {
+                // A header this device cannot accept locally. Not stored and
+                // never acked, so the server's copy outlives us -- but still
+                // terminal, so the frontier moves past it. See the method
+                // doc: a header that is malformed now will be malformed on
+                // every future pass, and a frontier held on one would strand
+                // the whole mailbox above it.
+                ingest.rows_rejected += 1;
+                CoreInboundDisposition::Rejected
+            } else if relay_row_already_known(&tx, &envelope.msg_id)? {
+                ingest.rows_already_known += 1;
+                CoreInboundDisposition::Seen
+            } else {
+                let size = carried.sealed.len() as i64;
+                let digest = carried_content_digest(&carried.recipient_hint, &carried.sealed);
+                let inserted = tx
+                    .execute(
+                        "INSERT OR IGNORE INTO carried_envelopes
+                            (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                             received_at, size_bytes, from_relay, content_digest)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1, ?8)",
+                        params![
+                            carried.msg_id,
+                            carried.hop_ttl as i64,
+                            carried.expiry,
+                            carried.recipient_hint,
+                            carried.sealed,
+                            now_ms,
+                            size,
+                            digest,
+                        ],
+                    )
+                    .map_err(store_err)?;
+                if inserted > 0 {
+                    ingest.rows_ingested += 1;
+                    CoreInboundDisposition::Carried
+                } else {
+                    ingest.rows_already_known += 1;
+                    CoreInboundDisposition::Seen
+                }
+            };
+            ingest.rows.push(CoreRelayEnvelopeDisposition {
+                relay_id: envelope.id,
+                msg_id: envelope.msg_id,
+                disposition,
+                recipient_hint: envelope.recipient_hint,
+            });
+        }
+        if ingest.rows_ingested > 0 {
+            enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
+        }
+        tx.commit().map_err(store_err)?;
+
+        // Every row above reached a terminal disposition, so the page is fully
+        // processed; the flag exists because a future ingest (D0) can fail to
+        // store a row it opened, and `CURSOR-01` then has to hold the frontier.
+        ingest.fully_processed = ingest
+            .rows
+            .iter()
+            .all(|row| row.disposition != CoreInboundDisposition::Failed);
+
+        {
+            let conn: &Connection = &conn;
+            crate::protocol_event::note(
+                conn,
+                &[crate::protocol_event::ProtocolEventDraft::new(
+                    crate::protocol_event::ProtocolEventCode::PageIngested,
+                    now_ms,
+                    if ingest.rows_ingested > 0 {
+                        "page_consumed_before_any_ack"
+                    } else {
+                        "replay_applied_nothing"
+                    },
+                )
+                .invariants(&["PAGE-01", "TXN-01", "IDEMP-01"])
+                .count("rows_returned", i64::from(ingest.rows_returned))
+                .count("rows_ingested", i64::from(ingest.rows_ingested))
+                .count("rows_already_known", i64::from(ingest.rows_already_known))
+                .count("rows_expired", i64::from(ingest.rows_expired))
+                .count("transactions", 1)],
+            );
+        }
+        Ok(ingest)
+    }
+}
+
+/// Does a durable local record already name this envelope?
+///
+/// Three places count, and they are the three places a `msg_id` can be
+/// remembered: a stored message, the consumed-hidden set for kinds that leave
+/// no message row, and the carry queue itself. Anything found here is `Seen` —
+/// which says only "I recognise this", never "I consumed it". Whether a `Seen`
+/// row may be acked is [`MessageStore::core_relay_ack_ids_with_consumed`]'s
+/// question alone.
+fn relay_row_already_known(tx: &Transaction<'_>, msg_id: &[u8]) -> Result<bool, CoreError> {
+    let known: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM messages WHERE msg_id = ?1
+             UNION ALL SELECT 1 FROM consumed_hidden_msg_ids WHERE msg_id = ?1
+             UNION ALL SELECT 1 FROM carried_envelopes WHERE msg_id = ?1
+             LIMIT 1",
+            params![msg_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?;
+    Ok(known.is_some())
+}
+
+impl MessageStore {
+    /// Emit protocol events from a core decision point that holds no
+    /// connection of its own — today that is `session::relay_pass`.
+    ///
+    /// Best-effort by construction, like every other operational emit: a
+    /// diagnostics record is never allowed to be the reason a relay pass
+    /// fails. See `crate::protocol_event::note`.
+    pub(crate) fn note_protocol_events(
+        &self,
+        drafts: &[crate::protocol_event::ProtocolEventDraft],
+    ) {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::note(&conn, drafts);
+    }
+
+    /// The archive-local pseudonym for one raw identifier, or `None` if the
+    /// ring could not allocate one. Callers that cannot name an actor emit
+    /// without one rather than failing.
+    pub(crate) fn protocol_pseudonym(&self, kind: &'static str, raw: &[u8]) -> Option<String> {
+        let conn = lock_conn(&self.conn);
+        crate::protocol_event::actor_pseudonym(&conn, kind, raw).ok()
+    }
+}
+
+/// One ingested relay page: what happened to each row, and the counts a
+/// transcript and a summary report.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreRelayPageIngest {
+    pub rows: Vec<CoreRelayEnvelopeDisposition>,
+    pub rows_returned: u32,
+    /// Rows newly persisted by this call. Zero on a replay of a page already
+    /// ingested, which is what makes the ingest idempotent (`IDEMP-01`).
+    pub rows_ingested: u32,
+    pub rows_already_known: u32,
+    pub rows_expired: u32,
+    pub rows_rejected: u32,
+    /// Whether every row reached a terminal disposition. `CURSOR-01` forbids
+    /// advancing a frontier across a page where this is false.
+    pub fully_processed: bool,
 }
 
 /// Hard ceiling on `consumed_hidden_msg_ids` rows, as a backstop under the

@@ -33,17 +33,23 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use data_encoding::BASE64URL_NOPAD;
 
 use cruisemesh_core::{
-    authored_expiry, core_contact_relay_unreachable_delta, core_family_relay_backoff_cap_ms,
-    core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_is_hidden_spray_kind,
-    core_kind_persists_msg_id_row, core_own_capabilities, core_relay_ack_ids,
+    authored_expiry, compute_recipient_hint, core_contact_relay_unreachable_delta,
+    core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
+    core_family_relay_jitter_ms, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
+    core_own_capabilities, core_relay_ack_ids, core_relay_pass_default_budgets,
     core_relay_queue_reflects_delivery, core_relay_rerun_action, core_should_ack_inbound,
     encode_hello, encode_hello2, generate_identity, may_start_carried_offer, parse_frame,
-    relay_classify_http_error, relay_cursor_advance, relay_fetch_walk_continues,
+    relay_classify_http_error, relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
     relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
-    CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition,
-    CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayPathState, CoreRelayRerunAction,
+    CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition, CoreRelayActionKind,
+    CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
+    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayPass,
+    CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction,
     CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
     RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
     FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
@@ -67,6 +73,13 @@ enum Owner {
         package: &'static str,
     },
     /// Nothing pins this yet.
+    ///
+    /// No invariant is in this class as of package C0 — LIVE-01, PROGRESS-01,
+    /// IDEMP-01 and TXN-01 were the last four and `relay_pass.rs` owns them
+    /// now. The variant stays because the next invariant this contract gains
+    /// will start here, and deleting it would make "there is nowhere to put
+    /// an unowned rule" the reason nobody writes one down.
+    #[allow(dead_code)]
     Unimplemented { package: &'static str },
 }
 
@@ -137,17 +150,17 @@ const CONTRACT: &[Invariant] = &[
         id: "LIVE-01",
         statement: "Every pass terminates inside its declared request, envelope, byte, and \
                     time/yield budgets.",
-        owner: Owner::Unimplemented {
-            package: "C0 (CoreRelayPass + replay runner)",
-        },
+        owner: Owner::Core(
+            "core/tests/relay_pass_replay.rs drives CoreRelayPass against a temp store, a fake              clock and a scripted driver: declared budgets, four hostile relays, and every              incident fixture; index re-asserts the budgets and termination",
+        ),
     },
     Invariant {
         id: "PROGRESS-01",
         statement: "A continuation must strictly advance a cursor or strictly increase a future \
                     deadline; unchanged-state reschedule loops are forbidden.",
-        owner: Owner::Unimplemented {
-            package: "C0 (CoreRelayPass + replay runner); the walk-budget half is already core",
-        },
+        owner: Owner::Core(
+            "core/src/relay_cursor.rs walk-budget yield plus core/tests/relay_pass_replay.rs              continuation-reason tests; index re-asserts that a pass which advanced nothing              schedules nothing",
+        ),
     },
     Invariant {
         id: "MARK-01",
@@ -189,17 +202,17 @@ const CONTRACT: &[Invariant] = &[
         id: "IDEMP-01",
         statement: "Duplicate, late, or replayed external results cannot double-apply a \
                     mutation, regress a cursor, or consume a carried row.",
-        owner: Owner::Unimplemented {
-            package: "C0 (CoreRelayPass event-permutation tests)",
-        },
+        owner: Owner::Core(
+            "core/tests/relay_pass_replay.rs result-permutation tests (duplicate, future id,              stale id, wrong pass, late-after-finish, cancellation); index re-asserts the              duplicate case",
+        ),
     },
     Invariant {
         id: "TXN-01",
         statement: "No store transaction spans external I/O; page consume and frontier \
                     advancement stay two short transactions.",
-        owner: Owner::Unimplemented {
-            package: "C0 (CoreRelayPass fault-injection/restart tests)",
-        },
+        owner: Owner::Core(
+            "core/src/store.rs ingest_relay_page (one transaction, committed before return) plus              core/tests/relay_pass_replay.rs restart-between-consume-and-ack fault injection;              index re-asserts the two-transaction shape",
+        ),
     },
     Invariant {
         id: "QUEUE-01",
@@ -1374,32 +1387,333 @@ fn wm_01_receipt_repair_has_no_core_model() {
     unimplemented!("package D2 gives receipt repair a bounded, reachable core state machine");
 }
 
+// ---------------------------------------------------------------------------
+// Package C0's four invariants, re-asserted so the id prints on failure
+// ---------------------------------------------------------------------------
+//
+// The executable owner of each is `core/tests/relay_pass_replay.rs`, which
+// drives a real `CoreRelayPass` against a temporary store, a fake clock and a
+// scripted driver through every incident fixture and every result
+// permutation. These four are the index's own re-assertions: small, direct,
+// and enough that a red build here names the rule rather than a function.
+
+/// A relay pass with nothing to do, for the assertions that only need one to
+/// exist and finish.
+fn drive_relay_pass(
+    store: &Arc<MessageStore>,
+    pass_id: &str,
+    now_ms: i64,
+    mut respond: impl FnMut(&CoreRelayHttpRequest) -> (u16, Vec<u8>),
+) -> (CoreRelayPassSummary, u32) {
+    let plan = CoreRelayPassPlan {
+        own: Some(CoreRelayEndpointConfig {
+            url: "https://relay.example".to_string(),
+            token: "member-token-cccccccccccc".to_string(),
+        }),
+        contacts: Vec::new(),
+        own_user_id: (0u8..32).collect(),
+        fetch_hints: vec![compute_recipient_hint((0u8..32).collect(), now_ms)],
+        presence_announce: Vec::new(),
+        presence_query: Vec::new(),
+        own_endpoint_changed: false,
+        swept_this_session: true,
+        consecutive_rate_limits: 0,
+        quiet_until_ms: 0,
+        budgets: core_relay_pass_default_budgets(),
+    };
+    let pass = CoreRelayPass::new(store.clone(), plan, pass_id.to_string());
+    let mut action = pass.start(now_ms);
+    let mut clock = now_ms;
+    let mut answered = 0u32;
+    loop {
+        match action.kind {
+            CoreRelayActionKind::Finished { summary } => return (summary, answered),
+            CoreRelayActionKind::Sleep { .. } => {
+                return (
+                    pass.summary().expect("a slept pass has a summary"),
+                    answered,
+                )
+            }
+            CoreRelayActionKind::Http { ref request } => {
+                assert!(
+                    answered < 4_096,
+                    "LIVE-01 violated: the pass did not terminate"
+                );
+                let (status, body) = respond(request);
+                answered += 1;
+                clock += 25;
+                action = pass.resume_http(CoreRelayHttpResult {
+                    pass_id: action.pass_id.clone(),
+                    action_id: action.action_id,
+                    status,
+                    headers: Vec::new(),
+                    body,
+                    error: None,
+                    completed_at_ms: clock,
+                });
+            }
+        }
+    }
+}
+
+const EMPTY_RELAY_PAGE: &[u8] = b"{\"envelopes\":[],\"next_cursor\":0}";
+
 #[test]
-#[ignore = "UNIMPLEMENTED: owned by package C0 (CoreRelayPass declared request/envelope/byte/time \
-            budgets and its adversarial property tests)"]
-fn live_01_pass_budgets_are_not_declared_anywhere_yet() {
-    unimplemented!("package C0 gives a pass explicit budgets it must terminate inside");
+fn live_01_a_pass_declares_its_budgets_and_terminates_inside_them() {
+    let id = lookup("LIVE-01").id;
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let now_ms = 1_700_000_000_000;
+    let budgets = core_relay_pass_default_budgets();
+
+    // The budgets are declared rather than implied, and they are finite.
+    contract_assert!(
+        id,
+        budgets.max_requests > 0
+            && budgets.max_envelopes > 0
+            && budgets.max_response_bytes > 0
+            && budgets.deadline_ms > 0,
+        "a pass with an unbounded budget has no budget: {budgets:?}"
+    );
+
+    // A relay that never runs out of mail must not produce a pass that never
+    // runs out of time.
+    let mut next_id = 1i64;
+    let (summary, requests) = drive_relay_pass(&store, "p1", now_ms, |_request| {
+        let rows: Vec<String> = (0..32)
+            .map(|_| {
+                let row = next_id;
+                next_id += 1;
+                format!(
+                    "{{\"id\":{row},\"msg_id\":\"{}\",\"hop_ttl\":3,\"recipient_hint\":\"{}\",\
+                      \"sealed\":\"{}\",\"expiry_ms\":{}}}",
+                    BASE64URL_NOPAD.encode(&contract_msg_id(row)),
+                    BASE64URL_NOPAD.encode(&compute_recipient_hint((0u8..32).collect(), now_ms)),
+                    BASE64URL_NOPAD.encode(&contract_sealed(row)),
+                    now_ms + 6 * 24 * 60 * 60 * 1000
+                )
+            })
+            .collect();
+        (
+            200,
+            format!(
+                "{{\"envelopes\":[{}],\"next_cursor\":{}}}",
+                rows.join(","),
+                next_id - 1
+            )
+            .into_bytes(),
+        )
+    });
+
+    contract_assert!(
+        id,
+        summary.requests_issued <= budgets.max_requests,
+        "the pass issued {} requests against a budget of {}",
+        summary.requests_issued,
+        budgets.max_requests
+    );
+    contract_assert!(
+        id,
+        summary.envelopes_processed <= budgets.max_envelopes,
+        "the pass took {} envelopes against a budget of {}",
+        summary.envelopes_processed,
+        budgets.max_envelopes
+    );
+    contract_assert!(
+        id,
+        summary.response_bytes_read <= budgets.max_response_bytes,
+        "the pass read {} bytes against a budget of {}",
+        summary.response_bytes_read,
+        budgets.max_response_bytes
+    );
+    contract_assert!(
+        id,
+        requests > 0,
+        "the scenario must actually make the pass do work"
+    );
+    contract_assert!(
+        id,
+        summary.budgets == budgets,
+        "the summary must carry the budgets it was held to, or a transcript cannot check them"
+    );
 }
 
 #[test]
-#[ignore = "UNIMPLEMENTED: owned by package C0 (CoreRelayPass continuation with an explicit \
-            progress reason); the walk-budget yield is already core in relay_cursor.rs"]
-fn progress_01_continuations_carry_no_progress_reason_yet() {
-    unimplemented!("package C0 requires a strict cursor advance or a strictly later deadline");
+fn progress_01_a_continuation_must_buy_something() {
+    let id = lookup("PROGRESS-01").id;
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let now_ms = 1_700_000_000_000;
+
+    // A pass with an empty mailbox and an empty queue advanced nothing, so it
+    // may schedule nothing. An unchanged-state reschedule is the livelock.
+    let (summary, _) = drive_relay_pass(&store, "p1", now_ms, |_request| {
+        (200, EMPTY_RELAY_PAGE.to_vec())
+    });
+    contract_assert!(
+        id,
+        summary.continuation.is_none(),
+        "a pass that advanced nothing scheduled a continuation anyway: {:?}",
+        summary.continuation
+    );
+    contract_assert!(
+        id,
+        summary.frontier_advances == 0 && summary.rows_ingested == 0,
+        "the scenario must be one where nothing advanced"
+    );
 }
 
 #[test]
-#[ignore = "UNIMPLEMENTED: owned by package C0 (CoreRelayPass duplicate/late/out-of-order event \
-            permutation tests)"]
-fn idemp_01_external_result_replay_is_not_modelled_yet() {
-    unimplemented!("package C0 makes duplicate, late and wrong-pass results provably inert");
+fn idemp_01_a_duplicate_result_changes_nothing() {
+    let id = lookup("IDEMP-01").id;
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let now_ms = 1_700_000_000_000;
+    let plan = CoreRelayPassPlan {
+        own: Some(CoreRelayEndpointConfig {
+            url: "https://relay.example".to_string(),
+            token: "member-token-cccccccccccc".to_string(),
+        }),
+        contacts: Vec::new(),
+        own_user_id: (0u8..32).collect(),
+        fetch_hints: vec![compute_recipient_hint((0u8..32).collect(), now_ms)],
+        presence_announce: Vec::new(),
+        presence_query: Vec::new(),
+        own_endpoint_changed: false,
+        swept_this_session: true,
+        consecutive_rate_limits: 0,
+        quiet_until_ms: 0,
+        budgets: core_relay_pass_default_budgets(),
+    };
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let action = pass.start(now_ms);
+    let CoreRelayActionKind::Http { .. } = action.kind else {
+        panic!("{id} violated: the scenario needs an outstanding action");
+    };
+
+    let result = CoreRelayHttpResult {
+        pass_id: action.pass_id.clone(),
+        action_id: action.action_id,
+        status: 200,
+        headers: Vec::new(),
+        body: EMPTY_RELAY_PAGE.to_vec(),
+        error: None,
+        completed_at_ms: now_ms + 10,
+    };
+    let next = pass.resume_http(result.clone());
+    // The same answer again. It names an action that is no longer
+    // outstanding, so it must mutate nothing and be counted.
+    let echoed = pass.resume_http(result);
+    match (&next.kind, &echoed.kind) {
+        (CoreRelayActionKind::Finished { summary }, CoreRelayActionKind::Finished { .. }) => {
+            contract_assert!(
+                id,
+                summary.stale_results_ignored == 0,
+                "the first answer was not stale"
+            );
+        }
+        (CoreRelayActionKind::Http { .. }, CoreRelayActionKind::Http { .. }) => {
+            contract_assert!(
+                id,
+                echoed.action_id == next.action_id,
+                "a duplicate must restate the outstanding action, not emit a new one"
+            );
+        }
+        (first, second) => panic!("{id} violated: unexpected pair {first:?} / {second:?}"),
+    }
+    let summary = pass.summary().expect("the pass finished");
+    contract_assert!(
+        id,
+        summary.stale_results_ignored >= 1,
+        "the duplicate must be recorded as ignored rather than silently dropped"
+    );
 }
 
 #[test]
-#[ignore = "UNIMPLEMENTED: owned by package C0 (CoreRelayPass two-transaction page ingest and \
-            frontier commit under fault injection)"]
-fn txn_01_transaction_boundaries_are_not_enforced_by_a_test_yet() {
-    unimplemented!("package C0 proves no store transaction spans external I/O");
+fn txn_01_a_page_is_consumed_in_a_transaction_that_closes_before_any_ack() {
+    let id = lookup("TXN-01").id;
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("in-memory store"));
+    let now_ms = 1_700_000_000_000;
+
+    // The store primitive is the load-bearing half: it opens one transaction,
+    // commits it, and returns. There is no shape in which it can be holding
+    // one when an ack is formed, because forming an ack needs its answer.
+    let hint = compute_recipient_hint((0u8..32).collect(), now_ms);
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    let envelopes: Vec<CoreRelayFetchedEnvelope> = (1..=8)
+        .map(|row| CoreRelayFetchedEnvelope {
+            id: row,
+            msg_id: contract_msg_id(row),
+            hop_ttl: 3,
+            recipient_hint: hint.clone(),
+            // Distinct payloads: the carry queue dedupes identical
+            // (hint, sealed) pairs, so eight copies of one byte pattern would
+            // be one row rather than eight.
+            sealed: contract_sealed(row),
+            expiry_ms: expiry,
+        })
+        .collect();
+
+    let first = store
+        .ingest_relay_page(envelopes.clone(), now_ms)
+        .expect("ingest");
+    contract_assert!(
+        id,
+        first.rows_ingested == 8 && first.fully_processed,
+        "the page must be durably consumed before anything is acked: {first:?}"
+    );
+
+    // The frontier is a second, later transaction. It has not run.
+    let key = relay_cursor_key(
+        "https://relay.example".to_string(),
+        "member-token-cccccccccccc".to_string(),
+    );
+    contract_assert!(
+        id,
+        store
+            .relay_fetch_cursor(key.clone())
+            .expect("cursor")
+            .after_id
+            == 0,
+        "the frontier must not move as a side effect of consuming a page"
+    );
+
+    // A crash and a relaunch: the relay re-presents the same page and the
+    // replay applies nothing.
+    let replay = store
+        .ingest_relay_page(envelopes, now_ms)
+        .expect("re-ingest");
+    contract_assert!(
+        id,
+        replay.rows_ingested == 0,
+        "a re-presented page must persist nothing new, got {} rows",
+        replay.rows_ingested
+    );
+    contract_assert!(
+        id,
+        store.carried_len().expect("carry depth") == 8,
+        "a replay must not duplicate a carried row"
+    );
+
+    // Only now, with the ack behind us, may the frontier advance.
+    let advanced = store
+        .advance_relay_fetch_cursor(key, 8, true)
+        .expect("advance");
+    contract_assert!(
+        id,
+        advanced == 8,
+        "the second transaction is what moves the frontier, got {advanced}"
+    );
+}
+
+fn contract_sealed(seed: i64) -> Vec<u8> {
+    let mut sealed = vec![0x11u8; 96];
+    sealed[..8].copy_from_slice(&(seed as u64).to_be_bytes());
+    sealed
+}
+
+fn contract_msg_id(seed: i64) -> Vec<u8> {
+    let mut id = vec![0u8; 16];
+    id[..8].copy_from_slice(&(seed as u64).to_be_bytes());
+    id[8] = 0xC0;
+    id
 }
 
 // ---------------------------------------------------------------------------
