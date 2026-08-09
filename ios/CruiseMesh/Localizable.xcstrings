@@ -1053,6 +1053,16 @@
         }
       }
     },
+    "Could not save that voice message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not save that voice message"
+          }
+        }
+      }
+    },
     "Couldn't open that link": {
       "localizations": {
         "en": {
@@ -1119,6 +1129,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Friend"
+          }
+        }
+      }
+    },
+    "Hold the mic to talk": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hold the mic to talk"
           }
         }
       }
@@ -1377,6 +1397,26 @@
         }
       }
     },
+    "Pause voice message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pause voice message"
+          }
+        }
+      }
+    },
+    "Play voice message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Play voice message"
+          }
+        }
+      }
+    },
     "Reachable now (%lld)": {
       "localizations": {
         "en": {
@@ -1429,6 +1469,26 @@
         }
       }
     },
+    "Release for hands-free": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Release for hands-free"
+          }
+        }
+      }
+    },
+    "Release to cancel": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Release to cancel"
+          }
+        }
+      }
+    },
     "Seen %@": {
       "localizations": {
         "en": {
@@ -1445,6 +1505,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Seen online %@"
+          }
+        }
+      }
+    },
+    "Send voice message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Send voice message"
           }
         }
       }
@@ -1667,6 +1737,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Shore Pass wasn’t set up"
+          }
+        }
+      }
+    },
+    "That voice message is too long to send. Try a shorter one.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That voice message is too long to send. Try a shorter one."
+          }
+        }
+      }
+    },
+    "Voice messages stop automatically after %lld seconds.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voice messages stop automatically after %lld seconds."
           }
         }
       }
@@ -2081,12 +2171,12 @@
         }
       }
     },
-    "Hold to record a voice memo": {
+    "Hold to talk": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Hold to record a voice memo"
+            "value": "Hold to talk"
           }
         }
       }
@@ -2337,6 +2427,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Messages are end-to-end encrypted, so CruiseMesh cannot proactively read them. You can block a contact and report abuse from their contact details."
+          }
+        }
+      }
+    },
+    "Microphone unavailable": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Microphone unavailable"
           }
         }
       }
@@ -2797,6 +2897,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "Recent activity"
+          }
+        }
+      }
+    },
+    "Record with controls": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Record with controls"
+          }
+        }
+      }
+    },
+    "Recording stopped when something else needed the microphone": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recording stopped when something else needed the microphone"
+          }
+        }
+      }
+    },
+    "Recording stopped when you left the app": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recording stopped when you left the app"
           }
         }
       }
@@ -3349,6 +3479,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Show setup QR"
+          }
+        }
+      }
+    },
+    "Slide left to cancel, up for hands-free": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Slide left to cancel, up for hands-free"
           }
         }
       }
@@ -3937,12 +4077,12 @@
         }
       }
     },
-    "Voice memo": {
+    "Voice message": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Voice memo"
+            "value": "Voice message"
           }
         }
       }
@@ -4157,12 +4297,12 @@
         }
       }
     },
-    "Could not play voice memo": {
+    "Could not play that voice message": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Could not play voice memo"
+            "value": "Could not play that voice message"
           }
         }
       }

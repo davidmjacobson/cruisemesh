@@ -138,8 +138,8 @@ fun GroupChatScreen(
                 currentGroup,
                 AttachmentPayload(
                     mediaType = AttachmentPayload.MediaType.AUDIO,
-                    mimeType = "audio/mp4",
-                    durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
+                    mimeType = VoiceRecorder.plan.mimeType,
+                    durationMs = durationMs,
                     blob = bytes,
                 ),
                 replyId,
@@ -182,7 +182,9 @@ fun GroupChatScreen(
     ) { granted ->
         Toast.makeText(
             context,
-            if (granted) "Microphone ready — hold the mic to record" else "Microphone permission is required for voice memos",
+            context.getString(
+                if (granted) R.string.ui_microphone_ready else R.string.ui_microphone_permission_needed,
+            ),
             Toast.LENGTH_SHORT,
         ).show()
     }
@@ -372,6 +374,7 @@ fun GroupChatScreen(
                     voiceRecorder.stop()?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
                 },
                 onCancelVoice = { voiceRecorder.cancel() },
+                bytesRecorded = { voiceRecorder.bytesRecorded() },
             )
         },
         overlays = {

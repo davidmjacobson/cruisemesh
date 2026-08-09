@@ -426,19 +426,19 @@ struct ChatView: View {
     private func sendVoice(url: URL, durationMs: Int32) {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url), !data.isEmpty else {
-            statusMessage = "Could not save voice memo"
+            statusMessage = String(localized: "Could not save that voice message")
             return
         }
         guard data.count <= AttachmentPayload.maxBlobBytes else {
-            statusMessage = "Voice memo too large for the mesh"
+            statusMessage = String(localized: "That voice message is too long to send. Try a shorter one.")
             return
         }
         sender.sendAttachment(
             contact: contact,
             attachment: AttachmentPayload(
                 mediaType: .audio,
-                mimeType: "audio/mp4",
-                durationMs: min(durationMs, 60_000),
+                mimeType: VoiceRecorder.plan.mimeType,
+                durationMs: durationMs,
                 blob: data
             ),
             replyToMsgId: replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
@@ -1059,10 +1059,22 @@ struct ChatImageView: View {
     }
 }
 
+/// A voice message in the timeline: play/pause, elapsed over total, and a
+/// progress bar. The total is the decoder's once a player exists, falling back
+/// to the duration the sender stated until then.
 struct VoiceMemoPlayerView: View {
     let blob: Data
     let durationMs: Int32
     @StateObject private var playback = VoiceMemoPlaybackController()
+
+    private var total: TimeInterval {
+        playback.total > 0 ? playback.total : TimeInterval(max(0, durationMs)) / 1000
+    }
+
+    private var progress: Double {
+        guard total > 0 else { return 0 }
+        return min(1, max(0, playback.elapsed / total))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -1070,20 +1082,30 @@ struct VoiceMemoPlayerView: View {
                 Button {
                     playback.toggle(blob: blob)
                 } label: {
-                    Image(systemName: playback.isPlaying ? "stop.fill" : "play.fill")
+                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
                 }
-                .accessibilityLabel(playback.isPlaying ? "Stop voice memo" : "Play voice memo")
-                let secs = max(1, Int((durationMs + 500) / 1000))
-                Text("Voice memo · \(secs / 60):\(String(format: "%02d", secs % 60))")
-                    .font(.subheadline)
+                .accessibilityLabel(playback.isPlaying ? "Pause voice message" : "Play voice message")
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(verbatim: "\(Self.clock(playback.elapsed)) / \(Self.clock(total))")
+                        .font(.subheadline.monospacedDigit())
+                    ProgressView(value: progress)
+                        .progressViewStyle(.linear)
+                        .frame(width: 120)
+                        .accessibilityHidden(true)
+                }
             }
             if playback.playbackFailed {
-                Text("Could not play voice memo")
+                Text("Could not play that voice message")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .onDisappear { playback.stop() }
+    }
+
+    private static func clock(_ seconds: TimeInterval) -> String {
+        let whole = Int(seconds.rounded(.down))
+        return "\(whole / 60):" + String(format: "%02d", whole % 60)
     }
 }
 

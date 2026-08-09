@@ -305,6 +305,20 @@ final class CoreBindingSmokeTests: XCTestCase {
         return all
     }()
 
+    /// `Float` in both directions, and a record nested inside a record beside
+    /// an enum. The voice-capture plan is the first exported surface here to
+    /// carry a float at all, so this executes the lowering rather than
+    /// trusting it.
+    func testAFloatCrossesTheBoundaryAndLandsInANestedRecord() {
+        let plan = voiceCapturePlan()
+        XCTAssertGreaterThan(plan.cancelSlideDp, 1)
+
+        let holding = voiceCapturePress(state: voiceCaptureIdleState()).state
+        XCTAssertEqual(holding.phase, .holding)
+        XCTAssertTrue(voiceCaptureDrag(state: holding, dx: -(plan.cancelSlideDp + 1), dy: 0).state.cancelArmed)
+        XCTAssertFalse(voiceCaptureDrag(state: holding, dx: -(plan.cancelSlideDp - 1), dy: 0).state.cancelArmed)
+    }
+
     private func person(
         userId: Data,
         displayName: String,

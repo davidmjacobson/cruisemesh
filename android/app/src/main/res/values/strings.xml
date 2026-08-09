@@ -139,7 +139,6 @@
     <string name="ui_relay_url">Relay URL</string>
     <string name="ui_relay_url_must_be_https">Relay URL must start with https:// This one was not saved.</string>
     <string name="ui_relay_url_optional">Relay URL (optional)</string>
-    <string name="ui_release_to_send">release to send</string>
     <string name="ui_report_contact">Report contact</string>
     <string name="ui_report_email_body">Reporting: %1$s\nTheir ID: %2$s\nTheir safety words: %3$s\nMy ID: %4$s\n\nWhat happened:\n</string>
     <string name="ui_report_email_subject">CruiseMesh abuse report</string>
@@ -158,7 +157,28 @@
     <string name="ui_got_it">Got it</string>
     <string name="ui_local_wi_fi_probes_were_denied">Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth.</string>
     <string name="ui_through_mutual_friends">Through %1$s</string>
-    <string name="ui_voice_memo_duration">Voice memo · %1$s</string>
+    <!-- Push-to-talk voice messages (specs/voice-ptt.md). A voice message is
+         an ordinary attachment on the mesh; none of this copy says so, because
+         a family member does not need to know. -->
+    <string name="ui_voice_message_progress">%1$s / %2$s</string>
+    <string name="ui_slide_to_cancel_or_lock">Slide left to cancel, up for hands-free</string>
+    <string name="ui_release_to_cancel">Release to cancel</string>
+    <string name="ui_release_for_hands_free">Release for hands-free</string>
+    <string name="ui_cancel_recording">Cancel</string>
+    <string name="ui_hold_the_mic_to_talk">Hold the mic to talk</string>
+    <string name="ui_hold_to_talk">Hold to talk</string>
+    <string name="ui_start_voice_message">Start voice message</string>
+    <string name="ui_recording_stopped_left_app">Recording stopped when you left the app</string>
+    <string name="ui_send_voice_message">Send voice message</string>
+    <string name="ui_play_voice_message">Play voice message</string>
+    <string name="ui_pause_voice_message">Pause voice message</string>
+    <string name="ui_could_not_play_voice_message">Could not play that voice message</string>
+    <string name="ui_could_not_save_voice_message">Could not save that voice message</string>
+    <string name="ui_voice_message_too_large">That voice message is too long to send. Try a shorter one.</string>
+    <string name="ui_voice_recording_failed">Recording did not work. Try again.</string>
+    <string name="ui_could_not_send_voice_message">Could not send that voice message. Try recording it again.</string>
+    <string name="ui_microphone_ready">Microphone ready — hold the mic to talk</string>
+    <string name="ui_microphone_permission_needed">CruiseMesh needs the microphone to send voice messages</string>
     <string name="ui_step_of">Step %1$d of %2$d</string>
     <string name="ui_nearby_access_on_detail">Nearby access is on. Background activity is optional but keeps messages moving while the app isn\'t open.</string>
     <string name="ui_nearby_access_off_detail">You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do.</string>

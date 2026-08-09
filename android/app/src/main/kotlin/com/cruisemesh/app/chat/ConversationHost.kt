@@ -33,6 +33,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 import com.cruisemesh.app.media.AttachmentPayload
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -337,7 +338,7 @@ fun stagePhotoOrWarn(context: Context, jpeg: ByteArray?, onStaged: (ByteArray) -
 }
 
 /**
- * Reads [file]'s bytes for an about-to-send voice memo, deleting the temp
+ * Reads [file]'s bytes for an about-to-send voice message, deleting the temp
  * recording either way, and validates size against
  * [AttachmentPayload.MAX_BLOB_BYTES]. Toasts the same "could not save" /
  * "too large" copy [ChatScreen] and [GroupChatScreen] have always shown on
@@ -351,11 +352,19 @@ fun readVoiceMemoBytes(context: Context, file: File): ByteArray? {
     }
     file.delete()
     if (bytes == null || bytes.isEmpty()) {
-        Toast.makeText(context, "Could not save voice memo", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            context,
+            context.getString(R.string.ui_could_not_save_voice_message),
+            Toast.LENGTH_SHORT,
+        ).show()
         return null
     }
     if (bytes.size > AttachmentPayload.MAX_BLOB_BYTES) {
-        Toast.makeText(context, "Voice memo is too large to send over the mesh", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            context,
+            context.getString(R.string.ui_voice_message_too_large),
+            Toast.LENGTH_SHORT,
+        ).show()
         return null
     }
     return bytes

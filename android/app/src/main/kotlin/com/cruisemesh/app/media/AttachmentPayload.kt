@@ -11,7 +11,7 @@ import uniffi.cruisemesh_core.encodeAttachmentPayload
  * (DESIGN.md §7.1 reserved kinds, §8 media readiness).
  *
  * v1 ships the blob **inline** in the sealed chat envelope so photos and
- * short voice memos ride the existing digest/relay/outbound path without a
+ * short voice messages ride the existing digest/relay/outbound path without a
  * separate chunk transfer. The layout is versioned so a later external-chunk
  * mode (kind=17) can land without breaking older clients: unknown versions
  * decode as failure and the UI shows a placeholder.
@@ -92,7 +92,7 @@ data class AttachmentPayload(
             MediaType.IMAGE -> if (payload.caption.isNotBlank()) "📷 ${payload.caption}" else "📷 Photo"
             MediaType.AUDIO -> {
                 val secs = ((payload.durationMs + 500) / 1000).coerceAtLeast(1)
-                if (payload.caption.isNotBlank()) "🎤 ${payload.caption}" else "🎤 Voice memo ($secs s)"
+                if (payload.caption.isNotBlank()) "🎤 ${payload.caption}" else "🎤 Voice message ($secs s)"
             }
             null -> "Attachment"
         }

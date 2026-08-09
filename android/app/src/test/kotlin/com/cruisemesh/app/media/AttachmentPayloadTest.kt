@@ -24,7 +24,7 @@ class AttachmentPayloadTest {
     }
 
     @Test
-    fun `round-trips voice memo without caption`() {
+    fun `round-trips voice message without caption`() {
         val original = AttachmentPayload(
             mediaType = AttachmentPayload.MediaType.AUDIO,
             mimeType = "audio/mp4",
@@ -66,7 +66,7 @@ class AttachmentPayloadTest {
             blob = byteArrayOf(1),
         )
         assertEquals("📷 Photo", AttachmentPayload.previewLabel(photo))
-        assertTrue(AttachmentPayload.previewLabel(voice).startsWith("🎤 Voice memo"))
+        assertTrue(AttachmentPayload.previewLabel(voice).startsWith("🎤 Voice message"))
         assertEquals(
             "📷 Photo",
             AttachmentPayload.previewLabelFromRaw(KIND_ATTACHMENT_MANIFEST, photo.encode()),

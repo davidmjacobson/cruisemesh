@@ -3,8 +3,13 @@ package com.cruisemesh.app.chat
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -16,6 +21,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.offset
@@ -27,6 +34,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
@@ -45,6 +53,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ModalBottomSheet
@@ -59,11 +68,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -77,6 +88,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerId
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.layout
@@ -86,11 +99,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.Dp
@@ -116,6 +132,7 @@ import com.cruisemesh.app.friending.ShareContactPolicy
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ComposerCameraIcon
 import com.cruisemesh.app.ui.ComposerMicIcon
+import com.cruisemesh.app.ui.ComposerPauseIcon
 import com.cruisemesh.app.ui.launchContactReport
 import com.cruisemesh.app.ui.ComposerSendIcon
 import com.cruisemesh.app.ui.ReplyIcon
@@ -127,13 +144,24 @@ import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import com.cruisemesh.app.ui.tickLegendText
 import uniffi.cruisemesh_core.ComposerReach
+import uniffi.cruisemesh_core.CoreVoiceCaptureState
 import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.VoiceCaptureEffect
+import uniffi.cruisemesh_core.VoiceCapturePhase
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.formatUserId
+import uniffi.cruisemesh_core.voiceCaptureBytes
+import uniffi.cruisemesh_core.voiceCaptureCancel
+import uniffi.cruisemesh_core.voiceCaptureDrag
+import uniffi.cruisemesh_core.voiceCaptureElapsed
+import uniffi.cruisemesh_core.voiceCaptureFinish
+import uniffi.cruisemesh_core.voiceCapturePress
+import uniffi.cruisemesh_core.voiceCaptureRelease
+import uniffi.cruisemesh_core.voiceCaptureStartHandsFree
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -148,10 +176,9 @@ import com.cruisemesh.app.R
 private const val RECEIPT_TYPE_DELIVERED: kotlin.UByte = 1u
 private const val RECEIPT_TYPE_READ: kotlin.UByte = 2u
 
-internal const val MAX_VOICE_MS = 60_000
-
-/** Below this hold duration a mic press is treated as an accidental tap, not a memo. */
-internal const val MIN_VOICE_MS = 500L
+// The duration bound and the accidental-tap threshold used to live here as
+// literals, and iOS carried its own copies. Both now come from the core's
+// `voiceCapturePlan()`, which derives the bound from the attachment blob cap.
 
 val REACTION_CHOICES = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
 
@@ -255,8 +282,8 @@ fun ChatScreen(
             currentContact,
             AttachmentPayload(
                 mediaType = AttachmentPayload.MediaType.AUDIO,
-                mimeType = "audio/mp4",
-                durationMs = durationMs.coerceAtMost(MAX_VOICE_MS),
+                mimeType = VoiceRecorder.plan.mimeType,
+                durationMs = durationMs,
                 blob = bytes,
             ),
             replyingTo?.let(::replyTargetId),
@@ -266,8 +293,8 @@ fun ChatScreen(
             reload()
         } else {
             // The recording file is already gone, so the generic "still here"
-            // copy would be wrong for a voice memo.
-            showSendFailure("Couldn't send the voice memo. Try recording it again.")
+            // copy would be wrong for a voice message.
+            showSendFailure(context.getString(R.string.ui_could_not_send_voice_message))
         }
     }
 
@@ -306,9 +333,13 @@ fun ChatScreen(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
         if (granted) {
-            Toast.makeText(context, "Microphone ready — hold the mic to record", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, context.getString(R.string.ui_microphone_ready), Toast.LENGTH_SHORT).show()
         } else {
-            Toast.makeText(context, "Microphone permission is required for voice memos", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_microphone_permission_needed),
+                Toast.LENGTH_SHORT,
+            ).show()
         }
     }
 
@@ -416,10 +447,15 @@ fun ChatScreen(
             if (result != null) {
                 sendVoiceFile(result.first, result.second)
             } else {
-                Toast.makeText(context, "Recording failed", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.ui_voice_recording_failed),
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
         },
         onCancelVoice = { voiceRecorder.cancel() },
+        onVoiceBytesRecorded = { voiceRecorder.bytesRecorded() },
         onBack = onBack,
         onDeleteContact = onDeleteContact,
         reachability = reachability,
@@ -482,6 +518,7 @@ private fun ConversationScreen(
     onStartVoice: () -> Boolean = { false },
     onStopVoice: () -> Unit = {},
     onCancelVoice: () -> Unit = {},
+    onVoiceBytesRecorded: () -> Long = { 0L },
     onReact: (MessageTarget, String) -> Unit = { _, _ -> },
     onBack: () -> Unit,
     onDeleteContact: () -> Unit,
@@ -659,6 +696,7 @@ private fun ConversationScreen(
                 onStartVoice = onStartVoice,
                 onStopVoice = onStopVoice,
                 onCancelVoice = onCancelVoice,
+                bytesRecorded = onVoiceBytesRecorded,
             )
         },
         overlays = {
@@ -912,13 +950,21 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
 /**
  * Signal-style message composer: a circular "+" (in the user's own-bubble
  * color) that opens the photo library, a rounded input pill with a camera
- * icon inside on the right, and a trailing action that is a hold-to-record
+ * icon inside on the right, and a trailing action that is a hold-to-talk
  * microphone when the draft is empty and a send button once there's text.
  *
- * Voice memos record while the mic is held and send on release (a press
- * shorter than [MIN_VOICE_MS] is treated as an accidental tap and discarded).
- * The recorder itself is owned by [ChatScreen]; this composable only drives it
- * through [onStartVoice] / [onStopVoice] / [onCancelVoice].
+ * Push-to-talk records while the mic is held and sends on release. Sliding
+ * left cancels; sliding up locks the recording hands-free so the finger can
+ * come off. Every threshold, the minimum hold that counts as speech, the
+ * duration bound and the byte budget belong to the core ([VoiceRecorder.plan],
+ * [voiceCapturePress] and friends), so this screen and the iOS composer cannot
+ * disagree about what the gesture means. The recorder itself is owned by
+ * [ChatScreen]; this composable only drives it through [onStartVoice] /
+ * [onStopVoice] / [onCancelVoice].
+ *
+ * A hold is a gesture some people cannot make, so the mic also carries a plain
+ * "start voice message" accessibility action that goes straight to the
+ * hands-free state, where Cancel and Send are ordinary buttons.
  */
 @Composable
 internal fun MessageComposer(
@@ -933,28 +979,102 @@ internal fun MessageComposer(
     onStartVoice: () -> Boolean,
     onStopVoice: () -> Unit,
     onCancelVoice: () -> Unit,
+    /**
+     * Bytes the encoder has written so far. Weighed on every tick because the
+     * duration bound only holds if the encoder honoured the bitrate it was
+     * asked for, and some do not; see `core/src/voice.rs`.
+     */
+    bytesRecorded: () -> Long = { 0L },
+    // Monotonic, not a frame count and not wall time: a stalled frame must not
+    // let a recording run past the byte budget, and a clock correction mid-hold
+    // (time-zone change at sea, cell reacquisition in port) must not shorten or
+    // lengthen it either. Injectable only so the gesture tests can hold a press
+    // for a plausible number of seconds without sleeping for them.
+    nowMs: () -> Long = SystemClock::elapsedRealtime,
 ) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
     val onBubbleColor = MaterialTheme.colorScheme.onPrimary
-    var recording by remember { mutableStateOf(false) }
-    var elapsedMs by remember { mutableLongStateOf(0L) }
+    val capture = remember { mutableStateOf(IDLE_VOICE_CAPTURE) }
+    val recordingStartedAt = remember { mutableLongStateOf(0L) }
+    val now by rememberUpdatedState(nowMs)
+    val recordedBytes by rememberUpdatedState(bytesRecorded)
+    val startVoice by rememberUpdatedState(onStartVoice)
+    val stopVoice by rememberUpdatedState(onStopVoice)
+    val cancelVoice by rememberUpdatedState(onCancelVoice)
+    val tooShortMessage = stringResource(R.string.ui_hold_the_mic_to_talk)
+    val leftTheAppMessage = stringResource(R.string.ui_recording_stopped_left_app)
+    val holdToTalkLabel = stringResource(R.string.ui_hold_to_talk)
+    val startVoiceLabel = stringResource(R.string.ui_start_voice_message)
+    val sendVoiceLabel = stringResource(R.string.ui_send_voice_message)
+    val recording = capture.value.phase != VoiceCapturePhase.IDLE
     // A staged photo can be sent on its own, so the send button shows whenever
     // there's text *or* a pending attachment; the mic only takes over when the
     // composer is otherwise empty.
     val canSend = draft.isNotBlank() || hasPendingAttachment
 
+    fun elapsedMs(): UInt =
+        (now() - recordingStartedAt.longValue)
+            .coerceIn(0L, UInt.MAX_VALUE.toLong())
+            .toUInt()
+
+    fun applyEffect(effect: VoiceCaptureEffect) {
+        when (effect) {
+            VoiceCaptureEffect.SEND -> stopVoice()
+            VoiceCaptureEffect.DISCARD_TOO_SHORT -> {
+                cancelVoice()
+                Toast.makeText(context, tooShortMessage, Toast.LENGTH_SHORT).show()
+            }
+            VoiceCaptureEffect.DISCARD_CANCELLED -> cancelVoice()
+            VoiceCaptureEffect.START, VoiceCaptureEffect.NONE -> Unit
+        }
+    }
+
     LaunchedEffect(recording) {
         if (!recording) return@LaunchedEffect
-        val start = System.currentTimeMillis()
-        while (recording) {
-            elapsedMs = System.currentTimeMillis() - start
-            if (elapsedMs >= MAX_VOICE_MS) {
-                recording = false
-                onStopVoice()
-                return@LaunchedEffect
+        while (capture.value.phase != VoiceCapturePhase.IDLE) {
+            val ticked = voiceCaptureElapsed(capture.value, elapsedMs())
+            capture.value = ticked.state
+            applyEffect(ticked.effect)
+            if (capture.value.phase != VoiceCapturePhase.IDLE) {
+                // The clock is not the only bound: an encoder that ignores the
+                // bitrate we asked for fills the envelope early, and finding
+                // that out after the user has spoken is the failure this
+                // package exists to remove.
+                val written = recordedBytes().coerceIn(0L, UInt.MAX_VALUE.toLong()).toUInt()
+                val weighed = voiceCaptureBytes(capture.value, written)
+                capture.value = weighed.state
+                applyEffect(weighed.effect)
             }
             delay(100)
+        }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        // A hands-free recording outlives the finger, so it can outlive the
+        // screen too: pressing Home, taking a call, or pulling down a
+        // notification all leave the app in the background, where Android
+        // feeds a recorder without a microphone foreground-service type
+        // silence. Sending a minute of that is worse than losing the
+        // recording, so stop and say so.
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP &&
+                capture.value.phase != VoiceCapturePhase.IDLE
+            ) {
+                capture.value = voiceCaptureCancel(capture.value).state
+                cancelVoice()
+                Toast.makeText(context, leftTheAppMessage, Toast.LENGTH_SHORT).show()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            // Leaving the screen mid-recording must not leave the mic hot.
+            if (capture.value.phase != VoiceCapturePhase.IDLE) {
+                capture.value = IDLE_VOICE_CAPTURE
+                cancelVoice()
+            }
         }
     }
 
@@ -983,28 +1103,15 @@ internal fun MessageComposer(
         Spacer(modifier = Modifier.width(8.dp))
 
         if (recording) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(10.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFFE53935)),
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(stringResource(R.string.ui_recording_duration, formatDurationMs(elapsedMs.toInt())))
-                Spacer(modifier = Modifier.weight(1f))
-                Text(text = stringResource(R.string.ui_release_to_send),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            RecordingPill(
+                state = capture.value,
+                modifier = Modifier.weight(1f),
+                onCancel = {
+                    val step = voiceCaptureCancel(capture.value)
+                    capture.value = step.state
+                    applyEffect(step.effect)
+                },
+            )
         } else {
             TextField(
                 value = draft,
@@ -1052,6 +1159,24 @@ internal fun MessageComposer(
             ) {
                 Icon(ComposerSendIcon, contentDescription = null, tint = onBubbleColor)
             }
+        } else if (capture.value.phase == VoiceCapturePhase.LOCKED) {
+            // Hands-free: the finger is off the button, so the same slot becomes
+            // an ordinary send control.
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(ownBubbleColor)
+                    .clickable {
+                        val step = voiceCaptureFinish(capture.value, elapsedMs())
+                        capture.value = step.state
+                        applyEffect(step.effect)
+                    }
+                    .semantics { contentDescription = sendVoiceLabel },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(ComposerSendIcon, contentDescription = null, tint = onBubbleColor)
+            }
         } else {
             Box(
                 modifier = Modifier
@@ -1059,35 +1184,52 @@ internal fun MessageComposer(
                     .clip(CircleShape)
                     .background(if (recording) ownBubbleColor else Color.Transparent)
                     .pointerInput(Unit) {
-                        detectTapGestures(
-                            onPress = {
-                                val started = onStartVoice()
-                                if (!started) {
-                                    tryAwaitRelease()
-                                    return@detectTapGestures
-                                }
-                                recording = true
-                                elapsedMs = 0L
-                                val pressStart = System.currentTimeMillis()
-                                tryAwaitRelease()
-                                val held = System.currentTimeMillis() - pressStart
-                                if (recording) {
-                                    recording = false
-                                    if (held < MIN_VOICE_MS) {
-                                        onCancelVoice()
-                                        Toast.makeText(
-                                            context,
-                                            "Hold the mic to record a voice memo",
-                                            Toast.LENGTH_SHORT,
-                                        ).show()
-                                    } else {
-                                        onStopVoice()
-                                    }
-                                }
-                            },
-                        )
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val pressed = voiceCapturePress(capture.value)
+                            if (pressed.effect != VoiceCaptureEffect.START || !startVoice()) {
+                                // Either a recording is already running or the
+                                // mic was refused: swallow the rest of the
+                                // gesture so nothing half-starts.
+                                waitForRelease(down.id)
+                                return@awaitEachGesture
+                            }
+                            recordingStartedAt.longValue = now()
+                            capture.value = pressed.state
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) break
+                                if (capture.value.phase != VoiceCapturePhase.HOLDING) break
+                                val dx = (change.position.x - down.position.x).toDp().value
+                                val dy = (change.position.y - down.position.y).toDp().value
+                                capture.value = voiceCaptureDrag(capture.value, dx, dy).state
+                            }
+
+                            val step = voiceCaptureRelease(capture.value, elapsedMs())
+                            capture.value = step.state
+                            applyEffect(step.effect)
+                        }
                     }
-                    .semantics { contentDescription = "Hold to record a voice memo" },
+                    .semantics {
+                        contentDescription = holdToTalkLabel
+                        role = Role.Button
+                        // Hold-to-talk is unreachable through a screen reader or
+                        // a switch: neither can express "press and keep
+                        // pressing". This action starts the same recording
+                        // hands-free, where Cancel and Send are plain buttons.
+                        onClick(label = startVoiceLabel) {
+                            val started = voiceCaptureStartHandsFree(capture.value)
+                            if (started.effect != VoiceCaptureEffect.START || !startVoice()) {
+                                return@onClick false
+                            }
+                            recordingStartedAt.longValue = now()
+                            capture.value = started.state
+                            true
+                        }
+                    },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -1096,6 +1238,95 @@ internal fun MessageComposer(
                     tint = if (recording) onBubbleColor else MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+    }
+}
+
+/**
+ * The core's idle capture state, restated as plain data.
+ *
+ * Everything the gesture *means* still comes from the core; this exists only
+ * because the composer must render before any gesture happens, and the Compose
+ * preview screenshot renderer inflates it in a sandbox that cannot load the
+ * native library. `MessageComposerCoreContractTest` asserts this stays equal to
+ * `voiceCaptureIdleState()`.
+ *
+ * A `get()` rather than a stored value: the generated record's fields are `var`,
+ * and a shared instance handed to several composers would be one stray write
+ * away from a very confusing bug.
+ */
+internal val IDLE_VOICE_CAPTURE: CoreVoiceCaptureState
+    get() = CoreVoiceCaptureState(
+        phase = VoiceCapturePhase.IDLE,
+        cancelArmed = false,
+        lockArmed = false,
+        elapsedMs = 0u,
+    )
+
+/** Drains the rest of a pointer gesture this composer is not acting on. */
+private suspend fun AwaitPointerEventScope.waitForRelease(pointerId: PointerId) {
+    while (true) {
+        val event = awaitPointerEvent()
+        val change = event.changes.firstOrNull { it.id == pointerId } ?: return
+        if (!change.pressed) return
+    }
+}
+
+/**
+ * Replaces the text field while a voice message is being recorded: a live red
+ * pip, the elapsed time, and what the gesture would do if the finger came off
+ * right now.
+ */
+@Composable
+private fun RecordingPill(
+    state: CoreVoiceCaptureState,
+    modifier: Modifier = Modifier,
+    onCancel: () -> Unit,
+) {
+    val locked = state.phase == VoiceCapturePhase.LOCKED
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = modifier
+            .clip(RoundedCornerShape(24.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(10.dp)
+                .clip(CircleShape)
+                .background(if (state.cancelArmed) Color(0xFF9E9E9E) else Color(0xFFE53935)),
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(stringResource(R.string.ui_recording_duration, formatDurationMs(state.elapsedMs.toInt())))
+        Spacer(modifier = Modifier.width(10.dp))
+        if (locked) {
+            Spacer(modifier = Modifier.weight(1f))
+            TextButton(onClick = onCancel) {
+                Text(stringResource(R.string.ui_cancel_recording))
+            }
+        } else {
+            Text(
+                text = when {
+                    state.cancelArmed -> stringResource(R.string.ui_release_to_cancel)
+                    state.lockArmed -> stringResource(R.string.ui_release_for_hands_free)
+                    else -> stringResource(R.string.ui_slide_to_cancel_or_lock)
+                },
+                style = MaterialTheme.typography.labelSmall,
+                // The hint takes the leftover width rather than whatever is
+                // left after it: unweighted, at a large font scale it wraps to
+                // four or five lines and grows the pill up over the message
+                // list at exactly the moment the user is reading it.
+                modifier = Modifier.weight(1f),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.End,
+                color = if (state.cancelArmed) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
         }
     }
 }
@@ -1807,6 +2038,19 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
     }
 }
 
+/**
+ * Inline voice-message bubble: play/pause, a progress bar, and elapsed over
+ * total.
+ *
+ * The player is media-usage/speech-content and asks for transient audio focus
+ * while a message plays, so music from another app ducks under it and comes
+ * back afterwards, the same way the iOS spoken-audio session behaves. It
+ * deliberately does **not** grab a communication route: on this project the mesh
+ * keeps running through every audio state, and a communication route would pull
+ * a connected headset onto its hands-free profile and fight the same radio the
+ * mesh is using. Losing focus pauses playback and nothing else — the mesh
+ * service has never listened to audio focus and must not start.
+ */
 @Composable
 private fun VoiceMemoPlayer(
     blob: ByteArray,
@@ -1815,17 +2059,37 @@ private fun VoiceMemoPlayer(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var playing by remember { mutableStateOf(false) }
+    var playing by remember(blob) { mutableStateOf(false) }
     // Guards against a double-tap starting a second load (and a second temp
     // file / MediaPlayer) while the first one is still preparing.
-    var loading by remember { mutableStateOf(false) }
-    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    var loading by remember(blob) { mutableStateOf(false) }
+    var player by remember(blob) { mutableStateOf<MediaPlayer?>(null) }
     // FA11: the play-<ts>.m4a temp file this player is backed by, if any --
     // tracked so every exit path (manual stop, dispose, completion) can
     // delete it instead of only the completion listener doing so.
-    var tempFile by remember { mutableStateOf<File?>(null) }
+    var tempFile by remember(blob) { mutableStateOf<File?>(null) }
+    var positionMs by remember(blob) { mutableIntStateOf(0) }
+    // The sender's stated duration until the decoder reports its own, which is
+    // the honest one for the progress bar.
+    var totalMs by remember(blob) { mutableIntStateOf(durationMs) }
+    val couldNotPlay = stringResource(R.string.ui_could_not_play_voice_message)
+    val audioManager = remember(context) {
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    }
+    val playbackAttributes = remember {
+        AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+    }
+    var focusRequest by remember(blob) { mutableStateOf<AudioFocusRequest?>(null) }
 
-    fun stopAndCleanup() {
+    fun abandonFocus() {
+        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        focusRequest = null
+    }
+
+    fun releasePlayer() {
         player?.let { mp ->
             try {
                 mp.stop()
@@ -1836,19 +2100,80 @@ private fun VoiceMemoPlayer(
         }
         player = null
         playing = false
+        positionMs = 0
         tempFile?.delete()
         tempFile = null
+        abandonFocus()
+    }
+
+    fun pausePlayback() {
+        val mp = player
+        playing = false
+        if (mp != null) {
+            try {
+                mp.pause()
+            } catch (_: IllegalStateException) {
+                releasePlayer()
+                return
+            }
+        }
+        abandonFocus()
+    }
+
+    /**
+     * Ducks or pauses whatever else is playing for the length of the message.
+     * Playback goes ahead either way — the user asked for it — so this returns
+     * nothing; the request is only good manners toward other apps.
+     */
+    fun requestFocus() {
+        if (focusRequest != null) return
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            .setAudioAttributes(playbackAttributes)
+            .setOnAudioFocusChangeListener { change ->
+                // Focus is about speakers, never about the mesh: MeshService
+                // keeps running through every one of these.
+                if (change == AudioManager.AUDIOFOCUS_LOSS ||
+                    change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
+                ) {
+                    pausePlayback()
+                }
+            }
+            .build()
+        if (audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            focusRequest = request
+        }
     }
 
     DisposableEffect(blob) {
-        onDispose { stopAndCleanup() }
+        onDispose { releasePlayer() }
+    }
+
+    LaunchedEffect(playing) {
+        while (playing) {
+            player?.let { positionMs = it.currentPosition.coerceAtLeast(0) }
+            delay(100)
+        }
     }
 
     Row(verticalAlignment = Alignment.CenterVertically) {
         IconButton(
             onClick = {
+                val existing = player
                 when {
-                    playing -> stopAndCleanup()
+                    playing && existing != null -> pausePlayback()
+                    existing != null -> {
+                        requestFocus()
+                        try {
+                            existing.start()
+                            playing = true
+                        } catch (_: IllegalStateException) {
+                            // A player that errored mid-message is unusable;
+                            // throw it away rather than crash the chat screen,
+                            // and let the next tap decode from scratch.
+                            releasePlayer()
+                            Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
+                        }
+                    }
                     loading -> Unit
                     else -> {
                         loading = true
@@ -1861,6 +2186,12 @@ private fun VoiceMemoPlayer(
                                     val temp = File(context.cacheDir, "play-${System.currentTimeMillis()}.m4a")
                                     temp.writeBytes(blob)
                                     val mp = MediaPlayer()
+                                    mp.setAudioAttributes(
+                                        AudioAttributes.Builder()
+                                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                            .build(),
+                                    )
                                     mp.setDataSource(temp.absolutePath)
                                     mp.prepare()
                                     temp to mp
@@ -1870,7 +2201,7 @@ private fun VoiceMemoPlayer(
                             }
                             loading = false
                             if (prepared == null) {
-                                Toast.makeText(context, "Could not play voice memo", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
                                 return@launch
                             }
                             val (temp, mp) = prepared
@@ -1880,15 +2211,25 @@ private fun VoiceMemoPlayer(
                                 temp.delete()
                                 return@launch
                             }
-                            mp.setOnCompletionListener {
-                                playing = false
-                                it.release()
-                                player = null
-                                temp.delete()
-                                tempFile = null
+                            // A finished message hands its decoder back. A
+                            // MediaPlayer is a hardware-codec instance and the
+                            // device has a small global pool of them; holding
+                            // one open per played bubble to save a re-decode on
+                            // replay costs the next message the ability to play
+                            // at all.
+                            mp.setOnCompletionListener { releasePlayer() }
+                            mp.setOnErrorListener { _, _, _ ->
+                                // The player is in the Error state now; every
+                                // later call on it would throw.
+                                releasePlayer()
+                                Toast.makeText(context, couldNotPlay, Toast.LENGTH_SHORT).show()
+                                true
                             }
+                            if (mp.duration > 0) totalMs = mp.duration
                             tempFile = temp
                             player = mp
+                            positionMs = 0
+                            requestFocus()
                             playing = true
                             mp.start()
                         }
@@ -1901,15 +2242,38 @@ private fun VoiceMemoPlayer(
             modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
         ) {
             Icon(
-                imageVector = if (playing) Icons.Default.Close else Icons.Default.PlayArrow,
-                contentDescription = if (playing) "Stop" else "Play voice memo",
+                imageVector = if (playing) ComposerPauseIcon else Icons.Default.PlayArrow,
+                contentDescription = stringResource(
+                    if (playing) R.string.ui_pause_voice_message else R.string.ui_play_voice_message,
+                ),
                 tint = contentColor,
             )
         }
-        Text(
-            text = stringResource(R.string.ui_voice_memo_duration, formatDurationMs(durationMs)),
-            style = MaterialTheme.typography.bodyMedium,
-        )
+        Column(modifier = Modifier.widthIn(min = 132.dp)) {
+            Text(
+                text = stringResource(
+                    R.string.ui_voice_message_progress,
+                    formatDurationMs(positionMs),
+                    formatDurationMs(totalMs),
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = contentColor,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = { if (totalMs > 0) (positionMs.toFloat() / totalMs).coerceIn(0f, 1f) else 0f },
+                color = contentColor,
+                trackColor = contentColor.copy(alpha = 0.25f),
+                drawStopIndicator = {},
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    // Not `contentDescription = ""`: that leaves the node's
+                    // progress range in place and TalkBack reads a percentage
+                    // over the "0:04 / 0:12" line right above it.
+                    .clearAndSetSemantics {},
+            )
+        }
     }
 }
 
