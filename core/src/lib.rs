@@ -181,6 +181,18 @@ pub use semantic::{
     core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
+// Package C0. Exported so the C1/C2 driver adapters have a surface to
+// compile against; deliberately unreachable from either shell today, and the
+// only caller in this repository is `core/tests/relay_pass_replay.rs`.
+pub use session::relay_pass::{
+    core_relay_pass_default_budgets, CoreRelayAction, CoreRelayActionKind, CoreRelayContactConfig,
+    CoreRelayContinuation, CoreRelayEndpointConfig, CoreRelayHeader, CoreRelayHttpRequest,
+    CoreRelayHttpResult, CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets,
+    CoreRelayPassOutcome, CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayProgressReason,
+    CoreRelayStage, CoreRelayTransportError, RELAY_PASS_DEADLINE_MS,
+    RELAY_PASS_MAX_AUTHORED_UPLOADS, RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES,
+    RELAY_PASS_MAX_RECEIPT_UPLOADS, RELAY_PASS_MAX_REQUESTS, RELAY_PASS_MAX_RESPONSE_BYTES,
+};
 pub use session::relay_policy::{
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
     core_family_relay_backoff_vectors, core_family_relay_health_vectors,
