@@ -65,6 +65,7 @@ of it: the gap is now countable.
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | core | `MessageStore::ingest_relay_page` is one transaction that commits before it returns, and the action/result seam makes the boundary structural; `core/tests/relay_pass_replay.rs` kills a pass between the consume and its ack and relaunches |
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
+| `DEDUP-01` | A relay mailbox is keyed on `(family_token, msg_id)` by content: it keeps the first stored ciphertext and never overwrites it, an identical re-post is an idempotent dedupe, and a same-id post carrying different immutable content is a distinct reported conflict — never a success that retires the sender's retry state. | core | server enforcement in `relayd/src/lib.rs` (`insert_envelope` and `insert_envelope_with_quota` resolve a same-id re-post by comparing sealed bytes; the differing-content case returns the additive 409 `msg_id_conflict` and leaves the stored row untouched) with `relayd/tests/e2e_mailbox.rs` conflict + dedupe e2e; sender classification in `core/src/relay_status.rs` (`relay_classify_http_error` → `CoreRelayFault::MsgIdConflict`) and `core/src/session/relay_pass.rs` (a conflict is per-envelope, never reaches `apply_success`, so the row stays queued); `core/tests/relay_pass_replay.rs` drives a real pass and proves the outbound row is not marked posted |
 
 ### 1.1 What each rule means, for someone reading it cold
 
@@ -463,6 +464,34 @@ on every call site being careful is not a rule:
   contact id and a message payload, drives the real emit points, and proves
   none of it reaches the archive — with a negative control that tampers with a
   clean archive and requires the scanner to fail.
+
+#### `DEDUP-01` — one msg_id, one content, and a conflict is not a delivery
+
+A `msg_id` is a random public identifier its author generates, and every mesh
+header carries it in the clear, so any party that has seen an envelope in
+flight knows its id. The relay is a deliberately content-agnostic mailbox and
+cannot tell which of two posts claiming one id is authentic. It therefore
+resolves a same-id re-post by *content*: the first stored ciphertext is
+authoritative and is never overwritten. A re-post carrying byte-identical
+sealed content is a genuine idempotent dedupe — this is the load-bearing case
+receipt retries and envelope re-uploads depend on — and it succeeds, naming
+the existing row and taking the longer hop budget and later expiry. A re-post
+carrying *different* sealed content under the same id is a distinct outcome:
+the stored row is left entirely unchanged and the post is answered with the
+additive `409 msg_id_conflict` code rather than a dedupe success.
+
+The distinction is what makes the identifier safe. Were a differing-content
+re-post treated as a success, whoever reached the mailbox first would decide
+what every later poster's id resolves to, and the later poster — seeing a 2xx —
+would retire its own send state believing its content had landed. So the
+sender half of the rule is equally binding: a conflict must never retire the
+retry state for that envelope. The classification lives in the core
+(`CoreRelayFault::MsgIdConflict`), a conflict is per-envelope and terminal for
+that one row but not for the lane, and because it is a non-2xx it never reaches
+the path that marks a row posted. The envelope stays queued, delivers by
+mesh/carry, and resurfaces on a later pass. Older clients that do not recognise
+the code still see a non-2xx and treat the post as not delivered, which is the
+safe degrade.
 
 ## 2. Frames, envelopes, kinds, and limits
 

@@ -1714,10 +1714,16 @@ impl PassState {
 
         match &outstanding.intent {
             ActionIntent::Upload(upload) => {
-                // 413 is per-envelope and terminal for that row; the lane
-                // continues. Everything else says something about the mailbox
-                // rather than the row, so the lane stops spending on it.
-                if fault != CoreRelayFault::MessageTooLarge {
+                // 413 (too large) and 409 (msg_id conflict) are per-envelope
+                // and terminal for that one row; the lane continues with the
+                // rest. Neither marks the row posted — a non-2xx never reaches
+                // `apply_success` — so the envelope stays queued and delivers
+                // by mesh/carry and resurfaces on a later pass (DEDUP-01).
+                // Every other fault says something about the mailbox rather
+                // than the row, so the lane stops spending on it.
+                if fault != CoreRelayFault::MessageTooLarge
+                    && fault != CoreRelayFault::MsgIdConflict
+                {
                     let url = upload.endpoint.url.clone();
                     self.uploads.retain(|queued| queued.endpoint.url != url);
                 }
@@ -2900,6 +2906,7 @@ fn relay_fault_outcome(fault: CoreRelayFault) -> &'static str {
         CoreRelayFault::PassExpired => "pass_expired",
         CoreRelayFault::PassSuspended => "pass_suspended",
         CoreRelayFault::TokenRejected => "token_rejected",
+        CoreRelayFault::MsgIdConflict => "msg_id_conflict",
         CoreRelayFault::Outage => "outage",
     }
 }
