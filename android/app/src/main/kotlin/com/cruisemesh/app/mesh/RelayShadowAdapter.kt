@@ -31,8 +31,8 @@ private const val TAG = "MeshService"
  * line, and only a reviewer's attention stands between the two engines and a
  * second writer. An adapter holding *this* cannot express one.
  *
- * `MeshService` constructs it as `store::noteRelayShadowReport`, which touches
- * the bounded diagnostics ring and nothing else.
+ * [RelaySyncEngine] constructs it as `store::noteRelayShadowReport`, which
+ * touches the bounded diagnostics ring and nothing else.
  */
 internal fun interface RelayShadowReportSink {
     fun note(report: CoreRelayShadowReport, nowMs: Long)
