@@ -153,12 +153,32 @@ class RelayShadowAdapterTest {
         val adapter = adapterFor(store)
         repeat(50) { step ->
             val capture = adapter.beginPass(NOW + step * 3_600_000L)
-            // A pass may still report the recipients it excluded; on its own
-            // that is not evidence worth a sample.
+            // A pass may still report the recipients it excluded and the
+            // carried rows it cannot speak for; on their own neither is
+            // evidence worth a sample.
             capture?.noteSkippedRecipients(listOf(RECIPIENT))
+            capture?.noteUnshadowed(40)
             adapter.finishPass(capture, RelayConfig(URL_A, TOKEN_A), contacts(usable = true), NOW)
         }
         assertFalse(store.exportProtocolEventsJsonl().contains("shadow"))
+    }
+
+    @Test
+    fun `rows the canary cannot speak for are counted even when they came first`() {
+        // A group envelope fans out before the first 1:1 row in the same lane.
+        // The report the 1:1 row earns must still say it could not speak for
+        // the fan-out, or a clean report reads as a claim about rows nobody
+        // compared.
+        val store = MessageStore.open(":memory:")
+        val adapter = adapterFor(store)
+        val capture = adapter.beginPass(NOW)!!
+        capture.noteUnshadowed(12)
+        capture.noteSucceeded(
+            CoreRelayShadowLane.AUTHORED, msgId(), 4u, hint(), RECIPIENT, SEALED_LEN, NOW,
+            RelayConfig(URL_A, TOKEN_A),
+        )
+        adapter.finishPass(capture, RelayConfig(URL_A, TOKEN_A), contacts(usable = true), NOW)
+        assertTrue(store.exportProtocolEventsJsonl().contains("\"rows_unshadowed\":12"))
     }
 
     @Test

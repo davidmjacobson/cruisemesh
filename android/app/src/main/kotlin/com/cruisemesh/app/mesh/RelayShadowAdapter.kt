@@ -364,9 +364,16 @@ internal class RelayShadowPassCapture(private val armSample: () -> Boolean) {
      * Rows this capture deliberately cannot speak for: group fan-out rows,
      * which core's upload lanes do not decompose, and carried rows, which a
      * later package owns.
+     *
+     * Counted whether or not the sample has been armed yet, and never a reason
+     * to arm it. Both halves matter: a mule pass that carries forty rows and
+     * compares none is not evidence worth a sample, and a group row that went
+     * out before the first authored row would otherwise be missing from a
+     * report the authored row does earn -- which is the undercount this field
+     * exists to prevent.
      */
     fun noteUnshadowed(rows: Int) {
-        if (rows > 0 && sampled()) unshadowed += rows
+        if (rows > 0) unshadowed += rows
     }
 
     /**
