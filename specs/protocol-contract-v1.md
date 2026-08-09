@@ -46,7 +46,9 @@ of it: the gap is now countable.
 | ID | Rule | Owner class | Executable owner |
 |---|---|---|---|
 | `ACK-01` | Proxy/carry disposition never makes a relay copy ackable. `SEEN` is ackable only with permitted durable local-consumption proof. | core | `core/src/engine.rs` ack tests; index re-asserts `core_should_ack_inbound` |
+| `ACK-02` | Expiry computed from the client clock never authorizes an ack. Only durable consumption permits a relay-row delete; genuinely expired rows are pruned by the relay on its own server clock. | core | `core/src/engine.rs` ack tests; index re-asserts a client-clock expiry never authorizes an ack |
 | `CARRY-01` | Sending or relay-uploading a carried row does not remove it. Only verified peer digest/receipt proof or expiry permits removal. | core | `core/src/engine.rs` confirm-carried tests, `core/src/store.rs` carry tests; index re-asserts upload-then-survive |
+| `CARRY-02` | Durable removal of a carried row requires an authenticated peer identity. An unauthenticated confirm (a bare BLE HELLO/digest) may only suppress re-offering for the encounter, never remove or retire a row. | core | `core/src/engine.rs` confirm-carried authentication tests; index re-asserts the authenticated-only removal gate |
 | `CURSOR-01` | A frontier advances only across a fully processed page whose required acks succeeded, and never moves backward on a normal pass. | core | `core/src/relay_cursor.rs` advance tests; index re-asserts `relay_cursor_advance` |
 | `PAGE-01` | Only an empty page is EOF. A short page continues. A non-empty non-advancing page terminates safely without unsafe advancement. | core | `core/src/relay_cursor.rs` walk-continuation tests; index re-asserts `relay_fetch_walk_continues` |
 | `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | core | `core/src/session/relay_policy.rs` owns request pacing, the exponential curve and its cap, the `Retry-After` floor, the stable identity jitter, the pending-rerun decision and the pass health fold; `relay_status.rs` owns the header clamp and the classification. Both shells delegate. The first clause — aborting the remaining stages — is completed by C0's pass |
@@ -77,6 +79,22 @@ this" — acks only when durable local evidence names the same envelope, and
 never for a group-addressed row, because a group row is one shared server
 copy that other members still need.
 
+#### `ACK-02` — a wrong clock must not delete other people's mail
+
+The relay marks a fetched row `Expired` by comparing the envelope's expiry to
+*this device's* wall clock. That comparison is not evidence the device ever
+consumed the row, and one phone's clock is not authority over a mailbox every
+family member shares. A phone whose clock is fast or has jumped forward — a
+bad restore, a hand-set clock, an NTP step — would otherwise decide live mail
+is expired and issue a server delete for it, dropping it for every family
+member whose clock is correct. So expiry alone never acks. The only
+disposition that authorizes deleting a relay row is durable consumption; a
+row this device both expired and genuinely consumed still acks, but on the
+consumption, not the clock. Genuinely dead rows are not stranded: the relay
+prunes by its own server clock, which is the single authority for
+expiry-based deletion, so client expiry-acking was redundant as well as
+unsafe.
+
 #### `CARRY-01` — handing a message on is not proof it arrived
 
 A carried envelope is the mesh's memory. Offering it over Bluetooth, or
@@ -85,6 +103,23 @@ that anyone received anything. A carried row is removed on exactly two
 grounds: a peer's digest or receipt naming the envelope, or expiry. This is
 the rule that makes an intermittently-connected fleet converge rather than
 silently lose mail at the first flaky link.
+
+#### `CARRY-02` — only a peer you have authenticated may retire your copy
+
+Removing a carried row is destructive and, for multi-hop-muled 1:1 mail,
+irreversible: this device may hold the sole remaining copy. So the proof that
+lets a peer's digest retire that copy must come from a peer whose identity was
+authenticated — a Noise-authenticated LAN session whose static key matched an
+accepted contact, or a signed delivery receipt. A bare BLE HELLO or DIGEST is
+unauthenticated cleartext link chatter: both the `user_id` it claims and the
+`msg_id`s it advertises are unsigned, so anyone in radio range could name a
+victim and an id they observed. Treating that as proof would let a mule be
+talked into deleting a stranger's undelivered mail — a targeted denial of
+delivery. An unauthenticated confirm therefore removes nothing; it may only
+decline to re-offer for that one encounter, which the digest spray plan
+already does by excluding the ids the peer named. This is the same
+"when in doubt, don't ack" direction as `ACK-01` and `CARRY-01`: churn is
+recoverable, deletion is not.
 
 #### `CURSOR-01` — the frontier only moves over ground you actually covered
 

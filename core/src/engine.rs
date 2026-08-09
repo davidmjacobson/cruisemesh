@@ -327,9 +327,8 @@ pub fn core_inbound_gate(
 /// (deleted from the relay mailbox) on the strength of the disposition
 /// alone.
 ///
-/// Only [`CoreInboundDisposition::Consumed`] (it was ours to open, and we
-/// did) and [`CoreInboundDisposition::Expired`] (it's dead weight regardless
-/// of who it was for) are safe to remove this way. A `Rejected` envelope is
+/// [`CoreInboundDisposition::Consumed`] (it was ours to open, and we did) is
+/// the only disposition safe to remove this way. A `Rejected` envelope is
 /// not ackable: its public header is invalid locally, but this device has not
 /// proven it was the sealed payload's sole true endpoint consumer.
 /// [`CoreInboundDisposition::Carried`] must NOT be acked: relay
@@ -344,6 +343,21 @@ pub fn core_inbound_gate(
 /// [`MessageStore::core_relay_ack_ids_with_consumed`] for the two narrow,
 /// independently store-verified cases where a Seen copy is still safe to
 /// ack -- this function alone can't tell, since it has no store access.
+///
+/// **`Expired` is deliberately NOT ackable (ACK-02).** The `Expired`
+/// disposition is set by [`MessageStore::ingest_relay_page`] purely from the
+/// *client's* wall clock (`expiry_ms <= now_ms`), with no proof this device
+/// ever consumed the row. Acking it would let a single phone whose clock is
+/// fast or has jumped forward (a bad restore, a manual clock set, an NTP
+/// step) issue a server DELETE for still-live mail in a shared family
+/// mailbox, dropping it for every family member whose clock is correct. A
+/// server delete is irreversible; a client clock is not authority over it.
+/// Genuinely expired rows are still cleaned up -- `relayd` prunes by its own
+/// server clock (`relayd/src/lib.rs` `prune_expired_on`), which is the single
+/// authority for expiry-based deletion. Client expiry-acking was therefore
+/// redundant as well as unsafe. A row this device *both* expired *and*
+/// durably consumed still acks -- but on its `Consumed` disposition, not its
+/// expiry, so the durable-consumption proof is what authorizes the delete.
 ///
 /// A `Consumed` group envelope was historically ackable here even though
 /// this device is only ONE of several endpoint consumers of the family's
@@ -362,10 +376,7 @@ pub fn core_inbound_gate(
 /// don't ack. Re-fetch churn is recoverable; a deleted relay copy is not.
 #[uniffi::export]
 pub fn core_should_ack_inbound(disposition: CoreInboundDisposition) -> bool {
-    matches!(
-        disposition,
-        CoreInboundDisposition::Consumed | CoreInboundDisposition::Expired
-    )
+    disposition == CoreInboundDisposition::Consumed
 }
 
 /// Ack ids among `items` using [`core_should_ack_inbound`] alone -- i.e.
@@ -839,13 +850,43 @@ impl MessageStore {
     /// [`Self::carried_envelopes_for_hints`] already excludes anything past
     /// its own `expiry` as of `now_ms`.
     ///
+    /// **Authenticated-peer gate (CARRY-02).** Removing a carried row is a
+    /// destructive, irreversible action: for multi-hop-muled 1:1 mail this
+    /// device may hold the *sole* remaining copy, so a wrongful removal is a
+    /// silent, targeted denial of delivery. It may therefore be driven only
+    /// by an *authenticated* peer identity. `peer_authenticated` must be
+    /// `true` only when the `peer_user_id`/`peer_known_msg_ids` pair came from
+    /// a cryptographically bound source: a Noise-authenticated LAN session
+    /// whose static key matched an accepted contact (`lan_session.rs`), or a
+    /// signed delivery receipt. It must be `false` for anything a peer merely
+    /// *claimed* -- above all a bare BLE HELLO/DIGEST, which is unauthenticated
+    /// cleartext link chatter (`protocol.rs`): the `user_id` it names and the
+    /// `msg_id`s it advertises are unsigned and trivially spoofable, so a
+    /// forged HELLO claiming a victim's `user_id` plus an observed `msg_id`
+    /// must never be able to make a mule delete that victim's mail.
+    ///
+    /// When `peer_authenticated` is `false` this call removes nothing and
+    /// returns 0. That is not a lost suppression: an unauthenticated peer's
+    /// advertised ids are still honoured *ephemerally* for the encounter by
+    /// [`Self::core_digest_spray_plan`], which excludes `peer_known_msg_ids`
+    /// from what it offers -- so a lying peer can at most decline the mail it
+    /// falsely claims to hold, never destroy this device's durable copy of it.
+    /// Only an authenticated confirm retires (removes) a carried row.
+    ///
     /// Returns the number of carried envelopes removed, for caller logging.
     pub fn core_confirm_carried_deliveries(
         &self,
         peer_user_id: Vec<u8>,
         peer_known_msg_ids: Vec<Vec<u8>>,
+        peer_authenticated: bool,
         now_ms: i64,
     ) -> Result<u64, CoreError> {
+        // CARRY-02: durable removal requires an authenticated peer. An
+        // unauthenticated confirm may only suppress re-offering for this
+        // encounter (the spray plan's known-set exclusion), never remove.
+        if !peer_authenticated {
+            return Ok(0);
+        }
         if peer_known_msg_ids.is_empty() {
             return Ok(0);
         }
@@ -877,9 +918,12 @@ impl MessageStore {
     /// 60s poll pass instead of waiting out the full expiry window.
     ///
     /// Per item:
-    /// - [`CoreInboundDisposition::Consumed`] or
-    ///   [`CoreInboundDisposition::Expired`]: ack (same as
-    ///   [`core_relay_ack_ids`]).
+    /// - [`CoreInboundDisposition::Consumed`]: ack (same as
+    ///   [`core_relay_ack_ids`]). [`CoreInboundDisposition::Expired`] does
+    ///   NOT ack (ACK-02): expiry is computed from the client clock and is no
+    ///   proof this device consumed anything, so a skewed clock must not be
+    ///   able to delete a shared row for everyone; `relayd` prunes truly-dead
+    ///   rows by its own server clock instead.
     /// - [`CoreInboundDisposition::Carried`]: never ack -- the relay copy is
     ///   the durable fallback until the real recipient (or another proxy)
     ///   fetches it.
@@ -913,8 +957,10 @@ impl MessageStore {
     /// of this device's imported groups' recent-day hints names a legacy
     /// shared-mailbox row that EVERY member fetches -- so it is never acked
     /// (not even on `Consumed`: this device is only one of several endpoint
-    /// consumers), except when `Expired`, which is dead weight for every
-    /// member alike. New-style group mail never trips this rule: per-member
+    /// consumers). Since ACK-02 there is no `Expired` escape from this rule
+    /// either: expiry never acks, so a legacy row is only ever deleted by
+    /// `relayd`'s server-clock prune, which is correct for every member at
+    /// once. New-style group mail never trips this rule: per-member
     /// fan-out rows ([`core_group_fanout_rows`]) are addressed to a member's
     /// OWN hint, indistinguishable from 1:1 mail, and their `Consumed` ack
     /// is correct precisely because each row has exactly one reader. Legacy
@@ -940,10 +986,12 @@ impl MessageStore {
         }
         let mut acked = Vec::with_capacity(items.len());
         for item in items {
-            if item.disposition != CoreInboundDisposition::Expired
-                && legacy_group_hints.contains(&item.recipient_hint)
-            {
+            if legacy_group_hints.contains(&item.recipient_hint) {
                 // Shared legacy row; other members still need it. Never ack.
+                // (Expired needs no exception here: since ACK-02, expiry alone
+                // never acks anything, so a legacy row's expiry cannot delete
+                // the shared copy the other members are still fetching either
+                // -- `relayd` prunes it server-side when it is truly dead.)
                 continue;
             }
             if core_should_ack_inbound(item.disposition) {
@@ -1120,7 +1168,25 @@ mod tests {
             disp(4, vec![4; 16], CoreInboundDisposition::Seen),
             disp(5, vec![5; 16], CoreInboundDisposition::Rejected),
         ];
-        assert_eq!(core_relay_ack_ids(items), vec![1, 3]);
+        // Only the durably-consumed row acks. Expired (id 3) is deliberately
+        // excluded (ACK-02): it is derived from the client clock and proves no
+        // consumption, so a skewed clock must not delete shared mail. relayd
+        // prunes truly-expired rows on its own server clock.
+        assert_eq!(core_relay_ack_ids(items), vec![1]);
+    }
+
+    #[test]
+    fn a_client_clock_expiry_never_authorizes_an_ack() {
+        // ACK-02 owner: the `Expired` disposition comes purely from the client
+        // clock and carries no proof of consumption, so it must never make a
+        // relay row ackable. Only durable consumption may.
+        assert!(!core_should_ack_inbound(CoreInboundDisposition::Expired));
+        assert!(core_should_ack_inbound(CoreInboundDisposition::Consumed));
+        let acked = core_relay_ack_ids(vec![
+            disp(1, vec![1; 16], CoreInboundDisposition::Expired),
+            disp(2, vec![2; 16], CoreInboundDisposition::Consumed),
+        ]);
+        assert_eq!(acked, vec![2], "expiry alone must not authorize a delete");
     }
 
     #[test]
@@ -1815,7 +1881,10 @@ mod tests {
                 disposition: CoreInboundDisposition::Consumed,
                 recipient_hint: legacy_hint.clone(),
             },
-            // Same hint but Expired: dead weight for every member -- ackable.
+            // Same hint but Expired. Since ACK-02, expiry alone never acks --
+            // not even for a legacy row -- so this device does not delete the
+            // shared copy the other members still fetch; relayd prunes it
+            // server-side when it is truly dead.
             CoreRelayEnvelopeDisposition {
                 relay_id: 2,
                 msg_id: vec![2; 16],
@@ -1826,7 +1895,10 @@ mod tests {
         let acked = store
             .core_relay_ack_ids_with_consumed(items, own, now)
             .unwrap();
-        assert_eq!(acked, vec![2]);
+        assert!(
+            acked.is_empty(),
+            "neither a consumed legacy row nor an expired one may be acked, got {acked:?}"
+        );
     }
 
     #[test]
@@ -2877,13 +2949,57 @@ mod tests {
 
         // Only the id the peer's digest actually advertised is proven
         // delivered; the other carry -- addressed to the same peer -- must
-        // survive since we have no positive evidence for it yet.
+        // survive since we have no positive evidence for it yet. Confirmed by
+        // an authenticated peer, so removal is permitted (CARRY-02).
         let removed = store
-            .core_confirm_carried_deliveries(peer_user_id, vec![advertised_id], now_ms)
+            .core_confirm_carried_deliveries(peer_user_id, vec![advertised_id], true, now_ms)
             .unwrap();
 
         assert_eq!(removed, 1);
         assert_eq!(store.carried_len().unwrap(), 1);
+    }
+
+    #[test]
+    fn confirm_carried_deliveries_from_an_unauthenticated_peer_removes_nothing() {
+        // CARRY-02 owner: a bare BLE HELLO/DIGEST is unauthenticated, so the
+        // `peer_user_id` and advertised `msg_id`s are unsigned claims. A
+        // spoofed HELLO naming a victim plus an observed id must NOT be able
+        // to delete the victim's carried (possibly sole-copy) mail. An
+        // unauthenticated confirm removes nothing; the same advertisement from
+        // an authenticated peer still removes, proving the gate is the only
+        // difference.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let peer_user_id = vec![5_u8; 16];
+        let now_ms = 1_700_000_000_000_i64;
+        let peer_hint_today = compute_recipient_hint(peer_user_id.clone(), now_ms);
+        let advertised_id = vec![1_u8; 16];
+        store
+            .enqueue_carried_envelope(
+                carried_envelope(&advertised_id, peer_hint_today, now_ms + 60_000),
+                false,
+                now_ms,
+                BIG_BUDGET,
+            )
+            .unwrap();
+
+        // Unauthenticated: the claim is ignored for removal purposes.
+        let removed_unauth = store
+            .core_confirm_carried_deliveries(
+                peer_user_id.clone(),
+                vec![advertised_id.clone()],
+                false,
+                now_ms,
+            )
+            .unwrap();
+        assert_eq!(removed_unauth, 0);
+        assert_eq!(store.carried_len().unwrap(), 1);
+
+        // Same advertisement, now from an authenticated peer: removal fires.
+        let removed_auth = store
+            .core_confirm_carried_deliveries(peer_user_id, vec![advertised_id], true, now_ms)
+            .unwrap();
+        assert_eq!(removed_auth, 1);
+        assert_eq!(store.carried_len().unwrap(), 0);
     }
 
     #[test]
@@ -2912,7 +3028,7 @@ mod tests {
             .unwrap();
 
         let removed = store
-            .core_confirm_carried_deliveries(peer_user_id, vec![group_msg_id], now_ms)
+            .core_confirm_carried_deliveries(peer_user_id, vec![group_msg_id], true, now_ms)
             .unwrap();
 
         assert_eq!(removed, 0);
@@ -2941,7 +3057,7 @@ mod tests {
             .unwrap();
 
         let removed = store
-            .core_confirm_carried_deliveries(peer_user_id, vec![expired_id], now_ms)
+            .core_confirm_carried_deliveries(peer_user_id, vec![expired_id], true, now_ms)
             .unwrap();
 
         assert_eq!(removed, 0);
@@ -2952,7 +3068,7 @@ mod tests {
     fn confirm_carried_deliveries_is_a_no_op_when_the_peer_advertises_nothing() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let removed = store
-            .core_confirm_carried_deliveries(vec![5_u8; 16], vec![], 1_700_000_000_000)
+            .core_confirm_carried_deliveries(vec![5_u8; 16], vec![], true, 1_700_000_000_000)
             .unwrap();
         assert_eq!(removed, 0);
     }

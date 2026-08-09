@@ -1325,7 +1325,7 @@ class MeshService : Service() {
         // its carried-copy confirmations retire envelopes the drain below would
         // otherwise re-offer, which is the spray the cooldown exists to reduce.
         takeGatedDigest(peerUserId)?.let { gated ->
-            respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity, gate)
+            respondToDigest(address, peerUserId, gated.entries, gated.recentMsgIds, identity, gate, gated.peerAuthenticated)
         }
         val drained = envelopeProcessor?.drainCarriedEnvelopesTo(address, peerUserId, gate.carriedBudgetBytes) ?: 0L
         SprayPolicy.noteBytesQueued(address, drained)
@@ -1347,12 +1347,27 @@ class MeshService : Service() {
         scheduleDeferredSpray(peerUserId, gate.retryAfterMs)
     }
 
-    /** A peer DIGEST held by the spray cooldown; see [gatedDigests]. */
-    private class GatedDigest(val entries: List<DigestEntry>, val recentMsgIds: List<ByteArray>)
+    /**
+     * A peer DIGEST held by the spray cooldown; see [gatedDigests].
+     *
+     * [peerAuthenticated] is captured at ARRIVAL (CARRY-02) and replayed
+     * unchanged so a BLE-sourced digest can never be treated as authenticated
+     * merely because it is answered on a later-elected LAN link.
+     */
+    private class GatedDigest(
+        val entries: List<DigestEntry>,
+        val recentMsgIds: List<ByteArray>,
+        val peerAuthenticated: Boolean,
+    )
 
-    private fun stashGatedDigest(peerUserId: ByteArray, entries: List<DigestEntry>, recentMsgIds: List<ByteArray>) {
+    private fun stashGatedDigest(
+        peerUserId: ByteArray,
+        entries: List<DigestEntry>,
+        recentMsgIds: List<ByteArray>,
+        peerAuthenticated: Boolean,
+    ) {
         synchronized(gatedDigests) {
-            gatedDigests[UserIdHex.encode(peerUserId)] = GatedDigest(entries, recentMsgIds)
+            gatedDigests[UserIdHex.encode(peerUserId)] = GatedDigest(entries, recentMsgIds, peerAuthenticated)
         }
     }
 
@@ -1912,6 +1927,19 @@ class MeshService : Service() {
 
         val resolvedPeerUserId = peerUserId!!
 
+        // CARRY-02: the authentication of a carried-delivery confirmation must
+        // bind to the transport the digest ARRIVED on, not the link we happen
+        // to answer on. `recentMsgIds` (the peer's advertised known-ids) is
+        // captured here, at arrival, and carried unchanged through any stash
+        // and replay; deriving the flag later from the elected route would let
+        // a digest that arrived over unauthenticated BLE be answered on a
+        // freshly-elected LAN link and have its advertised ids laundered into
+        // an authenticated removal. A LAN link is registered only after a
+        // completed Noise handshake whose static key matched an accepted
+        // contact ([onLanPeerAuthenticated]); a BLE link is not.
+        val peerAuthenticated =
+            MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
+
         // Post-reject cooldown (#275), the other half of the one in
         // [handleHello]. Everything in [respondToDigest] is outbound on the same
         // notify path the cooldown was armed for, and it is the *larger* half of
@@ -1935,7 +1963,7 @@ class MeshService : Service() {
                 "Holding the digest response for $address for ${syncDeferralMs}ms " +
                     "after a notify-reject teardown on this address",
             )
-            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds)
+            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds, peerAuthenticated)
             scheduleDeferredSpray(resolvedPeerUserId, syncDeferralMs)
             return
         }
@@ -1956,12 +1984,12 @@ class MeshService : Service() {
                 TAG,
                 "Holding the digest response for $address: ${gate.reason} (retry in ${gate.retryAfterMs}ms)",
             )
-            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds)
+            stashGatedDigest(resolvedPeerUserId, entries, recentMsgIds, peerAuthenticated)
             rearmGatedSpray(resolvedPeerUserId, gate)
             return
         }
 
-        respondToDigest(address, resolvedPeerUserId, entries, recentMsgIds, identity, gate)
+        respondToDigest(address, resolvedPeerUserId, entries, recentMsgIds, identity, gate, peerAuthenticated)
     }
 
     /**
@@ -1972,6 +2000,10 @@ class MeshService : Service() {
      * [address] is passed rather than re-derived: on the replay path the elected
      * route may have moved since the digest arrived, and what the peer told us
      * about its own state is true whichever link we answer on.
+     *
+     * [peerAuthenticated] is likewise passed, not re-derived: it must reflect
+     * the transport the digest ARRIVED on (CARRY-02), which on the replay path
+     * may differ from [address]'s current transport.
      */
     private fun respondToDigest(
         address: String,
@@ -1980,6 +2012,7 @@ class MeshService : Service() {
         recentMsgIds: List<ByteArray>,
         identity: Identity,
         gate: CoreSprayGate,
+        peerAuthenticated: Boolean,
     ) {
         // Everything queued here that is not part of the spray plan -- the
         // receipt repair pass, the per-missing-message re-send loop and the
@@ -2028,7 +2061,7 @@ class MeshService : Service() {
         // admission sees a link allowance that already reflects what this
         // encounter has queued.
         SprayPolicy.noteBytesQueued(address, queuedBytes)
-        envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate)
+        envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate, peerAuthenticated)
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
         }

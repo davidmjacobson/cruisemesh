@@ -98,10 +98,25 @@ const CONTRACT: &[Invariant] = &[
         owner: Owner::Core("core/src/engine.rs ack-eligibility tests"),
     },
     Invariant {
+        id: "ACK-02",
+        statement: "Client-clock expiry alone never acks a relay row; only durable consumption \
+                    authorizes a server delete, and truly-expired rows are pruned server-side.",
+        owner: Owner::Core(
+            "core/src/engine.rs ack-eligibility tests (a client-clock expiry \
+                            never authorizes an ack)",
+        ),
+    },
+    Invariant {
         id: "CARRY-01",
         statement: "Sending or relay-uploading a carried row does not remove it; only digest/\
                     receipt proof or expiry may.",
         owner: Owner::Core("core/src/engine.rs confirm-carried + core/src/store.rs carry tests"),
+    },
+    Invariant {
+        id: "CARRY-02",
+        statement: "Durable removal of a carried row requires an authenticated peer identity; an \
+                    unauthenticated confirm may only suppress re-offering, never remove.",
+        owner: Owner::Core("core/src/engine.rs confirm-carried authentication tests"),
     },
     Invariant {
         id: "CURSOR-01",
@@ -591,7 +606,7 @@ fn disposition(relay_id: i64, disposition: CoreInboundDisposition) -> CoreRelayE
 }
 
 #[test]
-fn ack_01_only_consumed_or_expired_mail_is_ackable() {
+fn ack_01_only_consumed_mail_is_ackable_on_disposition_alone() {
     let id = lookup("ACK-01").id;
 
     for never in [
@@ -611,11 +626,6 @@ fn ack_01_only_consumed_or_expired_mail_is_ackable() {
         core_should_ack_inbound(CoreInboundDisposition::Consumed),
         "a durably consumed envelope is the ackable case"
     );
-    contract_assert!(
-        id,
-        core_should_ack_inbound(CoreInboundDisposition::Expired),
-        "an expired envelope has nothing left to preserve"
-    );
 
     let acked = core_relay_ack_ids(vec![
         disposition(1, CoreInboundDisposition::Consumed),
@@ -627,6 +637,98 @@ fn ack_01_only_consumed_or_expired_mail_is_ackable() {
         id,
         acked == vec![1],
         "only the consumed row may be acked, got {acked:?}"
+    );
+}
+
+#[test]
+fn ack_02_client_clock_expiry_never_authorizes_an_ack() {
+    let id = lookup("ACK-02").id;
+
+    // The `Expired` disposition is set purely from the client's wall clock, so
+    // it is not proof this device consumed anything. It must never, on its own,
+    // authorize deleting a relay row -- a skewed clock would otherwise wipe
+    // still-live shared mail for every family member. relayd prunes genuinely
+    // expired rows on its own server clock.
+    contract_assert!(
+        id,
+        !core_should_ack_inbound(CoreInboundDisposition::Expired),
+        "expiry computed from the client clock must not make a row ackable"
+    );
+    contract_assert!(
+        id,
+        core_should_ack_inbound(CoreInboundDisposition::Consumed),
+        "durable consumption remains the ackable case"
+    );
+
+    let acked = core_relay_ack_ids(vec![
+        disposition(1, CoreInboundDisposition::Expired),
+        disposition(2, CoreInboundDisposition::Consumed),
+    ]);
+    contract_assert!(
+        id,
+        acked == vec![2],
+        "only the consumed row may be acked; expiry alone deletes nothing, got {acked:?}"
+    );
+}
+
+#[test]
+fn carry_02_durable_removal_requires_an_authenticated_peer() {
+    let id = lookup("CARRY-02").id;
+    let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+    let now_ms = 1_700_000_000_000;
+    let peer_user_id = vec![5u8; 16];
+    let peer_hint_today = compute_recipient_hint(peer_user_id.clone(), now_ms);
+    let advertised_id = vec![1u8; 16];
+
+    let envelope = CarriedEnvelope {
+        msg_id: advertised_id.clone(),
+        hop_ttl: 6,
+        expiry: now_ms + 60_000,
+        recipient_hint: peer_hint_today,
+        sealed: vec![9; 64],
+    };
+    let accepted = store
+        .enqueue_carried_envelope(envelope, false, now_ms, 1024 * 1024)
+        .expect("enqueue carried");
+    contract_assert!(id, accepted, "the fixture carry should have been accepted");
+
+    // An UNAUTHENTICATED confirm (a bare BLE HELLO/DIGEST claim) removes
+    // nothing -- a spoofed identity plus an observed id must not delete a
+    // possibly sole-copy carried row.
+    let removed_unauth = store
+        .core_confirm_carried_deliveries(
+            peer_user_id.clone(),
+            vec![advertised_id.clone()],
+            false,
+            now_ms,
+        )
+        .expect("unauthenticated confirm");
+    contract_assert!(
+        id,
+        removed_unauth == 0,
+        "an unauthenticated confirm must remove nothing, removed {removed_unauth}"
+    );
+    contract_assert!(
+        id,
+        store.carried_len().expect("carried len") == 1,
+        "the carried row must survive an unauthenticated confirm"
+    );
+
+    // The SAME advertisement from an AUTHENTICATED peer (Noise-authenticated
+    // LAN session or signed receipt) retires the row -- so the gate is the
+    // only difference, and legitimate delivery confirmation still works.
+    let removed_auth = store
+        .core_confirm_carried_deliveries(peer_user_id, vec![advertised_id], true, now_ms)
+        .expect("authenticated confirm");
+    contract_assert!(
+        id,
+        removed_auth == 1,
+        "an authenticated confirm must retire the delivered row, removed {removed_auth}"
+    );
+    contract_assert!(
+        id,
+        store.carried_len().expect("carried len") == 0,
+        "the delivered row must be gone after an authenticated confirm"
     );
 }
 
@@ -2304,7 +2406,15 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // needs one (SECRET-01 is checked over the whole corpus rather than by a
     // trace of its own), but the mapping must be deliberate rather than
     // accidental, so the exemptions are named here.
-    const NO_FIXTURE_NEEDED: &[&str] = &["ACK-01", "SECRET-01", "HELLO-01", "ENDPOINT-01", "UI-01"];
+    const NO_FIXTURE_NEEDED: &[&str] = &[
+        "ACK-01",
+        "ACK-02",
+        "CARRY-02",
+        "SECRET-01",
+        "HELLO-01",
+        "ENDPOINT-01",
+        "UI-01",
+    ];
 
     let mut covered: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for stem in FIXTURES {
