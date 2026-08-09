@@ -1,13 +1,22 @@
-# Voice over WiFi: recommendation and spec
+# Voice messages: recommendation and spec
 
 Status: proposal, 2026-08-05. Grounded against `core/src/content.rs`, `limits.rs`,
 `lan_session.rs`, `protocol.rs`, `relayd/src/lib.rs`, and both shells' manifests.
 
+> **What shipped:** asynchronous **voice messages** — hold to record, release to
+> send as an ordinary audio attachment, tap to play. Live, real-time
+> walkie-talkie "push-to-talk" (Phase 2 below) was considered and **explicitly
+> deferred**; it has never shipped. Where this document says "PTT" or "voice
+> burst," read it as the async voice-message UX unless it says "live PTT." The
+> **As built (Phase 1)** section at the end records how the shipped
+> implementation departs from this proposal.
+
 ## Recommendation
 
-**Do not build real-time voice calls. Do build push-to-talk as asynchronous
-voice bursts on the existing attachment pipeline, with an optional later
-live-PTT fast path over LAN.**
+**Do not build real-time voice calls. Do build asynchronous voice messages —
+recorded voice bursts on the existing attachment pipeline — and treat a live
+walkie-talkie fast path over LAN as an optional later step (deferred; see
+Phase 2).**
 
 Three-quarters of PTT already exists in the codebase: `CoreAttachmentPayload`
 supports `AttachmentMediaType::Audio` with `duration_ms` and a 180 KiB blob cap
@@ -72,10 +81,10 @@ decision on top of shipped infrastructure. Calls are a different product.
 
 ---
 
-## Spec: Phase 1 — PTT voice bursts (recommended)
+## Spec: Phase 1 — asynchronous voice messages (recommended)
 
-One-line: a hold-to-talk button that records a short Opus clip and sends it as
-a normal attachment envelope, with walkie-talkie receive semantics for
+One-line: a hold-to-record button that records a short Opus clip and sends it as
+a normal attachment envelope, with walkie-talkie catch-up receive semantics for
 capable, opted-in recipients.
 
 ### 1. Codec and blob format
@@ -133,7 +142,7 @@ capable, opted-in recipients.
   headphones/earbuds; if the A2DP mitigation banner is active, prefer the
   phone speaker rather than fighting the shared radio.
 - Strings in `strings.xml`/`Localizable.xcstrings`; sentence case; no jargon
-  ("Voice message," "Hold to talk").
+  ("Voice message," "Hold to record").
 
 ### 4. Platform notes
 

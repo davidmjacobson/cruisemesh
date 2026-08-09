@@ -14,7 +14,7 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <!-- QR-code friending (DESIGN.md §6.2) and in-chat camera photos -->
     <uses-permission android:name="android.permission.CAMERA" />
-    <!-- In-chat push-to-talk voice messages (DESIGN.md §8, specs/voice-ptt.md) -->
+    <!-- In-chat voice messages (DESIGN.md §8, specs/voice-messages.md) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Internet relay flush (DESIGN.md §9), best-effort only -->
     <uses-permission android:name="android.permission.INTERNET" />
