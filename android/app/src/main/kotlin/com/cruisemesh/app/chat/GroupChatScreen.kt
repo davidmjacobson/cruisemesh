@@ -374,6 +374,7 @@ fun GroupChatScreen(
                     voiceRecorder.stop()?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
                 },
                 onCancelVoice = { voiceRecorder.cancel() },
+                bytesRecorded = { voiceRecorder.bytesRecorded() },
             )
         },
         overlays = {

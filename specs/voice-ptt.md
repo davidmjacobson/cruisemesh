@@ -43,18 +43,18 @@ decision on top of shipped infrastructure. Calls are a different product.
 
 ### Practical reasons against calls
 
-- **No Mac.** CallKit, AVAudioEngine full-duplex, and the `voip` background
-  mode cannot be developed against CI-as-compiler. Real-time audio is the
-  single worst category of feature to ship untested on a platform; async PTT
-  playback/record is the same `VoiceRecorder` surface already in tree.
-- **Store review risk at the worst time.** The Play 14-day production clock is
-  running. Calls mean `foregroundServiceType="microphone"` on Android (new
-  sensitive-FGS declaration + video, review reset risk) and `voip`/CallKit on
-  iOS (new review scrutiny). PTT recording only in a foreground activity needs
-  **no new manifest surface on either platform.**
-- **One developer, real-time audio QA needs two humans in real time.** The
-  two-phone rig can verify an async voice envelope end-to-end with a scripted
-  assertion (blob digest + duration). It cannot verify echo cancellation.
+- **Real-time audio cannot be verified in CI.** CallKit, AVAudioEngine
+  full-duplex, and the `voip` background mode are only exercisable on hardware,
+  and real-time audio is the worst category of feature to ship untested. Async
+  PTT playback/record is the same `VoiceRecorder` surface already in tree.
+- **Calls need new sensitive platform declarations.** They mean
+  `foregroundServiceType="microphone"` on Android (a sensitive-FGS declaration
+  with its own review) and `voip`/CallKit on iOS. PTT recording only in a
+  foreground activity needs **no new manifest surface on either platform.**
+- **Automated verification stops at the envelope.** The two-phone rig can
+  verify an async voice envelope end-to-end with a scripted assertion (blob
+  digest + duration). It cannot verify echo cancellation, which needs two
+  people in two places at the same time.
 
 ### Product reasons
 
@@ -207,7 +207,7 @@ stays cheap if built:
   relay-mediated audio.** Reasons in the recommendation. If this ever becomes
   a real demand, it should be scoped as its own product (likely
   WebRTC-over-relayd-TURN with per-family metering) rather than grafted onto
-  the mesh core — and it should wait for a Mac.
+  the mesh core — and it should wait for a hardware-testable pipeline.
 
 ---
 
@@ -222,8 +222,8 @@ a considered decision as an oversight.
   writes Ogg, iOS's writes CAF, and neither platform's player reads the other's
   container — so honouring it would have meant vendoring libopus into the NDK
   and iOS CI toolchains and replacing both shells' capture and playback with raw
-  PCM pipelines. That is a large change nobody can test on device here (no Mac),
-  and it would make every voice message unplayable on already-shipped clients.
+  PCM pipelines. That is a large change with no device coverage behind it, and
+  it would make every voice message unplayable on already-shipped clients.
   AAC-LC is what both shells already write and both already read. What the
   proposal's numbers were really buying — ~2 KB/s so a full-length burst fits
   180 KiB with headroom — is honoured: 20 kbps mono at 16 kHz is 2.5 KB/s, and a
@@ -234,6 +234,22 @@ a considered decision as an oversight.
   `core/src/voice.rs` computes it from the blob cap, the container overhead and
   a headroom reserve, and both shells read it. There are no per-platform copies
   of the bitrate, the bound, the minimum hold, or the slide thresholds.
+- **The clock is not the only bound.** A duration derived from a bitrate only
+  holds if the encoder honours that bitrate, and AAC encoders vary in how low a
+  bitrate they accept at 16 kHz mono. So both shells weigh the file the encoder
+  is actually writing on every 100 ms tick and stop on whichever bound arrives
+  first (`voice_capture_bytes`). Being byte-bound costs the user seconds; being
+  unbound costs them the whole recording, after they have already spoken it.
+- **A hold is not the only way in.** `voice_capture_start_hands_free` enters the
+  same locked state directly, because neither a screen reader nor a switch can
+  express "press and keep pressing". Android reaches it through a semantics
+  action on the mic; iOS through the Start/Stop sheet.
+- **A locked recording is cancelled when the app leaves the foreground.**
+  Hands-free is the first state where recording outlives the finger, and neither
+  platform lets a foreground-only app keep a live microphone in the background.
+  Android watches `ON_STOP`; iOS watches `scenePhase == .background` and
+  `AVAudioSession.interruptionNotification`. The user is told the recording
+  stopped rather than being sent a minute of silence.
 - **No `ptt` payload flag and no HELLO2 capability bit.** Both were proposed for
   sender-side affordance only ("show PTT vs voice-memo per contact"). Nothing on
   the wire changed: a voice message is an ordinary audio attachment.

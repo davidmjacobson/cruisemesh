@@ -284,11 +284,11 @@ struct GroupChatView: View {
     private func sendVoice(url: URL, durationMs: Int32) {
         defer { try? FileManager.default.removeItem(at: url) }
         guard let data = try? Data(contentsOf: url), !data.isEmpty else {
-            statusMessage = "Could not save that voice message"
+            statusMessage = String(localized: "Could not save that voice message")
             return
         }
         guard data.count <= AttachmentPayload.maxBlobBytes else {
-            statusMessage = "That voice message is too long to send. Try a shorter one."
+            statusMessage = String(localized: "That voice message is too long to send. Try a shorter one.")
             return
         }
         sender.sendAttachment(

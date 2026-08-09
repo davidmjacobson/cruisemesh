@@ -67,7 +67,7 @@ workspace, the Android unit suite, and the iOS build and test suite gate every
 pull request.
 
 What works today: 1:1 and group messaging, delivery and read receipts, photos
-and voice memos (inline, up to 180 KiB), QR friending with a spoken 4-word
+and push-to-talk voice messages (inline, up to 180 KiB), QR friending with a spoken 4-word
 fingerprint, friends-of-friends introductions, all four delivery routes above,
 block and report, and passphrase-encrypted local backup and restore.
 

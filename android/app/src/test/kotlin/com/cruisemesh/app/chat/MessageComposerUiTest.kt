@@ -6,12 +6,15 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertWidthIsAtLeast
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTouchInput
@@ -187,6 +190,71 @@ class MessageComposerUiTest {
         compose.onNodeWithContentDescription("Hold to talk").assertIsDisplayed()
     }
 
+    /**
+     * Hold-to-talk is a gesture a switch-access or TalkBack user cannot make,
+     * so the mic also carries a plain click action into the hands-free state,
+     * where Cancel and Send are ordinary buttons.
+     */
+    @Test
+    fun theMicHasAClickActionForPeopleWhoCannotHold() {
+        val recorder = FakeRecorder()
+
+        compose.setContent { ComposerUnderTest(recorder) }
+
+        compose.onNodeWithContentDescription("Hold to talk")
+            .performSemanticsAction(SemanticsActions.OnClick)
+        assertEquals(1, recorder.started)
+
+        recorder.clockMs += 3_000
+        compose.onNodeWithContentDescription("Send voice message").performClick()
+
+        assertEquals(1, recorder.stopped)
+        assertEquals(0, recorder.cancelled)
+    }
+
+    @Test
+    fun aHandsFreeRecordingCanBeCancelledFromThePill() {
+        val recorder = FakeRecorder()
+
+        compose.setContent { ComposerUnderTest(recorder) }
+
+        compose.onNodeWithContentDescription("Hold to talk")
+            .performSemanticsAction(SemanticsActions.OnClick)
+        compose.onNodeWithText("Cancel").performClick()
+
+        assertEquals(1, recorder.started)
+        assertEquals(0, recorder.stopped)
+        assertEquals(1, recorder.cancelled)
+    }
+
+    /**
+     * The duration bound only holds if the encoder honoured the bitrate it was
+     * asked for. When it did not, the file fills the envelope early and the
+     * recording has to end there — not after the user has finished speaking.
+     */
+    @Test
+    fun anEncoderThatOvershootsEndsTheRecordingOnBytes() {
+        val recorder = FakeRecorder()
+
+        compose.setContent { ComposerUnderTest(recorder) }
+
+        compose.onNodeWithContentDescription("Hold to talk")
+            .performSemanticsAction(SemanticsActions.OnClick)
+        assertEquals(1, recorder.started)
+        assertEquals(0, recorder.stopped)
+
+        // Far past any plausible budget, however generous.
+        recorder.bytes = 4L * 1024 * 1024
+        recorder.clockMs += 1_000
+        repeat(10) {
+            compose.mainClock.advanceTimeBy(200)
+            compose.waitForIdle()
+        }
+
+        assertEquals(1, recorder.stopped)
+        assertEquals(0, recorder.cancelled)
+    }
+
     @Composable
     private fun ComposerUnderTest(recorder: FakeRecorder) {
         CruiseMeshTheme {
@@ -204,6 +272,7 @@ class MessageComposerUiTest {
                 },
                 onStopVoice = { recorder.stopped += 1 },
                 onCancelVoice = { recorder.cancelled += 1 },
+                bytesRecorded = { recorder.bytes },
                 nowMs = { recorder.clockMs },
             )
         }
@@ -214,5 +283,6 @@ class MessageComposerUiTest {
         var stopped = 0
         var cancelled = 0
         var clockMs = 1_000_000L
+        var bytes = 0L
     }
 }

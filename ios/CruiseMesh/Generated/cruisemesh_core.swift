@@ -31721,6 +31721,19 @@ public func verifySharedFriendCard(shared: SharedFriendCard, sharerSignPk: Data,
 })
 }
 /**
+ * The shell weighed the file the encoder is writing. Running out of byte
+ * budget ends the recording the same way running out of clock does: send what
+ * was said. See [`voice_capture_byte_budget`] for why this exists at all.
+ */
+public func voiceCaptureBytes(state: CoreVoiceCaptureState, bytesWritten: UInt32) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_bytes(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),
+        FfiConverterUInt32.lower(bytesWritten),$0
+    )
+})
+}
+/**
  * Explicit cancel: the cancel control, a failed recorder, or leaving the chat.
  */
 public func voiceCaptureCancel(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
@@ -31793,7 +31806,11 @@ public func voiceCaptureIdleState() -> CoreVoiceCaptureState {
  * The ceiling binds, not the cap, which is the configuration we want: a
  * full-length 60 s burst is ~158 KB of the 180 KiB budget. If the bitrate ever
  * rises far enough for the cap to bind instead, the recording time shortens on
- * its own and [`voice_duration_fits_attachment`] still holds.
+ * its own.
+ *
+ * All of that assumes the encoder honours the bitrate. When it does not, the
+ * clock is the wrong bound entirely, which is what
+ * [`voice_capture_byte_budget`] and [`voice_capture_bytes`] are for.
  */
 public func voiceCapturePlan() -> CoreVoiceCapturePlan {
     return try!  FfiConverterTypeCoreVoiceCapturePlan.lift(try! rustCall() {
@@ -31824,26 +31841,18 @@ public func voiceCaptureRelease(state: CoreVoiceCaptureState, elapsedMs: UInt32)
 })
 }
 /**
- * True when a recording of `duration_ms` is expected to fit one envelope.
- */
-public func voiceDurationFitsAttachment(durationMs: UInt32) -> Bool {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_cruisemesh_core_fn_func_voice_duration_fits_attachment(
-        FfiConverterUInt32.lower(durationMs),$0
-    )
-})
-}
-/**
- * Expected encoded size of a recording of `duration_ms`, container included.
+ * Begin recording hands-free, with no hold at all.
  *
- * The shells use this to warn *before* recording rather than discovering the
- * overflow afterwards; the post-encode size check stays as the real gate,
- * because an encoder is free to ignore the bitrate we asked for.
+ * Hold-to-talk is a gesture some people cannot make: a switch-access user has
+ * no way to express "press and keep pressing", and a screen reader owns the
+ * double-tap-and-hold that would otherwise reach the button. This is the same
+ * state a slide-up lock reaches, entered directly, so those users get the
+ * ordinary Cancel / Stop-and-send controls instead of a gesture.
  */
-public func voiceEstimatedBlobBytes(durationMs: UInt32) -> UInt32 {
-    return try!  FfiConverterUInt32.lift(try! rustCall() {
-    uniffi_cruisemesh_core_fn_func_voice_estimated_blob_bytes(
-        FfiConverterUInt32.lower(durationMs),$0
+public func voiceCaptureStartHandsFree(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
+    return try!  FfiConverterTypeCoreVoiceCaptureStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_voice_capture_start_hands_free(
+        FfiConverterTypeCoreVoiceCaptureState.lower(state),$0
     )
 })
 }
@@ -32493,6 +32502,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_verify_shared_friend_card() != 27605) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_bytes() != 23913) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_voice_capture_cancel() != 42180) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -32508,7 +32520,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_voice_capture_idle_state() != 13858) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_voice_capture_plan() != 39091) {
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_plan() != 51964) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_voice_capture_press() != 57222) {
@@ -32517,10 +32529,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_voice_capture_release() != 25036) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_voice_duration_fits_attachment() != 41587) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_cruisemesh_core_checksum_func_voice_estimated_blob_bytes() != 49079) {
+    if (uniffi_cruisemesh_core_checksum_func_voice_capture_start_hands_free() != 1458) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {

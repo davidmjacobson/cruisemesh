@@ -2,6 +2,7 @@ package com.cruisemesh.app.media
 
 import android.content.Context
 import android.media.MediaRecorder
+import android.os.SystemClock
 import android.util.Log
 import uniffi.cruisemesh_core.CoreVoiceCapturePlan
 import uniffi.cruisemesh_core.voiceCapturePlan
@@ -28,7 +29,26 @@ class VoiceRecorder(private val context: Context) {
     private var outputFile: File? = null
     private var startedAtMs: Long = 0L
 
+    /**
+     * Set when `MediaRecorder` hit [MAX_DURATION_BACKSTOP_MS] and stopped
+     * itself. It has already finalized the MPEG-4 `moov` atom by then, so the
+     * file on disk is complete and playable — but calling [MediaRecorder.stop]
+     * on it a second time throws, and treating that throw as a failed recording
+     * would delete the very file the backstop existed to save.
+     */
+    private var selfStopped = false
+
     val isRecording: Boolean get() = recorder != null
+
+    /**
+     * Bytes the encoder has written so far, for the composer's byte-budget
+     * check. Zero when nothing is recording.
+     *
+     * This is an in-progress MPEG-4 file, so it understates the finished size by
+     * the sample tables still to be written at stop; the core's byte budget
+     * holds a container allowance back for exactly that.
+     */
+    fun bytesRecorded(): Long = if (recorder == null) 0L else outputFile?.length() ?: 0L
 
     fun start(): Boolean {
         stopInternal(deleteFile = true)
@@ -54,12 +74,21 @@ class VoiceRecorder(private val context: Context) {
             // Backstop only. The composer stops at the plan's bound; this fires
             // a few seconds later and covers a UI that somehow stopped ticking.
             mediaRecorder.setMaxDuration(plan.maxDurationMs.toInt() + MAX_DURATION_BACKSTOP_MS)
+            mediaRecorder.setOnInfoListener { _, what, _ ->
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                    // The recording is finished and on disk; [stop] must read it
+                    // rather than try to stop an already-stopped recorder.
+                    selfStopped = true
+                }
+            }
             mediaRecorder.setOutputFile(file.absolutePath)
             mediaRecorder.prepare()
             mediaRecorder.start()
             recorder = mediaRecorder
             outputFile = file
-            startedAtMs = System.currentTimeMillis()
+            // Monotonic, not wall time: a carrier or NTP correction landing
+            // mid-hold must not shorten or lengthen what the user recorded.
+            startedAtMs = SystemClock.elapsedRealtime()
             true
         } catch (e: Exception) {
             Log.w(TAG, "Failed to start voice recorder: ${e.message}")
@@ -76,30 +105,33 @@ class VoiceRecorder(private val context: Context) {
         val file = outputFile
         val started = startedAtMs
         val mediaRecorder = recorder
+        val alreadyFinalized = selfStopped
         recorder = null
         outputFile = null
         startedAtMs = 0L
+        selfStopped = false
         if (mediaRecorder == null || file == null) return null
-        return try {
-            mediaRecorder.stop()
-            mediaRecorder.release()
-            val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(0L)
-            val durationMs = elapsed.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
-            if (!file.exists() || file.length() == 0L) {
-                file.delete()
-                null
-            } else {
-                file to durationMs
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to stop voice recorder: ${e.message}")
+        var stopFailed = false
+        if (!alreadyFinalized) {
             try {
-                mediaRecorder.release()
-            } catch (_: Exception) {
+                mediaRecorder.stop()
+            } catch (e: Exception) {
+                // Nothing recorded, or a state the recorder cannot stop from.
+                Log.w(TAG, "Failed to stop voice recorder: ${e.message}")
+                stopFailed = true
             }
-            file.delete()
-            null
         }
+        try {
+            mediaRecorder.release()
+        } catch (_: Exception) {
+        }
+        val elapsed = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+        val durationMs = elapsed.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
+        if (stopFailed || !file.exists() || file.length() == 0L) {
+            file.delete()
+            return null
+        }
+        return file to durationMs
     }
 
     fun cancel() {
@@ -109,13 +141,17 @@ class VoiceRecorder(private val context: Context) {
     private fun stopInternal(deleteFile: Boolean) {
         val mediaRecorder = recorder
         val file = outputFile
+        val alreadyFinalized = selfStopped
         recorder = null
         outputFile = null
         startedAtMs = 0L
+        selfStopped = false
         if (mediaRecorder != null) {
-            try {
-                mediaRecorder.stop()
-            } catch (_: Exception) {
+            if (!alreadyFinalized) {
+                try {
+                    mediaRecorder.stop()
+                } catch (_: Exception) {
+                }
             }
             try {
                 mediaRecorder.release()

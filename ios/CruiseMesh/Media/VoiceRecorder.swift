@@ -21,8 +21,30 @@ final class VoiceRecorder: NSObject {
 
     private var recorder: AVAudioRecorder?
     private var outputURL: URL?
+    /// Monotonic start stamp.
+    ///
+    /// Not `AVAudioRecorder.currentTime`: that reads 0 the moment the recorder
+    /// is no longer recording, so an interrupted or backstopped recording would
+    /// be stamped 0 ms and the bubble would say "0:00 / 0:00" over a minute of
+    /// speech. Not `Date()` either — a clock correction mid-hold (time-zone
+    /// change at sea, cell reacquisition in port) must not change what the user
+    /// recorded.
+    private var startedAt: TimeInterval = 0
 
     var isRecording: Bool { recorder?.isRecording == true }
+
+    /// Bytes the encoder has written so far, for the composer's byte-budget
+    /// check. Zero when nothing is recording.
+    ///
+    /// This is an in-progress MPEG-4 file, so it understates the finished size
+    /// by the sample tables still to be written at stop; the core's byte budget
+    /// holds a container allowance back for exactly that.
+    func bytesRecorded() -> UInt32 {
+        guard recorder != nil, let url = outputURL else { return 0 }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value ?? 0
+        return UInt32(min(size, UInt64(UInt32.max)))
+    }
 
     func start() -> Bool {
         cancel()
@@ -69,6 +91,7 @@ final class VoiceRecorder: NSObject {
             }
             recorder = rec
             outputURL = url
+            startedAt = ProcessInfo.processInfo.systemUptime
             return true
         } catch {
             Self.log.error("Could not create the M4A voice recorder: \(error.localizedDescription, privacy: .public)")
@@ -85,11 +108,13 @@ final class VoiceRecorder: NSObject {
             return nil
         }
         let bound = Double(Self.plan.maxDurationMs)
-        let duration = Int32(min(recorder.currentTime * 1_000, bound))
+        let held = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+        let duration = Int32(max(0, min(held, bound)))
         recorder.stop()
         deactivateAudioSession()
         self.recorder = nil
         self.outputURL = nil
+        self.startedAt = 0
         guard FileManager.default.fileExists(atPath: url.path),
               let bytes = try? Data(contentsOf: url),
               !bytes.isEmpty else {
@@ -114,9 +139,13 @@ final class VoiceRecorder: NSObject {
             try? FileManager.default.removeItem(at: url)
         }
         outputURL = nil
+        startedAt = 0
     }
 
-    private static let maxDurationBackstopSeconds: TimeInterval = 5
+    /// Slack between the composer's own stop and the recorder's hard stop.
+    /// Every path that drives this recorder stops at the plan's bound on its
+    /// own clock; this only covers a ticker that somehow stopped ticking.
+    static let maxDurationBackstopSeconds: TimeInterval = 5
 
     private func deactivateAudioSession() {
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])

@@ -167,6 +167,8 @@
     <string name="ui_cancel_recording">Cancel</string>
     <string name="ui_hold_the_mic_to_talk">Hold the mic to talk</string>
     <string name="ui_hold_to_talk">Hold to talk</string>
+    <string name="ui_start_voice_message">Start voice message</string>
+    <string name="ui_recording_stopped_left_app">Recording stopped when you left the app</string>
     <string name="ui_send_voice_message">Send voice message</string>
     <string name="ui_play_voice_message">Play voice message</string>
     <string name="ui_pause_voice_message">Pause voice message</string>

@@ -86,12 +86,14 @@ pub struct CoreVoiceCapturePlan {
 /// The ceiling binds, not the cap, which is the configuration we want: a
 /// full-length 60 s burst is ~158 KB of the 180 KiB budget. If the bitrate ever
 /// rises far enough for the cap to bind instead, the recording time shortens on
-/// its own and [`voice_duration_fits_attachment`] still holds.
+/// its own.
+///
+/// All of that assumes the encoder honours the bitrate. When it does not, the
+/// clock is the wrong bound entirely, which is what
+/// [`voice_capture_byte_budget`] and [`voice_capture_bytes`] are for.
 #[uniffi::export]
 pub fn voice_capture_plan() -> CoreVoiceCapturePlan {
-    let cap = ATTACHMENT_MAX_BLOB_BYTES as u64;
-    let overhead = VOICE_CONTAINER_OVERHEAD_BYTES as u64;
-    let usable = cap.saturating_sub(overhead) * (100 - VOICE_HEADROOM_PERCENT as u64) / 100;
+    let usable = voice_capture_byte_budget() as u64;
     let budget_ms = usable * 8 * 1000 / VOICE_BITRATE_BPS as u64;
     let max_duration_ms = budget_ms.min(VOICE_MAX_DURATION_CEILING_MS as u64) as u32;
     CoreVoiceCapturePlan {
@@ -105,24 +107,30 @@ pub fn voice_capture_plan() -> CoreVoiceCapturePlan {
     }
 }
 
-/// Expected encoded size of a recording of `duration_ms`, container included.
+/// How many bytes of encoded audio a recording may accumulate on disk before it
+/// has to stop, whatever the clock says.
 ///
-/// The shells use this to warn *before* recording rather than discovering the
-/// overflow afterwards; the post-encode size check stays as the real gate,
-/// because an encoder is free to ignore the bitrate we asked for.
-#[uniffi::export]
-pub fn voice_estimated_blob_bytes(duration_ms: u32) -> u32 {
-    let bytes_per_second = VOICE_BITRATE_BPS as u64 / 8;
-    let payload = duration_ms as u64 * bytes_per_second / 1000;
-    payload
-        .saturating_add(VOICE_CONTAINER_OVERHEAD_BYTES as u64)
+/// The duration bound above trusts the encoder to honour the bitrate it was
+/// asked for. Encoders are free not to: AAC implementations vary in how low a
+/// bitrate they will accept at 16 kHz mono, and a device that quietly clamps
+/// 20 kbps up to 24 or 32 produces a file over the cap while there is still
+/// time on the clock. That failure lands on the user at the *worst* moment —
+/// after they have spoken, with the recording already gone.
+///
+/// So the shells weigh the growing file on the same tick that advances the
+/// clock, and whichever bound arrives first ends the recording and sends what
+/// was said. Being byte-bound costs seconds; being unbound costs the message.
+///
+/// The budget is the payload room the duration arithmetic already reserves:
+/// `(cap - container_overhead) * (100 - headroom%) / 100`. Measuring an
+/// in-progress MPEG-4 file understates the finished size, because the `moov`
+/// sample tables are written at stop — that is precisely what the container
+/// allowance is holding back.
+fn voice_capture_byte_budget() -> u32 {
+    let cap = ATTACHMENT_MAX_BLOB_BYTES as u64;
+    let overhead = VOICE_CONTAINER_OVERHEAD_BYTES as u64;
+    (cap.saturating_sub(overhead) * (100 - VOICE_HEADROOM_PERCENT as u64) / 100)
         .min(u32::MAX as u64) as u32
-}
-
-/// True when a recording of `duration_ms` is expected to fit one envelope.
-#[uniffi::export]
-pub fn voice_duration_fits_attachment(duration_ms: u32) -> bool {
-    voice_estimated_blob_bytes(duration_ms) as usize <= ATTACHMENT_MAX_BLOB_BYTES
 }
 
 /// Where a hold-to-talk gesture currently stands.
@@ -243,6 +251,52 @@ pub fn voice_capture_elapsed(
     unchanged(advanced)
 }
 
+/// The shell weighed the file the encoder is writing. Running out of byte
+/// budget ends the recording the same way running out of clock does: send what
+/// was said. See [`voice_capture_byte_budget`] for why this exists at all.
+#[uniffi::export]
+pub fn voice_capture_bytes(
+    state: CoreVoiceCaptureState,
+    bytes_written: u32,
+) -> CoreVoiceCaptureStep {
+    if state.phase == VoiceCapturePhase::Idle {
+        return unchanged(state);
+    }
+    if bytes_written >= voice_capture_byte_budget() {
+        return step(
+            CoreVoiceCaptureState {
+                elapsed_ms: state.elapsed_ms,
+                ..voice_capture_idle_state()
+            },
+            VoiceCaptureEffect::Send,
+        );
+    }
+    unchanged(state)
+}
+
+/// Begin recording hands-free, with no hold at all.
+///
+/// Hold-to-talk is a gesture some people cannot make: a switch-access user has
+/// no way to express "press and keep pressing", and a screen reader owns the
+/// double-tap-and-hold that would otherwise reach the button. This is the same
+/// state a slide-up lock reaches, entered directly, so those users get the
+/// ordinary Cancel / Stop-and-send controls instead of a gesture.
+#[uniffi::export]
+pub fn voice_capture_start_hands_free(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
+    if state.phase != VoiceCapturePhase::Idle {
+        return unchanged(state);
+    }
+    step(
+        CoreVoiceCaptureState {
+            phase: VoiceCapturePhase::Locked,
+            cancel_armed: false,
+            lock_armed: false,
+            elapsed_ms: 0,
+        },
+        VoiceCaptureEffect::Start,
+    )
+}
+
 /// Finger lifted. `elapsed_ms` is the true held duration, which may be shorter
 /// than any tick ever reported for a quick tap.
 #[uniffi::export]
@@ -316,10 +370,21 @@ fn unchanged(state: CoreVoiceCaptureState) -> CoreVoiceCaptureStep {
 mod tests {
     use super::*;
 
+    /// What a recording of `duration_ms` is *expected* to weigh if the encoder
+    /// honours the bitrate. Only a test lives on this estimate; the shells act
+    /// on the bytes the encoder actually wrote.
+    fn estimated_blob_bytes(duration_ms: u32) -> u32 {
+        let bytes_per_second = VOICE_BITRATE_BPS as u64 / 8;
+        let payload = duration_ms as u64 * bytes_per_second / 1000;
+        payload
+            .saturating_add(VOICE_CONTAINER_OVERHEAD_BYTES as u64)
+            .min(u32::MAX as u64) as u32
+    }
+
     #[test]
     fn a_full_length_recording_fits_the_attachment_cap() {
         let plan = voice_capture_plan();
-        let worst_case = voice_estimated_blob_bytes(plan.max_duration_ms) as usize;
+        let worst_case = estimated_blob_bytes(plan.max_duration_ms) as usize;
         assert!(
             worst_case <= ATTACHMENT_MAX_BLOB_BYTES,
             "a {} ms recording at {} bps is ~{worst_case} bytes, over the {ATTACHMENT_MAX_BLOB_BYTES} byte cap",
@@ -329,7 +394,6 @@ mod tests {
         // And with real room to spare, not by a hair: an encoder that overshoots
         // its target must not push a legal recording over the cap.
         assert!(worst_case * 100 / ATTACHMENT_MAX_BLOB_BYTES <= 90);
-        assert!(voice_duration_fits_attachment(plan.max_duration_ms));
     }
 
     #[test]
@@ -343,10 +407,74 @@ mod tests {
 
     #[test]
     fn estimated_bytes_grow_with_duration_and_include_the_container() {
-        assert_eq!(voice_estimated_blob_bytes(0), 8 * 1024);
-        assert_eq!(voice_estimated_blob_bytes(1_000), 8 * 1024 + 2_500);
-        assert!(voice_estimated_blob_bytes(u32::MAX) > voice_estimated_blob_bytes(60_000));
-        assert!(!voice_duration_fits_attachment(u32::MAX));
+        assert_eq!(estimated_blob_bytes(0), 8 * 1024);
+        assert_eq!(estimated_blob_bytes(1_000), 8 * 1024 + 2_500);
+        assert!(estimated_blob_bytes(u32::MAX) > estimated_blob_bytes(60_000));
+        assert!(estimated_blob_bytes(u32::MAX) as usize > ATTACHMENT_MAX_BLOB_BYTES);
+    }
+
+    #[test]
+    fn the_byte_budget_bounds_a_recording_an_encoder_overshoots() {
+        let budget = voice_capture_byte_budget() as usize;
+        // Whatever else it is, it is a number a finished file can sit under.
+        assert!(budget + VOICE_CONTAINER_OVERHEAD_BYTES as usize <= ATTACHMENT_MAX_BLOB_BYTES);
+
+        let holding = voice_capture_press(voice_capture_idle_state()).state;
+        let under = voice_capture_bytes(holding, budget as u32 - 1);
+        assert_eq!(under.effect, VoiceCaptureEffect::None);
+        assert_eq!(under.state.phase, VoiceCapturePhase::Holding);
+
+        let over = voice_capture_bytes(holding, budget as u32);
+        assert_eq!(over.effect, VoiceCaptureEffect::Send);
+        assert_eq!(over.state.phase, VoiceCapturePhase::Idle);
+
+        // The one encoder failure this exists for: a device that clamps the
+        // requested 20 kbps up to 32 fills the budget at ~40 s, and the
+        // recording ends there instead of being rejected after the fact.
+        let bytes_at_40s = 40 * 32_000 / 8;
+        assert!(bytes_at_40s > budget as u32);
+        assert_eq!(
+            voice_capture_bytes(holding, bytes_at_40s).effect,
+            VoiceCaptureEffect::Send
+        );
+
+        // A locked recording is weighed the same way; an idle one is not.
+        let locked = voice_capture_start_hands_free(voice_capture_idle_state()).state;
+        assert_eq!(
+            voice_capture_bytes(locked, budget as u32).effect,
+            VoiceCaptureEffect::Send
+        );
+        assert_eq!(
+            voice_capture_bytes(voice_capture_idle_state(), u32::MAX).effect,
+            VoiceCaptureEffect::None
+        );
+    }
+
+    #[test]
+    fn hands_free_can_be_started_without_a_hold() {
+        let started = voice_capture_start_hands_free(voice_capture_idle_state());
+        assert_eq!(started.effect, VoiceCaptureEffect::Start);
+        assert_eq!(started.state.phase, VoiceCapturePhase::Locked);
+
+        // Lifting a finger that was never down must not send.
+        assert_eq!(
+            voice_capture_release(started.state, 5_000).effect,
+            VoiceCaptureEffect::None
+        );
+        // Starting twice must not restart the recorder under the first one.
+        assert_eq!(
+            voice_capture_start_hands_free(started.state).effect,
+            VoiceCaptureEffect::None
+        );
+        assert_eq!(
+            voice_capture_finish(started.state, 5_000).effect,
+            VoiceCaptureEffect::Send
+        );
+        // And the accidental-tap floor still applies on this path.
+        assert_eq!(
+            voice_capture_finish(started.state, 100).effect,
+            VoiceCaptureEffect::DiscardTooShort
+        );
     }
 
     #[test]

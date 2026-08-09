@@ -8,7 +8,7 @@ SwiftUI + CoreBluetooth shell, at feature parity with the Android app:
 | Conversation list + Signal-style ticks | ✓ |
 | 1:1 text messaging | ✓ |
 | Group creation, invites, text, unread state | ✓ |
-| Photos (library + camera) + voice memos | ✓ |
+| Photos (library + camera) + push-to-talk voice messages | ✓ |
 | QR friending + mutual `kind=3` friend request | ✓ |
 | Friends-of-friends suggestions + introductions | ✓ |
 | Deliberate contact sharing (QR + approval) | ✓ |

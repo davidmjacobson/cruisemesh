@@ -2431,6 +2431,16 @@
         }
       }
     },
+    "Microphone unavailable": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Microphone unavailable"
+          }
+        }
+      }
+    },
     "More": {
       "localizations": {
         "en": {
@@ -2887,6 +2897,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "Recent activity"
+          }
+        }
+      }
+    },
+    "Record with controls": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Record with controls"
+          }
+        }
+      }
+    },
+    "Recording stopped when something else needed the microphone": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recording stopped when something else needed the microphone"
+          }
+        }
+      }
+    },
+    "Recording stopped when you left the app": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Recording stopped when you left the app"
           }
         }
       }
@@ -3439,6 +3479,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Show setup QR"
+          }
+        }
+      }
+    },
+    "Slide left to cancel, up for hands-free": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Slide left to cancel, up for hands-free"
           }
         }
       }
