@@ -772,15 +772,20 @@ private struct GroupDetailsSheet: View {
         .sheet(isPresented: $showAddMembers) {
             NavigationStack {
                 List(availableContacts, id: \.userId) { contact in
+                    let displayName = ChatListLogic.displayNameOrId(
+                        name: coreContactDisplayName(contact: contact),
+                        displayId: formatUserId(userId: contact.userId)
+                    )
+                    let isSelected = selectedMemberIds.contains(contact.userId)
                     Button {
-                        if selectedMemberIds.contains(contact.userId) {
+                        if isSelected {
                             selectedMemberIds.remove(contact.userId)
                         } else {
                             selectedMemberIds.insert(contact.userId)
                         }
                     } label: {
                         HStack(spacing: 12) {
-                            Image(systemName: selectedMemberIds.contains(contact.userId)
+                            Image(systemName: isSelected
                                 ? "checkmark.circle.fill" : "circle")
                             AvatarView(
                                 userId: contact.userId,
@@ -788,13 +793,13 @@ private struct GroupDetailsSheet: View {
                                 size: 36,
                                 reachability: connectivity.level(for: contact.userId, nowMs: nowMs)
                             )
-                            Text(ChatListLogic.displayNameOrId(
-                                name: coreContactDisplayName(contact: contact),
-                                displayId: formatUserId(userId: contact.userId)
-                            ))
+                            Text(displayName)
                         }
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(displayName)
+                    .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                    .accessibilityAddTraits(isSelected ? .isSelected : [])
                 }
                 .overlay(alignment: .bottom) {
                     if let actionError {

@@ -64,6 +64,17 @@ final class ChatListLogicTests: XCTestCase {
         XCTAssertEqual(color1, color2)
     }
 
+    func testGeneratedAvatarPaletteAlwaysHasAccessibleForegroundContrast() {
+        for hueSeed in UInt8.min...UInt8.max {
+            let palette = ChatListLogic.avatarPalette(userId: Data([hueSeed]))
+            XCTAssertGreaterThanOrEqual(
+                palette.contrastRatio,
+                4.5,
+                "Avatar hue seed \(hueSeed) has insufficient foreground contrast"
+            )
+        }
+    }
+
     func testFormatRelativeTime() {
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC")!

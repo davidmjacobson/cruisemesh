@@ -29,14 +29,15 @@ struct NewGroupView: View {
                     } else {
                         ForEach(contacts, id: \.userId) { contact in
                             let displayName = ChatListLogic.contactDisplayName(contact)
+                            let isSelected = selected.contains(contact.userId)
                             Button {
                                 toggle(contact.userId)
                             } label: {
                                 HStack(spacing: 12) {
-                                    Image(systemName: selected.contains(contact.userId)
+                                    Image(systemName: isSelected
                                         ? "checkmark.circle.fill"
                                         : "circle")
-                                        .foregroundStyle(selected.contains(contact.userId) ? Color.accentColor : .secondary)
+                                        .foregroundStyle(isSelected ? Color.accentColor : .secondary)
                                     AvatarView(
                                         userId: contact.userId,
                                         name: displayName,
@@ -49,6 +50,9 @@ struct NewGroupView: View {
                                     Spacer()
                                 }
                             }
+                            .accessibilityLabel(displayName)
+                            .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                            .accessibilityAddTraits(isSelected ? .isSelected : [])
                         }
                     }
                 }

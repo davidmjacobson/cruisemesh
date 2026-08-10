@@ -2,13 +2,14 @@ package com.cruisemesh.app.ui
 
 import android.content.Intent
 import android.net.Uri
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -24,6 +25,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.testTag
@@ -68,10 +70,21 @@ fun TermsAcceptanceScreen(onAccept: () -> Unit) {
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 24.dp)
-                    .clickable { agreed = !agreed },
+                    .toggleable(
+                        value = agreed,
+                        role = Role.Checkbox,
+                        onValueChange = { agreed = it },
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Checkbox(checked = agreed, onCheckedChange = { agreed = it })
+                // The row owns the action and state semantics. A null handler
+                // keeps the visual checkbox from becoming a duplicate TalkBack
+                // target with a second, independently clickable action.
+                Checkbox(
+                    checked = agreed,
+                    onCheckedChange = null,
+                    modifier = Modifier.size(48.dp),
+                )
                 Text(
                     stringResource(R.string.ui_terms_acceptance_confirmation),
                     modifier = Modifier.padding(start = 8.dp),

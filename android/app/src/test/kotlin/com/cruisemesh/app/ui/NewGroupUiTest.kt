@@ -3,8 +3,13 @@ package com.cruisemesh.app.ui
 import android.content.Context
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertIsToggleable
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextInput
@@ -55,7 +60,12 @@ class NewGroupUiTest {
         compose.onNodeWithText(create).assertIsNotEnabled()
         compose.onNode(hasSetTextAction()).performTextInput("  Excursion crew  ")
         compose.onNodeWithText(create).assertIsNotEnabled()
-        compose.onNodeWithText("Maya").performClick()
+        compose.onAllNodesWithText("Maya").assertCountEquals(1)
+        compose.onNodeWithText("Maya")
+            .assertIsToggleable()
+            .assertIsOff()
+            .performClick()
+            .assertIsOn()
         compose.onNodeWithText(
             context.resources.getQuantityString(R.plurals.ui_create_group_count, 1, 1),
         ).assertIsEnabled().performClick()

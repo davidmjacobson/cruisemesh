@@ -8,6 +8,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -47,6 +49,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
@@ -538,18 +541,26 @@ fun GroupChatScreen(
                             val key = UserIdHex.encode(contact.userId)
                             val selected = key in selectedAddMemberIds
                             Row(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .toggleable(
+                                        value = selected,
+                                        role = Role.Checkbox,
+                                        onValueChange = { checked ->
+                                            selectedAddMemberIds = if (checked) {
+                                                selectedAddMemberIds + key
+                                            } else {
+                                                selectedAddMemberIds - key
+                                            }
+                                        },
+                                    )
+                                    .padding(vertical = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Checkbox(
                                     checked = selected,
-                                    onCheckedChange = { checked ->
-                                        selectedAddMemberIds = if (checked) {
-                                            selectedAddMemberIds + key
-                                        } else {
-                                            selectedAddMemberIds - key
-                                        }
-                                    },
+                                    onCheckedChange = null,
+                                    modifier = Modifier.size(48.dp),
                                 )
                                 AvatarBadge(
                                     userId = contact.userId,

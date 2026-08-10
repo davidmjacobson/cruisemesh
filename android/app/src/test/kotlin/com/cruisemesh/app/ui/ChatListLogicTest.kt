@@ -1,5 +1,7 @@
 package com.cruisemesh.app.ui
 
+import androidx.compose.ui.graphics.luminance
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Test
 import uniffi.cruisemesh_core.StoredMessage
@@ -16,10 +18,31 @@ class ChatListLogicTest {
         assertEquals("A", init2)
         
         val (_, init3) = ChatListLogic.avatarHueAndInitials(byteArrayOf(), "", "CM-ABCD")
-        assertEquals("AB", init3)
+        assertEquals("", init3)
         
         val (_, init4) = ChatListLogic.avatarHueAndInitials(byteArrayOf(), "Unknown", "CM-1234")
-        assertEquals("12", init4)
+        assertEquals("", init4)
+
+        val (_, init5) = ChatListLogic.avatarHueAndInitials(byteArrayOf(), "  Caleb  ", "CM-1234")
+        assertEquals("CA", init5)
+    }
+
+    @Test
+    fun generatedAvatarPaletteAlwaysHasAccessibleForegroundContrast() {
+        for (hueSeed in 0..255) {
+            val (background, _) = ChatListLogic.avatarHueAndInitials(
+                byteArrayOf(hueSeed.toByte()),
+                "Alice",
+                "CM-ABCD",
+            )
+            val foreground = ChatListLogic.avatarTextColor(background)
+            val backgroundLuminance = background.luminance().toDouble()
+            val foregroundLuminance = foreground.luminance().toDouble()
+            val contrast =
+                (maxOf(backgroundLuminance, foregroundLuminance) + 0.05) /
+                    (minOf(backgroundLuminance, foregroundLuminance) + 0.05)
+            assertTrue("seed $hueSeed has only $contrast:1 contrast", contrast >= 4.5)
+        }
     }
 
     @Test

@@ -24,6 +24,47 @@ enum ChatRoute: Hashable {
     case group(Data)
 }
 
+private enum MissingConversationKind {
+    case contact
+    case group
+
+    var message: String {
+        switch self {
+        case .contact:
+            "This friend is no longer available on this device."
+        case .group:
+            "This group is no longer available on this device."
+        }
+    }
+}
+
+private struct MissingConversationView: View {
+    let kind: MissingConversationKind
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "exclamationmark.bubble.fill")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+            Text("Conversation no longer available")
+                .font(.title2.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text(kind.message)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Back to chats") { dismiss() }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(32)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .navigationTitle("Conversation unavailable")
+        .navigationBarTitleDisplayMode(.inline)
+        .accessibilityIdentifier("screen.missing-conversation")
+    }
+}
+
 struct ChatListView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
@@ -160,10 +201,14 @@ struct ChatListView: View {
                 case .contact(let userId):
                     if let contact = try? AppStore.get().getContact(userId: userId) {
                         ChatView(contact: contact, identity: identity)
+                    } else {
+                        MissingConversationView(kind: .contact)
                     }
                 case .group(let groupId):
                     if let group = try? AppStore.get().getGroup(groupId: groupId) {
                         GroupChatView(group: group, identity: identity)
+                    } else {
+                        MissingConversationView(kind: .group)
                     }
                 }
             }

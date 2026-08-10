@@ -4,7 +4,12 @@ import android.content.Context
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertIsOff
+import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertIsToggleable
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -37,7 +42,12 @@ class TermsAcceptanceUiTest {
 
         compose.onNodeWithTag(UiTestTags.TERMS_SCREEN).assertIsDisplayed()
         compose.onNodeWithText(agree).assertIsNotEnabled()
-        compose.onNodeWithText(confirmation).performClick()
+        compose.onAllNodesWithText(confirmation).assertCountEquals(1)
+        compose.onNodeWithText(confirmation)
+            .assertIsToggleable()
+            .assertIsOff()
+            .performClick()
+            .assertIsOn()
         compose.onNodeWithText(agree).assertIsEnabled().performClick()
 
         assertEquals(1, accepted)
