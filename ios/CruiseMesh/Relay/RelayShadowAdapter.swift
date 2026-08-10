@@ -171,7 +171,7 @@ final class RelayShadowPassCapture {
     /// budget is spent on a pass that has evidence in it.
     private let armSample: () -> Bool
 
-    private var steps: [CoreRelayShadowStep] = []
+    private var recordedSteps: [CoreRelayShadowStep] = []
     private var skipped: [Data] = []
     private var unshadowed = 0
     private var dropped = 0
@@ -266,7 +266,7 @@ final class RelayShadowPassCapture {
         markedPosted: Bool
     ) {
         guard sampled() else { return }
-        if steps.count >= Self.maxRows {
+        if recordedSteps.count >= Self.maxRows {
             // Counted rather than silently forgotten: a report that compared
             // sixteen of forty rows must not read as a report about forty.
             dropped += 1
@@ -282,10 +282,10 @@ final class RelayShadowPassCapture {
             // from the error type says "true" even when there was no next row
             // for that mailbox to offer, which is most failures.
             if let waiting = awaitingContinuation.removeValue(forKey: key) {
-                steps[waiting].legacyContinuedLane = true
+                recordedSteps[waiting].legacyContinuedLane = true
             }
         }
-        steps.append(
+        recordedSteps.append(
             CoreRelayShadowStep(
                 lane: lane,
                 msgId: msgId,
@@ -305,7 +305,7 @@ final class RelayShadowPassCapture {
                 legacyContinuedLane: succeeded
             )
         )
-        if !succeeded, let key { awaitingContinuation[key] = steps.count - 1 }
+        if !succeeded, let key { awaitingContinuation[key] = recordedSteps.count - 1 }
     }
 
     /// Recipients the legacy engine excluded from its queue query before
@@ -353,7 +353,7 @@ final class RelayShadowPassCapture {
     /// may have had no rows at all.
     func armed() -> Bool { sampledDecision == true }
 
-    func steps() -> [CoreRelayShadowStep] { steps }
+    func steps() -> [CoreRelayShadowStep] { recordedSteps }
     func skippedRecipients() -> [Data] { skipped }
     func rowsUnshadowed() -> UInt32 { UInt32(clamping: unshadowed) }
     func rowsDropped() -> Int { dropped }
