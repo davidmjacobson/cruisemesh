@@ -23,7 +23,7 @@ class BootReceiver : BroadcastReceiver() {
         }
         if (!shouldStartMeshAfterBoot(
                 autoStartEnabled = MeshStartupPreferences.isAutoStartEnabled(context),
-                explicitlyStopped = MeshStartupPreferences.wasExplicitlyStopped(context),
+                meshEnabled = MeshStartupPreferences.isMeshEnabled(context),
                 permissionsGranted = permissionsGranted,
             )
         ) {

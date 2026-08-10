@@ -99,6 +99,10 @@
     <string name="ui_add_a_caption">Add a caption…</string>
     <string name="ui_members">Members</string>
     <string name="ui_mesh_status">Mesh status</string>
+    <string name="ui_mesh_running">Mesh running</string>
+    <string name="ui_mesh_running_detail">Turn nearby and internet delivery on or off. Your choice stays in effect when you reopen CruiseMesh.</string>
+    <string name="ui_start_mesh_after_restart">Start after phone restart</string>
+    <string name="ui_start_mesh_after_restart_detail">When the mesh is on, restore delivery after this phone restarts.</string>
     <string name="ui_message_info">Message info</string>
     <string name="ui_mute_notifications">Mute notifications</string>
     <string name="ui_my_friend_card">My friend card</string>
@@ -106,6 +110,20 @@
     <string name="ui_nearby_permissions_are_required_skipping_them_means_the">Nearby devices access is what lets CruiseMesh reach phones around you — grant it to start messaging.</string>
     <string name="ui_nearby_access_enabled">Nearby access enabled</string>
     <string name="ui_enable_nearby_access_required">Enable nearby access</string>
+    <string name="ui_notifications_enabled">Notifications enabled</string>
+    <string name="ui_enable_notifications">Enable notifications</string>
+    <string name="ui_notifications_are_off">Notifications are off</string>
+    <string name="ui_notifications_off_body">Messages still deliver while the mesh is running, but CruiseMesh cannot alert you when one arrives.</string>
+    <string name="ui_notifications_denied_mesh_continues">Notifications are off. The mesh will keep delivering messages while CruiseMesh is running.</string>
+    <string name="ui_notifications_off_mesh_running">Notifications off — mesh is still running</string>
+    <string name="ui_permissions_required_mesh_off">Permissions required — mesh is off</string>
+    <string name="ui_nearby_permission_blocking_body">Nearby devices access lets CruiseMesh scan, connect, send, and receive over Bluetooth. Grant it to turn the mesh on.</string>
+    <string name="ui_enable_permissions">Enable permissions</string>
+    <string name="ui_enable_nearby_in_app_permissions">Enable Nearby devices in App permissions — without it the mesh cannot run</string>
+    <string name="ui_enable_nearby_in_app_permissions_short">Enable Nearby devices in App permissions</string>
+    <string name="ui_nearby_required_for_messages">Nearby permissions are required for CruiseMesh to send and receive messages</string>
+    <string name="ui_permissions_denied_mesh_cannot_run">Permissions denied — mesh cannot run</string>
+    <string name="ui_nearby_required_to_turn_on_mesh">Nearby devices access is required to turn on the mesh</string>
     <string name="ui_background_activity_enabled">Background activity enabled</string>
     <string name="ui_enable_background_activity">Enable background activity</string>
     <string name="ui_new_chat">New chat</string>
@@ -206,8 +224,10 @@
     <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
     <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
     <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
-    <string name="ui_onboarding_permission_nearby_title">Nearby devices and notifications</string>
-    <string name="ui_onboarding_permission_nearby_detail">Lets your phone hand messages directly to phones around you, and tells you the moment one arrives.</string>
+    <string name="ui_onboarding_permission_nearby_title">Nearby devices</string>
+    <string name="ui_onboarding_permission_nearby_detail">Required to find nearby phones and hand messages directly to them over Bluetooth.</string>
+    <string name="ui_onboarding_permission_notifications_title">Notifications</string>
+    <string name="ui_onboarding_permission_notifications_detail">Optional. Alerts you when a message arrives; nearby delivery keeps working if notifications are off.</string>
     <string name="ui_onboarding_permission_background_title">Background activity</string>
     <string name="ui_onboarding_permission_background_detail">Keeps the mesh working while your phone is in your pocket, so messages still move when the screen is off.</string>
     <!-- The one phone setting that decides whether a cruise ends with a

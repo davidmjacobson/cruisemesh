@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.net.Uri
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -40,6 +41,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
@@ -56,12 +59,14 @@ const val SUPPORT_URL = "https://cruisemesh.app/support/"
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
+    meshEnabled: Boolean,
     meshStatus: String,
     relayHealth: RelayHealth,
     onShorePass: () -> Unit,
     onConnectionDetails: () -> Unit,
     onInternalTools: () -> Unit,
     onBackUp: () -> Unit,
+    onMeshEnabledChange: (Boolean) -> Unit,
     onFriendsOfFriendsChanged: (Boolean) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -107,14 +112,20 @@ fun SettingsScreen(
 
             SettingsGap()
             SettingsGroup("CruiseMesh operation") {
+                SettingsSwitch(
+                    title = stringResource(R.string.ui_mesh_running),
+                    detail = stringResource(R.string.ui_mesh_running_detail),
+                    checked = meshEnabled,
+                    onCheckedChange = onMeshEnabledChange,
+                )
                 Text(
                     meshStatus,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
                 )
                 SettingsSwitch(
-                    title = "Start automatically",
-                    detail = "Keep nearby delivery available after this phone restarts.",
+                    title = stringResource(R.string.ui_start_mesh_after_restart),
+                    detail = stringResource(R.string.ui_start_mesh_after_restart_detail),
                     checked = startAutomatically,
                     onCheckedChange = {
                         startAutomatically = it
@@ -385,7 +396,15 @@ private fun SettingsSwitch(
     onCheckedChange: (Boolean) -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {}
+            .toggleable(
+                value = checked,
+                role = Role.Switch,
+                onValueChange = onCheckedChange,
+            )
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(modifier = Modifier.weight(1f)) {
@@ -396,7 +415,9 @@ private fun SettingsSwitch(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        // The whole labeled row is the single switch target. A separate
+        // callback here would expose a duplicate, unlabeled control to TalkBack.
+        Switch(checked = checked, onCheckedChange = null)
     }
 }
 
