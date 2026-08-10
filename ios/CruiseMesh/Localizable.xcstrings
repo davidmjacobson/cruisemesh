@@ -663,6 +663,16 @@
         }
       }
     },
+    "Backup saved": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Backup saved"
+          }
+        }
+      }
+    },
     "Before you start": {
       "localizations": {
         "en": {
@@ -2181,6 +2191,16 @@
         }
       }
     },
+    "Hide passphrase": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hide passphrase"
+          }
+        }
+      }
+    },
     "Hold to talk": {
       "localizations": {
         "en": {
@@ -2287,6 +2307,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Keep current pass"
+          }
+        }
+      }
+    },
+    "Keep the backup file and its passphrase somewhere safe.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Keep the backup file and its passphrase somewhere safe."
           }
         }
       }
@@ -3499,6 +3529,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Show my friend card"
+          }
+        }
+      }
+    },
+    "Show passphrase": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show passphrase"
           }
         }
       }

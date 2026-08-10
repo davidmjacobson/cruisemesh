@@ -75,4 +75,27 @@ class RelayEngineSettingsTest {
         assertEquals("member-token", config?.relayToken)
         assertTrue(RelayConfigStore.shareOnline(context))
     }
+
+    @Test
+    fun `acquiring a pass creates exactly one unannounced update epoch`() {
+        val prefs = context.getSharedPreferences("cruisemesh_relay", android.content.Context.MODE_PRIVATE)
+        prefs.edit().clear().commit()
+        try {
+            assertEquals(0L, RelayConfigStore.relayEpoch(context))
+            assertEquals(0L, RelayConfigStore.announcedRelayEpoch(context))
+
+            RelayConfigStore.save(context, "https://relay.example", "member-token")
+            val acquiredEpoch = RelayConfigStore.relayEpoch(context)
+            assertTrue(acquiredEpoch > 0L)
+            assertEquals(0L, RelayConfigStore.announcedRelayEpoch(context))
+
+            RelayConfigStore.save(context, "https://relay.example", "member-token")
+            assertEquals(acquiredEpoch, RelayConfigStore.relayEpoch(context))
+
+            RelayConfigStore.markRelayEpochAnnounced(context, acquiredEpoch)
+            assertEquals(acquiredEpoch, RelayConfigStore.announcedRelayEpoch(context))
+        } finally {
+            prefs.edit().clear().commit()
+        }
+    }
 }

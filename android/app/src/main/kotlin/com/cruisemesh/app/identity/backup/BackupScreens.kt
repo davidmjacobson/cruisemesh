@@ -15,6 +15,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -27,19 +28,31 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.autofill.AutofillNode
+import androidx.compose.ui.autofill.AutofillType
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalAutofill
+import androidx.compose.ui.platform.LocalAutofillTree
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
 import kotlinx.coroutines.Dispatchers
@@ -75,7 +88,7 @@ private fun BackupFailureText.resolve(): String = when (this) {
  * Self-contained — hosts its own SAF launcher and calls [BackupService]
  * directly so the navigation host only needs to add a route.
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun BackupExportScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -178,6 +191,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 value = passphrase,
                 onValueChange = { passphrase = it },
                 label = "Backup passphrase",
+                autofillType = AutofillType.NewPassword,
             )
             PassphraseStrengthText(strength, passphrase.isEmpty())
             Spacer(Modifier.height(8.dp))
@@ -185,6 +199,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 value = confirm,
                 onValueChange = { confirm = it },
                 label = "Confirm passphrase",
+                autofillType = AutofillType.NewPassword,
             )
             if (confirm.isNotEmpty() && !matches) {
                 Text(stringResource(R.string.ui_passphrases_don_t_match),
@@ -206,10 +221,28 @@ fun BackupExportScreen(onBack: () -> Unit) {
             StatusArea(
                 state = state,
                 workingLabel = "Encrypting and saving…",
-                doneLabel = "Backup saved. Keep it and your passphrase somewhere safe.",
+                doneLabel = null,
             )
         }
     }
+
+    if (state == BackupUiState.Done) {
+        BackupSavedDialog(onDismiss = { state = BackupUiState.Idle })
+    }
+}
+
+@Composable
+internal fun BackupSavedDialog(onDismiss: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.ui_backup_saved)) },
+        text = { Text(stringResource(R.string.ui_backup_saved_keep_it_and_your_passphrase)) },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.ui_done))
+            }
+        },
+    )
 }
 
 /**
@@ -218,7 +251,7 @@ fun BackupExportScreen(onBack: () -> Unit) {
  * everything is re-read from the restored state. Meant for the onboarding
  * "Restore from backup" branch (fresh install, no store open yet).
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
 fun BackupRestoreScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -314,6 +347,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                     preview = null
                 },
                 label = "Backup passphrase",
+                autofillType = AutofillType.Password,
             )
 
             Spacer(Modifier.height(24.dp))
@@ -419,16 +453,57 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
-private fun PassphraseField(value: String, onValueChange: (String) -> Unit, label: String) {
+internal fun PassphraseField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    autofillType: AutofillType,
+) {
+    var visible by remember { mutableStateOf(false) }
+    val autofill = LocalAutofill.current
+    val autofillTree = LocalAutofillTree.current
+    val latestOnValueChange by rememberUpdatedState(onValueChange)
+    val autofillNode = remember(autofillType) {
+        AutofillNode(
+            autofillTypes = listOf(autofillType),
+            onFill = { latestOnValueChange(it) },
+        )
+    }
+    DisposableEffect(autofillTree, autofillNode) {
+        autofillTree += autofillNode
+        onDispose { autofillTree.children.remove(autofillNode.id) }
+    }
+
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
         label = { Text(label) },
         singleLine = true,
-        visualTransformation = PasswordVisualTransformation(),
+        visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        modifier = Modifier.fillMaxWidth(),
+        trailingIcon = {
+            TextButton(onClick = { visible = !visible }) {
+                Text(
+                    stringResource(
+                        if (visible) R.string.ui_hide_passphrase else R.string.ui_show_passphrase,
+                    ),
+                )
+            }
+        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned { coordinates ->
+                autofillNode.boundingBox = coordinates.boundsInWindow()
+            }
+            .onFocusChanged { focusState ->
+                if (focusState.isFocused) {
+                    autofill?.requestAutofillForNode(autofillNode)
+                } else {
+                    autofill?.cancelAutofillForNode(autofillNode)
+                }
+            },
     )
 }
 
@@ -495,7 +570,7 @@ private fun WarningCard(text: String) {
 }
 
 @Composable
-private fun StatusArea(state: BackupUiState, workingLabel: String, doneLabel: String) {
+private fun StatusArea(state: BackupUiState, workingLabel: String, doneLabel: String?) {
     when (state) {
         BackupUiState.Idle -> {}
         BackupUiState.Working -> Column(
@@ -506,12 +581,14 @@ private fun StatusArea(state: BackupUiState, workingLabel: String, doneLabel: St
             CircularProgressIndicator()
             Text(workingLabel, style = MaterialTheme.typography.bodyMedium)
         }
-        BackupUiState.Done -> Text(
-            doneLabel,
-            color = MaterialTheme.colorScheme.primary,
-            style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.padding(top = 24.dp),
-        )
+        BackupUiState.Done -> doneLabel?.let {
+            Text(
+                it,
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.padding(top = 24.dp),
+            )
+        }
         is BackupUiState.Error -> Text(
             state.text.resolve(),
             color = MaterialTheme.colorScheme.error,

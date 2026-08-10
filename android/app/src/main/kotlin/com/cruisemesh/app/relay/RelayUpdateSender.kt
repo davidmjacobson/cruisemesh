@@ -73,12 +73,23 @@ object RelayUpdateSender {
         identity: Identity,
         epoch: Long,
     ) {
-        val relay = RelayConfigStore.load(context)
+        queueToAllContacts(store, identity, epoch, RelayConfigStore.load(context))
+    }
+
+    /** Pure fan-out seam used by the host-core regression test. */
+    internal fun queueToAllContacts(
+        store: MessageStore,
+        identity: Identity,
+        epoch: Long,
+        relay: RelayConfig?,
+        sendToUser: (ByteArray, ByteArray) -> Boolean = MeshRouter::sendToUserId,
+        requestSync: () -> Unit = RelaySyncEvents::requestSync,
+    ) {
         // Blocked contacts get nothing from us — not even endpoint changes.
         val blocked = store.listBlockedUsers()
         for (contact in store.listContacts()) {
             if (blocked.any { it.contentEquals(contact.userId) }) continue
-            queueToContact(store, identity, contact, epoch, relay)
+            queueToContact(store, identity, contact, epoch, relay, sendToUser, requestSync)
         }
     }
 
@@ -88,6 +99,8 @@ object RelayUpdateSender {
         contact: Contact,
         epoch: Long,
         relay: RelayConfig?,
+        sendToUser: (ByteArray, ByteArray) -> Boolean,
+        requestSync: () -> Unit,
     ) {
         val timestamp = System.currentTimeMillis()
         val payload = try {
@@ -122,9 +135,9 @@ object RelayUpdateSender {
             return
         }
         GossipState.seenIds.record(authored.envelope.msgId)
-        RelaySyncEvents.requestSync()
+        requestSync()
 
-        if (!MeshRouter.sendToUserId(contact.userId, authored.frame)) {
+        if (!sendToUser(contact.userId, authored.frame)) {
             Log.i(
                 TAG,
                 "Queued relay update for ${UserIdHex.encode(contact.userId)}; peer not currently connected",

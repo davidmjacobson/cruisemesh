@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct BackupDocument: FileDocument {
@@ -24,6 +25,7 @@ struct BackupExportView: View {
     @State private var inventory: BackupInventory?
     @State private var includeHistory = true
     @State private var includeCourier = false
+    @State private var backupSaved = false
 
     private var acceptable: Bool {
         passphrase.count >= Int(backupMinPassphraseLength()) && passphrase == confirmation
@@ -45,8 +47,18 @@ struct BackupExportView: View {
                     .foregroundStyle(.secondary)
             }
             Section("Protect your backup") {
-                SecureField("Passphrase", text: $passphrase)
-                SecureField("Confirm passphrase", text: $confirmation)
+                BackupPassphraseField(
+                    "Passphrase",
+                    text: $passphrase,
+                    contentType: .newPassword,
+                    accessibilityIdentifier: "backup.export.passphrase"
+                )
+                BackupPassphraseField(
+                    "Confirm passphrase",
+                    text: $confirmation,
+                    contentType: .newPassword,
+                    accessibilityIdentifier: "backup.export.confirmation"
+                )
                 Text("Use at least \(backupMinPassphraseLength()) characters. You need this passphrase to restore the file.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -72,9 +84,18 @@ struct BackupExportView: View {
             contentType: BackupDocument.readableContentTypes[0],
             defaultFilename: BackupService.suggestedFileName
         ) { result in
-            if case .failure(let failure) = result {
+            switch result {
+            case .success:
+                error = nil
+                backupSaved = true
+            case .failure(let failure):
                 error = backupFailureText(failure, fallback: .couldNotSave).text
             }
+        }
+        .alert("Backup saved", isPresented: $backupSaved) {
+            Button("Done", role: .cancel) {}
+        } message: {
+            Text("Keep the backup file and its passphrase somewhere safe.")
         }
     }
 
@@ -147,7 +168,12 @@ struct BackupRestoreView: View {
                     if !fileName.isEmpty { Text(fileName).font(.caption).foregroundStyle(.secondary) }
                 }
                 Section("Unlock backup") {
-                    SecureField("Passphrase", text: $passphrase)
+                    BackupPassphraseField(
+                        "Passphrase",
+                        text: $passphrase,
+                        contentType: .password,
+                        accessibilityIdentifier: "backup.restore.passphrase"
+                    )
                         .onChange(of: passphrase) { _ in preview = nil }
                     if preview == nil {
                         Button(restoring ? "Reviewing…" : "Review backup") { review() }
@@ -247,6 +273,60 @@ struct BackupRestoreView: View {
                 self.error = backupFailureText(error, fallback: .couldNotRestore).text
             }
             restoring = false
+        }
+    }
+}
+
+private struct BackupPassphraseField: View {
+    let title: String
+    @Binding var text: String
+    let contentType: UITextContentType
+    let accessibilityIdentifier: String
+
+    @State private var isRevealed = false
+    @FocusState private var isFocused: Bool
+
+    init(
+        _ title: String,
+        text: Binding<String>,
+        contentType: UITextContentType,
+        accessibilityIdentifier: String
+    ) {
+        self.title = title
+        _text = text
+        self.contentType = contentType
+        self.accessibilityIdentifier = accessibilityIdentifier
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if isRevealed {
+                TextField(title, text: $text)
+                    .textContentType(contentType)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($isFocused)
+                    .accessibilityIdentifier(accessibilityIdentifier)
+            } else {
+                SecureField(title, text: $text)
+                    .textContentType(contentType)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($isFocused)
+                    .accessibilityIdentifier(accessibilityIdentifier)
+            }
+
+            Button {
+                isRevealed.toggle()
+                DispatchQueue.main.async { isFocused = true }
+            } label: {
+                Image(systemName: isRevealed ? "eye.slash" : "eye")
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isRevealed ? "Hide passphrase" : "Show passphrase")
+            .accessibilityIdentifier("\(accessibilityIdentifier).visibility")
         }
     }
 }
