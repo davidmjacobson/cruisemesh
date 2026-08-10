@@ -44,8 +44,6 @@ import os.log
 /// non-2xx normally with its status and preview, which keeps that rule here.
 enum RelayActionDriver {
 
-    private static let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")
-
     /// Run one action.
     ///
     /// Never throws: every failure is a typed result, because a driver that
