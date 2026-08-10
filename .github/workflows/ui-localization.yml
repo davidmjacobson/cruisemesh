@@ -13,4 +13,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - run: python tools/check_ui_localization.py
+      - name: Check UI localization
+        run: python tools/check_ui_localization.py
+      - name: Check Android and iOS Terms version parity
+        run: python tools/check_terms_version.py
