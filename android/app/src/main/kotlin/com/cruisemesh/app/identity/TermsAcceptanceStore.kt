@@ -2,7 +2,7 @@ package com.cruisemesh.app.identity
 
 import android.content.Context
 
-const val CURRENT_TERMS_VERSION = "2026-07-23"
+const val CURRENT_TERMS_VERSION = "2026-08-08"
 const val TERMS_OF_USE_URL = "https://cruisemesh.app/terms/"
 const val PRIVACY_POLICY_URL = "https://cruisemesh.app/privacy/"
 
