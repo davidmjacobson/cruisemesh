@@ -271,11 +271,13 @@ final class VoiceRecorder {
     }
 
     /// Default post-release drain window, matched to the Android side
-    /// (`VoiceDrainPlan.DRAIN_WINDOW_MS`): the field-measured tail loss was
-    /// ~0.4-0.5 s and the capture/encoder pipeline latency that causes it is not
-    /// queryable, so a fixed window is the honest bound. The cost is a little
-    /// trailing ambient audio, which beats clipping the last spoken word.
-    static let defaultTailDrainSeconds: TimeInterval = 0.5
+    /// (`VoiceDrainPlan.DRAIN_WINDOW_MS` = 600 ms): the field-measured tail loss
+    /// was ~0.4-0.5 s and the capture/encoder pipeline latency that causes it is
+    /// not queryable, so a fixed window is the honest bound. 0.6 s sits just above
+    /// the worst observed loss so there is headroom rather than the window exactly
+    /// cancelling it. The cost is a little trailing ambient audio, which beats
+    /// clipping the last spoken word.
+    static let defaultTailDrainSeconds: TimeInterval = 0.6
 
     /// The drain window to actually use, pure and static so it is unit-tested
     /// without audio hardware.

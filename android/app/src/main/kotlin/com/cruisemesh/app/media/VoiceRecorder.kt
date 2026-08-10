@@ -146,8 +146,15 @@ class VoiceRecorder(private val context: Context) {
             completion(null)
             return
         }
+        // Snapshot the held duration at release, BEFORE the drain, so the reported
+        // durationMs is what the user actually held the button for and does not
+        // grow by the drain window. iOS does the same (clampedDurationMs at
+        // stop-entry); this keeps the two shells' labels in agreement. The drain
+        // still captures the trailing audio into the file — the file's decoded
+        // length is a touch longer than this — but the label tracks the hold.
+        val heldMs = if (started == 0L) 0L else (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
         finalizeScope.launch {
-            val result = drainAndFinalize(mediaRecorder, file, started, alreadyFinalized)
+            val result = drainAndFinalize(mediaRecorder, file, heldMs, alreadyFinalized)
             withContext(Dispatchers.Main) { completion(result) }
         }
     }
@@ -161,7 +168,7 @@ class VoiceRecorder(private val context: Context) {
     private suspend fun drainAndFinalize(
         mediaRecorder: MediaRecorder,
         file: File,
-        started: Long,
+        heldMs: Long,
         alreadyFinalized: Boolean,
     ): Pair<File, Int>? = withContext(NonCancellable) {
         val drainMs = VoiceDrainPlan.drainWindowMs(alreadyFinalized)
@@ -185,8 +192,9 @@ class VoiceRecorder(private val context: Context) {
             mediaRecorder.release()
         } catch (_: Exception) {
         }
-        val elapsed = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-        val durationMs = elapsed.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
+        // heldMs is the button-hold snapshotted at release (see [stop]); it does
+        // not include the drain window.
+        val durationMs = heldMs.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
         // Diagnostic the owner can grep to confirm the drain actually ran and how
         // long it added before finalize.
         Log.i(

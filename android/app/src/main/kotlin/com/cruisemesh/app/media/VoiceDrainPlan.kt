@@ -24,11 +24,13 @@ internal object VoiceDrainPlan {
      * magnitude larger than the `AudioRecord` minimum buffer alone (tens of ms;
      * see [minBufferLatencyMs]) — the encoder/AudioFlinger buffering dominates
      * and is not queryable through `MediaRecorder`, so a fixed window is the
-     * honest bound rather than a derived one. 500 ms covers the observed loss
-     * with a little margin; the cost is a small amount of trailing ambient audio,
+     * honest bound rather than a derived one. 600 ms sits just above the worst
+     * loss observed on two phones (~0.5 s), so there is real headroom rather than
+     * the window exactly cancelling the loss and leaving the final phoneme on the
+     * truncation boundary; the cost is a small amount of trailing ambient audio,
      * which is the correct trade against clipping the last spoken word.
      */
-    const val DRAIN_WINDOW_MS: Long = 500L
+    const val DRAIN_WINDOW_MS: Long = 600L
 
     /**
      * The `AudioRecord` latency implied by a minimum buffer of [minBufferBytes]
