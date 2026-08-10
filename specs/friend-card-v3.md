@@ -1,7 +1,8 @@
 # Friend card v3 (`CMFRIEND3:`) — compact link form
 
-Status: **phase 1 — parser shipped, emitter still v2.** The flip to emitting
-v3 is a deliberate later change (see §Rollout).
+Status: **phase 2 — parser shipped, emitter now emits signed v3.** The own-card
+emit path emits signed `CMFRIEND3:` links; rejecting unsigned imports is a
+deliberate later change, phase 3 (see §Rollout).
 
 ## Why
 
@@ -139,27 +140,36 @@ colon, so the three prefixes cannot shadow each other.
 
 ## Emitter gating
 
-`make_friend_link` keeps emitting `CMFRIEND2:` in this phase, gated on a
-single private const in `identity.rs`:
+`make_friend_link` emits signed `CMFRIEND3:` links, gated on a single private
+const in `identity.rs`, now flipped:
 
 ```rust
-/// Flip to true only after the fleet parses CMFRIEND3 (see specs/friend-card-v3.md §Rollout).
-const EMIT_FRIEND_LINK_V3: bool = false;
+const EMIT_FRIEND_LINK_V3: bool = true;
 ```
 
-The v3 encoder is fully implemented and tested now, so the flip is a one-line
-diff with no new code paths. Tests exercise the v3 emit path directly (not
-through the const), plus one test pinning that `make_friend_link` currently
-still emits the `CMFRIEND2:` prefix — so the eventual flip is caught as a
-deliberate test update, not an accident.
+The v3 encoder was fully implemented and tested before the flip, so this was a
+one-line diff with no new code paths. Tests exercise the emitted link directly:
+the own-card emit path now emits the `CMFRIEND3:` prefix, the emitted link
+carries a verifying self-signature, and a one-byte tamper of the emitted link's
+`agree_pk` is rejected on import.
 
-## What must be true before the flip (phase 2, separate PR)
+## Rollout
 
-* Both platforms have shipped a release whose `parse_friend_text` accepts
-  `CMFRIEND3:`, and the fleet has had time to update.
-* An old build receiving a v3 link opens the add-friend flow and shows its
+* **Phase 1 — parser shipped (done, #226).** Both platforms ship a
+  `parse_friend_text` that accepts `CMFRIEND3:`; the fleet has had time to
+  update. An old build predating the parser that received a v3 link showed its
   generic "not a CruiseMesh friend card" error — no crash, but a dead end;
-  that is why the parser ships first.
+  that is why the parser shipped first.
+* **Phase 2 — emit signed v3 (done, this change).** The own-card emit path
+  emits signed `CMFRIEND3:` links, so a shared link or QR carries the card's
+  self-signature (TM-01) binding the agreement key and relay to the identity.
+  Safe because every fielded build already parses v3.
+* **Phase 3 — require-signed (later, separate PR).** Reject unsigned imports so
+  the TM-01 binding is mandatory, not best-effort. Gated on the *whole* fleet
+  running a build that emits signed cards: signed cards must be circulating
+  before unsigned imports can be refused, otherwise an updated device and a
+  not-yet-updated device (still emitting unsigned v2) could not add each other.
+  Legacy unsigned cards keep importing until this flip.
 
 ## Test checklist (phase 1)
 
@@ -182,7 +192,8 @@ deliberate test update, not an accident.
   token) yields a full https link ≤ 190 chars and ≥ 30% shorter than the v2
   link for the same card (the one-byte signature field for an unsigned card is
   within this bound).
-* `make_friend_link` still emits `CMFRIEND2:` (flip tripwire).
+* `make_friend_link` emits a signed `CMFRIEND3:` link that carries a verifying
+  self-signature, and a one-byte tamper of the emitted link is rejected.
 * `deep_link_route` + `core_detect_links` treat a `/f#CMFRIEND3:` URL the
   same as a v2 one.
 * Fuzz: `fuzz_targets/protocol_decoders.rs` already drives

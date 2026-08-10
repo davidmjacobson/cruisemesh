@@ -31161,12 +31161,14 @@ public func makeFriendCard(name: String, identity: Identity, relayUrl: String?, 
 }
 /**
  * Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
- * `CMFRIEND2:` form, which is ~half the size of the legacy JSON `CMFRIEND1:`
- * form and so produces a much less dense QR code. A third, smaller form
- * (`CMFRIEND3:`, `specs/friend-card-v3.md`) is fully implemented behind
- * [`EMIT_FRIEND_LINK_V3`] but not emitted yet, because a build that predates
- * it cannot read it. `parse_friend_text` accepts every form ever emitted, so
- * cards already shared in the field keep working.
+ * `CMFRIEND3:` form (`specs/friend-card-v3.md`): smaller than the `CMFRIEND2:`
+ * form it replaces and, for an own card minted by [`make_friend_card`], it
+ * carries the card's self-signature (TM-01) so a shared link or QR binds the
+ * agreement key and relay to the identity. The fleet has parsed `CMFRIEND3:`
+ * since #226, so builds that predate this emit change can still read it, and
+ * `parse_friend_text` accepts every form ever emitted, so older `CMFRIEND1:` /
+ * `CMFRIEND2:` cards already shared in the field keep working. Rejecting
+ * unsigned imports is a later phase (see [`EMIT_FRIEND_LINK_V3`]).
  */
 public func makeFriendLink(cardJson: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -33044,7 +33046,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_make_friend_card() != 17109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 21406) {
+    if (uniffi_cruisemesh_core_checksum_func_make_friend_link() != 15808) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_make_relay_setup_card() != 25797) {
