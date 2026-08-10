@@ -102,6 +102,11 @@ final class VoiceRecorder {
     private let activateSession: SessionActivator
     private let deactivateSession: () -> Void
     private let decodeDurationMs: DurationProbe
+    /// How long to keep the recorder running after the user releases, before
+    /// `stop()` tears the capture pipeline down — the tail-drain (see
+    /// ``drainWindowSeconds(stillRecording:configured:)``). Injectable so tests
+    /// can pin it to 0 and stay synchronous.
+    private let tailDrainSeconds: TimeInterval
 
     private var capture: VoiceCapturing?
     private var outputURL: URL?
@@ -129,12 +134,14 @@ final class VoiceRecorder {
         },
         activateSession: @escaping SessionActivator = VoiceRecorder.activateSharedSession,
         deactivateSession: @escaping () -> Void = VoiceRecorder.deactivateSharedSession,
-        decodeDurationMs: @escaping DurationProbe = VoiceRecorder.decodeDurationMs(url:)
+        decodeDurationMs: @escaping DurationProbe = VoiceRecorder.decodeDurationMs(url:),
+        tailDrainSeconds: TimeInterval = VoiceRecorder.defaultTailDrainSeconds
     ) {
         self.makeCapture = captureFactory
         self.activateSession = activateSession
         self.deactivateSession = deactivateSession
         self.decodeDurationMs = decodeDurationMs
+        self.tailDrainSeconds = tailDrainSeconds
     }
 
     var isRecording: Bool { capture?.isRecording == true }
@@ -245,7 +252,42 @@ final class VoiceRecorder {
             self.finish(success: true, requestedDurationMs: requested)
         }
 
-        capture.stop()
+        // Tail drain: keep the recorder capturing for a short window before
+        // stopping so the pipeline's in-flight tail — the ~0.4-0.5 s that an
+        // immediate stop() discards when the user lifts their finger on the last
+        // word — is written to the file before teardown. This is a delay *before*
+        // stop(); everything above (the finish delegate, the finalize timeout,
+        // the "only read the file after onFinish" gate from #297) is unchanged —
+        // the file is never read during the drain, only after finalize. A
+        // recorder that already hit its own hard backstop is no longer recording
+        // and is finalized, so it is stopped immediately with no drain.
+        let drain = Self.drainWindowSeconds(stillRecording: capture.isRecording, configured: tailDrainSeconds)
+        Self.log.info("Voice stop: draining \(drain, privacy: .public)s before finalize")
+        if drain > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + drain) { capture.stop() }
+        } else {
+            capture.stop()
+        }
+    }
+
+    /// Default post-release drain window, matched to the Android side
+    /// (`VoiceDrainPlan.DRAIN_WINDOW_MS`): the field-measured tail loss was
+    /// ~0.4-0.5 s and the capture/encoder pipeline latency that causes it is not
+    /// queryable, so a fixed window is the honest bound. The cost is a little
+    /// trailing ambient audio, which beats clipping the last spoken word.
+    static let defaultTailDrainSeconds: TimeInterval = 0.5
+
+    /// The drain window to actually use, pure and static so it is unit-tested
+    /// without audio hardware.
+    ///
+    /// - Parameter stillRecording: whether the capture is still running. A
+    ///   recorder that already stopped itself at its max-duration backstop is
+    ///   finalized; there is nothing to drain and `stop()` would be a no-op, so
+    ///   the window collapses to 0.
+    /// - Parameter configured: the requested window (tests pin this to 0).
+    static func drainWindowSeconds(stillRecording: Bool, configured: TimeInterval) -> TimeInterval {
+        guard stillRecording else { return 0 }
+        return max(0, configured)
     }
 
     /// Runs the finalize decision and delivers (or rejects) the recording.

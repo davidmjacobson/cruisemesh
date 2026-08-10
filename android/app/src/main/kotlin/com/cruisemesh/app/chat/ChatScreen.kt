@@ -444,15 +444,18 @@ fun ChatScreen(
             }
         },
         onStopVoice = {
-            val result = voiceRecorder.stop()
-            if (result != null) {
-                sendVoiceFile(result.first, result.second)
-            } else {
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.ui_voice_recording_failed),
-                    Toast.LENGTH_SHORT,
-                ).show()
+            // stop() drains the recorder's buffered tail off the UI thread, then
+            // delivers the finalized file (or null) back on the main thread.
+            voiceRecorder.stop { result ->
+                if (result != null) {
+                    sendVoiceFile(result.first, result.second)
+                } else {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.ui_voice_recording_failed),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
             }
         },
         onCancelVoice = { voiceRecorder.cancel() },

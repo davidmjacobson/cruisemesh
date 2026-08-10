@@ -371,7 +371,11 @@ fun GroupChatScreen(
                     }
                 },
                 onStopVoice = {
-                    voiceRecorder.stop()?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
+                    // stop() drains the recorder's buffered tail off the UI thread,
+                    // then delivers the finalized file back on the main thread.
+                    voiceRecorder.stop { result ->
+                        result?.let { (file, durationMs) -> sendVoiceFile(file, durationMs) }
+                    }
                 },
                 onCancelVoice = { voiceRecorder.cancel() },
                 bytesRecorded = { voiceRecorder.bytesRecorded() },
