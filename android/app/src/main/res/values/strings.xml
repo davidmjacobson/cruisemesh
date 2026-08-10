@@ -164,7 +164,7 @@
     <string name="ui_report_contact">Report contact</string>
     <string name="ui_report_email_body">Reporting: %1$s\nTheir ID: %2$s\nTheir safety words: %3$s\nMy ID: %4$s\n\nWhat happened:\n</string>
     <string name="ui_report_email_subject">CruiseMesh abuse report</string>
-    <string name="ui_no_email_app">No email app found. You can email %1$s directly.</string>
+    <string name="ui_no_email_app">No email app found. You can email %1$s directly — the address has been copied.</string>
     <string name="ui_recording_duration">Recording… %1$s</string>
     <string name="ui_last_peer">Last peer: %1$s</string>
     <string name="ui_this_phone">This phone: %1$s</string>

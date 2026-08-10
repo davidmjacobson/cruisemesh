@@ -10,6 +10,12 @@ import uniffi.cruisemesh_core.coreClassifyConnectionHealth
 /** Which semantic dot color the mesh status pill should show; see [MeshStatusTextLogic.build]. */
 enum class MeshStatusDotColor { GREEN, BLUE, AMBER, NEUTRAL }
 
+/** A status may pulse only when both its state and the person's motion setting allow it. */
+internal fun meshStatusDotShouldAnimate(
+    statusWantsPulse: Boolean,
+    systemAnimationsEnabled: Boolean,
+): Boolean = statusWantsPulse && systemAnimationsEnabled
+
 data class MeshStatusPillStatus(
     val text: String,
     val dot: MeshStatusDotColor?,

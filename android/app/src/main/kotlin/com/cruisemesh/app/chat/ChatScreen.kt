@@ -57,7 +57,9 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -130,19 +132,22 @@ import com.cruisemesh.app.ui.AvatarBadge
 import com.cruisemesh.app.ui.BubbleGrouping
 import com.cruisemesh.app.friending.ShareContactAvailability
 import com.cruisemesh.app.friending.ShareContactPolicy
+import com.cruisemesh.app.ui.ABUSE_REPORT_ADDRESS
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ComposerCameraIcon
 import com.cruisemesh.app.ui.ComposerMicIcon
 import com.cruisemesh.app.ui.ComposerPauseIcon
-import com.cruisemesh.app.ui.launchContactReport
 import com.cruisemesh.app.ui.ComposerSendIcon
-import com.cruisemesh.app.ui.ReplyIcon
+import com.cruisemesh.app.ui.ContactReportOutcome
 import com.cruisemesh.app.ui.ContactDetailsSheet
 import com.cruisemesh.app.ui.ConversationMessageMeta
 import com.cruisemesh.app.ui.CruiseMeshTheme
+import com.cruisemesh.app.ui.ReplyIcon
 import com.cruisemesh.app.ui.SignalTick
 import com.cruisemesh.app.ui.bubbleGroupingFor
+import com.cruisemesh.app.ui.copyAbuseReportAddress
 import com.cruisemesh.app.ui.formatConversationTimestamp
+import com.cruisemesh.app.ui.launchContactReport
 import com.cruisemesh.app.ui.tickLegendText
 import uniffi.cruisemesh_core.ComposerReach
 import uniffi.cruisemesh_core.CoreVoiceCaptureState
@@ -487,7 +492,21 @@ fun ChatScreen(
             }
             isBlocked = blocked
         },
-        onReport = { launchContactReport(context, currentContact, ownUserId) },
+        onReport = {
+            if (launchContactReport(context, currentContact, ownUserId) == ContactReportOutcome.ADDRESS_COPIED) {
+                coroutineScope.launch {
+                    val result = snackbarHostState.showSnackbar(
+                        message = context.getString(R.string.ui_no_email_app, ABUSE_REPORT_ADDRESS),
+                        actionLabel = context.getString(R.string.ui_copy),
+                        withDismissAction = true,
+                        duration = SnackbarDuration.Indefinite,
+                    )
+                    if (result == SnackbarResult.ActionPerformed) {
+                        copyAbuseReportAddress(context)
+                    }
+                }
+            }
+        },
         shareAvailability = shareAvailability,
         onShareContact = { onShareContact(currentContact) },
     )
@@ -715,7 +734,10 @@ private fun ConversationScreen(
                     onSetNickname = onSetNickname,
                     isBlocked = isBlocked,
                     onBlockedChange = onBlockedChange,
-                    onReport = onReport,
+                    onReport = {
+                        showContactDetails = false
+                        onReport()
+                    },
                     relayCardIsStale = relayCardIsStale,
                     shareAvailability = shareAvailability,
                     onShareContact = {

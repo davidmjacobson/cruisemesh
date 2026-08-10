@@ -2,6 +2,15 @@ import XCTest
 @testable import CruiseMesh
 
 final class MeshStatusPillLogicTests: XCTestCase {
+    func testReduceMotionKeepsTheStatusDotSteady() {
+        XCTAssertFalse(MeshStatusPillLogic.shouldAnimate(statusWantsPulse: true, reduceMotion: true))
+    }
+
+    func testStatusDotAnimatesOnlyWhenStateAndMotionSettingAllowIt() {
+        XCTAssertTrue(MeshStatusPillLogic.shouldAnimate(statusWantsPulse: true, reduceMotion: false))
+        XCTAssertFalse(MeshStatusPillLogic.shouldAnimate(statusWantsPulse: false, reduceMotion: false))
+    }
+
     private func suffix(
         _ health: RelayHealth,
         state: MeshRuntimeState = .meshing(nearby: 2),

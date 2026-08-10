@@ -81,6 +81,12 @@ struct MeshStatusPillStatus: Equatable {
 /// health that becomes action-required there needs wording here, or the pill
 /// silently swallows it.
 enum MeshStatusPillLogic {
+    /// Reduce Motion wins over a status that would otherwise pulse. The words,
+    /// color, and tap action remain unchanged, so no state is lost with motion.
+    static func shouldAnimate(statusWantsPulse: Bool, reduceMotion: Bool) -> Bool {
+        statusWantsPulse && !reduceMotion
+    }
+
     /// The text to append to the pill, or nil to leave the pill untouched.
     ///
     /// Only while the mesh is meshing: a stopped mesh is a more immediate

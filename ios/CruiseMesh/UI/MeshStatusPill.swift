@@ -40,6 +40,7 @@ final class MeshStatusPillClock: ObservableObject {
  deduplicated by `LanListeningSignal`, never the whole LAN snapshot).
  */
 struct MeshStatusPill: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
     @ObservedObject private var lan = LanListeningSignal.shared
@@ -106,7 +107,10 @@ struct MeshStatusPill: View {
         // is work nobody asked for.
         let service = InternetDeliveryService.of(RelayConfigStore.load())
         let status = self.status(service: service)
-        let pulsing = shouldPulse(service: service)
+        let pulsing = MeshStatusPillLogic.shouldAnimate(
+            statusWantsPulse: shouldPulse(service: service),
+            reduceMotion: reduceMotion
+        )
         return Button(action: onTap) {
             HStack(spacing: 6) {
                 Circle()
@@ -122,10 +126,18 @@ struct MeshStatusPill: View {
             .background(Capsule().fill(Color(.secondarySystemBackground)))
         }
         .buttonStyle(.plain)
-        .onAppear {
+        .onAppear { updatePulse(animate: pulsing) }
+        .onChange(of: pulsing) { updatePulse(animate: $0) }
+    }
+
+    private func updatePulse(animate: Bool) {
+        if animate {
+            pulse = false
             withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
                 pulse = true
             }
+        } else {
+            withAnimation(nil) { pulse = false }
         }
     }
 

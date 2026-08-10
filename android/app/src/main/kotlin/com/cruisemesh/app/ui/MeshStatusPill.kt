@@ -1,5 +1,9 @@
 package com.cruisemesh.app.ui
 
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -31,11 +35,19 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -44,13 +56,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.cruisemesh.app.mesh.ReachabilityLevel
-import androidx.compose.runtime.remember
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
-import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
+import com.cruisemesh.app.mesh.ReachabilityLevel
 
 /** How urgent a home-screen connectivity callout is. */
 enum class ConnectivityWarningSeverity {
@@ -279,6 +287,35 @@ private fun LegendRow(level: ReachabilityLevel, label: String, detail: String) {
     }
 }
 
+/**
+ * Observe Android's animator scale so "Remove animations" takes effect while
+ * the app is open. Compose normally scales animation clocks for us, but the
+ * explicit gate also keeps an infinite transition from running invisibly.
+ */
+@Composable
+private fun systemAnimationsEnabled(): Boolean {
+    val context = LocalContext.current
+    val resolver = context.contentResolver
+    fun readSetting(): Boolean =
+        Settings.Global.getFloat(resolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) > 0f
+
+    var enabled by remember(resolver) { mutableStateOf(readSetting()) }
+    DisposableEffect(resolver) {
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                enabled = readSetting()
+            }
+        }
+        resolver.registerContentObserver(
+            Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE),
+            false,
+            observer,
+        )
+        onDispose { resolver.unregisterContentObserver(observer) }
+    }
+    return enabled
+}
+
 @Composable
 fun MeshStatusPill(
     text: String,
@@ -286,8 +323,9 @@ fun MeshStatusPill(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val shouldPulse = dotColor != null &&
+    val statusWantsPulse = dotColor != null &&
         (text.startsWith("Mesh on") || text.contains("Starting", ignoreCase = true))
+    val shouldPulse = meshStatusDotShouldAnimate(statusWantsPulse, systemAnimationsEnabled())
     val pulse = rememberInfiniteTransition(label = "mesh-status-pulse")
     val dotScale = if (shouldPulse) {
         pulse.animateFloat(
