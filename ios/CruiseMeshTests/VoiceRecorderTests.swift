@@ -90,7 +90,8 @@ final class VoiceRecorderTests: XCTestCase {
             },
             activateSession: { Self.fakeSession },
             deactivateSession: { deactivations += 1 },
-            decodeDurationMs: { _ in 1_800 }
+            decodeDurationMs: { _ in 1_800 },
+            tailDrainSeconds: 0
         )
 
         XCTAssertTrue(recorder.start())
@@ -115,7 +116,8 @@ final class VoiceRecorderTests: XCTestCase {
             },
             activateSession: { Self.fakeSession },
             deactivateSession: {},
-            decodeDurationMs: { _ in 1_800 }
+            decodeDurationMs: { _ in 1_800 },
+            tailDrainSeconds: 0
         )
 
         XCTAssertTrue(recorder.start())
@@ -143,7 +145,8 @@ final class VoiceRecorderTests: XCTestCase {
             },
             activateSession: { Self.fakeSession },
             deactivateSession: {},
-            decodeDurationMs: { _ in nil }
+            decodeDurationMs: { _ in nil },
+            tailDrainSeconds: 0
         )
 
         XCTAssertTrue(recorder.start())
@@ -152,6 +155,63 @@ final class VoiceRecorderTests: XCTestCase {
         recorder.stop { result = $0 }
 
         XCTAssertNil(result, "an undecodable file must abort the send")
+    }
+
+    // MARK: The tail-drain decision and the drained stop
+
+    func testTailDrainWindowKeepsRecorderRunningTailWhileRecording() {
+        // A normal release, still recording: keep the pipeline running for the
+        // configured window so the buffered tail is written before teardown.
+        XCTAssertEqual(VoiceRecorder.drainWindowSeconds(stillRecording: true, configured: 0.5), 0.5)
+    }
+
+    func testTailDrainWindowIsZeroAfterAHardBackstop() {
+        // The recorder already stopped itself at its max-duration backstop: it is
+        // finalized and stop() is a no-op, so there is nothing to drain.
+        XCTAssertEqual(VoiceRecorder.drainWindowSeconds(stillRecording: false, configured: 0.5), 0)
+    }
+
+    func testTailDrainWindowClampsNegativeConfiguration() {
+        XCTAssertEqual(VoiceRecorder.drainWindowSeconds(stillRecording: true, configured: -1), 0)
+    }
+
+    func testDefaultTailDrainMatchesTheFieldMeasuredLoss() {
+        XCTAssertGreaterThanOrEqual(VoiceRecorder.defaultTailDrainSeconds, 0.4)
+        XCTAssertLessThanOrEqual(VoiceRecorder.defaultTailDrainSeconds, 0.6)
+    }
+
+    /// With a positive drain the file is delivered only *after* the drain window,
+    /// and the finalize gate still runs — the recording is not dropped by the
+    /// delay.
+    func testStopWithDrainStillDeliversAfterTheWindow() {
+        let recorder = VoiceRecorder(
+            captureFactory: { url, _ in
+                let fake = FakeVoiceCapture(url: url)
+                fake.finishSuccess = true
+                fake.bytesToWrite = 4_096
+                return fake
+            },
+            activateSession: { Self.fakeSession },
+            deactivateSession: {},
+            decodeDurationMs: { _ in 1_800 },
+            tailDrainSeconds: 0.2
+        )
+
+        XCTAssertTrue(recorder.start())
+
+        var result: (URL, Int32)??
+        recorder.stop { result = $0 }
+
+        // The drain is scheduled on the main queue, so nothing is delivered yet.
+        XCTAssertNil(result ?? nil, "delivery must wait for the drain window")
+
+        let delivered = expectation(description: "recording delivered after drain")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            if result != nil { delivered.fulfill() }
+        }
+        wait(for: [delivered], timeout: 2.0)
+        XCTAssertNotNil(result ?? nil, "a playable recording must be delivered after the drain")
+        if let url = (result ?? nil)?.0 { try? FileManager.default.removeItem(at: url) }
     }
 
     private static let fakeSession = VoiceRecorder.SessionInfo(

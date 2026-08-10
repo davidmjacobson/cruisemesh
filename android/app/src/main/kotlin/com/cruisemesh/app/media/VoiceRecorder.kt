@@ -4,6 +4,13 @@ import android.content.Context
 import android.media.MediaRecorder
 import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.cruisemesh_core.CoreVoiceCapturePlan
 import uniffi.cruisemesh_core.voiceCapturePlan
 import java.io.File
@@ -28,6 +35,15 @@ class VoiceRecorder(private val context: Context) {
     private var recorder: MediaRecorder? = null
     private var outputFile: File? = null
     private var startedAtMs: Long = 0L
+
+    /**
+     * Owns the post-release drain + finalize (see [stop]). Deliberately *not* the
+     * caller's composition/coroutine scope: a normal release commits the send
+     * immediately, and the user leaving the chat screen a few hundred ms later
+     * must not cancel the drain (which would leak the hot mic and orphan the
+     * file). This scope outlives the composable so the finalize always runs.
+     */
+    private val finalizeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
      * Set when `MediaRecorder` hit [MAX_DURATION_BACKSTOP_MS] and stopped
@@ -98,10 +114,26 @@ class VoiceRecorder(private val context: Context) {
     }
 
     /**
-     * Stops recording and returns the file + duration, or null if nothing
-     * usable was captured.
+     * Stops recording and delivers the file + duration (or null if nothing
+     * usable was captured) to [completion] on the main thread.
+     *
+     * Asynchronous by necessity: on a normal release we keep the recorder running
+     * for [VoiceDrainPlan.DRAIN_WINDOW_MS] so the AAC encoder pipeline's in-flight
+     * tail — the ~0.4-0.5 s that an immediate `stop()` discarded — gets encoded
+     * before finalize. That wait plus the finalize itself run off the caller's
+     * thread; the recorder's public state is cleared synchronously here, so
+     * [isRecording] flips false at once and the composer returns to idle without
+     * feeling stuck down.
+     *
+     * A max-duration backstop finalize (`selfStopped`) is delivered without any
+     * drain: that file is already complete and its recorder cannot be stopped
+     * again. [cancel] likewise never drains — it aborts and deletes immediately.
      */
-    fun stop(): Pair<File, Int>? {
+    fun stop(completion: (Pair<File, Int>?) -> Unit) {
+        // Snapshot and clear on the caller's thread so isRecording is false
+        // immediately and a racing start()/cancel() cannot touch the recorder we
+        // are about to drain (it is detached; cancel becomes a no-op on it, which
+        // is what lets an in-flight send finish rather than be dropped).
         val file = outputFile
         val started = startedAtMs
         val mediaRecorder = recorder
@@ -110,7 +142,42 @@ class VoiceRecorder(private val context: Context) {
         outputFile = null
         startedAtMs = 0L
         selfStopped = false
-        if (mediaRecorder == null || file == null) return null
+        if (mediaRecorder == null || file == null) {
+            completion(null)
+            return
+        }
+        // Snapshot the held duration at release, BEFORE the drain, so the reported
+        // durationMs is what the user actually held the button for and does not
+        // grow by the drain window. iOS does the same (clampedDurationMs at
+        // stop-entry); this keeps the two shells' labels in agreement. The drain
+        // still captures the trailing audio into the file — the file's decoded
+        // length is a touch longer than this — but the label tracks the hold.
+        val heldMs = if (started == 0L) 0L else (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+        finalizeScope.launch {
+            val result = drainAndFinalize(mediaRecorder, file, heldMs, alreadyFinalized)
+            withContext(Dispatchers.Main) { completion(result) }
+        }
+    }
+
+    /**
+     * The drain wait + `stop()`/`release()` + finalize decision, off the UI
+     * thread. Wrapped [NonCancellable] so that even if something cancels the
+     * launching job mid-wait, the mic is still released and the file finalized
+     * rather than left hot and orphaned.
+     */
+    private suspend fun drainAndFinalize(
+        mediaRecorder: MediaRecorder,
+        file: File,
+        heldMs: Long,
+        alreadyFinalized: Boolean,
+    ): Pair<File, Int>? = withContext(NonCancellable) {
+        val drainMs = VoiceDrainPlan.drainWindowMs(alreadyFinalized)
+        val releasedAt = SystemClock.elapsedRealtime()
+        if (drainMs > 0L) {
+            // Keep the encoder running so the buffered tail is written to the file.
+            delay(drainMs)
+        }
+        val drainedMs = SystemClock.elapsedRealtime() - releasedAt
         var stopFailed = false
         if (!alreadyFinalized) {
             try {
@@ -125,13 +192,22 @@ class VoiceRecorder(private val context: Context) {
             mediaRecorder.release()
         } catch (_: Exception) {
         }
-        val elapsed = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-        val durationMs = elapsed.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
+        // heldMs is the button-hold snapshotted at release (see [stop]); it does
+        // not include the drain window.
+        val durationMs = heldMs.coerceAtMost(voiceCapturePlan().maxDurationMs.toLong()).toInt()
+        // Diagnostic the owner can grep to confirm the drain actually ran and how
+        // long it added before finalize.
+        Log.i(
+            TAG,
+            "Voice stop finalize: requestedDrainMs=$drainMs actualDrainMs=$drainedMs " +
+                "finalized=$alreadyFinalized durationMs=$durationMs",
+        )
         if (stopFailed || !file.exists() || file.length() == 0L) {
             file.delete()
-            return null
+            null
+        } else {
+            file to durationMs
         }
-        return file to durationMs
     }
 
     fun cancel() {
