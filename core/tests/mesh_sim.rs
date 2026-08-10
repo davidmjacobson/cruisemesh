@@ -8,37 +8,32 @@
 //! recipient across hops and time gaps it could never reach directly.
 //!
 //! It drives the **real** core primitives -- `seal_message`/`open_message`,
-//! the §6.4 frame codec, [`SeenIds`], and the [`MessageStore`] carry queue --
-//! composed by the **same algorithm** `android/.../mesh/MeshService.kt` runs on
-//! device:
-//!   * receive: dedupe on `msg_id` -> drop if past `expiry` -> try to open;
-//!     opening means we're the recipient (deliver, don't re-flood), else it's
-//!     foreign traffic to relay (flood with `hop_ttl - 1`, if hops remain) and
-//!     carry (enqueue for later).
+//! the §6.4 frame codec, [`SeenIds`], and the [`MessageStore`] carry queue:
+//!   * receive: since package D0 this is no longer a third copy. `SimNode::receive`
+//!     and `SimNode::receive_from_relay` both call the one production inbound
+//!     transaction, [`MessageStore::process_inbound_frame`], which owns dedupe,
+//!     expiry, open-for-self/group-with-membership-guard, flood/carry
+//!     classification, and the ack-safety evidence. The sim only supplies the
+//!     frame and records the delivered payload; the disposition is core's.
 //!   * meeting (HELLO): first drain carried envelopes whose `recipient_hint`
 //!     matches the peer, handing each over and dropping it once delivered;
 //!     then spray the remaining carried envelopes onward to a non-recipient
 //!     mule, excluding any `msg_id`s that mule's digest says it already knows.
+//!     `Network::meet` still composes this from store primitives -- hoisting
+//!     the encounter/spray planner into core is package D2.
 //!   * relay: group-addressed uploads fan out into one row per member hint;
-//!     each node polls its own hints, runs the same group-open candidate rule
-//!     as the shells, and only acks rows it consumed.
-//!
-//! Because that orchestration currently lives in Kotlin, this file
-//! re-implements it in `SimNode::receive` / `Network::meet`. That validates
-//! the protocol, the primitives, and the *design*, and guards against
-//! regressions in the shared core -- but it is NOT a test of the Kotlin code
-//! itself. The durable fix is to hoist the algorithm into the core so both the
-//! shell and this sim call one implementation (noted in HANDOFF). Keep the two
-//! in sync until then.
+//!     each node polls its own hints and, through the same core transaction,
+//!     only acks rows it consumed.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use cruisemesh_core::{
     compute_recipient_hint, core_group_fanout_rows, default_expiry, encode_envelope_frame,
-    generate_identity, generate_msg_id, open_group_message, open_message, parse_frame,
-    seal_group_message, seal_message, CarriedEnvelope, CoreGroupFanoutRow, CoreInboundDisposition,
-    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreTransport, Frame, Group, Identity,
-    MessageStore, SeenIds, DEFAULT_HOP_TTL,
+    generate_identity, generate_msg_id, seal_group_message, seal_message, CarriedEnvelope,
+    CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundSource, CoreMeshRouterState,
+    CoreRelayEnvelopeDisposition, CoreTransport, Group, Identity, MessageStore, SeenIds,
+    DEFAULT_HOP_TTL,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -51,10 +46,9 @@ const DIGEST_CARRIED_MSG_IDS_LIMIT: u64 = 512;
 struct SimNode {
     identity: Identity,
     store: MessageStore,
-    seen: SeenIds,
-    /// UserIDs this node treats as contacts, for the family/foreign carry
-    /// classification (mules generally have none of the recipient's).
-    contacts: Vec<Vec<u8>>,
+    /// Process-wide flood-dedupe set, shared by reference with the core inbound
+    /// transaction exactly as a device shares `GossipState.seenIds`.
+    seen: Arc<SeenIds>,
     /// Plaintext of every message this node was the recipient of and opened.
     inbox: Vec<Vec<u8>>,
 }
@@ -64,8 +58,7 @@ impl SimNode {
         SimNode {
             identity: generate_identity(),
             store: MessageStore::open(":memory:".to_string()).expect("open in-memory store"),
-            seen: SeenIds::new(),
-            contacts: Vec::new(),
+            seen: Arc::new(SeenIds::new()),
             inbox: Vec::new(),
         }
     }
@@ -78,188 +71,55 @@ impl SimNode {
         self.store.upsert_group(group).expect("import group");
     }
 
-    /// Mirror of `MeshService.handleEnvelope`'s per-frame handling. Returns the
-    /// frame to flood onward (already `hop_ttl`-decremented) when this node is
-    /// a relay with budget left, or `None` when the frame is a duplicate,
-    /// expired, delivered to us, or out of hops.
+    /// Receive one BLE/LAN frame through the production inbound transaction
+    /// [`MessageStore::process_inbound_frame`]. Delivers any opened payload into
+    /// this node's inbox (the sim's stand-in for the shells' kind dispatch) and
+    /// returns the hop-decremented frame to flood onward, or `None` when the
+    /// frame is a duplicate, expired, delivered to us, or out of hops.
     fn receive(&mut self, frame_bytes: &[u8], now: i64) -> Option<Vec<u8>> {
-        let Ok(Frame::Envelope {
-            msg_id,
-            hop_ttl,
-            expiry,
-            recipient_hint,
-            sealed,
-        }) = parse_frame(frame_bytes.to_vec())
-        else {
-            return None;
-        };
-
-        // 1. Dedupe: handle each msg_id once.
-        if !self.seen.check_and_record(msg_id.clone()) {
-            return None;
-        }
-        // 2. Expiry: carriers drop past-expiry envelopes.
-        if expiry <= now {
-            return None;
-        }
-        // 3. Open vs relay.
-        if let Ok(opened) = open_message(self.identity.clone(), sealed.clone()) {
-            // Addressed to us directly: deliver, do not re-flood.
-            self.inbox.push(opened.payload);
-            return None;
-        }
-
-        if let Some(opened) = self.try_open_group_message(&recipient_hint, &sealed, now) {
-            // Group member delivery still keeps relaying/carrying for absent members.
-            self.inbox.push(opened.payload);
-            self.store
-                .enqueue_carried_envelope(
-                    CarriedEnvelope {
-                        msg_id: msg_id.clone(),
-                        hop_ttl,
-                        expiry,
-                        recipient_hint: recipient_hint.clone(),
-                        sealed: sealed.clone(),
-                    },
-                    true,
-                    now,
-                    FOREIGN_BUDGET,
-                )
-                .expect("enqueue carried group envelope");
-            if hop_ttl > 1 {
-                return Some(encode_envelope_frame(
-                    msg_id,
-                    hop_ttl - 1,
-                    expiry,
-                    recipient_hint,
-                    sealed,
-                ));
-            }
-            return None;
-        }
-
-        // Foreign: carry it for later, and relay it now if hops remain.
-        let is_family = self.hint_matches_known_target(&recipient_hint, now);
-        self.store
-            .enqueue_carried_envelope(
-                CarriedEnvelope {
-                    msg_id: msg_id.clone(),
-                    hop_ttl,
-                    expiry,
-                    recipient_hint: recipient_hint.clone(),
-                    sealed: sealed.clone(),
-                },
-                is_family,
-                now,
-                FOREIGN_BUDGET,
-            )
-            .expect("enqueue carried");
-        if hop_ttl > 1 {
-            Some(encode_envelope_frame(
-                msg_id,
-                hop_ttl - 1,
-                expiry,
-                recipient_hint,
-                sealed,
-            ))
-        } else {
-            None
-        }
-    }
-
-    /// Relay-source counterpart to [`Self::receive`]. A fetched row is not a
-    /// live-link flood: if it opens under one of this member's group keys it
-    /// is consumed without gossip re-injection; otherwise it is durably
-    /// carried and must stay unacked in the relay mailbox.
-    fn receive_from_relay(&mut self, envelope: &RelayEnvelope, now: i64) -> CoreInboundDisposition {
-        if self.seen.contains(envelope.msg_id.clone()) {
-            return CoreInboundDisposition::Seen;
-        }
-        if envelope.expiry <= now {
-            self.seen.record(envelope.msg_id.clone());
-            return CoreInboundDisposition::Expired;
-        }
-
-        if let Ok(opened) = open_message(self.identity.clone(), envelope.sealed.clone()) {
-            self.inbox.push(opened.payload);
-            self.seen.record(envelope.msg_id.clone());
-            return CoreInboundDisposition::Consumed;
-        }
-
-        let candidates = self
+        let outcome = self
             .store
-            .group_open_candidates(envelope.recipient_hint.clone(), self.user_id(), now)
-            .expect("group open candidates");
-        for group in candidates {
-            if !group
-                .member_user_ids
-                .iter()
-                .any(|member| member == &self.identity.user_id)
-            {
-                continue;
-            }
-            let Ok(opened) = open_group_message(group.clone(), envelope.sealed.clone()) else {
-                continue;
-            };
-            if !group
-                .member_user_ids
-                .iter()
-                .any(|member| member == &opened.sender_user_id)
-            {
-                continue;
-            }
-            self.inbox.push(opened.payload);
-            self.seen.record(envelope.msg_id.clone());
-            return CoreInboundDisposition::Consumed;
-        }
-
-        self.store
-            .enqueue_relay_carried_envelope(
-                CarriedEnvelope {
-                    msg_id: envelope.msg_id.clone(),
-                    hop_ttl: envelope.hop_ttl,
-                    expiry: envelope.expiry,
-                    recipient_hint: envelope.recipient_hint.clone(),
-                    sealed: envelope.sealed.clone(),
-                },
+            .process_inbound_frame(
+                self.identity.clone(),
+                self.seen.clone(),
+                CoreInboundSource::Mesh,
+                frame_bytes.to_vec(),
                 now,
             )
-            .expect("enqueue relay-carried envelope");
-        self.seen.record(envelope.msg_id.clone());
-        CoreInboundDisposition::Carried
-    }
-
-    fn try_open_group_message(
-        &self,
-        recipient_hint: &[u8],
-        sealed: &[u8],
-        now: i64,
-    ) -> Option<cruisemesh_core::OpenedMessage> {
-        self.store
-            .list_groups()
-            .expect("list groups")
-            .into_iter()
-            .filter(|group| {
-                recent_hints(&group.id, now)
-                    .iter()
-                    .any(|hint| hint == recipient_hint)
-            })
-            .find_map(|group| open_group_message(group, sealed.to_vec()).ok())
-    }
-
-    fn hint_matches_known_target(&self, hint: &[u8], now: i64) -> bool {
-        if self
-            .contacts
-            .iter()
-            .any(|target| recent_hints(target, now).iter().any(|h| h == hint))
-        {
-            return true;
+            .expect("process inbound mesh frame");
+        for payload in outcome.delivered_payloads {
+            self.inbox.push(payload);
         }
-        self.store
-            .list_groups()
-            .expect("list groups")
-            .into_iter()
-            .any(|group| recent_hints(&group.id, now).iter().any(|h| h == hint))
+        outcome.relay_frame
+    }
+
+    /// Relay-source counterpart to [`Self::receive`], through the same core
+    /// transaction: a fetched row is dispositioned by
+    /// [`MessageStore::process_inbound_frame`] with [`CoreInboundSource::Relay`]
+    /// — consumed if it opens for us, otherwise durably carried and left unacked
+    /// in the relay mailbox.
+    fn receive_from_relay(&mut self, envelope: &RelayEnvelope, now: i64) -> CoreInboundDisposition {
+        let frame = encode_envelope_frame(
+            envelope.msg_id.clone(),
+            envelope.hop_ttl,
+            envelope.expiry,
+            envelope.recipient_hint.clone(),
+            envelope.sealed.clone(),
+        );
+        let outcome = self
+            .store
+            .process_inbound_frame(
+                self.identity.clone(),
+                self.seen.clone(),
+                CoreInboundSource::Relay,
+                frame,
+                now,
+            )
+            .expect("process inbound relay frame");
+        for payload in outcome.delivered_payloads {
+            self.inbox.push(payload);
+        }
+        outcome.disposition
     }
 
     fn recent_delivery_hints(&self, now: i64) -> Vec<Vec<u8>> {

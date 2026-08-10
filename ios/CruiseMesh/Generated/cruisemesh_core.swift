@@ -3551,6 +3551,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func carriedMsgIds(limit: UInt64) throws  -> [Data]
     
     /**
+     * Enqueue a foreign/group envelope into the carry queue for later delivery.
+     *
+     * The stored `hop_ttl` is one less than the header's: carrying is itself a
+     * hop, so a mule delivery must count it exactly as the flood path counts
+     * its own re-relays. A relay-sourced row is stored `from_relay` so it is
+     * never re-uploaded (it is already on the relay); a mesh-sourced row is
+     * force-family here (the group/fan-out path) or classified by the store.
+     */
+    func carry(source: CoreInboundSource, msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data, nowMs: Int64) throws  -> Bool
+    
+    /**
      * A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
      * distinct sender who has ever posted in this chat, each with their
      * [`MessageStore::highest_contiguous_lamport`]. Ordered by
@@ -4856,6 +4867,19 @@ public protocol MessageStoreProtocol : AnyObject {
     func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [OutgoingReceiptEnvelope]
     
     /**
+     * Run one inbound `0x02` envelope through the production disposition and
+     * return the bounded work to execute. See the module docs for the ordered
+     * steps and the invariants preserved.
+     *
+     * `seen` is the process-wide flood-dedupe set (DESIGN.md §5.3). It is read
+     * with the non-mutating [`SeenIds::contains`] and recorded only once the
+     * envelope reaches a terminal handled state (DTN D4): an envelope whose
+     * durable carry failed stays re-presentable, one that was handled — even
+     * by deliberate drop — is deduped.
+     */
+    func processInboundFrame(identity: Identity, seen: SeenIds, source: CoreInboundSource, frame: Data, nowMs: Int64) throws  -> CoreInboundOutcome
+    
+    /**
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
      * (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
      * how many were pruned.
@@ -5823,6 +5847,29 @@ open func carriedMsgIds(limit: UInt64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_carried_msg_ids(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * Enqueue a foreign/group envelope into the carry queue for later delivery.
+     *
+     * The stored `hop_ttl` is one less than the header's: carrying is itself a
+     * hop, so a mule delivery must count it exactly as the flood path counts
+     * its own re-relays. A relay-sourced row is stored `from_relay` so it is
+     * never re-uploaded (it is already on the relay); a mesh-sourced row is
+     * force-family here (the group/fan-out path) or classified by the store.
+     */
+open func carry(source: CoreInboundSource, msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_carry(self.uniffiClonePointer(),
+        FfiConverterTypeCoreInboundSource.lower(source),
+        FfiConverterData.lower(msgId),
+        FfiConverterUInt8.lower(hopTtl),
+        FfiConverterInt64.lower(expiry),
+        FfiConverterData.lower(recipientHint),
+        FfiConverterData.lower(sealed),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -7756,6 +7803,29 @@ open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skip
         FfiConverterUInt64.lower(limit),
         FfiConverterInt64.lower(nowMs),
         FfiConverterSequenceData.lower(skipRecipientUserIds),$0
+    )
+})
+}
+    
+    /**
+     * Run one inbound `0x02` envelope through the production disposition and
+     * return the bounded work to execute. See the module docs for the ordered
+     * steps and the invariants preserved.
+     *
+     * `seen` is the process-wide flood-dedupe set (DESIGN.md §5.3). It is read
+     * with the non-mutating [`SeenIds::contains`] and recorded only once the
+     * envelope reaches a terminal handled state (DTN D4): an envelope whose
+     * durable carry failed stays re-presentable, one that was handled — even
+     * by deliberate drop — is deduped.
+     */
+open func processInboundFrame(identity: Identity, seen: SeenIds, source: CoreInboundSource, frame: Data, nowMs: Int64)throws  -> CoreInboundOutcome {
+    return try  FfiConverterTypeCoreInboundOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_process_inbound_frame(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeSeenIds.lower(seen),
+        FfiConverterTypeCoreInboundSource.lower(source),
+        FfiConverterData.lower(frame),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -11868,6 +11938,289 @@ public func FfiConverterTypeCoreIdentifiedRoute_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeCoreIdentifiedRoute_lower(_ value: CoreIdentifiedRoute) -> RustBuffer {
     return FfiConverterTypeCoreIdentifiedRoute.lower(value)
+}
+
+
+/**
+ * The result of running one inbound envelope through [`MessageStore::process_inbound_frame`].
+ *
+ * Every list here is bounded: at most one delivered payload (a frame is
+ * addressed to at most one 1:1 recipient or one group we belong to) and at
+ * most one re-flood frame. Nothing unbounded crosses the FFI boundary.
+ */
+public struct CoreInboundOutcome {
+    /**
+     * The relay ack rule's input: see [`crate::core_should_ack_inbound`] and
+     * [`crate::MessageStore::core_relay_ack_ids_with_consumed`].
+     */
+    public var disposition: CoreInboundDisposition
+    /**
+     * The opened plaintext to deliver — one entry when this device is the 1:1
+     * recipient or a group member and the sender is neither blocked nor a
+     * non-member, empty otherwise. The caller decodes and applies it.
+     */
+    public var deliveredPayloads: [Data]
+    /**
+     * The verified sender of the delivered payload, for the caller's kind
+     * dispatch and notifications. `None` when nothing was delivered.
+     */
+    public var deliveredSender: Data?
+    /**
+     * The §6.4 frame to flood onward, hop-decremented, or `None` when no hops
+     * remain or the frame is home / an own fan-out copy. The caller sends it;
+     * a failed send cannot undo any store mutation above.
+     */
+    public var relayFrame: Data?
+    /**
+     * Whether a carried row was newly enqueued this call.
+     */
+    public var carried: Bool
+    /**
+     * Whether an opened pairwise envelope was dropped because its sender is
+     * blocked — consumed for ack purposes, never delivered.
+     */
+    public var droppedBlocked: Bool
+    public var work: CoreInboundWork
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The relay ack rule's input: see [`crate::core_should_ack_inbound`] and
+         * [`crate::MessageStore::core_relay_ack_ids_with_consumed`].
+         */disposition: CoreInboundDisposition, 
+        /**
+         * The opened plaintext to deliver — one entry when this device is the 1:1
+         * recipient or a group member and the sender is neither blocked nor a
+         * non-member, empty otherwise. The caller decodes and applies it.
+         */deliveredPayloads: [Data], 
+        /**
+         * The verified sender of the delivered payload, for the caller's kind
+         * dispatch and notifications. `None` when nothing was delivered.
+         */deliveredSender: Data?, 
+        /**
+         * The §6.4 frame to flood onward, hop-decremented, or `None` when no hops
+         * remain or the frame is home / an own fan-out copy. The caller sends it;
+         * a failed send cannot undo any store mutation above.
+         */relayFrame: Data?, 
+        /**
+         * Whether a carried row was newly enqueued this call.
+         */carried: Bool, 
+        /**
+         * Whether an opened pairwise envelope was dropped because its sender is
+         * blocked — consumed for ack purposes, never delivered.
+         */droppedBlocked: Bool, work: CoreInboundWork) {
+        self.disposition = disposition
+        self.deliveredPayloads = deliveredPayloads
+        self.deliveredSender = deliveredSender
+        self.relayFrame = relayFrame
+        self.carried = carried
+        self.droppedBlocked = droppedBlocked
+        self.work = work
+    }
+}
+
+
+
+extension CoreInboundOutcome: Equatable, Hashable {
+    public static func ==(lhs: CoreInboundOutcome, rhs: CoreInboundOutcome) -> Bool {
+        if lhs.disposition != rhs.disposition {
+            return false
+        }
+        if lhs.deliveredPayloads != rhs.deliveredPayloads {
+            return false
+        }
+        if lhs.deliveredSender != rhs.deliveredSender {
+            return false
+        }
+        if lhs.relayFrame != rhs.relayFrame {
+            return false
+        }
+        if lhs.carried != rhs.carried {
+            return false
+        }
+        if lhs.droppedBlocked != rhs.droppedBlocked {
+            return false
+        }
+        if lhs.work != rhs.work {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(disposition)
+        hasher.combine(deliveredPayloads)
+        hasher.combine(deliveredSender)
+        hasher.combine(relayFrame)
+        hasher.combine(carried)
+        hasher.combine(droppedBlocked)
+        hasher.combine(work)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundOutcome {
+        return
+            try CoreInboundOutcome(
+                disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf), 
+                deliveredPayloads: FfiConverterSequenceData.read(from: &buf), 
+                deliveredSender: FfiConverterOptionData.read(from: &buf), 
+                relayFrame: FfiConverterOptionData.read(from: &buf), 
+                carried: FfiConverterBool.read(from: &buf), 
+                droppedBlocked: FfiConverterBool.read(from: &buf), 
+                work: FfiConverterTypeCoreInboundWork.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreInboundOutcome, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreInboundDisposition.write(value.disposition, into: &buf)
+        FfiConverterSequenceData.write(value.deliveredPayloads, into: &buf)
+        FfiConverterOptionData.write(value.deliveredSender, into: &buf)
+        FfiConverterOptionData.write(value.relayFrame, into: &buf)
+        FfiConverterBool.write(value.carried, into: &buf)
+        FfiConverterBool.write(value.droppedBlocked, into: &buf)
+        FfiConverterTypeCoreInboundWork.write(value.work, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundOutcome_lift(_ buf: RustBuffer) throws -> CoreInboundOutcome {
+    return try FfiConverterTypeCoreInboundOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundOutcome_lower(_ value: CoreInboundOutcome) -> RustBuffer {
+    return FfiConverterTypeCoreInboundOutcome.lower(value)
+}
+
+
+/**
+ * Bounded work counts for one processed frame, so a caller can fold
+ * receive-path progress into an encounter- or page-granularity protocol event
+ * without this hot per-envelope path writing the ring itself (contract §7.1
+ * forbids per-envelope ring writes).
+ */
+public struct CoreInboundWork {
+    public var delivered: UInt32
+    public var carried: UInt32
+    public var reflooded: UInt32
+    /**
+     * Opened and consumed by this endpoint, but deliberately not delivered
+     * (blocked sender, or a group body whose signer is not a member).
+     */
+    public var dropped: UInt32
+    public var deduped: UInt32
+    public var expired: UInt32
+    public var rejected: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(delivered: UInt32, carried: UInt32, reflooded: UInt32, 
+        /**
+         * Opened and consumed by this endpoint, but deliberately not delivered
+         * (blocked sender, or a group body whose signer is not a member).
+         */dropped: UInt32, deduped: UInt32, expired: UInt32, rejected: UInt32) {
+        self.delivered = delivered
+        self.carried = carried
+        self.reflooded = reflooded
+        self.dropped = dropped
+        self.deduped = deduped
+        self.expired = expired
+        self.rejected = rejected
+    }
+}
+
+
+
+extension CoreInboundWork: Equatable, Hashable {
+    public static func ==(lhs: CoreInboundWork, rhs: CoreInboundWork) -> Bool {
+        if lhs.delivered != rhs.delivered {
+            return false
+        }
+        if lhs.carried != rhs.carried {
+            return false
+        }
+        if lhs.reflooded != rhs.reflooded {
+            return false
+        }
+        if lhs.dropped != rhs.dropped {
+            return false
+        }
+        if lhs.deduped != rhs.deduped {
+            return false
+        }
+        if lhs.expired != rhs.expired {
+            return false
+        }
+        if lhs.rejected != rhs.rejected {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(delivered)
+        hasher.combine(carried)
+        hasher.combine(reflooded)
+        hasher.combine(dropped)
+        hasher.combine(deduped)
+        hasher.combine(expired)
+        hasher.combine(rejected)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundWork: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundWork {
+        return
+            try CoreInboundWork(
+                delivered: FfiConverterUInt32.read(from: &buf), 
+                carried: FfiConverterUInt32.read(from: &buf), 
+                reflooded: FfiConverterUInt32.read(from: &buf), 
+                dropped: FfiConverterUInt32.read(from: &buf), 
+                deduped: FfiConverterUInt32.read(from: &buf), 
+                expired: FfiConverterUInt32.read(from: &buf), 
+                rejected: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreInboundWork, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.delivered, into: &buf)
+        FfiConverterUInt32.write(value.carried, into: &buf)
+        FfiConverterUInt32.write(value.reflooded, into: &buf)
+        FfiConverterUInt32.write(value.dropped, into: &buf)
+        FfiConverterUInt32.write(value.deduped, into: &buf)
+        FfiConverterUInt32.write(value.expired, into: &buf)
+        FfiConverterUInt32.write(value.rejected, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundWork_lift(_ buf: RustBuffer) throws -> CoreInboundWork {
+    return try FfiConverterTypeCoreInboundWork.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundWork_lower(_ value: CoreInboundWork) -> RustBuffer {
+    return FfiConverterTypeCoreInboundWork.lower(value)
 }
 
 
@@ -22454,6 +22807,80 @@ extension CoreInboundGate: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where an inbound envelope came from — the source discriminant relay
+ * proxy-polling needs, mirroring the shells' `sourceAddress == null` test.
+ *
+ * [`CoreInboundSource::Mesh`] is a live BLE or authenticated same-LAN frame;
+ * [`CoreInboundSource::Relay`] is a row fetched from the relay mailbox, which
+ * is already durable server-side, so a carried copy of it is never re-uploaded
+ * and a per-member fan-out copy addressed to our own hint is neither carried
+ * nor re-flooded (`specs/group-relay-durability.md` §4.3 no-reinjection).
+ */
+
+public enum CoreInboundSource {
+    
+    case mesh
+    case relay
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundSource: FfiConverterRustBuffer {
+    typealias SwiftType = CoreInboundSource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundSource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .mesh
+        
+        case 2: return .relay
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreInboundSource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .mesh:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .relay:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundSource_lift(_ buf: RustBuffer) throws -> CoreInboundSource {
+    return try FfiConverterTypeCoreInboundSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundSource_lower(_ value: CoreInboundSource) -> RustBuffer {
+    return FfiConverterTypeCoreInboundSource.lower(value)
+}
+
+
+
+extension CoreInboundSource: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum CoreLanHealthAction {
     
@@ -32879,6 +33306,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_msg_ids() != 34000) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carry() != 23309) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33162,6 +33592,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 13280) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 65348) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {

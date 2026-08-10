@@ -185,6 +185,7 @@ pub use semantic::{
 // Package C0, driven from Android by package C1. Android reaches it only
 // behind a whole-pass engine selection that defaults to the legacy engine;
 // iOS does not reach it at all yet and compiles against this surface.
+pub use session::mesh_receive::{CoreInboundOutcome, CoreInboundSource, CoreInboundWork};
 pub use session::relay_pass::{
     core_relay_adapter_vectors, core_relay_pass_default_budgets, CoreRelayAction,
     CoreRelayActionKind, CoreRelayAdapterVector, CoreRelayContactConfig, CoreRelayContinuation,
