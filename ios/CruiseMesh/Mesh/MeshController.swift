@@ -1863,6 +1863,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.warning("Dropping group envelope from \(sourceLabel, privacy: .public): body.chatId does not match group id")
             return
         }
+        if (try? store.isUserBlocked(userId: opened.senderUserId)) == true {
+            log.info("Dropping group envelope from blocked sender on \(sourceLabel, privacy: .public)")
+            return
+        }
         switch body.kind {
         case ProtocolKind.text, ProtocolKind.attachmentManifest, ProtocolKind.reaction:
             try handleIncomingGroupChatMessage(

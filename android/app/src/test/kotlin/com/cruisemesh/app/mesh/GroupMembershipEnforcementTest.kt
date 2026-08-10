@@ -113,7 +113,7 @@ class GroupMembershipEnforcementTest {
     }
 
     @Test
-    fun nonMemberGroupEnvelopeIsDroppedMemberEnvelopeLands() {
+    fun nonMemberAndBlockedGroupEnvelopesAreDroppedMemberEnvelopeLands() {
         val dana = generateIdentity()
         val member = generateIdentity()
         val outsider = generateIdentity()
@@ -141,8 +141,18 @@ class GroupMembershipEnforcementTest {
             store.messagesForChat(group.id).isEmpty(),
         )
 
+        store.blockUser(member.userId, now)
         runCatching {
             processor.handleRelayEnvelope(groupEnvelope(member, group, 1u, now), dana)
+        }
+        assertTrue(
+            "blocked member group envelope must not be stored",
+            store.messagesForChat(group.id).isEmpty(),
+        )
+
+        store.unblockUser(member.userId)
+        runCatching {
+            processor.handleRelayEnvelope(groupEnvelope(member, group, 2u, now), dana)
         }
         val messages = store.messagesForChat(group.id)
         assertEquals("member group envelope should land", 1, messages.size)
