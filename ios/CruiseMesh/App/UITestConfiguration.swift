@@ -14,9 +14,18 @@ enum UITestConfiguration {
         case onboarding
         case homeEmpty = "home-empty"
         case chat
+        case chatListActions = "chat-list-actions"
+        case chatLateArrival = "chat-late-arrival"
 
         var termsAccepted: Bool { self != .terms }
-        var onboardingCompleted: Bool { self == .homeEmpty || self == .chat }
+        var onboardingCompleted: Bool {
+            switch self {
+            case .homeEmpty, .chat, .chatListActions, .chatLateArrival:
+                return true
+            case .terms, .onboarding:
+                return false
+            }
+        }
     }
 
     static let isEnabled: Bool = {
@@ -89,20 +98,78 @@ enum UITestConfiguration {
             ProfileStore.saveDisplayName("UI Tester")
         case .chat:
             ProfileStore.saveDisplayName("UI Tester")
-            let peer = generateIdentity()
-            let contact = Contact(
-                userId: peer.userId,
-                name: "Bob",
-                signPk: peer.signPk,
-                agreePk: peer.agreePk,
-                relayUrl: nil,
-                relayToken: nil
+            _ = seedContact(name: "Bob")
+        case .chatListActions:
+            ProfileStore.saveDisplayName("UI Tester")
+            let contact = seedContact(name: "Robert", nickname: "Dad")
+            insertMessage(
+                chatId: contact.userId,
+                senderUserId: contact.userId,
+                lamport: 1,
+                text: "Unread from Dad"
             )
-            do {
-                try AppStore.get().upsertContact(contact: contact)
-            } catch {
-                preconditionFailure("Could not seed UI-test contact: \(error)")
+        case .chatLateArrival:
+            ProfileStore.saveDisplayName("UI Tester")
+            let contact = seedContact(name: "Bob")
+            for index in 1...32 {
+                insertMessage(
+                    chatId: contact.userId,
+                    senderUserId: index.isMultiple(of: 3) ? identity.userId : contact.userId,
+                    lamport: UInt64(index),
+                    text: "History message \(index)"
+                )
             }
+        }
+    }
+
+    static func injectIncomingMessage(contact: Contact, text: String) {
+        guard scenario == .chatLateArrival else { return }
+        insertMessage(
+            chatId: contact.userId,
+            senderUserId: contact.userId,
+            lamport: 1_000,
+            text: text
+        )
+        ChatEvents.notifyChatChanged(contact.userId)
+    }
+
+    @discardableResult
+    private static func seedContact(name: String, nickname: String? = nil) -> Contact {
+        let peer = generateIdentity()
+        let contact = Contact(
+            userId: peer.userId,
+            name: name,
+            signPk: peer.signPk,
+            agreePk: peer.agreePk,
+            relayUrl: nil,
+            relayToken: nil,
+            nickname: nickname
+        )
+        do {
+            try AppStore.get().upsertContact(contact: contact)
+        } catch {
+            preconditionFailure("Could not seed UI-test contact: \(error)")
+        }
+        return contact
+    }
+
+    private static func insertMessage(
+        chatId: Data,
+        senderUserId: Data,
+        lamport: UInt64,
+        text: String
+    ) {
+        do {
+            _ = try AppStore.get().insertMessage(message: StoredMessage(
+                chatId: chatId,
+                senderUserId: senderUserId,
+                lamport: lamport,
+                timestamp: 1_700_000_000_000 + Int64(lamport) * 1_000,
+                kind: ProtocolKind.text,
+                payload: Data(text.utf8)
+            ))
+        } catch {
+            preconditionFailure("Could not seed UI-test message: \(error)")
         }
     }
 }

@@ -131,6 +131,11 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` | `60` | Requests per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` | `6291456` (6 MiB) | Uploaded `sealed` bytes per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_APNS_KEY_ID` | *(unset = APNs off)* | Apple push notification key ID. Set together with the next three fields; see §7.1. |
+| `CRUISEMESH_APNS_TEAM_ID` | *(unset = APNs off)* | Apple Developer Team ID. |
+| `CRUISEMESH_APNS_BUNDLE_ID` | *(unset = APNs off)* | App topic, currently `com.cruisemesh.app`. |
+| `CRUISEMESH_APNS_PRIVATE_KEY_FILE` | *(unset = APNs off)* | Absolute container path to the private `.p8` provider key. Never commit or bake it into the image. |
+| `CRUISEMESH_APNS_ENVIRONMENT` | `production` | `production`, `sandbox`, or `development` (`development` aliases `sandbox`). |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
@@ -195,6 +200,53 @@ wss://relay.example.com/ws?hints=<base64url,...>&after=<cursor>
 
 Caddy already proxies WebSocket upgrades on the compose stack (see `Caddyfile`
 comments). No extra port is required.
+
+### 7.1 iOS background relay wakes (APNs)
+
+iOS suspends ordinary WebSockets after the app backgrounds. CruiseMesh closes
+that latency gap with an Apple-supported background-notification doorbell:
+
+1. The app registers its APNs device token with `PUT /push/registrations`,
+   authenticated by the family **member** token. Deposit credentials are
+   rejected. The registration contains only the same rotating, salted
+   recipient hints used by relay fetch/WebSocket subscription.
+2. When a sealed envelope is stored, relayd matches its opaque hint and sends
+   `content-available: 1` through APNs. No sender, chat, preview, or ciphertext
+   is sent to Apple.
+3. iOS wakes the app, which runs the normal authenticated fetch/decrypt/ack
+   pass and holds the background completion callback until that pass finishes.
+   WebSocket and periodic polling remain correctness fallbacks.
+
+Apple schedules background notifications at its discretion, so this improves
+locked/background latency but is not a permanent-execution entitlement. The
+release gate must still exercise a locked physical iPhone against production
+APNs; Simulator tests cannot validate provider delivery.
+
+Create one APNs signing key in the Apple Developer portal, then set all four
+provider values. For Compose, keep the key outside the checkout and mount it
+read-only with a local, uncommitted `docker-compose.override.yml`:
+
+```yaml
+services:
+  relayd:
+    volumes:
+      - /etc/cruisemesh/AuthKey_ABC123.p8:/run/secrets/cruisemesh-apns.p8:ro
+```
+
+```sh
+export CRUISEMESH_APNS_KEY_ID=ABC123
+export CRUISEMESH_APNS_TEAM_ID=DEF456
+export CRUISEMESH_APNS_BUNDLE_ID=com.cruisemesh.app
+export CRUISEMESH_APNS_PRIVATE_KEY_FILE=/run/secrets/cruisemesh-apns.p8
+export CRUISEMESH_APNS_ENVIRONMENT=production
+docker compose up -d --build
+docker compose logs relayd | grep apns_wakes
+```
+
+If every APNs variable is absent/empty, the worker is disabled and relayd
+behaves as before. A partial configuration is a startup error. Registrations
+expire from matching after 45 days without a refresh, and APNs-invalid tokens
+are removed when Apple reports them.
 
 ## 8. Local (non-Docker) run
 
@@ -498,8 +550,9 @@ Notes an operator will care about:
   traffic.
 - **Charged routes** are `POST /envelopes` (1 request + its sealed bytes),
   `GET /envelopes`, `POST /envelopes/ack`, `POST /presence` (1 request each),
-  and the `GET /ws` **upgrade** (1 request). Frames on an established socket
-  are not charged — the connection caps in §7 bound those instead.
+  `PUT /push/registrations`, and the `GET /ws` **upgrade** (1 request each).
+  Frames on an established socket are not charged — the connection caps in
+  §7 bound those instead.
 - **Unlike the storage quota, a dedupe re-post *is* charged.** Re-uploading
   an existing `msg_id` adds zero stored bytes, but those bytes still crossed
   the wire and were decoded, which is exactly what this limit is protecting.
@@ -577,8 +630,8 @@ implicit always-active families). Semantics:
 - **Per-family quota**: `quota_bytes` overrides
   `CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES` for that family only.
 - **Revocation** (`DELETE`) removes the family **and purges its stored
-  envelopes and presence rows** — both credentials die together, since the
-  deposit token is resolved through the same row.
+  envelopes, presence rows, and APNs registrations** — both credentials die
+  together, since the deposit token is resolved through the same row.
 - **Two-token response**: provisioning mints both credentials — you
   supply the member `token`, relayd derives and stores its post-only
   `deposit_token` — and every family object in every response carries both
@@ -633,8 +686,9 @@ output somewhere you would put a password.
 ## 13. Not in this deploy yet
 
 - Multi-region / federation — single VPS is the intended family-scale deploy.
-- Android/iOS clients still primarily poll today; wiring the phone apps to
-  `GET /ws` is a client change, not a server gap.
+- Physical-device validation of production APNs scheduling remains a release
+  step; the provider/client implementation and deterministic server tests are
+  in-tree, but Apple delivery cannot be proven by a Simulator.
 - ~~Client-side handling of the 413/507 error bodies (see §10)~~ —
   shipped: both apps now surface distinct storage-full /
   too-large / rate-limited states through the Shore Pass indicator.

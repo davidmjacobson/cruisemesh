@@ -3,6 +3,20 @@ import XCTest
 @testable import CruiseMesh
 
 final class ChatListLogicTests: XCTestCase {
+    func testContactDisplayNamePrefersSavedNickname() {
+        let contact = Contact(
+            userId: Data(repeating: 1, count: 16),
+            name: "Robert",
+            signPk: Data(repeating: 2, count: 32),
+            agreePk: Data(repeating: 3, count: 32),
+            relayUrl: nil,
+            relayToken: nil,
+            nickname: "Dad"
+        )
+
+        XCTAssertEqual(ChatListLogic.contactDisplayName(contact), "Dad")
+    }
+
     func testInitials() {
         let (_, init1) = ChatListLogic.avatarHueAndInitials(
             userId: Data(), name: "Alice", displayId: "CM-ABCD"

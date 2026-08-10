@@ -14,7 +14,8 @@ import Foundation
 /// ask a family member for than "make sure all four arrive".
 enum DiagnosticsArchive {
     /// Zips `files` and returns the archive, or `nil` if it could not be
-    /// written. Caller falls back to sharing the loose files.
+    /// written. The caller must share nothing on failure: share targets may
+    /// silently discard all but the first loose diagnostics file.
     ///
     /// Uses `NSFileCoordinator`'s `.forUploading` on a staging directory --
     /// the platform's own zip, no third-party dependency. The staging
@@ -95,5 +96,26 @@ enum DiagnosticsArchive {
 
     private static func archiveURL(name: String) -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("\(name).zip")
+    }
+}
+
+enum DiagnosticsSharePlan: Equatable {
+    case nothingCaptured
+    case archive(URL)
+    case archiveFailed
+
+    /// Produces exactly one shareable archive or an explicit non-share state.
+    /// There is intentionally no loose-file case in this type, making the
+    /// field-data integrity rule enforceable instead of advisory.
+    static func prepare(
+        files: [URL],
+        name: String,
+        archiveWriter: ([URL], String) -> URL? = { files, name in
+            DiagnosticsArchive.write(files: files, name: name)
+        }
+    ) -> DiagnosticsSharePlan {
+        guard !files.isEmpty else { return .nothingCaptured }
+        guard let archive = archiveWriter(files, name) else { return .archiveFailed }
+        return .archive(archive)
     }
 }

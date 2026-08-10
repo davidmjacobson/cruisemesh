@@ -33,15 +33,17 @@ struct FriendAddedState: Identifiable {
 struct FriendIdentityBlock: View {
     let contact: Contact
 
+    private var displayName: String { ChatListLogic.contactDisplayName(contact) }
+
     var body: some View {
         VStack(spacing: 10) {
             AvatarView(
                 userId: contact.userId,
-                name: contact.name,
+                name: displayName,
                 size: 72,
                 photo: (try? AppStore.get().contactAvatar(userId: contact.userId)).flatMap { UIImage(data: $0) }
             )
-            Text(contact.name).font(.title2.bold())
+            Text(displayName).font(.title2.bold())
             // Safety-word verification moved to the contact's details sheet
             // ("Verify contact") to keep the first-run surface simple (T10).
         }
@@ -206,13 +208,14 @@ struct FriendConfirmationView: View {
     }
 
     private var statusText: String {
+        let displayName = ChatListLogic.contactDisplayName(state.contact)
         if state.awaitingAcceptance {
-            return "Waiting for \(state.contact.name) to accept."
+            return "Waiting for \(displayName) to accept."
         }
-        if connected { return "You're connected. \(state.contact.name) has your card too." }
+        if connected { return "You're connected. \(displayName) has your card too." }
         if state.relayConfigured {
-            return "Sending \(state.contact.name) your card through the relay so they can message you back."
+            return "Sending \(displayName) your card through the relay so they can message you back."
         }
-        return "Your card will reach \(state.contact.name) next time your phones are near each other. Until then, only you can start the chat."
+        return "Your card will reach \(displayName) next time your phones are near each other. Until then, only you can start the chat."
     }
 }

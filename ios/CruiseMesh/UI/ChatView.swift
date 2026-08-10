@@ -13,6 +13,10 @@ struct ChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var messages: [StoredMessage] = []
     @State private var rows: [ChatRowModel] = []
+    @State private var previousScrollRowIds: [String] = []
+    @State private var isNearConversationBottom = true
+    @State private var showNewMessages = false
+    @State private var newMessagesTargetRowId: String?
     @State private var avatarData: Data?
     @State private var deliveredThrough: UInt64 = 0
     @State private var readThrough: UInt64 = 0
@@ -109,72 +113,102 @@ struct ChatView: View {
             // bubble just above the composer (and keyboard), matching Android.
             GeometryReader { geo in
                 ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 4) {
-                            ForEach(rows, id: \.rowId) { row in
-                                let message = row.message
-                                if row.showDayBreak {
-                                    Text(row.dayLabel)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                        .frame(maxWidth: .infinity)
-                                        .padding(.vertical, 6)
-                                }
-                                MessageBubbleView(
-                                    message: message,
-                                    isOwn: message.senderUserId == identity.userId,
-                                    tick: message.senderUserId == identity.userId
-                                        ? tickStatusFor(
-                                            lamport: message.lamport,
-                                            deliveredThrough: deliveredThrough,
-                                            readThrough: readThrough
-                                        )
-                                        : nil,
-                                    contactColor: ChatListLogic.avatarHueAndInitials(
-                                        userId: contact.userId,
-                                        name: contact.name,
-                                        displayId: formatUserId(userId: contact.userId)
-                                    ).0,
-                                    quoted: replyMetadata[replyMessageKey(message)]?.quoted,
-                                    canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
-                                    reactions: row.reactions,
-                                    grouping: row.grouping,
-                                    timeLabel: row.timeLabel,
-                                    arrivalLabel: row.arrivalLabel,
-                                    onStatus: { statusMessage = $0 },
-                                    onReact: { emoji in
-                                        sendReaction(to: message, emoji: emoji)
-                                    },
-                                    onReply: {
+                    ZStack(alignment: .bottom) {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 4) {
+                                ForEach(rows, id: \.rowId) { row in
+                                    let message = row.message
+                                    if row.showDayBreak {
+                                        Text(row.dayLabel)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 6)
+                                    }
+                                    MessageBubbleView(
+                                        message: message,
+                                        isOwn: message.senderUserId == identity.userId,
+                                        tick: message.senderUserId == identity.userId
+                                            ? tickStatusFor(
+                                                lamport: message.lamport,
+                                                deliveredThrough: deliveredThrough,
+                                                readThrough: readThrough
+                                            )
+                                            : nil,
+                                        contactColor: ChatListLogic.avatarHueAndInitials(
+                                            userId: contact.userId,
+                                            name: resolvedName,
+                                            displayId: formatUserId(userId: contact.userId)
+                                        ).0,
+                                        quoted: replyMetadata[replyMessageKey(message)]?.quoted,
+                                        canReply: replyMetadata[replyMessageKey(message)]?.msgId != nil,
+                                        reactions: row.reactions,
+                                        grouping: row.grouping,
+                                        timeLabel: row.timeLabel,
+                                        arrivalLabel: row.arrivalLabel,
+                                        onStatus: { statusMessage = $0 },
+                                        onReact: { emoji in
+                                            sendReaction(to: message, emoji: emoji)
+                                        },
+                                        onReply: {
+                                            replyingTo = message
+                                            composerFocused = true
+                                        },
+                                        onPhotoTap: { jpeg in
+                                            viewedPhoto = ViewedPhoto(jpeg: jpeg)
+                                        },
+                                        onQuotedTap: { target in
+                                            withAnimation {
+                                                proxy.scrollTo(target.stableRowId, anchor: .center)
+                                            }
+                                        }
+                                    )
+                                    .swipeToReply {
                                         replyingTo = message
                                         composerFocused = true
-                                    },
-                                    onPhotoTap: { jpeg in
-                                        viewedPhoto = ViewedPhoto(jpeg: jpeg)
-                                    },
-                                    onQuotedTap: { target in
-                                        withAnimation {
-                                            proxy.scrollTo(target.stableRowId, anchor: .center)
+                                    }
+                                    .id(row.rowId)
+                                }
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id(conversationBottomId)
+                                    .onAppear {
+                                        isNearConversationBottom = true
+                                        if newMessagesTargetRowId == nil {
+                                            showNewMessages = false
                                         }
                                     }
-                                )
-                                .swipeToReply {
-                                    replyingTo = message
-                                    composerFocused = true
-                                }
-                                .id(row.rowId)
+                                    .onDisappear { isNearConversationBottom = false }
                             }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(minHeight: geo.size.height, alignment: .bottom)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .frame(minHeight: geo.size.height, alignment: .bottom)
+                        .scrollDismissesKeyboard(.interactively)
+
+                        if showNewMessages {
+                            Button {
+                                scrollToAnnouncedMessage(proxy: proxy)
+                            } label: {
+                                Label("New messages", systemImage: "arrow.down")
+                                    .font(.subheadline.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .background(.regularMaterial, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.bottom, 12)
+                            .accessibilityIdentifier("chat.new-messages")
+                        }
                     }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: rows.count) { _ in
-                        scrollToLatest(proxy: proxy)
+                    .onChange(of: rows.map(\.rowId)) { rowIds in
+                        handleConversationRowsChanged(rowIds, proxy: proxy)
                     }
                     .onAppear {
-                        scrollToLatest(proxy: proxy, animated: false)
+                        previousScrollRowIds = rows.map(\.rowId)
+                        DispatchQueue.main.async {
+                            scrollToLatest(proxy: proxy, animated: false)
+                        }
                     }
                 }
             }
@@ -201,6 +235,17 @@ struct ChatView: View {
         .navigationTitle(resolvedName)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            if UITestConfiguration.scenario == .chatLateArrival {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Inject incoming message") {
+                        UITestConfiguration.injectIncomingMessage(
+                            contact: contact,
+                            text: "New message while reading history"
+                        )
+                    }
+                    .accessibilityIdentifier("chat.uitest-inject-incoming")
+                }
+            }
             ToolbarItem(placement: .principal) {
                 Button { showDetails = true } label: {
                     HStack {
@@ -229,6 +274,7 @@ struct ChatView: View {
             isMuted = ChatMuteStore.isMuted(contact.userId)
             isBlocked = (try? store.isUserBlocked(userId: contact.userId)) ?? false
             ChatVisibility.setVisible(contact.userId)
+            MessageNotifier.clearChatNotifications(chatId: contact.userId)
             if !UITestConfiguration.isEnabled {
                 MeshController.shared.notifyChatViewed(chatId: contact.userId)
             }
@@ -250,6 +296,7 @@ struct ChatView: View {
                 ChatVisibility.clearVisible(contact.userId)
             } else if phase == .active {
                 ChatVisibility.setVisible(contact.userId)
+                MessageNotifier.clearChatNotifications(chatId: contact.userId)
                 if !UITestConfiguration.isEnabled {
                     MeshController.shared.notifyChatViewed(chatId: contact.userId)
                 }
@@ -462,10 +509,7 @@ struct ChatView: View {
 
     private func senderLabel(_ message: StoredMessage) -> String {
         if message.senderUserId == identity.userId { return "You" }
-        return ChatListLogic.displayNameOrId(
-            name: contact.name,
-            displayId: formatUserId(userId: contact.userId)
-        )
+        return ChatListLogic.contactDisplayName(contact)
     }
 
     private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
@@ -475,6 +519,43 @@ struct ChatView: View {
         } else {
             proxy.scrollTo(last.rowId, anchor: .bottom)
         }
+    }
+
+    private var conversationBottomId: String {
+        "chat-bottom-\(UserIdHex.encode(contact.userId))"
+    }
+
+    private func handleConversationRowsChanged(_ rowIds: [String], proxy: ScrollViewProxy) {
+        let decision = ConversationScrollPolicy.decide(
+            previousRowIds: previousScrollRowIds,
+            currentRowIds: rowIds,
+            lateArrivalRowIds: Set(rows.filter { $0.arrivalLabel != nil }.map(\.rowId)),
+            isNearBottom: isNearConversationBottom,
+            newestIsOwnMessage: rows.last?.message.senderUserId == identity.userId
+        )
+        previousScrollRowIds = rowIds
+
+        switch decision {
+        case .none:
+            break
+        case .autoScroll:
+            showNewMessages = false
+            newMessagesTargetRowId = nil
+            DispatchQueue.main.async { scrollToLatest(proxy: proxy) }
+        case .showNewMessages(let targetRowId):
+            showNewMessages = true
+            newMessagesTargetRowId = targetRowId
+        }
+    }
+
+    private func scrollToAnnouncedMessage(proxy: ScrollViewProxy) {
+        if let target = newMessagesTargetRowId {
+            withAnimation { proxy.scrollTo(target, anchor: .center) }
+        } else {
+            scrollToLatest(proxy: proxy)
+        }
+        showNewMessages = false
+        newMessagesTargetRowId = nil
     }
 }
 

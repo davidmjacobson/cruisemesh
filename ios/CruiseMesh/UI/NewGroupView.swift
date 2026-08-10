@@ -28,6 +28,7 @@ struct NewGroupView: View {
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(contacts, id: \.userId) { contact in
+                            let displayName = ChatListLogic.contactDisplayName(contact)
                             Button {
                                 toggle(contact.userId)
                             } label: {
@@ -38,15 +39,12 @@ struct NewGroupView: View {
                                         .foregroundStyle(selected.contains(contact.userId) ? Color.accentColor : .secondary)
                                     AvatarView(
                                         userId: contact.userId,
-                                        name: contact.name,
+                                        name: displayName,
                                         size: 36,
                                         photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
                                             .flatMap { UIImage(data: $0) }
                                     )
-                                    Text(ChatListLogic.displayNameOrId(
-                                        name: contact.name,
-                                        displayId: formatUserId(userId: contact.userId)
-                                    ))
+                                    Text(displayName)
                                     .foregroundStyle(.primary)
                                     Spacer()
                                 }
@@ -67,7 +65,11 @@ struct NewGroupView: View {
                 }
             }
             .onAppear {
-                contacts = (try? store.listContacts()) ?? []
+                contacts = ((try? store.listContacts()) ?? []).sorted {
+                    coreContactDisplayName(contact: $0).localizedCaseInsensitiveCompare(
+                        coreContactDisplayName(contact: $1)
+                    ) == .orderedAscending
+                }
             }
         }
     }

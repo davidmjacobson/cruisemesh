@@ -2,6 +2,13 @@ import SwiftUI
 import UIKit
 
 enum ChatListLogic {
+    static func contactDisplayName(_ contact: Contact) -> String {
+        displayNameOrId(
+            name: coreContactDisplayName(contact: contact),
+            displayId: formatUserId(userId: contact.userId)
+        )
+    }
+
     static func displayNameOrId(name: String, displayId: String) -> String {
         if !name.isEmpty && name != "Unknown" { return name }
         return displayId

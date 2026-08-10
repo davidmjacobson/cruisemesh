@@ -51,6 +51,8 @@
 //!    replay heals the gap — that is what the cursor is for. Bounded memory
 //!    beats trying to buffer forever for a phone that went to sea.
 
+pub mod apns;
+
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -61,7 +63,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -169,6 +171,8 @@ const _: () = assert!(
 const _: () = assert!(MAX_ENVELOPE_SEALED_BYTES <= MAX_FETCH_PAGE_SEALED_BYTES);
 pub const MAX_FETCH_HINTS: usize = 256;
 pub const MAX_ACK_IDS: usize = 512;
+pub const MAX_PUSH_HINTS: usize = 256;
+const PUSH_REGISTRATION_RETENTION_MS: i64 = 45 * 24 * 60 * 60 * 1000;
 const MAX_PRESENCE_ANNOUNCE: usize = 4;
 const MAX_PRESENCE_QUERY: usize = 512;
 const PRESENCE_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
@@ -743,6 +747,10 @@ pub struct AppState {
     /// (`CRUISEMESH_RELAY_ADMIN_TOKEN`). `None` disables the admin routes
     /// entirely (they answer 404), which is the self-hosted default.
     admin_token: Option<String>,
+    /// Optional APNs worker queue. Self-hosted relays without Apple provider
+    /// credentials leave this disabled; registration remains harmless and
+    /// the existing poll/WebSocket paths continue unchanged.
+    push_wake_tx: Option<tokio::sync::mpsc::Sender<PushWake>>,
 }
 
 #[derive(Clone, Debug)]
@@ -750,6 +758,11 @@ pub struct BroadcastEnvelope {
     pub family_token: String,
     pub recipient_hint: String,
     pub envelope: EnvelopeResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PushWake {
+    pub device_tokens: Vec<String>,
 }
 
 impl AppState {
@@ -884,7 +897,13 @@ impl AppState {
                 Instant::now(),
             ))),
             admin_token: None,
+            push_wake_tx: None,
         }
+    }
+
+    pub fn with_push_wake_sender(mut self, sender: tokio::sync::mpsc::Sender<PushWake>) -> Self {
+        self.push_wake_tx = Some(sender);
+        self
     }
 
     /// Charge one request (and, for uploads, its sealed bytes) against this
@@ -1533,6 +1552,98 @@ impl RelayStore {
         Ok(deleted as u64)
     }
 
+    pub fn replace_push_registration(
+        &self,
+        family_token: &str,
+        device_token: &str,
+        hints: &[Vec<u8>],
+        updated_ms: i64,
+    ) -> Result<(), String> {
+        if hints.is_empty() || hints.len() > MAX_PUSH_HINTS {
+            return Err(format!(
+                "push registration requires 1..={MAX_PUSH_HINTS} hints"
+            ));
+        }
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO push_registrations (family_token, device_token, updated_ms)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(family_token, device_token) DO UPDATE SET
+                updated_ms = excluded.updated_ms",
+            params![family_token, device_token, updated_ms],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM push_registration_hints
+             WHERE family_token = ?1 AND device_token = ?2",
+            params![family_token, device_token],
+        )
+        .map_err(|e| e.to_string())?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT OR IGNORE INTO push_registration_hints
+                        (family_token, device_token, hint)
+                     VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| e.to_string())?;
+            for hint in hints {
+                if hint.len() != RECIPIENT_HINT_LEN {
+                    return Err(format!("push hint must be {RECIPIENT_HINT_LEN} bytes"));
+                }
+                insert
+                    .execute(params![family_token, device_token, hint])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn push_device_tokens_for_hint(
+        &self,
+        family_token: &str,
+        hint: &[u8],
+        now_ms: i64,
+    ) -> Result<Vec<String>, String> {
+        let fresh_after = now_ms.saturating_sub(PUSH_REGISTRATION_RETENTION_MS);
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT r.device_token
+                 FROM push_registrations r
+                 JOIN push_registration_hints h
+                   ON h.family_token = r.family_token
+                  AND h.device_token = r.device_token
+                 WHERE r.family_token = ?1 AND h.hint = ?2 AND r.updated_ms >= ?3
+                 ORDER BY r.device_token",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map(params![family_token, hint, fresh_after], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<String>, _>>()
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_push_device_token(&self, device_token: &str) -> Result<u64, String> {
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM push_registration_hints WHERE device_token = ?1",
+            params![device_token],
+        )
+        .map_err(|e| e.to_string())?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM push_registrations WHERE device_token = ?1",
+                params![device_token],
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(deleted as u64)
+    }
+
     /// Drop rows past either their per-envelope `expiry_ms` or the 30-day
     /// server retention ceiling (`created_at_ms + MAX_RETENTION_MS`).
     ///
@@ -1823,8 +1934,8 @@ impl RelayStore {
         get_family_on(&conn, token)
     }
 
-    /// Revoke a family and purge everything it stored (envelopes and
-    /// presence). Returns `false` if no such family existed.
+    /// Revoke a family and purge everything it stored (envelopes, presence,
+    /// and APNs registrations). Returns `false` if no such family existed.
     pub fn delete_family(&self, token: &str) -> Result<bool, String> {
         let mut conn = self.conn.lock().expect("relay store mutex poisoned");
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -1835,6 +1946,16 @@ impl RelayStore {
         .map_err(|e| e.to_string())?;
         tx.execute(
             "DELETE FROM presence WHERE family_token = ?1",
+            params![token],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM push_registration_hints WHERE family_token = ?1",
+            params![token],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM push_registrations WHERE family_token = ?1",
             params![token],
         )
         .map_err(|e| e.to_string())?;
@@ -2081,7 +2202,26 @@ fn prune_expired_on(conn: &Connection, now_ms: i64) -> Result<u64, String> {
             params![presence_floor],
         )
         .map_err(|e| e.to_string())?;
-    Ok((deleted + deleted_presence) as u64)
+    let push_floor = now_ms.saturating_sub(PUSH_REGISTRATION_RETENTION_MS);
+    let deleted_push_hints = conn
+        .execute(
+            "DELETE FROM push_registration_hints
+             WHERE EXISTS (
+                 SELECT 1 FROM push_registrations r
+                 WHERE r.family_token = push_registration_hints.family_token
+                   AND r.device_token = push_registration_hints.device_token
+                   AND r.updated_ms < ?1
+             )",
+            params![push_floor],
+        )
+        .map_err(|e| e.to_string())?;
+    let deleted_push_registrations = conn
+        .execute(
+            "DELETE FROM push_registrations WHERE updated_ms < ?1",
+            params![push_floor],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok((deleted + deleted_presence + deleted_push_hints + deleted_push_registrations) as u64)
 }
 
 /// FR7: hourly (by default) background maintenance -- expiry pruning used
@@ -2128,6 +2268,7 @@ pub fn app(state: AppState) -> Router {
         .route("/envelopes", post(post_envelope).get(get_envelopes))
         .route("/envelopes/ack", post(ack_envelopes))
         .route("/presence", post(sync_presence))
+        .route("/push/registrations", put(put_push_registration))
         .route(
             "/admin/families",
             post(admin_provision_family).get(admin_list_families),
@@ -2367,10 +2508,36 @@ async fn post_envelope(
     };
     // Fan-out for live WS subscribers. Lagging peers are dropped (module docs).
     let _ = state.tx.send(std::sync::Arc::new(BroadcastEnvelope {
-        family_token,
+        family_token: family_token.clone(),
         recipient_hint: encode_base64_field(&recipient_hint),
         envelope,
     }));
+
+    // Apple suspends ordinary app WebSockets. If this relay has an APNs
+    // worker, match the same opaque salted hint and enqueue a content-
+    // available doorbell. The worker sees only device tokens; it never sees
+    // or interprets sealed message content.
+    if let Some(push_tx) = state.push_wake_tx.clone() {
+        let store = state.store.clone();
+        let push_family = family_token;
+        let push_hint = recipient_hint;
+        tokio::spawn(async move {
+            let tokens = store
+                .run_blocking(move |store| {
+                    store.push_device_tokens_for_hint(&push_family, &push_hint, now_ms())
+                })
+                .await;
+            match tokens {
+                Ok(device_tokens) if !device_tokens.is_empty() => {
+                    if let Err(error) = push_tx.try_send(PushWake { device_tokens }) {
+                        warn!(%error, "APNs wake queue unavailable; relay delivery remains available by poll")
+                    }
+                }
+                Ok(_) => {}
+                Err(detail) => warn!(%detail, "APNs registration lookup failed"),
+            }
+        });
+    }
 
     Ok(Json(PostEnvelopeResponse { id }))
 }
@@ -2487,6 +2654,68 @@ async fn ack_envelopes(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(AckResponse { deleted }))
+}
+
+#[derive(Deserialize)]
+struct PutPushRegistrationRequest {
+    device_token: String,
+    hints: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PutPushRegistrationResponse {
+    registered_hints: usize,
+}
+
+async fn put_push_registration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PutPushRegistrationRequest>,
+) -> Result<Json<PutPushRegistrationResponse>, ApiError> {
+    // Deposit credentials appear in friend cards and can only post sealed
+    // mail. They must never be able to bind an APNs token to a family.
+    let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+
+    let device_token = request.device_token.trim().to_ascii_lowercase();
+    let valid_token = (32..=200).contains(&device_token.len())
+        && device_token.len() % 2 == 0
+        && device_token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !valid_token {
+        return Err(ApiError::bad_request(
+            "device_token must be an even-length hexadecimal APNs token".to_string(),
+        ));
+    }
+    if request.hints.is_empty() || request.hints.len() > MAX_PUSH_HINTS {
+        return Err(ApiError::bad_request(format!(
+            "hints must contain between 1 and {MAX_PUSH_HINTS} entries"
+        )));
+    }
+    let mut hints = Vec::with_capacity(request.hints.len());
+    for encoded in request.hints {
+        let hint = decode_base64_field(&encoded, "hint")?;
+        if hint.len() != RECIPIENT_HINT_LEN {
+            return Err(ApiError::bad_request(format!(
+                "each hint must decode to {RECIPIENT_HINT_LEN} bytes"
+            )));
+        }
+        if !hints.contains(&hint) {
+            hints.push(hint);
+        }
+    }
+
+    let family_token = access.token;
+    let hint_count = hints.len();
+    state
+        .store
+        .run_blocking(move |store| {
+            store.replace_push_registration(&family_token, &device_token, &hints, now_ms())
+        })
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(PutPushRegistrationResponse {
+        registered_hints: hint_count,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -3609,6 +3838,22 @@ CREATE TABLE IF NOT EXISTS presence (
     PRIMARY KEY(family_token, hint)
 );
 CREATE INDEX IF NOT EXISTS idx_presence_last_seen ON presence(last_seen_ms);
+CREATE TABLE IF NOT EXISTS push_registrations (
+    family_token TEXT NOT NULL,
+    device_token TEXT NOT NULL,
+    updated_ms   INTEGER NOT NULL,
+    PRIMARY KEY(family_token, device_token)
+);
+CREATE TABLE IF NOT EXISTS push_registration_hints (
+    family_token TEXT NOT NULL,
+    device_token TEXT NOT NULL,
+    hint         BLOB NOT NULL,
+    PRIMARY KEY(family_token, device_token, hint)
+);
+CREATE INDEX IF NOT EXISTS idx_push_registration_hints_lookup
+    ON push_registration_hints(family_token, hint);
+CREATE INDEX IF NOT EXISTS idx_push_registrations_updated
+    ON push_registrations(updated_ms);
 CREATE TABLE IF NOT EXISTS families (
     token         TEXT PRIMARY KEY,
     status        TEXT NOT NULL DEFAULT 'active',
@@ -3749,6 +3994,80 @@ mod tests {
                 .to_string(),
             ))
             .unwrap()
+    }
+
+    fn push_registration_request(token: &str, device_token: &str, hint: u8) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri("/push/registrations")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "device_token": device_token,
+                    "hints": [encode_base64_field(&sample_hint(hint))],
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn member_registration_enqueues_matching_apns_wake() {
+        let store = RelayStore::open(":memory:").unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let app = app(
+            AppState::new(store, HashSet::from(["family-a".to_string()]))
+                .with_push_wake_sender(sender),
+        );
+        let token = "ab".repeat(32);
+        let response = app
+            .clone()
+            .oneshot(push_registration_request("family-a", &token, 1))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["registered_hints"], 1);
+
+        let response = app
+            .oneshot(envelope_request("family-a", 9, 48))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wake = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(wake.device_tokens, vec![token]);
+    }
+
+    #[tokio::test]
+    async fn deposit_credentials_cannot_register_push_tokens() {
+        let app = test_app();
+        let response = app
+            .oneshot(push_registration_request(
+                &deposit_token_for("family-a"),
+                &"ab".repeat(32),
+                1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "deposit_only");
+    }
+
+    #[test]
+    fn stale_push_registrations_do_not_match() {
+        let (_db, store) = test_store();
+        let token = "ab".repeat(32);
+        let now = PUSH_REGISTRATION_RETENTION_MS + 10;
+        store
+            .replace_push_registration("family-a", &token, &[sample_hint(1)], 1)
+            .unwrap();
+        assert!(store
+            .push_device_tokens_for_hint("family-a", &sample_hint(1), now)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

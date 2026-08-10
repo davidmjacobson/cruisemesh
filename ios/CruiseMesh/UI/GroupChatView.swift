@@ -16,6 +16,10 @@ struct GroupChatView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var messages: [StoredMessage] = []
     @State private var rows: [GroupChatRowModel] = []
+    @State private var previousScrollRowIds: [String] = []
+    @State private var isNearConversationBottom = true
+    @State private var showNewMessages = false
+    @State private var newMessagesTargetRowId: String?
     @State private var contactsById: [Data: Contact] = [:]
     @State private var draft = ""
     @State private var showDetails = false
@@ -64,62 +68,92 @@ struct GroupChatView: View {
         VStack(spacing: 0) {
             GeometryReader { geo in
                 ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 2) {
-                            ForEach(rows, id: \.rowId) { row in
-                                let message = row.message
-                                let messageSenderName = senderName(message.senderUserId)
-                                let messageColor = ChatListLogic.avatarHueAndInitials(
-                                    userId: message.senderUserId,
-                                    name: messageSenderName,
-                                    displayId: formatUserId(userId: message.senderUserId)
-                                ).0
-                                let replyKey = replyMessageKey(message)
-                                GroupMessageRow(
-                                    message: message,
-                                    isOwn: message.senderUserId == identity.userId,
-                                    groupName: activeGroup.name,
-                                    senderLabel: row.senderLabel,
-                                    contactColor: messageColor,
-                                    quoted: replyMetadata[replyKey]?.quoted,
-                                    canReply: replyMetadata[replyKey]?.msgId != nil,
-                                    reactions: row.reactions,
-                                    timeLabel: row.timeLabel,
-                                    arrivalLabel: row.arrivalLabel,
-                                    onReact: { emoji in
-                                        sendReaction(to: message, emoji: emoji)
-                                    },
-                                    onReply: {
+                    ZStack(alignment: .bottom) {
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 2) {
+                                ForEach(rows, id: \.rowId) { row in
+                                    let message = row.message
+                                    let messageSenderName = senderName(message.senderUserId)
+                                    let messageColor = ChatListLogic.avatarHueAndInitials(
+                                        userId: message.senderUserId,
+                                        name: messageSenderName,
+                                        displayId: formatUserId(userId: message.senderUserId)
+                                    ).0
+                                    let replyKey = replyMessageKey(message)
+                                    GroupMessageRow(
+                                        message: message,
+                                        isOwn: message.senderUserId == identity.userId,
+                                        groupName: activeGroup.name,
+                                        senderLabel: row.senderLabel,
+                                        contactColor: messageColor,
+                                        quoted: replyMetadata[replyKey]?.quoted,
+                                        canReply: replyMetadata[replyKey]?.msgId != nil,
+                                        reactions: row.reactions,
+                                        timeLabel: row.timeLabel,
+                                        arrivalLabel: row.arrivalLabel,
+                                        onReact: { emoji in
+                                            sendReaction(to: message, emoji: emoji)
+                                        },
+                                        onReply: {
+                                            replyingTo = message
+                                            composerFocused = true
+                                        },
+                                        onPhotoTap: { jpeg in
+                                            viewedPhoto = ViewedPhoto(jpeg: jpeg)
+                                        },
+                                        onQuotedTap: { target in
+                                            withAnimation {
+                                                proxy.scrollTo(messageId(target), anchor: .center)
+                                            }
+                                        },
+                                        onStatus: { statusMessage = $0 }
+                                    )
+                                    .swipeToReply {
                                         replyingTo = message
                                         composerFocused = true
-                                    },
-                                    onPhotoTap: { jpeg in
-                                        viewedPhoto = ViewedPhoto(jpeg: jpeg)
-                                    },
-                                    onQuotedTap: { target in
-                                        withAnimation {
-                                            proxy.scrollTo(messageId(target), anchor: .center)
-                                        }
-                                    },
-                                    onStatus: { statusMessage = $0 }
-                                )
-                                .swipeToReply {
-                                    replyingTo = message
-                                    composerFocused = true
+                                    }
+                                    .id(row.rowId)
                                 }
-                                .id(row.rowId)
+                                Color.clear
+                                    .frame(height: 1)
+                                    .id(conversationBottomId)
+                                    .onAppear {
+                                        isNearConversationBottom = true
+                                        if newMessagesTargetRowId == nil {
+                                            showNewMessages = false
+                                        }
+                                    }
+                                    .onDisappear { isNearConversationBottom = false }
                             }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(minHeight: geo.size.height, alignment: .bottom)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .frame(minHeight: geo.size.height, alignment: .bottom)
+                        .scrollDismissesKeyboard(.interactively)
+
+                        if showNewMessages {
+                            Button {
+                                scrollToAnnouncedMessage(proxy: proxy)
+                            } label: {
+                                Label("New messages", systemImage: "arrow.down")
+                                    .font(.subheadline.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .background(.regularMaterial, in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.bottom, 12)
+                            .accessibilityIdentifier("group-chat.new-messages")
+                        }
                     }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onChange(of: rows.count) { _ in
-                        scrollToLatest(proxy: proxy)
+                    .onChange(of: rows.map(\.rowId)) { rowIds in
+                        handleConversationRowsChanged(rowIds, proxy: proxy)
                     }
                     .onAppear {
-                        scrollToLatest(proxy: proxy, animated: false)
+                        previousScrollRowIds = rows.map(\.rowId)
+                        DispatchQueue.main.async {
+                            scrollToLatest(proxy: proxy, animated: false)
+                        }
                     }
                 }
             }
@@ -165,6 +199,7 @@ struct GroupChatView: View {
             draft = DraftStore.load(chatId: activeGroup.id)
             isMuted = ChatMuteStore.isMuted(activeGroup.id)
             ChatVisibility.setVisible(activeGroup.id)
+            MessageNotifier.clearChatNotifications(chatId: activeGroup.id)
             MeshController.shared.notifyChatViewed(chatId: activeGroup.id)
             loadContacts()
             reload()
@@ -186,6 +221,7 @@ struct GroupChatView: View {
                 ChatVisibility.clearVisible(activeGroup.id)
             } else if phase == .active {
                 ChatVisibility.setVisible(activeGroup.id)
+                MessageNotifier.clearChatNotifications(chatId: activeGroup.id)
                 MeshController.shared.notifyChatViewed(chatId: activeGroup.id)
             }
         }
@@ -325,6 +361,43 @@ struct GroupChatView: View {
         } else {
             proxy.scrollTo(last.rowId, anchor: .bottom)
         }
+    }
+
+    private var conversationBottomId: String {
+        "group-chat-bottom-\(UserIdHex.encode(activeGroup.id))"
+    }
+
+    private func handleConversationRowsChanged(_ rowIds: [String], proxy: ScrollViewProxy) {
+        let decision = ConversationScrollPolicy.decide(
+            previousRowIds: previousScrollRowIds,
+            currentRowIds: rowIds,
+            lateArrivalRowIds: Set(rows.filter { $0.arrivalLabel != nil }.map(\.rowId)),
+            isNearBottom: isNearConversationBottom,
+            newestIsOwnMessage: rows.last?.message.senderUserId == identity.userId
+        )
+        previousScrollRowIds = rowIds
+
+        switch decision {
+        case .none:
+            break
+        case .autoScroll:
+            showNewMessages = false
+            newMessagesTargetRowId = nil
+            DispatchQueue.main.async { scrollToLatest(proxy: proxy) }
+        case .showNewMessages(let targetRowId):
+            showNewMessages = true
+            newMessagesTargetRowId = targetRowId
+        }
+    }
+
+    private func scrollToAnnouncedMessage(proxy: ScrollViewProxy) {
+        if let target = newMessagesTargetRowId {
+            withAnimation { proxy.scrollTo(target, anchor: .center) }
+        } else {
+            scrollToLatest(proxy: proxy)
+        }
+        showNewMessages = false
+        newMessagesTargetRowId = nil
     }
 
     private func loadContacts() {

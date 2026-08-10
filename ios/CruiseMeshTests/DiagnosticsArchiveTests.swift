@@ -61,6 +61,26 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertNil(DiagnosticsArchive.write(files: [missing], name: "cruisemesh-diagnostics-2026-08-03"))
     }
 
+    func testSharePlanRefusesLooseFileFallbackWhenArchiveFails() {
+        let files = [
+            workDirectory.appendingPathComponent("log.txt"),
+            workDirectory.appendingPathComponent("metrics.csv")
+        ]
+        var attemptedFiles: [URL] = []
+
+        let plan = DiagnosticsSharePlan.prepare(
+            files: files,
+            name: "cruisemesh-diagnostics-2026-08-03",
+            archiveWriter: { urls, _ in
+                attemptedFiles = urls
+                return nil
+            }
+        )
+
+        XCTAssertEqual(plan, .archiveFailed)
+        XCTAssertEqual(attemptedFiles, files)
+    }
+
     /// "Delete captured diagnostics" has to take the zip too, or it leaves a
     /// full second copy of everything it claimed to erase.
     func testDeleteRemovesWrittenArchives() throws {
