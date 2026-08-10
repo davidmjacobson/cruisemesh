@@ -210,6 +210,48 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertFalse(app.alerts["Delete contact?"].exists)
     }
 
+    func testChatListMarkReadAndDeleteRequireDeliberateActions() {
+        launch(scenario: "chat-list-actions")
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
+        let dad = app.staticTexts["Dad"].firstMatch
+        XCTAssertTrue(dad.waitForExistence(timeout: 5), "Saved nickname should label the chat row")
+
+        dad.swipeLeft()
+        let markRead = app.buttons["Mark as read"]
+        XCTAssertTrue(markRead.waitForExistence(timeout: 3))
+        markRead.tap()
+
+        dad.swipeLeft()
+        XCTAssertFalse(app.buttons["Mark as read"].exists)
+        let delete = app.buttons["Delete"]
+        XCTAssertTrue(delete.waitForExistence(timeout: 3))
+        delete.tap()
+        XCTAssertTrue(app.alerts["Delete Dad?"].waitForExistence(timeout: 3))
+        app.alerts["Delete Dad?"].buttons["Cancel"].tap()
+        XCTAssertTrue(dad.exists)
+        attachScreenshot(named: "Chat-list-actions-nickname-mark-read-delete-cancel")
+    }
+
+    func testIncomingMessageWhileReadingHistoryShowsUsableJumpAction() {
+        launch(scenario: "chat-late-arrival")
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
+        app.staticTexts["Bob"].firstMatch.tap()
+        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["History message 32"].waitForExistence(timeout: 5))
+
+        for _ in 0..<4 { app.swipeDown() }
+        let inject = element("chat.uitest-inject-incoming")
+        XCTAssertTrue(inject.waitForExistence(timeout: 3))
+        inject.tap()
+
+        let jump = element("chat.new-messages")
+        XCTAssertTrue(jump.waitForExistence(timeout: 5))
+        XCTAssertTrue(jump.isHittable)
+        attachScreenshot(named: "Chat-new-messages-action")
+        jump.tap()
+        XCTAssertTrue(app.staticTexts["New message while reading history"].waitForExistence(timeout: 5))
+    }
+
     private func launch(scenario: String) {
         self.scenario = scenario
         app = XCUIApplication()
@@ -225,6 +267,13 @@ final class CruiseMeshUITests: XCTestCase {
 
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    private func attachScreenshot(named name: String) {
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = name
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
     }
 
     private func assertRevealControl(

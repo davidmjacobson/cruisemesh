@@ -37,6 +37,14 @@ services:
       # somewhere else than the file you were watching.)
       CRUISEMESH_RELAY_DB: /data/cruisemesh-relayd.sqlite
       CRUISEMESH_RELAY_BIND: 0.0.0.0:8080
+      # Optional Apple background relay wakes (§7.1 in DEPLOY.md). All four
+      # provider fields must be set together. Mount the .p8 file into the
+      # container with a private compose override; never bake it into an image.
+      CRUISEMESH_APNS_KEY_ID: ${CRUISEMESH_APNS_KEY_ID:-}
+      CRUISEMESH_APNS_TEAM_ID: ${CRUISEMESH_APNS_TEAM_ID:-}
+      CRUISEMESH_APNS_BUNDLE_ID: ${CRUISEMESH_APNS_BUNDLE_ID:-}
+      CRUISEMESH_APNS_PRIVATE_KEY_FILE: ${CRUISEMESH_APNS_PRIVATE_KEY_FILE:-}
+      CRUISEMESH_APNS_ENVIRONMENT: ${CRUISEMESH_APNS_ENVIRONMENT:-production}
       # FR2: default to info-level logs so a field incident is debuggable
       # without redeploying with an env var change first. Override with a
       # more/less verbose value as needed (e.g. RUST_LOG=debug,tower_http=off).

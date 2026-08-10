@@ -17,12 +17,14 @@ struct ShareContactView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var code: String?
 
+    private var displayName: String { ChatListLogic.contactDisplayName(contact) }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
                     if let code {
-                        Text(contact.name)
+                        Text(displayName)
                             .font(.title2.bold())
                             .multilineTextAlignment(.center)
                         Text(formatUserId(userId: contact.userId))
@@ -37,7 +39,7 @@ struct ShareContactView: View {
                                 .padding()
                                 .background(RoundedRectangle(cornerRadius: 16).fill(Color.white))
                         }
-                        Text("Anyone with this code can ask to connect with \(contact.name). \(contact.name) chooses whether to accept. The code stops working in 7 days.")
+                        Text("Anyone with this code can ask to connect with \(displayName). \(displayName) chooses whether to accept. The code stops working in 7 days.")
                             .font(.callout)
                             .multilineTextAlignment(.center)
                     } else {
@@ -45,7 +47,7 @@ struct ShareContactView: View {
                         // friends of friends means "do not hand me around", and
                         // it would be incoherent for that to stop the automatic
                         // introductions and permit this one (decision 4).
-                        Text("\(contact.name) has turned off being introduced to others.")
+                        Text("\(displayName) has turned off being introduced to others.")
                             .font(.body)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)

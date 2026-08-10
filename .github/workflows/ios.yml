@@ -11,6 +11,8 @@ name: iOS
 # the Swift bindings the app links against), plus this workflow itself.
 
 on:
+  schedule:
+    - cron: "23 6 * * *"
   workflow_dispatch:
     inputs:
       suite:
@@ -42,6 +44,10 @@ on:
 jobs:
   ios:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(github.event_name == 'schedule' && '["standard","compact-accessibility","ipad-dark"]' || '["standard"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -102,19 +108,38 @@ jobs:
       # CI-built IPA ever registered it, and the website's "Open in CruiseMesh"
       # button was inert in Safari for two releases because nothing checked.
       # Asserts on the GENERATED plist, which is what actually ships.
-      - name: Assert the generated Info.plist declares cruisemesh://
+      - name: Assert generated URL and background-push declarations
         run: |
           set -o pipefail
           plutil -extract CFBundleURLTypes json -o - ios/CruiseMesh/Info.plist \
             | python3 -c "import json,sys; t=json.load(sys.stdin); sys.exit(0) if any('cruisemesh' in d.get('CFBundleURLSchemes', []) for d in t) else sys.exit('Generated Info.plist does not declare the cruisemesh:// URL scheme -- check CFBundleURLTypes in ios/project.yml')"
+          plutil -extract UIBackgroundModes json -o - ios/CruiseMesh/Info.plist \
+            | python3 -c "import json,sys; m=json.load(sys.stdin); sys.exit(0) if 'remote-notification' in m else sys.exit('Generated Info.plist does not declare remote-notification -- check UIBackgroundModes in ios/project.yml')"
+          plutil -extract aps-environment raw -o - ios/CruiseMesh/CruiseMesh.entitlements >/dev/null
 
-      - name: Pick an available iPhone simulator
+      - name: Pick an available simulator for the profile
         id: sim
+        env:
+          PROFILE: ${{ matrix.profile }}
         run: |
-          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; c=[x for k,v in d.items() if 'iOS' in k for x in v if x.get('isAvailable') and 'iPhone' in x['name']]; print(c[0]['udid'])")
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,os,sys; d=json.load(sys.stdin)['devices']; p=os.environ['PROFILE']; c=[x for k,v in d.items() if 'iOS' in k for x in v if x.get('isAvailable')]; c=[x for x in c if ('iPad' in x['name'])] if p=='ipad-dark' else [x for x in c if 'iPhone' in x['name']]; compact=[x for x in c if 'SE' in x['name'] or 'mini' in x['name']]; c=compact if p=='compact-accessibility' and compact else c; print(c[0]['udid'])")
           test -n "$UDID"
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           echo "Using simulator $UDID"
+
+      - name: Configure nightly appearance and content size
+        if: github.event_name == 'schedule' && matrix.profile != 'standard'
+        env:
+          PROFILE: ${{ matrix.profile }}
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$UDID" -b
+          if [[ "$PROFILE" == "compact-accessibility" ]]; then
+            xcrun simctl ui "$UDID" content_size accessibility-extra-extra-large
+          elif [[ "$PROFILE" == "ipad-dark" ]]; then
+            xcrun simctl ui "$UDID" appearance dark
+          fi
 
       - name: Build & test on the iOS Simulator
         working-directory: ios
@@ -140,7 +165,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-test-results
+          name: ${{ github.event_name == 'schedule' && format('ios-test-results-{0}', matrix.profile) || 'ios-test-results' }}
           path: |
             ios/build/TestResults.xcresult
             ios/build/xcodebuild.log

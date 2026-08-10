@@ -56,7 +56,10 @@ targets:
         DEFINES_MODULE: YES
       configs:
         Debug:
+          APS_ENVIRONMENT: development
           SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+        Release:
+          APS_ENVIRONMENT: production
     info:
       path: CruiseMesh/Info.plist
       properties:
@@ -75,6 +78,7 @@ targets:
         UIBackgroundModes:
           - bluetooth-central
           - bluetooth-peripheral
+          - remote-notification
         NSBluetoothAlwaysUsageDescription: CruiseMesh needs Bluetooth to scan, connect, send, and receive messages nearby. Without it, the mesh cannot work as designed.
         NSBluetoothPeripheralUsageDescription: CruiseMesh needs Bluetooth advertising so friends can find you on the mesh. Without it, the mesh cannot work as designed.
         NSCameraUsageDescription: Take a photo to send in chat, or scan a friend QR code.

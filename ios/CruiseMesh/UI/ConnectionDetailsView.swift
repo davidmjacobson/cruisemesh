@@ -1,4 +1,5 @@
 import SwiftUI
+import os.log
 
 /// The instants every rendered time on the page is measured against, passed
 /// down together so no two rows can disagree about "now".
@@ -525,6 +526,7 @@ enum ConnectionCopy {
  section.
  */
 struct ConnectionDetailsView: View {
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "ConnectionDetails")
     @ObservedObject var appModel: AppModel
 
     @StateObject private var model = ConnectionDetailsModel()
@@ -1149,15 +1151,24 @@ struct ConnectionDetailsView: View {
         if let url = ConflictDiagnosticsExport.writeCSVFile() { urls.append(url) }
         if let url = ProtocolEventExport.writeJSONLFile() { urls.append(url) }
         hasDiagnosticArchive = !urls.isEmpty
-        if urls.isEmpty {
+        let plan = DiagnosticsSharePlan.prepare(
+            files: urls,
+            name: DiagnosticsArchive.todaysName()
+        )
+        switch plan {
+        case .nothingCaptured:
             supportMessage = String(localized: "No diagnostics captured yet.")
-            return
+            shareFile = nil
+        case .archiveFailed:
+            Self.log.error("Could not create the diagnostics ZIP; refusing lossy loose-file fallback")
+            supportMessage = String(
+                localized: "Couldn't prepare the diagnostics ZIP. Nothing was shared; try again."
+            )
+            shareFile = nil
+        case .archive(let archive):
+            supportMessage = nil
+            shareFile = ShareableFile(url: archive)
         }
-        // Zipping is a disk write and can fail -- a full device, most likely.
-        // Sending the loose files then beats telling someone who has captured
-        // diagnostics that they have none.
-        let archive = DiagnosticsArchive.write(files: urls, name: DiagnosticsArchive.todaysName())
-        shareFile = ShareableFile(urls: archive.map { [$0] } ?? urls)
     }
 
     /// Answers `hasAnythingCaptured` off the main actor and posts the result.

@@ -46,6 +46,7 @@ struct ChatListView: View {
     @State private var bluetoothAudioWarningDismissed = false
     @State private var publishedFriendDirectory = false
     @State private var showStoreRecoveryNotice = false
+    @State private var pendingDeleteSummary: ChatSummary?
     @State private var path = NavigationPath()
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
 
@@ -134,11 +135,19 @@ struct ChatListView: View {
                                 )
                             )
                         }
-                        .swipeActions {
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             Button(role: .destructive) {
-                                delete(summary)
+                                pendingDeleteSummary = summary
                             } label: {
                                 Label("Delete", systemImage: "trash")
+                            }
+                            if summary.unreadCount > 0 {
+                                Button {
+                                    markRead(summary)
+                                } label: {
+                                    Label("Mark as read", systemImage: "envelope.open")
+                                }
+                                .tint(.blue)
                             }
                         }
                     }
@@ -312,6 +321,16 @@ struct ChatListView: View {
                 let (chatId, isGroup) = event
                 path.append(isGroup ? ChatRoute.group(chatId) : ChatRoute.contact(chatId))
             }
+            .alert(item: $pendingDeleteSummary) { summary in
+                Alert(
+                    title: Text(String(localized: "Delete \(summary.title)?")),
+                    message: Text(deleteConfirmationMessage(summary)),
+                    primaryButton: .destructive(Text("Delete")) {
+                        delete(summary)
+                    },
+                    secondaryButton: .cancel()
+                )
+            }
         }
         .accessibilityIdentifier("screen.chat-list")
     }
@@ -329,6 +348,26 @@ struct ChatListView: View {
             FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
             MeshController.shared.contactListChanged()
         }
+        reload()
+    }
+
+    private func deleteConfirmationMessage(_ summary: ChatSummary) -> String {
+        summary.isGroup
+            ? String(localized: "This deletes the group and its chat history from this phone.")
+            : String(localized: "This removes the contact and deletes your chat history.")
+    }
+
+    @MainActor
+    private func markRead(_ summary: ChatSummary) {
+        let store = AppStore.get()
+        ChatReadMarker.markRead(
+            store: store,
+            ownUserId: identity.userId,
+            chatId: summary.chatId,
+            isGroup: summary.isGroup
+        )
+        MessageNotifier.clearChatNotifications(chatId: summary.chatId)
+        ChatEvents.notifyChatChanged(summary.chatId)
         reload()
     }
 

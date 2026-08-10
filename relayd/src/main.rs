@@ -4,6 +4,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use cruisemesh_relayd::{
+    apns::{spawn_apns_worker, ApnsConfig},
     app, parse_bind, parse_family_quota_bytes, parse_rate_bytes_per_min,
     parse_rate_requests_per_min, parse_tokens, parse_ws_connection_cap, spawn_prune_task, AppState,
     RateLimitConfig, RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
@@ -82,6 +83,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
+    let apns_config = ApnsConfig::from_env()?;
+    let apns_enabled = apns_config.is_some();
     // FR7: hourly background prune + incremental_vacuum, independent of
     // client traffic. Detached (never awaited/joined) -- it runs for the
     // life of the process; graceful shutdown below only drains in-flight
@@ -103,22 +106,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_global_requests_per_min = rate_limits.global_requests_per_min,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         admin_api = admin_token.is_some(),
+        apns_wakes = apns_enabled,
         "relay server listening"
     );
-    axum::serve(
-        listener,
-        app(AppState::with_full_config(
-            store,
-            auth_tokens,
-            cruisemesh_relayd::WS_BROADCAST_CAPACITY,
-            family_quota_bytes,
-            ws_limits,
-            rate_limits,
-        )
-        .with_admin_token(admin_token)),
+    let mut state = AppState::with_full_config(
+        store.clone(),
+        auth_tokens,
+        cruisemesh_relayd::WS_BROADCAST_CAPACITY,
+        family_quota_bytes,
+        ws_limits,
+        rate_limits,
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_admin_token(admin_token);
+    let _apns_task = if let Some(config) = apns_config {
+        let (sender, receiver) = tokio::sync::mpsc::channel(256);
+        state = state.with_push_wake_sender(sender);
+        Some(spawn_apns_worker(store, config, receiver)?)
+    } else {
+        None
+    };
+    axum::serve(listener, app(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
 }
 

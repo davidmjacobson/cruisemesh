@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import UserNotifications
+import os.log
 
 @main
 struct CruiseMeshApp: App {
@@ -114,6 +115,8 @@ struct CruiseMeshApp: App {
 /// Both only happen today when something calls into `MeshController`, which
 /// this provides for the background-relaunch case specifically.
 final class AppDelegate: NSObject, UIApplicationDelegate {
+    private static let log = Logger(subsystem: "com.cruisemesh", category: "AppDelegate")
+
     func applicationWillTerminate(_ application: UIApplication) {
         guard !UITestConfiguration.isEnabled else { return }
         DiagnosticLogExport.archiveCurrentSession()
@@ -135,6 +138,9 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         // launch" guidance needs a hook that always runs. See
         // MetricKitCollector's doc.
         MetricKitCollector.shared.start()
+        UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+        MessageNotifier.configureCategories()
+        MessageNotifier.registerForRemoteNotificationsIfAuthorized()
         // Same reasoning: Background App Refresh has to be sampled on the main
         // actor, and a headless relaunch is exactly the case where knowing it
         // is denied matters most.
@@ -160,6 +166,51 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
         }
         return true
     }
+
+    func application(
+        _ application: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        guard !UITestConfiguration.isEnabled else { return }
+        RemoteNotificationTokenStore.save(deviceToken)
+        RemotePushRegistrationClient.syncCurrentIfPossible()
+    }
+
+    func application(
+        _ application: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        guard !UITestConfiguration.isEnabled else { return }
+        Self.log.warning("APNs registration failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    func application(
+        _ application: UIApplication,
+        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+    ) {
+        guard userInfo["cruisemesh_relay_wake"] as? Bool == true,
+              TermsAcceptanceStore.isCurrentVersionAccepted(),
+              OnboardingStore.isCompleted(),
+              RelayConfigStore.load() != nil
+        else {
+            completionHandler(.noData)
+            return
+        }
+        let meshEnabled = AppDefaults.current.object(forKey: AppModel.meshEnabledKey) == nil
+            || AppDefaults.current.bool(forKey: AppModel.meshEnabledKey)
+        guard meshEnabled else {
+            completionHandler(.noData)
+            return
+        }
+
+        let identity = IdentityStore.loadOrCreate()
+        MeshController.shared.configure(identity: identity)
+        MeshController.shared.start()
+        MeshController.shared.handleRemoteRelayWake { completed in
+            completionHandler(completed ? .newData : .failed)
+        }
+    }
 }
 
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
@@ -183,6 +234,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let info = response.notification.request.content.userInfo
         guard let hex = info[MessageNotifier.chatUserIdKey] as? String,
               let chatId = try? UserIdHex.decode(hex) else { return }
+        defer { MessageNotifier.clearChatNotifications(chatId: chatId) }
         let isGroup = info[MessageNotifier.chatIsGroupKey] as? Bool ?? false
         let store = AppStore.get()
         let identity = IdentityStore.loadOrCreate()
@@ -197,27 +249,12 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
                 RealMeshSender(store: store, identity: identity).sendText(contact: contact, text: text)
             }
         } else if response.actionIdentifier == MessageNotifier.markReadActionId {
-            let senderIds: [Data]
-            if isGroup, let group = try? store.getGroup(groupId: chatId) {
-                senderIds = group.memberUserIds.filter { $0 != identity.userId }
-            } else {
-                senderIds = [chatId]
-            }
-            for senderId in senderIds {
-                let through = PeerStreamWatermark.through(
-                    store: store,
-                    chatId: chatId,
-                    senderUserId: senderId
-                )
-                if through > 0 {
-                    try? store.recordOutgoingReceipt(
-                        chatId: chatId,
-                        senderUserId: senderId,
-                        receiptType: ReceiptType.read,
-                        throughLamport: through
-                    )
-                }
-            }
+            ChatReadMarker.markRead(
+                store: store,
+                ownUserId: identity.userId,
+                chatId: chatId,
+                isGroup: isGroup
+            )
             ChatEvents.notifyChatChanged(chatId)
         } else if response.actionIdentifier == UNNotificationDefaultActionIdentifier {
             DispatchQueue.main.async { NotificationOpenEvents.subject.send((chatId, isGroup)) }

@@ -161,21 +161,19 @@ struct FriendsView: View {
                         .padding(.vertical, 12)
                     }
                     ForEach(contacts, id: \.userId) { contact in
+                        let displayName = ChatListLogic.contactDisplayName(contact)
                         NavigationLink {
                             ChatView(contact: contact, identity: identity)
                         } label: {
                             HStack {
                                 AvatarView(
                                     userId: contact.userId,
-                                    name: contact.name,
+                                    name: displayName,
                                     photo: (try? AppStore.get().contactAvatar(userId: contact.userId))
                                         .flatMap { UIImage(data: $0) }
                                 )
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text(ChatListLogic.displayNameOrId(
-                                        name: contact.name,
-                                        displayId: formatUserId(userId: contact.userId)
-                                    ))
+                                    Text(displayName)
                                     if let waiting = waitingText(for: contact) {
                                         Text(waiting)
                                             .font(.caption)
@@ -294,7 +292,11 @@ struct FriendsView: View {
     private func reload() {
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         contacts = ((try? AppStore.get().listContacts()) ?? [])
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .sorted {
+                coreContactDisplayName(contact: $0).localizedCaseInsensitiveCompare(
+                    coreContactDisplayName(contact: $1)
+                ) == .orderedAscending
+            }
         suggestions = FriendsOfFriendsStore.isEnabled()
             ? ((try? AppStore.get().listFriendSuggestions(nowMs: now)) ?? [])
             : []
@@ -307,7 +309,8 @@ struct FriendsView: View {
     /// The sharer's name when we still have them, their formatted UserID when
     /// we do not — never nothing, so "Shared by" is always a real answer.
     private func sharerLabel(for userId: Data) -> String {
-        let name = (try? AppStore.get().getContact(userId: userId))?.name
+        let name = (try? AppStore.get().getContact(userId: userId))
+            .map { coreContactDisplayName(contact: $0) }
         if let name, !name.isEmpty { return name }
         return formatUserId(userId: userId)
     }
@@ -321,9 +324,10 @@ struct FriendsView: View {
             return nil
         }
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let displayName = ChatListLogic.contactDisplayName(contact)
         return row.expiresAtMs > now
-            ? "Waiting for \(contact.name) to accept."
-            : "\(contact.name) didn't respond. Ask them to scan your code directly."
+            ? "Waiting for \(displayName) to accept."
+            : "\(displayName) didn't respond. Ask them to scan your code directly."
     }
 
     private func openPendingShared(_ request: PendingSharedRequest) {

@@ -78,6 +78,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var lanTransport: LanTransport?
     private let lanHealth = LanHealthTracker()
     private let store = AppStore.get()
+    private let incomingAnnouncements = IncomingMessageAnnouncementGate(
+        announcer: LocalNotificationAnnouncer()
+    )
     private let bluetoothAudioBackoff = BluetoothAudioBackoff()
     /// Coalesces the failover resume fan-out per logical peer — see
     /// `scheduleFailoverResume`. Confined to `meshQueue` like the rest of the
@@ -149,6 +152,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
     private var relaySyncPending = false
+    /// APNs content-available wakes hold their background fetch completion
+    /// until the authoritative relay pass finishes (or a 25-second safety
+    /// deadline wins), giving iOS a reason to keep the process runnable while
+    /// the encrypted mailbox is fetched and acknowledged.
+    private var remoteRelayWakeCompletions: [UUID: (Bool) -> Void] = [:]
     /// C2: whether a full core-engine pass has run to completion in this
     /// process, feeding `CoreRelayPassPlan.sweptThisSession` — an input rather
     /// than store state because `relay_sweep_due` correctness must not depend on
@@ -251,6 +259,42 @@ final class MeshController: ObservableObject, @unchecked Sendable {
 
     func notifyChatViewed(chatId: Data) {
         meshQueue.async { self.notifyChatViewedOnMeshQueue(chatId: chatId) }
+    }
+
+    func handleRemoteRelayWake(completion: @escaping (Bool) -> Void) {
+        meshQueue.async {
+            let id = UUID()
+            self.remoteRelayWakeCompletions[id] = completion
+            self.meshQueue.asyncAfter(deadline: .now() + 25) {
+                self.finishRemoteRelayWake(id: id, completed: false)
+            }
+            self.attemptRemoteRelayWake(id: id)
+        }
+    }
+
+    private func attemptRemoteRelayWake(id: UUID) {
+        guard remoteRelayWakeCompletions[id] != nil else { return }
+        guard !runRelaySync() else { return }
+        // A background launch can reach this queue before NWPathMonitor has
+        // delivered its first satisfied path. Keep the OS-granted window open
+        // and retry briefly instead of reporting failure immediately and
+        // getting suspended just before connectivity becomes visible.
+        meshQueue.asyncAfter(deadline: .now() + .milliseconds(500)) {
+            self.attemptRemoteRelayWake(id: id)
+        }
+    }
+
+    private func finishRemoteRelayWake(id: UUID, completed: Bool) {
+        guard let completion = remoteRelayWakeCompletions.removeValue(forKey: id) else { return }
+        onMain { completion(completed) }
+    }
+
+    private func finishAllRemoteRelayWakes(completed: Bool) {
+        let completions = Array(remoteRelayWakeCompletions.values)
+        remoteRelayWakeCompletions.removeAll()
+        for completion in completions {
+            onMain { completion(completed) }
+        }
     }
 
     private func startOnMeshQueue() {
@@ -515,6 +559,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         relayCancellable?.cancel()
         relayCancellable = nil
         relaySyncPending = false
+        finishAllRemoteRelayWakes(completed: false)
         onMain { MeshRuntimeStatus.shared.markStopped() }
         log.info("Mesh stopped")
     }
@@ -2029,22 +2074,30 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             receiptType: ReceiptType.delivered,
             throughLamport: throughLamport
         )
-        if ChatVisibility.isVisible(group.id) {
+        let chatVisible = ChatVisibility.isVisible(group.id)
+        if chatVisible {
             try? store.recordOutgoingReceipt(
                 chatId: group.id,
                 senderUserId: senderUserId,
                 receiptType: ReceiptType.read,
                 throughLamport: throughLamport
             )
-        } else if isVisibleChatKind(body.kind) {
-            let senderName = (try? store.getContact(userId: senderUserId))
-                .map { coreContactDisplayName(contact: $0) }
-                ?? String(UserIdHex.encode(senderUserId).prefix(8))
-            let preview = body.kind == ProtocolKind.attachmentManifest
-                ? AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
-                : (String(data: body.content, encoding: .utf8) ?? "")
-            MessageNotifier.notifyIncomingGroupMessage(group: group, senderName: senderName, preview: preview)
         }
+        incomingAnnouncements.announceGroupIfNeeded(
+            chatVisible: chatVisible,
+            kind: body.kind,
+            group: group,
+            senderName: {
+                (try? self.store.getContact(userId: senderUserId))
+                    .map { coreContactDisplayName(contact: $0) }
+                    ?? String(UserIdHex.encode(senderUserId).prefix(8))
+            },
+            preview: {
+                body.kind == ProtocolKind.attachmentManifest
+                    ? AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                    : (String(data: body.content, encoding: .utf8) ?? "")
+            }
+        )
     }
 
     /// Imports a pairwise-sealed `kind=4` group invite (DESIGN.md §6.5). Wire
@@ -2110,16 +2163,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             )
         }
 
-        if !ChatVisibility.isVisible(group.id) {
-            let senderName = (try? store.getContact(userId: senderUserId))
-                .map { coreContactDisplayName(contact: $0) }
-                ?? String(UserIdHex.encode(senderUserId).prefix(8))
-            MessageNotifier.notifyIncomingGroupMessage(
-                group: group,
-                senderName: senderName,
-                preview: "Added you to \(group.name)"
-            )
-        }
+        incomingAnnouncements.announceGroupInviteIfNeeded(
+            chatVisible: ChatVisibility.isVisible(group.id),
+            group: group
+        )
     }
 
     private func handleIncomingChat(
@@ -2233,15 +2280,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 )
             }
         }
-        if !visible, isVisibleChatKind(kind) {
-            let preview: String
-            if kind == ProtocolKind.attachmentManifest {
-                preview = AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
-            } else {
-                preview = String(data: body.content, encoding: .utf8) ?? ""
+        incomingAnnouncements.announceDirectIfNeeded(
+            chatVisible: visible,
+            kind: kind,
+            contact: contact,
+            preview: {
+                if kind == ProtocolKind.attachmentManifest {
+                    return AttachmentPayload.previewLabel(AttachmentPayload.decode(body.content))
+                }
+                return String(data: body.content, encoding: .utf8) ?? ""
             }
-            MessageNotifier.notifyIncoming(contact: contact, preview: preview)
-        }
+        )
         RelaySyncEvents.requestSync()
     }
 
@@ -2413,7 +2462,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         if !wasKnown {
             FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
             FriendImportEvents.notify(FriendImportEvent(contact: contact, directBluetooth: sourceAddress != nil))
-            MessageNotifier.notifyFriendAdded(contact: contact)
+            incomingAnnouncements.announceFriendAdded(contact: contact)
         }
         log.info("Imported contact \(UserIdHex.encode(contact.userId), privacy: .public) from friend request")
     }
@@ -2473,7 +2522,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // At most one prompt per requester per day (core keeps the clock), so a
         // resend cannot be used to wear somebody down.
         if (try? store.noteSharedRequestPrompt(requesterUserId: senderUserId, nowMs: now)) == true {
-            MessageNotifier.notifySharedRequest(name: card.name, userId: senderUserId)
+            incomingAnnouncements.announceSharedRequest(name: card.name, userId: senderUserId)
         }
         log.info("Holding a shared-card friend request for confirmation from \(UserIdHex.encode(sharer.userId), privacy: .public)")
     }
@@ -2830,7 +2879,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 contact: contact,
                 directBluetooth: sourceAddress != nil
             ))
-            MessageNotifier.notifyFriendAdded(contact: contact)
+            incomingAnnouncements.announceFriendAdded(contact: contact)
         }
     }
 
@@ -3507,31 +3556,36 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         let ownUserId = identity.userId
         let subscribeConfig = config
+        RemotePushRegistrationClient.sync(config: config, ownUserId: ownUserId)
         relayPushClient.start(config: config) {
             relayPushSubscription(ownUserId: ownUserId, config: subscribeConfig)
         }
     }
 
-    private func runRelaySync() {
-        guard isRunning, let identity else { return }
+    @discardableResult
+    private func runRelaySync() -> Bool {
+        guard isRunning, let identity else { return false }
         // No own config is no longer a hard stop: contacts' friend cards can
         // carry relays worth polling (Android parity). relaySyncBlocking
         // reports .noConfig when there is truly nowhere to sync.
         let config = RelayConfigStore.load()
+        if let config {
+            RemotePushRegistrationClient.sync(config: config, ownUserId: identity.userId)
+        }
         guard pathMonitor?.currentPath.status == .satisfied else {
             onMain { MeshConnectivityStatus.shared.setRelayHealth(.noInternet) }
-            return
+            return false
         }
         // CP2b: honor relayd's Retry-After. Nudges inside the advertised
         // window (poll tick, push frame, queue change) are dropped; the 60 s
         // poll tick retries once the window has passed. Mirrors
         // RelaySyncEngine.kt's coalesced backoff.
         if Int64(Date().timeIntervalSince1970 * 1_000) < relayRateLimitedUntilMs {
-            return
+            return false
         }
         if relaySyncInFlight {
             relaySyncPending = true
-            return
+            return true
         }
         relaySyncInFlight = true
         backfillRelayReceipts(identity: identity)
@@ -3550,6 +3604,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             await self.relaySyncBlocking(identity: identity, config: config)
             self.meshQueue.async { self.finishRelaySync() }
         }
+        return true
     }
 
     /// `RATE-01`'s second clause: a nudge that arrived while the pass was in
@@ -3567,6 +3622,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// on a timer set elsewhere still being alive.
     private func finishRelaySync() {
         relaySyncInFlight = false
+        finishAllRemoteRelayWakes(completed: true)
         let pending = relaySyncPending
         relaySyncPending = false
         let backoffRemainingMs = relayRateLimitedUntilMs

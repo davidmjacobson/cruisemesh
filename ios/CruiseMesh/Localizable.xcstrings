@@ -4357,6 +4357,16 @@
         }
       }
     },
+    "Added you to %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Added you to %@"
+          }
+        }
+      }
+    },
     "Backup contents": {
       "localizations": {
         "en": {
@@ -4377,6 +4387,26 @@
         }
       }
     },
+    "Couldn't prepare the diagnostics ZIP. Nothing was shared; try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't prepare the diagnostics ZIP. Nothing was shared; try again."
+          }
+        }
+      }
+    },
+    "Delete %@?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delete %@?"
+          }
+        }
+      }
+    },
     "Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.": {
       "localizations": {
         "en": {
@@ -4387,12 +4417,62 @@
         }
       }
     },
+    "Inject incoming message": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Inject incoming message"
+          }
+        }
+      }
+    },
+    "Mark as read": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mark as read"
+          }
+        }
+      }
+    },
+    "New messages": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "New messages"
+          }
+        }
+      }
+    },
     "Restore preview": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Restore preview"
+          }
+        }
+      }
+    },
+    "This deletes the group and its chat history from this phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This deletes the group and its chat history from this phone."
+          }
+        }
+      }
+    },
+    "This removes the contact and deletes your chat history.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This removes the contact and deletes your chat history."
           }
         }
       }
