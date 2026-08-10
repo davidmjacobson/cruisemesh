@@ -2641,6 +2641,16 @@
         }
       }
     },
+    "On a few legacy passes a day, compares what the core engine would have done and records only where they differ. Sends and receives nothing extra.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "On a few legacy passes a day, compares what the core engine would have done and records only where they differ. Sends and receives nothing extra."
+          }
+        }
+      }
+    },
     "On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.": {
       "localizations": {
         "en": {
@@ -3147,6 +3157,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Restore ready"
+          }
+        }
+      }
+    },
+    "Runs the next relay pass on the rebuilt core engine. Legacy stays the default; this is for canary testing only.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Runs the next relay pass on the rebuilt core engine. Legacy stays the default; this is for canary testing only."
           }
         }
       }

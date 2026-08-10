@@ -9,6 +9,8 @@ struct InternalToolsView: View {
 
     @State private var relayUrl = ""
     @State private var relayToken = ""
+    @State private var useCoreRelayEngine = false
+    @State private var relayShadowOn = true
     @State private var lanAddress = ""
     @State private var lanError: String?
     @State private var showLanQR = false
@@ -31,6 +33,8 @@ struct InternalToolsView: View {
                 relayUrl = config.relayUrl
                 relayToken = config.relayToken
             }
+            useCoreRelayEngine = RelayEngineSettings.passEngine() == .core
+            relayShadowOn = RelayEngineSettings.shadowEnabled()
         }
         .task(id: relayUrl + "\u{0}" + relayToken) {
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -85,6 +89,29 @@ struct InternalToolsView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            // C2: the whole-pass rollback switch, read once when a pass starts.
+            // Off by default; the legacy engine is unchanged until this is
+            // turned on. Mirrors Android's "Rebuilt internet sync" toggle.
+            Toggle("Rebuilt internet sync", isOn: Binding(
+                get: { useCoreRelayEngine },
+                set: {
+                    useCoreRelayEngine = $0
+                    RelayEngineSettings.setPassEngine($0 ? .core : .legacy)
+                }
+            ))
+            Text("Runs the next relay pass on the rebuilt core engine. Legacy stays the default; this is for canary testing only.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("Relay migration canary", isOn: Binding(
+                get: { relayShadowOn },
+                set: {
+                    relayShadowOn = $0
+                    RelayEngineSettings.setShadowEnabled($0)
+                }
+            ))
+            Text("On a few legacy passes a day, compares what the core engine would have done and records only where they differ. Sends and receives nothing extra.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
