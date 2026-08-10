@@ -93,27 +93,25 @@ struct OnboardingView: View {
                             .frame(width: index == page ? 22 : 8, height: 8)
                     }
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Page \(page + 1) of \(Self.pageCount)")
 
-                HStack {
-                    if page > 0 {
-                        Button("Back") {
-                            withAnimation { page -= 1 }
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        backButton
+                        restoreButton
+                        Spacer()
+                        primaryButton
+                    }
+                    VStack(spacing: 10) {
+                        primaryButton
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                        HStack {
+                            backButton
+                            Spacer()
+                            restoreButton
                         }
                     }
-                    Button("Restore from backup") {
-                        showRestore = true
-                    }
-                    .buttonStyle(.borderless)
-                    Spacer()
-                    Button(page == lastPage ? "Start using CruiseMesh" : "Next") {
-                        if page == lastPage {
-                            complete()
-                        } else {
-                            withAnimation { page += 1 }
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(page == lastPage && trimmedName.isEmpty)
                 }
             }
             .padding(20)
@@ -139,6 +137,33 @@ struct OnboardingView: View {
         .accessibilityIdentifier("screen.onboarding")
     }
 
+    @ViewBuilder private var backButton: some View {
+        if page > 0 {
+            Button("Back") {
+                withAnimation { page -= 1 }
+            }
+        }
+    }
+
+    private var restoreButton: some View {
+        Button("Restore from backup") {
+            showRestore = true
+        }
+        .buttonStyle(.borderless)
+    }
+
+    private var primaryButton: some View {
+        Button(page == lastPage ? "Start using CruiseMesh" : "Next") {
+            if page == lastPage {
+                complete()
+            } else {
+                withAnimation { page += 1 }
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .disabled(page == lastPage && trimmedName.isEmpty)
+    }
+
     private func complete() {
         // Mirrors the button's own guard: the last slide cannot be completed
         // without a name, so there is no fallback to fall back to.
@@ -162,24 +187,27 @@ private struct OnboardingSlide: View {
     let supportText: String?
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: systemImage)
-                .font(.system(size: 58, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-            Text(title)
-                .font(.largeTitle.weight(.bold))
-                .multilineTextAlignment(.center)
-            Text(bodyText)
-                .font(.title3)
-                .multilineTextAlignment(.center)
-            if let supportText {
-                Text(supportText)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 58, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text(title)
+                    .font(.largeTitle.weight(.bold))
                     .multilineTextAlignment(.center)
+                Text(bodyText)
+                    .font(.title3)
+                    .multilineTextAlignment(.center)
+                if let supportText {
+                    Text(supportText)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
             }
+            .frame(maxWidth: .infinity)
+            .padding(28)
         }
-        .padding(28)
     }
 }
 
@@ -255,30 +283,33 @@ private struct PermissionsSlide: View {
     }
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(systemName: action == .allSet ? "checkmark.circle.fill" : "checkmark.shield")
-                .font(.system(size: 58, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-            Text("Give CruiseMesh more ways to connect")
-                .font(.largeTitle.weight(.bold))
-                .multilineTextAlignment(.center)
-            Text("Each of these opens up another path for your messages.")
-                .font(.title3)
-                .multilineTextAlignment(.center)
-            callToAction
-            footnote
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            // Radios are the subject of this slide, and airplane mode is the
-            // one radio setting that decides whether the trip ends with a
-            // roaming bill. Same supporting style as the footnote above it.
-            Text("On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: action == .allSet ? "checkmark.circle.fill" : "checkmark.shield")
+                    .font(.system(size: 58, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("Give CruiseMesh more ways to connect")
+                    .font(.largeTitle.weight(.bold))
+                    .multilineTextAlignment(.center)
+                Text("Each of these opens up another path for your messages.")
+                    .font(.title3)
+                    .multilineTextAlignment(.center)
+                callToAction
+                footnote
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                // Radios are the subject of this slide, and airplane mode is the
+                // one radio setting that decides whether the trip ends with a
+                // roaming bill. Same supporting style as the footnote above it.
+                Text("On board, turn on airplane mode, then turn Wi-Fi and Bluetooth back on. CruiseMesh works fully without cellular, and airplane mode prevents roaming charges.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(28)
         }
-        .padding(28)
         .onAppear(perform: refreshPermissions)
         .onChange(of: scenePhase) { phase in
             // The permission alerts, and a trip to Settings, both take the
@@ -363,36 +394,39 @@ private struct ProfileSetupSlide: View {
     }
 
     var body: some View {
-        VStack(spacing: 18) {
-            Text("What name would you like to go by?")
-                .font(.largeTitle.weight(.bold))
-                .multilineTextAlignment(.center)
-            Text("This is what people see when you share your friend card or add each other nearby. You can change it anytime.")
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-            // With no name yet the avatar draws a neutral person glyph. Its own
-            // accessibility label would fall back to the formatted user id, so
-            // override it here: nowhere in onboarding should a person be read
-            // their own identifier.
-            AvatarView(
-                userId: identity.userId,
-                name: displayName,
-                size: 92,
-                photo: avatarImage
-            )
-            .accessibilityLabel("Your profile picture")
-            TextField("Your name", text: $displayName)
-                .textFieldStyle(.roundedBorder)
-            if isNameEmpty {
-                Text("Enter a name to continue.")
-                    .font(.caption)
+        ScrollView {
+            VStack(spacing: 18) {
+                Text("What name would you like to go by?")
+                    .font(.largeTitle.weight(.bold))
+                    .multilineTextAlignment(.center)
+                Text("This is what people see when you share your friend card or add each other nearby. You can change it anytime.")
+                    .font(.body)
                     .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                // With no name yet the avatar draws a neutral person glyph. Its own
+                // accessibility label would fall back to the formatted user id, so
+                // override it here: nowhere in onboarding should a person be read
+                // their own identifier.
+                AvatarView(
+                    userId: identity.userId,
+                    name: displayName,
+                    size: 92,
+                    photo: avatarImage
+                )
+                .accessibilityLabel("Your profile picture")
+                TextField("Your name", text: $displayName)
+                    .textFieldStyle(.roundedBorder)
+                if isNameEmpty {
+                    Text("Enter a name to continue.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                PhotosPicker(selection: $photoItem, matching: .images) {
+                    Label("Choose profile photo", systemImage: "photo")
+                }
             }
-            PhotosPicker(selection: $photoItem, matching: .images) {
-                Label("Choose profile photo", systemImage: "photo")
-            }
+            .frame(maxWidth: .infinity)
+            .padding(28)
         }
-        .padding(28)
     }
 }

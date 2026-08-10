@@ -21,17 +21,20 @@ object ChatListLogic {
         val color = Color.hsv(hue * 360f, 0.5f, 0.7f)
 
         val initials = if (name.isNotBlank() && name != "Unknown") {
-            name.take(2).uppercase()
+            name.trim().take(2).uppercase()
         } else {
-            // displayId is like CM-K7QX...
-            val cleaned = displayId.removePrefix("CM-")
-            cleaned.take(2).uppercase()
+            // A neutral person glyph is more legible than two arbitrary
+            // identifier characters and matches the iOS shell.
+            ""
         }
         return color to initials
     }
 
     fun avatarTextColor(background: Color): Color =
-        if (background.luminance() > 0.58f) Color.Black else Color.White
+        // This is the luminance crossover where black and white provide the
+        // same contrast. Choosing either side guarantees at least 4.5:1 for
+        // every generated avatar hue.
+        if (background.luminance() > 0.179f) Color.Black else Color.White
 
     fun avatarContentDescription(name: String, displayId: String): String =
         "Avatar for ${displayNameOrId(name, displayId)}"

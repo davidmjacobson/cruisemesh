@@ -11,6 +11,9 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -87,6 +90,13 @@ fun AvatarBadge(
                     )
                 } else if (isGroup) {
                     GroupAvatarGlyph(size = size, color = contentColor)
+                } else if (initials.isEmpty()) {
+                    Icon(
+                        imageVector = Icons.Default.Person,
+                        contentDescription = null,
+                        tint = contentColor,
+                        modifier = Modifier.size(size * 0.42f),
+                    )
                 } else {
                     Text(
                         text = initials,

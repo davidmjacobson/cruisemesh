@@ -27,6 +27,7 @@ final class CruiseMeshUITests: XCTestCase {
         }
         app?.terminate()
         app = nil
+        XCUIDevice.shared.orientation = .portrait
         super.tearDown()
     }
 
@@ -70,6 +71,38 @@ final class CruiseMeshUITests: XCTestCase {
         start.tap()
 
         assertUsableHome()
+    }
+
+    func testOnboardingPrimaryActionsStayVisibleInCompactLandscape() {
+        launch(scenario: "onboarding")
+        XCTAssertTrue(element("screen.onboarding").waitForExistence(timeout: 10))
+
+        XCUIDevice.shared.orientation = .landscapeLeft
+        for _ in 0..<4 {
+            let next = app.buttons["Next"]
+            XCTAssertTrue(next.waitForExistence(timeout: 3))
+            XCTAssertTrue(next.isHittable, "Next must remain visible outside the scrolling page content")
+            next.tap()
+        }
+
+        let start = app.buttons["Start using CruiseMesh"]
+        XCTAssertTrue(start.waitForExistence(timeout: 3))
+        XCTAssertTrue(start.isHittable, "The final primary action must remain visible in landscape")
+        XCTAssertTrue(app.buttons["Restore from backup"].isHittable)
+    }
+
+    func testNewGroupMemberSelectionAnnouncesItsState() {
+        launch(scenario: "chat")
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
+
+        app.buttons["New chat"].tap()
+        app.buttons["New group"].tap()
+
+        let bob = app.buttons["Bob"].firstMatch
+        XCTAssertTrue(bob.waitForExistence(timeout: 5))
+        XCTAssertEqual(bob.value as? String, "Not selected")
+        bob.tap()
+        XCTAssertEqual(bob.value as? String, "Selected")
     }
 
     func testHomeOpensAndDismissesFriendsAndSettings() {

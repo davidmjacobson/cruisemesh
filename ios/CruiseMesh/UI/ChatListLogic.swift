@@ -1,6 +1,12 @@
 import SwiftUI
 import UIKit
 
+struct AvatarPalette {
+    let background: Color
+    let foreground: Color
+    let contrastRatio: Double
+}
+
 enum ChatListLogic {
     static func contactDisplayName(_ contact: Contact) -> String {
         displayNameOrId(
@@ -26,9 +32,7 @@ enum ChatListLogic {
     /// `displayId` is kept in the signature for the call sites that still pass
     /// it; nothing derived from an identifier is shown to a person any more.
     static func avatarHueAndInitials(userId: Data, name: String, displayId: String) -> (Color, String) {
-        let sum = userId.reduce(0) { $0 + Int($1) }
-        let hue = Double(sum & 0xFF) / 255.0
-        let color = Color(hue: hue, saturation: 0.5, brightness: 0.7)
+        let color = avatarPalette(userId: userId).background
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let initials: String
         if !trimmed.isEmpty && trimmed != "Unknown" {
@@ -37,6 +41,38 @@ enum ChatListLogic {
             initials = ""
         }
         return (color, initials)
+    }
+
+    /// A deterministic avatar palette whose foreground meets WCAG AA text
+    /// contrast for every possible generated hue.
+    static func avatarPalette(userId: Data) -> AvatarPalette {
+        let sum = userId.reduce(0) { $0 + Int($1) }
+        let hue = CGFloat(sum & 0xFF) / 255.0
+        let uiBackground = UIColor(hue: hue, saturation: 0.5, brightness: 0.7, alpha: 1)
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        precondition(uiBackground.getRed(&red, green: &green, blue: &blue, alpha: &alpha))
+
+        func linearized(_ component: CGFloat) -> Double {
+            let value = Double(component)
+            return value <= 0.04045
+                ? value / 12.92
+                : pow((value + 0.055) / 1.055, 2.4)
+        }
+
+        let luminance = 0.2126 * linearized(red)
+            + 0.7152 * linearized(green)
+            + 0.0722 * linearized(blue)
+        let blackContrast = (luminance + 0.05) / 0.05
+        let whiteContrast = 1.05 / (luminance + 0.05)
+        let useBlack = blackContrast >= whiteContrast
+        return AvatarPalette(
+            background: Color(uiBackground),
+            foreground: useBlack ? .black : .white,
+            contrastRatio: useBlack ? blackContrast : whiteContrast
+        )
     }
 
     static func formatRelativeTime(timestampMs: Int64, nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> String {

@@ -15,6 +15,7 @@ struct AvatarView: View {
             name: name,
             displayId: displayId
         )
+        let foreground = ChatListLogic.avatarPalette(userId: userId).foreground
         ZStack(alignment: .bottomTrailing) {
             SwiftUI.Group {
                 if let photo, !isGroup {
@@ -24,7 +25,7 @@ struct AvatarView: View {
                 } else if isGroup {
                     Image(systemName: "person.2.fill")
                         .font(.system(size: size * 0.42, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(foreground)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Circle().fill(color))
                 } else if initials.isEmpty {
@@ -32,13 +33,13 @@ struct AvatarView: View {
                     // of a user id. Mirrors the group case just above.
                     Image(systemName: "person.fill")
                         .font(.system(size: size * 0.42, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(foreground)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Circle().fill(color))
                 } else {
                     Text(initials)
                         .font(.system(size: size * 0.35, weight: .semibold))
-                        .foregroundStyle(.white)
+                        .foregroundStyle(foreground)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Circle().fill(color))
                 }
