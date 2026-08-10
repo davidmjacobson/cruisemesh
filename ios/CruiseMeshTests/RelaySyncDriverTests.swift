@@ -421,7 +421,7 @@ final class RelaySyncDriverTests: XCTestCase {
             return RelaySyncDriver(
                 store: store,
                 executor: executor,
-                clock: { now },
+                clock: { self.now },
                 isCancelled: { self.cancelled }
             ).run(plan: plan, passId: "t")
         }
