@@ -90,6 +90,14 @@ impl SimNode {
         for payload in outcome.delivered_payloads {
             self.inbox.push(payload);
         }
+        // DTN D4: the sim's in-memory delivery cannot fail, so a delivered
+        // payload always commits — recording `seen` and any hidden evidence the
+        // core deferred until after delivery. A real caller skips this on a
+        // durable-delivery failure and reports Failed instead.
+        if let Some(commit) = outcome.commit {
+            self.store
+                .core_commit_inbound_delivery(self.seen.clone(), commit);
+        }
         outcome.relay_frame
     }
 
@@ -118,6 +126,13 @@ impl SimNode {
             .expect("process inbound relay frame");
         for payload in outcome.delivered_payloads {
             self.inbox.push(payload);
+        }
+        // DTN D4: commit the deferred `seen`/hidden-evidence bookkeeping now the
+        // (infallible, in-memory) delivery has landed, so the disposition
+        // returned for the relay ack decision reflects a durably-consumed copy.
+        if let Some(commit) = outcome.commit {
+            self.store
+                .core_commit_inbound_delivery(self.seen.clone(), commit);
         }
         outcome.disposition
     }

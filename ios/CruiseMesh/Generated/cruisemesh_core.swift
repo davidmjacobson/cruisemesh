@@ -3551,17 +3551,6 @@ public protocol MessageStoreProtocol : AnyObject {
     func carriedMsgIds(limit: UInt64) throws  -> [Data]
     
     /**
-     * Enqueue a foreign/group envelope into the carry queue for later delivery.
-     *
-     * The stored `hop_ttl` is one less than the header's: carrying is itself a
-     * hop, so a mule delivery must count it exactly as the flood path counts
-     * its own re-relays. A relay-sourced row is stored `from_relay` so it is
-     * never re-uploaded (it is already on the relay); a mesh-sourced row is
-     * force-family here (the group/fan-out path) or classified by the store.
-     */
-    func carry(source: CoreInboundSource, msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data, nowMs: Int64) throws  -> Bool
-    
-    /**
      * A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
      * distinct sender who has ever posted in this chat, each with their
      * [`MessageStore::highest_contiguous_lamport`]. Ordered by
@@ -3734,6 +3723,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * friend card carried.
      */
     func contactRelayEpoch(userId: Data) throws  -> Int64
+    
+    /**
+     * Commit the DTN D4 bookkeeping for a payload the caller has now durably
+     * delivered: record the ACK-01 consumed-hidden evidence (best-effort — the
+     * store re-checks every safety condition and declines otherwise) and mark
+     * the msg_id seen so the next copy dedupes. MUST be called only after the
+     * native delivery of [`CoreInboundOutcome::delivered_payloads`] succeeded;
+     * on a delivery failure the caller leaves this uncalled, so the msg_id
+     * stays re-presentable and the disposition it reports is
+     * [`CoreInboundDisposition::Failed`] (see the module docs). Takes only the
+     * bounded [`CoreInboundCommit`] the outcome handed back — no ambient state.
+     */
+    func coreCommitInboundDelivery(seen: SeenIds, commit: CoreInboundCommit) 
     
     /**
      * Confirm-before-delete muling (DTN_TODOS.md §3.2, D2
@@ -4875,7 +4877,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * with the non-mutating [`SeenIds::contains`] and recorded only once the
      * envelope reaches a terminal handled state (DTN D4): an envelope whose
      * durable carry failed stays re-presentable, one that was handled — even
-     * by deliberate drop — is deduped.
+     * by deliberate drop — is deduped. The one exception is a payload handed
+     * back to *deliver*: its `seen` record is deferred to the caller's
+     * post-delivery [`Self::core_commit_inbound_delivery`], because only the
+     * caller knows whether its durable delivery landed (see the module docs).
      */
     func processInboundFrame(identity: Identity, seen: SeenIds, source: CoreInboundSource, frame: Data, nowMs: Int64) throws  -> CoreInboundOutcome
     
@@ -5852,29 +5857,6 @@ open func carriedMsgIds(limit: UInt64)throws  -> [Data] {
 }
     
     /**
-     * Enqueue a foreign/group envelope into the carry queue for later delivery.
-     *
-     * The stored `hop_ttl` is one less than the header's: carrying is itself a
-     * hop, so a mule delivery must count it exactly as the flood path counts
-     * its own re-relays. A relay-sourced row is stored `from_relay` so it is
-     * never re-uploaded (it is already on the relay); a mesh-sourced row is
-     * force-family here (the group/fan-out path) or classified by the store.
-     */
-open func carry(source: CoreInboundSource, msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data, nowMs: Int64)throws  -> Bool {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
-    uniffi_cruisemesh_core_fn_method_messagestore_carry(self.uniffiClonePointer(),
-        FfiConverterTypeCoreInboundSource.lower(source),
-        FfiConverterData.lower(msgId),
-        FfiConverterUInt8.lower(hopTtl),
-        FfiConverterInt64.lower(expiry),
-        FfiConverterData.lower(recipientHint),
-        FfiConverterData.lower(sealed),
-        FfiConverterInt64.lower(nowMs),$0
-    )
-})
-}
-    
-    /**
      * A sync digest for `chat_id` (DESIGN.md §7.3): one [`DigestEntry`] per
      * distinct sender who has ever posted in this chat, each with their
      * [`MessageStore::highest_contiguous_lamport`]. Ordered by
@@ -6152,6 +6134,25 @@ open func contactRelayEpoch(userId: Data)throws  -> Int64 {
         FfiConverterData.lower(userId),$0
     )
 })
+}
+    
+    /**
+     * Commit the DTN D4 bookkeeping for a payload the caller has now durably
+     * delivered: record the ACK-01 consumed-hidden evidence (best-effort — the
+     * store re-checks every safety condition and declines otherwise) and mark
+     * the msg_id seen so the next copy dedupes. MUST be called only after the
+     * native delivery of [`CoreInboundOutcome::delivered_payloads`] succeeded;
+     * on a delivery failure the caller leaves this uncalled, so the msg_id
+     * stays re-presentable and the disposition it reports is
+     * [`CoreInboundDisposition::Failed`] (see the module docs). Takes only the
+     * bounded [`CoreInboundCommit`] the outcome handed back — no ambient state.
+     */
+open func coreCommitInboundDelivery(seen: SeenIds, commit: CoreInboundCommit) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_commit_inbound_delivery(self.uniffiClonePointer(),
+        FfiConverterTypeSeenIds.lower(seen),
+        FfiConverterTypeCoreInboundCommit.lower(commit),$0
+    )
+}
 }
     
     /**
@@ -7816,7 +7817,10 @@ open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skip
      * with the non-mutating [`SeenIds::contains`] and recorded only once the
      * envelope reaches a terminal handled state (DTN D4): an envelope whose
      * durable carry failed stays re-presentable, one that was handled — even
-     * by deliberate drop — is deduped.
+     * by deliberate drop — is deduped. The one exception is a payload handed
+     * back to *deliver*: its `seen` record is deferred to the caller's
+     * post-delivery [`Self::core_commit_inbound_delivery`], because only the
+     * caller knows whether its durable delivery landed (see the module docs).
      */
 open func processInboundFrame(identity: Identity, seen: SeenIds, source: CoreInboundSource, frame: Data, nowMs: Int64)throws  -> CoreInboundOutcome {
     return try  FfiConverterTypeCoreInboundOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11942,6 +11946,149 @@ public func FfiConverterTypeCoreIdentifiedRoute_lower(_ value: CoreIdentifiedRou
 
 
 /**
+ * The DTN D4 bookkeeping a caller must commit *after* it has durably applied
+ * the delivered payload this outcome hands back — the flood-dedupe `seen`
+ * record and the ACK-01 consumed-hidden evidence, folded across the FFI
+ * boundary so neither is written until the native delivery succeeds.
+ *
+ * It is present in [`CoreInboundOutcome::commit`] exactly when a payload was
+ * handed back to deliver (a 1:1 message we opened, or a group message for a
+ * member). The caller runs the production `deliver → commit` order:
+ * deliver the payload durably, then call
+ * [`MessageStore::core_commit_inbound_delivery`] with this token; if that
+ * delivery instead fails, drop this token unused and report
+ * [`CoreInboundDisposition::Failed`] — the `msg_id` then stays unrecorded and
+ * re-presentable, and the relay copy is never acked (T4-06 / DTN D4). This is
+ * why the delivered path never records `seen` itself: only the caller knows
+ * whether the durable delivery it owns actually landed.
+ */
+public struct CoreInboundCommit {
+    /**
+     * The envelope id to mark seen once delivery succeeds.
+     */
+    public var msgId: Data
+    /**
+     * The opened body's kind, when it decoded, so the commit can record the
+     * ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
+     * deliveries (recording hidden evidence is a pairwise-only licence) and
+     * for bodies that do not decode.
+     */
+    public var hiddenKind: UInt8?
+    /**
+     * The envelope fields [`MessageStore::core_record_consumed_hidden_msg_id`]
+     * re-checks before it will write evidence. Carried verbatim so the commit
+     * stays a single call with no ambient state.
+     */
+    public var recipientHint: Data
+    public var expiry: Int64
+    public var ownUserId: Data
+    public var nowMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The envelope id to mark seen once delivery succeeds.
+         */msgId: Data, 
+        /**
+         * The opened body's kind, when it decoded, so the commit can record the
+         * ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
+         * deliveries (recording hidden evidence is a pairwise-only licence) and
+         * for bodies that do not decode.
+         */hiddenKind: UInt8?, 
+        /**
+         * The envelope fields [`MessageStore::core_record_consumed_hidden_msg_id`]
+         * re-checks before it will write evidence. Carried verbatim so the commit
+         * stays a single call with no ambient state.
+         */recipientHint: Data, expiry: Int64, ownUserId: Data, nowMs: Int64) {
+        self.msgId = msgId
+        self.hiddenKind = hiddenKind
+        self.recipientHint = recipientHint
+        self.expiry = expiry
+        self.ownUserId = ownUserId
+        self.nowMs = nowMs
+    }
+}
+
+
+
+extension CoreInboundCommit: Equatable, Hashable {
+    public static func ==(lhs: CoreInboundCommit, rhs: CoreInboundCommit) -> Bool {
+        if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.hiddenKind != rhs.hiddenKind {
+            return false
+        }
+        if lhs.recipientHint != rhs.recipientHint {
+            return false
+        }
+        if lhs.expiry != rhs.expiry {
+            return false
+        }
+        if lhs.ownUserId != rhs.ownUserId {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(msgId)
+        hasher.combine(hiddenKind)
+        hasher.combine(recipientHint)
+        hasher.combine(expiry)
+        hasher.combine(ownUserId)
+        hasher.combine(nowMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundCommit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundCommit {
+        return
+            try CoreInboundCommit(
+                msgId: FfiConverterData.read(from: &buf), 
+                hiddenKind: FfiConverterOptionUInt8.read(from: &buf), 
+                recipientHint: FfiConverterData.read(from: &buf), 
+                expiry: FfiConverterInt64.read(from: &buf), 
+                ownUserId: FfiConverterData.read(from: &buf), 
+                nowMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreInboundCommit, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterOptionUInt8.write(value.hiddenKind, into: &buf)
+        FfiConverterData.write(value.recipientHint, into: &buf)
+        FfiConverterInt64.write(value.expiry, into: &buf)
+        FfiConverterData.write(value.ownUserId, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundCommit_lift(_ buf: RustBuffer) throws -> CoreInboundCommit {
+    return try FfiConverterTypeCoreInboundCommit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundCommit_lower(_ value: CoreInboundCommit) -> RustBuffer {
+    return FfiConverterTypeCoreInboundCommit.lower(value)
+}
+
+
+/**
  * The result of running one inbound envelope through [`MessageStore::process_inbound_frame`].
  *
  * Every list here is bounded: at most one delivered payload (a frame is
@@ -11980,6 +12127,14 @@ public struct CoreInboundOutcome {
      * blocked — consumed for ack purposes, never delivered.
      */
     public var droppedBlocked: Bool
+    /**
+     * Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
+     * D4 bookkeeping the caller commits after it durably delivers the payload.
+     * See [`CoreInboundCommit`]. `None` for every path that has no native
+     * delivery to wait on (the store mutations of those paths — carry, hidden
+     * evidence for a self-consumed drop — are already committed before return).
+     */
+    public var commit: CoreInboundCommit?
     public var work: CoreInboundWork
 
     // Default memberwise initializers are never public by default, so we
@@ -12009,13 +12164,21 @@ public struct CoreInboundOutcome {
         /**
          * Whether an opened pairwise envelope was dropped because its sender is
          * blocked — consumed for ack purposes, never delivered.
-         */droppedBlocked: Bool, work: CoreInboundWork) {
+         */droppedBlocked: Bool, 
+        /**
+         * Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
+         * D4 bookkeeping the caller commits after it durably delivers the payload.
+         * See [`CoreInboundCommit`]. `None` for every path that has no native
+         * delivery to wait on (the store mutations of those paths — carry, hidden
+         * evidence for a self-consumed drop — are already committed before return).
+         */commit: CoreInboundCommit?, work: CoreInboundWork) {
         self.disposition = disposition
         self.deliveredPayloads = deliveredPayloads
         self.deliveredSender = deliveredSender
         self.relayFrame = relayFrame
         self.carried = carried
         self.droppedBlocked = droppedBlocked
+        self.commit = commit
         self.work = work
     }
 }
@@ -12042,6 +12205,9 @@ extension CoreInboundOutcome: Equatable, Hashable {
         if lhs.droppedBlocked != rhs.droppedBlocked {
             return false
         }
+        if lhs.commit != rhs.commit {
+            return false
+        }
         if lhs.work != rhs.work {
             return false
         }
@@ -12055,6 +12221,7 @@ extension CoreInboundOutcome: Equatable, Hashable {
         hasher.combine(relayFrame)
         hasher.combine(carried)
         hasher.combine(droppedBlocked)
+        hasher.combine(commit)
         hasher.combine(work)
     }
 }
@@ -12073,6 +12240,7 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
                 relayFrame: FfiConverterOptionData.read(from: &buf), 
                 carried: FfiConverterBool.read(from: &buf), 
                 droppedBlocked: FfiConverterBool.read(from: &buf), 
+                commit: FfiConverterOptionTypeCoreInboundCommit.read(from: &buf), 
                 work: FfiConverterTypeCoreInboundWork.read(from: &buf)
         )
     }
@@ -12084,6 +12252,7 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
         FfiConverterOptionData.write(value.relayFrame, into: &buf)
         FfiConverterBool.write(value.carried, into: &buf)
         FfiConverterBool.write(value.droppedBlocked, into: &buf)
+        FfiConverterOptionTypeCoreInboundCommit.write(value.commit, into: &buf)
         FfiConverterTypeCoreInboundWork.write(value.work, into: &buf)
     }
 }
@@ -26716,6 +26885,30 @@ fileprivate struct FfiConverterOptionTypeCoreFailoverResumeArm: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreInboundCommit: FfiConverterRustBuffer {
+    typealias SwiftType = CoreInboundCommit?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreInboundCommit.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreInboundCommit.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreLanEndpoint: FfiConverterRustBuffer {
     typealias SwiftType = CoreLanEndpoint?
 
@@ -33306,9 +33499,6 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_msg_ids() != 34000) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carry() != 23309) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_chat_digest() != 38268) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -33367,6 +33557,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_relay_epoch() != 12666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_commit_inbound_delivery() != 60150) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 7270) {
@@ -33594,7 +33787,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 13280) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 65348) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 43681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {

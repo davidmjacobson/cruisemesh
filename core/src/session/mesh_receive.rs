@@ -21,9 +21,25 @@
 //! today in place of the third copy it used to keep. It performs no I/O: the
 //! caller executes the returned re-flood frame and applies the delivered
 //! payload (its chat insert, receipts, notifications — the kind-specific
-//! delivery that stays native presentation, D1). Because store mutations are
-//! committed before return and a failed native send only follows, a lost send
-//! can never ack a relay row, delete a carried row, or advance a frontier.
+//! delivery that stays native presentation, D1). The carry, hidden-kind ack
+//! evidence for a self-consumed *drop*, and receipt rows written here are
+//! committed through the store's short transactions before return, so a lost
+//! re-flood send afterward can never ack a relay row, delete a carried row, or
+//! advance a frontier.
+//!
+//! The one thing deliberately *not* committed before return is the DTN D4
+//! bookkeeping for a payload handed back to deliver: the flood-dedupe `seen`
+//! record and the ACK-01 consumed-hidden evidence for a *delivered* pairwise
+//! message. Because the durable delivery of that payload is the native
+//! caller's (D1's) job and can fail, recording `seen` here would poison the
+//! dedupe set on a failed persist (the msg_id would dedupe away forever) and
+//! returning an ackable `Consumed` would delete the relay copy that the retry
+//! needs. Instead the delivered path returns a [`CoreInboundCommit`] the caller
+//! applies only once its delivery succeeds (via
+//! [`MessageStore::core_commit_inbound_delivery`]); on a delivery failure the
+//! caller drops the token, leaves the msg_id unrecorded, and reports
+//! [`CoreInboundDisposition::Failed`] — exactly the production
+//! `deliver → record-seen` order (T4-06).
 //!
 //! **Preserved invariants**, each with an owner in `core/tests/mesh_sim.rs` or
 //! this module's tests:
@@ -89,6 +105,39 @@ pub struct CoreInboundWork {
     pub rejected: u32,
 }
 
+/// The DTN D4 bookkeeping a caller must commit *after* it has durably applied
+/// the delivered payload this outcome hands back — the flood-dedupe `seen`
+/// record and the ACK-01 consumed-hidden evidence, folded across the FFI
+/// boundary so neither is written until the native delivery succeeds.
+///
+/// It is present in [`CoreInboundOutcome::commit`] exactly when a payload was
+/// handed back to deliver (a 1:1 message we opened, or a group message for a
+/// member). The caller runs the production `deliver → commit` order:
+/// deliver the payload durably, then call
+/// [`MessageStore::core_commit_inbound_delivery`] with this token; if that
+/// delivery instead fails, drop this token unused and report
+/// [`CoreInboundDisposition::Failed`] — the `msg_id` then stays unrecorded and
+/// re-presentable, and the relay copy is never acked (T4-06 / DTN D4). This is
+/// why the delivered path never records `seen` itself: only the caller knows
+/// whether the durable delivery it owns actually landed.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CoreInboundCommit {
+    /// The envelope id to mark seen once delivery succeeds.
+    pub msg_id: Vec<u8>,
+    /// The opened body's kind, when it decoded, so the commit can record the
+    /// ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
+    /// deliveries (recording hidden evidence is a pairwise-only licence) and
+    /// for bodies that do not decode.
+    pub hidden_kind: Option<u8>,
+    /// The envelope fields [`MessageStore::core_record_consumed_hidden_msg_id`]
+    /// re-checks before it will write evidence. Carried verbatim so the commit
+    /// stays a single call with no ambient state.
+    pub recipient_hint: Vec<u8>,
+    pub expiry: i64,
+    pub own_user_id: Vec<u8>,
+    pub now_ms: i64,
+}
+
 /// The result of running one inbound envelope through [`MessageStore::process_inbound_frame`].
 ///
 /// Every list here is bounded: at most one delivered payload (a frame is
@@ -115,6 +164,12 @@ pub struct CoreInboundOutcome {
     /// Whether an opened pairwise envelope was dropped because its sender is
     /// blocked — consumed for ack purposes, never delivered.
     pub dropped_blocked: bool,
+    /// Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
+    /// D4 bookkeeping the caller commits after it durably delivers the payload.
+    /// See [`CoreInboundCommit`]. `None` for every path that has no native
+    /// delivery to wait on (the store mutations of those paths — carry, hidden
+    /// evidence for a self-consumed drop — are already committed before return).
+    pub commit: Option<CoreInboundCommit>,
     pub work: CoreInboundWork,
 }
 
@@ -127,6 +182,7 @@ impl CoreInboundOutcome {
             relay_frame: None,
             carried: false,
             dropped_blocked: false,
+            commit: None,
             work,
         }
     }
@@ -142,7 +198,10 @@ impl MessageStore {
     /// with the non-mutating [`SeenIds::contains`] and recorded only once the
     /// envelope reaches a terminal handled state (DTN D4): an envelope whose
     /// durable carry failed stays re-presentable, one that was handled — even
-    /// by deliberate drop — is deduped.
+    /// by deliberate drop — is deduped. The one exception is a payload handed
+    /// back to *deliver*: its `seen` record is deferred to the caller's
+    /// post-delivery [`Self::core_commit_inbound_delivery`], because only the
+    /// caller knows whether its durable delivery landed (see the module docs).
     pub fn process_inbound_frame(
         &self,
         identity: Identity,
@@ -206,51 +265,57 @@ impl MessageStore {
         // recipient (§6.3), so a successful open means this device is the
         // endpoint. Deliver locally and never re-flood — it is home.
         if let Ok(opened) = open_message(identity.clone(), sealed.clone()) {
-            // Terminal: consumed by this endpoint whatever we do with the body.
-            seen.record(msg_id.clone());
-
-            // ACK-01 hidden-kind evidence. Recording is the one licence a later
-            // relay copy of a hidden kind (a receipt, profile sync, …) needs to
-            // ack away; it is valid only from this pairwise-open path, and the
-            // store re-checks every safety condition (kind leaves no message
-            // row, own hint, not a group hint, unexpired) and declines
-            // otherwise. Best-effort: a missing record costs one relay
-            // re-fetch, never a message. Sim/raw payloads that are not content
-            // frames simply do not decode, so nothing is recorded.
-            let mut delivered_sender = None;
-            let mut delivered_payloads = Vec::new();
-            if let Ok(body) = decode_extended_message_body(opened.payload.clone()) {
-                let _ = self.core_record_consumed_hidden_msg_id(
-                    msg_id.clone(),
-                    body.kind,
-                    recipient_hint.clone(),
-                    expiry,
-                    identity.user_id.clone(),
-                    now_ms,
-                );
-            }
-
             // Blocked-sender inbound gate: a blocked identity is dropped before
             // delivery — no chat row, no receipt — but the envelope is still
             // consumed (we are the sole endpoint; a deliberate discard is
             // consumption), so its relay copy acks away instead of refetching
-            // forever.
-            let dropped_blocked = self.is_user_blocked(opened.sender_user_id.clone())?;
-            if dropped_blocked {
+            // forever. A drop has no native delivery to wait on, so it is
+            // terminal here: record `seen` now and carry no commit.
+            if self.is_user_blocked(opened.sender_user_id.clone())? {
+                seen.record(msg_id);
                 work.dropped = 1;
-            } else {
-                delivered_sender = Some(opened.sender_user_id.clone());
-                delivered_payloads.push(opened.payload);
-                work.delivered = 1;
+                return Ok(CoreInboundOutcome {
+                    disposition: CoreInboundDisposition::Consumed,
+                    delivered_payloads: Vec::new(),
+                    delivered_sender: None,
+                    relay_frame: None,
+                    carried: false,
+                    dropped_blocked: true,
+                    commit: None,
+                    work,
+                });
             }
 
+            // A deliverable 1:1 message. Hand the payload back for the caller's
+            // native delivery and defer the DTN D4 bookkeeping to its
+            // post-delivery commit: `seen` (so a failed persist does not poison
+            // the dedupe set) and the ACK-01 hidden-kind evidence (the one
+            // licence a later relay copy of a hidden kind needs to ack away —
+            // valid only from this pairwise-open path, and only once the kind
+            // was actually consumed). The kind is captured for the commit;
+            // sim/raw payloads that are not content frames simply do not decode,
+            // so no evidence is ever recorded for them. `Consumed` is the
+            // disposition the caller reports *iff* its delivery succeeds; on a
+            // failure it drops the commit and reports `Failed` instead.
+            let hidden_kind = decode_extended_message_body(opened.payload.clone())
+                .ok()
+                .map(|body| body.kind);
+            work.delivered = 1;
             return Ok(CoreInboundOutcome {
                 disposition: CoreInboundDisposition::Consumed,
-                delivered_payloads,
-                delivered_sender,
+                delivered_payloads: vec![opened.payload],
+                delivered_sender: Some(opened.sender_user_id),
                 relay_frame: None,
                 carried: false,
-                dropped_blocked,
+                dropped_blocked: false,
+                commit: Some(CoreInboundCommit {
+                    msg_id,
+                    hidden_kind,
+                    recipient_hint,
+                    expiry,
+                    own_user_id: identity.user_id.clone(),
+                    now_ms,
+                }),
                 work,
             });
         }
@@ -269,7 +334,6 @@ impl MessageStore {
             let Ok(opened) = open_group_message(group.clone(), sealed.clone()) else {
                 continue;
             };
-            seen.record(msg_id.clone());
 
             let signer_is_member = group
                 .member_user_ids
@@ -279,17 +343,13 @@ impl MessageStore {
                 .member_user_ids
                 .iter()
                 .any(|member| member == &identity.user_id);
+            let deliver = signer_is_member && we_are_member;
 
-            let mut delivered_payloads = Vec::new();
-            let mut delivered_sender = None;
-            if signer_is_member && we_are_member {
-                delivered_sender = Some(opened.sender_user_id.clone());
-                delivered_payloads.push(opened.payload);
-                work.delivered = 1;
-            } else {
-                work.dropped = 1;
-            }
-
+            // Carry + reflood run whatever the membership verdict — a member's
+            // body is muled on for absent members, a spoofed-signer body is
+            // muled like the foreign traffic it effectively is. These are
+            // core's durable store mutations and commit before return.
+            //
             // A relay-fetched fan-out copy addressed to our own hint is already
             // durable for every member on the relay; re-flooding or carrying it
             // would give the same content a second flood identity under the
@@ -324,13 +384,45 @@ impl MessageStore {
                 (relay_frame, carried)
             };
 
+            if deliver {
+                // A deliverable group message: hand the payload back and defer
+                // the `seen` record to the caller's post-delivery commit, the
+                // same DTN D4 order as the pairwise path (group deliveries
+                // record no hidden evidence — that is a pairwise-only licence).
+                work.delivered = 1;
+                return Ok(CoreInboundOutcome {
+                    disposition: CoreInboundDisposition::Consumed,
+                    delivered_payloads: vec![opened.payload],
+                    delivered_sender: Some(opened.sender_user_id),
+                    relay_frame,
+                    carried,
+                    dropped_blocked: false,
+                    commit: Some(CoreInboundCommit {
+                        msg_id: msg_id.clone(),
+                        hidden_kind: None,
+                        recipient_hint: recipient_hint.clone(),
+                        expiry,
+                        own_user_id: identity.user_id.clone(),
+                        now_ms,
+                    }),
+                    work,
+                });
+            }
+
+            // Spoofed-signer / non-member: no native delivery to wait on. The
+            // envelope is consumed by deliberate drop and muled on, so it is
+            // terminal here — record `seen` now (matching production's
+            // finishAdmission(CONSUMED, terminal=true) for this case).
+            seen.record(msg_id.clone());
+            work.dropped = 1;
             return Ok(CoreInboundOutcome {
                 disposition: CoreInboundDisposition::Consumed,
-                delivered_payloads,
-                delivered_sender,
+                delivered_payloads: Vec::new(),
+                delivered_sender: None,
                 relay_frame,
                 carried,
                 dropped_blocked: false,
+                commit: None,
                 work,
             });
         }
@@ -367,10 +459,43 @@ impl MessageStore {
             relay_frame,
             carried,
             dropped_blocked: false,
+            commit: None,
             work,
         })
     }
 
+    /// Commit the DTN D4 bookkeeping for a payload the caller has now durably
+    /// delivered: record the ACK-01 consumed-hidden evidence (best-effort — the
+    /// store re-checks every safety condition and declines otherwise) and mark
+    /// the msg_id seen so the next copy dedupes. MUST be called only after the
+    /// native delivery of [`CoreInboundOutcome::delivered_payloads`] succeeded;
+    /// on a delivery failure the caller leaves this uncalled, so the msg_id
+    /// stays re-presentable and the disposition it reports is
+    /// [`CoreInboundDisposition::Failed`] (see the module docs). Takes only the
+    /// bounded [`CoreInboundCommit`] the outcome handed back — no ambient state.
+    pub fn core_commit_inbound_delivery(&self, seen: Arc<SeenIds>, commit: CoreInboundCommit) {
+        if let Some(kind) = commit.hidden_kind {
+            // Best-effort, exactly as the pairwise path recorded it before: a
+            // missing record costs one relay re-fetch, never a message.
+            let _ = self.core_record_consumed_hidden_msg_id(
+                commit.msg_id.clone(),
+                kind,
+                commit.recipient_hint,
+                commit.expiry,
+                commit.own_user_id,
+                commit.now_ms,
+            );
+        }
+        seen.record(commit.msg_id);
+    }
+}
+
+/// Store mutations kept deliberately OUT of the exported FFI surface: internal
+/// helpers the inbound transaction composes. Leaving them off the
+/// `#[uniffi::export]` block above keeps D1's frozen binding baseline from
+/// gaining a raw `carry` method a shell could call to enqueue a carried row
+/// outside the single-authority disposition (A0 clean-surface discipline).
+impl MessageStore {
     /// Enqueue a foreign/group envelope into the carry queue for later delivery.
     ///
     /// The stored `hop_ttl` is one less than the header's: carrying is itself a
@@ -526,14 +651,29 @@ mod tests {
             sealed,
         );
 
+        let commit_seen = seen();
         let outcome = store
-            .process_inbound_frame(me.clone(), seen(), CoreInboundSource::Relay, frame, NOW)
+            .process_inbound_frame(
+                me.clone(),
+                commit_seen.clone(),
+                CoreInboundSource::Relay,
+                frame,
+                NOW,
+            )
             .unwrap();
         assert_eq!(outcome.disposition, CoreInboundDisposition::Consumed);
         assert_eq!(outcome.delivered_payloads.len(), 1);
 
+        // DTN D4: the hidden-kind evidence is deferred to the post-delivery
+        // commit, so it is written only once the caller has durably delivered
+        // the payload it was handed. Run that commit now.
+        let commit = outcome
+            .commit
+            .expect("a delivered payload carries a commit token");
+        store.core_commit_inbound_delivery(commit_seen, commit);
+
         // Before the record, a SEEN copy of a hidden kind is not ackable; the
-        // evidence written above is what turns this into an ack.
+        // evidence the commit wrote is what turns this into an ack.
         let ack = store
             .core_relay_ack_ids_with_consumed(
                 vec![CoreRelayEnvelopeDisposition {
@@ -696,11 +836,69 @@ mod tests {
             .unwrap();
         assert_eq!(first.disposition, CoreInboundDisposition::Consumed);
         assert_eq!(first.delivered_payloads.len(), 1);
+        // DTN D4: the first copy's `seen` record lands on the post-delivery
+        // commit, and it is exactly that record that must dedupe the second.
+        store.core_commit_inbound_delivery(
+            shared.clone(),
+            first
+                .commit
+                .expect("a delivered payload carries a commit token"),
+        );
 
         let second = store
             .process_inbound_frame(me, shared, CoreInboundSource::Mesh, frame, NOW)
             .unwrap();
         assert_eq!(second.disposition, CoreInboundDisposition::Seen);
         assert!(second.delivered_payloads.is_empty());
+    }
+
+    #[test]
+    fn an_uncommitted_delivery_stays_re_presentable_and_is_never_deduped() {
+        // DTN D4 / T4-06: the whole reason the delivered path defers `seen` to
+        // the caller's post-delivery commit is that a durable delivery FAILURE
+        // must leave the envelope re-presentable — never poisoned into the
+        // dedupe set and never acked. Model a failed native delivery by simply
+        // NOT calling `core_commit_inbound_delivery`, then prove the very next
+        // copy re-dispatches (delivers again) instead of being dropped as Seen.
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let sealed = seal_message(sender, me.agree_pk.clone(), b"retry me".to_vec()).unwrap();
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            expiry(),
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            sealed,
+        );
+        let shared = seen();
+
+        // First copy opens and is handed back to deliver, but the caller's
+        // durable delivery "fails", so it drops the commit and reports Failed.
+        let first = store
+            .process_inbound_frame(
+                me.clone(),
+                shared.clone(),
+                CoreInboundSource::Mesh,
+                frame.clone(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(first.disposition, CoreInboundDisposition::Consumed);
+        assert_eq!(first.delivered_payloads.len(), 1);
+        assert!(first.commit.is_some());
+        // Deliberately do NOT commit — this stands in for a failed persist.
+
+        // The next copy must re-dispatch, not dedupe: the msg_id was never
+        // recorded, so it opens and is delivered again for the retry.
+        let second = store
+            .process_inbound_frame(me, shared, CoreInboundSource::Mesh, frame, NOW)
+            .unwrap();
+        assert_eq!(
+            second.disposition,
+            CoreInboundDisposition::Consumed,
+            "an uncommitted (failed) delivery must not poison the seen set"
+        );
+        assert_eq!(second.delivered_payloads.len(), 1);
     }
 }
