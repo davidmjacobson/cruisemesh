@@ -66,6 +66,7 @@ class ConversationHost internal constructor(
 
     /** Which message the info bottom sheet is showing, if any. */
     var infoMessage by mutableStateOf<StoredMessage?>(null)
+        private set
 
     var newMessagesAvailable by mutableStateOf(false)
         private set
@@ -97,6 +98,20 @@ class ConversationHost internal constructor(
     fun closeOverlay() {
         focused = null
         keyboardFreeze.onOverlayClosed()
+    }
+
+    /**
+     * Replaces the focus overlay with Message info without briefly restoring
+     * the composer keyboard between the two modal surfaces.
+     */
+    fun openInfo(message: StoredMessage) {
+        infoMessage = message
+        focused = null
+        keyboardFreeze.onOverlayClosed(shouldRestoreKeyboard = false)
+    }
+
+    fun closeInfo() {
+        infoMessage = null
     }
 
     /** Resolves the currently-focused message out of [visibleMessages], or null if it's vanished (e.g. deleted). */

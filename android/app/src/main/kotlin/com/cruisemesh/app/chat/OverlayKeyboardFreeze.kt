@@ -89,13 +89,22 @@ class OverlayKeyboardFreeze internal constructor(
     }
 
     /**
-     * Call after removing the overlay: brings the keyboard back, but only if
-     * it was actually open at press time — an unconditional show() would pop
-     * the keyboard open after a long-press in a keyboard-closed chat.
+     * Call after removing the overlay: normally brings the keyboard back, but
+     * only if it was actually open at press time — an unconditional show()
+     * would pop the keyboard open after a long-press in a keyboard-closed
+     * chat.
+     *
+     * [shouldRestoreKeyboard] is false when another modal immediately replaces
+     * the focus overlay. In that transition the modal needs the IME to stay
+     * hidden, and the frozen conversation can be released immediately behind
+     * its scrim instead of waiting for a keyboard that must not return.
      */
-    fun onOverlayClosed() {
-        if (restoreKeyboard) {
+    fun onOverlayClosed(shouldRestoreKeyboard: Boolean = true) {
+        if (shouldRestoreKeyboard && restoreKeyboard) {
             keyboardController?.show()
+        } else if (!shouldRestoreKeyboard) {
+            frozenContentBottomPx = 0f
+            restoreKeyboard = false
         }
     }
 

@@ -80,6 +80,22 @@ class OverlayKeyboardFreezeTest {
     }
 
     @Test
+    fun `replacing overlay with a modal keeps keyboard hidden and releases freeze`() {
+        val keyboard = FakeKeyboard()
+        val freeze = freezeOf(keyboard)
+        freeze.trackLiveContentBottom(500f, imeVisible = true)
+
+        freeze.onOverlayOpened()
+        freeze.trackLiveContentBottom(800f, imeVisible = false)
+        assertEquals(300f, freeze.extraBottomPx)
+
+        freeze.onOverlayClosed(shouldRestoreKeyboard = false)
+
+        assertEquals(0, keyboard.showCalls)
+        assertEquals(0f, freeze.extraBottomPx)
+    }
+
+    @Test
     fun `release is immediate when nothing is frozen`() = runBlocking {
         val freeze = freezeOf(FakeKeyboard())
         freeze.releaseWhenKeyboardReturns()
