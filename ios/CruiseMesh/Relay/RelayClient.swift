@@ -439,8 +439,67 @@ enum RelayClient {
 
     private static func applyAuth(_ request: inout URLRequest, config: RelayConfig) {
         request.setValue("Bearer \(config.relayToken)", forHTTPHeaderField: "Authorization")
+        stampTransportHeaders(on: &request)
+    }
+
+    /// The transport headers every relay call carries, whichever engine sends
+    /// it: this client's user agent and the tunnel-bypass hint. Split out of
+    /// `applyAuth` without changing what the legacy path sends, so the core
+    /// driver and the legacy engine stamp them from one place — the iOS
+    /// counterpart of Android sharing `RelayClient.openTransport`, and the
+    /// reason the two engines cannot drift below the protocol layer.
+    ///
+    /// It deliberately does *not* set `Authorization`: that is a protocol
+    /// header the core action already carries in full, and setting it here too
+    /// would be a second place a token is chosen.
+    static func stampTransportHeaders(on request: inout URLRequest) {
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("1", forHTTPHeaderField: "Bypass-Tunnel-Reminder")
+    }
+
+    /// Builds the `URLRequest` for one typed core action.
+    ///
+    /// Core owns the method, the path, every protocol header (`Authorization`
+    /// included) and the body; this adds only the transport headers and the
+    /// connect timeout, and decides nothing else. The `Accept` and
+    /// `Content-Type` headers come from the action, so a GET carries neither a
+    /// body nor a `Content-Type` and a POST carries exactly the bytes core
+    /// formed.
+    static func coreTransportRequest(from action: CoreRelayHttpRequest) throws -> URLRequest {
+        let url = try buildURL(action.baseUrl, path: action.path)
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = action.method
+        for header in action.headers {
+            request.setValue(header.value, forHTTPHeaderField: header.name)
+        }
+        stampTransportHeaders(on: &request)
+        if !action.body.isEmpty {
+            request.httpBody = action.body
+        }
+        return request
+    }
+
+    /// Puts a fully-formed core action on the wire and returns what came back,
+    /// interpreting nothing.
+    ///
+    /// A non-2xx returns normally, with its (preview) body and its status,
+    /// exactly as the legacy client's `performRequest` does — naming the
+    /// failure from the status and the relay's own `code` is core's job, not
+    /// the transport's. This throws only the typed *transport* failures the
+    /// legacy path already raises (`RelayResponseTooLargeError`,
+    /// `RelayResponseStalledError`, `URLError`), which the driver maps to a
+    /// `CoreRelayTransportError`. The `maxBytes` cap is the action's own, so a
+    /// page too big to take is refused from the same cursor rather than
+    /// skipped.
+    static func performCoreTransport(
+        _ request: URLRequest,
+        maxBytes: Int
+    ) throws -> (status: Int, response: HTTPURLResponse, body: Data) {
+        let (data, response) = try performRequest(request, maxBytes: maxBytes)
+        guard let http = response as? HTTPURLResponse else {
+            throw malformedResponse("non-HTTP relay response")
+        }
+        return (http.statusCode, http, data)
     }
 
     private static func buildURL(_ base: String, path: String) throws -> URL {
@@ -530,10 +589,13 @@ enum RelayClient {
         Int(Date().timeIntervalSince(started) * 1000)
     }
 
-    private static func performRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+    private static func performRequest(
+        _ request: URLRequest,
+        maxBytes: Int = Int(relayMaxResponseBytes())
+    ) throws -> (Data, URLResponse) {
         let sem = DispatchSemaphore(value: 0)
         let delegate = BoundedRelayResponseDelegate(
-            maxBytes: Int(relayMaxResponseBytes()),
+            maxBytes: maxBytes,
             errorPreviewBytes: errorBodyPreviewBytes,
             semaphore: sem
         )

@@ -149,6 +149,26 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var audioRouteObserver: NSObjectProtocol?
     private var relaySyncInFlight = false
     private var relaySyncPending = false
+    /// C2: whether a full core-engine pass has run to completion in this
+    /// process, feeding `CoreRelayPassPlan.sweptThisSession` — an input rather
+    /// than store state because `relay_sweep_due` correctness must not depend on
+    /// recovering an in-memory session. Touched only on the detached relay task,
+    /// which serialises through `relaySyncInFlight`.
+    private var coreEngineSweptThisSession = false
+    /// C2: the read-only migration canary. On a sampled few legacy passes a day
+    /// it captures what the legacy engine observed for the receipts+authored
+    /// slice and asks the core planner what it would have done, recording only
+    /// where they differ. It holds a diagnostics sink, never the store, and can
+    /// open no socket. Off for a core pass (`relayShadowPermitted`).
+    private lazy var relayShadowAdapter = RelayShadowAdapter(
+        sink: RelayShadowReportSink { report, nowMs in
+            AppStore.get().noteRelayShadowReport(report: report, nowMs: nowMs)
+        },
+        passEngine: { RelayEngineSettings.passEngine() },
+        shadowEnabled: { RelayEngineSettings.shadowEnabled() },
+        loadSampler: { RelayEngineSettings.shadowSampler() },
+        saveSampler: { RelayEngineSettings.setShadowSampler($0) }
+    )
     private var currentLanEndpoint: LanManualEndpoint?
     private var currentLanInstanceToken: Data?
     private var currentLanNetworkId: String?
@@ -3686,6 +3706,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// delivery, which goes through `onMeshQueue` so a relay-fetched envelope
     /// is processed under the same serial guarantee a BLE frame gets.
     private func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
+        // C2: whole-pass engine selection, read once here at pass start and not
+        // consulted again — the flip cannot mix engines within a pass. Default
+        // legacy; the core path runs only when the internal switch is on. When
+        // it is, the legacy pass below (and its canary) never execute, which is
+        // the other half of "one engine writes the production store per pass".
+        if RelayEngineSettings.passEngine() == .core {
+            await performCoreRelaySyncPass(identity: identity, config: config)
+            return
+        }
         let store = AppStore.get()
         // T11 + CP2b: structured rejections of our OWN saved config -- a
         // contact's stale card relay failing is not our pass's fault. The
@@ -3918,9 +3947,33 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // receipt queue and the outbound queue need it -- in the field
             // capture the receipt queue was the one visibly failing. Mirrors
             // RelaySyncEngine.kt.
+            // C2 canary: begin capturing this legacy pass if it is one of the
+            // sampled ones. Everything below feeds values, never a live object;
+            // `finishPass` runs in the `defer` so it fires whether the pass
+            // returns or throws, and after the uploads, so nothing it does can
+            // change what the pass did. A pass with no rows to compare spends no
+            // sample and writes nothing.
+            let shadowCapture = relayShadowAdapter.beginPass(nowMs: now)
+            let shadowContacts = contacts.map { contact in
+                CoreRelayShadowContact(
+                    userId: contact.userId,
+                    relayUrl: contact.relayUrl,
+                    relayToken: contact.relayToken,
+                    endpointUsable: endpointUsable(contact) && endpointAnswering(contact)
+                )
+            }
+            defer {
+                relayShadowAdapter.finishPass(
+                    capture: shadowCapture,
+                    own: config,
+                    contacts: shadowContacts,
+                    nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
+            }
             let skipRecipients = contacts
                 .filter { sendConfig(for: $0) == nil }
                 .map { $0.userId }
+            shadowCapture?.noteSkippedRecipients(skipRecipients)
             if !skipRecipients.isEmpty {
                 let skipped = skipRecipients.map { UserIdHex.encode($0) }.joined(separator: ", ")
                 relaySyncLog.info(
@@ -3940,10 +3993,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     _ = try relayRequest { try RelayClient.postReceiptEnvelope(config: cfg, envelope: env) }
                     _ = try store.markOutgoingReceiptEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     noteContactSuccess(contact: contact, usedConfig: cfg)
+                    shadowCapture?.noteSucceeded(
+                        lane: .receipt, msgId: env.msgId, hopTtl: env.hopTtl,
+                        recipientHint: env.recipientHint, recipientUserId: env.recipientUserId,
+                        sealedLen: env.sealed.count, expiryMs: env.expiry, endpoint: cfg
+                    )
                 } catch {
                     try rethrowFamilyRateLimit(error)
                     noteFailure(error, usedConfig: cfg)
                     noteContactFailure(error, contact: contact, usedConfig: cfg)
+                    shadowCapture?.noteFailed(
+                        lane: .receipt, msgId: env.msgId, hopTtl: env.hopTtl,
+                        recipientHint: env.recipientHint, recipientUserId: env.recipientUserId,
+                        sealedLen: env.sealed.count, expiryMs: env.expiry, endpoint: cfg, error: error
+                    )
                 }
             }
             // A stranded outbound queue was previously invisible in a support
@@ -4006,7 +4069,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     guard let group = groupsById[env.recipientUserId] else {
                         // Recipient is neither contact nor imported group
                         // (e.g. a group deleted mid-queue); keep the legacy
-                        // single post so the envelope isn't stranded.
+                        // single post so the envelope isn't stranded. The canary
+                        // cannot speak for it — core resolves a destination per
+                        // contact, not per bare recipient id.
+                        shadowCapture?.noteUnshadowed(1)
                         do {
                             _ = try relayRequest { try RelayClient.postOutboundEnvelope(config: cfg, envelope: env) }
                             _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
@@ -4030,6 +4096,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                         sealed: env.sealed,
                         envelopeTimestampMs: env.timestamp
                     )
+                    // A group-addressed row is a lane core does not decompose
+                    // per member; counted so a clean report never reads as a
+                    // claim about it.
+                    shadowCapture?.noteUnshadowed(max(1, group.memberUserIds.count))
                     var posted = 0
                     for row in rows {
                         do {
@@ -4050,10 +4120,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     _ = try relayRequest { try RelayClient.postOutboundEnvelope(config: cfg, envelope: env) }
                     _ = try store.markOutboundEnvelopeRelayPosted(msgId: env.msgId, postedAtMs: now)
                     noteContactSuccess(contact: contact, usedConfig: cfg)
+                    shadowCapture?.noteSucceeded(
+                        lane: .authored, msgId: env.msgId, hopTtl: env.hopTtl,
+                        recipientHint: env.recipientHint, recipientUserId: env.recipientUserId,
+                        sealedLen: env.sealed.count, expiryMs: env.expiry, endpoint: cfg
+                    )
                 } catch {
                     try rethrowFamilyRateLimit(error)
                     noteFailure(error, usedConfig: cfg)
                     noteContactFailure(error, contact: contact, usedConfig: cfg)
+                    shadowCapture?.noteFailed(
+                        lane: .authored, msgId: env.msgId, hopTtl: env.hopTtl,
+                        recipientHint: env.recipientHint, recipientUserId: env.recipientUserId,
+                        sealedLen: env.sealed.count, expiryMs: env.expiry, endpoint: cfg, error: error
+                    )
                 }
             }
             // Carried mail starves like the outbound and receipt queues: a
@@ -4067,6 +4147,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 skipRecipientUserIds: skipRecipients
             )
             for env in family {
+                // Carried rows are a lane a later package owns; the canary
+                // cannot speak for them, so each is counted as unshadowed.
+                shadowCapture?.noteUnshadowed(1)
                 // Carried mail goes to the mailbox its recipient actually
                 // polls: a contact hint posts to that contact's resolved
                 // relay; a group hint decomposes into per-member fan-out rows
@@ -4412,6 +4495,172 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self.noteRelayRateLimit(fault: fault, retryAfterMs: retryAfterMs)
             }
             relaySyncLog.warning("Relay sync failed: \(message, privacy: .public)")
+        }
+    }
+
+    /// The relay sync pass, core engine (C2). Mirrors Android
+    /// `RelaySyncEngine.performCoreRelaySyncPass`.
+    ///
+    /// Assembles the facts core cannot read from the store — this device's own
+    /// pass, its contacts' cards, the hints it fetches under, whether its
+    /// endpoint changed, and the quiet window already in force — hands them over
+    /// as a `CoreRelayPassPlan`, drives the actions that come back through
+    /// `RelaySyncDriver`/`RelayActionDriver`, and projects the summary onto the
+    /// health pill and the retry/continuation timers this shell owns. It makes
+    /// no protocol arithmetic itself.
+    ///
+    /// Off by default; `RelayEngineSettings.passEngine` selects it. Known gaps
+    /// keep the default legacy and are recorded in the contract's §5.2 (group
+    /// fan-out, silent-endpoint fallback) and owned by later packages (ingested
+    /// pages are not yet handed to the inbound processor, and the presence
+    /// answer is not projected back — package C4). What the shell still owns on
+    /// both paths — the receipt backfill and the announce — already ran in
+    /// `runRelaySync` before this is reached, so nothing here re-runs them.
+    private func performCoreRelaySyncPass(identity: Identity, config: RelayConfig?) async {
+        let store = AppStore.get()
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        let contacts = (try? store.listContacts()) ?? []
+        let rejections = Dictionary(
+            uniqueKeysWithValues: ((try? store.listContactRelayRejections()) ?? []).map { ($0.userId, $0) }
+        )
+        let unreachable = (try? store.listContactRelayUnreachable()) ?? []
+        // The silence breaker is state this shell keeps and core's
+        // `endpoint_usable` reads; restore it and open the pass boundary exactly
+        // as the legacy pass does, or every rested endpoint answers "still
+        // answering" and a retired host is re-dialled on every pass.
+        ContactRelaySilence.shared.restore(unreachable)
+        ContactRelaySilence.shared.beginPass()
+        func endpointUsable(_ contact: Contact) -> Bool {
+            Self.contactEndpointUsable(contact: contact, rejections: rejections, nowMs: now)
+        }
+        func endpointAnswering(_ contact: Contact) -> Bool {
+            ContactRelaySilence.shared.endpointAnswering(
+                userId: contact.userId,
+                endpointKey: relayCursorKey(
+                    relayUrl: contact.relayUrl ?? "",
+                    relayToken: contact.relayToken ?? ""
+                ),
+                nowMs: now
+            )
+        }
+        let anyConfigKnown = config != nil || contacts.contains {
+            Self.resolvedPollRelayConfig(contact: $0, fallback: config) != nil
+        }
+        guard anyConfigKnown else {
+            await MainActor.run { MeshConnectivityStatus.shared.setRelayHealth(.noConfig) }
+            return
+        }
+        let fetchHints = (try? store.relayFetchHints(ownUserId: identity.userId, nowMs: now)) ?? []
+        let presenceAnnounce = RelayConfigStore.shareOnline()
+            ? recentPresenceHintsFor(userId: identity.userId, nowMs: now)
+            : []
+        let presenceQuery = contacts.flatMap { recentPresenceHintsFor(userId: $0.userId, nowMs: now) }
+        // Read before any announce records the epoch as sent; `runRelaySync`
+        // already queued the notice for both engines, so this only tells core's
+        // announce stage whether the shell has already fanned the endpoint out.
+        let ownEndpointChanged = RelayConfigStore.relayEpoch() > RelayConfigStore.announcedRelayEpoch()
+
+        let plan = CoreRelayPassPlan(
+            own: config.map { CoreRelayEndpointConfig(url: $0.relayUrl, token: $0.relayToken) },
+            contacts: contacts.map { contact in
+                CoreRelayContactConfig(
+                    userId: contact.userId,
+                    relayUrl: contact.relayUrl,
+                    relayToken: contact.relayToken,
+                    endpointUsable: endpointUsable(contact) && endpointAnswering(contact)
+                )
+            },
+            ownUserId: identity.userId,
+            fetchHints: fetchHints,
+            presenceAnnounce: presenceAnnounce,
+            presenceQuery: presenceQuery,
+            ownEndpointChanged: ownEndpointChanged,
+            sweptThisSession: coreEngineSweptThisSession,
+            consecutiveRateLimits: UInt32(clamping: familyRelayBackoff.consecutiveRateLimits),
+            quietUntilMs: relayRateLimitedUntilMs,
+            budgets: coreRelayPassDefaultBudgets()
+        )
+
+        let identityPublicBytes = identity.userId
+        let executor = LiveRelayActionExecutor(
+            isCancelled: { [weak self] in !(self?.isRunning ?? false) },
+            pace: { [weak self] in
+                guard let self else { return }
+                // Monotonic on purpose: the pacer's reservation must not be
+                // rewound by a wall-clock correction. The budget belongs to the
+                // family's token, not to whichever engine spends it.
+                let monotonicNowMs = Int64(clamping: DispatchTime.now().uptimeNanoseconds / 1_000_000)
+                let waitMs = self.familyRelayRequestPacer.reserve(nowMs: monotonicNowMs)
+                if waitMs > 0 { Thread.sleep(forTimeInterval: Double(waitMs) / 1_000) }
+            }
+        )
+        let summary = RelaySyncDriver(
+            store: store,
+            executor: executor,
+            clock: { Int64(Date().timeIntervalSince1970 * 1_000) },
+            isCancelled: { [weak self] in !(self?.isRunning ?? false) }
+        ).run(plan: plan, passId: "cp")
+
+        // Only a pass that ran every stage has swept every mailbox; a cancelled,
+        // refused or rate-limited pass swept nothing.
+        if summary.outcome == .completed { coreEngineSweptThisSession = true }
+
+        let syncedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        let health = Self.relayHealth(forCorePass: summary.health, nowMs: syncedAtMs)
+        let outcome = summary.outcome
+        let quietUntilMs = summary.quietUntilMs
+        let continuationNeeded = summary.continuation != nil
+        relaySyncLog.info(
+            "Core relay pass complete: outcome=\(String(describing: outcome), privacy: .public) requests=\(summary.requestsIssued, privacy: .public) ingested=\(summary.rowsIngested, privacy: .public)"
+        )
+        await MainActor.run {
+            MeshConnectivityStatus.shared.setRelayHealth(health)
+        }
+        // `relayRateLimitedUntilMs` and the backoff counter are the controller's
+        // own state, read by `runRelaySync` on `meshQueue`, so they are written
+        // there too. `RATE-01`'s escalation moves on both sides of a core pass:
+        // only a completed pass clears it, only a rate-limited one bumps it.
+        meshQueue.async { [weak self] in
+            guard let self else { return }
+            switch outcome {
+            case .rateLimited:
+                // For the count alone; core already decided the window this
+                // refusal earns and put it in the summary.
+                _ = self.familyRelayBackoff.onRateLimited(retryAfterMs: 0, identityPublicBytes: identityPublicBytes)
+                if quietUntilMs > 0 {
+                    self.relayRateLimitedUntilMs = max(self.relayRateLimitedUntilMs, quietUntilMs)
+                }
+            case .completed:
+                self.familyRelayBackoff.onSuccessfulPass()
+                if quietUntilMs <= Int64(Date().timeIntervalSince1970 * 1_000) {
+                    self.relayRateLimitedUntilMs = 0
+                }
+            default:
+                break
+            }
+            let quietRemainingMs = self.relayRateLimitedUntilMs - Int64(Date().timeIntervalSince1970 * 1_000)
+            if quietRemainingMs > 0 {
+                self.scheduleRelayRateLimitRetry(afterMs: quietRemainingMs)
+            } else if continuationNeeded {
+                self.scheduleMailboxContinuation()
+            }
+        }
+    }
+
+    /// Projects the core pass's own health onto this shell's display type,
+    /// attaching the shell's clock reading. The precedence itself is core policy
+    /// (`coreRelayPassHealth`, `RATE-01`); this is the same projection
+    /// `RelayHealth.afterSyncPass` does, applied to a health core already folded.
+    private static func relayHealth(forCorePass health: CoreRelayPassHealth, nowMs: Int64) -> RelayHealth {
+        switch health {
+        case .ok: return .ok(lastSyncMs: nowMs)
+        case .quotaFull: return .quotaFull(lastAttemptMs: nowMs)
+        case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
+        case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
+        case .expired: return .expired(lastAttemptMs: nowMs)
+        case .suspended: return .suspended(lastAttemptMs: nowMs)
+        case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
+        case .failing: return .failing(lastAttemptMs: nowMs)
         }
     }
 
