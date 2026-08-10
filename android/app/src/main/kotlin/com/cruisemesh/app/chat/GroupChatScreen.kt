@@ -657,8 +657,7 @@ fun GroupChatScreen(
                     closeOverlay()
                 },
                 onInfo = {
-                    host.infoMessage = focusedMessage
-                    closeOverlay()
+                    host.openInfo(focusedMessage)
                 },
             ) {
                 GroupMessageBubbleVisual(
@@ -693,7 +692,7 @@ fun GroupChatScreen(
             )
         }
         MessageInfoBottomSheet(
-            onDismiss = { host.infoMessage = null },
+            onDismiss = { host.closeInfo() },
             rows = messageInfoRows(
                 currentInfoMessage,
                 infoIsOwn,

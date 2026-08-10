@@ -793,8 +793,7 @@ private fun ConversationScreen(
                             closeOverlay()
                         },
                         onInfo = {
-                            host.infoMessage = focusedMessage
-                            closeOverlay()
+                            host.openInfo(focusedMessage)
                         },
                     ) {
                         MessageBubbleVisual(
@@ -832,7 +831,7 @@ private fun ConversationScreen(
             ?.takeIf { infoIsOwn && currentInfoMessage.lamport <= deliveredThrough }
             ?.let { transportRouteText(it.toInt()) }
         MessageInfoBottomSheet(
-            onDismiss = { host.infoMessage = null },
+            onDismiss = { host.closeInfo() },
             rows = messageInfoRows(
                     currentInfoMessage,
                     infoIsOwn,
