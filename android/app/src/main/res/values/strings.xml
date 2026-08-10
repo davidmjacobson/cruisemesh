@@ -36,6 +36,10 @@
     <string name="ui_backup_contains_contacts_and_groups">Backup contains %1$s contacts and %2$s groups.</string>
     <string name="ui_backup_identity_always_included">Your identity, contacts, groups, privacy settings, and message-number continuity are always included.</string>
     <string name="ui_backup_identity_always_restored">Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.</string>
+    <string name="ui_backup_saved">Backup saved</string>
+    <string name="ui_backup_saved_keep_it_and_your_passphrase">Keep the backup file and its passphrase somewhere safe.</string>
+    <string name="ui_show_passphrase">Show</string>
+    <string name="ui_hide_passphrase">Hide</string>
     <string name="ui_block">Block</string>
     <string name="ui_block_contact">Block contact</string>
     <string name="ui_block_explanation">They won\'t be able to message you, and they won\'t appear as a suggested friend. They won\'t be told. Scanning their card again unblocks them.</string>

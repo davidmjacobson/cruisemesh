@@ -90,6 +90,37 @@ final class CruiseMeshUITests: XCTestCase {
         assertUsableHome()
     }
 
+    func testBackupPassphraseFieldsOfferRevealControls() {
+        launch(scenario: "home-empty")
+        assertUsableHome()
+
+        app.buttons["More"].tap()
+        app.buttons["Settings"].tap()
+        XCTAssertTrue(element("screen.settings").waitForExistence(timeout: 5))
+
+        let backup = app.staticTexts["Back up account"]
+        for _ in 0..<5 where !backup.isHittable {
+            app.swipeUp()
+        }
+        XCTAssertTrue(backup.isHittable)
+        backup.tap()
+
+        XCTAssertTrue(app.navigationBars["Back up account"].waitForExistence(timeout: 5))
+        assertRevealControl("backup.export.passphrase.visibility")
+        XCTAssertTrue(element("backup.export.passphrase").exists)
+        XCTAssertTrue(element("backup.export.confirmation").exists)
+
+        app.terminate()
+        launch(scenario: "onboarding")
+        let restore = app.buttons["Restore from backup"]
+        XCTAssertTrue(restore.waitForExistence(timeout: 5))
+        restore.tap()
+
+        XCTAssertTrue(app.navigationBars["Restore from backup"].waitForExistence(timeout: 5))
+        XCTAssertTrue(element("backup.restore.passphrase").exists)
+        assertRevealControl("backup.restore.passphrase.visibility")
+    }
+
     func testFriendPreviewActionRemainsAvailableWithKeyboardOpen() {
         launch(scenario: "home-empty")
         app.buttons["Add a friend"].tap()
@@ -194,6 +225,22 @@ final class CruiseMeshUITests: XCTestCase {
 
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    private func assertRevealControl(
+        _ identifier: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let reveal = element(identifier)
+        for _ in 0..<5 where !reveal.isHittable {
+            app.swipeUp()
+        }
+        XCTAssertTrue(reveal.waitForExistence(timeout: 5), file: file, line: line)
+        XCTAssertTrue(reveal.isHittable, file: file, line: line)
+        XCTAssertEqual(reveal.label, "Show passphrase", file: file, line: line)
+        reveal.tap()
+        XCTAssertEqual(reveal.label, "Hide passphrase", file: file, line: line)
     }
 
     private func assertUsableHome(file: StaticString = #filePath, line: UInt = #line) {

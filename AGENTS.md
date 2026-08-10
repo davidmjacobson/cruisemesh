@@ -4,6 +4,15 @@ Build and bindgen recipes that don't fit in [README.md](README.md), including
 the faster paths and the ones with sharp edges. Human contributors are as much
 the audience as agents are.
 
+## Android and iOS parity
+
+Treat Android and iOS as peer shells by default. For every user-visible feature,
+bug fix, workflow, setting, validation rule, status, and copy change, inspect
+both implementations and preserve equivalent behavior and regression coverage
+unless the user explicitly limits the work to one platform. When a platform
+constraint makes exact parity impossible, implement the closest native behavior
+and call out the difference in the handoff.
+
 ## Android UniFFI Setup
 
 Fresh worktrees do not contain generated Android UniFFI artifacts because these
