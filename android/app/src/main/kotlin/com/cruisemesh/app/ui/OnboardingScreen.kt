@@ -60,12 +60,14 @@ fun OnboardingScreen(
     displayName: String,
     avatarPath: String?,
     meshPermissionsGranted: Boolean,
+    notificationPermissionGranted: Boolean,
     batteryExemptionGranted: Boolean,
     onDisplayNameChange: (String) -> Unit,
     onTakePhoto: () -> Unit,
     onChoosePhoto: () -> Unit,
     onRemovePhoto: () -> Unit,
     onRequestMeshPermissions: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
     onRestore: () -> Unit,
     onComplete: () -> Unit,
@@ -209,8 +211,10 @@ fun OnboardingScreen(
                                 1 -> DeliverySlide()
                                 2 -> PermissionsSlide(
                                     meshPermissionsGranted = meshPermissionsGranted,
+                                    notificationPermissionGranted = notificationPermissionGranted,
                                     batteryExemptionGranted = batteryExemptionGranted,
                                     onRequestMeshPermissions = onRequestMeshPermissions,
+                                    onRequestNotificationPermission = onRequestNotificationPermission,
                                     onRequestBatteryExemption = onRequestBatteryExemption,
                                 )
                                 3 -> WifiSlide()
@@ -293,8 +297,10 @@ private fun WifiSlide() {
 @Composable
 private fun PermissionsSlide(
     meshPermissionsGranted: Boolean,
+    notificationPermissionGranted: Boolean,
     batteryExemptionGranted: Boolean,
     onRequestMeshPermissions: () -> Unit,
+    onRequestNotificationPermission: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
 ) {
     SlideScaffold(
@@ -318,18 +324,17 @@ private fun PermissionsSlide(
             }
         }
 
-        // The T5 draft splits this into three rows (nearby / notifications /
-        // background). Deliberately kept at two: `meshPermissionsGranted` is a
-        // single boolean covering the whole nearby+POST_NOTIFICATIONS set, so
-        // a separate notifications row would show a green tick when only
-        // notifications had been denied. Splitting it needs real per-permission
-        // state first -- a status indicator that can lie is worse than one row.
         val items = listOf(
             PermissionItem(
                 title = stringResource(R.string.ui_onboarding_permission_nearby_title),
                 detail = stringResource(R.string.ui_onboarding_permission_nearby_detail),
                 enabled = meshPermissionsGranted,
                 required = true,
+            ),
+            PermissionItem(
+                title = stringResource(R.string.ui_onboarding_permission_notifications_title),
+                detail = stringResource(R.string.ui_onboarding_permission_notifications_detail),
+                enabled = notificationPermissionGranted,
             ),
             PermissionItem(
                 title = stringResource(R.string.ui_onboarding_permission_background_title),
@@ -351,6 +356,21 @@ private fun PermissionsSlide(
                 stringResource(
                     if (meshPermissionsGranted) R.string.ui_nearby_access_enabled
                     else R.string.ui_enable_nearby_access_required,
+                ),
+            )
+        }
+
+        OutlinedButton(
+            onClick = onRequestNotificationPermission,
+            enabled = !notificationPermissionGranted,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 12.dp),
+        ) {
+            Text(
+                stringResource(
+                    if (notificationPermissionGranted) R.string.ui_notifications_enabled
+                    else R.string.ui_enable_notifications,
                 ),
             )
         }

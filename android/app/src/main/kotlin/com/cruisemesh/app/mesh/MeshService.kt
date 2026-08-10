@@ -495,16 +495,17 @@ class MeshService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             Log.i(TAG, "Stopping mesh at the user's request")
-            MeshStartupPreferences.markExplicitlyStopped(this)
+            MeshStartupPreferences.setMeshEnabled(this, false)
             MeshRuntimeStatus.markStopped()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // A manual/app start begins a new session. BootReceiver checks the
-        // explicit-stop bit before it ever reaches this path.
-        MeshStartupPreferences.clearExplicitStop(this)
+        // Any start initiated by the app is durable user intent, matching the
+        // iOS "Mesh running" switch. BootReceiver only reaches this path when
+        // that same preference is already enabled.
+        MeshStartupPreferences.setMeshEnabled(this, true)
         startForeground(NOTIFICATION_ID, buildNotification())
         if (!TermsAcceptanceStore.isCurrentVersionAccepted(this)) {
             MeshRuntimeStatus.markStopped()
@@ -2279,17 +2280,12 @@ class MeshService : Service() {
         }
 
         /** Permissions MeshService needs before it will start its BLE roles. */
-        fun requiredPermissions(): Array<String> {
+        fun requiredPermissions(): Array<String> =
             // minSdk is 31 (S), so the Bluetooth trio is always required.
-            val base = mutableListOf(
+            arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_ADVERTISE,
                 Manifest.permission.BLUETOOTH_CONNECT,
             )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                base += Manifest.permission.POST_NOTIFICATIONS
-            }
-            return base.toTypedArray()
-        }
     }
 }

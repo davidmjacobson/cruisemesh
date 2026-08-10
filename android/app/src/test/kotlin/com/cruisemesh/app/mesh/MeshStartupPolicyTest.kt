@@ -10,7 +10,7 @@ class MeshStartupPolicyTest {
         assertTrue(
             shouldStartMeshAfterBoot(
                 autoStartEnabled = true,
-                explicitlyStopped = false,
+                meshEnabled = true,
                 permissionsGranted = true,
             ),
         )
@@ -21,7 +21,7 @@ class MeshStartupPolicyTest {
         assertFalse(
             shouldStartMeshAfterBoot(
                 autoStartEnabled = true,
-                explicitlyStopped = true,
+                meshEnabled = false,
                 permissionsGranted = true,
             ),
         )
@@ -32,16 +32,44 @@ class MeshStartupPolicyTest {
         assertFalse(
             shouldStartMeshAfterBoot(
                 autoStartEnabled = false,
-                explicitlyStopped = false,
+                meshEnabled = true,
                 permissionsGranted = true,
             ),
         )
         assertFalse(
             shouldStartMeshAfterBoot(
                 autoStartEnabled = true,
-                explicitlyStopped = false,
+                meshEnabled = true,
                 permissionsGranted = false,
             ),
         )
+    }
+
+    @Test
+    fun `app open respects durable mesh toggle`() {
+        assertTrue(
+            shouldStartMeshOnAppOpen(
+                meshEnabled = true,
+                permissionsGranted = true,
+                runtimeStopped = true,
+            ),
+        )
+        assertFalse(
+            shouldStartMeshOnAppOpen(
+                meshEnabled = false,
+                permissionsGranted = true,
+                runtimeStopped = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `notification permission is not required for mesh operation`() {
+        val required = MeshService.requiredPermissions().toSet()
+
+        assertTrue(required.contains(android.Manifest.permission.BLUETOOTH_SCAN))
+        assertTrue(required.contains(android.Manifest.permission.BLUETOOTH_ADVERTISE))
+        assertTrue(required.contains(android.Manifest.permission.BLUETOOTH_CONNECT))
+        assertFalse(required.contains(android.Manifest.permission.POST_NOTIFICATIONS))
     }
 }

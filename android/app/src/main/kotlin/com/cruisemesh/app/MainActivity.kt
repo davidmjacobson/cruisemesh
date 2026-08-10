@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
@@ -100,6 +101,7 @@ import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.MeshService
 import com.cruisemesh.app.mesh.MeshStartupPreferences
+import com.cruisemesh.app.mesh.shouldStartMeshOnAppOpen
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.parseLanEndpointLink
@@ -174,7 +176,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        MeshStartupPreferences.clearExplicitStop(this)
         // T21: a killed process can leave its ongoing mesh notification
         // posted. Drop it before the auto-start below decides what to do, so
         // the shade never claims the mesh is running while it isn't.
@@ -203,7 +204,6 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        MeshStartupPreferences.clearExplicitStop(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
         handleBluetoothEnableRequest(intent)
     }
@@ -412,6 +412,9 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
     val meshPermissionsGranted = remember(context, permissionRefreshToken) {
         hasMeshPermissions(context)
     }
+    val notificationPermissionGranted = remember(context, permissionRefreshToken) {
+        hasNotificationPermission(context)
+    }
     val batteryExemptionGranted = remember(context, permissionRefreshToken) {
         isIgnoringBatteryOptimizations(context)
     }
@@ -428,17 +431,29 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
             if (permanentlyDenied) {
                 Toast.makeText(
                     context,
-                    "Enable Nearby devices (and notifications) in App permissions — without them the mesh cannot run",
+                    context.getString(R.string.ui_enable_nearby_in_app_permissions),
                     Toast.LENGTH_LONG,
                 ).show()
                 openAppPermissionSettings(context)
             } else {
                 Toast.makeText(
                     context,
-                    "Nearby permissions are required for CruiseMesh to send and receive messages",
+                    context.getString(R.string.ui_nearby_required_for_messages),
                     Toast.LENGTH_LONG,
                 ).show()
             }
+        }
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        permissionRefreshToken += 1
+        if (!granted) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_notifications_denied_mesh_continues),
+                Toast.LENGTH_LONG,
+            ).show()
         }
     }
     val batteryOptimizationLauncher = rememberLauncherForActivityResult(
@@ -487,6 +502,7 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
         displayName = displayName,
         avatarPath = avatarPath,
         meshPermissionsGranted = meshPermissionsGranted,
+        notificationPermissionGranted = notificationPermissionGranted,
         batteryExemptionGranted = batteryExemptionGranted,
         onDisplayNameChange = {
             displayName = it
@@ -516,6 +532,11 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
         onRequestMeshPermissions = {
             if (!meshPermissionsGranted) {
                 meshPermissionLauncher.launch(MeshService.requiredPermissions())
+            }
+        },
+        onRequestNotificationPermission = {
+            if (!notificationPermissionGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         },
         onRequestBatteryExemption = {
@@ -792,6 +813,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     val hasPermissions = remember(context, permissionRefreshToken) {
         hasMeshPermissions(context)
     }
+    val notificationPermissionGranted = remember(context, permissionRefreshToken) {
+        hasNotificationPermission(context)
+    }
     var bluetoothEnabled by remember { mutableStateOf(isBluetoothRadioEnabled(context)) }
 
     // Re-check after App info / system dialogs so the blocking banner clears
@@ -845,9 +869,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
             }
         } else {
-            transientMeshStatus = "Permissions denied — mesh cannot run"
+            transientMeshStatus = context.getString(R.string.ui_permissions_denied_mesh_cannot_run)
             // If the system will not show the dialog again, send the user to
-            // App info so they can flip Nearby / Notifications manually.
+            // App info so they can flip Nearby devices access manually.
             val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
                 grants[perm] == false &&
                     !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
@@ -855,16 +879,29 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             if (permanentlyDenied) {
                 Toast.makeText(
                     context,
-                    "Enable Nearby devices (and notifications) in App permissions",
+                    context.getString(R.string.ui_enable_nearby_in_app_permissions_short),
                     Toast.LENGTH_LONG,
                 ).show()
                 openAppPermissionSettings(context)
             }
         }
     }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        permissionRefreshToken += 1
+        if (!granted) {
+            transientMeshStatus = context.getString(R.string.ui_notifications_off_mesh_running)
+        }
+    }
 
-    LaunchedEffect(hasPermissions) {
-        if (hasPermissions && runtimeStatus == MeshRuntimeState.STOPPED) {
+    LaunchedEffect(hasPermissions, runtimeStatus) {
+        if (shouldStartMeshOnAppOpen(
+                meshEnabled = MeshStartupPreferences.isMeshEnabled(context),
+                permissionsGranted = hasPermissions,
+                runtimeStopped = runtimeStatus == MeshRuntimeState.STOPPED,
+            )
+        ) {
             startMesh(context)
         }
     }
@@ -1045,9 +1082,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
         connectivityWarning = when {
             !hasPermissions -> ConnectivityWarning(
-                title = "Permissions required — mesh is off",
-                body = "Without Nearby devices (and notification) access, CruiseMesh cannot scan, connect, send, or receive messages. The app will not work as designed until you grant them.",
-                actionLabel = "Enable permissions",
+                title = stringResource(R.string.ui_permissions_required_mesh_off),
+                body = stringResource(R.string.ui_nearby_permission_blocking_body),
+                actionLabel = stringResource(R.string.ui_enable_permissions),
                 severity = ConnectivityWarningSeverity.Blocking,
             )
             !bluetoothEnabled -> ConnectivityWarning(
@@ -1055,6 +1092,12 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 body = stringResource(R.string.ui_bluetooth_is_off_body),
                 actionLabel = stringResource(R.string.ui_turn_on_bluetooth),
                 severity = ConnectivityWarningSeverity.Blocking,
+            )
+            !notificationPermissionGranted -> ConnectivityWarning(
+                title = stringResource(R.string.ui_notifications_are_off),
+                body = stringResource(R.string.ui_notifications_off_body),
+                actionLabel = stringResource(R.string.ui_enable_notifications),
+                severity = ConnectivityWarningSeverity.Caution,
             )
             bluetoothAudioConnected && !bluetoothAudioWarningDismissed && !hideBluetoothAudioWarning -> ConnectivityWarning(
                 title = "Bluetooth audio connected",
@@ -1073,6 +1116,8 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 }.onFailure {
                     context.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
                 }
+                !notificationPermissionGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ->
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 bluetoothAudioConnected -> bluetoothAudioWarningDismissed = true
             }
         },
@@ -1090,7 +1135,14 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         MeshStatusLegendDialog(
             statusText = transientMeshStatus ?: pillStatus.text,
             canStartMesh = runtimeStatus == MeshRuntimeState.STOPPED,
-            onStartMesh = { permissionLauncher.launch(MeshService.requiredPermissions()) },
+            onStartMesh = {
+                if (hasPermissions) {
+                    MeshStartupPreferences.setMeshEnabled(context, true)
+                    startMesh(context)
+                } else {
+                    permissionLauncher.launch(MeshService.requiredPermissions())
+                }
+            },
             onConnectionDetails = {
                 showMeshStatusLegend = false
                 navController.navigate("connectionDetails")
@@ -1106,13 +1158,46 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
     val store = remember { AppStore.get(context) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
     val relayHealth by MeshConnectivityStatus.relay.collectAsState()
+    var meshEnabled by remember { mutableStateOf(MeshStartupPreferences.isMeshEnabled(context)) }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        if (grants.values.all { it }) {
+            meshEnabled = true
+            MeshStartupPreferences.setMeshEnabled(context, true)
+            startMesh(context)
+        } else {
+            meshEnabled = false
+            MeshStartupPreferences.setMeshEnabled(context, false)
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_nearby_required_to_turn_on_mesh),
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
     SettingsScreen(
+        meshEnabled = meshEnabled,
         meshStatus = runtimeStatus.label,
         relayHealth = relayHealth,
         onShorePass = { navController.navigate("shorePass") },
         onConnectionDetails = { navController.navigate("connectionDetails") },
         onInternalTools = { navController.navigate("internalTools") },
         onBackUp = { navController.navigate("backup") },
+        onMeshEnabledChange = { enabled ->
+            if (enabled) {
+                if (hasMeshPermissions(context)) {
+                    meshEnabled = true
+                    MeshStartupPreferences.setMeshEnabled(context, true)
+                    startMesh(context)
+                } else {
+                    permissionLauncher.launch(MeshService.requiredPermissions())
+                }
+            } else {
+                meshEnabled = false
+                stopMesh(context)
+            }
+        },
         onFriendsOfFriendsChanged = { enabled ->
             FriendsOfFriendsStore.setEnabled(context, enabled)
             if (!enabled) store.clearFriendSuggestions()
@@ -1741,12 +1826,25 @@ private fun startMesh(context: Context) {
     }
 }
 
+private fun stopMesh(context: Context) {
+    MeshStartupPreferences.setMeshEnabled(context, false)
+    if (MeshRuntimeStatus.state.value == MeshRuntimeState.STOPPED) return
+    context.startService(
+        Intent(context, MeshService::class.java).setAction(MeshService.ACTION_STOP),
+    )
+}
+
 private const val TAG = "CruiseMeshUi"
 
 private fun hasMeshPermissions(context: Context): Boolean =
     MeshService.requiredPermissions().all {
         ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
     }
+
+private fun hasNotificationPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
+        PackageManager.PERMISSION_GRANTED
 
 private fun openAppPermissionSettings(context: Context) {
     val intent = Intent(
