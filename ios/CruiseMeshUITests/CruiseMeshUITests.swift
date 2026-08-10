@@ -244,7 +244,11 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(inject.waitForExistence(timeout: 3))
         inject.tap()
 
-        let jump = element("chat.new-messages")
+        // Assert the control through the name VoiceOver users interact with.
+        // SwiftUI exposes this transient overlay as a labelled button on the
+        // current SDK, but does not propagate its view identifier into the
+        // accessibility snapshot.
+        let jump = app.buttons["New messages"].firstMatch
         XCTAssertTrue(jump.waitForExistence(timeout: 5))
         XCTAssertTrue(jump.isHittable)
         attachScreenshot(named: "Chat-new-messages-action")
