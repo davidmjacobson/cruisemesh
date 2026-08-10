@@ -138,6 +138,13 @@ pub fn seal_backup(
     payload: CoreBackupPayload,
     iterations: Option<u32>,
 ) -> Result<Vec<u8>, CoreBackupError> {
+    if passphrase.chars().count() < BACKUP_MIN_PASSPHRASE_LEN {
+        return Err(CoreBackupError::InvalidPayload {
+            reason: format!(
+                "backup passphrase must be at least {BACKUP_MIN_PASSPHRASE_LEN} characters"
+            ),
+        });
+    }
     let iterations = iterations.unwrap_or(PBKDF2_DEFAULT_ITERATIONS);
     validate_iterations(iterations)?;
     let plaintext = encode_inner(&payload)?;
@@ -551,7 +558,12 @@ mod tests {
 
     #[test]
     fn wrong_passphrase_and_tampering_fail() {
-        let mut file = seal_backup("right".into(), payload(), Some(PBKDF2_MIN_ITERATIONS)).unwrap();
+        let mut file = seal_backup(
+            "right choice".into(),
+            payload(),
+            Some(PBKDF2_MIN_ITERATIONS),
+        )
+        .unwrap();
         assert!(matches!(
             open_backup("wrong".into(), file.clone()),
             Err(CoreBackupError::WrongPassphraseOrCorrupt)
@@ -559,9 +571,26 @@ mod tests {
         let last = file.len() - 1;
         file[last] ^= 1;
         assert!(matches!(
-            open_backup("right".into(), file),
+            open_backup("right choice".into(), file),
             Err(CoreBackupError::WrongPassphraseOrCorrupt)
         ));
+    }
+
+    #[test]
+    fn seal_requires_minimum_passphrase_length() {
+        assert!(matches!(
+            seal_backup("short".into(), payload(), Some(PBKDF2_MIN_ITERATIONS)),
+            Err(CoreBackupError::InvalidPayload { .. })
+        ));
+
+        let expected = payload();
+        let file = seal_backup(
+            "long enough".into(),
+            expected.clone(),
+            Some(PBKDF2_MIN_ITERATIONS),
+        )
+        .unwrap();
+        assert_eq!(open_backup("long enough".into(), file).unwrap(), expected);
     }
 
     #[test]

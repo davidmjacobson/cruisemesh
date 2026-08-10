@@ -1054,6 +1054,10 @@ internal class InboundEnvelopeProcessor(
             Log.w(TAG, "Dropping group envelope from $address: body.chatId does not match group id")
             return
         }
+        if (store.isUserBlocked(opened.senderUserId)) {
+            Log.i(TAG, "Dropping group envelope from $address: sender is blocked")
+            return
+        }
         when (body.kind) {
             KIND_TEXT, KIND_ATTACHMENT_MANIFEST, KIND_REACTION -> handleIncomingGroupChatMessage(
                 address,
