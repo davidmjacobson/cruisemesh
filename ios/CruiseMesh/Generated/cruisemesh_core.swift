@@ -17945,6 +17945,20 @@ public func FfiConverterTypeExtendedMessageBody_lower(_ value: ExtendedMessageBo
 /**
  * The public, shareable half of an identity — what a QR code / friend-request
  * string actually carries. No secret material.
+ *
+ * `signature` is the card owner's own Ed25519 signature over the
+ * security-relevant fields (see [`friend_card_signed_bytes`]), binding
+ * `agree_pk` and the relay fields to the `sign_pk`/UserID that the verbal
+ * safety words cover. It is `None` on legacy cards (v1/v2 links, and any card
+ * minted before this field existed); those still import, but only a card
+ * carrying a *valid* signature is protected against an `agree_pk`/relay
+ * key-substitution swap on a tamperable sharing channel. A signature that is
+ * present but does not verify is rejected outright, never downgraded to
+ * unsigned (see [`verify_friend_card_self_signature`]).
+ *
+ * The field is `#[serde(default)]` and skipped when absent, so the JSON wire
+ * form stays backward-compatible in both directions: an old client ignores
+ * the extra field, and a new client reads an old card as unsigned.
  */
 public struct FriendCard {
     public var name: String
@@ -17952,15 +17966,17 @@ public struct FriendCard {
     public var agreePk: Data
     public var relayUrl: String?
     public var relayToken: String?
+    public var signature: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?) {
+    public init(name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, signature: Data?) {
         self.name = name
         self.signPk = signPk
         self.agreePk = agreePk
         self.relayUrl = relayUrl
         self.relayToken = relayToken
+        self.signature = signature
     }
 }
 
@@ -17983,6 +17999,9 @@ extension FriendCard: Equatable, Hashable {
         if lhs.relayToken != rhs.relayToken {
             return false
         }
+        if lhs.signature != rhs.signature {
+            return false
+        }
         return true
     }
 
@@ -17992,6 +18011,7 @@ extension FriendCard: Equatable, Hashable {
         hasher.combine(agreePk)
         hasher.combine(relayUrl)
         hasher.combine(relayToken)
+        hasher.combine(signature)
     }
 }
 
@@ -18007,7 +18027,8 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
                 signPk: FfiConverterData.read(from: &buf), 
                 agreePk: FfiConverterData.read(from: &buf), 
                 relayUrl: FfiConverterOptionString.read(from: &buf), 
-                relayToken: FfiConverterOptionString.read(from: &buf)
+                relayToken: FfiConverterOptionString.read(from: &buf), 
+                signature: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -18017,6 +18038,7 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
         FfiConverterData.write(value.agreePk, into: &buf)
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
+        FfiConverterOptionData.write(value.signature, into: &buf)
     }
 }
 
@@ -31289,6 +31311,12 @@ public func parseFrame(bytes: Data)throws  -> Frame {
 }
 /**
  * Parse a friend-card JSON payload received via QR scan or pasted text.
+ *
+ * This is an import (untrusted-input) entry point, so it verifies the card's
+ * self-signature: a legacy unsigned card is accepted, a validly signed card is
+ * accepted, and a card whose signature is present-but-invalid is rejected with
+ * [`CoreError::SignatureInvalid`] (TM-01). Friend-request payloads ride as
+ * this JSON, so requests are signature-checked here too.
  */
 public func parseFriendCard(json: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -33046,7 +33074,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_frame() != 28787) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 1373) {
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_card() != 17464) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_import() != 5666) {

@@ -75,6 +75,25 @@ limits.
   phrase for verbal verification (Signal-safety-number style). Trust is
   TOFU-with-verification: the QR/string you scanned *is* the key you talk
   to; verify the phrase aloud if you didn't control the channel.
+- **Card self-signature.** The 4-word fingerprint is derived from the UserID,
+  i.e. from the Ed25519 signing key alone — it does *not* cover the X25519
+  agreement key or the relay fields. To stop a key-substitution swap on a
+  tamperable sharing channel (a card forwarded as text, with `agree_pk`
+  replaced by an attacker's while the victim's `sign_pk`/fingerprint is kept),
+  a card carries the owner's own Ed25519 signature over
+  `sign_pk ‖ agree_pk ‖ relay_url ‖ relay_token ‖ name`
+  (domain-separated, length-framed; `core/src/identity.rs`). Import verifies it
+  against the card's own signing key: a valid signature makes the whole card
+  tamper-evident, and a signature that is present but does not verify is
+  rejected outright — never silently downgraded to unsigned. Residual, stated
+  honestly: legacy unsigned cards (pre-signature v1/v2 links held across the
+  fleet) still import and remain `agree_pk`-substitutable via the fingerprint
+  gap, and until a future *require-signed* flip an attacker can strip the
+  signature and present a card as unsigned. Signed cards are the MITM-proof
+  path; requiring them everywhere is a later fleet-rollout step. Note also that
+  the currently emitted link form is still the unsigned `CMFRIEND2:` binary;
+  the signature rides friend-request JSON today and the `CMFRIEND3:` link once
+  its emit flag is flipped.
 
 ## Message encryption (1:1)
 

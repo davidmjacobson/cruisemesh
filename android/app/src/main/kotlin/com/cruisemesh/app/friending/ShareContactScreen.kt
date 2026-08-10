@@ -69,6 +69,11 @@ fun ShareContactScreen(
                     agreePk = contact.agreePk,
                     relayUrl = contact.relayUrl,
                     relayToken = contact.relayToken,
+                    // No primary self-signature when re-sharing: the sharer
+                    // never holds the contact's signing key. Integrity of a
+                    // shared card comes from the sharer's own SharedFriendCard
+                    // signature instead.
+                    signature = null,
                 ),
                 sharedPolicyRevision,
                 System.currentTimeMillis(),

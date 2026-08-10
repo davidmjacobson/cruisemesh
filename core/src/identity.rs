@@ -47,6 +47,17 @@ const V3_URL_TAG_OFFICIAL: u8 = 0x02;
 const V3_TOKEN_TAG_NONE: u8 = 0x00;
 const V3_TOKEN_TAG_VERBATIM: u8 = 0x01;
 const V3_TOKEN_TAG_HEX: u8 = 0x02;
+/// v3 self-signature field tags (`specs/friend-card-v3.md`).
+const V3_SIG_TAG_NONE: u8 = 0x00;
+const V3_SIG_TAG_PRESENT: u8 = 0x01;
+
+/// Length of an Ed25519 signature; the card's self-signature is exactly this.
+const FRIEND_CARD_SIGNATURE_LEN: usize = 64;
+/// Domain separator for the primary FriendCard self-signature (TM-01). Fresh
+/// and distinct from every other signing domain (e.g. the shared-card
+/// [`SHARED_CARD_SIGN_DOMAIN`]) so a signature can never be replayed across
+/// contexts.
+const FRIEND_CARD_SIGN_DOMAIN: &[u8] = b"CruiseMesh friend card self-signature v1\0";
 /// Longest hex token the packed form can carry — its length prefix is one byte
 /// counting *raw* bytes, so two hex characters each.
 const V3_MAX_PACKED_HEX_CHARS: usize = 2 * u8::MAX as usize;
@@ -72,6 +83,20 @@ pub struct Identity {
 
 /// The public, shareable half of an identity — what a QR code / friend-request
 /// string actually carries. No secret material.
+///
+/// `signature` is the card owner's own Ed25519 signature over the
+/// security-relevant fields (see [`friend_card_signed_bytes`]), binding
+/// `agree_pk` and the relay fields to the `sign_pk`/UserID that the verbal
+/// safety words cover. It is `None` on legacy cards (v1/v2 links, and any card
+/// minted before this field existed); those still import, but only a card
+/// carrying a *valid* signature is protected against an `agree_pk`/relay
+/// key-substitution swap on a tamperable sharing channel. A signature that is
+/// present but does not verify is rejected outright, never downgraded to
+/// unsigned (see [`verify_friend_card_self_signature`]).
+///
+/// The field is `#[serde(default)]` and skipped when absent, so the JSON wire
+/// form stays backward-compatible in both directions: an old client ignores
+/// the extra field, and a new client reads an old card as unsigned.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FriendCard {
     pub name: String,
@@ -79,6 +104,8 @@ pub struct FriendCard {
     pub agree_pk: Vec<u8>,
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -236,14 +263,21 @@ pub fn make_friend_card(
     let relay_token = relay_token
         .map(crate::relay_deposit_token_for)
         .filter(|token| !token.is_empty());
-    let card = FriendCard {
+    let mut card = FriendCard {
         name,
         sign_pk: identity.sign_pk,
         agree_pk: identity.agree_pk,
         relay_url,
         relay_token,
+        signature: None,
     };
     validate_friend_card(&card)?;
+    // Self-sign under the card owner's own key over the final field values
+    // (relay_token is already attenuated above, so the signature covers exactly
+    // what ships). Binds agree_pk + relay fields to the sign_pk/UserID the
+    // safety words cover (TM-01). The signature does not cover itself, so it is
+    // computed on the signature-less card and then stored.
+    card.signature = Some(sign_friend_card(&card, &identity.sign_sk)?);
     let json =
         serde_json::to_string(&card).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
     if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
@@ -252,6 +286,94 @@ pub fn make_friend_card(
         ));
     }
     Ok(json)
+}
+
+/// Canonical, domain-separated, length-framed bytes a primary FriendCard's
+/// self-signature is computed over (TM-01). Field order is fixed as
+/// `sign_pk ‖ agree_pk ‖ relay_url ‖ relay_token ‖ name`; every field is
+/// length-prefixed and the two optional fields carry an explicit presence byte,
+/// so no two distinct cards can ever produce the same signed bytes (a `None`
+/// relay URL is unambiguously different from a `Some("")` one). The signature
+/// itself is deliberately excluded, so signing and verifying see identical
+/// bytes regardless of whether the card already carries a signature. This is
+/// wire-format independent: a card self-signs the same whether it later ships
+/// as JSON (friend requests) or as a `CMFRIEND3:` binary link.
+fn friend_card_signed_bytes(card: &FriendCard) -> Vec<u8> {
+    let mut out = FRIEND_CARD_SIGN_DOMAIN.to_vec();
+    push_len_prefixed(&mut out, &card.sign_pk);
+    push_len_prefixed(&mut out, &card.agree_pk);
+    push_opt_len_prefixed(&mut out, card.relay_url.as_deref().map(str::as_bytes));
+    push_opt_len_prefixed(&mut out, card.relay_token.as_deref().map(str::as_bytes));
+    push_len_prefixed(&mut out, card.name.as_bytes());
+    out
+}
+
+fn push_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn push_opt_len_prefixed(out: &mut Vec<u8>, value: Option<&[u8]>) {
+    match value {
+        None => out.push(0),
+        Some(bytes) => {
+            out.push(1);
+            push_len_prefixed(out, bytes);
+        }
+    }
+}
+
+/// Sign a card under its owner's Ed25519 secret key. Returns the raw 64-byte
+/// signature over [`friend_card_signed_bytes`].
+fn sign_friend_card(card: &FriendCard, sign_sk: &[u8]) -> Result<Vec<u8>, CoreError> {
+    let signing_key = signing_key_from_bytes(sign_sk)?;
+    Ok(signing_key
+        .sign(&friend_card_signed_bytes(card))
+        .to_bytes()
+        .to_vec())
+}
+
+/// Verify a primary card's self-signature, the import-side half of TM-01.
+///
+/// * No signature (legacy v1/v2 card, or a pre-signature v3 card): accepted as
+///   unsigned — the fleet still holds these and must keep importing them. Such
+///   a card remains `agree_pk`-substitution-MITM-able via the safety-word gap;
+///   closing that is a later "require-signed" flip, not this change.
+/// * Signature present and valid against the card's own `sign_pk`: accepted.
+/// * Signature present but the wrong length or not verifying: rejected with
+///   [`CoreError::SignatureInvalid`]. A present-but-bad signature is NEVER
+///   silently treated as unsigned — that would let a tamperer strip the binding
+///   while keeping the card importable.
+fn verify_friend_card_self_signature(card: &FriendCard) -> Result<(), CoreError> {
+    let Some(signature) = card.signature.as_ref() else {
+        return Ok(());
+    };
+    let signature_bytes: [u8; FRIEND_CARD_SIGNATURE_LEN] = signature
+        .as_slice()
+        .try_into()
+        .map_err(|_| CoreError::SignatureInvalid)?;
+    let verifying_key = verifying_key_from_bytes(&card.sign_pk)?;
+    let signature = Signature::from_bytes(&signature_bytes);
+    verifying_key
+        .verify(&friend_card_signed_bytes(card), &signature)
+        .map_err(|_| CoreError::SignatureInvalid)
+}
+
+/// Deserialize + validate a friend card JSON without verifying the
+/// self-signature. Used by the emit path ([`make_friend_link`]), which operates
+/// on the caller's *own* freshly minted card, not on untrusted import input.
+/// The import entry point [`parse_friend_card`] layers signature verification
+/// on top of this.
+fn friend_card_from_json(json: &str) -> Result<FriendCard, CoreError> {
+    if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
+        return Err(CoreError::InvalidFriendCard(
+            "friend card is too large".to_string(),
+        ));
+    }
+    let card: FriendCard =
+        serde_json::from_str(json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    validate_friend_card(&card)?;
+    Ok(card)
 }
 
 /// Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
@@ -263,7 +385,11 @@ pub fn make_friend_card(
 /// cards already shared in the field keep working.
 #[uniffi::export]
 pub fn make_friend_link(card_json: String) -> Result<String, CoreError> {
-    let card = parse_friend_card(card_json)?;
+    // Emit path: the JSON is this phone's own card, so deserialize+validate
+    // without re-verifying its self-signature (verification is an import-side
+    // concern). This also keeps the emitter working for callers that mint a
+    // card with synthetic keys, e.g. wire-format golden vectors.
+    let card = friend_card_from_json(&card_json)?;
     if EMIT_FRIEND_LINK_V3 {
         let binary = encode_friend_card_binary_v3(&card)?;
         return Ok(format!(
@@ -336,12 +462,16 @@ fn decode_friend_card_binary(bytes: &[u8]) -> Result<FriendCard, CoreError> {
             "trailing bytes after friend card".to_string(),
         ));
     }
+    // The v2 wire layout is frozen (CP4 golden vectors pin it byte-for-byte)
+    // and predates the self-signature, so a v2 card is always unsigned. A
+    // signed card ships as v3 or as JSON.
     let card = FriendCard {
         name,
         sign_pk,
         agree_pk,
         relay_url,
         relay_token,
+        signature: None,
     };
     validate_friend_card(&card)?;
     Ok(card)
@@ -388,14 +518,32 @@ fn encode_friend_card_binary_v3(card: &FriendCard) -> Result<Vec<u8>, CoreError>
             "display name too long to encode".to_string(),
         ));
     }
-    let mut out = Vec::with_capacity(67 + name.len());
+    let mut out = Vec::with_capacity(68 + name.len());
     out.extend_from_slice(&card.sign_pk);
     out.extend_from_slice(&card.agree_pk);
     out.push(name.len() as u8);
     out.extend_from_slice(name);
     encode_v3_url_field(&mut out, card.relay_url.as_deref());
     encode_v3_token_field(&mut out, card.relay_token.as_deref());
+    encode_v3_signature_field(&mut out, card.signature.as_deref())?;
     Ok(out)
+}
+
+/// v3 self-signature field: `0x00` for an unsigned card, or `0x01 ‖ raw[64]`
+/// for a signed one. The signature is fixed-length (Ed25519), so no length
+/// prefix is needed. `validate_friend_card` has already checked the length.
+fn encode_v3_signature_field(out: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), CoreError> {
+    match value {
+        None => out.push(V3_SIG_TAG_NONE),
+        Some(signature) => {
+            if signature.len() != FRIEND_CARD_SIGNATURE_LEN {
+                return Err(CoreError::SignatureInvalid);
+            }
+            out.push(V3_SIG_TAG_PRESENT);
+            out.extend_from_slice(signature);
+        }
+    }
+    Ok(())
 }
 
 fn encode_v3_url_field(out: &mut Vec<u8>, value: Option<&str>) {
@@ -481,6 +629,7 @@ fn decode_friend_card_binary_v3(bytes: &[u8]) -> Result<FriendCard, CoreError> {
         .to_string();
     let relay_url = decode_v3_url_field(bytes, &mut pos)?;
     let relay_token = decode_v3_token_field(bytes, &mut pos)?;
+    let signature = decode_v3_signature_field(bytes, &mut pos)?;
     if pos != bytes.len() {
         return Err(CoreError::InvalidFriendCard(
             "trailing bytes after friend card".to_string(),
@@ -492,9 +641,25 @@ fn decode_friend_card_binary_v3(bytes: &[u8]) -> Result<FriendCard, CoreError> {
         agree_pk,
         relay_url,
         relay_token,
+        signature,
     };
     validate_friend_card(&card)?;
+    // v3 is an import path: a present-but-invalid self-signature is rejected,
+    // never silently downgraded to unsigned (TM-01).
+    verify_friend_card_self_signature(&card)?;
     Ok(card)
+}
+
+fn decode_v3_signature_field(bytes: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, CoreError> {
+    match read_binary_slice(bytes, pos, 1)?[0] {
+        V3_SIG_TAG_NONE => Ok(None),
+        V3_SIG_TAG_PRESENT => Ok(Some(
+            read_binary_slice(bytes, pos, FRIEND_CARD_SIGNATURE_LEN)?.to_vec(),
+        )),
+        other => Err(CoreError::InvalidFriendCard(format!(
+            "invalid signature tag {other}"
+        ))),
+    }
 }
 
 fn decode_v3_url_field(bytes: &[u8], pos: &mut usize) -> Result<Option<String>, CoreError> {
@@ -558,16 +723,16 @@ fn read_binary_slice<'a>(
 }
 
 /// Parse a friend-card JSON payload received via QR scan or pasted text.
+///
+/// This is an import (untrusted-input) entry point, so it verifies the card's
+/// self-signature: a legacy unsigned card is accepted, a validly signed card is
+/// accepted, and a card whose signature is present-but-invalid is rejected with
+/// [`CoreError::SignatureInvalid`] (TM-01). Friend-request payloads ride as
+/// this JSON, so requests are signature-checked here too.
 #[uniffi::export]
 pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
-    if json.len() > MAX_FRIEND_CARD_JSON_BYTES {
-        return Err(CoreError::InvalidFriendCard(
-            "friend card is too large".to_string(),
-        ));
-    }
-    let card: FriendCard =
-        serde_json::from_str(&json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
-    validate_friend_card(&card)?;
+    let card = friend_card_from_json(&json)?;
+    verify_friend_card_self_signature(&card)?;
     Ok(card)
 }
 
@@ -669,6 +834,15 @@ fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
             expected: 32,
             actual: card.agree_pk.len() as u32,
         });
+    }
+    // A present signature must be Ed25519-sized. A wrong length is a malformed
+    // signed card, not an unsigned one — reject rather than downgrade (TM-01).
+    if card
+        .signature
+        .as_ref()
+        .is_some_and(|sig| sig.len() != FRIEND_CARD_SIGNATURE_LEN)
+    {
+        return Err(CoreError::SignatureInvalid);
     }
     Ok(())
 }
@@ -1093,6 +1267,7 @@ mod tests {
             agree_pk: shared_person.agree_pk.clone(),
             relay_url: Some("https://relay.example".to_string()),
             relay_token: Some("deposit-token".to_string()),
+            signature: None,
         };
         let shared = create_shared_friend_card(sharer.clone(), card.clone(), 7, 1_000_000).unwrap();
         (sharer, shared_person, card, shared)
@@ -1564,6 +1739,7 @@ mod tests {
             agree_pk: vec![0x22; 32],
             relay_url: relay_url.map(str::to_string),
             relay_token: relay_token.map(str::to_string),
+            signature: None,
         }
     }
 
@@ -1649,10 +1825,11 @@ mod tests {
             .windows(OFFICIAL_URL.len())
             .any(|w| w == OFFICIAL_URL.as_bytes()));
         // 32 keys + 32 keys + 1 len + 4 name + 1 URL tag + 1 token tag + 1 len
-        // + 32 token bytes.
-        assert_eq!(encoded.len(), 104);
+        // + 32 token bytes + 1 signature tag (unsigned card).
+        assert_eq!(encoded.len(), 105);
         assert_eq!(encoded[69], V3_URL_TAG_OFFICIAL);
         assert_eq!(encoded[70], V3_TOKEN_TAG_HEX);
+        assert_eq!(encoded[104], V3_SIG_TAG_NONE);
 
         // Anything that is not that exact string is carried verbatim.
         for url in [
@@ -1710,6 +1887,8 @@ mod tests {
         wire.push(V3_TOKEN_TAG_VERBATIM);
         wire.extend_from_slice(&(HEX_TOKEN.len() as u16).to_be_bytes());
         wire.extend_from_slice(HEX_TOKEN.as_bytes());
+        // Unsigned card.
+        wire.push(V3_SIG_TAG_NONE);
 
         let card = decode_friend_card_binary_v3(&wire).unwrap();
         assert_eq!(card.relay_url.as_deref(), Some(OFFICIAL_URL));
@@ -1756,10 +1935,19 @@ mod tests {
         }
 
         let base = encode_friend_card_binary_v3(&v3_card("Dave", None, None)).unwrap();
-        assert_eq!(base.len(), 71);
+        // keys(64) + name_len(1) + "Dave"(4) + url tag(1) + token tag(1)
+        // + signature tag(1).
+        assert_eq!(base.len(), 72);
 
-        // Unknown URL tag / unknown token tag.
-        for (index, tag) in [(69usize, 0x03u8), (69, 0xff), (70, 0x03), (70, 0xff)] {
+        // Unknown URL tag / unknown token tag / unknown signature tag.
+        for (index, tag) in [
+            (69usize, 0x03u8),
+            (69, 0xff),
+            (70, 0x03),
+            (70, 0xff),
+            (71, 0x02),
+            (71, 0xff),
+        ] {
             let mut bad = base.clone();
             bad[index] = tag;
             assert!(decode_friend_card_binary_v3(&bad).is_err());
@@ -1863,6 +2051,164 @@ mod tests {
         let mut card: FriendCard = serde_json::from_str(&json).unwrap();
         card.name = "x".repeat(MAX_DISPLAY_NAME_BYTES + 1);
         assert!(parse_friend_card(serde_json::to_string(&card).unwrap()).is_err());
+    }
+
+    // ---- TM-01: primary friend-card self-signature -------------------------
+
+    /// A card minted by `make_friend_card` carries a self-signature that
+    /// verifies on import, and the signed bytes cover the attenuated relay
+    /// token that actually ships (not the member token passed in).
+    #[test]
+    fn signed_card_json_round_trips_and_verifies() {
+        let id = generate_identity();
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id.clone(),
+            Some("https://relay.example".to_string()),
+            Some("family-token".to_string()),
+        )
+        .unwrap();
+        let card = parse_friend_card(json).expect("signed card verifies on import");
+        assert_eq!(card.signature.as_ref().map(Vec::len), Some(64));
+        assert_eq!(card.sign_pk, id.sign_pk);
+        assert_eq!(card.agree_pk, id.agree_pk);
+        // The signature is over the shipped (deposit-attenuated) token.
+        verify_friend_card_self_signature(&card).expect("re-verify");
+    }
+
+    /// The exact TM-01 attack: keep the victim's `sign_pk`/UserID (so the
+    /// verbal safety words still match) but swap `agree_pk` to the attacker's,
+    /// so messages would seal to the attacker. A signed card makes this a hard
+    /// rejection.
+    #[test]
+    fn tampered_agree_pk_in_signed_json_card_is_rejected() {
+        let victim = generate_identity();
+        let attacker = generate_identity();
+        let json = make_friend_card("Victim".to_string(), victim.clone(), None, None).unwrap();
+        let mut card: FriendCard = serde_json::from_str(&json).unwrap();
+        // sign_pk (and thus UserID / safety words) unchanged; agree_pk swapped.
+        card.agree_pk = attacker.agree_pk.clone();
+        let tampered = serde_json::to_string(&card).unwrap();
+        assert!(matches!(
+            parse_friend_card(tampered),
+            Err(CoreError::SignatureInvalid)
+        ));
+    }
+
+    /// Swapping the relay fields (where a card points its mail) on a signed
+    /// card is likewise rejected.
+    #[test]
+    fn tampered_relay_in_signed_json_card_is_rejected() {
+        let id = generate_identity();
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id,
+            Some("https://relay.example".to_string()),
+            Some("family-token".to_string()),
+        )
+        .unwrap();
+        let mut card: FriendCard = serde_json::from_str(&json).unwrap();
+        card.relay_url = Some("https://attacker.example".to_string());
+        assert!(matches!(
+            parse_friend_card(serde_json::to_string(&card).unwrap()),
+            Err(CoreError::SignatureInvalid)
+        ));
+    }
+
+    /// Legacy unsigned cards (no `signature` field at all, as every card in the
+    /// field predating this change) must still import — the fleet holds them.
+    #[test]
+    fn legacy_unsigned_json_card_still_imports() {
+        let id = generate_identity();
+        // A JSON blob with no signature field, exactly like an old client emits.
+        let legacy = format!(
+            "{{\"name\":\"Dave\",\"sign_pk\":{:?},\"agree_pk\":{:?},\"relay_url\":null,\"relay_token\":null}}",
+            id.sign_pk, id.agree_pk
+        );
+        let card = parse_friend_card(legacy).expect("legacy unsigned card imports");
+        assert!(card.signature.is_none());
+        assert_eq!(card.sign_pk, id.sign_pk);
+    }
+
+    /// A present-but-invalid signature is a hard reject, never a silent
+    /// downgrade to unsigned — otherwise a tamperer could keep the card
+    /// importable while breaking the binding.
+    #[test]
+    fn present_but_invalid_signature_is_rejected_not_downgraded() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id, None, None).unwrap();
+        let mut card: FriendCard = serde_json::from_str(&json).unwrap();
+        // Corrupt one byte of an otherwise well-formed 64-byte signature.
+        card.signature.as_mut().unwrap()[0] ^= 0x01;
+        assert!(matches!(
+            parse_friend_card(serde_json::to_string(&card).unwrap()),
+            Err(CoreError::SignatureInvalid)
+        ));
+
+        // A wrong-length signature is malformed, not unsigned.
+        let mut short = card.clone();
+        short.signature = Some(vec![0u8; 32]);
+        assert!(matches!(
+            parse_friend_card(serde_json::to_string(&short).unwrap()),
+            Err(CoreError::SignatureInvalid)
+        ));
+    }
+
+    /// A signed card survives a `CMFRIEND3:` binary round trip byte-for-byte,
+    /// signature included, and verifies on decode.
+    #[test]
+    fn signed_card_round_trips_through_v3_binary() {
+        let id = generate_identity();
+        let json = make_friend_card(
+            "Dave".to_string(),
+            id,
+            Some(crate::relay_setup::OFFICIAL_RELAY_URL.to_string()),
+            Some(HEX_TOKEN.to_string()),
+        )
+        .unwrap();
+        let card = parse_friend_card(json).unwrap();
+        assert!(card.signature.is_some());
+        let binary = encode_friend_card_binary_v3(&card).unwrap();
+        let decoded = decode_friend_card_binary_v3(&binary).expect("signed v3 card verifies");
+        assert_eq!(decoded, card);
+    }
+
+    /// Tampering `agree_pk` inside a signed `CMFRIEND3:` binary is rejected on
+    /// decode, the same guarantee the JSON path gives.
+    #[test]
+    fn tampered_agree_pk_in_signed_v3_binary_is_rejected() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id, None, None).unwrap();
+        let card = parse_friend_card(json).unwrap();
+        let mut binary = encode_friend_card_binary_v3(&card).unwrap();
+        // agree_pk occupies bytes [32..64].
+        binary[40] ^= 0x01;
+        assert!(matches!(
+            decode_friend_card_binary_v3(&binary),
+            Err(CoreError::SignatureInvalid)
+        ));
+    }
+
+    /// The signature is domain-separated: the same field bytes signed under the
+    /// friend-card domain never collide with any other signing context.
+    #[test]
+    fn friend_card_signed_bytes_are_domain_separated() {
+        let card = v3_card("Dave", Some("https://relay.example"), Some("abc"));
+        assert!(friend_card_signed_bytes(&card).starts_with(FRIEND_CARD_SIGN_DOMAIN));
+        assert_ne!(FRIEND_CARD_SIGN_DOMAIN, SHARED_CARD_SIGN_DOMAIN);
+    }
+
+    /// Documented residual: until the require-signed flip, the emitted v2 link
+    /// carries no signature, so a link shared today still imports as unsigned.
+    #[test]
+    fn emitted_v2_link_is_unsigned_and_imports() {
+        let id = generate_identity();
+        let json = make_friend_card("Dave".to_string(), id.clone(), None, None).unwrap();
+        let link = make_friend_link(json).unwrap();
+        assert!(link.starts_with(FRIEND_LINK_PREFIX_V2));
+        let card = parse_friend_text(link).expect("v2 link imports");
+        assert!(card.signature.is_none());
+        assert_eq!(friend_card_user_id(card), id.user_id);
     }
 
     #[test]
