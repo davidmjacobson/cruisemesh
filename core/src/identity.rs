@@ -31,13 +31,20 @@ const FRIEND_LINK_PREFIX_V2: &str = "CMFRIEND2:";
 const SHARED_CARD_PREFIX: &str = "CMSHARE1:";
 /// Compact link form v3 (`specs/friend-card-v3.md`): the v2 layout with the two
 /// compressible parts squeezed out — the hosted relay URL becomes a single tag
-/// byte, and a lowercase-hex relay token rides as raw bytes instead of ASCII.
-/// A typical hosted-relay card drops from ~265 to ~175 characters. Parsed now,
-/// emitted later (see [`EMIT_FRIEND_LINK_V3`]).
+/// byte, and a lowercase-hex relay token rides as raw bytes instead of ASCII —
+/// plus a trailing self-signature field. A typical hosted-relay card drops from
+/// ~265 to ~175 characters. This is the form [`make_friend_link`] now emits
+/// (see [`EMIT_FRIEND_LINK_V3`]).
 const FRIEND_LINK_PREFIX_V3: &str = "CMFRIEND3:";
 
-/// Flip to true only after the fleet parses CMFRIEND3 (see specs/friend-card-v3.md §Rollout).
-const EMIT_FRIEND_LINK_V3: bool = false;
+/// Phase 2 of the friend-card self-signing rollout (`specs/friend-card-v3.md`
+/// §Rollout): emit signed `CMFRIEND3:` links. The fleet has shipped the v3
+/// parser since #226, so older builds can read what we now emit, and the card's
+/// self-signature (TM-01) rides along in the v3 signature field. Phase 3
+/// (rejecting unsigned imports) is a LATER step, gated on the whole fleet
+/// running a build that emits signed cards — signed cards must be circulating
+/// before unsigned imports can be refused.
+const EMIT_FRIEND_LINK_V3: bool = true;
 
 /// v3 relay-URL field tags.
 const V3_URL_TAG_NONE: u8 = 0x00;
@@ -377,12 +384,14 @@ fn friend_card_from_json(json: &str) -> Result<FriendCard, CoreError> {
 }
 
 /// Compact, chat-app-safe text form of a FriendCard (T12). Emits the binary
-/// `CMFRIEND2:` form, which is ~half the size of the legacy JSON `CMFRIEND1:`
-/// form and so produces a much less dense QR code. A third, smaller form
-/// (`CMFRIEND3:`, `specs/friend-card-v3.md`) is fully implemented behind
-/// [`EMIT_FRIEND_LINK_V3`] but not emitted yet, because a build that predates
-/// it cannot read it. `parse_friend_text` accepts every form ever emitted, so
-/// cards already shared in the field keep working.
+/// `CMFRIEND3:` form (`specs/friend-card-v3.md`): smaller than the `CMFRIEND2:`
+/// form it replaces and, for an own card minted by [`make_friend_card`], it
+/// carries the card's self-signature (TM-01) so a shared link or QR binds the
+/// agreement key and relay to the identity. The fleet has parsed `CMFRIEND3:`
+/// since #226, so builds that predate this emit change can still read it, and
+/// `parse_friend_text` accepts every form ever emitted, so older `CMFRIEND1:` /
+/// `CMFRIEND2:` cards already shared in the field keep working. Rejecting
+/// unsigned imports is a later phase (see [`EMIT_FRIEND_LINK_V3`]).
 #[uniffi::export]
 pub fn make_friend_link(card_json: String) -> Result<String, CoreError> {
     // Emit path: the JSON is this phone's own card, so deserialize+validate
@@ -1554,8 +1563,10 @@ mod tests {
         assert_eq!(card.relay_token, Some("family-token".to_string()));
 
         // New-format card: byte-identical layout, deposit token in the same
-        // slot. Pinned end-to-end from make_friend_card + make_friend_link
-        // so any accidental format or derivation change fails here.
+        // slot. Pinned end-to-end from make_friend_card + the v2 binary encoder
+        // so any accidental format or derivation change fails here. The v2
+        // layout is still the wire form for SharedFriendCard, so it stays
+        // byte-frozen even though make_friend_link now emits CMFRIEND3.
         let identity = Identity {
             user_id: derive_user_id(&[0x11; 32]).to_vec(),
             sign_pk: vec![0x11; 32],
@@ -1570,7 +1581,12 @@ mod tests {
             Some("family-token".to_string()),
         )
         .unwrap();
-        assert_eq!(make_friend_link(json).unwrap(), NEW_FORMAT);
+        let card = friend_card_from_json(&json).unwrap();
+        let v2_link = format!(
+            "{FRIEND_LINK_PREFIX_V2}{}",
+            BASE64URL_NOPAD.encode(&encode_friend_card_binary(&card).unwrap())
+        );
+        assert_eq!(v2_link, NEW_FORMAT);
 
         let card = parse_friend_text(NEW_FORMAT.to_string()).expect("new-format card must parse");
         assert_eq!(
@@ -1584,7 +1600,7 @@ mod tests {
         let id = generate_identity();
         let json = make_friend_card("Dave".to_string(), id.clone(), None, None).unwrap();
         let link = make_friend_link(json).unwrap();
-        assert!(link.starts_with(FRIEND_LINK_PREFIX_V2));
+        assert!(link.starts_with(FRIEND_LINK_PREFIX_V3));
         let card = parse_friend_text(link).expect("valid link");
         assert_eq!(friend_card_user_id(card), id.user_id);
     }
@@ -1641,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn friend_link_emits_compact_v2_and_round_trips_with_relay() {
+    fn friend_link_emits_compact_v3_and_round_trips_with_relay() {
         let id = generate_identity();
         let json = make_friend_card(
             "Dave".to_string(),
@@ -1651,9 +1667,9 @@ mod tests {
         )
         .unwrap();
         let link = make_friend_link(json.clone()).unwrap();
-        assert!(link.starts_with(FRIEND_LINK_PREFIX_V2));
+        assert!(link.starts_with(FRIEND_LINK_PREFIX_V3));
 
-        let card = parse_friend_text(link.clone()).expect("valid v2 link");
+        let card = parse_friend_text(link.clone()).expect("valid v3 link");
         assert_eq!(card.name, "Dave");
         assert_eq!(card.sign_pk, id.sign_pk);
         assert_eq!(card.agree_pk, id.agree_pk);
@@ -2009,11 +2025,13 @@ mod tests {
         );
     }
 
-    /// Tripwire for the phase-2 flip: while the fleet still contains builds
-    /// that cannot read v3, we must keep emitting v2. Flipping
-    /// `EMIT_FRIEND_LINK_V3` is meant to fail here so it is a deliberate edit.
+    /// Phase 2 of the friend-card self-signing rollout: the own-card emit path
+    /// now emits a signed `CMFRIEND3:` link, and the emitted link actually
+    /// carries the self-signature (the whole point — a shared link/QR binds the
+    /// agreement key and relay to the identity). A one-byte tamper of the
+    /// emitted link's `agree_pk` is a hard rejection on import.
     #[test]
-    fn make_friend_link_still_emits_v2() {
+    fn make_friend_link_emits_signed_v3() {
         let id = generate_identity();
         let json = make_friend_card(
             "Dave".to_string(),
@@ -2023,8 +2041,29 @@ mod tests {
         )
         .unwrap();
         let link = make_friend_link(json).unwrap();
-        assert!(link.starts_with(FRIEND_LINK_PREFIX_V2));
-        assert!(!link.starts_with(FRIEND_LINK_PREFIX_V3));
+        // Emitted form is v3, not the old unsigned v2.
+        assert!(link.starts_with(FRIEND_LINK_PREFIX_V3));
+        assert!(!link.starts_with(FRIEND_LINK_PREFIX_V2));
+
+        // The emitted v3 link round-trips the card AND carries a verifying
+        // self-signature.
+        let card = parse_friend_text(link.clone()).expect("emitted v3 link imports");
+        assert!(
+            card.signature.is_some(),
+            "emitted link must carry signature"
+        );
+        verify_friend_card_self_signature(&card).expect("emitted signature verifies");
+
+        // Tamper one byte of the decoded agree_pk (bytes [32..64] of the v3
+        // binary) inside the emitted link: import must reject it.
+        let body = &link[FRIEND_LINK_PREFIX_V3.len()..];
+        let mut binary = BASE64URL_NOPAD.decode(body.as_bytes()).unwrap();
+        binary[40] ^= 0x01;
+        let tampered = format!("{FRIEND_LINK_PREFIX_V3}{}", BASE64URL_NOPAD.encode(&binary));
+        assert!(matches!(
+            parse_friend_text(tampered),
+            Err(CoreError::SignatureInvalid)
+        ));
     }
 
     #[test]
@@ -2198,16 +2237,18 @@ mod tests {
         assert_ne!(FRIEND_CARD_SIGN_DOMAIN, SHARED_CARD_SIGN_DOMAIN);
     }
 
-    /// Documented residual: until the require-signed flip, the emitted v2 link
-    /// carries no signature, so a link shared today still imports as unsigned.
+    /// Phase 2: the emitted v3 link is signed and imports, verifying its
+    /// self-signature. Rejecting *unsigned* imports is still a later phase, so
+    /// legacy unsigned cards keep importing (covered separately).
     #[test]
-    fn emitted_v2_link_is_unsigned_and_imports() {
+    fn emitted_v3_link_is_signed_and_imports() {
         let id = generate_identity();
         let json = make_friend_card("Dave".to_string(), id.clone(), None, None).unwrap();
         let link = make_friend_link(json).unwrap();
-        assert!(link.starts_with(FRIEND_LINK_PREFIX_V2));
-        let card = parse_friend_text(link).expect("v2 link imports");
-        assert!(card.signature.is_none());
+        assert!(link.starts_with(FRIEND_LINK_PREFIX_V3));
+        let card = parse_friend_text(link).expect("v3 link imports");
+        assert!(card.signature.is_some());
+        verify_friend_card_self_signature(&card).expect("emitted signature verifies");
         assert_eq!(friend_card_user_id(card), id.user_id);
     }
 
