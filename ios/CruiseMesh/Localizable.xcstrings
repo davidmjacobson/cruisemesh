@@ -633,6 +633,16 @@
         }
       }
     },
+    "Back to chats": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back to chats"
+          }
+        }
+      }
+    },
     "Back up account": {
       "localizations": {
         "en": {
@@ -1009,6 +1019,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Connectivity"
+          }
+        }
+      }
+    },
+    "Conversation no longer available": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversation no longer available"
+          }
+        }
+      }
+    },
+    "Conversation unavailable": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Conversation unavailable"
           }
         }
       }
