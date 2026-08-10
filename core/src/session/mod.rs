@@ -18,12 +18,19 @@
 //! is reachable only behind a whole-pass engine selection that defaults to
 //! the legacy engine.
 //!
+//! [`mesh_receive`] owns the inbound transaction: one call takes a peer frame
+//! and an explicit `now_ms`, runs the production dedupe/expiry/open/authorize/
+//! carry disposition in the store's own short transactions, and returns bounded
+//! intents. It is the single authority `core/tests/mesh_sim.rs` and (in D1) the
+//! shells' inbound processors call, replacing their duplicated receive logic.
+//!
 //! [`relay_shadow`] is the migration canary's read-only planner: pure
 //! functions over values a shell captured from a legacy pass, so the two
 //! engines can be compared without either of them running twice. It calls
 //! `relay_pass`'s own planning helpers rather than restating them, and it is
 //! deleted with the legacy engine it exists to check.
 
+pub mod mesh_receive;
 pub mod relay_pass;
 pub mod relay_policy;
 pub mod relay_shadow;
