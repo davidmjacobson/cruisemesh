@@ -143,14 +143,27 @@ enum UITestConfiguration {
             agreePk: peer.agreePk,
             relayUrl: nil,
             relayToken: nil,
-            nickname: nickname
+            nickname: nil
         )
+        let store = AppStore.get()
         do {
-            try AppStore.get().upsertContact(contact: contact)
+            try store.upsertContact(contact: contact)
+            if let nickname {
+                let nicknameSaved = try store.setContactNickname(
+                    userId: contact.userId,
+                    nickname: nickname
+                )
+                guard nicknameSaved else {
+                    preconditionFailure("Could not seed UI-test contact nickname")
+                }
+            }
         } catch {
             preconditionFailure("Could not seed UI-test contact: \(error)")
         }
-        return contact
+        guard let stored = try? store.getContact(userId: contact.userId) else {
+            preconditionFailure("Could not reload seeded UI-test contact")
+        }
+        return stored
     }
 
     private static func insertMessage(

@@ -215,13 +215,17 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
         let dad = app.staticTexts["Dad"].firstMatch
         XCTAssertTrue(dad.waitForExistence(timeout: 5), "Saved nickname should label the chat row")
+        let dadRow = app.cells.containing(.staticText, identifier: "Dad").firstMatch
+        XCTAssertTrue(dadRow.waitForExistence(timeout: 3))
 
-        dad.swipeLeft()
+        dadRow.swipeLeft()
         let markRead = app.buttons["Mark as read"]
         XCTAssertTrue(markRead.waitForExistence(timeout: 3))
         markRead.tap()
 
-        dad.swipeLeft()
+        let refreshedDadRow = app.cells.containing(.staticText, identifier: "Dad").firstMatch
+        XCTAssertTrue(refreshedDadRow.waitForExistence(timeout: 3))
+        refreshedDadRow.swipeLeft()
         XCTAssertFalse(app.buttons["Mark as read"].exists)
         let delete = app.buttons["Delete"]
         XCTAssertTrue(delete.waitForExistence(timeout: 3))
@@ -244,7 +248,11 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(inject.waitForExistence(timeout: 3))
         inject.tap()
 
-        let jump = element("chat.new-messages")
+        // Assert the control through the name VoiceOver users interact with.
+        // SwiftUI exposes this transient overlay as a labelled button on the
+        // current SDK, but does not propagate its view identifier into the
+        // accessibility snapshot.
+        let jump = app.buttons["New messages"].firstMatch
         XCTAssertTrue(jump.waitForExistence(timeout: 5))
         XCTAssertTrue(jump.isHittable)
         attachScreenshot(named: "Chat-new-messages-action")
