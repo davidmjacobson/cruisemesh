@@ -72,3 +72,30 @@ val ReplyIcon: ImageVector by lazy {
         pathData = "M10,9V5l-7,7 7,7v-4.1c5,0 8.5,1.6 11,5.1 -1,-5 -4,-10 -11,-11z",
     )
 }
+
+/** Outlined "content_copy" glyph for message actions. */
+val MessageCopyIcon: ImageVector by lazy {
+    materialIcon(
+        name = "MessageCopy",
+        pathData = "M16,1H4c-1.1,0 -2,0.9 -2,2v14h2V3h12V1zM19,5H8c-1.1,0 -2,0.9 -2,2v14c0,1.1 " +
+            "0.9,2 2,2h11c1.1,0 2,-0.9 2,-2V7c0,-1.1 -0.9,-2 -2,-2zM19,21H8V7h11v14z",
+    )
+}
+
+/** Filled "file_download" glyph for saving an image attachment. */
+val MessageSaveIcon: ImageVector by lazy {
+    materialIcon(
+        name = "MessageSave",
+        pathData = "M19,9h-4V3H9v6H5l7,7 7,-7zM5,18v2h14v-2H5z",
+    )
+}
+
+/** Outlined "info" glyph for message details. */
+val MessageInfoIcon: ImageVector by lazy {
+    materialIcon(
+        name = "MessageInfo",
+        pathData = "M11,17h2v-6h-2v6zM12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 " +
+            "10,-10S17.52,2 12,2zM12,20c-4.41,0 -8,-3.59 -8,-8s3.59,-8 8,-8 8,3.59 8,8 " +
+            "-3.59,8 -8,8zM11,9h2V7h-2v2z",
+    )
+}

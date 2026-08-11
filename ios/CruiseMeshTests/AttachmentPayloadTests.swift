@@ -48,4 +48,41 @@ final class AttachmentPayloadTests: XCTestCase {
         let voice = AttachmentPayload(mediaType: .audio, mimeType: "audio/mp4", durationMs: 4_200, blob: Data([1]))
         XCTAssertTrue(AttachmentPayload.previewLabel(voice).hasPrefix("🎤 Voice message"))
     }
+
+    func testMessageImageDataIsContextualToImageAttachments() {
+        let jpeg = Data([1, 2, 3])
+        let photo = stored(
+            kind: ProtocolKind.attachmentManifest,
+            payload: AttachmentPayload(
+                mediaType: .image,
+                mimeType: "image/jpeg",
+                durationMs: 0,
+                blob: jpeg
+            ).encode()
+        )
+        let audio = stored(
+            kind: ProtocolKind.attachmentManifest,
+            payload: AttachmentPayload(
+                mediaType: .audio,
+                mimeType: "audio/mp4",
+                durationMs: 1_000,
+                blob: Data([4])
+            ).encode()
+        )
+
+        XCTAssertEqual(messageImageData(photo), jpeg)
+        XCTAssertNil(messageImageData(audio))
+        XCTAssertNil(messageImageData(stored(kind: 1, payload: Data("hello".utf8))))
+    }
+
+    private func stored(kind: UInt8, payload: Data) -> StoredMessage {
+        StoredMessage(
+            chatId: Data([1]),
+            senderUserId: Data([2]),
+            lamport: 1,
+            timestamp: 1,
+            kind: kind,
+            payload: payload
+        )
+    }
 }

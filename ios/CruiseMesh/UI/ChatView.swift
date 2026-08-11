@@ -734,6 +734,10 @@ private struct MessageBubbleView: View {
                         .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
                 )
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
+                // Restrict the system targeted preview to the actual bubble.
+                // SwiftUI then performs the same source-frame-to-fitted-frame
+                // spring that Signal's custom iOS context menu implements.
+                .contentShape(.contextMenuPreview, bubbleShape)
                 // Simultaneous, not `.onTapGesture`: an exclusive tap gesture
                 // on the bubble swallows taps aimed at a link inside its text
                 // (6.6), and the tick legend is not worth a dead link. Both
@@ -748,6 +752,7 @@ private struct MessageBubbleView: View {
                     MessageActionsMenu(
                         canReply: canReply,
                         copyText: messageCopyText(message),
+                        imageData: messageImageData(message),
                         ownReaction: reactions.first(where: { $0.reactedByOwnUser })?.emoji,
                         onReact: onReact,
                         onReply: onReply,
@@ -755,6 +760,7 @@ private struct MessageBubbleView: View {
                             UIPasteboard.general.string = messageCopyText(message)
                             onStatus("Copied")
                         },
+                        onStatus: onStatus,
                         onInfo: { showInfo = true }
                     )
                 }
@@ -829,10 +835,7 @@ private struct MessageBubbleView: View {
                 case .image:
                     ChatImageView(
                         jpeg: attachment.blob,
-                        canReply: canReply,
-                        onReply: onReply,
-                        onOpen: onPhotoTap,
-                        onStatus: onStatus
+                        onOpen: onPhotoTap
                     )
                 case .audio:
                     VoiceMemoPlayerView(blob: attachment.blob, durationMs: attachment.durationMs)
@@ -1093,13 +1096,11 @@ struct MessageInfoSheet: View {
     }
 }
 
-/// Chat photo: keeps native aspect ratio and offers Save via long-press.
+/// Chat photo: keeps native aspect ratio. Its parent bubble owns the unified
+/// reaction/action menu, including contextual Save image.
 struct ChatImageView: View {
     let jpeg: Data
-    var canReply = false
-    var onReply: () -> Void = {}
     var onOpen: (Data) -> Void = { _ in }
-    var onStatus: (String) -> Void = { _ in }
 
     var body: some View {
         if let ui = UIImage(data: jpeg) {
@@ -1111,27 +1112,6 @@ struct ChatImageView: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     onOpen(jpeg)
-                }
-                .contextMenu {
-                    if canReply {
-                        Button(action: onReply) {
-                            Label("Reply", systemImage: "arrowshape.turn.up.left")
-                        }
-                    }
-                    Button {
-                        ImageGallery.saveJpeg(jpeg) { result in
-                            switch result {
-                            case .saved:
-                                onStatus("Saved to Photos")
-                            case .denied:
-                                onStatus("Photo Library access is required to save images. Enable it in Settings.")
-                            case .failed(let message):
-                                onStatus(message)
-                            }
-                        }
-                    } label: {
-                        Label("Save image", systemImage: "square.and.arrow.down")
-                    }
                 }
                 .accessibilityHint("Double-tap to view full screen; long-press for message options")
         } else {

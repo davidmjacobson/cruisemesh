@@ -58,11 +58,11 @@ class OverlayPlacementTest {
     }
 
     @Test
-    fun `bar one pixel past the top edge keeps bubble anchored and stacks controls below`() {
+    fun `bar one pixel past the top edge moves bubble down to make room`() {
         val result = compute(OverlayPlacement.Bounds(left = 50f, top = 57f, right = 250f, bottom = 107f))
-        assertEquals(57f, result.bubbleTop)
-        assertEquals(115f, result.barTop)
-        assertEquals(173f, result.menuTop)
+        assertEquals(58f, result.bubbleTop)
+        assertEquals(0f, result.barTop)
+        assertEquals(116f, result.menuTop)
     }
 
     @Test
@@ -74,11 +74,11 @@ class OverlayPlacementTest {
     }
 
     @Test
-    fun `menu one pixel past the bottom edge keeps bubble anchored and stacks controls above`() {
+    fun `menu one pixel past the bottom edge lifts bubble to make room`() {
         val result = compute(OverlayPlacement.Bounds(left = 50f, top = 643f, right = 250f, bottom = 693f))
-        assertEquals(643f, result.bubbleTop)
-        assertEquals(477f, result.barTop)
-        assertEquals(535f, result.menuTop)
+        assertEquals(642f, result.bubbleTop)
+        assertEquals(584f, result.barTop)
+        assertEquals(700f, result.menuTop)
     }
 
     @Test
@@ -94,13 +94,11 @@ class OverlayPlacementTest {
         assertNoOverlap(result)
     }
 
-    // Regression: Pixel 7 field repro (2026-07-23), device px. A 21-line bubble
-    // left ~435px above and ~255px below -- the menu fit in neither natural
-    // slot, and the old order (resolve overlap, then clamp) clamped the bar
-    // from y=45 back down onto the menu at y=223. The split arrangement keeps
-    // the menu above and moves the bar below instead.
+    // Pixel 7 field geometry (2026-07-23), device px. The complete stack fits
+    // by only ~95px, so this is the useful boundary case for Signal-style
+    // message motion: it must move the long bubble, not split the controls.
     @Test
-    fun `tall bubble with a cramped top splits menu above and bar below`() {
+    fun `tall bubble moves into the narrow complete-stack range`() {
         val result = compute(
             bounds = OverlayPlacement.Bounds(left = 252f, top = 622f, right = 1037f, bottom = 2040f),
             screenTop = 187f,
@@ -109,8 +107,9 @@ class OverlayPlacementTest {
             menuHeight = 396f,
             spacing = 21f,
         )
-        assertEquals(205f, result.menuTop) // 622 - 21 - 396, above the bubble
-        assertEquals(2061f, result.barTop) // 2040 + 21, below the bubble
+        assertEquals(460f, result.bubbleTop)
+        assertEquals(282f, result.barTop)
+        assertEquals(1899f, result.menuTop)
         assertNoOverlap(result, barHeight = 157f, menuHeight = 396f)
     }
 
@@ -125,13 +124,13 @@ class OverlayPlacementTest {
     }
 
     @Test
-    fun `bubble scrolled past the top keeps controls inside the viewport`() {
+    fun `bubble scrolled past the top moves into a complete fitted stack`() {
         val result = compute(
             bounds = OverlayPlacement.Bounds(left = 50f, top = -150f, right = 250f, bottom = 60f),
         )
-        // No room above the clipped anchor: bar and menu stack below it.
-        assertEquals(68f, result.barTop)
-        assertEquals(126f, result.menuTop)
+        assertEquals(58f, result.bubbleTop)
+        assertEquals(0f, result.barTop)
+        assertEquals(276f, result.menuTop)
         assertNoOverlap(result)
     }
 

@@ -49,6 +49,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -62,6 +63,7 @@ import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.media.KIND_GROUP_INVITE
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.MediaCompressor
 import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.isVisibleChatKind
@@ -279,6 +281,11 @@ fun GroupChatScreen(
                 val isOwn = message.senderUserId.contentEquals(ownUserId)
                 GroupMessageBubble(
                     message = message,
+                    isFocused = host.focused?.target == MessageTarget(
+                        message.senderUserId,
+                        message.lamport,
+                        message.kind,
+                    ),
                     isOwn = isOwn,
                     senderLabel = if (!isOwn && !grouping[index].joinsPrevious) {
                         senderName(message.senderUserId)
@@ -640,7 +647,8 @@ fun GroupChatScreen(
             val focusedGrouping = grouping.getOrNull(focusedIndex) ?: BubbleGrouping(joinsPrevious = false, joinsNext = false)
             val focusedShape = bubbleShapeFor(focusedIsOwn, focusedGrouping)
             val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
-            val focusedCopyText = remember(focusedMessage.payload) { String(focusedMessage.payload, Charsets.UTF_8) }
+            val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
+            val focusedImage = remember(focusedMessage.payload, focusedMessage.kind) { messageImageBytes(focusedMessage) }
             val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
             val focusedSenderLabel = if (!focusedIsOwn) senderName(focusedMessage.senderUserId) else null
             val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
@@ -666,6 +674,17 @@ fun GroupChatScreen(
                         Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                     }
                     closeOverlay()
+                },
+                onSaveImage = focusedImage?.let { jpeg ->
+                    {
+                        val saved = ImageGallery.saveJpeg(context, jpeg)
+                        Toast.makeText(
+                            context,
+                            if (saved != null) "Saved to Pictures/CruiseMesh" else "Could not save image",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                        closeOverlay()
+                    }
                 },
                 onInfo = {
                     host.openInfo(focusedMessage)
@@ -788,6 +807,7 @@ private fun GroupConversationTopBar(
 @Composable
 private fun GroupMessageBubble(
     message: StoredMessage,
+    isFocused: Boolean,
     isOwn: Boolean,
     senderLabel: String?,
     groupName: String,
@@ -854,6 +874,7 @@ private fun GroupMessageBubble(
                 onLongClick = { onLongPress(target, boundsInRoot) },
             ),
             modifier = Modifier
+                .alpha(if (isFocused) 0f else 1f)
                 .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                 .messageActions(
                     onLongClick = { onLongPress(target, boundsInRoot) },
