@@ -89,6 +89,14 @@ impl PeerHub {
         self.router.identified_routes().len()
     }
 
+    pub fn connected_user_ids(&self) -> Vec<Vec<u8>> {
+        self.router
+            .identified_routes()
+            .into_iter()
+            .map(|route| route.user_id)
+            .collect()
+    }
+
     pub async fn send_to_peer(&self, peer_user_id: &[u8], frame: Vec<u8>) -> bool {
         let sender = self
             .senders

@@ -8,6 +8,7 @@ description = "Always-on CruiseMesh helper node for Windows"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 cruisemesh-core = { path = "../core" }
 futures-util = "0.3"
