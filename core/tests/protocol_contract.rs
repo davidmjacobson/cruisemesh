@@ -109,8 +109,8 @@ const CONTRACT: &[Invariant] = &[
     },
     Invariant {
         id: "CARRY-01",
-        statement: "Sending or relay-uploading a carried row does not remove it; only digest/\
-                    receipt proof or expiry may.",
+        statement: "Sending or relay-uploading a carried row does not remove it; delivery proof, \
+                    expiry, or EVICT-01's low-trust pressure rule is required.",
         owner: Owner::Core("core/src/engine.rs confirm-carried + core/src/store.rs carry tests"),
     },
     Invariant {
@@ -118,6 +118,12 @@ const CONTRACT: &[Invariant] = &[
         statement: "Durable removal of a carried row requires an authenticated peer identity; an \
                     unauthenticated confirm may only suppress re-offering, never remove.",
         owner: Owner::Core("core/src/engine.rs confirm-carried authentication tests"),
+    },
+    Invariant {
+        id: "EVICT-01",
+        statement: "Carry pressure may evict only low-trust foreign rows; admitted family rows \
+                    survive, and rejected admissions remain retryable and observable.",
+        owner: Owner::Core("core/src/store.rs carry-pressure admission and eviction tests"),
     },
     Invariant {
         id: "CURSOR-01",
@@ -2527,6 +2533,9 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // tests), and the sender half is a classification plus a driven pass
     // (`dedup_01_a_conflict_is_classified_apart_and_never_retires_a_send` here,
     // and `relay_pass_replay.rs`), none of which is a JSONL replay fixture.
+    // EVICT-01 is likewise a local admission invariant: its executable
+    // incidents are small-budget SQLite tests in `store.rs`, not a relay-pass
+    // transcript.
     const NO_FIXTURE_NEEDED: &[&str] = &[
         "ACK-01",
         "ACK-02",
@@ -2536,6 +2545,7 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         "ENDPOINT-01",
         "UI-01",
         "DEDUP-01",
+        "EVICT-01",
     ];
 
     let mut covered: BTreeMap<String, Vec<&str>> = BTreeMap::new();
