@@ -940,6 +940,7 @@ fun GroupMessageBubbleVisual(
                     } else {
                         AttachmentBubbleContent(
                             attachment = attachment,
+                            messageKey = messageItemKey(message),
                             contentColor = contentColor,
                             isOwn = isOwn,
                             bodyActions = bodyActions,
