@@ -91,8 +91,10 @@ pub use groups::{
     GroupMetadataUpdate,
 };
 pub use identity::{
-    fingerprint_words, friend_card_match, generate_identity, make_friend_card, make_friend_link,
-    parse_friend_card, parse_friend_text, CoreError, FriendCard, FriendCardMatch, Identity,
+    create_shared_friend_card, fingerprint_words, format_user_id, friend_card_match,
+    friend_card_user_id, generate_identity, make_friend_card, make_friend_link,
+    make_shared_friend_request_payload, parse_friend_card, parse_friend_request_content,
+    parse_friend_text, CoreError, FriendCard, FriendCardMatch, FriendRequestContent, Identity,
 };
 pub use lan_session::{
     lan_default_tcp_port, lan_max_frame_size, lan_service_type, LanNoiseSession,
@@ -102,7 +104,7 @@ pub use lan_util::{
     core_format_lan_endpoint, core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
     core_make_lan_endpoint_link, core_parse_lan_endpoint, core_parse_lan_endpoint_link,
     core_subnet_24_hosts, lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local,
-    should_resend_lan_endpoint, CoreLanEndpoint,
+    lan_hosts_share_local_network, should_resend_lan_endpoint, CoreLanEndpoint,
 };
 pub use late_arrival::{
     core_late_arrival_flags, late_arrival_flags, LateArrivalInput, LATE_ARRIVAL_MIN_DELAY_MS,
