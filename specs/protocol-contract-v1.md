@@ -47,8 +47,9 @@ of it: the gap is now countable.
 |---|---|---|---|
 | `ACK-01` | Proxy/carry disposition never makes a relay copy ackable. `SEEN` is ackable only with permitted durable local-consumption proof. | core | `core/src/engine.rs` ack tests; index re-asserts `core_should_ack_inbound` |
 | `ACK-02` | Expiry computed from the client clock never authorizes an ack. Only durable consumption permits a relay-row delete; genuinely expired rows are pruned by the relay on its own server clock. | core | `core/src/engine.rs` ack tests; index re-asserts a client-clock expiry never authorizes an ack |
-| `CARRY-01` | Sending or relay-uploading a carried row does not remove it. Only verified peer digest/receipt proof or expiry permits removal. | core | `core/src/engine.rs` confirm-carried tests, `core/src/store.rs` carry tests; index re-asserts upload-then-survive |
+| `CARRY-01` | Sending or relay-uploading a carried row does not remove it. Removal requires verified peer digest/receipt proof, expiry, or the low-trust pressure rule in `EVICT-01`. | core | `core/src/engine.rs` confirm-carried tests, `core/src/store.rs` carry tests; index re-asserts upload-then-survive |
 | `CARRY-02` | Durable removal of a carried row requires an authenticated peer identity. An unauthenticated confirm (a bare BLE HELLO/digest) may only suppress re-offering for the encounter, never remove or retire a row. | core | `core/src/engine.rs` confirm-carried authentication tests; index re-asserts the authenticated-only removal gate |
+| `EVICT-01` | Carry pressure may evict only low-trust foreign rows. An admitted family row is never pressure-evicted; an admission that cannot fit its applicable foreign or total byte budget is rejected without itself authorizing seen/ack state, and records redacted evidence when the diagnostics ring is writable. | core | `core/src/store.rs` carry-pressure admission, eviction, and event tests |
 | `CURSOR-01` | A frontier advances only across a fully processed page whose required acks succeeded, and never moves backward on a normal pass. | core | `core/src/relay_cursor.rs` advance tests; index re-asserts `relay_cursor_advance` |
 | `PAGE-01` | Only an empty page is EOF. A short page continues. A non-empty non-advancing page terminates safely without unsafe advancement. | core | `core/src/relay_cursor.rs` walk-continuation tests; index re-asserts `relay_fetch_walk_continues` |
 | `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | core | `core/src/session/relay_policy.rs` owns request pacing, the exponential curve and its cap, the `Retry-After` floor, the stable identity jitter, the pending-rerun decision and the pass health fold; `relay_status.rs` owns the header clamp and the classification. Both shells delegate. The first clause — aborting the remaining stages — is completed by C0's pass |
@@ -100,10 +101,33 @@ unsafe.
 
 A carried envelope is the mesh's memory. Offering it over Bluetooth, or
 uploading it to a relay, proves only that this device did something — not
-that anyone received anything. A carried row is removed on exactly two
-grounds: a peer's digest or receipt naming the envelope, or expiry. This is
-the rule that makes an intermittently-connected fleet converge rather than
-silently lose mail at the first flaky link.
+that anyone received anything. Neither action removes the row. Normal
+retirement has exactly two grounds: a peer's digest or receipt naming the
+envelope, or expiry. The only resource-pressure exception is `EVICT-01`,
+which is restricted to low-trust foreign carry and is explicitly recorded.
+This is the rule that makes an intermittently-connected fleet converge
+rather than silently lose mail at the first flaky link.
+
+#### `EVICT-01` — pressure spends low-trust capacity, never admitted family mail
+
+The carry queue is bounded because an unauthenticated peer can manufacture
+foreign envelopes and can forge a public hint that happens to classify as
+family. That bound is enforced as an admission policy, not as permission to
+silently delete the oldest valuable row. Old foreign rows may be evicted to
+make room within the foreign and total byte budgets. An already-admitted
+family row is never selected for pressure eviction.
+
+If a new family or foreign row still cannot fit its applicable foreign or
+total byte budget after the eligible foreign rows are considered, the new row
+is rejected atomically. Rejection does not itself record its `msg_id` as seen
+or authorize an ack, so a carry-only inbound path permits a later copy to
+retry after capacity changes. Independent terminal work can still justify
+seen state — for example, a group row this device durably consumed locally —
+but proxy/carry disposition never justifies an ack. Foreign eviction and
+capacity rejection attempt bounded, redacted protocol events with byte and
+row counts only; as with every protocol event, a broken or unwritable
+diagnostics ring cannot fail the operational transaction. The events never
+carry a message id, recipient hint, ciphertext, identity, or endpoint.
 
 #### `CARRY-02` — only a peer you have authenticated may retire your copy
 
@@ -1039,7 +1063,9 @@ than left to be discovered.
 | `action_result_accepted` | a driver's result was applied | `session/relay_pass.rs` (dark) | `IDEMP-01` |
 | `action_result_stale_ignored` | a duplicate, late or wrong-pass result changed nothing | `session/relay_pass.rs` (dark) | `IDEMP-01` |
 | `budget_yield` | a pass stopped inside a declared budget rather than at the end of its work | `session/relay_pass.rs` (dark) | `LIVE-01`, `PROGRESS-01` |
+| `carried_row_evicted` | low-trust foreign rows were removed to enforce carry byte budgets | `store.rs` carry admission and migration | `EVICT-01`, `CARRY-01` |
 | `carried_row_marked` | a relay-uploaded carried row was durably marked | `session/relay_pass.rs` (dark), for the announce-time wholesale clear; C3 adds the per-row record | `MARK-01`, `CARRY-01` |
+| `carry_admission_rejected` | a new carried row could not fit without deleting admitted family mail | `store.rs` carry admission | `EVICT-01`, `CARRY-01` |
 | `continuation_scheduled` | a pass scheduled more work, with its progress reason | `session/relay_pass.rs` (dark) | `PROGRESS-01` |
 | `endpoint_recovered` | a contact endpoint answered again and its streak cleared | `store.rs` `clear_contact_relay_unreachable` | `SILENCE-01` |
 | `endpoint_rested` | a no-answer streak reached the rest threshold | `store.rs` `note_contact_relay_unreachable` | `SILENCE-01` |

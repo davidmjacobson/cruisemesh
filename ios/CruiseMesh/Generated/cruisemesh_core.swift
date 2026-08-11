@@ -4044,12 +4044,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes win eviction fights: foreign rows are evicted first. Foreign
-     * rows additionally share `foreign_budget_bytes`, and the entire queue
-     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
-     * grow it indefinitely. Resource eviction is never reported as delivery
-     * and never produces a receipt or relay ack. All of this happens in one
-     * transaction.
+     * envelopes are never pressure-evicted. Foreign rows additionally share
+     * `foreign_budget_bytes`, and the entire queue has a 64 MiB sealed-byte
+     * admission ceiling so a forged family hint cannot grow it indefinitely.
+     * Pressure may evict older foreign rows; if the new row still cannot fit,
+     * admission fails without marking it seen or acking it, so a later copy
+     * can retry. Every pressure loss/rejection attempts a redacted protocol
+     * event; diagnostics failure never fails admission work. All of this
+     * happens in one transaction.
      */
     func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64) throws  -> Bool
     
@@ -4070,7 +4072,10 @@ public protocol MessageStoreProtocol : AnyObject {
      * / [`MessageStore::carried_envelopes_for_peer_sync`] so we can hand it
      * to the real recipient over BLE. `INSERT OR IGNORE` keyed on `msg_id`,
      * so re-fetching the same still-unacked proxy envelope on a later poll
-     * pass is a no-op. Returns whether a new row was inserted.
+     * pass is a no-op. Returns whether a new row was admitted. A capacity
+     * rejection returns an error so a carry-only inbound path leaves the
+     * relay row unacked and can present it again after space becomes
+     * available.
      */
     func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64) throws  -> Bool
     
@@ -4350,6 +4355,9 @@ public protocol MessageStoreProtocol : AnyObject {
      * * `Carried` — newly persisted as a relay-sourced carried row, so it is
      * delivered over the mesh and never re-uploaded. Never acked
      * (`ACK-01`): muling is not consuming.
+     * * `Failed` — a valid new row could not fit its applicable foreign or
+     * total budget. The candidate is removed again in the same transaction,
+     * remains unacked, and holds the frontier so it can retry.
      *
      * `Consumed` is deliberately absent. Until D0 lands, a row this device is
      * the true endpoint for is carried rather than opened, which costs a
@@ -6541,12 +6549,14 @@ open func deliveryHintsForPeer(peerUserId: Data, nowMs: Int64)throws  -> [Data] 
      * `is_family` marks whether this envelope is addressed to someone this
      * node knows (its `recipient_hint` matched a contact -- the caller
      * decides, since it holds the contacts and the hint derivation). Family
-     * envelopes win eviction fights: foreign rows are evicted first. Foreign
-     * rows additionally share `foreign_budget_bytes`, and the entire queue
-     * has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
-     * grow it indefinitely. Resource eviction is never reported as delivery
-     * and never produces a receipt or relay ack. All of this happens in one
-     * transaction.
+     * envelopes are never pressure-evicted. Foreign rows additionally share
+     * `foreign_budget_bytes`, and the entire queue has a 64 MiB sealed-byte
+     * admission ceiling so a forged family hint cannot grow it indefinitely.
+     * Pressure may evict older foreign rows; if the new row still cannot fit,
+     * admission fails without marking it seen or acking it, so a later copy
+     * can retry. Every pressure loss/rejection attempts a redacted protocol
+     * event; diagnostics failure never fails admission work. All of this
+     * happens in one transaction.
      */
 open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, receivedAtMs: Int64, foreignBudgetBytes: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -6576,7 +6586,10 @@ open func enqueueCarriedEnvelope(envelope: CarriedEnvelope, isFamily: Bool, rece
      * / [`MessageStore::carried_envelopes_for_peer_sync`] so we can hand it
      * to the real recipient over BLE. `INSERT OR IGNORE` keyed on `msg_id`,
      * so re-fetching the same still-unacked proxy envelope on a later poll
-     * pass is a no-op. Returns whether a new row was inserted.
+     * pass is a no-op. Returns whether a new row was admitted. A capacity
+     * rejection returns an error so a carry-only inbound path leaves the
+     * relay row unacked and can present it again after space becomes
+     * available.
      */
 open func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -6991,6 +7004,9 @@ open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
      * * `Carried` — newly persisted as a relay-sourced carried row, so it is
      * delivered over the mesh and never re-uploaded. Never acked
      * (`ACK-01`): muling is not consuming.
+     * * `Failed` — a valid new row could not fit its applicable foreign or
+     * total budget. The candidate is removed again in the same transaction,
+     * remains unacked, and holds the frontier so it can retry.
      *
      * `Consumed` is deliberately absent. Until D0 lands, a row this device is
      * the true endpoint for is carried rather than opened, which costs a
@@ -33622,10 +33638,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delivery_hints_for_peer() != 55681) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 15186) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_carried_envelope() != 34720) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 14046) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 33391) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {
@@ -33688,7 +33704,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 35783) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 54199) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message() != 27136) {

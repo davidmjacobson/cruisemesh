@@ -1087,7 +1087,8 @@ impl MessageStore {
         // relay; NULL = never confirmed anywhere. Consulted ONLY by
         // `family_carried_envelopes` (the relay-upload query); no removal
         // path reads it -- a carried envelope is still dropped only on
-        // digest-proof of receipt, eviction, or expiry. Without it every
+        // digest-proof of receipt, EVICT-01 foreign-pressure eviction, or
+        // expiry. Without it every
         // sync pass re-posted the same head-of-queue envelopes for their
         // whole seven-day life, burning the family's shared relay rate
         // budget and starving rows behind the batch limit of their first
@@ -5774,12 +5775,14 @@ impl MessageStore {
     /// `is_family` marks whether this envelope is addressed to someone this
     /// node knows (its `recipient_hint` matched a contact -- the caller
     /// decides, since it holds the contacts and the hint derivation). Family
-    /// envelopes win eviction fights: foreign rows are evicted first. Foreign
-    /// rows additionally share `foreign_budget_bytes`, and the entire queue
-    /// has a hard 64 MiB sealed-byte ceiling so a forged family hint cannot
-    /// grow it indefinitely. Resource eviction is never reported as delivery
-    /// and never produces a receipt or relay ack. All of this happens in one
-    /// transaction.
+    /// envelopes are never pressure-evicted. Foreign rows additionally share
+    /// `foreign_budget_bytes`, and the entire queue has a 64 MiB sealed-byte
+    /// admission ceiling so a forged family hint cannot grow it indefinitely.
+    /// Pressure may evict older foreign rows; if the new row still cannot fit,
+    /// admission fails without marking it seen or acking it, so a later copy
+    /// can retry. Every pressure loss/rejection attempts a redacted protocol
+    /// event; diagnostics failure never fails admission work. All of this
+    /// happens in one transaction.
     pub fn enqueue_carried_envelope(
         &self,
         envelope: CarriedEnvelope,
@@ -5787,50 +5790,14 @@ impl MessageStore {
         received_at_ms: i64,
         foreign_budget_bytes: i64,
     ) -> Result<bool, CoreError> {
-        validate_carried_envelope(&envelope, received_at_ms)?;
-        let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
-        let mut conn = lock_conn(&self.conn);
-        let tx = conn.transaction().map_err(store_err)?;
-        let size = envelope.sealed.len() as i64;
-        let changed = tx
-            .execute(
-                "INSERT OR IGNORE INTO carried_envelopes
-                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
-                     received_at, size_bytes, content_digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    envelope.msg_id,
-                    envelope.hop_ttl as i64,
-                    envelope.expiry,
-                    envelope.recipient_hint,
-                    envelope.sealed,
-                    is_family as i64,
-                    received_at_ms,
-                    size,
-                    content_digest,
-                ],
-            )
-            .map_err(store_err)?;
-
-        if changed == 0 {
-            // Already carrying this msg_id: nothing inserted, so the budget
-            // can't have grown -- skip eviction.
-            tx.commit().map_err(store_err)?;
-            return Ok(false);
-        }
-
-        tx.execute(
-            "DELETE FROM carried_envelopes WHERE expiry <= ?1",
-            params![received_at_ms],
-        )
-        .map_err(store_err)?;
-        enforce_carried_budgets(
-            &tx,
-            foreign_budget_bytes.max(0),
+        enqueue_carried_envelope_with_budgets(
+            self,
+            envelope,
+            is_family,
+            received_at_ms,
+            foreign_budget_bytes,
             DEFAULT_TOTAL_CARRY_BUDGET_BYTES,
-        )?;
-        tx.commit().map_err(store_err)?;
-        Ok(true)
+        )
     }
 
     /// Store an envelope pulled FROM the relay that we're proxying for its
@@ -5849,45 +5816,21 @@ impl MessageStore {
     /// / [`MessageStore::carried_envelopes_for_peer_sync`] so we can hand it
     /// to the real recipient over BLE. `INSERT OR IGNORE` keyed on `msg_id`,
     /// so re-fetching the same still-unacked proxy envelope on a later poll
-    /// pass is a no-op. Returns whether a new row was inserted.
+    /// pass is a no-op. Returns whether a new row was admitted. A capacity
+    /// rejection returns an error so a carry-only inbound path leaves the
+    /// relay row unacked and can present it again after space becomes
+    /// available.
     pub fn enqueue_relay_carried_envelope(
         &self,
         envelope: CarriedEnvelope,
         now_ms: i64,
     ) -> Result<bool, CoreError> {
-        validate_carried_envelope(&envelope, now_ms)?;
-        let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
-        let mut conn = lock_conn(&self.conn);
-        let tx = conn.transaction().map_err(store_err)?;
-        let size = envelope.sealed.len() as i64;
-        let changed = tx
-            .execute(
-                "INSERT OR IGNORE INTO carried_envelopes
-                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
-                     received_at, size_bytes, from_relay, content_digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1, ?8)",
-                params![
-                    envelope.msg_id,
-                    envelope.hop_ttl as i64,
-                    envelope.expiry,
-                    envelope.recipient_hint,
-                    envelope.sealed,
-                    now_ms,
-                    size,
-                    content_digest,
-                ],
-            )
-            .map_err(store_err)?;
-        if changed > 0 {
-            tx.execute(
-                "DELETE FROM carried_envelopes WHERE expiry <= ?1",
-                params![now_ms],
-            )
-            .map_err(store_err)?;
-            enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
-        }
-        tx.commit().map_err(store_err)?;
-        Ok(changed > 0)
+        enqueue_relay_carried_envelope_with_budget(
+            self,
+            envelope,
+            now_ms,
+            DEFAULT_TOTAL_CARRY_BUDGET_BYTES,
+        )
     }
 
     /// Carried envelopes whose `recipient_hint` matches any of `hints` and
@@ -6515,6 +6458,9 @@ impl MessageStore {
     /// * `Carried` — newly persisted as a relay-sourced carried row, so it is
     ///   delivered over the mesh and never re-uploaded. Never acked
     ///   (`ACK-01`): muling is not consuming.
+    /// * `Failed` — a valid new row could not fit its applicable foreign or
+    ///   total budget. The candidate is removed again in the same transaction,
+    ///   remains unacked, and holds the frontier so it can retry.
     ///
     /// `Consumed` is deliberately absent. Until D0 lands, a row this device is
     /// the true endpoint for is carried rather than opened, which costs a
@@ -6541,6 +6487,11 @@ impl MessageStore {
 
         let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+            params![now_ms],
+        )
+        .map_err(store_err)?;
         for envelope in envelopes {
             let carried = CarriedEnvelope {
                 msg_id: envelope.msg_id.clone(),
@@ -6594,8 +6545,20 @@ impl MessageStore {
                     )
                     .map_err(store_err)?;
                 if inserted > 0 {
-                    ingest.rows_ingested += 1;
-                    CoreInboundDisposition::Carried
+                    if finalize_carried_admission(
+                        &tx,
+                        &envelope.msg_id,
+                        true,
+                        size,
+                        i64::MAX,
+                        DEFAULT_TOTAL_CARRY_BUDGET_BYTES,
+                        now_ms,
+                    )? {
+                        ingest.rows_ingested += 1;
+                        CoreInboundDisposition::Carried
+                    } else {
+                        CoreInboundDisposition::Failed
+                    }
                 } else {
                     ingest.rows_already_known += 1;
                     CoreInboundDisposition::Seen
@@ -6607,9 +6570,6 @@ impl MessageStore {
                 disposition,
                 recipient_hint: envelope.recipient_hint,
             });
-        }
-        if ingest.rows_ingested > 0 {
-            enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
         }
         tx.commit().map_err(store_err)?;
 
@@ -7096,6 +7056,266 @@ fn carried_content_digest(recipient_hint: &[u8], sealed: &[u8]) -> Vec<u8> {
     digest
 }
 
+const CARRY_ADMISSION_CAPACITY_ERROR: &str =
+    "carry admission rejected: applicable byte budget cannot fit row";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CarriedBudgetEnforcement {
+    evicted_rows: i64,
+    evicted_bytes: i64,
+    total_bytes: i64,
+    within_budget: bool,
+}
+
+fn note_carried_row_eviction(
+    tx: &Transaction<'_>,
+    pressure: CarriedBudgetEnforcement,
+    now_ms: i64,
+) {
+    if pressure.evicted_rows == 0 {
+        return;
+    }
+    crate::protocol_event::note(
+        tx,
+        &[crate::protocol_event::ProtocolEventDraft::new(
+            crate::protocol_event::ProtocolEventCode::CarriedRowEvicted,
+            now_ms,
+            "foreign_rows_evicted",
+        )
+        .invariants(&["EVICT-01", "CARRY-01"])
+        .count("rows_evicted", pressure.evicted_rows)
+        .count("bytes_evicted", pressure.evicted_bytes)
+        .count("queue_bytes", pressure.total_bytes.max(0))],
+    );
+}
+
+fn note_carry_admission_rejected(
+    tx: &Transaction<'_>,
+    is_family: bool,
+    incoming_bytes: i64,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+    now_ms: i64,
+) {
+    let mut draft = crate::protocol_event::ProtocolEventDraft::new(
+        crate::protocol_event::ProtocolEventCode::CarryAdmissionRejected,
+        now_ms,
+        if is_family {
+            "family_admission_rejected"
+        } else {
+            "foreign_admission_rejected"
+        },
+    )
+    .invariants(&["EVICT-01", "CARRY-01"])
+    .count("incoming_bytes", incoming_bytes.max(0))
+    .count("total_budget_bytes", total_budget_bytes.max(0));
+    if !is_family {
+        draft = draft.count("foreign_budget_bytes", foreign_budget_bytes.max(0));
+    }
+    crate::protocol_event::note(tx, &[draft]);
+}
+
+/// Whether the just-inserted candidate can fit after every *other* foreign
+/// row has been evicted. Checking this before enforcement is what makes a
+/// failed admission atomic: an impossible candidate cannot destroy older
+/// foreign rows on its way to being rejected.
+fn carried_admission_can_fit(
+    tx: &Transaction<'_>,
+    is_family: bool,
+    incoming_bytes: i64,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+) -> Result<bool, CoreError> {
+    let family_bytes: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0)
+             FROM carried_envelopes WHERE is_family = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(store_err)?;
+    let total_budget_bytes = total_budget_bytes.max(0);
+    if is_family {
+        Ok(family_bytes <= total_budget_bytes)
+    } else {
+        Ok(incoming_bytes <= foreign_budget_bytes.max(0)
+            && family_bytes.saturating_add(incoming_bytes) <= total_budget_bytes)
+    }
+}
+
+/// Apply EVICT-01 to one row that was inserted in the caller's transaction.
+/// Returns `false` only after removing that same candidate and recording a
+/// redacted rejection. Existing family rows are never deletion candidates.
+fn finalize_carried_admission(
+    tx: &Transaction<'_>,
+    msg_id: &[u8],
+    is_family: bool,
+    incoming_bytes: i64,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+    now_ms: i64,
+) -> Result<bool, CoreError> {
+    if !carried_admission_can_fit(
+        tx,
+        is_family,
+        incoming_bytes,
+        foreign_budget_bytes,
+        total_budget_bytes,
+    )? {
+        tx.execute(
+            "DELETE FROM carried_envelopes WHERE msg_id = ?1",
+            params![msg_id],
+        )
+        .map_err(store_err)?;
+        note_carry_admission_rejected(
+            tx,
+            is_family,
+            incoming_bytes,
+            foreign_budget_bytes,
+            total_budget_bytes,
+            now_ms,
+        );
+        return Ok(false);
+    }
+
+    let pressure = enforce_carried_budgets_protecting(
+        tx,
+        foreign_budget_bytes,
+        total_budget_bytes,
+        Some(msg_id),
+    )?;
+    if !pressure.within_budget {
+        // The feasibility check above and this enforcement run under the same
+        // SQLite transaction, so this would mean the two rules drifted. Fail
+        // closed rather than silently accepting an over-budget row.
+        return Err(CoreError::Store(
+            "carry admission feasibility/enforcement mismatch".into(),
+        ));
+    }
+    note_carried_row_eviction(tx, pressure, now_ms);
+    Ok(true)
+}
+
+fn enqueue_carried_envelope_with_budgets(
+    store: &MessageStore,
+    envelope: CarriedEnvelope,
+    is_family: bool,
+    received_at_ms: i64,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+) -> Result<bool, CoreError> {
+    validate_carried_envelope(&envelope, received_at_ms)?;
+    let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
+    let msg_id = envelope.msg_id.clone();
+    let mut conn = lock_conn(&store.conn);
+    let tx = conn.transaction().map_err(store_err)?;
+    let size = envelope.sealed.len() as i64;
+    let changed = tx
+        .execute(
+            "INSERT OR IGNORE INTO carried_envelopes
+                (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                 received_at, size_bytes, content_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                envelope.msg_id,
+                envelope.hop_ttl as i64,
+                envelope.expiry,
+                envelope.recipient_hint,
+                envelope.sealed,
+                is_family as i64,
+                received_at_ms,
+                size,
+                content_digest,
+            ],
+        )
+        .map_err(store_err)?;
+
+    if changed == 0 {
+        // Already carrying this msg_id or content: nothing inserted, so the
+        // budget cannot have grown.
+        tx.commit().map_err(store_err)?;
+        return Ok(false);
+    }
+
+    tx.execute(
+        "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+        params![received_at_ms],
+    )
+    .map_err(store_err)?;
+    let admitted = finalize_carried_admission(
+        &tx,
+        &msg_id,
+        is_family,
+        size,
+        foreign_budget_bytes,
+        total_budget_bytes,
+        received_at_ms,
+    )?;
+    tx.commit().map_err(store_err)?;
+    if admitted {
+        Ok(true)
+    } else {
+        Err(CoreError::Store(CARRY_ADMISSION_CAPACITY_ERROR.into()))
+    }
+}
+
+fn enqueue_relay_carried_envelope_with_budget(
+    store: &MessageStore,
+    envelope: CarriedEnvelope,
+    now_ms: i64,
+    total_budget_bytes: i64,
+) -> Result<bool, CoreError> {
+    validate_carried_envelope(&envelope, now_ms)?;
+    let content_digest = carried_content_digest(&envelope.recipient_hint, &envelope.sealed);
+    let msg_id = envelope.msg_id.clone();
+    let mut conn = lock_conn(&store.conn);
+    let tx = conn.transaction().map_err(store_err)?;
+    let size = envelope.sealed.len() as i64;
+    let changed = tx
+        .execute(
+            "INSERT OR IGNORE INTO carried_envelopes
+                (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                 received_at, size_bytes, from_relay, content_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, 1, ?8)",
+            params![
+                envelope.msg_id,
+                envelope.hop_ttl as i64,
+                envelope.expiry,
+                envelope.recipient_hint,
+                envelope.sealed,
+                now_ms,
+                size,
+                content_digest,
+            ],
+        )
+        .map_err(store_err)?;
+    if changed == 0 {
+        tx.commit().map_err(store_err)?;
+        return Ok(false);
+    }
+
+    tx.execute(
+        "DELETE FROM carried_envelopes WHERE expiry <= ?1",
+        params![now_ms],
+    )
+    .map_err(store_err)?;
+    let admitted = finalize_carried_admission(
+        &tx,
+        &msg_id,
+        true,
+        size,
+        i64::MAX,
+        total_budget_bytes,
+        now_ms,
+    )?;
+    tx.commit().map_err(store_err)?;
+    if admitted {
+        Ok(true)
+    } else {
+        Err(CoreError::Store(CARRY_ADMISSION_CAPACITY_ERROR.into()))
+    }
+}
+
 /// Backfill the content-level dedupe key for existing stores and collapse
 /// pre-migration duplicates deterministically, keeping the oldest row. No
 /// deletion here is a delivery signal; this is local queue compaction only.
@@ -7199,30 +7419,46 @@ fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreErro
             .map_err(store_err)?;
     }
 
-    enforce_carried_budgets(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES)?;
+    let pressure =
+        enforce_carried_budgets_protecting(&tx, i64::MAX, DEFAULT_TOTAL_CARRY_BUDGET_BYTES, None)?;
+    note_carried_row_eviction(&tx, pressure, 0);
     tx.commit().map_err(store_err)
 }
 
+#[cfg(test)]
 fn enforce_carried_budgets(
     tx: &Transaction<'_>,
     foreign_budget_bytes: i64,
     total_budget_bytes: i64,
-) -> Result<(), CoreError> {
-    let mut foreign_total: i64 = tx
+) -> Result<CarriedBudgetEnforcement, CoreError> {
+    enforce_carried_budgets_protecting(tx, foreign_budget_bytes, total_budget_bytes, None)
+}
+
+fn enforce_carried_budgets_protecting(
+    tx: &Transaction<'_>,
+    foreign_budget_bytes: i64,
+    total_budget_bytes: i64,
+    protected_msg_id: Option<&[u8]>,
+) -> Result<CarriedBudgetEnforcement, CoreError> {
+    let (mut foreign_total, mut total): (i64, i64) = tx
         .query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0)
-             FROM carried_envelopes WHERE is_family = 0",
+            "SELECT COALESCE(SUM(CASE WHEN is_family = 0 THEN size_bytes ELSE 0 END), 0),
+                    COALESCE(SUM(size_bytes), 0)
+             FROM carried_envelopes",
             [],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(store_err)?;
+    let foreign_budget_bytes = foreign_budget_bytes.max(0);
+    let total_budget_bytes = total_budget_bytes.max(0);
+    let mut pressure = CarriedBudgetEnforcement::default();
     while foreign_total > foreign_budget_bytes {
         let oldest: Option<(Vec<u8>, i64)> = tx
             .query_row(
                 "SELECT msg_id, size_bytes FROM carried_envelopes
-                 WHERE is_family = 0
+                 WHERE is_family = 0 AND (?1 IS NULL OR msg_id != ?1)
                  ORDER BY received_at ASC, msg_id ASC LIMIT 1",
-                [],
+                params![protected_msg_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -7236,21 +7472,18 @@ fn enforce_carried_budgets(
         )
         .map_err(store_err)?;
         foreign_total = foreign_total.saturating_sub(size);
+        total = total.saturating_sub(size);
+        pressure.evicted_rows = pressure.evicted_rows.saturating_add(1);
+        pressure.evicted_bytes = pressure.evicted_bytes.saturating_add(size.max(0));
     }
 
-    let mut total: i64 = tx
-        .query_row(
-            "SELECT COALESCE(SUM(size_bytes), 0) FROM carried_envelopes",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(store_err)?;
-    while total > total_budget_bytes.max(0) {
+    while total > total_budget_bytes {
         let oldest: Option<(Vec<u8>, i64)> = tx
             .query_row(
                 "SELECT msg_id, size_bytes FROM carried_envelopes
-                 ORDER BY is_family ASC, received_at ASC, msg_id ASC LIMIT 1",
-                [],
+                 WHERE is_family = 0 AND (?1 IS NULL OR msg_id != ?1)
+                 ORDER BY received_at ASC, msg_id ASC LIMIT 1",
+                params![protected_msg_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -7263,9 +7496,14 @@ fn enforce_carried_budgets(
             params![msg_id],
         )
         .map_err(store_err)?;
+        foreign_total = foreign_total.saturating_sub(size);
         total = total.saturating_sub(size);
+        pressure.evicted_rows = pressure.evicted_rows.saturating_add(1);
+        pressure.evicted_bytes = pressure.evicted_bytes.saturating_add(size.max(0));
     }
-    Ok(())
+    pressure.total_bytes = total.max(0);
+    pressure.within_budget = foreign_total <= foreign_budget_bytes && total <= total_budget_bytes;
+    Ok(pressure)
 }
 
 /// Shared by [`MessageStore::highest_contiguous_lamport`] and
@@ -11045,6 +11283,46 @@ mod tests {
                 .unwrap(),
             2,
             "the receipt was recorded, not lost with the ring"
+        );
+
+        // EVICT-01 has two new ring call sites inside carry transactions.
+        // Neither a successful foreign eviction nor a capacity rejection may
+        // turn an optional diagnostics failure into operational data loss.
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"pressure-old", b"h1", 9_000, 60),
+            false,
+            1_000,
+            60,
+            60,
+        )
+        .unwrap());
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"pressure-family", b"h2", 9_000, 60),
+            true,
+            2_000,
+            60,
+            60,
+        )
+        .unwrap());
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"pressure-family".to_vec()]
+        );
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"pressure-reject", b"h3", 9_000, 1),
+            true,
+            3_000,
+            60,
+            60,
+        )
+        .is_err());
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"pressure-family".to_vec()],
+            "the rejected candidate is removed even when its evidence cannot be written"
         );
     }
 
@@ -16688,7 +16966,7 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_evicts_foreign_before_oldest_family() {
+    fn total_budget_evicts_foreign_but_never_family() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store
             .enqueue_carried_envelope(
@@ -16717,7 +16995,9 @@ mod tests {
 
         let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().unwrap();
-        enforce_carried_budgets(&tx, BIG_BUDGET, 200).unwrap();
+        let pressure = enforce_carried_budgets(&tx, BIG_BUDGET, 200).unwrap();
+        assert!(pressure.within_budget);
+        assert_eq!(pressure.evicted_rows, 1);
         tx.commit().unwrap();
         drop(conn);
 
@@ -16726,13 +17006,286 @@ mod tests {
 
         let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().unwrap();
-        enforce_carried_budgets(&tx, BIG_BUDGET, 100).unwrap();
+        let pressure = enforce_carried_budgets(&tx, BIG_BUDGET, 100).unwrap();
+        assert!(
+            !pressure.within_budget,
+            "family-only overage must remain visible instead of deleting a live row"
+        );
+        assert_eq!(pressure.evicted_rows, 0);
         tx.commit().unwrap();
         drop(conn);
         assert_eq!(
             store.carried_msg_ids(10).unwrap(),
+            vec![b"family-old".to_vec(), b"family-new".to_vec()]
+        );
+    }
+
+    #[test]
+    fn family_admission_rejects_atomically_and_retries_after_expiry_frees_space() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"family-old", b"h1", 1_500, 100),
+            true,
+            1_000,
+            BIG_BUDGET,
+            150,
+        )
+        .unwrap());
+
+        let candidate = carried(b"family-new", b"h2", 9_000, 100);
+        let error = enqueue_carried_envelope_with_budgets(
+            &store,
+            candidate.clone(),
+            true,
+            1_100,
+            BIG_BUDGET,
+            150,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Store(message) if message == CARRY_ADMISSION_CAPACITY_ERROR
+        ));
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"family-old".to_vec()]
+        );
+
+        let evidence = store.export_protocol_events_jsonl().unwrap();
+        assert!(evidence.contains(r#""code":"carry_admission_rejected""#));
+        assert!(evidence.contains(r#""outcome":"family_admission_rejected""#));
+        assert!(evidence.contains("EVICT-01"));
+        assert!(
+            !evidence.contains("family-new"),
+            "pressure evidence must not carry a raw msg_id"
+        );
+
+        // The rejected row was not retained as a duplicate/seen record. Once
+        // the old row expires, the exact same candidate can be admitted.
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store, candidate, true, 2_000, BIG_BUDGET, 150,
+        )
+        .unwrap());
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
             vec![b"family-new".to_vec()]
         );
+    }
+
+    #[test]
+    fn a_new_family_row_spends_foreign_capacity_before_admission() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (id, is_family, received_at) in [
+            (b"foreign".as_slice(), false, 1_000),
+            (b"family-old".as_slice(), true, 2_000),
+            (b"family-new".as_slice(), true, 3_000),
+        ] {
+            assert!(enqueue_carried_envelope_with_budgets(
+                &store,
+                carried(id, id, 9_000, 100),
+                is_family,
+                received_at,
+                BIG_BUDGET,
+                200,
+            )
+            .unwrap());
+        }
+
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"family-old".to_vec(), b"family-new".to_vec()]
+        );
+        let evidence = store.export_protocol_events_jsonl().unwrap();
+        assert!(evidence.contains(r#""code":"carried_row_evicted""#));
+        assert!(evidence.contains(r#""outcome":"foreign_rows_evicted""#));
+        assert!(evidence.contains(r#""rows_evicted":1"#));
+        assert!(evidence.contains(r#""bytes_evicted":100"#));
+    }
+
+    #[test]
+    fn foreign_admission_cannot_displace_family_or_poison_a_retry() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"family", b"family-hint", 9_000, 150),
+            true,
+            1_000,
+            BIG_BUDGET,
+            150,
+        )
+        .unwrap());
+        let candidate = carried(b"foreign", b"foreign-hint", 9_000, 10);
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            candidate.clone(),
+            false,
+            2_000,
+            BIG_BUDGET,
+            150,
+        )
+        .is_err());
+        assert_eq!(store.carried_msg_ids(10).unwrap(), vec![b"family".to_vec()]);
+
+        assert!(store.remove_carried_envelope(b"family".to_vec()).unwrap());
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store, candidate, false, 3_000, BIG_BUDGET, 150,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn oversized_foreign_admission_rejects_before_eviction_and_reports_its_budget() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"foreign-old", b"old-hint", 9_000, 40),
+            false,
+            1_000,
+            100,
+            1_000,
+        )
+        .unwrap());
+
+        let candidate = carried(b"foreign-big", b"big-hint", 9_000, 101);
+        let error = enqueue_carried_envelope_with_budgets(
+            &store,
+            candidate.clone(),
+            false,
+            2_000,
+            100,
+            1_000,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Store(message) if message == CARRY_ADMISSION_CAPACITY_ERROR
+        ));
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"foreign-old".to_vec()],
+            "an impossible candidate must not evict a useful older foreign row on its way out"
+        );
+
+        let evidence = store.export_protocol_events_jsonl().unwrap();
+        assert!(evidence.contains(r#""outcome":"foreign_admission_rejected""#));
+        assert!(evidence.contains(r#""incoming_bytes":101"#));
+        assert!(evidence.contains(r#""foreign_budget_bytes":100"#));
+        assert!(!evidence.contains("foreign-big"));
+
+        assert!(
+            enqueue_carried_envelope_with_budgets(&store, candidate, false, 3_000, 200, 1_000,)
+                .unwrap()
+        );
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"foreign-old".to_vec(), b"foreign-big".to_vec()]
+        );
+    }
+
+    #[test]
+    fn relay_proxy_admission_uses_the_same_family_preservation_rule() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(enqueue_carried_envelope_with_budgets(
+            &store,
+            carried(b"family", b"h1", 9_000, 100),
+            true,
+            1_000,
+            BIG_BUDGET,
+            100,
+        )
+        .unwrap());
+
+        let error = enqueue_relay_carried_envelope_with_budget(
+            &store,
+            carried(b"relay-proxy", b"h2", 9_000, 10),
+            2_000,
+            100,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Store(message) if message == CARRY_ADMISSION_CAPACITY_ERROR
+        ));
+        assert_eq!(store.carried_msg_ids(10).unwrap(), vec![b"family".to_vec()]);
+    }
+
+    #[test]
+    fn bulk_relay_page_capacity_failure_is_retryable_and_holds_the_page() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let existing_id = b"family-full-0001";
+        {
+            let conn = lock_conn(&store.conn);
+            conn.execute(
+                "INSERT INTO carried_envelopes
+                    (msg_id, hop_ttl, expiry, recipient_hint, sealed, is_family,
+                     received_at, size_bytes, from_relay, content_digest)
+                 VALUES (?1, 3, 9000, X'0102030405060708', zeroblob(?2), 1,
+                         1000, ?2, 0, X'01')",
+                params![existing_id.as_slice(), DEFAULT_TOTAL_CARRY_BUDGET_BYTES],
+            )
+            .unwrap();
+        }
+
+        let candidate_id = b"relay-rejected01".to_vec();
+        let ingest = store
+            .ingest_relay_page(
+                vec![CoreRelayFetchedEnvelope {
+                    id: 77,
+                    msg_id: candidate_id.clone(),
+                    hop_ttl: 3,
+                    recipient_hint: b"hint-123".to_vec(),
+                    sealed: vec![9; 10],
+                    expiry_ms: 9_000,
+                }],
+                2_000,
+                Some("p1-1".to_string()),
+                4,
+            )
+            .unwrap();
+
+        assert_eq!(ingest.rows_ingested, 0);
+        assert!(
+            !ingest.fully_processed,
+            "a failed row must hold the frontier"
+        );
+        assert_eq!(ingest.rows.len(), 1);
+        assert_eq!(ingest.rows[0].disposition, CoreInboundDisposition::Failed);
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![existing_id.to_vec()],
+            "the admitted family row survives and the rejected candidate leaves no dedupe poison"
+        );
+
+        let evidence = store.export_protocol_events_jsonl().unwrap();
+        assert!(evidence.contains(r#""code":"carry_admission_rejected""#));
+        assert!(!evidence.contains("relay-rejected01"));
+        assert!(
+            evidence.contains(r#""code":"page_ingested""#),
+            "the committed page transaction remains observable even when its frontier must hold"
+        );
+
+        // Free capacity and present the exact same relay row again. The first
+        // rejection did not create a carried row or any separate seen record.
+        assert!(store.remove_carried_envelope(existing_id.to_vec()).unwrap());
+        let retry = store
+            .ingest_relay_page(
+                vec![CoreRelayFetchedEnvelope {
+                    id: 77,
+                    msg_id: candidate_id,
+                    hop_ttl: 3,
+                    recipient_hint: b"hint-123".to_vec(),
+                    sealed: vec![9; 10],
+                    expiry_ms: 9_000,
+                }],
+                3_000,
+                Some("p2-1".to_string()),
+                4,
+            )
+            .unwrap();
+        assert!(retry.fully_processed);
+        assert_eq!(retry.rows_ingested, 1);
+        assert_eq!(retry.rows[0].disposition, CoreInboundDisposition::Carried);
     }
 
     // --- relay proxy-polling (from_relay) -----------------------------------
