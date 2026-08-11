@@ -1358,7 +1358,7 @@ private fun RecordingPill(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ConversationTopBar(
+internal fun ConversationTopBar(
     contact: Contact,
     displayId: String,
     displayName: String,
