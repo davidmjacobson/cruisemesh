@@ -7268,6 +7268,51 @@ fn enforce_carried_budgets(
     Ok(())
 }
 
+// Crate-linked node shells can finish the relay/inbound migration without
+// widening the UniFFI surface. CoreRelayPass intentionally persists fetched
+// rows first; these bounded queries let the same process subsequently present
+// only relay-sourced rows to `process_inbound_frame`. They expose no mutation:
+// consumption still goes through the shared inbound authority and an explicit
+// `remove_carried_envelope` only after delivery succeeds.
+impl MessageStore {
+    pub fn relay_sourced_carried_envelopes(
+        &self,
+        limit: u64,
+        now_ms: i64,
+    ) -> Result<Vec<CarriedEnvelope>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT msg_id, hop_ttl, expiry, recipient_hint, sealed
+                 FROM carried_envelopes
+                 WHERE from_relay = 1 AND expiry > ?1
+                 ORDER BY received_at ASC, msg_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![now_ms, limit as i64], row_to_carried)
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    pub fn non_relay_carried_msg_ids(&self, limit: u64) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT msg_id FROM carried_envelopes
+                 WHERE from_relay = 0
+                 ORDER BY received_at ASC, msg_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+}
+
 /// Shared by [`MessageStore::highest_contiguous_lamport`] and
 /// [`MessageStore::chat_digest`] (which needs it once per sender, under a
 /// single lock acquisition -- `Connection`'s `Mutex` isn't reentrant, so
