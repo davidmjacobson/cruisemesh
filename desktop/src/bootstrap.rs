@@ -1,4 +1,7 @@
-use std::{fs, sync::Arc};
+use std::{
+    fs,
+    sync::{Arc, RwLock},
+};
 
 use anyhow::{bail, Context, Result};
 use cruisemesh_core::{
@@ -30,12 +33,13 @@ pub struct BootstrapStatus {
 pub struct BootstrapStore {
     paths: AppPaths,
     identity: Identity,
-    config: NodeConfig,
+    config: RwLock<NodeConfig>,
     store: Arc<MessageStore>,
 }
 
 impl BootstrapStore {
     pub fn open(paths: AppPaths) -> Result<Self> {
+        crate::backup::apply_pending_restore(&paths)?;
         let config = NodeConfig::load_or_create(&paths.config)?;
         let identity = IdentityStore::new(paths.identity.clone()).load_or_create()?;
         let store = Arc::new(MessageStore::open(
@@ -44,7 +48,7 @@ impl BootstrapStore {
         Ok(Self {
             paths,
             identity,
-            config,
+            config: RwLock::new(config),
             store,
         })
     }
@@ -57,8 +61,31 @@ impl BootstrapStore {
         Arc::clone(&self.store)
     }
 
-    pub fn config(&self) -> &NodeConfig {
-        &self.config
+    pub fn config(&self) -> NodeConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    pub fn update_display_name(&self, display_name: String) -> Result<NodeConfig> {
+        let display_name = display_name.trim().to_string();
+        if display_name.is_empty() {
+            bail!("display name cannot be empty");
+        }
+        make_friend_card(display_name.clone(), self.identity.clone(), None, None)?;
+        let mut next = self.config();
+        next.display_name = display_name;
+        next.save(&self.paths.config)?;
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.clone();
+        Ok(next)
     }
 
     pub fn relay_config(&self) -> Result<Option<RelayConfig>> {
@@ -98,7 +125,7 @@ impl BootstrapStore {
             .map(|value| (Some(value.relay_url), Some(value.member_token)))
             .unwrap_or((None, None));
         make_friend_card(
-            self.config.display_name.clone(),
+            self.config().display_name,
             self.identity.clone(),
             url,
             token,
@@ -131,7 +158,7 @@ impl BootstrapStore {
     pub fn status(&self) -> Result<BootstrapStatus> {
         let relay_configured = self.relay_config()?.is_some();
         Ok(BootstrapStatus {
-            display_name: self.config.display_name.clone(),
+            display_name: self.config().display_name,
             user_id: cruisemesh_core::format_user_id(self.identity.user_id.clone()),
             relay_configured,
             contacts: self.store.list_contacts()?.len(),

@@ -44,20 +44,42 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop/ui/src-tauri -> target
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
       - name: Test CruiseMesh Helper
         run: cargo test -p cruisemesh-node
       - name: Clippy CruiseMesh Helper
         # Core has a documented pre-existing clippy backlog in the Ubuntu job.
         # This gate is for warnings introduced by the Windows shell itself.
         run: cargo clippy -p cruisemesh-node --all-targets --no-deps -- -D warnings
+      - name: Build messenger frontend
+        working-directory: desktop/ui
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Lint Tauri messenger host
+        run: cargo clippy --manifest-path desktop/ui/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Build Tauri messenger
+        working-directory: desktop/ui
+        run: npm run tauri build -- --no-bundle
       - name: Build dogfood helper
         run: cargo build --release -p cruisemesh-node
-      - name: Upload dogfood helper
+      - name: Upload Windows dogfood
         uses: actions/upload-artifact@v4
         with:
-          name: cruisemesh-helper-windows-x64
+          name: cruisemesh-windows-x64
           path: |
             target/release/cruisemesh-node.exe
+            desktop/ui/src-tauri/target/release/CruiseMesh.exe
             desktop/DOGFOOD.md
 
   android-units:

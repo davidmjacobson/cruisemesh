@@ -114,12 +114,12 @@ impl DeliveryDispatcher {
                             enabled: content.friends_of_friends_enabled,
                             revision: content.friends_of_friends_revision,
                         })?;
-                    let avatar_applied = self.store.set_contact_avatar(
+                    self.store.set_contact_avatar(
                         sender_user_id.clone(),
                         (!content.avatar.is_empty()).then_some(content.avatar),
                         content.avatar_epoch,
                     )?;
-                    if avatar_applied && contact.name != content.name {
+                    if contact.name != content.name {
                         contact.name = content.name;
                         self.store.upsert_contact(contact)?;
                     }

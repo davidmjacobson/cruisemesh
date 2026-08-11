@@ -500,6 +500,7 @@ name = "cruisemesh-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "cruisemesh-core",
  "futures-util",

@@ -1,7 +1,11 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 #[cfg(windows)]
+pub mod backup;
+#[cfg(windows)]
 pub mod bootstrap;
+#[cfg(windows)]
+pub mod chat;
 #[cfg(windows)]
 pub mod config;
 #[cfg(windows)]

@@ -52,6 +52,7 @@ pub async fn run(paths: AppPaths, bootstrap: Arc<BootstrapStore>) -> Result<()> 
     thread_rng().fill_bytes(&mut token);
     let listen_port = Arc::new(AtomicU16::new(0));
     let relay_nudge = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
     let services = SessionServices {
         identity: identity.clone(),
         store: store.clone(),
@@ -72,7 +73,9 @@ pub async fn run(paths: AppPaths, bootstrap: Arc<BootstrapStore>) -> Result<()> 
     let ipc_server = tokio::spawn(ipc::serve(
         bootstrap.clone(),
         hub.clone(),
+        inbound.clone(),
         relay_nudge.clone(),
+        shutdown.clone(),
     ));
     let hint_task = tokio::spawn(lan_hint_loop(
         store.clone(),
@@ -111,6 +114,7 @@ pub async fn run(paths: AppPaths, bootstrap: Arc<BootstrapStore>) -> Result<()> 
         result = cached_connector => result.context("cached endpoint task stopped")??,
         _ = tokio::signal::ctrl_c() => tracing::info!("shutdown requested"),
         _ = tray_quit => tracing::info!("tray requested shutdown"),
+        _ = shutdown.notified() => tracing::info!("restart requested to install a staged restore"),
         result = async {
             loop {
                 heartbeat.tick().await;
