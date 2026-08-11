@@ -16,6 +16,17 @@ import uniffi.cruisemesh_core.coreClassifyConnectionHealth
 
 class MeshStatusTextLogicTest {
 
+    @Test
+    fun `mesh status dot stays steady when system animations are disabled`() {
+        assertFalse(meshStatusDotShouldAnimate(statusWantsPulse = true, systemAnimationsEnabled = false))
+    }
+
+    @Test
+    fun `mesh status dot animates only for a pulsing state`() {
+        assertTrue(meshStatusDotShouldAnimate(statusWantsPulse = true, systemAnimationsEnabled = true))
+        assertFalse(meshStatusDotShouldAnimate(statusWantsPulse = false, systemAnimationsEnabled = true))
+    }
+
     private companion object {
         const val NOW = 1_760_000_000_000L
 
