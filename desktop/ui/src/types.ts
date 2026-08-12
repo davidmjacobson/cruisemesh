@@ -3,23 +3,33 @@ export type ConversationKind = "person" | "group";
 
 export interface Profile {
   display_name: string;
-  formatted_user_id: string;
   friend_link: string;
   fingerprint_words: string[];
 }
 
 export interface NodeStatus {
-  display_name: string;
-  user_id: string;
   relay_configured: boolean;
   contacts: number;
   reduced_mode: boolean;
+}
+
+export interface Preferences {
+  prevent_sleep_on_ac: boolean;
+  share_online: boolean;
+}
+
+export interface Diagnostics {
+  helper_version: string;
+  listening_port: number;
+  data_directory: string;
+  logs_directory: string;
 }
 
 export interface Contact {
   id: string;
   display_name: string;
   connected_lan: boolean;
+  internet_delivery_configured: boolean;
   fingerprint_words: string[];
 }
 
@@ -38,6 +48,8 @@ export interface ConversationSummary {
 export interface AppSnapshot {
   profile: Profile;
   node: NodeStatus;
+  preferences: Preferences;
+  diagnostics: Diagnostics;
   lan_peers: number;
   contacts: Contact[];
   conversations: ConversationSummary[];

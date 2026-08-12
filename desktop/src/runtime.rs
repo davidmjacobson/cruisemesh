@@ -76,6 +76,7 @@ pub async fn run(paths: AppPaths, bootstrap: Arc<BootstrapStore>) -> Result<()> 
         inbound.clone(),
         relay_nudge.clone(),
         shutdown.clone(),
+        listening_port,
     ));
     let hint_task = tokio::spawn(lan_hint_loop(
         store.clone(),

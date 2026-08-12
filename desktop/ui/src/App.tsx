@@ -13,16 +13,16 @@ import {
   MessageBar,
   MessageBarBody,
   Spinner,
+  Switch,
   Text,
   Textarea,
-  Tooltip,
 } from "@fluentui/react-components";
 import {
   Add24Regular,
   ArrowReply24Regular,
   Attach24Regular,
   Chat24Regular,
-  Checkmark16Regular,
+  CheckmarkCircle16Filled,
   CheckmarkCircle16Regular,
   Dismiss16Regular,
   Group24Regular,
@@ -42,7 +42,14 @@ import { QRCodeSVG } from "qrcode.react";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { prepareAttachment } from "./media";
-import { friendWebLink, kindNumber, tickLabel } from "./presentation";
+import {
+  connectionSummary,
+  contactRouteLabel,
+  friendWebLink,
+  kindNumber,
+  tickLabel,
+  tickVisual,
+} from "./presentation";
 import type {
   AppSnapshot,
   Conversation,
@@ -67,10 +74,12 @@ function formatTime(timestamp?: number): string {
 }
 
 function TickIcon({ tick }: { tick?: Tick }) {
-  if (!tick) return null;
+  const visual = tickVisual(tick);
+  if (!tick || !visual) return null;
+  const Glyph = visual.filled ? CheckmarkCircle16Filled : CheckmarkCircle16Regular;
   return (
     <span className={`tick tick-${tick}`} aria-label={tickLabel(tick)} title={tickLabel(tick)}>
-      {tick === "sent" ? <Checkmark16Regular /> : <CheckmarkCircle16Regular />}
+      {Array.from({ length: visual.count }, (_, index) => <Glyph key={index} aria-hidden />)}
     </span>
   );
 }
@@ -309,6 +318,18 @@ export function App() {
     }
   }
 
+  async function updatePreferences(preventSleepOnAc: boolean, shareOnline: boolean) {
+    setBusy(true);
+    try {
+      await api.setPreferences(preventSleepOnAc, shareOnline);
+      await refreshSnapshot();
+    } catch (nextError) {
+      setError(errorText(nextError));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function react(message: Message, emoji: string) {
     if (!selectedId) return;
     try {
@@ -365,12 +386,8 @@ export function App() {
             </div>
           </div>
           <div className="header-actions">
-            <Tooltip content="Add friend" relationship="label">
-              <Button appearance="subtle" icon={<Add24Regular />} onClick={() => setDialog("friend")} />
-            </Tooltip>
-            <Tooltip content="New group" relationship="label">
-              <Button appearance="subtle" icon={<Group24Regular />} onClick={() => setDialog("group")} />
-            </Tooltip>
+            <Button appearance="subtle" icon={<Add24Regular />} aria-label="Add friend" title="Add friend" onClick={() => setDialog("friend")} />
+            <Button appearance="subtle" icon={<Group24Regular />} aria-label="New group" title="New group" onClick={() => setDialog("group")} />
           </div>
         </header>
         <nav className="conversation-list">
@@ -414,6 +431,7 @@ export function App() {
             profileName={profileName}
             setProfileName={setProfileName}
             updateProfile={() => void updateProfile()}
+            updatePreferences={(preventSleepOnAc, shareOnline) => void updatePreferences(preventSleepOnAc, shareOnline)}
           />
         ) : conversation ? (
           <section className="chat" aria-label={`Conversation with ${conversation.title}`}>
@@ -462,9 +480,7 @@ export function App() {
                   accept="image/*,audio/*"
                   onChange={(event) => void attach(event.target.files?.[0])}
                 />
-                <Tooltip content="Attach photo or recording" relationship="label">
-                  <Button type="button" appearance="subtle" icon={<Attach24Regular />} disabled={busy} onClick={() => fileInput.current?.click()} />
-                </Tooltip>
+                <Button type="button" appearance="subtle" icon={<Attach24Regular />} aria-label="Attach photo or recording" title="Attach photo or recording" disabled={busy} onClick={() => fileInput.current?.click()} />
                 <VoiceButton disabled={busy} onRecorded={(file) => void attach(file)} onError={(value) => setError(value)} />
                 <Textarea
                   aria-label="Message"
@@ -584,19 +600,88 @@ function VoiceButton({ disabled, onRecorded, onError }: { disabled: boolean; onR
       onError(errorText(error));
     }
   }
-  return <Tooltip content={recording ? "Stop recording" : "Record voice message"} relationship="label"><Button type="button" appearance={recording ? "primary" : "subtle"} icon={<Mic24Regular />} disabled={disabled} onClick={() => void toggle()} /></Tooltip>;
+  const label = recording ? "Stop recording" : "Record voice message";
+  return <Button type="button" appearance={recording ? "primary" : "subtle"} icon={<Mic24Regular />} aria-label={label} title={label} disabled={disabled} onClick={() => void toggle()} />;
 }
 
-function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard, busy, backupPassphrase, setBackupPassphrase, exportBackup, restoreBackup, profileName, setProfileName, updateProfile }: { snapshot: AppSnapshot; relayText: string; setRelayText: (value: string) => void; importRelay: () => void; showCard: () => void; busy: boolean; backupPassphrase: string; setBackupPassphrase: (value: string) => void; exportBackup: () => void; restoreBackup: () => void; profileName: string; setProfileName: (value: string) => void; updateProfile: () => void }) {
+function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard, busy, backupPassphrase, setBackupPassphrase, exportBackup, restoreBackup, profileName, setProfileName, updateProfile, updatePreferences }: { snapshot: AppSnapshot; relayText: string; setRelayText: (value: string) => void; importRelay: () => void; showCard: () => void; busy: boolean; backupPassphrase: string; setBackupPassphrase: (value: string) => void; exportBackup: () => void; restoreBackup: () => void; profileName: string; setProfileName: (value: string) => void; updateProfile: () => void; updatePreferences: (preventSleepOnAc: boolean, shareOnline: boolean) => void }) {
+  const connection = connectionSummary(snapshot.lan_peers, snapshot.node.relay_configured);
+  const nearby = snapshot.contacts.filter((contact) => contact.connected_lan);
+  const other = snapshot.contacts.filter((contact) => !contact.connected_lan);
+  const recent = snapshot.conversations.filter((row) => row.timestamp_ms).slice(0, 5);
   return (
     <section className="settings-view" aria-labelledby="settings-title">
       <header><Text id="settings-title" size={700} weight="semibold">Profile & settings</Text><Text>Your identity stays on this Windows account.</Text></header>
-      <div className="settings-card"><Avatar name={snapshot.profile.display_name} size={64} color="colorful" /><div><Input value={profileName} onChange={(_, data) => setProfileName(data.value)} aria-label="Display name" /><div className="fingerprint" aria-label={`Fingerprint ${snapshot.profile.fingerprint_words.join(" ")}`}>{snapshot.profile.fingerprint_words.join(" · ")}</div><div className="subtle">{snapshot.profile.formatted_user_id}</div></div><Button appearance="secondary" disabled={busy || !profileName.trim() || profileName.trim() === snapshot.profile.display_name} onClick={updateProfile}>Save profile</Button><Button icon={<QrCode24Regular />} onClick={showCard}>My friend card</Button></div>
-      <div className="settings-card column"><Text size={500} weight="semibold">Connection details</Text><div className="detail-grid"><span>Nearby Wi-Fi peers</span><strong>{snapshot.lan_peers}</strong><span>Internet delivery</span><strong>{snapshot.node.relay_configured ? "Ready" : "Not configured"}</strong><span>Contacts</span><strong>{snapshot.node.contacts}</strong></div></div>
+      <section className="settings-card profile-card" aria-labelledby="profile-heading">
+        <Avatar name={snapshot.profile.display_name} size={72} color="colorful" />
+        <div className="profile-copy">
+          <Text id="profile-heading" size={500} weight="semibold">You</Text>
+          <label className="field-label" htmlFor="profile-name">Name</label>
+          <Input id="profile-name" value={profileName} onChange={(_, data) => setProfileName(data.value)} aria-label="Name" />
+          <details className="identity-disclosure">
+            <summary>Verify my identity</summary>
+            <div className="fingerprint" aria-label={`Fingerprint ${snapshot.profile.fingerprint_words.join(" ")}`}>{snapshot.profile.fingerprint_words.join(" · ")}</div>
+            <Text size={200}>Have your friend match these words against your name in their contacts.</Text>
+          </details>
+        </div>
+        <div className="settings-actions profile-actions">
+          <Button appearance="secondary" disabled={busy || !profileName.trim() || profileName.trim() === snapshot.profile.display_name} onClick={updateProfile}>Save name</Button>
+          <Button icon={<QrCode24Regular />} onClick={showCard}>My friend card</Button>
+        </div>
+      </section>
+
+      <section className="settings-card column" aria-labelledby="connection-heading">
+        <div>
+          <Text id="connection-heading" size={500} weight="semibold">Connection details</Text>
+          <Text block size={200}>Active paths, people, and recent conversation activity.</Text>
+        </div>
+        <div className={`connection-health health-${connection.tone}`}>
+          <strong>{connection.title}</strong>
+          <span>{connection.detail}</span>
+        </div>
+        <div className="settings-subsection">
+          <Text weight="semibold">Active paths</Text>
+          <div className="path-row"><div><strong>Nearby Wi-Fi</strong><span>Authenticated devices on this local network</span></div><Badge appearance="tint" color={snapshot.lan_peers ? "success" : "informative"}>{snapshot.lan_peers ? `${snapshot.lan_peers} active` : "Waiting"}</Badge></div>
+          <div className="path-row"><div><strong>Shore Pass</strong><span>Internet delivery when people are not nearby</span></div><Badge appearance="tint" color={snapshot.node.relay_configured ? "success" : "warning"}>{snapshot.node.relay_configured ? "Ready" : "Not set up"}</Badge></div>
+          <div className="path-row"><div><strong>Background helper</strong><span>Continues helping after this window closes</span></div><Badge appearance="tint" color="success">Running</Badge></div>
+        </div>
+        <PeopleSection title="Reachable nearby" contacts={nearby} />
+        <PeopleSection title="Other people" contacts={other} />
+        <div className="settings-subsection">
+          <Text weight="semibold">Recent conversations</Text>
+          {recent.length === 0 && <Text size={200}>Conversation activity will appear here.</Text>}
+          {recent.map((row) => <div className="activity-row" key={row.id}><span><strong>{row.title}</strong><small>{row.preview || "Activity"}</small></span><time>{formatTime(row.timestamp_ms)}</time></div>)}
+        </div>
+      </section>
       <div className="settings-card column"><Text size={500} weight="semibold">Shore Pass</Text><Text>Paste a CMRELAY1 card or cruisemesh.app relay setup link. The member credential is protected with Windows DPAPI and never exposed to this window.</Text><Textarea value={relayText} onChange={(_, data) => setRelayText(data.value)} placeholder="Paste Shore Pass" /><Button appearance="primary" disabled={busy || !relayText.trim()} onClick={importRelay}>Import Shore Pass</Button></div>
       <div className="settings-card column"><Text size={500} weight="semibold">Encrypted backup & restore</Text><Text>Portable .cmbak files can migrate this identity between Android, iOS, and Windows. Do not run the restored identity on two devices at once.</Text><Input type="password" value={backupPassphrase} onChange={(_, data) => setBackupPassphrase(data.value)} placeholder="Passphrase (10+ characters)" aria-label="Backup passphrase" /><div className="settings-actions"><Button appearance="primary" disabled={busy || backupPassphrase.length < 10} onClick={exportBackup}>Save encrypted backup</Button><Button appearance="secondary" disabled={busy || backupPassphrase.length < 10} onClick={restoreBackup}>Restore from backup</Button></div></div>
-      <div className="settings-card column"><Text size={500} weight="semibold">Advanced</Text><Text>The helper keeps running from the tray when this window closes. Diagnostics never include names, message bodies, keys, or relay credentials.</Text></div>
+      <section className="settings-card column" aria-labelledby="advanced-heading">
+        <div><Text id="advanced-heading" size={500} weight="semibold">Advanced</Text><Text block size={200}>Background operation, privacy, and support details.</Text></div>
+        <label className="setting-switch"><span><strong>Keep this PC awake while helping</strong><small>Prevents system sleep while plugged in. Changes apply the next time the helper starts.</small></span><Switch checked={snapshot.preferences.prevent_sleep_on_ac} disabled={busy} aria-label="Keep this PC awake while helping" onChange={(_, data) => updatePreferences(data.checked, snapshot.preferences.share_online)} /></label>
+        <label className="setting-switch"><span><strong>Share when I’m online</strong><small>Lets accepted friends see recent Shore Pass availability.</small></span><Switch checked={snapshot.preferences.share_online} disabled={busy} aria-label="Share when I’m online" onChange={(_, data) => updatePreferences(snapshot.preferences.prevent_sleep_on_ac, data.checked)} /></label>
+        <div className="settings-subsection">
+          <Text weight="semibold">Runtime</Text>
+          <div className="detail-grid"><span>Helper version</span><strong>{snapshot.diagnostics.helper_version}</strong><span>LAN listener</span><strong>TCP {snapshot.diagnostics.listening_port}</strong><span>Contacts</span><strong>{snapshot.node.contacts}</strong><span>Groups</span><strong>{snapshot.conversations.filter((row) => row.kind === "group").length}</strong><span>Background operation</span><strong>Running from tray</strong><span>Identity protection</span><strong>Windows account</strong></div>
+        </div>
+        <details className="technical-disclosure"><summary>Support locations</summary><div><span>Data</span><code>{snapshot.diagnostics.data_directory}</code><span>Logs</span><code>{snapshot.diagnostics.logs_directory}</code></div></details>
+        <Text size={200}>Identity and Shore Pass secrets are protected for this Windows account. Logs and diagnostics exclude names, message bodies, keys, and relay credentials.</Text>
+      </section>
     </section>
+  );
+}
+
+function PeopleSection({ title, contacts }: { title: string; contacts: AppSnapshot["contacts"] }) {
+  return (
+    <div className="settings-subsection">
+      <Text weight="semibold">{title} ({contacts.length})</Text>
+      {contacts.length === 0 && <Text size={200}>No one in this group right now.</Text>}
+      {contacts.map((contact) => (
+        <div className="person-row" key={contact.id}>
+          <Avatar name={contact.display_name} size={32} color="colorful" />
+          <span><strong>{contact.display_name}</strong><small>{contactRouteLabel(contact.connected_lan, contact.internet_delivery_configured)}</small></span>
+        </div>
+      ))}
+    </div>
   );
 }
 

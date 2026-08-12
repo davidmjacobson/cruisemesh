@@ -114,6 +114,10 @@ enum Request {
     SetProfile {
         display_name: String,
     },
+    SetPreferences {
+        prevent_sleep_on_ac: bool,
+        share_online: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -136,8 +140,15 @@ pub async fn serve(
     inbound: InboundExecutor,
     relay_nudge: Arc<tokio::sync::Notify>,
     shutdown: Arc<tokio::sync::Notify>,
+    listening_port: u16,
 ) -> Result<()> {
-    let chat = ChatService::new(bootstrap.clone(), hub.clone(), inbound, relay_nudge.clone());
+    let chat = ChatService::new(
+        bootstrap.clone(),
+        hub.clone(),
+        inbound,
+        relay_nudge.clone(),
+        listening_port,
+    );
     let mut server = create_server(true)?;
     loop {
         server.connect().await?;
@@ -243,6 +254,7 @@ fn parse_request(line: &str) -> std::result::Result<Request, serde_json::Error> 
             &["command", "path", "passphrase"]
         }
         Some("SetProfile") => &["command", "display_name"],
+        Some("SetPreferences") => &["command", "prevent_sleep_on_ac", "share_online"],
         _ => &["command"],
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -264,8 +276,8 @@ async fn dispatch(
     let result: Result<serde_json::Value> = async {
         Ok(match request {
             Request::GetProtocolInfo => serde_json::json!({
-                "protocol_version": 2,
-                "minimum_ui_version": 2,
+                "protocol_version": 3,
+                "minimum_ui_version": 3,
             }),
             Request::GetStatus => serde_json::to_value(status(bootstrap, hub)?)?,
             Request::GetFriendCard => serde_json::json!({ "text": bootstrap.friend_link()? }),
@@ -343,6 +355,10 @@ async fn dispatch(
             Request::SetProfile { display_name } => {
                 serde_json::to_value(chat.update_profile(display_name).await?)?
             }
+            Request::SetPreferences {
+                prevent_sleep_on_ac,
+                share_online,
+            } => serde_json::to_value(chat.update_preferences(prevent_sleep_on_ac, share_online)?)?,
         })
     }
     .await;
@@ -426,6 +442,14 @@ mod tests {
         .is_ok());
         assert!(parse_request(
             r#"{"command":"SendText","conversation_id":"person:00","text":"hi","sealed":"secret"}"#
+        )
+        .is_err());
+        assert!(parse_request(
+            r#"{"command":"SetPreferences","prevent_sleep_on_ac":false,"share_online":true}"#
+        )
+        .is_ok());
+        assert!(parse_request(
+            r#"{"command":"SetPreferences","prevent_sleep_on_ac":false,"share_online":true,"relay_token":"secret"}"#
         )
         .is_err());
     }

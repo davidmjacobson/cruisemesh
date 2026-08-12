@@ -88,6 +88,22 @@ impl BootstrapStore {
         Ok(next)
     }
 
+    pub fn update_preferences(
+        &self,
+        prevent_sleep_on_ac: bool,
+        share_online: bool,
+    ) -> Result<NodeConfig> {
+        let mut next = self.config();
+        next.prevent_sleep_on_ac = prevent_sleep_on_ac;
+        next.share_online = share_online;
+        next.save(&self.paths.config)?;
+        *self
+            .config
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next.clone();
+        Ok(next)
+    }
+
     pub fn relay_config(&self) -> Result<Option<RelayConfig>> {
         if !self.paths.relay.exists() {
             return Ok(None);
@@ -190,6 +206,19 @@ mod tests {
         drop(first);
         let second = BootstrapStore::open(paths).unwrap();
         assert_eq!(second.identity.user_id, first_id);
+    }
+
+    #[test]
+    fn preferences_persist_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::under(temp.path().join("CruiseMesh")).unwrap();
+        let first = BootstrapStore::open(paths.clone()).unwrap();
+        first.update_preferences(false, false).unwrap();
+        drop(first);
+
+        let second = BootstrapStore::open(paths).unwrap();
+        assert!(!second.config().prevent_sleep_on_ac);
+        assert!(!second.config().share_online);
     }
 
     #[test]

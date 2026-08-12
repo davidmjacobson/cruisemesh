@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { friendWebLink, kindNumber, tickLabel } from "./presentation";
+import { connectionSummary, contactRouteLabel, friendWebLink, kindNumber, tickLabel, tickVisual } from "./presentation";
 import type { Message } from "./types";
 
 function message(kind: Message["kind"]): Message {
@@ -27,6 +27,21 @@ describe("messenger presentation protocol", () => {
     expect(tickLabel("sent")).toBe("Sent");
     expect(tickLabel("delivered")).toBe("Delivered");
     expect(tickLabel("read")).toBe("Read");
+  });
+
+  it("matches the mobile receipt glyph progression", () => {
+    expect(tickVisual("sent")).toEqual({ count: 1, filled: false });
+    expect(tickVisual("delivered")).toEqual({ count: 2, filled: false });
+    expect(tickVisual("read")).toEqual({ count: 2, filled: true });
+  });
+
+  it("describes only connection evidence Windows actually has", () => {
+    expect(connectionSummary(2, false).title).toBe("Connected nearby");
+    expect(connectionSummary(0, true).title).toBe("Internet delivery is ready");
+    expect(connectionSummary(0, false).tone).toBe("waiting");
+    expect(contactRouteLabel(true, false)).toBe("Nearby on Wi-Fi");
+    expect(contactRouteLabel(false, true)).toBe("Shore Pass available");
+    expect(contactRouteLabel(false, false)).toBe("Not nearby");
   });
 
   it("encodes friend cards in the canonical browser link fragment", () => {
