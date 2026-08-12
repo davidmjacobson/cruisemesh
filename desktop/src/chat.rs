@@ -612,7 +612,7 @@ impl ChatService {
         Ok(ReportView {
             mailto: format!(
                 "mailto:abuse@cruisemesh.app?subject={}&body={}",
-                urlencoding(&subject),
+                urlencoding(subject),
                 urlencoding(&body)
             ),
             address: "abuse@cruisemesh.app".into(),
@@ -940,7 +940,7 @@ impl ChatService {
         for contact in contacts {
             let preview = store.chat_preview(contact.user_id.clone(), own.clone())?;
             let id = person_id(&contact.user_id);
-            rows.push(summary_from_preview(
+            let mut row = summary_from_preview(
                 id.clone(),
                 ConversationKind::Person,
                 contact_display_name(&contact),
@@ -948,13 +948,14 @@ impl ChatService {
                 connected.iter().any(|id| id == &contact.user_id),
                 preview,
                 &own,
-                self.bootstrap.is_muted(&id),
-            ));
+            );
+            row.muted = self.bootstrap.is_muted(&id);
+            rows.push(row);
         }
         for group in store.list_groups()? {
             let preview = store.chat_preview(group.id.clone(), own.clone())?;
             let id = group_id(&group.id);
-            rows.push(summary_from_preview(
+            let mut row = summary_from_preview(
                 id.clone(),
                 ConversationKind::Group,
                 group.name,
@@ -962,8 +963,9 @@ impl ChatService {
                 false,
                 preview,
                 &own,
-                self.bootstrap.is_muted(&id),
-            ));
+            );
+            row.muted = self.bootstrap.is_muted(&id);
+            rows.push(row);
         }
         rows.sort_by(|left, right| {
             right
@@ -1154,7 +1156,6 @@ fn summary_from_preview(
     connected_lan: bool,
     preview: cruisemesh_core::CoreChatPreview,
     own_user_id: &[u8],
-    muted: bool,
 ) -> ConversationSummary {
     let (text, timestamp, tick) = preview
         .last_message
@@ -1179,7 +1180,7 @@ fn summary_from_preview(
         preview: text,
         timestamp_ms: timestamp,
         tick,
-        muted,
+        muted: false,
     }
 }
 
