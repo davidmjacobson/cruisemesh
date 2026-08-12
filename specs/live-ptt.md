@@ -207,12 +207,13 @@ per-member fallback for anyone not live-complete.
 close peers, only if Phase 1/2 prove the demand and the reassembler/flow-control
 work is worth it. Likely never.
 
-## Sequencing against the refactor
+## Sequencing
 
-Build **after the D-wave** settles: live PTT is a genuinely new lane that
-touches transport + a new capture pipeline + libopus, and it must sit on top of
-the consolidated mesh/session, not race it. It shares no policy with the
-Wave-C/D consolidation. It is also gated on the honest question below.
+Build **after the in-flight mesh/session consolidation settles**: live PTT is
+a genuinely new lane that touches transport, a new capture pipeline, and
+libopus, and it must sit on top of the consolidated session layer rather than
+race it. It shares no policy with that consolidation, so it is a sequencing
+dependency, not a design one. It is also gated on the honest question below.
 
 ## The honest recommendation
 
@@ -223,7 +224,8 @@ frequently fall back to voice messages; it shines on a home/cabin network. Given
 that, plus the libopus dual-encode cost, the go/no-go is: **is walkie-talkie-
 on-friendly-networks worth a new native codec dependency and a new capture
 pipeline, when async voice messages already cover the offline/ship case?** My
-lean: worth prototyping Phase 1 *after* the media two-plane and the D-wave,
+lean: worth prototyping Phase 1 *after* two-plane media and the session
+consolidation,
 because voice messages (once the tail-clip fix lands) already deliver most of
 the "send my voice" value with none of the real-time fragility.
 

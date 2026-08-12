@@ -255,16 +255,17 @@ informed by field metrics, and a *study* (not a commitment) of consented
 mule-assist for blobs — whether a plugged-in, opted-in family device may
 courier encrypted blobs under its own storage grant.
 
-## Sequencing against the refactor
+## Sequencing
 
-This is deliberately a new plane, not a change to the one being unified: no
-policy here twins anything the C/D waves are consolidating, and nothing in
-it may land inside a refactor package. Build after the D-wave encounter
-work settles (its budgets are the ones BLOB-01 must respect), as its own
-workflow series: core policy module first (chunking, bitmap, source
-selection, consent verdicts — pure, table-tested), then the LAN bulk
-sub-channel drivers, then relayd. Voice push-to-talk does not wait for any
-of this; it rides the existing pipeline today.
+This is deliberately a new plane rather than a change to the existing one: no
+policy here duplicates anything the in-flight mesh/session consolidation is
+unifying, and none of it should land inside that work. Build it after the
+peer-encounter half of that consolidation settles, since its budgets are the
+ones BLOB-01 must respect. Then proceed as its own series: the core policy
+module first (chunking, bitmap, source selection, consent verdicts — pure and
+table-tested), then the LAN bulk sub-channel drivers, then relayd. Voice
+push-to-talk does not wait for any of this; it rides the existing pipeline
+today.
 
 ## Acceptance criteria (Phase 1)
 
