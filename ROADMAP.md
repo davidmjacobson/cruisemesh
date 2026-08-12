@@ -84,9 +84,13 @@ closed set of compatibility facts and never messages, contacts, network
 addresses, Wi-Fi names, or a stable reporting identifier. No background
 analytics, no periodic upload, no global telemetry switch.
 
-What is still missing is the other half — somewhere for reports to aggregate
-that is not a file in this repository. Until that exists, the field-report
-issue template is how this data arrives.
+The first two rollout phases need no server at all — golden fixtures and a
+shared core reducer, then a guided local report exported through the platform
+share sheet — so the work can start well before the question of where reports
+aggregate is settled. Until it is, the field-report issue template is how this
+data arrives.
+
+Spec: [`specs/ship-wifi-field-reports.md`](specs/ship-wifi-field-reports.md).
 
 ### 4. Live push-to-talk — specified, and honestly may not be worth it
 
