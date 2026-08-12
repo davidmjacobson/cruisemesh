@@ -13,11 +13,7 @@ use cruisemesh_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    bootstrap::{BootstrapStatus, BootstrapStore},
-    lan::session::PeerHub,
-    mesh::inbound::InboundExecutor,
-};
+use crate::{bootstrap::BootstrapStore, lan::session::PeerHub, mesh::inbound::InboundExecutor};
 
 const USER_ID_BYTES: usize = 16;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -33,12 +29,15 @@ pub struct ChatService {
     hub: Arc<PeerHub>,
     inbound: InboundExecutor,
     relay_nudge: Arc<tokio::sync::Notify>,
+    listening_port: u16,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AppSnapshot {
     pub profile: ProfileView,
-    pub node: BootstrapStatus,
+    pub node: AppNodeView,
+    pub preferences: PreferencesView,
+    pub diagnostics: DiagnosticsView,
     pub lan_peers: usize,
     pub contacts: Vec<ContactView>,
     pub conversations: Vec<ConversationSummary>,
@@ -48,9 +47,29 @@ pub struct AppSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct ProfileView {
     pub display_name: String,
-    pub formatted_user_id: String,
     pub friend_link: String,
     pub fingerprint_words: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AppNodeView {
+    pub relay_configured: bool,
+    pub contacts: usize,
+    pub reduced_mode: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PreferencesView {
+    pub prevent_sleep_on_ac: bool,
+    pub share_online: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DiagnosticsView {
+    pub helper_version: &'static str,
+    pub listening_port: u16,
+    pub data_directory: String,
+    pub logs_directory: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +77,7 @@ pub struct ContactView {
     pub id: String,
     pub display_name: String,
     pub connected_lan: bool,
+    pub internet_delivery_configured: bool,
     pub fingerprint_words: Vec<String>,
 }
 
@@ -176,37 +196,54 @@ impl ChatService {
         hub: Arc<PeerHub>,
         inbound: InboundExecutor,
         relay_nudge: Arc<tokio::sync::Notify>,
+        listening_port: u16,
     ) -> Self {
         Self {
             bootstrap,
             hub,
             inbound,
             relay_nudge,
+            listening_port,
         }
     }
 
     pub fn snapshot(&self) -> Result<AppSnapshot> {
         let contacts = self.bootstrap.store().list_contacts()?;
         let connected = self.hub.connected_user_ids();
+        let status = self.bootstrap.status()?;
+        let config = self.bootstrap.config();
         let contact_views = contacts
             .iter()
             .map(|contact| ContactView {
                 id: person_id(&contact.user_id),
                 display_name: contact_display_name(contact),
                 connected_lan: connected.iter().any(|id| id == &contact.user_id),
+                internet_delivery_configured: contact.relay_url.is_some()
+                    && contact.relay_token.is_some(),
                 fingerprint_words: fingerprint_words(contact.user_id.clone()),
             })
             .collect();
         Ok(AppSnapshot {
             profile: ProfileView {
-                display_name: self.bootstrap.config().display_name.clone(),
-                formatted_user_id: cruisemesh_core::format_user_id(
-                    self.bootstrap.identity().user_id.clone(),
-                ),
+                display_name: config.display_name.clone(),
                 friend_link: self.bootstrap.friend_link()?,
                 fingerprint_words: fingerprint_words(self.bootstrap.identity().user_id.clone()),
             },
-            node: self.bootstrap.status()?,
+            node: AppNodeView {
+                relay_configured: status.relay_configured,
+                contacts: status.contacts,
+                reduced_mode: status.reduced_mode,
+            },
+            preferences: PreferencesView {
+                prevent_sleep_on_ac: config.prevent_sleep_on_ac,
+                share_online: config.share_online,
+            },
+            diagnostics: DiagnosticsView {
+                helper_version: env!("CARGO_PKG_VERSION"),
+                listening_port: self.listening_port,
+                data_directory: self.bootstrap.paths().root.to_string_lossy().into_owned(),
+                logs_directory: self.bootstrap.paths().logs.to_string_lossy().into_owned(),
+            },
             lan_peers: self.hub.connected_peer_count(),
             contacts: contact_views,
             conversations: self.list_conversations(contacts, connected)?,
@@ -445,11 +482,23 @@ impl ChatService {
         }
         Ok(ProfileView {
             display_name: config.display_name,
-            formatted_user_id: cruisemesh_core::format_user_id(
-                self.bootstrap.identity().user_id.clone(),
-            ),
             friend_link: self.bootstrap.friend_link()?,
             fingerprint_words: fingerprint_words(self.bootstrap.identity().user_id.clone()),
+        })
+    }
+
+    pub fn update_preferences(
+        &self,
+        prevent_sleep_on_ac: bool,
+        share_online: bool,
+    ) -> Result<PreferencesView> {
+        let config = self
+            .bootstrap
+            .update_preferences(prevent_sleep_on_ac, share_online)?;
+        self.relay_nudge.notify_one();
+        Ok(PreferencesView {
+            prevent_sleep_on_ac: config.prevent_sleep_on_ac,
+            share_online: config.share_online,
         })
     }
 
@@ -895,6 +944,7 @@ mod tests {
             hub,
             inbound,
             Arc::new(tokio::sync::Notify::new()),
+            45_892,
         );
         (temp, bootstrap, service, contact, friend)
     }
@@ -915,6 +965,34 @@ mod tests {
             conversation.messages[0].tick,
             Some(TickView::Sent)
         ));
+    }
+
+    #[test]
+    fn snapshot_hides_the_public_user_id_and_reports_operational_details() {
+        let (_temp, bootstrap, service, _contact, _friend) = service();
+        let snapshot = service.snapshot().unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+
+        assert!(json["profile"].get("formatted_user_id").is_none());
+        assert!(json["node"].get("user_id").is_none());
+        assert_eq!(json["diagnostics"]["listening_port"], 45_892);
+        assert_eq!(json["diagnostics"]["helper_version"], "0.1.0");
+        assert_eq!(
+            json["preferences"]["prevent_sleep_on_ac"],
+            bootstrap.config().prevent_sleep_on_ac
+        );
+    }
+
+    #[test]
+    fn advanced_preferences_persist_and_are_returned_to_the_ui() {
+        let (_temp, bootstrap, service, _contact, _friend) = service();
+        let updated = service.update_preferences(false, false).unwrap();
+
+        assert!(!updated.prevent_sleep_on_ac);
+        assert!(!updated.share_online);
+        assert!(!bootstrap.config().prevent_sleep_on_ac);
+        assert!(!bootstrap.config().share_online);
+        assert!(!service.snapshot().unwrap().preferences.share_online);
     }
 
     #[test]

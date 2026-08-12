@@ -27,7 +27,7 @@ mod windows_app {
     const PIPE_NAME: &str = r"\\.\pipe\CruiseMeshNode";
     const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     const START_TIMEOUT: Duration = Duration::from_secs(15);
-    const UI_PROTOCOL_VERSION: u64 = 2;
+    const UI_PROTOCOL_VERSION: u64 = 3;
     const OLD_HELPER_MESSAGE: &str = "An older CruiseMesh Helper is already running. Right-click the CruiseMesh Helper tray icon, confirm Quit, and leave this window open. It will start the updated helper automatically.";
     static PROTOCOL_READY: AtomicBool = AtomicBool::new(false);
 
@@ -317,6 +317,19 @@ mod windows_app {
     }
 
     #[tauri::command]
+    async fn set_preferences(
+        prevent_sleep_on_ac: bool,
+        share_online: bool,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "SetPreferences",
+            "prevent_sleep_on_ac": prevent_sleep_on_ac,
+            "share_online": share_online,
+        }))
+        .await
+    }
+
+    #[tauri::command]
     fn initial_activation() -> Vec<String> {
         std::env::args().collect()
     }
@@ -347,6 +360,7 @@ mod windows_app {
                 preview_backup,
                 stage_restore,
                 set_profile,
+                set_preferences,
                 initial_activation,
             ])
             .run(tauri::generate_context!())

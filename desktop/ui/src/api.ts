@@ -33,6 +33,8 @@ export const api = {
     invoke<BackupPreview>("stage_restore", { path, passphrase }),
   setProfile: (displayName: string) =>
     invoke("set_profile", { displayName }),
+  setPreferences: (preventSleepOnAc: boolean, shareOnline: boolean) =>
+    invoke("set_preferences", { preventSleepOnAc, shareOnline }),
   initialActivation: () => invoke<string[]>("initial_activation"),
 };
 

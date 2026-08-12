@@ -19,7 +19,7 @@ unsupported-attachment row; it never fails the entire conversation response.
 
 Read commands:
 
-- `GetProtocolInfo` (currently protocol version 2)
+- `GetProtocolInfo` (currently protocol version 3)
 - `GetAppSnapshot`
 - `GetConversation { conversation_id }`
 - the frozen Stage 1 status/card/event commands
@@ -27,7 +27,7 @@ Read commands:
 Mutation commands:
 
 - `SendText`, `SendAttachment`, `React`, `MarkRead`
-- `CreateGroup`, `SetProfile`
+- `CreateGroup`, `SetProfile`, `SetPreferences`
 - `ImportFriendCard`, `ImportRelaySetup`
 - `CreateBackup`, `PreviewBackup`, `StageRestore`
 

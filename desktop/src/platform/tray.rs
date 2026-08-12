@@ -18,14 +18,15 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
             LoadIconW, MessageBoxW, PostQuitMessage, PostThreadMessageW, RegisterClassW,
-            TranslateMessage, HWND_MESSAGE, IDI_APPLICATION, IDYES, MB_ICONINFORMATION, MB_YESNO,
-            MSG, WM_APP, WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
+            TranslateMessage, HWND_MESSAGE, IDYES, MB_ICONINFORMATION, MB_YESNO, MSG, WM_APP,
+            WM_LBUTTONUP, WM_QUIT, WM_RBUTTONUP, WNDCLASSW,
         },
     },
 };
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const TRAY_ID: u32 = 1;
+const PRODUCT_ICON_RESOURCE_ID: usize = 1;
 static QUIT_SENDER: OnceLock<Mutex<Option<oneshot::Sender<()>>>> = OnceLock::new();
 
 pub struct TrayIcon {
@@ -89,13 +90,17 @@ fn tray_thread(ready: std::sync::mpsc::Sender<Result<u32>>) {
 unsafe fn create_tray() -> Result<(HWND, NOTIFYICONDATAW)> {
     let class_name = wide("CruiseMeshHelperTrayWindow");
     let instance = GetModuleHandleW(ptr::null());
+    let product_icon = LoadIconW(instance, PRODUCT_ICON_RESOURCE_ID as *const u16);
+    if product_icon.is_null() {
+        bail!("failed to load the embedded CruiseMesh tray icon");
+    }
     let class = WNDCLASSW {
         style: 0,
         lpfnWndProc: Some(window_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: instance,
-        hIcon: ptr::null_mut(),
+        hIcon: product_icon,
         hCursor: ptr::null_mut(),
         hbrBackground: ptr::null_mut(),
         lpszMenuName: ptr::null(),
@@ -127,7 +132,7 @@ unsafe fn create_tray() -> Result<(HWND, NOTIFYICONDATAW)> {
     icon.uID = TRAY_ID;
     icon.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     icon.uCallbackMessage = TRAY_MESSAGE;
-    icon.hIcon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
+    icon.hIcon = product_icon;
     copy_wide("CruiseMesh Helper — Running", &mut icon.szTip);
     if Shell_NotifyIconW(NIM_ADD, &icon) == 0 {
         DestroyWindow(window);
