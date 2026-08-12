@@ -141,6 +141,13 @@ jobs:
             xcrun simctl ui "$UDID" appearance dark
           fi
 
+      # -retry-tests-on-failure re-runs only the tests that failed, up to
+      # -test-iterations attempts. The XCUITest suite flakes on the shared
+      # runner's simulator -- a different test each time, always a
+      # waitForExistence timeout -- and one transient miss used to red the whole
+      # PR, which teaches everyone to skim past red on the one gate iOS has.
+      # This does not weaken it: a genuine break fails both attempts and stays
+      # red.
       - name: Build & test on the iOS Simulator
         working-directory: ios
         run: |
@@ -157,9 +164,34 @@ jobs:
             -derivedDataPath build/dd \
             -resultBundlePath build/TestResults.xcresult \
             -parallel-testing-enabled NO \
+            -retry-tests-on-failure \
+            -test-iterations 2 \
             "${ONLY_TESTING[@]}" \
             CODE_SIGNING_ALLOWED=NO \
             | tee build/xcodebuild.log
+
+      # A retried-and-passed test is a flake the green check would otherwise
+      # hide. Say so in the summary, so retries stay visible as a cost rather
+      # than becoming the way the suite normally passes.
+      - name: Report retried tests
+        if: always()
+        working-directory: ios
+        run: |
+          failed=$(grep -cE "Test [Cc]ase .* failed " build/xcodebuild.log || true)
+          if [ "${failed:-0}" -gt 0 ]; then
+            echo "$failed test attempt(s) failed before the run finished; with retries on, a green check here means a later attempt passed. See the xcodebuild log artifact." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The privacy manifest is wired through project.yml, which xcodegen
+      # regenerates on every run; the only proof it survived into the app is
+      # looking inside the app. Checked here so a PR catches it, and again on
+      # the release archive that Apple actually receives.
+      - name: Assert the privacy manifest is in the built app
+        working-directory: ios
+        run: |
+          ../tools/assert_privacy_manifest.sh \
+            build/dd/Build/Products/Debug-iphonesimulator/CruiseMesh.app
 
       - name: Upload iOS test evidence
         if: always()
