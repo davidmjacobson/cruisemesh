@@ -64,7 +64,7 @@ export interface Message {
   own: boolean;
   lamport: number;
   timestamp_ms: number;
-  kind: "text" | "image" | "audio" | "group_invite";
+  kind: "text" | "image" | "audio" | "group_invite" | "unsupported_attachment";
   text?: string;
   attachment?: Attachment;
   reply_to_id?: string;

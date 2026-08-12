@@ -10,9 +10,12 @@ the Tauri crate does not link `cruisemesh-core`.
 
 Every request is a tagged JSON line. The node rejects unknown commands and
 fields, caps requests at 512 KiB, validates typed `person:`/`group:` IDs, and
-caps initial chat history at the newest 50 stored rows. That bound keeps even
-attachment-heavy histories below the UI host's 16 MiB response cap after JSON
-and base64 expansion. Attachments remain under the core 180 KiB blob ceiling.
+caps initial chat history at the newest 50 visible rows. Hidden protocol rows
+and reactions have separate bounded reads, so they cannot crowd chat history
+out of the page. That bound keeps even attachment-heavy histories below the UI
+host's 16 MiB response cap after JSON and base64 expansion. Attachments remain
+under the core 180 KiB blob ceiling. A malformed attachment becomes one
+unsupported-attachment row; it never fails the entire conversation response.
 
 Read commands:
 
