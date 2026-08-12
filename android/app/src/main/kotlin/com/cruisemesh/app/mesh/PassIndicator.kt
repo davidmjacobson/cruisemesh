@@ -120,7 +120,11 @@ fun passIndicator(health: RelayHealth, configured: Boolean): PassIndicator {
         RelayHealth.Checking,
         -> PassIndicator.NONE
         is RelayHealth.Ok -> PassIndicator.READY
-        RelayHealth.NoInternet -> PassIndicator.WAITING
+        // A roaming deferral reads exactly like being offline: the pass is
+        // healthy and the wait is deliberate, so it is never a fault state.
+        RelayHealth.NoInternet,
+        RelayHealth.DeferredRoaming,
+        -> PassIndicator.WAITING
         // Transient, self-healing ("?"): can't reach right now, or told to
         // slow down. Same reaction either way -- none.
         is RelayHealth.Failing,

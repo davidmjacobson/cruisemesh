@@ -47,6 +47,9 @@ object RelayEngineSettings {
 
     private const val PREF_SHADOW_ENABLED = "pass_engine_shadow"
 
+    /** A deliberate, user-facing opt-in for relay traffic on roaming data. */
+    private const val PREF_ALLOW_ROAMING_DATA = "allow_roaming_data"
+
     private const val PREF_SHADOW_DAY = "pass_engine_shadow_day"
     private const val PREF_SHADOW_COUNT = "pass_engine_shadow_count"
     private const val PREF_SHADOW_LAST_MS = "pass_engine_shadow_last_ms"
@@ -92,6 +95,13 @@ object RelayEngineSettings {
 
     fun setShadowEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(PREF_SHADOW_ENABLED, enabled).apply()
+    }
+
+    fun allowsRoamingData(context: Context): Boolean =
+        prefs(context).getBoolean(PREF_ALLOW_ROAMING_DATA, false)
+
+    fun setAllowsRoamingData(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(PREF_ALLOW_ROAMING_DATA, enabled).apply()
     }
 
     /**

@@ -23957,6 +23957,90 @@ extension CoreRelayFault: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What the relay gate should do for the selected network path.
+ */
+
+public enum CoreRelayNetworkVerdict {
+    
+    /**
+     * The path may run every relay lane.
+     */
+    case permitted
+    /**
+     * Do not start a relay pass. This is an offline-like deferral, never a
+     * relay failure.
+     */
+    case deferredRoaming
+    /**
+     * Run lightweight sync, but leave carried-envelope uploads queued.
+     */
+    case deferredConstrained
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayNetworkVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayNetworkVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayNetworkVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .permitted
+        
+        case 2: return .deferredRoaming
+        
+        case 3: return .deferredConstrained
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayNetworkVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .permitted:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .deferredRoaming:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .deferredConstrained:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayNetworkVerdict_lift(_ buf: RustBuffer) throws -> CoreRelayNetworkVerdict {
+    return try FfiConverterTypeCoreRelayNetworkVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayNetworkVerdict_lower(_ value: CoreRelayNetworkVerdict) -> RustBuffer {
+    return FfiConverterTypeCoreRelayNetworkVerdict.lower(value)
+}
+
+
+
+extension CoreRelayNetworkVerdict: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which relay operation an action performs. The driver does not branch on
  * it — the request is complete without it — but a transcript and a crash
  * report read far better with it than with a path.
@@ -24628,6 +24712,82 @@ public func FfiConverterTypeCoreRelayRerunAction_lower(_ value: CoreRelayRerunAc
 
 
 extension CoreRelayRerunAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Whether the operating system can say that the selected internet path is
+ * roaming. iOS deliberately reports [`CoreRelayRoaming::Unknown`]: it has no
+ * public roaming bit, and core must not invent one from a transport name.
+ */
+
+public enum CoreRelayRoaming {
+    
+    case yes
+    case no
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayRoaming: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayRoaming
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayRoaming {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .yes
+        
+        case 2: return .no
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayRoaming, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .yes:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .no:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRoaming_lift(_ buf: RustBuffer) throws -> CoreRelayRoaming {
+    return try FfiConverterTypeCoreRelayRoaming.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRoaming_lower(_ value: CoreRelayRoaming) -> RustBuffer {
+    return FfiConverterTypeCoreRelayRoaming.lower(value)
+}
+
+
+
+extension CoreRelayRoaming: Equatable, Hashable {}
 
 
 
@@ -30078,6 +30238,32 @@ public func coreRelayAdapterVectors() -> [CoreRelayAdapterVector] {
 })
 }
 /**
+ * Decide whether the current network permits Shore Pass work.
+ *
+ * Android supplies a real roaming bit and is gated precisely on it. iOS has
+ * no public roaming API — `CTCarrier` was deprecated in iOS 16 and reports
+ * dummy values on current releases — so it supplies `Unknown`, and core
+ * deliberately declines to guess. The only signal iOS could stand in with is
+ * "expensive", which means cellular, so inferring roaming from it would take
+ * Shore Pass away from every iPhone that is off Wi-Fi at home. That trade is
+ * not worth making: a roaming iPhone is already protected by the system's own
+ * Data Roaming setting, which blocks the traffic at the modem and is stronger
+ * than any policy this function could express.
+ *
+ * Constrained paths (Android Data Saver, iOS Low Data Mode) still permit
+ * lightweight sync while their carried lane is deferred by
+ * [`CoreRelayNetworkVerdict::DeferredConstrained`], on both platforms.
+ */
+public func coreRelayNetworkPermitted(roaming: CoreRelayRoaming, constrained: Bool, userAllowsRoaming: Bool) -> CoreRelayNetworkVerdict {
+    return try!  FfiConverterTypeCoreRelayNetworkVerdict.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_network_permitted(
+        FfiConverterTypeCoreRelayRoaming.lower(roaming),
+        FfiConverterBool.lower(constrained),
+        FfiConverterBool.lower(userAllowsRoaming),$0
+    )
+})
+}
+/**
  * The deployed budgets. The only constructor a shell can reach, for the same
  * reason [`crate::CoreFamilyRelayPacer::new`] is: a second door onto these
  * numbers would be a second place they are decided.
@@ -32826,6 +33012,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_adapter_vectors() != 50015) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_network_permitted() != 44955) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_default_budgets() != 26530) {

@@ -46,7 +46,7 @@ enum PassIndicator {
         switch health {
         case .noConfig, .checking: return .none
         case .ok: return .ready
-        case .noInternet: return .waiting
+        case .noInternet, .deferredRoaming: return .waiting
         // Transient, self-healing ("?"): can't reach right now, or told to
         // slow down. Same reaction either way -- none.
         case .failing, .rateLimited: return .attention

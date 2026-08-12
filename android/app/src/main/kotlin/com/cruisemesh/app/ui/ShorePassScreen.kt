@@ -690,6 +690,7 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
         RelayHealth.NoConfig -> "Checking setup…"
         RelayHealth.Checking -> "Checking setup…"
         RelayHealth.NoInternet -> "Phone is offline · setup is saved"
+        RelayHealth.DeferredRoaming -> "Waiting for non-roaming internet · setup is saved"
         is RelayHealth.Ok -> "Ready · checked ${passRelativeAge(health.lastSyncMs)}"
         is RelayHealth.Failing -> "Service unavailable · try again later"
         is RelayHealth.Expired -> "Pass expired · renewal required"

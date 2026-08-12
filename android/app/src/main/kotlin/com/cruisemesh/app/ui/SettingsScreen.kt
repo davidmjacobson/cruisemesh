@@ -52,7 +52,9 @@ import com.cruisemesh.app.mesh.PassIndicator
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.passIndicator
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.RelayEngineSettings
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
+import com.cruisemesh.app.mesh.RelaySyncEvents
 
 const val SUPPORT_URL = "https://cruisemesh.app/support/"
 
@@ -78,6 +80,7 @@ fun SettingsScreen(
     var friendsOfFriends by remember {
         mutableStateOf(FriendsOfFriendsStore.isEnabled(context))
     }
+    var useRoamingData by remember { mutableStateOf(RelayEngineSettings.allowsRoamingData(context)) }
     val relayConfigured = RelayConfigStore.load(context) != null
     val showInternalTools =
         context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -175,6 +178,22 @@ fun SettingsScreen(
             }
 
             SettingsGap()
+            SettingsGroup(stringResource(R.string.ui_advanced)) {
+                SettingsSwitch(
+                    title = stringResource(R.string.ui_use_roaming_data_for_shore_pass),
+                    detail = stringResource(R.string.ui_use_roaming_data_for_shore_pass_detail),
+                    checked = useRoamingData,
+                    onCheckedChange = {
+                        useRoamingData = it
+                        RelayEngineSettings.setAllowsRoamingData(context, it)
+                        // The relay front door reads the preference per call,
+                        // so this nudge takes effect without a restart.
+                        RelaySyncEvents.requestSync()
+                    },
+                )
+            }
+
+            SettingsGap()
             SettingsGroup(stringResource(R.string.ui_backup)) {
                 SettingsLink(
                     title = stringResource(R.string.ui_back_up_account),
@@ -251,6 +270,7 @@ private fun relayTitle(health: RelayHealth, configured: Boolean): String {
         RelayHealth.Checking -> "Checking Shore Pass setup…"
         is RelayHealth.Ok -> "Shore Pass is working"
         RelayHealth.NoInternet -> "Shore Pass is waiting for internet"
+        RelayHealth.DeferredRoaming -> stringResource(R.string.ui_relay_deferred_roaming)
         is RelayHealth.Failing -> "Shore Pass needs attention"
         is RelayHealth.Expired -> "Shore Pass expired"
         is RelayHealth.Suspended -> "Shore Pass suspended"
@@ -269,6 +289,7 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         RelayHealth.Checking -> "Setup is saved; CruiseMesh has not completed an authenticated check yet."
         is RelayHealth.Ok -> "Internet delivery is ready · checked ${relativeAge(health.lastSyncMs)}."
         RelayHealth.NoInternet -> "Configured; this phone is currently offline."
+        RelayHealth.DeferredRoaming -> stringResource(R.string.ui_relay_deferred_roaming)
         is RelayHealth.Failing -> "The relay could not be reached."
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
         is RelayHealth.Suspended -> "Contact support for help with this pass."

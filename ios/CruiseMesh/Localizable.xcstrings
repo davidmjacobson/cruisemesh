@@ -593,6 +593,16 @@
         }
       }
     },
+    "Advanced": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Advanced"
+          }
+        }
+      }
+    },
     "Arrived %@": {
       "localizations": {
         "en": {
@@ -1535,6 +1545,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Release to cancel"
+          }
+        }
+      }
+    },
+    "Roaming data is controlled by iOS. To prevent roaming charges at sea, turn off Data Roaming in Settings, under Cellular, then Cellular Data Options.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Roaming data is controlled by iOS. To prevent roaming charges at sea, turn off Data Roaming in Settings, under Cellular, then Cellular Data Options."
           }
         }
       }
@@ -4203,6 +4223,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Waiting for internet"
+          }
+        }
+      }
+    },
+    "Waiting for non-roaming internet to avoid roaming charges": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for non-roaming internet to avoid roaming charges"
           }
         }
       }

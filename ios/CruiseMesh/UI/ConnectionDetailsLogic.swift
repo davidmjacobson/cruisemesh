@@ -367,6 +367,7 @@ enum ConnectionInputs {
         case .noConfig: return .checking
         case .checking: return .checking
         case .noInternet: return .waitingForInternet
+        case .deferredRoaming: return .waitingForInternet
         case .ok: return .connected
         case .failing: return .unreachable
         case .expired: return .passExpired
@@ -385,6 +386,7 @@ enum ConnectionInputs {
      */
     static func validatedInternet(_ health: RelayHealth) -> Bool {
         if case .noInternet = health { return false }
+        if case .deferredRoaming = health { return false }
         return true
     }
 

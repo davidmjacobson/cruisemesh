@@ -513,6 +513,8 @@ struct ShorePassView: View {
             return "Checking setup…"
         case .noInternet:
             return "Phone is offline · setup is saved"
+        case .deferredRoaming:
+            return String(localized: "Waiting for non-roaming internet to avoid roaming charges")
         case .ok(let lastSyncMs):
             return "Ready · checked \(relativeAge(lastSyncMs))"
         case .failing:

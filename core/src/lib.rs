@@ -204,11 +204,12 @@ pub use session::relay_policy::{
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
     core_family_relay_backoff_vectors, core_family_relay_health_vectors,
     core_family_relay_jitter_ms, core_family_relay_jitter_vectors, core_family_relay_pacer_vectors,
-    core_family_relay_rerun_vectors, core_relay_pass_health, core_relay_rerun_action,
-    core_worse_relay_fault, CoreFamilyRelayBackoff, CoreFamilyRelayPacer, CoreRelayBackoffVector,
-    CoreRelayHealthVector, CoreRelayJitterVector, CoreRelayPacerVector, CoreRelayPassHealth,
-    CoreRelayRerunAction, CoreRelayRerunVector, FAMILY_RELAY_BACKOFF_BASE_MS,
-    FAMILY_RELAY_BACKOFF_CAP_MS, FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
+    core_family_relay_rerun_vectors, core_relay_network_permitted, core_relay_pass_health,
+    core_relay_rerun_action, core_worse_relay_fault, CoreFamilyRelayBackoff, CoreFamilyRelayPacer,
+    CoreRelayBackoffVector, CoreRelayHealthVector, CoreRelayJitterVector, CoreRelayNetworkVerdict,
+    CoreRelayPacerVector, CoreRelayPassHealth, CoreRelayRerunAction, CoreRelayRerunVector,
+    CoreRelayRoaming, FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_BACKOFF_CAP_MS,
+    FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
 };
 // The migration canary. Pure comparison over captured values, and removed
 // with the legacy engine it exists to check.

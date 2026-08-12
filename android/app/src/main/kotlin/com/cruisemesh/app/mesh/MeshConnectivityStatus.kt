@@ -10,6 +10,8 @@ sealed class RelayHealth {
     data class Ok(val lastSyncMs: Long) : RelayHealth()
     object Checking : RelayHealth()
     object NoInternet : RelayHealth()
+    /** Relay work is intentionally waiting for a non-roaming path. */
+    object DeferredRoaming : RelayHealth()
     object NoConfig : RelayHealth()
     data class Failing(val lastAttemptMs: Long) : RelayHealth()
     data class Expired(val lastAttemptMs: Long) : RelayHealth()

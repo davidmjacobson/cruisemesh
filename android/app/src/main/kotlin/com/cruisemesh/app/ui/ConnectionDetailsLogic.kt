@@ -317,6 +317,7 @@ object ConnectionInputs {
             is RelayHealth.NoConfig -> CoreRelayPathState.CHECKING
             is RelayHealth.Checking -> CoreRelayPathState.CHECKING
             is RelayHealth.NoInternet -> CoreRelayPathState.WAITING_FOR_INTERNET
+            is RelayHealth.DeferredRoaming -> CoreRelayPathState.WAITING_FOR_INTERNET
             is RelayHealth.Ok -> CoreRelayPathState.CONNECTED
             is RelayHealth.Failing -> CoreRelayPathState.UNREACHABLE
             is RelayHealth.Expired -> CoreRelayPathState.PASS_EXPIRED
@@ -333,7 +334,8 @@ object ConnectionInputs {
      * app publishes; every other health value was produced by a request that
      * a validated network carried.
      */
-    fun validatedInternet(health: RelayHealth): Boolean = health !is RelayHealth.NoInternet
+    fun validatedInternet(health: RelayHealth): Boolean =
+        health !is RelayHealth.NoInternet && health !is RelayHealth.DeferredRoaming
 
     /** Last successful Shore Pass sync, or `0` when there has not been one. */
     fun relayLastSyncMs(health: RelayHealth): Long =
