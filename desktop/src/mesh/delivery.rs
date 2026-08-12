@@ -13,18 +13,27 @@ use cruisemesh_core::{
 
 use crate::lan::endpoint_cache::EndpointCache;
 
+pub type DiscoveryPolicy = Arc<dyn Fn() -> (bool, u64) + Send + Sync>;
+
 pub struct DeliveryDispatcher {
     store: Arc<MessageStore>,
     identity: Identity,
     endpoints: EndpointCache,
+    discovery: DiscoveryPolicy,
 }
 
 impl DeliveryDispatcher {
-    pub fn new(store: Arc<MessageStore>, identity: Identity, endpoints: EndpointCache) -> Self {
+    pub fn new(
+        store: Arc<MessageStore>,
+        identity: Identity,
+        endpoints: EndpointCache,
+        discovery: DiscoveryPolicy,
+    ) -> Self {
         Self {
             store,
             identity,
             endpoints,
+            discovery,
         }
     }
 
@@ -167,8 +176,8 @@ impl DeliveryDispatcher {
         if friend_card_user_id(request.card.clone()) != sender_user_id {
             bail!("friend request card does not match its verified sender");
         }
-        if request.shared.is_some() {
-            // Shared-card and introduced flows require explicit confirmation.
+        if let Some(shared) = request.shared {
+            self.hold_shared_friend_request(sender_user_id, request.card, shared)?;
             return Ok(());
         }
         self.store.upsert_imported_contact(Contact {
@@ -180,6 +189,62 @@ impl DeliveryDispatcher {
             relay_token: request.card.relay_token,
             nickname: None,
         })?;
+        Ok(())
+    }
+
+    fn hold_shared_friend_request(
+        &self,
+        sender_user_id: &[u8],
+        card: cruisemesh_core::FriendCard,
+        shared: cruisemesh_core::SharedFriendCard,
+    ) -> Result<()> {
+        let (enabled, revision) = (self.discovery)();
+        let Some(sharer) = self.store.get_contact(shared.sharer_user_id.clone())? else {
+            return Ok(());
+        };
+        if self.store.is_user_blocked(shared.sharer_user_id.clone())? {
+            return Ok(());
+        }
+        if cruisemesh_core::friend_card_user_id(shared.card.clone()) != self.identity.user_id {
+            return Ok(());
+        }
+        if !enabled {
+            return Ok(());
+        }
+        if !cruisemesh_core::verify_shared_friend_card(
+            shared.clone(),
+            sharer.sign_pk,
+            self.identity.user_id.clone(),
+            revision,
+            now_ms(),
+        )? {
+            return Ok(());
+        }
+        if self
+            .store
+            .get_shared_request_dismissal(sender_user_id.to_vec())?
+            .map(|row| row.suppressed)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let now = now_ms();
+        self.store
+            .upsert_pending_shared_request(cruisemesh_core::PendingSharedRequest {
+                requester_user_id: sender_user_id.to_vec(),
+                name: card.name,
+                sign_pk: card.sign_pk,
+                agree_pk: card.agree_pk,
+                relay_url: card.relay_url,
+                relay_token: card.relay_token,
+                sharer_user_id: shared.sharer_user_id,
+                expires_at_ms: shared.expires_at_ms,
+                first_seen_ms: now,
+                last_prompted_ms: 0,
+            })?;
+        let _ = self
+            .store
+            .note_shared_request_prompt(sender_user_id.to_vec(), now);
         Ok(())
     }
 
@@ -212,4 +277,12 @@ impl DeliveryDispatcher {
             }
         }
     }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }

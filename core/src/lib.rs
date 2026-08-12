@@ -94,8 +94,10 @@ pub use groups::{
 pub use identity::{
     create_shared_friend_card, fingerprint_words, format_user_id, friend_card_match,
     friend_card_user_id, generate_identity, make_friend_card, make_friend_link,
-    make_shared_friend_request_payload, parse_friend_card, parse_friend_request_content,
-    parse_friend_text, CoreError, FriendCard, FriendCardMatch, FriendRequestContent, Identity,
+    make_shared_contact_code, make_shared_friend_request_payload, parse_friend_card,
+    parse_friend_import, parse_friend_request_content, parse_friend_text, shared_card_expired,
+    verify_shared_friend_card, CoreError, FriendCard, FriendCardMatch, FriendImport,
+    FriendRequestContent, Identity, SharedFriendCard,
 };
 pub use lan_session::{
     lan_default_tcp_port, lan_max_frame_size, lan_service_type, LanNoiseSession,
@@ -255,7 +257,8 @@ pub use store::{
     CoreRecipientDeliveryStatus, DigestEntry, FriendSuggestion, IncomingMessageInsertOutcome,
     MessageArrival, MessageConflictSummary, MessageOrigin, MessageReference, MessageStore,
     OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
-    PeerConnectionSummary, PeerConnectionTransport, RelayFetchCursor, StoredMessage,
+    PeerConnectionSummary, PeerConnectionTransport, PendingSharedRequest, RelayFetchCursor,
+    StoredMessage,
 };
 pub use transport_policy::{
     core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,

@@ -5,6 +5,7 @@ export interface Profile {
   display_name: string;
   friend_link: string;
   fingerprint_words: string[];
+  avatar_base64?: string;
 }
 
 export interface NodeStatus {
@@ -16,6 +17,39 @@ export interface NodeStatus {
 export interface Preferences {
   prevent_sleep_on_ac: boolean;
   share_online: boolean;
+  friends_of_friends: boolean;
+}
+
+export interface ShorePassStatus {
+  configured: boolean;
+  state: string;
+  title: string;
+  detail: string;
+}
+
+export interface PendingShared {
+  id: string;
+  name: string;
+  fingerprint_words: string[];
+  sharer_name: string;
+  offer_dont_ask_again: boolean;
+}
+
+export interface FriendPreview {
+  name: string;
+  fingerprint_words: string[];
+  already_known: boolean;
+  shared: boolean;
+  expired: boolean;
+  sharer_name?: string;
+}
+
+export interface ConversationMember {
+  id: string;
+  display_name: string;
+  own: boolean;
+  fingerprint_words: string[];
+  avatar_base64?: string;
 }
 
 export interface Diagnostics {
@@ -31,6 +65,10 @@ export interface Contact {
   connected_lan: boolean;
   internet_delivery_configured: boolean;
   fingerprint_words: string[];
+  nickname?: string;
+  blocked: boolean;
+  muted: boolean;
+  avatar_base64?: string;
 }
 
 export interface ConversationSummary {
@@ -43,6 +81,7 @@ export interface ConversationSummary {
   preview?: string;
   timestamp_ms?: number;
   tick?: Tick;
+  muted: boolean;
 }
 
 export interface AppSnapshot {
@@ -56,6 +95,9 @@ export interface AppSnapshot {
   attachment_max_blob_bytes: number;
   voice_min_duration_ms: number;
   voice_max_duration_ms: number;
+  terms_accepted: boolean;
+  shore_pass: ShorePassStatus;
+  pending_shared: PendingShared[];
 }
 
 export interface Attachment {
@@ -91,6 +133,8 @@ export interface Conversation {
   kind: ConversationKind;
   title: string;
   member_count: number;
+  has_older: boolean;
+  members: ConversationMember[];
   messages: Message[];
 }
 

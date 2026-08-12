@@ -117,7 +117,7 @@ mod windows_main {
                             .unwrap_or("contact")
                     );
                 } else {
-                    let contact = bootstrap.import_friend(&text)?;
+                    let (contact, _) = bootstrap.import_friend(&text)?;
                     println!("Imported {}.", contact.name);
                 }
             }

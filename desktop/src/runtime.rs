@@ -46,7 +46,19 @@ pub async fn run(paths: AppPaths, bootstrap: Arc<BootstrapStore>) -> Result<()> 
     let identity = bootstrap.identity().clone();
     let store = bootstrap.store();
     let endpoints = EndpointCache::new(paths.endpoint_cache.clone());
-    let inbound = InboundExecutor::start(store.clone(), identity.clone(), endpoints.clone())?;
+    let inbound_bootstrap = bootstrap.clone();
+    let inbound = InboundExecutor::start_with_discovery(
+        store.clone(),
+        identity.clone(),
+        endpoints.clone(),
+        Arc::new(move || {
+            let config = inbound_bootstrap.config();
+            (
+                config.friends_of_friends,
+                config.friends_of_friends_revision,
+            )
+        }),
+    )?;
     let hub = Arc::new(PeerHub::new(&identity));
     let mut token = vec![0_u8; 8];
     thread_rng().fill_bytes(&mut token);
@@ -263,6 +275,7 @@ async fn relay_loop(
             .drain_relay_sourced(&bootstrap.store(), now_ms())
             .await?;
         schedule.observe(&result.summary);
+        bootstrap.record_relay_health(result.summary.health);
         tracing::info!(
             outcome = ?result.summary.outcome,
             requests = result.summary.requests_issued,

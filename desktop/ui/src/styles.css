@@ -102,6 +102,18 @@ button, textarea, input { font: inherit; }
 .camera-scanner { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
 .camera-scanner video { width: 100%; max-height: 280px; border-radius: 8px; background: black; object-fit: cover; }
 .visually-hidden { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.onboarding { height: 100%; display: flex; flex-direction: column; justify-content: center; gap: 16px; max-width: 520px; margin: 0 auto; padding: 32px; }
+.chat-header-button { display: flex; align-items: center; gap: 12px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.pending-banner { width: calc(100% - 12px); margin: 6px; padding: 10px 12px; border: 0; border-radius: 8px; background: var(--colorBrandBackground2); color: inherit; text-align: left; cursor: pointer; font-weight: 600; }
+.staged-photo { display: flex; flex-direction: column; gap: 8px; margin: 0 42px 8px; }
+.staged-photo img { max-height: 160px; border-radius: 8px; object-fit: contain; }
+.photo-markup { position: fixed; inset: 0; z-index: 50; display: grid; grid-template-rows: 1fr auto; background: rgb(0 0 0 / 86%); }
+.markup-stage { position: relative; min-height: 0; }
+.markup-stage img, .markup-overlay { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.markup-overlay { pointer-events: none; }
+.markup-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 12px 16px; background: var(--colorNeutralBackground1); }
+.markup-swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid transparent; cursor: pointer; }
+.markup-swatch.selected { border-color: var(--colorBrandStroke1); }
 @media (max-width: 800px) { .app-shell { grid-template-columns: 48px minmax(220px, 280px) 1fr; } .message { max-width: 90%; } .profile-card { flex-wrap: wrap; } .profile-actions { width: 100%; flex-direction: row; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; } }
 @media (forced-colors: active) { .conversation-row.selected, .own .bubble { border: 2px solid Highlight; } .presence { border: 1px solid CanvasText; } }

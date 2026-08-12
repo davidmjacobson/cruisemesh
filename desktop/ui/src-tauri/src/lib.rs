@@ -27,7 +27,7 @@ mod windows_app {
     const PIPE_NAME: &str = r"\\.\pipe\CruiseMeshNode";
     const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     const START_TIMEOUT: Duration = Duration::from_secs(15);
-    const UI_PROTOCOL_VERSION: u64 = 3;
+    const UI_PROTOCOL_VERSION: u64 = 4;
     const OLD_HELPER_MESSAGE: &str = "An older CruiseMesh Helper is already running. Right-click the CruiseMesh Helper tray icon, confirm Quit, and leave this window open. It will start the updated helper automatically.";
     static PROTOCOL_READY: AtomicBool = AtomicBool::new(false);
 
@@ -189,10 +189,14 @@ mod windows_app {
     }
 
     #[tauri::command]
-    async fn get_conversation(conversation_id: String) -> std::result::Result<Value, String> {
+    async fn get_conversation(
+        conversation_id: String,
+        before_timestamp_ms: Option<i64>,
+    ) -> std::result::Result<Value, String> {
         request(json!({
             "command": "GetConversation",
             "conversation_id": conversation_id,
+            "before_timestamp_ms": before_timestamp_ms,
         }))
         .await
     }
@@ -270,6 +274,119 @@ mod windows_app {
     }
 
     #[tauri::command]
+    async fn preview_friend(text: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "PreviewFriendCard", "text": text })).await
+    }
+
+    #[tauri::command]
+    async fn delete_contact(conversation_id: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "DeleteContact", "conversation_id": conversation_id })).await
+    }
+
+    #[tauri::command]
+    async fn set_nickname(
+        conversation_id: String,
+        nickname: Option<String>,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "SetNickname",
+            "conversation_id": conversation_id,
+            "nickname": nickname,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn set_blocked(
+        conversation_id: String,
+        blocked: bool,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "SetBlocked",
+            "conversation_id": conversation_id,
+            "blocked": blocked,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn set_muted(
+        conversation_id: String,
+        muted: bool,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "SetMuted",
+            "conversation_id": conversation_id,
+            "muted": muted,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn report_contact(conversation_id: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "ReportContact", "conversation_id": conversation_id })).await
+    }
+
+    #[tauri::command]
+    async fn rename_group(
+        conversation_id: String,
+        name: String,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "RenameGroup",
+            "conversation_id": conversation_id,
+            "name": name,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn add_group_members(
+        conversation_id: String,
+        member_ids: Vec<String>,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "AddGroupMembers",
+            "conversation_id": conversation_id,
+            "member_ids": member_ids,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn share_contact(conversation_id: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "ShareContact", "conversation_id": conversation_id })).await
+    }
+
+    #[tauri::command]
+    async fn accept_pending_shared(requester_id: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "AcceptPendingShared", "requester_id": requester_id })).await
+    }
+
+    #[tauri::command]
+    async fn dismiss_pending_shared(
+        requester_id: String,
+        suppress: bool,
+    ) -> std::result::Result<Value, String> {
+        request(json!({
+            "command": "DismissPendingShared",
+            "requester_id": requester_id,
+            "suppress": suppress,
+        }))
+        .await
+    }
+
+    #[tauri::command]
+    async fn set_profile_photo(data_base64: String) -> std::result::Result<Value, String> {
+        request(json!({ "command": "SetProfilePhoto", "data_base64": data_base64 })).await
+    }
+
+    #[tauri::command]
+    async fn accept_terms() -> std::result::Result<Value, String> {
+        request(json!({ "command": "AcceptTerms" })).await
+    }
+
+    #[tauri::command]
     async fn import_relay(text: String) -> std::result::Result<Value, String> {
         request(json!({ "command": "ImportRelaySetup", "text": text })).await
     }
@@ -320,11 +437,13 @@ mod windows_app {
     async fn set_preferences(
         prevent_sleep_on_ac: bool,
         share_online: bool,
+        friends_of_friends: Option<bool>,
     ) -> std::result::Result<Value, String> {
         request(json!({
             "command": "SetPreferences",
             "prevent_sleep_on_ac": prevent_sleep_on_ac,
             "share_online": share_online,
+            "friends_of_friends": friends_of_friends,
         }))
         .await
     }
@@ -355,6 +474,19 @@ mod windows_app {
                 mark_read,
                 create_group,
                 import_friend,
+                preview_friend,
+                delete_contact,
+                set_nickname,
+                set_blocked,
+                set_muted,
+                report_contact,
+                rename_group,
+                add_group_members,
+                share_contact,
+                accept_pending_shared,
+                dismiss_pending_shared,
+                set_profile_photo,
+                accept_terms,
                 import_relay,
                 create_backup,
                 preview_backup,

@@ -56,15 +56,17 @@ import {
 } from "./presentation";
 import { VoicePlayer } from "./VoicePlayer";
 import { voicePlayback } from "./voice";
+import { PhotoMarkup } from "./PhotoMarkup";
 import type {
   AppSnapshot,
   Conversation,
   ConversationSummary,
+  FriendPreview,
   Message,
   Tick,
 } from "./types";
 
-type DialogName = "friend" | "card" | "group" | null;
+type DialogName = "friend" | "card" | "group" | "details" | "share" | "pending" | null;
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -106,6 +108,10 @@ export function App() {
   const [reply, setReply] = useState<Message>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [friendPreview, setFriendPreview] = useState<FriendPreview>();
+  const [shareCode, setShareCode] = useState<{ name: string; code: string }>();
+  const [stagedPhoto, setStagedPhoto] = useState<string>();
+  const [drawing, setDrawing] = useState(false);
   const previousUnread = useRef<Map<string, number> | undefined>(undefined);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -119,6 +125,7 @@ export function App() {
           if (
             row.unread_count > old &&
             row.id !== selectedId &&
+            !row.muted &&
             (!document.hasFocus() || document.hidden)
           ) {
             let granted = await isPermissionGranted();
@@ -144,7 +151,7 @@ export function App() {
     }
     try {
       const next = await api.conversation(selectedId);
-      setConversation(next);
+      setConversation((previous) => mergeConversation(previous, next));
       if (next.kind === "person") await api.markRead(next.id);
     } catch (nextError) {
       setError(errorText(nextError));
@@ -204,6 +211,10 @@ export function App() {
 
   async function attach(file?: File, durationMs = 0) {
     if (!file || !selectedId || !snapshot) return;
+    if (file.type.startsWith("image/") && !stagedPhoto) {
+      setStagedPhoto(URL.createObjectURL(file));
+      return;
+    }
     setBusy(true);
     try {
       const prepared = await prepareAttachment(
@@ -225,8 +236,18 @@ export function App() {
   async function addFriend() {
     setBusy(true);
     try {
+      if (!friendPreview) {
+        const preview = await api.previewFriend(friendText);
+        if (preview.expired) {
+          setError(userCopy.expiredCode);
+          return;
+        }
+        setFriendPreview(preview);
+        return;
+      }
       await api.importFriend(friendText);
       setFriendText("");
+      setFriendPreview(undefined);
       setDialog(null);
       await refreshSnapshot();
     } catch (nextError) {
@@ -332,10 +353,10 @@ export function App() {
     }
   }
 
-  async function updatePreferences(preventSleepOnAc: boolean, shareOnline: boolean) {
+  async function updatePreferences(preventSleepOnAc: boolean, shareOnline: boolean, friendsOfFriends?: boolean) {
     setBusy(true);
     try {
-      await api.setPreferences(preventSleepOnAc, shareOnline);
+      await api.setPreferences(preventSleepOnAc, shareOnline, friendsOfFriends);
       await refreshSnapshot();
     } catch (nextError) {
       setError(errorText(nextError));
@@ -356,6 +377,30 @@ export function App() {
     } catch (nextError) {
       setError(errorText(nextError));
     }
+  }
+
+  if (snapshot && !snapshot.terms_accepted) {
+    return (
+      <Onboarding
+        busy={busy}
+        name={profileName || snapshot.profile.display_name}
+        setName={setProfileName}
+        onContinue={() => void (async () => {
+          setBusy(true);
+          try {
+            if (profileName.trim() && profileName.trim() !== snapshot.profile.display_name) {
+              await api.setProfile(profileName);
+            }
+            await api.acceptTerms();
+            await refreshSnapshot();
+          } catch (nextError) {
+            setError(errorText(nextError));
+          } finally {
+            setBusy(false);
+          }
+        })()}
+      />
+    );
   }
 
   if (!snapshot) {
@@ -405,6 +450,11 @@ export function App() {
           </div>
         </header>
         <nav className="conversation-list">
+          {snapshot.pending_shared.length > 0 && (
+            <button className="pending-banner" onClick={() => setDialog("pending")}>
+              {snapshot.pending_shared.length} waiting to connect
+            </button>
+          )}
           {snapshot.conversations.length === 0 ? (
             <div className="empty-list">
               <Navigation24Regular />
@@ -445,21 +495,46 @@ export function App() {
             profileName={profileName}
             setProfileName={setProfileName}
             updateProfile={() => void updateProfile()}
-            updatePreferences={(preventSleepOnAc, shareOnline) => void updatePreferences(preventSleepOnAc, shareOnline)}
+            updatePreferences={(preventSleepOnAc, shareOnline, friendsOfFriends) => void updatePreferences(preventSleepOnAc, shareOnline, friendsOfFriends)}
           />
         ) : conversation ? (
           <section className="chat" aria-label={`Conversation with ${conversation.title}`}>
             <header className="chat-header">
-              <Avatar name={conversation.title} color="colorful" />
-              <div>
-                <Text size={500} weight="semibold">{conversation.title}</Text>
-                <div className="subtle">
-                  {conversation.kind === "group" ? `${conversation.member_count} members` : selectedSummary(snapshot, conversation.id)?.connected_lan ? "Nearby on Wi-Fi" : "CruiseMesh contact"}
+              <button type="button" className="chat-header-button" onClick={() => setDialog("details")}>
+                <Avatar
+                  name={conversation.title}
+                  color="colorful"
+                  image={personAvatar(
+                    conversation.title,
+                    conversation.kind === "person"
+                      ? snapshot.contacts.find((contact) => contact.id === conversation.id)?.avatar_base64
+                      : undefined,
+                  )}
+                />
+                <div>
+                  <Text size={500} weight="semibold">{conversation.title}</Text>
+                  <div className="subtle">
+                    {conversation.kind === "group" ? `${conversation.member_count} members` : selectedSummary(snapshot, conversation.id)?.connected_lan ? "Nearby on Wi-Fi" : "CruiseMesh contact"}
+                  </div>
                 </div>
-                {conversation.kind === "person" && <div className="fingerprint compact" aria-label={`Fingerprint ${snapshot.contacts.find((contact) => contact.id === conversation.id)?.fingerprint_words.join(" ") || "unavailable"}`}>{snapshot.contacts.find((contact) => contact.id === conversation.id)?.fingerprint_words.join(" · ")}</div>}
-              </div>
+              </button>
             </header>
             <div className="message-list" role="log" aria-live="polite">
+              {conversation.has_older && (
+                <Button appearance="subtle" disabled={busy} onClick={() => void (async () => {
+                  const oldest = conversation.messages[0];
+                  if (!oldest) return;
+                  setBusy(true);
+                  try {
+                    const page = await api.conversation(conversation.id, oldest.timestamp_ms);
+                    setConversation((current) => current ? { ...page, messages: [...page.messages, ...current.messages.filter((message) => !page.messages.some((row) => row.id === message.id))] } : page);
+                  } catch (nextError) {
+                    setError(errorText(nextError));
+                  } finally {
+                    setBusy(false);
+                  }
+                })()}>{userCopy.loadOlder}</Button>
+              )}
               {conversation.messages.length === 0 && (
                 <div className="empty-chat">
                   <Avatar name={conversation.title} size={72} color="colorful" />
@@ -483,6 +558,22 @@ export function App() {
               <div ref={messagesEnd} />
             </div>
             <form className="composer" onSubmit={send}>
+              {stagedPhoto && !drawing && (
+                <div className="staged-photo">
+                  <img src={stagedPhoto} alt="" />
+                  <div className="settings-actions">
+                    <Button type="button" onClick={() => setDrawing(true)}>{userCopy.draw}</Button>
+                    <Button type="button" appearance="primary" disabled={busy} onClick={() => void (async () => {
+                      const response = await fetch(stagedPhoto);
+                      const blob = await response.blob();
+                      URL.revokeObjectURL(stagedPhoto);
+                      setStagedPhoto(undefined);
+                      await attach(new File([blob], "photo.jpg", { type: blob.type || "image/jpeg" }));
+                    })}>Send</Button>
+                    <Button type="button" onClick={() => { URL.revokeObjectURL(stagedPhoto); setStagedPhoto(undefined); }}>Cancel</Button>
+                  </div>
+                </div>
+              )}
               {reply && (
                 <div className="reply-banner">
                   <ArrowReply24Regular />
@@ -531,9 +622,10 @@ export function App() {
       <FriendDialog
         open={dialog === "friend"}
         text={friendText}
-        setText={setFriendText}
+        setText={(value) => { setFriendText(value); setFriendPreview(undefined); }}
+        preview={friendPreview}
         busy={busy}
-        onClose={() => setDialog(null)}
+        onClose={() => { setFriendPreview(undefined); setDialog(null); }}
         onImport={() => void addFriend()}
         onShowCard={() => setDialog("card")}
       />
@@ -549,12 +641,113 @@ export function App() {
         onClose={() => setDialog(null)}
         onCreate={() => void createGroup()}
       />
+      {dialog === "details" && conversation && (
+        conversation.kind === "person" ? (
+          <PersonDetails
+            snapshot={snapshot}
+            conversationId={conversation.id}
+            busy={busy}
+            onClose={() => setDialog(null)}
+            onChanged={() => void Promise.all([refreshConversation(), refreshSnapshot()])}
+            onShare={async () => {
+              try {
+                setShareCode(await api.shareContact(conversation.id));
+                setDialog("share");
+              } catch (nextError) {
+                setError(errorText(nextError));
+              }
+            }}
+            onDeleted={() => {
+              setSelectedId(undefined);
+              setConversation(undefined);
+              setDialog(null);
+              void refreshSnapshot();
+            }}
+          />
+        ) : (
+          <GroupDetails
+            snapshot={snapshot}
+            conversation={conversation}
+            busy={busy}
+            onClose={() => setDialog(null)}
+            onChanged={() => void Promise.all([refreshConversation(), refreshSnapshot()])}
+          />
+        )
+      )}
+      {dialog === "share" && shareCode && (
+        <Dialog open onOpenChange={(_, data) => { if (!data.open) setDialog(null); }}>
+          <DialogSurface>
+            <DialogBody>
+              <DialogTitle>{userCopy.shareContact}</DialogTitle>
+              <DialogContent className="card-dialog">
+                <Text>{userCopy.shareContactHelp}</Text>
+                <div className="qr"><QRCodeSVG value={shareCode.code} size={236} level="M" marginSize={2} /></div>
+                <Text>{shareCode.name}</Text>
+              </DialogContent>
+              <DialogActions><Button appearance="primary" onClick={() => setDialog(null)}>Done</Button></DialogActions>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
+      )}
+      {dialog === "pending" && (
+        <PendingDialog
+          rows={snapshot.pending_shared}
+          busy={busy}
+          onClose={() => setDialog(null)}
+          onAccept={async (id) => {
+            setBusy(true);
+            try {
+              await api.acceptPendingShared(id);
+              await refreshSnapshot();
+            } catch (nextError) {
+              setError(errorText(nextError));
+            } finally {
+              setBusy(false);
+            }
+          }}
+          onDismiss={async (id, suppress) => {
+            setBusy(true);
+            try {
+              await api.dismissPendingShared(id, suppress);
+              await refreshSnapshot();
+            } catch (nextError) {
+              setError(errorText(nextError));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      )}
+      {drawing && stagedPhoto && snapshot && (
+        <PhotoMarkup
+          source={stagedPhoto}
+          maxBytes={snapshot.attachment_max_blob_bytes}
+          onCancel={() => setDrawing(false)}
+          onConfirm={(file) => {
+            URL.revokeObjectURL(stagedPhoto);
+            setStagedPhoto(undefined);
+            setDrawing(false);
+            void attach(file);
+          }}
+        />
+      )}
     </div>
   );
 }
 
 function selectedSummary(snapshot: AppSnapshot, id: string) {
   return snapshot.conversations.find((row) => row.id === id);
+}
+
+function mergeConversation(previous: Conversation | undefined, next: Conversation): Conversation {
+  if (!previous || previous.id !== next.id) return next;
+  const incoming = new Set(next.messages.map((message) => message.id));
+  const older = previous.messages.filter((message) => !incoming.has(message.id));
+  return { ...next, messages: [...older, ...next.messages] };
+}
+
+function personAvatar(name: string, avatarBase64?: string) {
+  return avatarBase64 ? { src: `data:image/jpeg;base64,${avatarBase64}` } : undefined;
 }
 
 function ConversationRow({ row, selected, onClick }: { row: ConversationSummary; selected: boolean; onClick: () => void }) {
@@ -725,7 +918,7 @@ function VoiceButton({
   );
 }
 
-function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard, busy, backupPassphrase, setBackupPassphrase, exportBackup, restoreBackup, profileName, setProfileName, updateProfile, updatePreferences }: { snapshot: AppSnapshot; relayText: string; setRelayText: (value: string) => void; importRelay: () => void; showCard: () => void; busy: boolean; backupPassphrase: string; setBackupPassphrase: (value: string) => void; exportBackup: () => void; restoreBackup: () => void; profileName: string; setProfileName: (value: string) => void; updateProfile: () => void; updatePreferences: (preventSleepOnAc: boolean, shareOnline: boolean) => void }) {
+function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard, busy, backupPassphrase, setBackupPassphrase, exportBackup, restoreBackup, profileName, setProfileName, updateProfile, updatePreferences }: { snapshot: AppSnapshot; relayText: string; setRelayText: (value: string) => void; importRelay: () => void; showCard: () => void; busy: boolean; backupPassphrase: string; setBackupPassphrase: (value: string) => void; exportBackup: () => void; restoreBackup: () => void; profileName: string; setProfileName: (value: string) => void; updateProfile: () => void; updatePreferences: (preventSleepOnAc: boolean, shareOnline: boolean, friendsOfFriends?: boolean) => void }) {
   const connection = connectionSummary(snapshot.lan_peers, snapshot.node.relay_configured);
   const nearby = snapshot.contacts.filter((contact) => contact.connected_lan);
   const other = snapshot.contacts.filter((contact) => !contact.connected_lan);
@@ -734,7 +927,7 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
     <section className="settings-view" aria-labelledby="settings-title">
       <header><Text id="settings-title" size={700} weight="semibold">Profile & settings</Text><Text>Your identity stays on this Windows account.</Text></header>
       <section className="settings-card profile-card" aria-labelledby="profile-heading">
-        <Avatar name={snapshot.profile.display_name} size={72} color="colorful" />
+        <Avatar name={snapshot.profile.display_name} size={72} color="colorful" image={personAvatar(snapshot.profile.display_name, snapshot.profile.avatar_base64)} />
         <div className="profile-copy">
           <Text id="profile-heading" size={500} weight="semibold">You</Text>
           <label className="field-label" htmlFor="profile-name">Name</label>
@@ -747,6 +940,20 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
         </div>
         <div className="settings-actions profile-actions">
           <Button appearance="secondary" disabled={busy || !profileName.trim() || profileName.trim() === snapshot.profile.display_name} onClick={updateProfile}>Save name</Button>
+          <Button onClick={() => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = "image/*";
+            input.onchange = () => {
+              const file = input.files?.[0];
+              if (!file) return;
+              void (async () => {
+                const prepared = await prepareAttachment(file, 24 * 1024);
+                await api.setProfilePhoto(prepared.data_base64);
+              })().catch(() => undefined);
+            };
+            input.click();
+          }}>Choose photo</Button>
           <Button icon={<QrCode24Regular />} onClick={showCard}>My friend card</Button>
         </div>
       </section>
@@ -759,6 +966,10 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
         <div className={`connection-health health-${connection.tone}`}>
           <strong>{connection.title}</strong>
           <span>{connection.detail}</span>
+        </div>
+        <div className={`connection-health ${snapshot.shore_pass.state === "ready" || snapshot.shore_pass.state === "not_set_up" || snapshot.shore_pass.state === "checking" ? "health-good" : "health-waiting"}`}>
+          <strong>{snapshot.shore_pass.title}</strong>
+          <span>{snapshot.shore_pass.detail}</span>
         </div>
         <div className="settings-subsection">
           <Text weight="semibold">Active paths</Text>
@@ -780,12 +991,18 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
         <div><Text id="advanced-heading" size={500} weight="semibold">Advanced</Text><Text block size={200}>Background operation, privacy, and support details.</Text></div>
         <label className="setting-switch"><span><strong>Keep this PC awake while helping</strong><small>Prevents system sleep while plugged in. Changes apply the next time the helper starts.</small></span><Switch checked={snapshot.preferences.prevent_sleep_on_ac} disabled={busy} aria-label="Keep this PC awake while helping" onChange={(_, data) => updatePreferences(data.checked, snapshot.preferences.share_online)} /></label>
         <label className="setting-switch"><span><strong>Share when I’m online</strong><small>Lets accepted friends see recent Shore Pass availability.</small></span><Switch checked={snapshot.preferences.share_online} disabled={busy} aria-label="Share when I’m online" onChange={(_, data) => updatePreferences(snapshot.preferences.prevent_sleep_on_ac, data.checked)} /></label>
+        <label className="setting-switch"><span><strong>{userCopy.friendsOfFriends}</strong><small>{userCopy.friendsOfFriendsDetail}</small></span><Switch checked={snapshot.preferences.friends_of_friends} disabled={busy} aria-label={userCopy.friendsOfFriends} onChange={(_, data) => updatePreferences(snapshot.preferences.prevent_sleep_on_ac, snapshot.preferences.share_online, data.checked)} /></label>
         <div className="settings-subsection">
           <Text weight="semibold">Runtime</Text>
           <div className="detail-grid"><span>Helper version</span><strong>{snapshot.diagnostics.helper_version}</strong><span>{userCopy.wifiPort}</span><strong>{snapshot.diagnostics.listening_port}</strong><span>Contacts</span><strong>{snapshot.node.contacts}</strong><span>Groups</span><strong>{snapshot.conversations.filter((row) => row.kind === "group").length}</strong><span>Background operation</span><strong>Running from tray</strong><span>Identity protection</span><strong>Windows account</strong></div>
         </div>
         <details className="technical-disclosure"><summary>Support locations</summary><div><span>Data</span><code>{snapshot.diagnostics.data_directory}</code><span>Logs</span><code>{snapshot.diagnostics.logs_directory}</code></div></details>
         <Text size={200}>Identity and Shore Pass secrets are protected for this Windows account. Logs and diagnostics exclude names, message bodies, keys, and relay credentials.</Text>
+        <div className="settings-actions">
+          <Button appearance="subtle" onClick={() => window.open("https://cruisemesh.app/support/", "_blank")}>{userCopy.helpSupport}</Button>
+          <Button appearance="subtle" onClick={() => window.open("https://cruisemesh.app/terms/", "_blank")}>{userCopy.termsLink}</Button>
+          <Button appearance="subtle" onClick={() => window.open("https://cruisemesh.app/privacy/", "_blank")}>{userCopy.privacyLink}</Button>
+        </div>
       </section>
     </section>
   );
@@ -806,9 +1023,9 @@ function PeopleSection({ title, contacts }: { title: string; contacts: AppSnapsh
   );
 }
 
-function FriendDialog({ open, text, setText, busy, onClose, onImport, onShowCard }: { open: boolean; text: string; setText: (value: string) => void; busy: boolean; onClose: () => void; onImport: () => void; onShowCard: () => void }) {
+function FriendDialog({ open, text, setText, preview, busy, onClose, onImport, onShowCard }: { open: boolean; text: string; setText: (value: string) => void; preview?: FriendPreview; busy: boolean; onClose: () => void; onImport: () => void; onShowCard: () => void }) {
   const [scanning, setScanning] = useState(false);
-  return <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) { setScanning(false); onClose(); } }}><DialogSurface><DialogBody><DialogTitle>Add a friend</DialogTitle><DialogContent className="dialog-stack"><Text>{userCopy.addFriendHelp}</Text>{scanning ? <CameraScanner onValue={(value) => { setText(value); setScanning(false); }} onCancel={() => setScanning(false)} /> : <Button appearance="secondary" icon={<QrCode24Regular />} onClick={() => setScanning(true)}>Scan with webcam</Button>}<Textarea autoFocus={!scanning} value={text} onChange={(_, data) => setText(data.value)} placeholder="https://cruisemesh.app/f#…" /><Button appearance="subtle" icon={<QrCode24Regular />} onClick={onShowCard}>Show my card instead</Button></DialogContent><DialogActions><Button appearance="secondary" onClick={onClose}>Cancel</Button><Button appearance="primary" disabled={busy || !text.trim()} onClick={onImport}>Add friend</Button></DialogActions></DialogBody></DialogSurface></Dialog>;
+  return <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) { setScanning(false); onClose(); } }}><DialogSurface><DialogBody><DialogTitle>{preview ? userCopy.addThisFriend : "Add a friend"}</DialogTitle><DialogContent className="dialog-stack">{preview ? <><Text weight="semibold">{preview.name}</Text>{preview.shared && preview.sharer_name && <Text>{userCopy.sharedBy} {preview.sharer_name}</Text>}{preview.already_known && <Text>{userCopy.alreadyKnown}</Text>}<div className="fingerprint">{preview.fingerprint_words.join(" · ")}</div><Text size={200}>{userCopy.safetyWords}</Text></> : <><Text>{userCopy.addFriendHelp}</Text>{scanning ? <CameraScanner onValue={(value) => { setText(value); setScanning(false); }} onCancel={() => setScanning(false)} /> : <Button appearance="secondary" icon={<QrCode24Regular />} onClick={() => setScanning(true)}>Scan with webcam</Button>}<Textarea autoFocus={!scanning} value={text} onChange={(_, data) => setText(data.value)} placeholder="https://cruisemesh.app/f#…" /><Button appearance="subtle" icon={<QrCode24Regular />} onClick={onShowCard}>Show my card instead</Button></>}</DialogContent><DialogActions><Button appearance="secondary" onClick={onClose}>Cancel</Button><Button appearance="primary" disabled={busy || !text.trim()} onClick={onImport}>{preview ? "Add friend" : "Continue"}</Button></DialogActions></DialogBody></DialogSurface></Dialog>;
 }
 
 function CameraScanner({ onValue, onCancel }: { onValue: (value: string) => void; onCancel: () => void }) {
@@ -869,4 +1086,124 @@ function CardDialog({ open, snapshot, onClose }: { open: boolean; snapshot: AppS
 
 function GroupDialog({ open, snapshot, name, setName, members, setMembers, busy, onClose, onCreate }: { open: boolean; snapshot: AppSnapshot; name: string; setName: (value: string) => void; members: Set<string>; setMembers: (value: Set<string>) => void; busy: boolean; onClose: () => void; onCreate: () => void }) {
   return <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) onClose(); }}><DialogSurface><DialogBody><DialogTitle>New group</DialogTitle><DialogContent className="dialog-stack"><Input value={name} onChange={(_, data) => setName(data.value)} placeholder="Group name" aria-label="Group name" />{snapshot.contacts.map((contact) => <Checkbox key={contact.id} checked={members.has(contact.id)} label={contact.display_name} onChange={(_, data) => { const next = new Set(members); data.checked ? next.add(contact.id) : next.delete(contact.id); setMembers(next); }} />)}{snapshot.contacts.length === 0 && <Text>Add a friend before creating a group.</Text>}</DialogContent><DialogActions><Button appearance="secondary" onClick={onClose}>Cancel</Button><Button appearance="primary" disabled={busy || !name.trim() || members.size === 0} onClick={onCreate}>Create</Button></DialogActions></DialogBody></DialogSurface></Dialog>;
+}
+
+function Onboarding({ name, setName, busy, onContinue }: { name: string; setName: (value: string) => void; busy: boolean; onContinue: () => void }) {
+  const [agreed, setAgreed] = useState(false);
+  return (
+    <main className="onboarding">
+      <Text size={700} weight="semibold">{userCopy.termsTitle}</Text>
+      <Text>{userCopy.termsBody}</Text>
+      <div className="settings-actions">
+        <Button appearance="subtle" onClick={() => window.open("https://cruisemesh.app/terms/", "_blank")}>{userCopy.termsLink}</Button>
+        <Button appearance="subtle" onClick={() => window.open("https://cruisemesh.app/privacy/", "_blank")}>{userCopy.privacyLink}</Button>
+      </div>
+      <label className="field-label" htmlFor="setup-name">Name</label>
+      <Input id="setup-name" value={name} onChange={(_, data) => setName(data.value)} />
+      <label className="setting-switch">
+        <span>{userCopy.termsAgree}</span>
+        <Switch checked={agreed} onChange={(_, data) => setAgreed(data.checked)} />
+      </label>
+      <Button appearance="primary" disabled={busy || !agreed || !name.trim()} onClick={onContinue}>{userCopy.continueSetup}</Button>
+    </main>
+  );
+}
+
+function PersonDetails({ snapshot, conversationId, busy, onClose, onChanged, onShare, onDeleted }: { snapshot: AppSnapshot; conversationId: string; busy: boolean; onClose: () => void; onChanged: () => void; onShare: () => void; onDeleted: () => void }) {
+  const contact = snapshot.contacts.find((row) => row.id === conversationId);
+  const [nickname, setNickname] = useState(contact?.nickname || "");
+  if (!contact) return null;
+  return (
+    <Dialog open onOpenChange={(_, data) => { if (!data.open) onClose(); }}>
+      <DialogSurface>
+        <DialogBody>
+          <DialogTitle>{contact.display_name}</DialogTitle>
+          <DialogContent className="dialog-stack">
+            <Avatar name={contact.display_name} size={72} color="colorful" image={personAvatar(contact.display_name, contact.avatar_base64)} />
+            <div className="fingerprint">{contact.fingerprint_words.join(" · ")}</div>
+            <label className="field-label">{userCopy.nickname}</label>
+            <Input value={nickname} onChange={(_, data) => setNickname(data.value)} />
+            <Text size={200}>{userCopy.nicknameHint}</Text>
+            <Button disabled={busy} onClick={() => void api.setNickname(conversationId, nickname.trim() || undefined).then(onChanged)}>{userCopy.nickname}</Button>
+            <label className="setting-switch"><span>{userCopy.muteNotifications}</span><Switch checked={contact.muted} disabled={busy} onChange={(_, data) => void api.setMuted(conversationId, data.checked).then(onChanged)} /></label>
+            <label className="setting-switch"><span>{userCopy.blockContact}</span><Switch checked={contact.blocked} disabled={busy} onChange={(_, data) => {
+              if (data.checked && !window.confirm(userCopy.blockExplain)) return;
+              void api.setBlocked(conversationId, data.checked).then(onChanged);
+            }} /></label>
+            {snapshot.preferences.friends_of_friends && <Button onClick={onShare}>{userCopy.shareContact}</Button>}
+            <Button onClick={() => void api.reportContact(conversationId).then((report) => { window.open(report.mailto); })}>{userCopy.reportContact}</Button>
+            <Button appearance="primary" disabled={busy} onClick={() => {
+              if (!window.confirm(`Delete ${contact.display_name}?`)) return;
+              void api.deleteContact(conversationId).then(onDeleted);
+            }}>{userCopy.deleteContact}</Button>
+          </DialogContent>
+          <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  );
+}
+
+function GroupDetails({ snapshot, conversation, busy, onClose, onChanged }: { snapshot: AppSnapshot; conversation: Conversation; busy: boolean; onClose: () => void; onChanged: () => void }) {
+  const [name, setName] = useState(conversation.title);
+  const [additions, setAdditions] = useState<Set<string>>(new Set());
+  const existing = new Set(conversation.members.filter((member) => !member.own).map((member) => member.id));
+  const candidates = snapshot.contacts.filter((contact) => !existing.has(contact.id));
+  return (
+    <Dialog open onOpenChange={(_, data) => { if (!data.open) onClose(); }}>
+      <DialogSurface>
+        <DialogBody>
+          <DialogTitle>{conversation.title}</DialogTitle>
+          <DialogContent className="dialog-stack">
+            <Input value={name} onChange={(_, data) => setName(data.value)} aria-label={userCopy.renameGroup} />
+            <Button disabled={busy || !name.trim() || name.trim() === conversation.title} onClick={() => void api.renameGroup(conversation.id, name).then(onChanged)}>{userCopy.renameGroup}</Button>
+            {conversation.members.map((member) => (
+              <div className="person-row" key={member.id}>
+                <Avatar name={member.display_name} size={32} color="colorful" image={personAvatar(member.display_name, member.avatar_base64)} />
+                <span><strong>{member.display_name}{member.own ? " (you)" : ""}</strong><small>{member.fingerprint_words.join(" · ")}</small></span>
+              </div>
+            ))}
+            {candidates.length > 0 && <Text weight="semibold">{userCopy.addMembers}</Text>}
+            {candidates.map((contact) => (
+              <Checkbox key={contact.id} checked={additions.has(contact.id)} label={contact.display_name} onChange={(_, data) => {
+                const next = new Set(additions);
+                data.checked ? next.add(contact.id) : next.delete(contact.id);
+                setAdditions(next);
+              }} />
+            ))}
+            {additions.size > 0 && <Button disabled={busy} onClick={() => void api.addGroupMembers(conversation.id, [...additions]).then(() => { setAdditions(new Set()); onChanged(); })}>{userCopy.addMembers}</Button>}
+          </DialogContent>
+          <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  );
+}
+
+function PendingDialog({ rows, busy, onClose, onAccept, onDismiss }: { rows: AppSnapshot["pending_shared"]; busy: boolean; onClose: () => void; onAccept: (id: string) => void; onDismiss: (id: string, suppress: boolean) => void }) {
+  return (
+    <Dialog open onOpenChange={(_, data) => { if (!data.open) onClose(); }}>
+      <DialogSurface>
+        <DialogBody>
+          <DialogTitle>{userCopy.waitingToConnect}</DialogTitle>
+          <DialogContent className="dialog-stack">
+            {rows.length === 0 && <Text>No one is waiting.</Text>}
+            {rows.map((row) => (
+              <div className="settings-card column" key={row.id}>
+                <Text weight="semibold">{row.name}</Text>
+                <Text size={200}>{userCopy.sharedBy} {row.sharer_name}</Text>
+                <div className="fingerprint">{row.fingerprint_words.join(" · ")}</div>
+                <div className="settings-actions">
+                  <Button appearance="primary" disabled={busy} onClick={() => onAccept(row.id)}>{userCopy.connect}</Button>
+                  <Button disabled={busy} onClick={() => onDismiss(row.id, false)}>{userCopy.notNow}</Button>
+                  {row.offer_dont_ask_again && <Button disabled={busy} onClick={() => onDismiss(row.id, true)}>{userCopy.dontAskAgain}</Button>}
+                </div>
+              </div>
+            ))}
+          </DialogContent>
+          <DialogActions><Button onClick={onClose}>Done</Button></DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  );
 }

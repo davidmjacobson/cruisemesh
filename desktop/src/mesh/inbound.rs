@@ -35,6 +35,15 @@ impl InboundExecutor {
         identity: Identity,
         endpoints: EndpointCache,
     ) -> Result<Self> {
+        Self::start_with_discovery(store, identity, endpoints, Arc::new(|| (true, 0)))
+    }
+
+    pub fn start_with_discovery(
+        store: Arc<MessageStore>,
+        identity: Identity,
+        endpoints: EndpointCache,
+        discovery: crate::mesh::delivery::DiscoveryPolicy,
+    ) -> Result<Self> {
         let seen = Arc::new(SeenIds::new());
         for msg_id in store.non_relay_carried_msg_ids(512)? {
             seen.record(msg_id);
@@ -49,7 +58,7 @@ impl InboundExecutor {
             .name("cruisemesh-store".into())
             .spawn(move || {
                 let dispatcher =
-                    DeliveryDispatcher::new(store.clone(), identity.clone(), endpoints);
+                    DeliveryDispatcher::new(store.clone(), identity.clone(), endpoints, discovery);
                 while let Some(job) = receiver.blocking_recv() {
                     let result = process_one(
                         &store,
