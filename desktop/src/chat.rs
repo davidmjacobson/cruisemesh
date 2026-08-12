@@ -5,11 +5,11 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use cruisemesh_core::{
     core_reaction_summaries_by_target, core_tick_status_for, core_visible_chat_messages,
     create_group, decode_attachment_payload, encode_attachment_payload,
-    encode_profile_sync_content, encode_reaction_payload, fingerprint_words, AttachmentMediaType,
-    AuthoredEnvelope, AuthoredReceipt, Contact, CoreAttachmentPayload, CoreMessageTarget,
-    CoreReactionPayload, CoreTickStatus, Group, MessageStore, ProfileSyncContent, StoredMessage,
-    KIND_ATTACHMENT_MANIFEST, KIND_GROUP_INVITE, KIND_PROFILE_SYNC, KIND_REACTION, KIND_TEXT,
-    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    encode_profile_sync_content, encode_reaction_payload, fingerprint_words, voice_capture_plan,
+    AttachmentMediaType, AuthoredEnvelope, AuthoredReceipt, Contact, CoreAttachmentPayload,
+    CoreMessageTarget, CoreReactionPayload, CoreTickStatus, Group, MessageStore,
+    ProfileSyncContent, StoredMessage, KIND_ATTACHMENT_MANIFEST, KIND_GROUP_INVITE,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_TEXT, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,8 @@ pub struct AppSnapshot {
     pub contacts: Vec<ContactView>,
     pub conversations: Vec<ConversationSummary>,
     pub attachment_max_blob_bytes: u32,
+    pub voice_min_duration_ms: u32,
+    pub voice_max_duration_ms: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -248,6 +250,8 @@ impl ChatService {
             contacts: contact_views,
             conversations: self.list_conversations(contacts, connected)?,
             attachment_max_blob_bytes: cruisemesh_core::attachment_max_blob_bytes(),
+            voice_min_duration_ms: voice_capture_plan().min_duration_ms,
+            voice_max_duration_ms: voice_capture_plan().max_duration_ms,
         })
     }
 
@@ -981,6 +985,9 @@ mod tests {
             json["preferences"]["prevent_sleep_on_ac"],
             bootstrap.config().prevent_sleep_on_ac
         );
+        let plan = cruisemesh_core::voice_capture_plan();
+        assert_eq!(json["voice_min_duration_ms"], plan.min_duration_ms);
+        assert_eq!(json["voice_max_duration_ms"], plan.max_duration_ms);
     }
 
     #[test]

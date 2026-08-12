@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { connectionSummary, contactRouteLabel, friendWebLink, kindNumber, tickLabel, tickVisual } from "./presentation";
+import {
+  connectionSummary,
+  contactRouteLabel,
+  formatDay,
+  formatDurationMs,
+  friendWebLink,
+  isNewDay,
+  kindNumber,
+  tickLabel,
+  tickVisual,
+  userCopy,
+  voiceProgress,
+} from "./presentation";
 import type { Message } from "./types";
 
 function message(kind: Message["kind"]): Message {
@@ -48,5 +60,34 @@ describe("messenger presentation protocol", () => {
     expect(friendWebLink("CMFRIEND3:abc")).toBe(
       "https://cruisemesh.app/f#CMFRIEND3:abc",
     );
+  });
+
+  it("formats voice times the way the phones do", () => {
+    expect(formatDurationMs(0)).toBe("0:00");
+    expect(formatDurationMs(4_200)).toBe("0:04");
+    expect(formatDurationMs(12_400)).toBe("0:12");
+    expect(formatDurationMs(61_000)).toBe("1:01");
+    expect(voiceProgress(3_000, 12_000)).toBe(0.25);
+    expect(voiceProgress(20, 0)).toBe(0);
+    expect(voiceProgress(-5, 10)).toBe(0);
+    expect(voiceProgress(20, 10)).toBe(1);
+  });
+
+  it("inserts a date chip when the calendar day changes", () => {
+    const monday = Date.parse("2026-08-10T10:00:00");
+    const laterMonday = Date.parse("2026-08-10T22:00:00");
+    const tuesday = Date.parse("2026-08-11T09:00:00");
+    expect(isNewDay(monday)).toBe(true);
+    expect(isNewDay(laterMonday, monday)).toBe(false);
+    expect(isNewDay(tuesday, laterMonday)).toBe(true);
+    expect(formatDay(monday, tuesday)).toBe("Yesterday");
+    expect(formatDay(tuesday, tuesday)).toBe("Today");
+  });
+
+  it("keeps Windows internals and protocol names out of family-facing copy", () => {
+    const surface = Object.values(userCopy).join("\n");
+    for (const jargon of ["DPAPI", "CMRELAY", "CMFRIEND", "WebView2", "TCP", "LAN listener"]) {
+      expect(surface).not.toContain(jargon);
+    }
   });
 });
