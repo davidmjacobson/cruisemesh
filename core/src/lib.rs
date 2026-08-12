@@ -31,6 +31,7 @@ mod relay_status;
 mod relay_wire;
 mod semantic;
 mod session;
+mod ship_wifi;
 mod spray_policy;
 mod store;
 mod transport_policy;
@@ -183,6 +184,21 @@ pub use semantic::{
     core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,
     core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
     CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
+};
+pub use ship_wifi::{
+    core_ship_wifi_build_report, core_ship_wifi_evidence_strength, core_ship_wifi_forbidden_keys,
+    core_ship_wifi_generate_nonce, core_ship_wifi_parse_report, core_ship_wifi_reduce,
+    core_ship_wifi_report_file_name, core_ship_wifi_report_max_bytes,
+    core_ship_wifi_schema_version, core_ship_wifi_serialize_report, ShipWifiAuthorization,
+    ShipWifiCompletedSweep, ShipWifiConsent, ShipWifiDirectionsAttempted, ShipWifiDiscoverySource,
+    ShipWifiEndpointSource, ShipWifiEvidenceSnapshot, ShipWifiEvidenceStrength,
+    ShipWifiFailureClass, ShipWifiLatencyBucket, ShipWifiLocalPermission, ShipWifiNetworkContext,
+    ShipWifiObservation, ShipWifiObservationEvent, ShipWifiOrigin, ShipWifiPeriod,
+    ShipWifiPeriodPrecision, ShipWifiPlatform, ShipWifiProbeDirection, ShipWifiReport,
+    ShipWifiReportAttribution, ShipWifiReportError, ShipWifiReportingClient, ShipWifiResult,
+    ShipWifiSeparation, ShipWifiShip, ShipWifiSweepVerdict, ShipWifiVerdict, ShipWifiVpnReadiness,
+    SHIP_WIFI_CONSENT_POLICY_VERSION, SHIP_WIFI_FORBIDDEN_KEYS, SHIP_WIFI_NONCE_BYTES,
+    SHIP_WIFI_REPORT_FILE_NAME, SHIP_WIFI_REPORT_MAX_BYTES, SHIP_WIFI_REPORT_SCHEMA_VERSION,
 };
 // Package C0, driven from Android by package C1. Android reaches it only
 // behind a whole-pass engine selection that defaults to the legacy engine;
