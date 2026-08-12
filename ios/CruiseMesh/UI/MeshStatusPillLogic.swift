@@ -110,7 +110,9 @@ enum MeshStatusPillLogic {
             return String(localized: "\(name) storage is full")
         case .messageTooLarge:
             return String(localized: "A message was too large to send")
-        case .ok, .checking, .noInternet, .noConfig, .failing, .rateLimited:
+        // A roaming deferral is a deliberate wait, so it belongs with the
+        // states that ask nothing of the user, never with the ones above.
+        case .ok, .checking, .noInternet, .deferredRoaming, .noConfig, .failing, .rateLimited:
             return nil
         }
     }
