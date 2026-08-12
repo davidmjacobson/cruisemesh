@@ -145,7 +145,10 @@ fun ChatListScreen(
                 actions = {
                     Box {
                         IconButton(onClick = { showHomeMenu = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "More options")
+                            Icon(
+                                Icons.Default.MoreVert,
+                                contentDescription = stringResource(R.string.ui_more_options),
+                            )
                         }
                         DropdownMenu(
                             expanded = showHomeMenu,
@@ -187,7 +190,10 @@ fun ChatListScreen(
         floatingActionButton = {
             Box {
                 FloatingActionButton(onClick = { showComposeMenu = true }) {
-                    Icon(Icons.Default.Add, contentDescription = "Start something")
+                    Icon(
+                        Icons.Default.Add,
+                        contentDescription = stringResource(R.string.ui_start_something),
+                    )
                 }
                 DropdownMenu(
                     expanded = showComposeMenu,
@@ -363,6 +369,7 @@ fun ChatRow(
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
+    val context = LocalContext.current
     val displayId = remember(summary.chatId, summary.isGroup) {
         if (summary.isGroup) summary.title else formatUserId(summary.chatId)
     }
@@ -416,7 +423,7 @@ fun ChatRow(
                 
                 if (summary.lastMessage != null) {
                     Text(
-                        text = ChatListLogic.formatRelativeTime(summary.lastMessage.timestamp),
+                        text = ChatListLogic.formatRelativeTime(context, summary.lastMessage.timestamp),
                         style = MaterialTheme.typography.labelSmall,
                         color = if (isUnread) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(start = 8.dp)

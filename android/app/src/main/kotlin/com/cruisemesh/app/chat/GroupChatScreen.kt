@@ -178,7 +178,11 @@ fun GroupChatScreen(
                 cameraLauncher.launch(uri)
             }
         } else {
-            Toast.makeText(context, "Camera permission is required to take photos", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_camera_permission_required_for_photos),
+                Toast.LENGTH_SHORT,
+            ).show()
         }
     }
 
@@ -197,7 +201,7 @@ fun GroupChatScreen(
     DisposableEffect(Unit) { onDispose { voiceRecorder.cancel() } }
 
     fun senderName(userId: ByteArray): String {
-        if (userId.contentEquals(ownUserId)) return "You"
+        if (userId.contentEquals(ownUserId)) return context.getString(R.string.ui_you)
         val contact = contactsByUserId[UserIdHex.encode(userId)]
         return contact?.let(::coreContactDisplayName)?.takeIf { it.isNotBlank() }
             ?: formatUserId(userId)
@@ -671,7 +675,7 @@ fun GroupChatScreen(
                 onCopy = {
                     if (focusedCopyText.isNotBlank()) {
                         clipboard.setText(AnnotatedString(focusedCopyText))
-                        Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, R.string.ui_copied, Toast.LENGTH_SHORT).show()
                     }
                     closeOverlay()
                 },
@@ -680,7 +684,13 @@ fun GroupChatScreen(
                         val saved = ImageGallery.saveJpeg(context, jpeg)
                         Toast.makeText(
                             context,
-                            if (saved != null) "Saved to Pictures/CruiseMesh" else "Could not save image",
+                            context.getString(
+                                if (saved != null) {
+                                    R.string.ui_saved_to_pictures
+                                } else {
+                                    R.string.ui_could_not_save_image
+                                },
+                            ),
                             Toast.LENGTH_SHORT,
                         ).show()
                         closeOverlay()
@@ -756,7 +766,7 @@ private fun GroupConversationTopBar(
         TopAppBar(
             navigationIcon = {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                 }
             },
             title = {
@@ -821,6 +831,7 @@ private fun GroupMessageBubble(
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
     onLinkClick: (MessageLink) -> Unit = {},
 ) {
+    val context = LocalContext.current
     if (message.kind == KIND_GROUP_INVITE) {
         Box(
             modifier = Modifier
@@ -885,7 +896,10 @@ private fun GroupMessageBubble(
         // see core/src/late_arrival.rs. The bubble keeps the sender's time.
         if (lateArrivalMs != null) {
             Text(
-                text = stringResource(R.string.ui_arrived_at, formatConversationTimestamp(lateArrivalMs)),
+                text = stringResource(
+                    R.string.ui_arrived_at,
+                    formatConversationTimestamp(context, lateArrivalMs),
+                ),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 12.dp),
@@ -914,6 +928,7 @@ fun GroupMessageBubbleVisual(
     onQuotedClick: (() -> Unit)? = null,
     bodyActions: MessageBodyActions? = null,
 ) {
+    val context = LocalContext.current
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -984,7 +999,7 @@ fun GroupMessageBubbleVisual(
                     ) {
                         if (showTimestamp) {
                             Text(
-                                text = formatConversationTimestamp(message.timestamp),
+                                text = formatConversationTimestamp(context, message.timestamp),
                                 style = MaterialTheme.typography.labelSmall,
                                 color = contentColor.copy(alpha = 0.7f),
                             )

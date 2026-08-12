@@ -865,7 +865,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             if (isIgnoringBatteryOptimizations(context)) {
                 startMesh(context)
             } else {
-                transientMeshStatus = "Requesting background permission…"
+                transientMeshStatus = context.getString(R.string.ui_requesting_background_permission)
                 batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
             }
         } else {
@@ -1100,10 +1100,10 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 severity = ConnectivityWarningSeverity.Caution,
             )
             bluetoothAudioConnected && !bluetoothAudioWarningDismissed && !hideBluetoothAudioWarning -> ConnectivityWarning(
-                title = "Bluetooth audio connected",
-                body = "The mesh is still running, but wireless earbuds/speakers can slow nearby delivery. Watch for glitches.",
-                actionLabel = "Dismiss",
-                secondaryActionLabel = "Don't show this again",
+                title = stringResource(R.string.ui_bluetooth_audio_connected),
+                body = stringResource(R.string.ui_bluetooth_audio_connected_body),
+                actionLabel = stringResource(R.string.ui_dismiss),
+                secondaryActionLabel = stringResource(R.string.ui_dont_show_again),
                 severity = ConnectivityWarningSeverity.Caution,
             )
             else -> null

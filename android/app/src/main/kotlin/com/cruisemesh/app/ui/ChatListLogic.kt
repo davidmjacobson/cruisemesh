@@ -1,5 +1,7 @@
 package com.cruisemesh.app.ui
 
+import android.content.Context
+import android.text.format.DateFormat
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
 import com.cruisemesh.app.media.AttachmentPayload
@@ -42,7 +44,11 @@ object ChatListLogic {
     fun unreadBadgeText(count: Int): String =
         if (count > 99) "99+" else count.coerceAtLeast(0).toString()
 
-    fun formatRelativeTime(timestampMs: Long, nowMs: Long = System.currentTimeMillis()): String {
+    fun formatRelativeTime(
+        context: Context,
+        timestampMs: Long,
+        nowMs: Long = System.currentTimeMillis(),
+    ): String {
         val now = Calendar.getInstance().apply { timeInMillis = nowMs }
         val then = Calendar.getInstance().apply { timeInMillis = timestampMs }
         val diffMs = nowMs - timestampMs
@@ -51,7 +57,7 @@ object ChatListLogic {
                         now.get(Calendar.DAY_OF_YEAR) == then.get(Calendar.DAY_OF_YEAR)
                         
         if (isSameDay) {
-            return SimpleDateFormat("h:mm a", Locale.getDefault()).format(then.time)
+            return DateFormat.getTimeFormat(context).format(then.time)
         }
         
         // within 7 days

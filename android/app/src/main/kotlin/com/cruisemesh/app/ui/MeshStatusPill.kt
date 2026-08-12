@@ -323,6 +323,7 @@ fun MeshStatusPill(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val statusDescription = stringResource(R.string.ui_mesh_status_named, text)
     val statusWantsPulse = dotColor != null &&
         (text.startsWith("Mesh on") || text.contains("Starting", ignoreCase = true))
     val shouldPulse = meshStatusDotShouldAnimate(statusWantsPulse, systemAnimationsEnabled())
@@ -360,7 +361,7 @@ fun MeshStatusPill(
             .minimumInteractiveComponentSize()
             .semantics {
                 role = Role.Button
-                contentDescription = "Mesh status: $text"
+                contentDescription = statusDescription
             }
             .clickable(onClick = onClick),
         shape = CircleShape,

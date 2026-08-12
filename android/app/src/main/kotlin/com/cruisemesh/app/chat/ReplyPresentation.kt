@@ -24,8 +24,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.cruisemesh.app.R
 import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import uniffi.cruisemesh_core.MessageStore
@@ -217,7 +219,10 @@ fun ReplyComposerPreview(
                 // FA10: keep the 40dp visual size, restore a 48dp touch target.
                 modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
             ) {
-                Icon(Icons.Default.Close, contentDescription = "Cancel reply")
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = stringResource(R.string.ui_cancel_reply),
+                )
             }
         }
     }

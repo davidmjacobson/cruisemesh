@@ -79,7 +79,7 @@ fun WaitingToConnectScreen(
                 title = { Text(stringResource(R.string.ui_waiting_to_connect)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )

@@ -93,7 +93,7 @@ fun ShareContactScreen(
                 title = { Text(stringResource(R.string.ui_share_contact)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )
@@ -127,7 +127,7 @@ fun ShareContactScreen(
                 ) {
                     Image(
                         bitmap = qrBitmap,
-                        contentDescription = "Shared contact QR code",
+                        contentDescription = stringResource(R.string.ui_shared_contact_qr_code),
                         modifier = Modifier
                             .padding(16.dp)
                             .size(240.dp),

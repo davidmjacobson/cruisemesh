@@ -65,6 +65,7 @@ fun ProfileScreen(
     val context = LocalContext.current
     var displayName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     val initialDisplayName = remember { ProfileStore.loadDisplayName(context) }
+    var savedDisplayName by remember { mutableStateOf(initialDisplayName) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
 
     fun bumpAndSync() = onProfileChanged(ProfileStore.bumpOwnAvatarEpoch(context))
@@ -104,7 +105,7 @@ fun ProfileScreen(
     }
 
     fun leaveScreen() {
-        if (displayName.trim() != initialDisplayName.trim()) bumpAndSync()
+        if (savedDisplayName != initialDisplayName.trim()) bumpAndSync()
         onBack()
     }
 
@@ -114,7 +115,10 @@ fun ProfileScreen(
                 title = { Text(stringResource(R.string.ui_profile)) },
                 navigationIcon = {
                     IconButton(onClick = ::leaveScreen) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.ui_back),
+                        )
                     }
                 },
             )
@@ -128,7 +132,7 @@ fun ProfileScreen(
                 .padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            ProfileSection(title = "You") {
+            ProfileSection(title = stringResource(R.string.ui_you)) {
                 LocalProfileEditor(
                     userId = profileUserId,
                     displayId = displayId,
@@ -136,7 +140,10 @@ fun ProfileScreen(
                     avatarPath = avatarPath,
                     onDisplayNameChange = {
                         displayName = it
-                        ProfileStore.saveDisplayName(context, it)
+                        ProfileStore.normalizedDisplayName(it)?.let { normalized ->
+                            ProfileStore.saveDisplayName(context, normalized)
+                            savedDisplayName = normalized
+                        }
                     },
                     onTakePhoto = {
                         if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
@@ -160,7 +167,12 @@ fun ProfileScreen(
                         avatarPath = null
                         bumpAndSync()
                     },
-                    helperText = "Your profile photo is shared with friends.",
+                    helperText = stringResource(R.string.ui_profile_photo_shared_with_friends),
+                    nameError = if (displayName.isBlank()) {
+                        stringResource(R.string.ui_profile_name_required)
+                    } else {
+                        null
+                    },
                 )
                 var showVerification by remember { mutableStateOf(false) }
                 Row(
@@ -190,7 +202,7 @@ fun ProfileScreen(
             }
 
             SettingsSpacer()
-            ProfileSection(title = "My friend card") {
+            ProfileSection(title = stringResource(R.string.ui_my_friend_card)) {
                 Button(onClick = onShowMyQr, modifier = Modifier.fillMaxWidth()) {
                     Text(stringResource(R.string.ui_show_my_friend_card))
                 }

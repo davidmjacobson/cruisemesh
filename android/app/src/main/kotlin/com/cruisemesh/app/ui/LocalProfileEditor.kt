@@ -31,6 +31,7 @@ fun LocalProfileEditor(
     onRemovePhoto: (() -> Unit)?,
     modifier: Modifier = Modifier,
     helperText: String? = null,
+    nameError: String? = null,
 ) {
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -78,6 +79,8 @@ fun LocalProfileEditor(
                 .fillMaxWidth()
                 .padding(top = 12.dp),
             singleLine = true,
+            isError = nameError != null,
+            supportingText = nameError?.let { error -> { Text(error) } },
         )
 
         helperText?.let {

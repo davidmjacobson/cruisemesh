@@ -213,7 +213,7 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                 },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )
@@ -609,7 +609,7 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Image(
                         bitmap = qr,
-                        contentDescription = "Shore Pass setup QR code",
+                        contentDescription = stringResource(R.string.ui_shore_pass_setup_qr_code),
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(

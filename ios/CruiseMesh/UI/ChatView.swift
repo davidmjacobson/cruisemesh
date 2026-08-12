@@ -594,8 +594,8 @@ struct ChatRowModel: Equatable {
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        f.locale = .current
+        f.timeStyle = .short
+        f.dateStyle = .none
         return f
     }()
 
@@ -1053,8 +1053,8 @@ private func messageArrivalText(_ arrival: MessageArrival) -> String {
 
 private func arrivalTime(_ timestampMs: Int64) -> String {
     let formatter = DateFormatter()
-    formatter.dateFormat = "h:mm a"
-    formatter.locale = .current
+    formatter.timeStyle = .short
+    formatter.dateStyle = .none
     return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1_000))
 }
 

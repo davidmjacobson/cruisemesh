@@ -11,6 +11,11 @@ struct ProfileView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showMyCard = false
 
+    private var effectiveDisplayName: String {
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? appModel.displayName : trimmed
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -45,6 +50,12 @@ struct ProfileView: View {
                         TextField("Your name", text: $displayName)
                             .multilineTextAlignment(.trailing)
                     }
+                    if displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text("Enter a name to keep your profile recognizable.")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("profile.name-error")
+                    }
                     DisclosureGroup("Verify my identity") {
                         Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
                             .font(.body.monospaced())
@@ -78,6 +89,7 @@ struct ProfileView: View {
                 try? await Task.sleep(nanoseconds: 350_000_000)
                 guard !Task.isCancelled else { return }
                 let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return }
                 guard trimmed != appModel.displayName else { return }
                 ProfileStore.saveDisplayName(trimmed)
                 appModel.displayName = trimmed
@@ -96,7 +108,7 @@ struct ProfileView: View {
                 }
             }
             .sheet(isPresented: $showMyCard) {
-                MyQRView(identity: identity, displayName: displayName, onSayHi: { _ in })
+                MyQRView(identity: identity, displayName: effectiveDisplayName, onSayHi: { _ in })
             }
         }
     }

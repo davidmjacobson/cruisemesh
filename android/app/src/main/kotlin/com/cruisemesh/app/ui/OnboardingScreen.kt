@@ -437,13 +437,14 @@ private fun ProfileSlide(
             onTakePhoto = onTakePhoto,
             onChoosePhoto = onChoosePhoto,
             onRemovePhoto = onRemovePhoto,
-            // Says why the button below is disabled; without it a blank field
-            // and a dead button is a dead end.
-            helperText = if (displayName.isBlank()) {
+            nameError = if (displayName.isBlank()) {
                 stringResource(R.string.ui_onboarding_name_required)
             } else {
-                stringResource(R.string.ui_onboarding_profile_photo_helper)
+                null
             },
+            // Says why the button below is disabled; without it a blank field
+            // and a dead button is a dead end.
+            helperText = stringResource(R.string.ui_onboarding_profile_photo_helper),
         )
     }
 }

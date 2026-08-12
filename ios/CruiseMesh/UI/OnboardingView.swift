@@ -10,7 +10,7 @@ struct OnboardingView: View {
     let onComplete: () -> Void
 
     @State private var page = 0
-    @State private var displayName = ProfileStore.loadDisplayName()
+    @State private var displayName = ProfileStore.loadStoredDisplayName()
     @State private var avatarImage = ProfilePhotoStore.loadAvatarImage()
     @State private var photoItem: PhotosPickerItem?
     @State private var showRestore = false

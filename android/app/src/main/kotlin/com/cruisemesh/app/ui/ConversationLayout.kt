@@ -1,8 +1,8 @@
 package com.cruisemesh.app.ui
 
-import java.text.SimpleDateFormat
+import android.content.Context
+import android.text.format.DateFormat
 import java.util.Calendar
-import java.util.Locale
 import java.util.TimeZone
 
 private const val DEFAULT_GROUP_WINDOW_MS = 5 * 60 * 1000L
@@ -36,10 +36,11 @@ fun bubbleGroupingFor(
 }
 
 fun formatConversationTimestamp(
+    context: Context,
     timestampMs: Long,
     timeZone: TimeZone = TimeZone.getDefault(),
 ): String {
-    val formatter = SimpleDateFormat("h:mm a", Locale.getDefault())
+    val formatter = DateFormat.getTimeFormat(context)
     formatter.timeZone = timeZone
     return formatter.format(timestampMs)
 }

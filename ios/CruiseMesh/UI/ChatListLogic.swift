@@ -80,10 +80,7 @@ enum ChatListLogic {
         let then = Date(timeIntervalSince1970: TimeInterval(timestampMs) / 1000)
         let cal = Calendar.current
         if cal.isDate(now, inSameDayAs: then) {
-            let f = DateFormatter()
-            f.dateFormat = "h:mm a"
-            f.locale = .current
-            return f.string(from: then)
+            return DateFormatter.localizedString(from: then, dateStyle: .none, timeStyle: .short)
         }
         let diff = nowMs - timestampMs
         if diff >= 0 && diff < 7 * 24 * 60 * 60 * 1000 {

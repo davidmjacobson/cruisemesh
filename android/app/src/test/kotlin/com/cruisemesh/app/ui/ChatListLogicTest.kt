@@ -1,13 +1,21 @@
 package com.cruisemesh.app.ui
 
+import android.content.Context
+import android.provider.Settings
 import androidx.compose.ui.graphics.luminance
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import uniffi.cruisemesh_core.StoredMessage
 import java.util.Calendar
 
+@RunWith(RobolectricTestRunner::class)
 class ChatListLogicTest {
+
+    private val context: Context = ApplicationProvider.getApplicationContext()
 
     @Test
     fun testInitials() {
@@ -47,21 +55,34 @@ class ChatListLogicTest {
 
     @Test
     fun testFormatRelativeTime() {
+        Settings.System.putString(context.contentResolver, Settings.System.TIME_12_24, "12")
         val now = Calendar.getInstance()
         now.set(2026, Calendar.JULY, 9, 14, 0, 0)
         val nowMs = now.timeInMillis
         
         val sameDay = Calendar.getInstance()
         sameDay.set(2026, Calendar.JULY, 9, 9, 30, 0)
-        assertEquals("9:30 AM", ChatListLogic.formatRelativeTime(sameDay.timeInMillis, nowMs))
+        assertEquals("9:30 AM", ChatListLogic.formatRelativeTime(context, sameDay.timeInMillis, nowMs))
         
         val twoDaysAgo = Calendar.getInstance()
         twoDaysAgo.set(2026, Calendar.JULY, 7, 14, 0, 0)
-        assertEquals("Tue", ChatListLogic.formatRelativeTime(twoDaysAgo.timeInMillis, nowMs))
+        assertEquals("Tue", ChatListLogic.formatRelativeTime(context, twoDaysAgo.timeInMillis, nowMs))
         
         val older = Calendar.getInstance()
         older.set(2026, Calendar.JUNE, 1, 14, 0, 0)
-        assertEquals("Jun 1", ChatListLogic.formatRelativeTime(older.timeInMillis, nowMs))
+        assertEquals("Jun 1", ChatListLogic.formatRelativeTime(context, older.timeInMillis, nowMs))
+    }
+
+    @Test
+    fun `same-day time follows the device 24-hour preference`() {
+        Settings.System.putString(context.contentResolver, Settings.System.TIME_12_24, "24")
+        val now = Calendar.getInstance().apply { set(2026, Calendar.JULY, 9, 14, 0, 0) }
+        val sameDay = Calendar.getInstance().apply { set(2026, Calendar.JULY, 9, 9, 30, 0) }
+
+        assertEquals(
+            "09:30",
+            ChatListLogic.formatRelativeTime(context, sameDay.timeInMillis, now.timeInMillis),
+        )
     }
 
     @Test

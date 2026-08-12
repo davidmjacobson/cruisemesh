@@ -4547,6 +4547,36 @@
         }
       }
     },
+    "Add a friend to start messaging over Bluetooth — no Wi-Fi needed.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add a friend to start messaging over Bluetooth — no Wi-Fi needed."
+          }
+        }
+      }
+    },
+    "All quiet on deck": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "All quiet on deck"
+          }
+        }
+      }
+    },
+    "Enter a name to keep your profile recognizable.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Enter a name to keep your profile recognizable."
+          }
+        }
+      }
+    },
     "on %@": {
       "localizations": {
         "en": {
