@@ -108,7 +108,7 @@ use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 
 use crate::groups::{canonicalize_members, validate_group};
@@ -117,7 +117,7 @@ use crate::{
     core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
     CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, CoreRelayShadowReport,
     FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
-    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
@@ -540,6 +540,26 @@ pub struct OutgoingSharedRequest {
 pub struct DigestEntry {
     pub sender_user_id: Vec<u8>,
     pub through_lamport: u64,
+}
+
+/// One member's delivered/read watermarks for messages authored by a given
+/// sender in a group (D9). `added_at_ms` is 0 for founding members (or
+/// members imported before this column existed); a later joiner has the
+/// wall-clock of the upsert that first listed them.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupMemberReceipt {
+    pub member_user_id: Vec<u8>,
+    pub delivered_through: u64,
+    pub read_through: u64,
+    pub delivered_via_transport: Option<u8>,
+    pub added_at_ms: i64,
+}
+
+/// Per-member group receipt snapshot used to derive the aggregate tick
+/// (`✓✓` = every eligible current member is at or above the message lamport).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct GroupReceiptState {
+    pub members: Vec<GroupMemberReceipt>,
 }
 
 /// A sealed envelope this node is muling for someone else (DESIGN.md §5.3
@@ -1180,6 +1200,12 @@ impl MessageStore {
             "groups",
             "metadata_changed_by",
             "BLOB NOT NULL DEFAULT X''",
+        )?;
+        ensure_column(
+            &conn,
+            "group_members",
+            "added_at_ms",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         // Older stores already have stable ids for locally authored rows in
         // the outbound queue. Backfill those so they can be quoted after an
@@ -2455,6 +2481,13 @@ impl MessageStore {
             .optional()
             .map_err(store_err)?
             .unwrap_or(0);
+        let (own_delivered_through, own_read_through) = group_preview_watermarks(
+            &conn,
+            &chat_id,
+            &own_user_id,
+            own_delivered_through,
+            own_read_through,
+        )?;
         let avatar_bytes: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT avatar FROM contacts WHERE user_id = ?1",
@@ -3808,6 +3841,181 @@ impl MessageStore {
             .optional()
             .map_err(store_err)?;
         Ok(through.unwrap_or(0) as u64)
+    }
+
+    /// Record that `member_user_id` has delivered/read messages authored by
+    /// `author_user_id` in `group_id` through `through_lamport`. Monotonic
+    /// and isolated from the 1:1 `receipts` table so a group watermark can
+    /// never paint ticks on a pairwise chat.
+    pub fn record_group_receipt(
+        &self,
+        group_id: Vec<u8>,
+        author_user_id: Vec<u8>,
+        member_user_id: Vec<u8>,
+        receipt_type: u8,
+        through_lamport: u64,
+        via_transport: Option<u8>,
+    ) -> Result<(), CoreError> {
+        validate_receipt_watermark(receipt_type, through_lamport)?;
+        if group_id.len() != crate::GROUP_ID_LEN {
+            return Err(CoreError::Malformed(format!(
+                "group receipt id must be exactly {} bytes",
+                crate::GROUP_ID_LEN
+            )));
+        }
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO group_receipts
+                (group_id, author_user_id, member_user_id, receipt_type, through_lamport, via_transport)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(group_id, author_user_id, member_user_id, receipt_type) DO UPDATE SET
+                via_transport = CASE
+                    WHEN excluded.via_transport IS NOT NULL
+                         AND (
+                             excluded.through_lamport > through_lamport
+                             OR (excluded.through_lamport = through_lamport
+                                 AND via_transport IS NULL)
+                         )
+                    THEN excluded.via_transport
+                    ELSE via_transport END,
+                through_lamport = MAX(through_lamport, excluded.through_lamport)",
+            params![
+                group_id,
+                author_user_id,
+                member_user_id,
+                receipt_type as i64,
+                through_lamport as i64,
+                via_transport.map(|t| t as i64)
+            ],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Cumulative group watermark `member` has reported for `author`'s
+    /// stream in `group_id`. 0 if none has been recorded.
+    pub fn group_receipt_through(
+        &self,
+        group_id: Vec<u8>,
+        author_user_id: Vec<u8>,
+        member_user_id: Vec<u8>,
+        receipt_type: u8,
+    ) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let through: Option<i64> = conn
+            .query_row(
+                "SELECT through_lamport FROM group_receipts
+                 WHERE group_id = ?1 AND author_user_id = ?2
+                   AND member_user_id = ?3 AND receipt_type = ?4",
+                params![
+                    group_id,
+                    author_user_id,
+                    member_user_id,
+                    receipt_type as i64
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(through.unwrap_or(0) as u64)
+    }
+
+    /// T6 route the member's `receipt_type` watermark last advanced on, if any.
+    pub fn group_receipt_via_transport(
+        &self,
+        group_id: Vec<u8>,
+        author_user_id: Vec<u8>,
+        member_user_id: Vec<u8>,
+        receipt_type: u8,
+    ) -> Result<Option<u8>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let via: Option<Option<i64>> = conn
+            .query_row(
+                "SELECT via_transport FROM group_receipts
+                 WHERE group_id = ?1 AND author_user_id = ?2
+                   AND member_user_id = ?3 AND receipt_type = ?4",
+                params![
+                    group_id,
+                    author_user_id,
+                    member_user_id,
+                    receipt_type as i64
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        Ok(via.flatten().map(|t| t as u8))
+    }
+
+    /// Per-member delivered/read snapshot for `author_user_id`'s stream in
+    /// this group. `member_user_ids` is the current roster the caller wants
+    /// considered (typically `group.member_user_ids`); members not in that
+    /// list are omitted so a departed member cannot hold the aggregate tick.
+    pub fn group_receipt_state(
+        &self,
+        group_id: Vec<u8>,
+        author_user_id: Vec<u8>,
+        member_user_ids: Vec<Vec<u8>>,
+    ) -> Result<GroupReceiptState, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut added_at: HashMap<Vec<u8>, i64> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT user_id, added_at_ms FROM group_members WHERE group_id = ?1")
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![&group_id], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (user_id, at) = row.map_err(store_err)?;
+                added_at.insert(user_id, at);
+            }
+        }
+        let mut watermarks: HashMap<(Vec<u8>, u8), (u64, Option<u8>)> = HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT member_user_id, receipt_type, through_lamport, via_transport
+                     FROM group_receipts
+                     WHERE group_id = ?1 AND author_user_id = ?2",
+                )
+                .map_err(store_err)?;
+            let rows = stmt
+                .query_map(params![&group_id, &author_user_id], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, i64>(1)? as u8,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                })
+                .map_err(store_err)?;
+            for row in rows {
+                let (member, receipt_type, through, via) = row.map_err(store_err)?;
+                watermarks.insert((member, receipt_type), (through, via.map(|v| v as u8)));
+            }
+        }
+        let mut members = Vec::with_capacity(member_user_ids.len());
+        for member_user_id in member_user_ids {
+            let delivered = watermarks
+                .get(&(member_user_id.clone(), RECEIPT_TYPE_DELIVERED))
+                .cloned()
+                .unwrap_or((0, None));
+            let read = watermarks
+                .get(&(member_user_id.clone(), RECEIPT_TYPE_READ))
+                .map(|(through, _)| *through)
+                .unwrap_or(0);
+            members.push(GroupMemberReceipt {
+                added_at_ms: added_at.get(&member_user_id).copied().unwrap_or(0),
+                member_user_id,
+                delivered_through: delivered.0,
+                read_through: read,
+                delivered_via_transport: delivered.1,
+            });
+        }
+        Ok(GroupReceiptState { members })
     }
 
     /// Add or update a contact, keyed on `user_id` -- re-scanning the same
@@ -5751,6 +5959,11 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "DELETE FROM outgoing_receipt_envelopes WHERE chat_id = ?1",
+            params![&group_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM group_receipts WHERE group_id = ?1",
             params![&group_id],
         )
         .map_err(store_err)?;
@@ -7927,19 +8140,107 @@ pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(),
         ],
     )
     .map_err(store_err)?;
+    let mut previous_added: HashMap<Vec<u8>, i64> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT user_id, added_at_ms FROM group_members WHERE group_id = ?1")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![&group.id], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            let (user_id, added_at_ms) = row.map_err(store_err)?;
+            previous_added.insert(user_id, added_at_ms);
+        }
+    }
     tx.execute(
         "DELETE FROM group_members WHERE group_id = ?1",
         params![&group.id],
     )
     .map_err(store_err)?;
+    let now_ms = unix_now_ms();
+    let founding = previous_added.is_empty();
     for member_user_id in canonicalize_members(group.member_user_ids.clone()) {
+        let added_at_ms = previous_added
+            .get(&member_user_id)
+            .copied()
+            .unwrap_or(if founding { 0 } else { now_ms });
         tx.execute(
-            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
-            params![&group.id, member_user_id],
+            "INSERT INTO group_members (group_id, user_id, added_at_ms) VALUES (?1, ?2, ?3)",
+            params![&group.id, member_user_id, added_at_ms],
         )
         .map_err(store_err)?;
     }
     Ok(())
+}
+
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// If `chat_id` is a group, the list-row ticks are the min watermark every
+/// other current member has reported. 1:1 chats keep the `receipts` values.
+fn group_preview_watermarks(
+    conn: &Connection,
+    chat_id: &[u8],
+    own_user_id: &[u8],
+    pairwise_delivered: i64,
+    pairwise_read: i64,
+) -> Result<(i64, i64), CoreError> {
+    let is_group: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM groups WHERE group_id = ?1",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?;
+    if is_group.is_none() {
+        return Ok((pairwise_delivered, pairwise_read));
+    }
+    let members = load_group_members(conn, chat_id)?;
+    let others: Vec<Vec<u8>> = members
+        .into_iter()
+        .filter(|member| member.as_slice() != own_user_id)
+        .collect();
+    if others.is_empty() {
+        return Ok((i64::MAX, i64::MAX));
+    }
+    let mut delivered = i64::MAX;
+    let mut read = i64::MAX;
+    for member in others {
+        let d: i64 = conn
+            .query_row(
+                "SELECT through_lamport FROM group_receipts
+                 WHERE group_id = ?1 AND author_user_id = ?2
+                   AND member_user_id = ?3 AND receipt_type = ?4",
+                params![chat_id, own_user_id, member, RECEIPT_TYPE_DELIVERED as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        let r: i64 = conn
+            .query_row(
+                "SELECT through_lamport FROM group_receipts
+                 WHERE group_id = ?1 AND author_user_id = ?2
+                   AND member_user_id = ?3 AND receipt_type = ?4",
+                params![chat_id, own_user_id, member, RECEIPT_TYPE_READ as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or(0);
+        delivered = delivered.min(d);
+        read = read.min(r);
+    }
+    Ok((delivered, read))
 }
 
 fn load_group_members(conn: &Connection, group_id: &[u8]) -> Result<Vec<Vec<u8>>, CoreError> {
@@ -8327,9 +8628,22 @@ CREATE TABLE IF NOT EXISTS groups (
 CREATE TABLE IF NOT EXISTS group_members (
     group_id BLOB NOT NULL,
     user_id  BLOB NOT NULL,
+    added_at_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(group_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_group_members_user_id ON group_members(user_id);
+
+-- D9: per-member delivered/read watermarks for a group's authored streams.
+-- Distinct from `receipts` so a group receipt can never land in a 1:1 chat.
+CREATE TABLE IF NOT EXISTS group_receipts (
+    group_id         BLOB NOT NULL,
+    author_user_id   BLOB NOT NULL,
+    member_user_id   BLOB NOT NULL,
+    receipt_type     INTEGER NOT NULL,
+    through_lamport  INTEGER NOT NULL,
+    via_transport    INTEGER,
+    PRIMARY KEY(group_id, author_user_id, member_user_id, receipt_type)
+);
 
 CREATE TABLE IF NOT EXISTS receipts (
     chat_id         BLOB NOT NULL,
@@ -14844,6 +15158,128 @@ mod tests {
     }
 
     #[test]
+    fn group_receipts_are_monotonic_and_isolated_from_one_to_one() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let family = group(0x11, "Family", 0x22, &[b"me", b"alice", b"bob"]);
+        store.upsert_group(family.clone()).unwrap();
+        let me = test_user_id(b"me");
+        let alice = test_user_id(b"alice");
+        let bob = test_user_id(b"bob");
+
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                alice.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                3,
+                Some(0),
+            )
+            .unwrap();
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                alice.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                Some(3),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .group_receipt_through(
+                    family.id.clone(),
+                    me.clone(),
+                    alice.clone(),
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            store
+                .group_receipt_via_transport(
+                    family.id.clone(),
+                    me.clone(),
+                    alice,
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            store
+                .receipt_through(family.id.clone(), me.clone(), RECEIPT_TYPE_DELIVERED)
+                .unwrap(),
+            0
+        );
+
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                bob.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                3,
+                Some(2),
+            )
+            .unwrap();
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                bob,
+                RECEIPT_TYPE_READ,
+                1,
+                None,
+            )
+            .unwrap();
+        let state = store
+            .group_receipt_state(
+                family.id.clone(),
+                me.clone(),
+                family.member_user_ids.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::core_group_tick_status_for(3, 1_700_000_000_000, me, state),
+            crate::CoreTickStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn adding_a_group_member_stamps_added_at_and_keeps_founders() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut family = group(0x11, "Family", 0x22, &[b"me", b"alice"]);
+        store.upsert_group(family.clone()).unwrap();
+        family.member_user_ids.push(test_user_id(b"carol"));
+        family.metadata_revision = 1;
+        family.metadata_changed_by = test_user_id(b"me");
+        store.upsert_group(family.clone()).unwrap();
+
+        let state = store
+            .group_receipt_state(
+                family.id.clone(),
+                test_user_id(b"me"),
+                family.member_user_ids,
+            )
+            .unwrap();
+        let founder = state
+            .members
+            .iter()
+            .find(|m| m.member_user_id == test_user_id(b"alice"))
+            .unwrap();
+        let joiner = state
+            .members
+            .iter()
+            .find(|m| m.member_user_id == test_user_id(b"carol"))
+            .unwrap();
+        assert_eq!(founder.added_at_ms, 0);
+        assert!(joiner.added_at_ms > 0);
+    }
+
+    #[test]
     fn delete_group_removes_group_and_group_chat_state() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         let group = group(0x11, "Family", 0x22, &[b"alice", b"bob"]);
@@ -14871,6 +15307,16 @@ mod tests {
         store
             .record_outgoing_receipt(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ, 1)
             .unwrap();
+        store
+            .record_group_receipt(
+                group.id.clone(),
+                test_user_id(b"me"),
+                test_user_id(b"alice"),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                None,
+            )
+            .unwrap();
 
         assert!(store.delete_group(group.id.clone()).unwrap());
         assert_eq!(store.get_group(group.id.clone()).unwrap(), None);
@@ -14887,6 +15333,17 @@ mod tests {
         assert_eq!(
             store
                 .outgoing_receipt_through(group.id.clone(), b"alice".to_vec(), RECEIPT_TYPE_READ)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .group_receipt_through(
+                    group.id.clone(),
+                    test_user_id(b"me"),
+                    test_user_id(b"alice"),
+                    RECEIPT_TYPE_DELIVERED
+                )
                 .unwrap(),
             0
         );

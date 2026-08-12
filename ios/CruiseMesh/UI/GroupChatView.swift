@@ -5,7 +5,7 @@ import SwiftUI
 import UIKit
 
 /// Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
-/// Group wire receipts are deferred — no ✓/✓✓ ticks yet.
+/// Own-message ticks come from per-member D9 watermarks.
 struct GroupChatView: View {
     let group: Group
     let identity: Identity
@@ -41,6 +41,7 @@ struct GroupChatView: View {
     @State private var viewedPhoto: ViewedPhoto?
     @State private var isMuted = false
     @State private var updatedGroup: Group?
+    @State private var receiptState = GroupReceiptState(members: [])
 
     private let store = AppStore.get()
     private var sender: GroupSender { GroupSender(store: store, identity: identity) }
@@ -86,6 +87,7 @@ struct GroupChatView: View {
                                     GroupMessageRow(
                                         message: message,
                                         isOwn: message.senderUserId == identity.userId,
+                                        tick: tickFor(message),
                                         groupName: activeGroup.name,
                                         senderLabel: row.senderLabel,
                                         contactColor: messageColor,
@@ -450,6 +452,25 @@ struct GroupChatView: View {
         if let stored = try? store.getGroup(groupId: activeGroup.id) {
             updatedGroup = stored
         }
+        receiptState = (try? store.groupReceiptState(
+            groupId: activeGroup.id,
+            authorUserId: identity.userId,
+            memberUserIds: activeGroup.memberUserIds
+        )) ?? GroupReceiptState(members: [])
+    }
+
+    private func tickFor(_ message: StoredMessage) -> TickStatus? {
+        guard message.senderUserId == identity.userId else { return nil }
+        switch coreGroupTickStatusFor(
+            lamport: message.lamport,
+            messageTimestamp: message.timestamp,
+            authorUserId: identity.userId,
+            state: receiptState
+        ) {
+        case .sent: return .sent
+        case .delivered: return .delivered
+        case .read: return .read
+        }
     }
 
     private func sendReaction(to message: StoredMessage, emoji: String) {
@@ -533,6 +554,7 @@ struct GroupChatRowModel: Equatable {
 private struct GroupMessageRow: View {
     let message: StoredMessage
     let isOwn: Bool
+    let tick: TickStatus?
     let groupName: String
     let senderLabel: String?
     let contactColor: Color
@@ -615,15 +637,10 @@ private struct GroupMessageRow: View {
                                 onStatus: onStatus
                             )
                         }
-                        if isOwn {
-                            // Group receipts aren't on the wire yet (D9), so
-                            // SENT — "sealed and queued", true at authoring —
-                            // is the only honest state; without it an own
-                            // group bubble reads as never-sent next to 1:1
-                            // chats. Mirrors ChatView's tick placement.
+                        if isOwn, let tick {
                             HStack {
                                 Spacer(minLength: 0)
-                                SignalTickView(status: .sent, tint: .white)
+                                SignalTickView(status: tick, tint: .white)
                             }
                         }
                     }
@@ -673,15 +690,28 @@ private struct GroupMessageRow: View {
             }
             .padding(.vertical, 2)
             .sheet(isPresented: $showInfo) {
-                MessageInfoSheet(rows: messageInfoRows(
+                MessageInfoSheet(rows: groupMessageInfoRows(
                     message: message,
                     isOwn: isOwn,
-                    tick: nil,
+                    tick: tick,
                     arrival: try? AppStore.get().messageArrival(
                         chatId: message.chatId,
                         senderUserId: message.senderUserId,
                         lamport: message.lamport
                     ),
+                    receiptState: (try? AppStore.get().groupReceiptState(
+                        groupId: message.chatId,
+                        authorUserId: message.senderUserId,
+                        memberUserIds: (try? AppStore.get().getGroup(groupId: message.chatId))?.memberUserIds ?? []
+                    )) ?? GroupReceiptState(members: []),
+                    ownUserId: message.senderUserId,
+                    senderName: { userId in
+                        if let contact = try? AppStore.get().getContact(userId: userId) {
+                            let name = coreContactDisplayName(contact: contact)
+                            if !name.isEmpty { return name }
+                        }
+                        return formatUserId(userId: userId)
+                    },
                     outboundExpiryMs: outboundExpiry
                 ))
             }

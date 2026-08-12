@@ -87,6 +87,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// mesh event state.
     private let failoverResumeDebounce = FailoverResumeDebounce()
     private var identity: Identity!
+    /// Peers that have sent a group-scoped DIGEST this process. Old clients
+    /// never do, so they keep the lamport-0 group catch-up.
+    private var groupDigestPeers = Set<Data>()
     private var relayTimer: DispatchSourceTimer?
     /// CP2b: epoch ms until which relayd asked us not to sync again
     /// (`Retry-After` on a 429); 0 = no backoff. `runRelaySync` drops nudges
@@ -709,6 +712,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 receiptType: ReceiptType.read,
                 throughLamport: through
             )
+            emitGroupReceiptsToAuthor(group: group, authorUserId: senderUserId, identity: identity)
         }
     }
 
@@ -1207,6 +1211,64 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         MeshRouter.sendToAddress(address: address, frame: digest)
         SprayPolicy.noteDigestSent(peerUserId: userId, address: address)
+        sendGroupDigests(address: address, userId: userId, identity: identity)
+    }
+
+    private func sendGroupDigests(address: String, userId: Data, identity: Identity) {
+        let advertised = (try? store.coreDigestAdvertisedMsgIds()) ?? []
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups where group.memberUserIds.contains(userId)
+            && group.memberUserIds.contains(identity.userId) {
+            let entries = (try? store.chatDigest(chatId: group.id)) ?? []
+            guard let digest = try? encodeDigest(
+                chatId: group.id,
+                entries: entries,
+                recentMsgIds: advertised
+            ) else { continue }
+            MeshRouter.sendToAddress(address: address, frame: digest)
+        }
+    }
+
+    private func handleGroupDigest(
+        address: String,
+        chatId: Data,
+        entries: [DigestEntry],
+        peerUserId: Data?,
+        identity: Identity
+    ) {
+        guard let peerUserId,
+              let group = try? store.getGroup(groupId: chatId),
+              digestIsSharedGroup(
+                digestChatId: chatId,
+                helloUserId: peerUserId,
+                ownUserId: identity.userId,
+                group: group
+              ) else {
+            log.warning("Dropping DIGEST from \(address, privacy: .public)")
+            return
+        }
+        groupDigestPeers.insert(peerUserId)
+        let gate = SprayPolicy.maySpray(
+            peerUserId: peerUserId,
+            address: address,
+            trigger: .peerDigest
+        )
+        guard gate.allow else {
+            log.info("Skipping group DIGEST for \(address, privacy: .public)")
+            return
+        }
+        let peerHasThrough = DigestSync.throughLamportForSelf(entries: entries, ownUserId: identity.userId)
+        var queuedBytes = resendGroupOutboundToPeer(
+            address: address,
+            peerUserId: peerUserId,
+            identity: identity,
+            afterLamport: peerHasThrough,
+            onlyGroupId: group.id
+        )
+        if let contact = try? store.getContact(userId: peerUserId) {
+            queuedBytes += syncGroupReceiptsToPeer(identity: identity, contact: contact, address: address)
+        }
+        SprayPolicy.noteBytesQueued(address: address, bytes: queuedBytes)
     }
 
     /// Battery, 2026-07-21: foreground-only (see `setAppForeground`). This
@@ -1279,7 +1341,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         let peerUserId = MeshRouter.userIdFor(address: address)
         guard DigestSync.isExpectedChatId(digestChatId: chatId, helloUserId: peerUserId),
               let peerUserId else {
-            log.warning("Dropping DIGEST from \(address, privacy: .public)")
+            handleGroupDigest(
+                address: address,
+                chatId: chatId,
+                entries: entries,
+                peerUserId: peerUserId,
+                identity: identity
+            )
             return
         }
         // CARRY-02: the authentication of a carried-delivery confirmation must
@@ -1356,6 +1424,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         var queuedBytes = 0
         if let contact = try? store.getContact(userId: peerUserId) {
             queuedBytes += syncReceiptsFirst(identity: identity, contact: contact, address: address)
+            queuedBytes += syncGroupReceiptsToPeer(identity: identity, contact: contact, address: address)
             let peerHasThrough = DigestSync.throughLamportForSelf(entries: entries, ownUserId: identity.userId)
             let queued = (try? store.outboundEnvelopesAfter(
                 chatId: contact.userId,
@@ -1392,11 +1461,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             }
             MeshRouter.recordHiddenOffered(address: address, msgIds: newlyOffered)
         }
-        queuedBytes += resendGroupOutboundToPeer(
-            address: address,
-            peerUserId: peerUserId,
-            identity: identity
-        )
+        if !groupDigestPeers.contains(peerUserId) {
+            queuedBytes += resendGroupOutboundToPeer(
+                address: address,
+                peerUserId: peerUserId,
+                identity: identity,
+                afterLamport: 0
+            )
+        }
         // Charged before the plan is built, so `sprayDigestPlanTo`'s own
         // admission sees a link allowance that already reflects what this
         // encounter has queued.
@@ -2062,7 +2134,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         recordInboundChatArrival(senderUserId: senderUserId, kind: body.kind, arrival: arrival)
         ChatEvents.notifyChatChanged(group.id)
 
-        // Local read watermark only (group wire receipts are deferred).
         let throughLamport = PeerStreamWatermark.through(
             store: store,
             chatId: group.id,
@@ -2082,6 +2153,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 receiptType: ReceiptType.read,
                 throughLamport: throughLamport
             )
+        }
+        if let identity {
+            emitGroupReceiptsToAuthor(group: group, authorUserId: senderUserId, identity: identity)
         }
         incomingAnnouncements.announceGroupIfNeeded(
             chatVisible: chatVisible,
@@ -2302,6 +2376,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         arrival: MessageArrival
     ) throws {
         guard let receipt = try? decodeReceiptContent(bytes: body.content) else { return }
+        if let groupId = receipt.groupId {
+            try handleIncomingGroupReceipt(
+                sourceAddress: sourceAddress,
+                envelopeSender: envelopeSender,
+                receipt: receipt,
+                groupId: groupId,
+                identity: identity,
+                arrival: arrival
+            )
+            return
+        }
         guard receipt.senderUserId == identity.userId else { return }
         guard (try? store.getContact(userId: envelopeSender)) != nil else { return }
         // A receipt is the other half of what the receipt-quiet backoff (#280)
@@ -2971,16 +3056,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func resendGroupOutboundToPeer(
         address: String,
         peerUserId: Data,
-        identity: Identity
+        identity: Identity,
+        afterLamport: UInt64,
+        onlyGroupId: Data? = nil
     ) -> Int {
         var queuedBytes = 0
         let groups = (try? store.listGroups()) ?? []
         for group in groups where group.memberUserIds.contains(peerUserId)
             && group.memberUserIds.contains(identity.userId) {
+            if let onlyGroupId, group.id != onlyGroupId { continue }
             let envelopes = (try? store.outboundEnvelopesAfter(
                 chatId: group.id,
                 senderUserId: identity.userId,
-                afterLamport: 0
+                afterLamport: afterLamport
             )) ?? []
             for envelope in envelopes {
                 if envelope.kind == ProtocolKind.groupInvite,
@@ -3069,6 +3157,154 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         ) else { return }
         GossipState.seenIds.record(msgId: authored.envelope.msgId)
         _ = MeshRouter.sendToUserId(userId: contact.userId, frame: authored.frame)
+    }
+
+    private func handleIncomingGroupReceipt(
+        sourceAddress _: String?,
+        envelopeSender: Data,
+        receipt: ReceiptContent,
+        groupId: Data,
+        identity: Identity,
+        arrival: MessageArrival
+    ) throws {
+        guard receipt.senderUserId == identity.userId else { return }
+        guard let group = try? store.getGroup(groupId: groupId),
+              group.memberUserIds.contains(envelopeSender),
+              group.memberUserIds.contains(identity.userId),
+              (try? store.getContact(userId: envelopeSender)) != nil else { return }
+        SprayPolicy.noteReceiptProgress(peerUserId: envelopeSender)
+        try store.recordGroupReceipt(
+            groupId: groupId,
+            authorUserId: identity.userId,
+            memberUserId: envelopeSender,
+            receiptType: receipt.receiptType,
+            throughLamport: receipt.lamport,
+            viaTransport: arrival.transport
+        )
+        if receipt.receiptType == ReceiptType.delivered {
+            try? store.recordDeliveredMetric(
+                chatId: groupId,
+                throughLamport: receipt.lamport,
+                deliveredAtMs: arrival.receivedAt,
+                viaTransport: arrival.transport
+            )
+        }
+        ChatEvents.notifyChatChanged(groupId)
+    }
+
+    private func emitGroupReceiptsToAuthor(group: Group, authorUserId: Data, identity: Identity) {
+        guard let contact = try? store.getContact(userId: authorUserId) else { return }
+        var queued = false
+        for owed in ReceiptRepair.owedForGroup(store: store, groupId: group.id, authorUserId: authorUserId) {
+            if queueOutgoingGroupReceiptForRelay(
+                identity: identity,
+                author: contact,
+                groupId: group.id,
+                receiptType: owed.receiptType,
+                throughLamport: owed.throughLamport
+            ) {
+                queued = true
+            }
+            sendGroupReceiptToContact(
+                identity: identity,
+                author: contact,
+                groupId: group.id,
+                receiptType: owed.receiptType,
+                throughLamport: owed.throughLamport
+            )
+        }
+        if queued { RelaySyncEvents.requestSync() }
+    }
+
+    @discardableResult
+    private func syncGroupReceiptsToPeer(
+        identity: Identity,
+        contact: Contact,
+        address: String
+    ) -> Int {
+        var queuedBytes = 0
+        let groups = (try? store.listGroups()) ?? []
+        for group in groups where group.memberUserIds.contains(contact.userId)
+            && group.memberUserIds.contains(identity.userId) {
+            for owed in ReceiptRepair.owedForGroup(store: store, groupId: group.id, authorUserId: contact.userId) {
+                queuedBytes += sendGroupReceiptOnAddress(
+                    identity: identity,
+                    author: contact,
+                    groupId: group.id,
+                    address: address,
+                    receiptType: owed.receiptType,
+                    throughLamport: owed.throughLamport
+                )
+            }
+        }
+        return queuedBytes
+    }
+
+    @discardableResult
+    private func queueOutgoingGroupReceiptForRelay(
+        identity: Identity,
+        author: Contact,
+        groupId: Data,
+        receiptType: UInt8,
+        throughLamport: UInt64
+    ) -> Bool {
+        let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+        let existing = try? store.outgoingReceiptEnvelope(
+            chatId: groupId,
+            senderUserId: author.userId,
+            receiptType: receiptType
+        )
+        guard let authored = try? store.ensureAuthoredGroupReceipt(
+            identity: identity,
+            author: author,
+            groupId: groupId,
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: timestamp
+        ) else { return false }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        return existing == nil || (existing?.throughLamport ?? 0) < authored.envelope.throughLamport
+    }
+
+    @discardableResult
+    private func sendGroupReceiptOnAddress(
+        identity: Identity,
+        author: Contact,
+        groupId: Data,
+        address: String,
+        receiptType: UInt8,
+        throughLamport: UInt64
+    ) -> Int {
+        guard let authored = try? store.ensureAuthoredGroupReceipt(
+            identity: identity,
+            author: author,
+            groupId: groupId,
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        ) else { return 0 }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        guard MeshRouter.sendToAddress(address: address, frame: authored.frame) else { return 0 }
+        return authored.envelope.sealed.count
+    }
+
+    private func sendGroupReceiptToContact(
+        identity: Identity,
+        author: Contact,
+        groupId: Data,
+        receiptType: UInt8,
+        throughLamport: UInt64
+    ) {
+        guard let authored = try? store.ensureAuthoredGroupReceipt(
+            identity: identity,
+            author: author,
+            groupId: groupId,
+            receiptType: receiptType,
+            throughLamport: throughLamport,
+            timestampMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        ) else { return }
+        GossipState.seenIds.record(msgId: authored.envelope.msgId)
+        _ = MeshRouter.sendToUserId(userId: author.userId, frame: authored.frame)
     }
 
     @discardableResult

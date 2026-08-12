@@ -56,4 +56,10 @@ object ReceiptRepair {
         listOf(RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ)
             .map { type -> OwedReceipt(type, store.outgoingReceiptThrough(peerUserId, peerUserId, type)) }
             .filter { it.throughLamport > 0uL }
+
+    /** Receipts we owe [authorUserId] for their stream in [groupId]. */
+    fun owedForGroup(store: MessageStore, groupId: ByteArray, authorUserId: ByteArray): List<OwedReceipt> =
+        listOf(RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ)
+            .map { type -> OwedReceipt(type, store.outgoingReceiptThrough(groupId, authorUserId, type)) }
+            .filter { it.throughLamport > 0uL }
 }

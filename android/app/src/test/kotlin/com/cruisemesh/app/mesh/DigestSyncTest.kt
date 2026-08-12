@@ -24,6 +24,13 @@ class DigestSyncTest {
     }
 
     @Test
+    fun `a group-scoped digest is rejected by the 1-1 HELLO check`() {
+        val alice = userId(1)
+        val groupId = userId(9)
+        assertFalse(DigestSync.isExpectedChatId(digestChatId = groupId, helloUserId = alice))
+    }
+
+    @Test
     fun `a digest before any HELLO on the link is rejected`() {
         assertFalse(DigestSync.isExpectedChatId(digestChatId = userId(1), helloUserId = null))
     }

@@ -97,6 +97,25 @@ final class CoreBindingSmokeTests: XCTestCase {
         XCTAssertNil(unset?.attention)
     }
 
+    func testReceiptContentOptionalGroupIdCrossesPresentAndAbsent() throws {
+        let pairwise = ReceiptContent(
+            chatId: Data([1, 2, 3]),
+            senderUserId: Data([4, 5, 6]),
+            lamport: 7,
+            receiptType: 1,
+            groupId: nil
+        )
+        let decoded = try decodeReceiptContent(bytes: encodeReceiptContent(content: pairwise))
+        XCTAssertNil(decoded.groupId)
+        XCTAssertEqual(decoded.lamport, 7)
+
+        let groupId = Data(repeating: 0x11, count: 16)
+        var grouped = pairwise
+        grouped.groupId = groupId
+        let groupDecoded = try decodeReceiptContent(bytes: encodeReceiptContent(content: grouped))
+        XCTAssertEqual(groupDecoded.groupId, groupId)
+    }
+
     /// A record in, a record with a nested record out. The three counts are
     /// copied verbatim by the core, so they pin unsigned marshalling in both
     /// directions -- including a value with its top bit set, which a converter

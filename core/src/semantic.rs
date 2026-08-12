@@ -7,8 +7,9 @@ use rusqlite::{params, OptionalExtension};
 use crate::store::store_err;
 use crate::CoreError;
 use crate::{
-    decode_reaction_payload, ConsumedHiddenLamport, CoreMessageTarget, MessageStore, StoredMessage,
-    KIND_ATTACHMENT_MANIFEST, KIND_GROUP_INVITE, KIND_REACTION, KIND_TEXT, RECEIPT_TYPE_READ,
+    decode_reaction_payload, ConsumedHiddenLamport, CoreMessageTarget, GroupReceiptState,
+    MessageStore, StoredMessage, KIND_ATTACHMENT_MANIFEST, KIND_GROUP_INVITE, KIND_REACTION,
+    KIND_TEXT, RECEIPT_TYPE_READ,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
@@ -68,6 +69,41 @@ pub fn core_tick_status_for(
     } else {
         CoreTickStatus::Sent
     }
+}
+
+/// Aggregate group tick (DESIGN.md §7.2): ✓✓ iff every *eligible* current
+/// member has delivered (filled iff every eligible member has read).
+///
+/// A member is eligible for message `lamport` at `message_timestamp` when
+/// they are not the author and they were already in the group when the
+/// message was sent (`added_at_ms == 0` means founding / unknown-old, so
+/// they count; a later `added_at_ms` after the message does not). An empty
+/// eligible set — only the author remains — is vacuously Read.
+#[uniffi::export]
+pub fn core_group_tick_status_for(
+    lamport: u64,
+    message_timestamp: i64,
+    author_user_id: Vec<u8>,
+    state: GroupReceiptState,
+) -> CoreTickStatus {
+    let mut delivered_through = u64::MAX;
+    let mut read_through = u64::MAX;
+    let mut eligible = 0u32;
+    for member in state.members {
+        if member.member_user_id == author_user_id {
+            continue;
+        }
+        if member.added_at_ms > 0 && member.added_at_ms > message_timestamp {
+            continue;
+        }
+        eligible += 1;
+        delivered_through = delivered_through.min(member.delivered_through);
+        read_through = read_through.min(member.read_through);
+    }
+    if eligible == 0 {
+        return CoreTickStatus::Read;
+    }
+    core_tick_status_for(lamport, delivered_through, read_through)
 }
 
 /// **1:1 chats only.** Compares every non-self sender's lamport against a
@@ -407,5 +443,64 @@ mod tests {
         assert_eq!(core_tick_status_for(3, 1, 3), CoreTickStatus::Read);
         assert!(core_is_visible_chat_kind(KIND_GROUP_INVITE));
         assert!(!core_is_visible_chat_kind(KIND_REACTION));
+    }
+
+    #[test]
+    fn group_tick_is_delivered_only_when_every_eligible_member_has_it() {
+        let author = vec![1];
+        let alice = vec![2];
+        let bob = vec![3];
+        let state = crate::GroupReceiptState {
+            members: vec![
+                crate::GroupMemberReceipt {
+                    member_user_id: author.clone(),
+                    delivered_through: 0,
+                    read_through: 0,
+                    delivered_via_transport: None,
+                    added_at_ms: 0,
+                },
+                crate::GroupMemberReceipt {
+                    member_user_id: alice,
+                    delivered_through: 5,
+                    read_through: 5,
+                    delivered_via_transport: Some(0),
+                    added_at_ms: 0,
+                },
+                crate::GroupMemberReceipt {
+                    member_user_id: bob,
+                    delivered_through: 4,
+                    read_through: 0,
+                    delivered_via_transport: Some(0),
+                    added_at_ms: 0,
+                },
+            ],
+        };
+        assert_eq!(
+            core_group_tick_status_for(5, 1_000, author.clone(), state.clone()),
+            CoreTickStatus::Sent
+        );
+        assert_eq!(
+            core_group_tick_status_for(4, 1_000, author, state),
+            CoreTickStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn group_tick_ignores_members_who_joined_after_the_message() {
+        let author = vec![1];
+        let late = vec![2];
+        let state = crate::GroupReceiptState {
+            members: vec![crate::GroupMemberReceipt {
+                member_user_id: late,
+                delivered_through: 0,
+                read_through: 0,
+                delivered_via_transport: None,
+                added_at_ms: 2_000,
+            }],
+        };
+        assert_eq!(
+            core_group_tick_status_for(1, 1_000, author, state),
+            CoreTickStatus::Read
+        );
     }
 }

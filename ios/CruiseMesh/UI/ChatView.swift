@@ -1055,6 +1055,49 @@ func messageInfoRows(
     return rows
 }
 
+func groupMessageInfoRows(
+    message: StoredMessage,
+    isOwn: Bool,
+    tick: TickStatus?,
+    arrival: MessageArrival? = nil,
+    receiptState: GroupReceiptState,
+    ownUserId: Data,
+    senderName: (Data) -> String,
+    outboundExpiryMs: Int64? = nil,
+    nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+) -> [MessageInfoRow] {
+    var rows = messageInfoRows(
+        message: message,
+        isOwn: isOwn,
+        tick: tick,
+        arrival: arrival,
+        outboundExpiryMs: outboundExpiryMs,
+        nowMs: nowMs
+    )
+    guard isOwn else { return rows }
+    for member in receiptState.members {
+        if member.memberUserId == ownUserId { continue }
+        if member.addedAtMs > 0 && member.addedAtMs > message.timestamp { continue }
+        let memberTick = tickStatusFor(
+            lamport: message.lamport,
+            deliveredThrough: member.deliveredThrough,
+            readThrough: member.readThrough
+        )
+        let status: String
+        switch memberTick {
+        case .read: status = "Read"
+        case .delivered: status = "Delivered"
+        case .sent: status = "Waiting"
+        }
+        var value = status
+        if let via = member.deliveredViaTransport {
+            value += " · \(transportRouteText(via))"
+        }
+        rows.append(.labeled(label: senderName(member.memberUserId), value: value))
+    }
+    return rows
+}
+
 private func expiryRemainingText(_ remainingMs: Int64) -> String {
     let minutes = (max(0, remainingMs) + 59_999) / 60_000
     if minutes >= 2 * 24 * 60 { return "\((minutes + 1_439) / 1_440) days" }

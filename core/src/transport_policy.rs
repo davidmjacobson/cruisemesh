@@ -36,6 +36,26 @@ pub fn digest_is_expected_chat_id(digest_chat_id: Vec<u8>, hello_user_id: Option
     hello_user_id.is_some_and(|id| id == digest_chat_id)
 }
 
+/// A DIGEST whose `chat_id` is a group this device shares with the link
+/// peer. Old clients never reach this helper: they drop those frames via
+/// [`digest_is_expected_chat_id`] (group id ≠ HELLO user id).
+#[uniffi::export]
+pub fn digest_is_shared_group(
+    digest_chat_id: Vec<u8>,
+    hello_user_id: Option<Vec<u8>>,
+    own_user_id: Vec<u8>,
+    group: crate::Group,
+) -> bool {
+    hello_user_id.is_some_and(|peer| {
+        group.id == digest_chat_id
+            && group.member_user_ids.iter().any(|member| member == &peer)
+            && group
+                .member_user_ids
+                .iter()
+                .any(|member| member == &own_user_id)
+    })
+}
+
 /// Bounds of the periodic re-digest interval (D8). A link that stays up past a
 /// jittered point in this window re-runs the digest exchange, so a message that
 /// arrived (or a receipt that was authored) after the one-shot connect-time
@@ -67,6 +87,39 @@ mod concurrent_offer_tests {
         assert!(may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS - 1));
         assert!(!may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS));
         assert!(!may_start_carried_offer(MAX_CONCURRENT_CARRIED_OFFERS + 5));
+    }
+
+    #[test]
+    fn old_clients_drop_a_group_scoped_digest() {
+        let peer = vec![0xAA; 16];
+        let group_id = vec![0xBB; 16];
+        assert!(!digest_is_expected_chat_id(group_id, Some(peer)));
+    }
+
+    #[test]
+    fn new_clients_accept_a_digest_for_a_shared_group() {
+        let peer = vec![0xAA; 16];
+        let me = vec![0xCC; 16];
+        let group = crate::Group {
+            id: vec![0xBB; 16],
+            name: "family".into(),
+            member_user_ids: vec![peer.clone(), me.clone()],
+            key: vec![0xDD; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        };
+        assert!(digest_is_shared_group(
+            group.id.clone(),
+            Some(peer.clone()),
+            me.clone(),
+            group.clone(),
+        ));
+        assert!(!digest_is_shared_group(
+            group.id.clone(),
+            Some(vec![0xEE; 16]),
+            me,
+            group,
+        ));
     }
 }
 

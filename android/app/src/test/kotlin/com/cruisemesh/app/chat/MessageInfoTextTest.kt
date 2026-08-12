@@ -9,6 +9,11 @@ import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.StoredMessage
 
 class MessageInfoTextTest {
+    companion object {
+        init {
+            com.cruisemesh.app.mesh.HostCoreLibrary.load()
+        }
+    }
     private fun message(lamport: ULong = 42uL) = StoredMessage(
         senderUserId = byteArrayOf(1),
         chatId = byteArrayOf(2),
@@ -108,5 +113,48 @@ class MessageInfoTextTest {
 
         assertTrue(labelValue(rows, "Status")?.value?.startsWith("Delivered") == true)
         assertNull(rows.filterIsInstance<MessageInfoRow.Sentence>().firstOrNull { it.text.startsWith("Delivery confirmed via") })
+    }
+
+    @Test
+    fun groupMessageInfoListsPerMemberStatusAndSkipsLateJoiners() {
+        val author = byteArrayOf(1)
+        val alice = byteArrayOf(2)
+        val late = byteArrayOf(3)
+        val state = uniffi.cruisemesh_core.GroupReceiptState(
+            members = listOf(
+                uniffi.cruisemesh_core.GroupMemberReceipt(
+                    memberUserId = author,
+                    deliveredThrough = 0uL,
+                    readThrough = 0uL,
+                    deliveredViaTransport = null,
+                    addedAtMs = 0,
+                ),
+                uniffi.cruisemesh_core.GroupMemberReceipt(
+                    memberUserId = alice,
+                    deliveredThrough = 42uL,
+                    readThrough = 0uL,
+                    deliveredViaTransport = 0u,
+                    addedAtMs = 0,
+                ),
+                uniffi.cruisemesh_core.GroupMemberReceipt(
+                    memberUserId = late,
+                    deliveredThrough = 0uL,
+                    readThrough = 0uL,
+                    deliveredViaTransport = null,
+                    addedAtMs = 1_783_608_000_001L,
+                ),
+            ),
+        )
+        val rows = groupMessageInfoRows(
+            message = message(),
+            isOwn = true,
+            tick = TickStatus.DELIVERED,
+            arrival = null,
+            receiptState = state,
+            ownUserId = author,
+            senderName = { if (it.contentEquals(alice)) "Alice" else "Other" },
+        )
+        assertEquals("Delivered · direct Bluetooth", labelValue(rows, "Alice")?.value)
+        assertNull(labelValue(rows, "Other"))
     }
 }
