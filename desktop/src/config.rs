@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::DEFAULT_DISPLAY_NAME;
 
+pub const CURRENT_TERMS_VERSION: &str = "2026-08-08";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeConfig {
@@ -12,6 +14,11 @@ pub struct NodeConfig {
     pub prevent_sleep_on_ac: bool,
     pub share_online: bool,
     pub firewall_prompt_dismissed: bool,
+    pub friends_of_friends: bool,
+    pub friends_of_friends_revision: u64,
+    pub terms_version: Option<String>,
+    pub muted_chat_ids: Vec<String>,
+    pub avatar_epoch: i64,
 }
 
 impl Default for NodeConfig {
@@ -21,6 +28,11 @@ impl Default for NodeConfig {
             prevent_sleep_on_ac: true,
             share_online: true,
             firewall_prompt_dismissed: false,
+            friends_of_friends: true,
+            friends_of_friends_revision: 0,
+            terms_version: None,
+            muted_chat_ids: Vec::new(),
+            avatar_epoch: 0,
         }
     }
 }

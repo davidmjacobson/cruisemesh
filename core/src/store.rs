@@ -7566,6 +7566,59 @@ impl MessageStore {
         rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
     }
 
+    /// Same presentation page as [`Self::recent_presentation_messages_for_chat`],
+    /// optionally older than `before_timestamp_ms`. Desktop uses this to page
+    /// without pulling the whole thread; mobile keeps its own surface.
+    pub fn presentation_messages_before(
+        &self,
+        chat_id: Vec<u8>,
+        before_timestamp_ms: Option<i64>,
+        visible_limit: u64,
+        reaction_limit: u64,
+    ) -> Result<Vec<StoredMessage>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let visible = visible_chat_kind_sql_list();
+        let mut stmt = conn
+            .prepare(&format!(
+                "WITH recent_visible AS (
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    FROM messages
+                    WHERE chat_id = ?1 AND kind IN ({visible})
+                      AND (?5 IS NULL OR timestamp < ?5)
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?2
+                 ), recent_reactions AS (
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    FROM messages
+                    WHERE chat_id = ?1 AND kind = ?3
+                      AND (?5 IS NULL OR timestamp < ?5)
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?4
+                 )
+                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 FROM (
+                    SELECT * FROM recent_visible
+                    UNION ALL
+                    SELECT * FROM recent_reactions
+                 )
+                 ORDER BY timestamp ASC, id ASC",
+            ))
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    chat_id,
+                    visible_limit.min(i64::MAX as u64) as i64,
+                    crate::KIND_REACTION as i64,
+                    reaction_limit.min(i64::MAX as u64) as i64,
+                    before_timestamp_ms,
+                ],
+                row_to_message,
+            )
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
     pub fn relay_sourced_carried_envelopes(
         &self,
         limit: u64,

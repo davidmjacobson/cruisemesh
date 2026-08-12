@@ -44,6 +44,9 @@ pub struct AppSnapshot {
     pub attachment_max_blob_bytes: u32,
     pub voice_min_duration_ms: u32,
     pub voice_max_duration_ms: u32,
+    pub terms_accepted: bool,
+    pub shore_pass: crate::bootstrap::ShorePassStatus,
+    pub pending_shared: Vec<PendingSharedView>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -51,6 +54,7 @@ pub struct ProfileView {
     pub display_name: String,
     pub friend_link: String,
     pub fingerprint_words: Vec<String>,
+    pub avatar_base64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -64,6 +68,7 @@ pub struct AppNodeView {
 pub struct PreferencesView {
     pub prevent_sleep_on_ac: bool,
     pub share_online: bool,
+    pub friends_of_friends: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -81,6 +86,10 @@ pub struct ContactView {
     pub connected_lan: bool,
     pub internet_delivery_configured: bool,
     pub fingerprint_words: Vec<String>,
+    pub nickname: Option<String>,
+    pub blocked: bool,
+    pub muted: bool,
+    pub avatar_base64: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -94,6 +103,7 @@ pub struct ConversationSummary {
     pub preview: Option<String>,
     pub timestamp_ms: Option<i64>,
     pub tick: Option<TickView>,
+    pub muted: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -109,7 +119,39 @@ pub struct ConversationView {
     pub kind: ConversationKind,
     pub title: String,
     pub member_count: usize,
+    pub has_older: bool,
+    pub members: Vec<ConversationMember>,
     pub messages: Vec<MessageView>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConversationMember {
+    pub id: String,
+    pub display_name: String,
+    pub own: bool,
+    pub fingerprint_words: Vec<String>,
+    pub avatar_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PendingSharedView {
+    pub id: String,
+    pub name: String,
+    pub fingerprint_words: Vec<String>,
+    pub sharer_name: String,
+    pub offer_dont_ask_again: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReportView {
+    pub mailto: String,
+    pub address: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShareContactView {
+    pub name: String,
+    pub code: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -216,21 +258,10 @@ impl ChatService {
         let config = self.bootstrap.config();
         let contact_views = contacts
             .iter()
-            .map(|contact| ContactView {
-                id: person_id(&contact.user_id),
-                display_name: contact_display_name(contact),
-                connected_lan: connected.iter().any(|id| id == &contact.user_id),
-                internet_delivery_configured: contact.relay_url.is_some()
-                    && contact.relay_token.is_some(),
-                fingerprint_words: fingerprint_words(contact.user_id.clone()),
-            })
-            .collect();
+            .map(|contact| self.contact_view(contact, &connected))
+            .collect::<Result<Vec<_>>>()?;
         Ok(AppSnapshot {
-            profile: ProfileView {
-                display_name: config.display_name.clone(),
-                friend_link: self.bootstrap.friend_link()?,
-                fingerprint_words: fingerprint_words(self.bootstrap.identity().user_id.clone()),
-            },
+            profile: self.profile_view()?,
             node: AppNodeView {
                 relay_configured: status.relay_configured,
                 contacts: status.contacts,
@@ -239,6 +270,7 @@ impl ChatService {
             preferences: PreferencesView {
                 prevent_sleep_on_ac: config.prevent_sleep_on_ac,
                 share_online: config.share_online,
+                friends_of_friends: config.friends_of_friends,
             },
             diagnostics: DiagnosticsView {
                 helper_version: env!("CARGO_PKG_VERSION"),
@@ -252,10 +284,21 @@ impl ChatService {
             attachment_max_blob_bytes: cruisemesh_core::attachment_max_blob_bytes(),
             voice_min_duration_ms: voice_capture_plan().min_duration_ms,
             voice_max_duration_ms: voice_capture_plan().max_duration_ms,
+            terms_accepted: self.bootstrap.terms_accepted(),
+            shore_pass: self.bootstrap.shore_pass_status()?,
+            pending_shared: self.pending_shared_views()?,
         })
     }
 
     pub fn conversation(&self, conversation_id: &str) -> Result<ConversationView> {
+        self.conversation_page(conversation_id, None)
+    }
+
+    pub fn conversation_page(
+        &self,
+        conversation_id: &str,
+        before_timestamp_ms: Option<i64>,
+    ) -> Result<ConversationView> {
         let conversation = self.resolve(conversation_id)?;
         let (chat_id, kind, title, member_count) = match &conversation {
             Conversation::Person(contact) => (
@@ -272,13 +315,21 @@ impl ChatService {
             ),
         };
         let store = self.bootstrap.store();
-        let all = store.recent_presentation_messages_for_chat(
+        let fetch_limit = CHAT_HISTORY_ROW_LIMIT.saturating_add(1);
+        let all = store.presentation_messages_before(
             chat_id.clone(),
-            CHAT_HISTORY_ROW_LIMIT,
+            before_timestamp_ms,
+            fetch_limit,
             REACTION_HISTORY_ROW_LIMIT,
         )?;
+        let has_older =
+            core_visible_chat_messages(all.clone()).len() as u64 > CHAT_HISTORY_ROW_LIMIT;
         let reaction_map = reaction_map(&all, &self.bootstrap.identity().user_id);
-        let visible = core_visible_chat_messages(all);
+        let mut visible = core_visible_chat_messages(all);
+        if has_older && visible.len() as u64 > CHAT_HISTORY_ROW_LIMIT {
+            let skip = visible.len() - CHAT_HISTORY_ROW_LIMIT as usize;
+            visible = visible.into_iter().skip(skip).collect();
+        }
         let delivered = store.receipt_through(
             chat_id.clone(),
             self.bootstrap.identity().user_id.clone(),
@@ -313,6 +364,8 @@ impl ChatService {
             kind,
             title,
             member_count,
+            has_older,
+            members: self.conversation_members(&conversation)?,
             messages,
         })
     }
@@ -465,14 +518,7 @@ impl ChatService {
 
     pub async fn update_profile(&self, display_name: String) -> Result<ProfileView> {
         let config = self.bootstrap.update_display_name(display_name)?;
-        let payload = encode_profile_sync_content(ProfileSyncContent {
-            avatar_epoch: 0,
-            name: config.display_name.clone(),
-            avatar: Vec::new(),
-            friends_of_friends_version: 0,
-            friends_of_friends_enabled: false,
-            friends_of_friends_revision: 0,
-        })?;
+        let payload = self.profile_sync_payload(&config)?;
         for contact in self.bootstrap.store().list_contacts()? {
             let authored = self.bootstrap.store().author_pairwise_message(
                 self.bootstrap.identity().clone(),
@@ -484,26 +530,403 @@ impl ChatService {
             )?;
             self.send_authored_to(&contact.user_id, authored).await;
         }
-        Ok(ProfileView {
-            display_name: config.display_name,
-            friend_link: self.bootstrap.friend_link()?,
-            fingerprint_words: fingerprint_words(self.bootstrap.identity().user_id.clone()),
-        })
+        self.profile_view()
     }
 
     pub fn update_preferences(
         &self,
         prevent_sleep_on_ac: bool,
         share_online: bool,
+        friends_of_friends: Option<bool>,
     ) -> Result<PreferencesView> {
-        let config = self
-            .bootstrap
-            .update_preferences(prevent_sleep_on_ac, share_online)?;
+        let config = self.bootstrap.update_preferences(
+            prevent_sleep_on_ac,
+            share_online,
+            friends_of_friends,
+        )?;
         self.relay_nudge.notify_one();
         Ok(PreferencesView {
             prevent_sleep_on_ac: config.prevent_sleep_on_ac,
             share_online: config.share_online,
+            friends_of_friends: config.friends_of_friends,
         })
+    }
+
+    pub async fn import_and_request_friend(&self, text: &str) -> Result<String> {
+        let (contact, shared) = self.bootstrap.import_friend(text)?;
+        self.send_friend_request(&contact, shared).await?;
+        self.relay_nudge.notify_one();
+        Ok(contact_display_name(&contact))
+    }
+
+    pub fn delete_contact(&self, conversation_id: &str) -> Result<()> {
+        let Conversation::Person(contact) = self.resolve(conversation_id)? else {
+            bail!("only a person can be deleted this way");
+        };
+        self.bootstrap.store().delete_contact(contact.user_id)?;
+        Ok(())
+    }
+
+    pub fn set_nickname(&self, conversation_id: &str, nickname: Option<String>) -> Result<()> {
+        let Conversation::Person(contact) = self.resolve(conversation_id)? else {
+            bail!("only a person can have a nickname");
+        };
+        self.bootstrap
+            .store()
+            .set_contact_nickname(contact.user_id, nickname)?;
+        Ok(())
+    }
+
+    pub fn set_blocked(&self, conversation_id: &str, blocked: bool) -> Result<()> {
+        let Conversation::Person(contact) = self.resolve(conversation_id)? else {
+            bail!("only a person can be blocked");
+        };
+        if blocked {
+            self.bootstrap
+                .store()
+                .block_user(contact.user_id, now_ms())?;
+        } else {
+            self.bootstrap.store().unblock_user(contact.user_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_muted(&self, conversation_id: &str, muted: bool) -> Result<()> {
+        let _ = self.resolve(conversation_id)?;
+        self.bootstrap.set_muted(conversation_id, muted)?;
+        Ok(())
+    }
+
+    pub fn report_contact(&self, conversation_id: &str) -> Result<ReportView> {
+        let Conversation::Person(contact) = self.resolve(conversation_id)? else {
+            bail!("only a person can be reported");
+        };
+        let name = contact_display_name(&contact);
+        let their_id = cruisemesh_core::format_user_id(contact.user_id.clone());
+        let words = fingerprint_words(contact.user_id).join(" ");
+        let my_id = cruisemesh_core::format_user_id(self.bootstrap.identity().user_id.clone());
+        let subject = "CruiseMesh abuse report";
+        let body = format!(
+            "Reporting: {name}\nTheir ID: {their_id}\nTheir safety words: {words}\nMy ID: {my_id}\n\nWhat happened:\n"
+        );
+        Ok(ReportView {
+            mailto: format!(
+                "mailto:abuse@cruisemesh.app?subject={}&body={}",
+                urlencoding(&subject),
+                urlencoding(&body)
+            ),
+            address: "abuse@cruisemesh.app".into(),
+        })
+    }
+
+    pub async fn rename_group(&self, conversation_id: &str, name: String) -> Result<()> {
+        let Conversation::Group(group) = self.resolve(conversation_id)? else {
+            bail!("only a group can be renamed");
+        };
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            bail!("group name cannot be empty");
+        }
+        let result = self.bootstrap.store().author_group_metadata_update(
+            self.bootstrap.identity().clone(),
+            group.clone(),
+            name,
+            group.member_user_ids,
+            now_ms(),
+        )?;
+        self.publish_group_update(&result.authored, &result.group.member_user_ids)
+            .await;
+        Ok(())
+    }
+
+    pub async fn add_group_members(
+        &self,
+        conversation_id: &str,
+        member_ids: Vec<String>,
+    ) -> Result<()> {
+        let Conversation::Group(group) = self.resolve(conversation_id)? else {
+            bail!("only a group can gain members");
+        };
+        let store = self.bootstrap.store();
+        let mut additions = Vec::new();
+        for id in member_ids {
+            let user_id = decode_person_id(&id)?;
+            if group
+                .member_user_ids
+                .iter()
+                .any(|member| member == &user_id)
+            {
+                continue;
+            }
+            additions.push(
+                store
+                    .get_contact(user_id)?
+                    .context("group member is not an accepted contact")?,
+            );
+        }
+        if additions.is_empty() {
+            bail!("select at least one new contact");
+        }
+        let mut all_ids = group.member_user_ids.clone();
+        all_ids.extend(additions.iter().map(|contact| contact.user_id.clone()));
+        let result = store.author_group_metadata_update(
+            self.bootstrap.identity().clone(),
+            group.clone(),
+            group.name,
+            all_ids,
+            now_ms(),
+        )?;
+        for invite in store.queue_group_invites(
+            self.bootstrap.identity().clone(),
+            result.group.clone(),
+            additions,
+            now_ms(),
+        )? {
+            let recipient = invite.envelope.recipient_user_id.clone();
+            self.send_authored_to(&recipient, invite).await;
+        }
+        self.publish_group_update(&result.authored, &result.group.member_user_ids)
+            .await;
+        Ok(())
+    }
+
+    pub fn share_contact(&self, conversation_id: &str) -> Result<ShareContactView> {
+        let Conversation::Person(contact) = self.resolve(conversation_id)? else {
+            bail!("only a person can be shared");
+        };
+        if !self.bootstrap.config().friends_of_friends {
+            bail!("turn on friends of friends before sharing a contact");
+        }
+        let name = contact_display_name(&contact);
+        let card = cruisemesh_core::FriendCard {
+            name: contact.name,
+            sign_pk: contact.sign_pk,
+            agree_pk: contact.agree_pk,
+            relay_url: contact.relay_url,
+            relay_token: contact.relay_token,
+            signature: None,
+        };
+        let shared = cruisemesh_core::create_shared_friend_card(
+            self.bootstrap.identity().clone(),
+            card,
+            self.bootstrap.config().friends_of_friends_revision,
+            now_ms(),
+        )?;
+        Ok(ShareContactView {
+            name,
+            code: cruisemesh_core::make_shared_contact_code(shared)?,
+        })
+    }
+
+    pub async fn accept_pending_shared(&self, requester_id: &str) -> Result<String> {
+        let user_id = decode_person_id(requester_id)?;
+        let pending = self
+            .bootstrap
+            .store()
+            .get_pending_shared_request(user_id.clone())?
+            .context("that request is no longer waiting")?;
+        let contact = Contact {
+            user_id: pending.requester_user_id,
+            name: pending.name,
+            sign_pk: pending.sign_pk,
+            agree_pk: pending.agree_pk,
+            relay_url: pending.relay_url,
+            relay_token: pending.relay_token,
+            nickname: None,
+        };
+        let contact = self.bootstrap.store().upsert_imported_contact(contact)?;
+        self.bootstrap
+            .store()
+            .delete_pending_shared_request(user_id)?;
+        self.send_friend_request(&contact, None).await?;
+        Ok(contact_display_name(&contact))
+    }
+
+    pub fn dismiss_pending_shared(&self, requester_id: &str, suppress: bool) -> Result<()> {
+        let user_id = decode_person_id(requester_id)?;
+        if suppress {
+            self.bootstrap
+                .store()
+                .suppress_shared_requests(user_id.clone())?;
+        } else {
+            self.bootstrap
+                .store()
+                .record_shared_request_dismissal(user_id.clone())?;
+        }
+        self.bootstrap
+            .store()
+            .delete_pending_shared_request(user_id)?;
+        Ok(())
+    }
+
+    pub async fn set_profile_photo(&self, data_base64: String) -> Result<ProfileView> {
+        let bytes = if data_base64.is_empty() {
+            Vec::new()
+        } else {
+            BASE64
+                .decode(data_base64.as_bytes())
+                .context("photo is not valid base64")?
+        };
+        if bytes.len() > 24 * 1024 {
+            bail!("that photo is too large to use as a profile picture");
+        }
+        let config = self.bootstrap.save_avatar_bytes(&bytes)?;
+        let payload = self.profile_sync_payload(&config)?;
+        for contact in self.bootstrap.store().list_contacts()? {
+            let authored = self.bootstrap.store().author_pairwise_message(
+                self.bootstrap.identity().clone(),
+                contact.clone(),
+                KIND_PROFILE_SYNC,
+                payload.clone(),
+                None,
+                now_ms(),
+            )?;
+            self.send_authored_to(&contact.user_id, authored).await;
+        }
+        self.profile_view()
+    }
+
+    fn profile_view(&self) -> Result<ProfileView> {
+        let avatar = self.bootstrap.load_avatar_bytes();
+        Ok(ProfileView {
+            display_name: self.bootstrap.config().display_name,
+            friend_link: self.bootstrap.friend_link()?,
+            fingerprint_words: fingerprint_words(self.bootstrap.identity().user_id.clone()),
+            avatar_base64: (!avatar.is_empty()).then(|| BASE64.encode(avatar)),
+        })
+    }
+
+    fn profile_sync_payload(&self, config: &crate::config::NodeConfig) -> Result<Vec<u8>> {
+        Ok(encode_profile_sync_content(ProfileSyncContent {
+            avatar_epoch: config.avatar_epoch,
+            name: config.display_name.clone(),
+            avatar: self.bootstrap.load_avatar_bytes(),
+            friends_of_friends_version: 1,
+            friends_of_friends_enabled: config.friends_of_friends,
+            friends_of_friends_revision: config.friends_of_friends_revision,
+        })?)
+    }
+
+    fn contact_view(&self, contact: &Contact, connected: &[Vec<u8>]) -> Result<ContactView> {
+        let id = person_id(&contact.user_id);
+        let avatar = self
+            .bootstrap
+            .store()
+            .contact_avatar(contact.user_id.clone())?;
+        Ok(ContactView {
+            id: id.clone(),
+            display_name: contact_display_name(contact),
+            connected_lan: connected.iter().any(|peer| peer == &contact.user_id),
+            internet_delivery_configured: contact.relay_url.is_some()
+                && contact.relay_token.is_some(),
+            fingerprint_words: fingerprint_words(contact.user_id.clone()),
+            nickname: contact.nickname.clone(),
+            blocked: self
+                .bootstrap
+                .store()
+                .is_user_blocked(contact.user_id.clone())?,
+            muted: self.bootstrap.is_muted(&id),
+            avatar_base64: avatar
+                .filter(|bytes| !bytes.is_empty())
+                .map(|bytes| BASE64.encode(bytes)),
+        })
+    }
+
+    fn conversation_members(&self, conversation: &Conversation) -> Result<Vec<ConversationMember>> {
+        let store = self.bootstrap.store();
+        let own = self.bootstrap.identity().user_id.clone();
+        let ids = match conversation {
+            Conversation::Person(contact) => vec![own.clone(), contact.user_id.clone()],
+            Conversation::Group(group) => group.member_user_ids.clone(),
+        };
+        let mut members = Vec::new();
+        for id in ids {
+            let own_member = id == own;
+            let (name, avatar) = if own_member {
+                (
+                    self.bootstrap.config().display_name,
+                    self.bootstrap.load_avatar_bytes(),
+                )
+            } else if let Some(contact) = store.get_contact(id.clone())? {
+                (
+                    contact_display_name(&contact),
+                    store.contact_avatar(id.clone())?.unwrap_or_default(),
+                )
+            } else {
+                ("Unknown".into(), Vec::new())
+            };
+            members.push(ConversationMember {
+                id: if own_member {
+                    person_id(&own)
+                } else {
+                    person_id(&id)
+                },
+                display_name: name,
+                own: own_member,
+                fingerprint_words: fingerprint_words(id),
+                avatar_base64: (!avatar.is_empty()).then(|| BASE64.encode(avatar)),
+            });
+        }
+        Ok(members)
+    }
+
+    fn pending_shared_views(&self) -> Result<Vec<PendingSharedView>> {
+        let store = self.bootstrap.store();
+        let mut rows = Vec::new();
+        for request in store.list_pending_shared_requests(now_ms())? {
+            let sharer_name = store
+                .get_contact(request.sharer_user_id.clone())?
+                .map(|contact| contact_display_name(&contact))
+                .unwrap_or_else(|| "A friend".into());
+            let dismissal =
+                store.get_shared_request_dismissal(request.requester_user_id.clone())?;
+            rows.push(PendingSharedView {
+                id: person_id(&request.requester_user_id),
+                name: request.name,
+                fingerprint_words: fingerprint_words(request.requester_user_id),
+                sharer_name,
+                offer_dont_ask_again: dismissal.map(|row| row.count >= 1).unwrap_or(false),
+            });
+        }
+        Ok(rows)
+    }
+
+    async fn send_friend_request(
+        &self,
+        contact: &Contact,
+        shared: Option<cruisemesh_core::SharedFriendCard>,
+    ) -> Result<()> {
+        let card = self.bootstrap.friend_card_json()?;
+        let payload = if let Some(shared) = shared {
+            cruisemesh_core::make_shared_friend_request_payload(card, shared)?
+        } else {
+            card
+        };
+        let authored = self.bootstrap.store().author_friend_request(
+            self.bootstrap.identity().clone(),
+            contact.clone(),
+            payload,
+            now_ms(),
+        )?;
+        self.inbound
+            .record_authored(authored.envelope.msg_id.clone());
+        self.send_authored_to(&contact.user_id, authored).await;
+        Ok(())
+    }
+
+    async fn publish_group_update(
+        &self,
+        authored: &cruisemesh_core::AuthoredEnvelope,
+        members: &[Vec<u8>],
+    ) {
+        self.inbound
+            .record_authored(authored.envelope.msg_id.clone());
+        for member in members {
+            if member != &self.bootstrap.identity().user_id {
+                let _ = self.hub.send_to_peer(member, authored.frame.clone()).await;
+            }
+        }
+        self.relay_nudge.notify_one();
     }
 
     fn list_conversations(
@@ -516,26 +939,30 @@ impl ChatService {
         let mut rows = Vec::new();
         for contact in contacts {
             let preview = store.chat_preview(contact.user_id.clone(), own.clone())?;
+            let id = person_id(&contact.user_id);
             rows.push(summary_from_preview(
-                person_id(&contact.user_id),
+                id.clone(),
                 ConversationKind::Person,
                 contact_display_name(&contact),
                 2,
                 connected.iter().any(|id| id == &contact.user_id),
                 preview,
                 &own,
+                self.bootstrap.is_muted(&id),
             ));
         }
         for group in store.list_groups()? {
             let preview = store.chat_preview(group.id.clone(), own.clone())?;
+            let id = group_id(&group.id);
             rows.push(summary_from_preview(
-                group_id(&group.id),
+                id.clone(),
                 ConversationKind::Group,
                 group.name,
                 group.member_user_ids.len(),
                 false,
                 preview,
                 &own,
+                self.bootstrap.is_muted(&id),
             ));
         }
         rows.sort_by(|left, right| {
@@ -727,6 +1154,7 @@ fn summary_from_preview(
     connected_lan: bool,
     preview: cruisemesh_core::CoreChatPreview,
     own_user_id: &[u8],
+    muted: bool,
 ) -> ConversationSummary {
     let (text, timestamp, tick) = preview
         .last_message
@@ -751,6 +1179,7 @@ fn summary_from_preview(
         preview: text,
         timestamp_ms: timestamp,
         tick,
+        muted,
     }
 }
 
@@ -908,6 +1337,19 @@ fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
+fn urlencoding(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -933,7 +1375,7 @@ mod tests {
         let bootstrap = Arc::new(BootstrapStore::open(paths.clone()).unwrap());
         let friend = generate_identity();
         let card = make_friend_card("Emma".into(), friend.clone(), None, None).unwrap();
-        let contact = bootstrap
+        let (contact, _) = bootstrap
             .import_friend(&make_friend_link(card).unwrap())
             .unwrap();
         let hub = Arc::new(PeerHub::new(bootstrap.identity()));
@@ -993,13 +1435,31 @@ mod tests {
     #[test]
     fn advanced_preferences_persist_and_are_returned_to_the_ui() {
         let (_temp, bootstrap, service, _contact, _friend) = service();
-        let updated = service.update_preferences(false, false).unwrap();
+        let updated = service.update_preferences(false, false, None).unwrap();
 
         assert!(!updated.prevent_sleep_on_ac);
         assert!(!updated.share_online);
         assert!(!bootstrap.config().prevent_sleep_on_ac);
         assert!(!bootstrap.config().share_online);
         assert!(!service.snapshot().unwrap().preferences.share_online);
+        assert!(service.snapshot().unwrap().preferences.friends_of_friends);
+    }
+
+    #[test]
+    fn contact_management_and_older_page_surface_are_available() {
+        let (_temp, _bootstrap, service, contact, _friend) = service();
+        let id = person_id(&contact.user_id);
+        service.set_nickname(&id, Some("Em".into())).unwrap();
+        service.set_muted(&id, true).unwrap();
+        let snapshot = service.snapshot().unwrap();
+        let row = snapshot.contacts.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.nickname.as_deref(), Some("Em"));
+        assert!(row.muted);
+        let page = service.conversation_page(&id, Some(1)).unwrap();
+        assert!(page.messages.is_empty());
+        assert!(!page.has_older);
+        service.delete_contact(&id).unwrap();
+        assert!(service.snapshot().unwrap().contacts.is_empty());
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub logs: PathBuf,
     pub endpoint_cache: PathBuf,
     pub ipc_lock: PathBuf,
+    pub avatar: PathBuf,
 }
 
 impl AppPaths {
@@ -35,6 +36,7 @@ impl AppPaths {
             messages: root.join("messages.db"),
             endpoint_cache: root.join("lan-endpoints.json"),
             ipc_lock: root.join("ipc.lock"),
+            avatar: root.join("avatar.jpg"),
             root,
             logs,
         })

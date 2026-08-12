@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { markupFit } from "./markup";
 import {
   connectionSummary,
   contactRouteLabel,
@@ -82,6 +83,13 @@ describe("messenger presentation protocol", () => {
     expect(isNewDay(tuesday, laterMonday)).toBe(true);
     expect(formatDay(monday, tuesday)).toBe("Yesterday");
     expect(formatDay(tuesday, tuesday)).toBe("Today");
+  });
+
+  it("letterboxes markup the same way the phones do", () => {
+    const fit = markupFit(200, 100, 400, 400);
+    expect(fit.scale).toBe(2);
+    expect(fit.offsetX).toBe(0);
+    expect(fit.offsetY).toBe(100);
   });
 
   it("keeps Windows internals and protocol names out of family-facing copy", () => {

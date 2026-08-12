@@ -76,6 +76,8 @@ enum Request {
     GetAppSnapshot,
     GetConversation {
         conversation_id: String,
+        #[serde(default)]
+        before_timestamp_ms: Option<i64>,
     },
     SendText {
         conversation_id: String,
@@ -117,7 +119,52 @@ enum Request {
     SetPreferences {
         prevent_sleep_on_ac: bool,
         share_online: bool,
+        #[serde(default)]
+        friends_of_friends: Option<bool>,
     },
+    PreviewFriendCard {
+        text: String,
+    },
+    DeleteContact {
+        conversation_id: String,
+    },
+    SetNickname {
+        conversation_id: String,
+        nickname: Option<String>,
+    },
+    SetBlocked {
+        conversation_id: String,
+        blocked: bool,
+    },
+    SetMuted {
+        conversation_id: String,
+        muted: bool,
+    },
+    ReportContact {
+        conversation_id: String,
+    },
+    RenameGroup {
+        conversation_id: String,
+        name: String,
+    },
+    AddGroupMembers {
+        conversation_id: String,
+        member_ids: Vec<String>,
+    },
+    ShareContact {
+        conversation_id: String,
+    },
+    AcceptPendingShared {
+        requester_id: String,
+    },
+    DismissPendingShared {
+        requester_id: String,
+        suppress: bool,
+    },
+    SetProfilePhoto {
+        data_base64: String,
+    },
+    AcceptTerms,
 }
 
 #[derive(Debug, Serialize)]
@@ -245,16 +292,34 @@ fn parse_request(line: &str) -> std::result::Result<Request, serde_json::Error> 
         | Some("GetFriendCard")
         | Some("SubscribeEvents")
         | Some("GetAppSnapshot") => &["command"],
-        Some("GetConversation") | Some("MarkRead") => &["command", "conversation_id"],
+        Some("GetConversation") => &["command", "conversation_id", "before_timestamp_ms"],
+        Some("MarkRead") | Some("DeleteContact") | Some("ReportContact") | Some("ShareContact") => {
+            &["command", "conversation_id"]
+        }
         Some("SendText") => &["command", "conversation_id", "text", "reply_to_id"],
         Some("SendAttachment") => &["command", "conversation_id", "draft", "reply_to_id"],
         Some("React") => &["command", "conversation_id", "target", "emoji"],
         Some("CreateGroup") => &["command", "name", "member_ids"],
+        Some("AddGroupMembers") => &["command", "conversation_id", "member_ids"],
+        Some("RenameGroup") => &["command", "conversation_id", "name"],
+        Some("SetNickname") => &["command", "conversation_id", "nickname"],
+        Some("SetBlocked") => &["command", "conversation_id", "blocked"],
+        Some("SetMuted") => &["command", "conversation_id", "muted"],
+        Some("PreviewFriendCard") => &["command", "text"],
+        Some("AcceptPendingShared") => &["command", "requester_id"],
+        Some("DismissPendingShared") => &["command", "requester_id", "suppress"],
+        Some("SetProfilePhoto") => &["command", "data_base64"],
+        Some("AcceptTerms") => &["command"],
         Some("CreateBackup") | Some("PreviewBackup") | Some("StageRestore") => {
             &["command", "path", "passphrase"]
         }
         Some("SetProfile") => &["command", "display_name"],
-        Some("SetPreferences") => &["command", "prevent_sleep_on_ac", "share_online"],
+        Some("SetPreferences") => &[
+            "command",
+            "prevent_sleep_on_ac",
+            "share_online",
+            "friends_of_friends",
+        ],
         _ => &["command"],
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -276,15 +341,17 @@ async fn dispatch(
     let result: Result<serde_json::Value> = async {
         Ok(match request {
             Request::GetProtocolInfo => serde_json::json!({
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "minimum_ui_version": 3,
             }),
             Request::GetStatus => serde_json::to_value(status(bootstrap, hub)?)?,
             Request::GetFriendCard => serde_json::json!({ "text": bootstrap.friend_link()? }),
             Request::ImportFriendCard { text } => {
-                let contact = bootstrap.import_friend(&text)?;
-                relay_nudge.notify_one();
-                serde_json::json!({ "name": contact.name })
+                let name = chat.import_and_request_friend(&text).await?;
+                serde_json::json!({ "name": name })
+            }
+            Request::PreviewFriendCard { text } => {
+                serde_json::to_value(bootstrap.preview_friend(&text)?)?
             }
             Request::ImportRelaySetup { text } => {
                 bootstrap.import_relay_setup(&text)?;
@@ -293,9 +360,12 @@ async fn dispatch(
             }
             Request::SubscribeEvents => unreachable!("handled as a stream"),
             Request::GetAppSnapshot => serde_json::to_value(chat.snapshot()?)?,
-            Request::GetConversation { conversation_id } => {
-                serde_json::to_value(chat.conversation(&conversation_id)?)?
-            }
+            Request::GetConversation {
+                conversation_id,
+                before_timestamp_ms,
+            } => serde_json::to_value(
+                chat.conversation_page(&conversation_id, before_timestamp_ms)?,
+            )?,
             Request::SendText {
                 conversation_id,
                 text,
@@ -358,7 +428,75 @@ async fn dispatch(
             Request::SetPreferences {
                 prevent_sleep_on_ac,
                 share_online,
-            } => serde_json::to_value(chat.update_preferences(prevent_sleep_on_ac, share_online)?)?,
+                friends_of_friends,
+            } => serde_json::to_value(chat.update_preferences(
+                prevent_sleep_on_ac,
+                share_online,
+                friends_of_friends,
+            )?)?,
+            Request::DeleteContact { conversation_id } => {
+                chat.delete_contact(&conversation_id)?;
+                serde_json::json!({ "deleted": true })
+            }
+            Request::SetNickname {
+                conversation_id,
+                nickname,
+            } => {
+                chat.set_nickname(&conversation_id, nickname)?;
+                serde_json::json!({ "updated": true })
+            }
+            Request::SetBlocked {
+                conversation_id,
+                blocked,
+            } => {
+                chat.set_blocked(&conversation_id, blocked)?;
+                serde_json::json!({ "updated": true })
+            }
+            Request::SetMuted {
+                conversation_id,
+                muted,
+            } => {
+                chat.set_muted(&conversation_id, muted)?;
+                serde_json::json!({ "updated": true })
+            }
+            Request::ReportContact { conversation_id } => {
+                serde_json::to_value(chat.report_contact(&conversation_id)?)?
+            }
+            Request::RenameGroup {
+                conversation_id,
+                name,
+            } => {
+                chat.rename_group(&conversation_id, name).await?;
+                serde_json::json!({ "updated": true })
+            }
+            Request::AddGroupMembers {
+                conversation_id,
+                member_ids,
+            } => {
+                chat.add_group_members(&conversation_id, member_ids).await?;
+                serde_json::json!({ "updated": true })
+            }
+            Request::ShareContact { conversation_id } => {
+                serde_json::to_value(chat.share_contact(&conversation_id)?)?
+            }
+            Request::AcceptPendingShared { requester_id } => {
+                let name = chat.accept_pending_shared(&requester_id).await?;
+                serde_json::json!({ "name": name })
+            }
+            Request::DismissPendingShared {
+                requester_id,
+                suppress,
+            } => {
+                chat.dismiss_pending_shared(&requester_id, suppress)?;
+                serde_json::json!({ "dismissed": true })
+            }
+            Request::SetProfilePhoto { data_base64 } => {
+                serde_json::to_value(chat.set_profile_photo(data_base64).await?)?
+            }
+            Request::AcceptTerms => {
+                bootstrap.accept_terms()?;
+                serde_json::json!({ "accepted": true })
+            }
         })
     }
     .await;
