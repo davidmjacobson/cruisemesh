@@ -8875,6 +8875,190 @@ public func FfiConverterTypeSeenIds_lower(_ value: SeenIds) -> UnsafeMutableRawP
 }
 
 
+
+
+/**
+ * In-memory observation session. Process restart is [`Self::new`].
+ */
+public protocol ShipWifiObservationProtocol : AnyObject {
+    
+    /**
+     * Build a schema-versioned report from the current session and the
+     * user-approved attribution. Does not send anything.
+     */
+    func buildReport(attribution: ShipWifiReportAttribution) throws  -> ShipWifiReport
+    
+    /**
+     * Feed one normalized event. Events that arrive before
+     * [`ShipWifiObservationEvent::NetworkJoined`] are ignored so a stale
+     * permission bit from a previous network cannot attach to the next one.
+     */
+    func observe(event: ShipWifiObservationEvent) 
+    
+    /**
+     * Drop every coarse fact. Same effect as process restart.
+     */
+    func reset() 
+    
+    func snapshot()  -> ShipWifiEvidenceSnapshot
+    
+}
+
+/**
+ * In-memory observation session. Process restart is [`Self::new`].
+ */
+open class ShipWifiObservation:
+    ShipWifiObservationProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_shipwifiobservation(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_shipwifiobservation_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_shipwifiobservation(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Build a schema-versioned report from the current session and the
+     * user-approved attribution. Does not send anything.
+     */
+open func buildReport(attribution: ShipWifiReportAttribution)throws  -> ShipWifiReport {
+    return try  FfiConverterTypeShipWifiReport.lift(try rustCallWithError(FfiConverterTypeShipWifiReportError.lift) {
+    uniffi_cruisemesh_core_fn_method_shipwifiobservation_build_report(self.uniffiClonePointer(),
+        FfiConverterTypeShipWifiReportAttribution.lower(attribution),$0
+    )
+})
+}
+    
+    /**
+     * Feed one normalized event. Events that arrive before
+     * [`ShipWifiObservationEvent::NetworkJoined`] are ignored so a stale
+     * permission bit from a previous network cannot attach to the next one.
+     */
+open func observe(event: ShipWifiObservationEvent) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_shipwifiobservation_observe(self.uniffiClonePointer(),
+        FfiConverterTypeShipWifiObservationEvent.lower(event),$0
+    )
+}
+}
+    
+    /**
+     * Drop every coarse fact. Same effect as process restart.
+     */
+open func reset() {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_shipwifiobservation_reset(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+open func snapshot() -> ShipWifiEvidenceSnapshot {
+    return try!  FfiConverterTypeShipWifiEvidenceSnapshot.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_shipwifiobservation_snapshot(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiObservation: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = ShipWifiObservation
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> ShipWifiObservation {
+        return ShipWifiObservation(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: ShipWifiObservation) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiObservation {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: ShipWifiObservation, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiObservation_lift(_ pointer: UnsafeMutableRawPointer) throws -> ShipWifiObservation {
+    return try FfiConverterTypeShipWifiObservation.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiObservation_lower(_ value: ShipWifiObservation) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeShipWifiObservation.lower(value)
+}
+
+
 public struct AuthoredEnvelope {
     public var message: StoredMessage
     public var envelope: OutboundEnvelope
@@ -21372,6 +21556,928 @@ public func FfiConverterTypeSharedRequestDismissal_lower(_ value: SharedRequestD
 }
 
 
+public struct ShipWifiConsent {
+    public var policyVersion: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(policyVersion: UInt32) {
+        self.policyVersion = policyVersion
+    }
+}
+
+
+
+extension ShipWifiConsent: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiConsent, rhs: ShipWifiConsent) -> Bool {
+        if lhs.policyVersion != rhs.policyVersion {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(policyVersion)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiConsent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiConsent {
+        return
+            try ShipWifiConsent(
+                policyVersion: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiConsent, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.policyVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiConsent_lift(_ buf: RustBuffer) throws -> ShipWifiConsent {
+    return try FfiConverterTypeShipWifiConsent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiConsent_lower(_ value: ShipWifiConsent) -> RustBuffer {
+    return FfiConverterTypeShipWifiConsent.lower(value)
+}
+
+
+/**
+ * Coarse facts the reducer is willing to admit, plus the derived verdict.
+ *
+ * No timestamps, no endpoints, no identifiers. Strength is not stored here
+ * because it depends on the user-supplied separation, which is not an
+ * observation.
+ */
+public struct ShipWifiEvidenceSnapshot {
+    public var sessionActive: Bool
+    public var verdict: ShipWifiVerdict
+    public var origin: ShipWifiOrigin
+    public var discoverySource: ShipWifiDiscoverySource
+    public var authenticatedLan: Bool
+    public var encryptedRoundTrip: Bool
+    public var directionsAttempted: ShipWifiDirectionsAttempted
+    public var completedSweep: ShipWifiCompletedSweep
+    public var localPermission: ShipWifiLocalPermission
+    public var vpnReadiness: ShipWifiVpnReadiness
+    public var hasPeerEvidence: Bool
+    public var guidedTestCompleted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sessionActive: Bool, verdict: ShipWifiVerdict, origin: ShipWifiOrigin, discoverySource: ShipWifiDiscoverySource, authenticatedLan: Bool, encryptedRoundTrip: Bool, directionsAttempted: ShipWifiDirectionsAttempted, completedSweep: ShipWifiCompletedSweep, localPermission: ShipWifiLocalPermission, vpnReadiness: ShipWifiVpnReadiness, hasPeerEvidence: Bool, guidedTestCompleted: Bool) {
+        self.sessionActive = sessionActive
+        self.verdict = verdict
+        self.origin = origin
+        self.discoverySource = discoverySource
+        self.authenticatedLan = authenticatedLan
+        self.encryptedRoundTrip = encryptedRoundTrip
+        self.directionsAttempted = directionsAttempted
+        self.completedSweep = completedSweep
+        self.localPermission = localPermission
+        self.vpnReadiness = vpnReadiness
+        self.hasPeerEvidence = hasPeerEvidence
+        self.guidedTestCompleted = guidedTestCompleted
+    }
+}
+
+
+
+extension ShipWifiEvidenceSnapshot: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiEvidenceSnapshot, rhs: ShipWifiEvidenceSnapshot) -> Bool {
+        if lhs.sessionActive != rhs.sessionActive {
+            return false
+        }
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
+        if lhs.origin != rhs.origin {
+            return false
+        }
+        if lhs.discoverySource != rhs.discoverySource {
+            return false
+        }
+        if lhs.authenticatedLan != rhs.authenticatedLan {
+            return false
+        }
+        if lhs.encryptedRoundTrip != rhs.encryptedRoundTrip {
+            return false
+        }
+        if lhs.directionsAttempted != rhs.directionsAttempted {
+            return false
+        }
+        if lhs.completedSweep != rhs.completedSweep {
+            return false
+        }
+        if lhs.localPermission != rhs.localPermission {
+            return false
+        }
+        if lhs.vpnReadiness != rhs.vpnReadiness {
+            return false
+        }
+        if lhs.hasPeerEvidence != rhs.hasPeerEvidence {
+            return false
+        }
+        if lhs.guidedTestCompleted != rhs.guidedTestCompleted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sessionActive)
+        hasher.combine(verdict)
+        hasher.combine(origin)
+        hasher.combine(discoverySource)
+        hasher.combine(authenticatedLan)
+        hasher.combine(encryptedRoundTrip)
+        hasher.combine(directionsAttempted)
+        hasher.combine(completedSweep)
+        hasher.combine(localPermission)
+        hasher.combine(vpnReadiness)
+        hasher.combine(hasPeerEvidence)
+        hasher.combine(guidedTestCompleted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiEvidenceSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiEvidenceSnapshot {
+        return
+            try ShipWifiEvidenceSnapshot(
+                sessionActive: FfiConverterBool.read(from: &buf), 
+                verdict: FfiConverterTypeShipWifiVerdict.read(from: &buf), 
+                origin: FfiConverterTypeShipWifiOrigin.read(from: &buf), 
+                discoverySource: FfiConverterTypeShipWifiDiscoverySource.read(from: &buf), 
+                authenticatedLan: FfiConverterBool.read(from: &buf), 
+                encryptedRoundTrip: FfiConverterBool.read(from: &buf), 
+                directionsAttempted: FfiConverterTypeShipWifiDirectionsAttempted.read(from: &buf), 
+                completedSweep: FfiConverterTypeShipWifiCompletedSweep.read(from: &buf), 
+                localPermission: FfiConverterTypeShipWifiLocalPermission.read(from: &buf), 
+                vpnReadiness: FfiConverterTypeShipWifiVpnReadiness.read(from: &buf), 
+                hasPeerEvidence: FfiConverterBool.read(from: &buf), 
+                guidedTestCompleted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiEvidenceSnapshot, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.sessionActive, into: &buf)
+        FfiConverterTypeShipWifiVerdict.write(value.verdict, into: &buf)
+        FfiConverterTypeShipWifiOrigin.write(value.origin, into: &buf)
+        FfiConverterTypeShipWifiDiscoverySource.write(value.discoverySource, into: &buf)
+        FfiConverterBool.write(value.authenticatedLan, into: &buf)
+        FfiConverterBool.write(value.encryptedRoundTrip, into: &buf)
+        FfiConverterTypeShipWifiDirectionsAttempted.write(value.directionsAttempted, into: &buf)
+        FfiConverterTypeShipWifiCompletedSweep.write(value.completedSweep, into: &buf)
+        FfiConverterTypeShipWifiLocalPermission.write(value.localPermission, into: &buf)
+        FfiConverterTypeShipWifiVpnReadiness.write(value.vpnReadiness, into: &buf)
+        FfiConverterBool.write(value.hasPeerEvidence, into: &buf)
+        FfiConverterBool.write(value.guidedTestCompleted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEvidenceSnapshot_lift(_ buf: RustBuffer) throws -> ShipWifiEvidenceSnapshot {
+    return try FfiConverterTypeShipWifiEvidenceSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEvidenceSnapshot_lower(_ value: ShipWifiEvidenceSnapshot) -> RustBuffer {
+    return FfiConverterTypeShipWifiEvidenceSnapshot.lower(value)
+}
+
+
+public struct ShipWifiNetworkContext {
+    public var authorization: ShipWifiAuthorization
+    public var separation: ShipWifiSeparation
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(authorization: ShipWifiAuthorization, separation: ShipWifiSeparation) {
+        self.authorization = authorization
+        self.separation = separation
+    }
+}
+
+
+
+extension ShipWifiNetworkContext: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiNetworkContext, rhs: ShipWifiNetworkContext) -> Bool {
+        if lhs.authorization != rhs.authorization {
+            return false
+        }
+        if lhs.separation != rhs.separation {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(authorization)
+        hasher.combine(separation)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiNetworkContext: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiNetworkContext {
+        return
+            try ShipWifiNetworkContext(
+                authorization: FfiConverterTypeShipWifiAuthorization.read(from: &buf), 
+                separation: FfiConverterTypeShipWifiSeparation.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiNetworkContext, into buf: inout [UInt8]) {
+        FfiConverterTypeShipWifiAuthorization.write(value.authorization, into: &buf)
+        FfiConverterTypeShipWifiSeparation.write(value.separation, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiNetworkContext_lift(_ buf: RustBuffer) throws -> ShipWifiNetworkContext {
+    return try FfiConverterTypeShipWifiNetworkContext.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiNetworkContext_lower(_ value: ShipWifiNetworkContext) -> RustBuffer {
+    return FfiConverterTypeShipWifiNetworkContext.lower(value)
+}
+
+
+public struct ShipWifiPeriod {
+    public var value: String
+    public var precision: ShipWifiPeriodPrecision
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(value: String, precision: ShipWifiPeriodPrecision) {
+        self.value = value
+        self.precision = precision
+    }
+}
+
+
+
+extension ShipWifiPeriod: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiPeriod, rhs: ShipWifiPeriod) -> Bool {
+        if lhs.value != rhs.value {
+            return false
+        }
+        if lhs.precision != rhs.precision {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(value)
+        hasher.combine(precision)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiPeriod: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiPeriod {
+        return
+            try ShipWifiPeriod(
+                value: FfiConverterString.read(from: &buf), 
+                precision: FfiConverterTypeShipWifiPeriodPrecision.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiPeriod, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.value, into: &buf)
+        FfiConverterTypeShipWifiPeriodPrecision.write(value.precision, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPeriod_lift(_ buf: RustBuffer) throws -> ShipWifiPeriod {
+    return try FfiConverterTypeShipWifiPeriod.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPeriod_lower(_ value: ShipWifiPeriod) -> RustBuffer {
+    return FfiConverterTypeShipWifiPeriod.lower(value)
+}
+
+
+/**
+ * Schema-versioned report. This is the object the preview must render; the
+ * JSON is a serialization of it, not a parallel summary.
+ */
+public struct ShipWifiReport {
+    public var schemaVersion: UInt32
+    public var reportNonce: String
+    public var ship: ShipWifiShip
+    public var period: ShipWifiPeriod
+    public var networkContext: ShipWifiNetworkContext
+    public var result: ShipWifiResult
+    public var reportingClient: ShipWifiReportingClient
+    public var consent: ShipWifiConsent
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(schemaVersion: UInt32, reportNonce: String, ship: ShipWifiShip, period: ShipWifiPeriod, networkContext: ShipWifiNetworkContext, result: ShipWifiResult, reportingClient: ShipWifiReportingClient, consent: ShipWifiConsent) {
+        self.schemaVersion = schemaVersion
+        self.reportNonce = reportNonce
+        self.ship = ship
+        self.period = period
+        self.networkContext = networkContext
+        self.result = result
+        self.reportingClient = reportingClient
+        self.consent = consent
+    }
+}
+
+
+
+extension ShipWifiReport: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiReport, rhs: ShipWifiReport) -> Bool {
+        if lhs.schemaVersion != rhs.schemaVersion {
+            return false
+        }
+        if lhs.reportNonce != rhs.reportNonce {
+            return false
+        }
+        if lhs.ship != rhs.ship {
+            return false
+        }
+        if lhs.period != rhs.period {
+            return false
+        }
+        if lhs.networkContext != rhs.networkContext {
+            return false
+        }
+        if lhs.result != rhs.result {
+            return false
+        }
+        if lhs.reportingClient != rhs.reportingClient {
+            return false
+        }
+        if lhs.consent != rhs.consent {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(schemaVersion)
+        hasher.combine(reportNonce)
+        hasher.combine(ship)
+        hasher.combine(period)
+        hasher.combine(networkContext)
+        hasher.combine(result)
+        hasher.combine(reportingClient)
+        hasher.combine(consent)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiReport {
+        return
+            try ShipWifiReport(
+                schemaVersion: FfiConverterUInt32.read(from: &buf), 
+                reportNonce: FfiConverterString.read(from: &buf), 
+                ship: FfiConverterTypeShipWifiShip.read(from: &buf), 
+                period: FfiConverterTypeShipWifiPeriod.read(from: &buf), 
+                networkContext: FfiConverterTypeShipWifiNetworkContext.read(from: &buf), 
+                result: FfiConverterTypeShipWifiResult.read(from: &buf), 
+                reportingClient: FfiConverterTypeShipWifiReportingClient.read(from: &buf), 
+                consent: FfiConverterTypeShipWifiConsent.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiReport, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.schemaVersion, into: &buf)
+        FfiConverterString.write(value.reportNonce, into: &buf)
+        FfiConverterTypeShipWifiShip.write(value.ship, into: &buf)
+        FfiConverterTypeShipWifiPeriod.write(value.period, into: &buf)
+        FfiConverterTypeShipWifiNetworkContext.write(value.networkContext, into: &buf)
+        FfiConverterTypeShipWifiResult.write(value.result, into: &buf)
+        FfiConverterTypeShipWifiReportingClient.write(value.reportingClient, into: &buf)
+        FfiConverterTypeShipWifiConsent.write(value.consent, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReport_lift(_ buf: RustBuffer) throws -> ShipWifiReport {
+    return try FfiConverterTypeShipWifiReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReport_lower(_ value: ShipWifiReport) -> RustBuffer {
+    return FfiConverterTypeShipWifiReport.lower(value)
+}
+
+
+/**
+ * User-approved identification and client description. The only place a
+ * `String` enters the report, and every string is length-limited, scanned
+ * for IP/MAC forms, and shown in the preview.
+ */
+public struct ShipWifiReportAttribution {
+    public var lineId: String?
+    public var shipId: String?
+    public var lineOther: String?
+    public var shipOther: String?
+    public var periodValue: String
+    public var periodPrecision: ShipWifiPeriodPrecision
+    public var authorization: ShipWifiAuthorization
+    public var separation: ShipWifiSeparation
+    public var platform: ShipWifiPlatform
+    public var osMajor: String
+    public var appVersion: String
+    public var deviceModel: String?
+    public var consentPolicyVersion: UInt32
+    /**
+     * When `None`, a fresh 128-bit nonce is generated. Tests and replayed
+     * drafts pass an explicit value so the artifact is deterministic.
+     */
+    public var reportNonce: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(lineId: String?, shipId: String?, lineOther: String?, shipOther: String?, periodValue: String, periodPrecision: ShipWifiPeriodPrecision, authorization: ShipWifiAuthorization, separation: ShipWifiSeparation, platform: ShipWifiPlatform, osMajor: String, appVersion: String, deviceModel: String?, consentPolicyVersion: UInt32, 
+        /**
+         * When `None`, a fresh 128-bit nonce is generated. Tests and replayed
+         * drafts pass an explicit value so the artifact is deterministic.
+         */reportNonce: String?) {
+        self.lineId = lineId
+        self.shipId = shipId
+        self.lineOther = lineOther
+        self.shipOther = shipOther
+        self.periodValue = periodValue
+        self.periodPrecision = periodPrecision
+        self.authorization = authorization
+        self.separation = separation
+        self.platform = platform
+        self.osMajor = osMajor
+        self.appVersion = appVersion
+        self.deviceModel = deviceModel
+        self.consentPolicyVersion = consentPolicyVersion
+        self.reportNonce = reportNonce
+    }
+}
+
+
+
+extension ShipWifiReportAttribution: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiReportAttribution, rhs: ShipWifiReportAttribution) -> Bool {
+        if lhs.lineId != rhs.lineId {
+            return false
+        }
+        if lhs.shipId != rhs.shipId {
+            return false
+        }
+        if lhs.lineOther != rhs.lineOther {
+            return false
+        }
+        if lhs.shipOther != rhs.shipOther {
+            return false
+        }
+        if lhs.periodValue != rhs.periodValue {
+            return false
+        }
+        if lhs.periodPrecision != rhs.periodPrecision {
+            return false
+        }
+        if lhs.authorization != rhs.authorization {
+            return false
+        }
+        if lhs.separation != rhs.separation {
+            return false
+        }
+        if lhs.platform != rhs.platform {
+            return false
+        }
+        if lhs.osMajor != rhs.osMajor {
+            return false
+        }
+        if lhs.appVersion != rhs.appVersion {
+            return false
+        }
+        if lhs.deviceModel != rhs.deviceModel {
+            return false
+        }
+        if lhs.consentPolicyVersion != rhs.consentPolicyVersion {
+            return false
+        }
+        if lhs.reportNonce != rhs.reportNonce {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(lineId)
+        hasher.combine(shipId)
+        hasher.combine(lineOther)
+        hasher.combine(shipOther)
+        hasher.combine(periodValue)
+        hasher.combine(periodPrecision)
+        hasher.combine(authorization)
+        hasher.combine(separation)
+        hasher.combine(platform)
+        hasher.combine(osMajor)
+        hasher.combine(appVersion)
+        hasher.combine(deviceModel)
+        hasher.combine(consentPolicyVersion)
+        hasher.combine(reportNonce)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiReportAttribution: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiReportAttribution {
+        return
+            try ShipWifiReportAttribution(
+                lineId: FfiConverterOptionString.read(from: &buf), 
+                shipId: FfiConverterOptionString.read(from: &buf), 
+                lineOther: FfiConverterOptionString.read(from: &buf), 
+                shipOther: FfiConverterOptionString.read(from: &buf), 
+                periodValue: FfiConverterString.read(from: &buf), 
+                periodPrecision: FfiConverterTypeShipWifiPeriodPrecision.read(from: &buf), 
+                authorization: FfiConverterTypeShipWifiAuthorization.read(from: &buf), 
+                separation: FfiConverterTypeShipWifiSeparation.read(from: &buf), 
+                platform: FfiConverterTypeShipWifiPlatform.read(from: &buf), 
+                osMajor: FfiConverterString.read(from: &buf), 
+                appVersion: FfiConverterString.read(from: &buf), 
+                deviceModel: FfiConverterOptionString.read(from: &buf), 
+                consentPolicyVersion: FfiConverterUInt32.read(from: &buf), 
+                reportNonce: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiReportAttribution, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.lineId, into: &buf)
+        FfiConverterOptionString.write(value.shipId, into: &buf)
+        FfiConverterOptionString.write(value.lineOther, into: &buf)
+        FfiConverterOptionString.write(value.shipOther, into: &buf)
+        FfiConverterString.write(value.periodValue, into: &buf)
+        FfiConverterTypeShipWifiPeriodPrecision.write(value.periodPrecision, into: &buf)
+        FfiConverterTypeShipWifiAuthorization.write(value.authorization, into: &buf)
+        FfiConverterTypeShipWifiSeparation.write(value.separation, into: &buf)
+        FfiConverterTypeShipWifiPlatform.write(value.platform, into: &buf)
+        FfiConverterString.write(value.osMajor, into: &buf)
+        FfiConverterString.write(value.appVersion, into: &buf)
+        FfiConverterOptionString.write(value.deviceModel, into: &buf)
+        FfiConverterUInt32.write(value.consentPolicyVersion, into: &buf)
+        FfiConverterOptionString.write(value.reportNonce, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReportAttribution_lift(_ buf: RustBuffer) throws -> ShipWifiReportAttribution {
+    return try FfiConverterTypeShipWifiReportAttribution.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReportAttribution_lower(_ value: ShipWifiReportAttribution) -> RustBuffer {
+    return FfiConverterTypeShipWifiReportAttribution.lower(value)
+}
+
+
+public struct ShipWifiReportingClient {
+    public var platform: ShipWifiPlatform
+    public var osMajor: String
+    public var appVersion: String
+    public var deviceModel: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(platform: ShipWifiPlatform, osMajor: String, appVersion: String, deviceModel: String?) {
+        self.platform = platform
+        self.osMajor = osMajor
+        self.appVersion = appVersion
+        self.deviceModel = deviceModel
+    }
+}
+
+
+
+extension ShipWifiReportingClient: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiReportingClient, rhs: ShipWifiReportingClient) -> Bool {
+        if lhs.platform != rhs.platform {
+            return false
+        }
+        if lhs.osMajor != rhs.osMajor {
+            return false
+        }
+        if lhs.appVersion != rhs.appVersion {
+            return false
+        }
+        if lhs.deviceModel != rhs.deviceModel {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(platform)
+        hasher.combine(osMajor)
+        hasher.combine(appVersion)
+        hasher.combine(deviceModel)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiReportingClient: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiReportingClient {
+        return
+            try ShipWifiReportingClient(
+                platform: FfiConverterTypeShipWifiPlatform.read(from: &buf), 
+                osMajor: FfiConverterString.read(from: &buf), 
+                appVersion: FfiConverterString.read(from: &buf), 
+                deviceModel: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiReportingClient, into buf: inout [UInt8]) {
+        FfiConverterTypeShipWifiPlatform.write(value.platform, into: &buf)
+        FfiConverterString.write(value.osMajor, into: &buf)
+        FfiConverterString.write(value.appVersion, into: &buf)
+        FfiConverterOptionString.write(value.deviceModel, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReportingClient_lift(_ buf: RustBuffer) throws -> ShipWifiReportingClient {
+    return try FfiConverterTypeShipWifiReportingClient.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiReportingClient_lower(_ value: ShipWifiReportingClient) -> RustBuffer {
+    return FfiConverterTypeShipWifiReportingClient.lower(value)
+}
+
+
+public struct ShipWifiResult {
+    public var verdict: ShipWifiVerdict
+    public var origin: ShipWifiOrigin
+    public var discoverySource: ShipWifiDiscoverySource
+    public var authenticatedLan: Bool
+    public var encryptedRoundTrip: Bool
+    public var directionsAttempted: ShipWifiDirectionsAttempted
+    public var completedSweep: ShipWifiCompletedSweep
+    public var localPermission: ShipWifiLocalPermission
+    public var vpnReadiness: ShipWifiVpnReadiness
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(verdict: ShipWifiVerdict, origin: ShipWifiOrigin, discoverySource: ShipWifiDiscoverySource, authenticatedLan: Bool, encryptedRoundTrip: Bool, directionsAttempted: ShipWifiDirectionsAttempted, completedSweep: ShipWifiCompletedSweep, localPermission: ShipWifiLocalPermission, vpnReadiness: ShipWifiVpnReadiness) {
+        self.verdict = verdict
+        self.origin = origin
+        self.discoverySource = discoverySource
+        self.authenticatedLan = authenticatedLan
+        self.encryptedRoundTrip = encryptedRoundTrip
+        self.directionsAttempted = directionsAttempted
+        self.completedSweep = completedSweep
+        self.localPermission = localPermission
+        self.vpnReadiness = vpnReadiness
+    }
+}
+
+
+
+extension ShipWifiResult: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiResult, rhs: ShipWifiResult) -> Bool {
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
+        if lhs.origin != rhs.origin {
+            return false
+        }
+        if lhs.discoverySource != rhs.discoverySource {
+            return false
+        }
+        if lhs.authenticatedLan != rhs.authenticatedLan {
+            return false
+        }
+        if lhs.encryptedRoundTrip != rhs.encryptedRoundTrip {
+            return false
+        }
+        if lhs.directionsAttempted != rhs.directionsAttempted {
+            return false
+        }
+        if lhs.completedSweep != rhs.completedSweep {
+            return false
+        }
+        if lhs.localPermission != rhs.localPermission {
+            return false
+        }
+        if lhs.vpnReadiness != rhs.vpnReadiness {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(verdict)
+        hasher.combine(origin)
+        hasher.combine(discoverySource)
+        hasher.combine(authenticatedLan)
+        hasher.combine(encryptedRoundTrip)
+        hasher.combine(directionsAttempted)
+        hasher.combine(completedSweep)
+        hasher.combine(localPermission)
+        hasher.combine(vpnReadiness)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiResult {
+        return
+            try ShipWifiResult(
+                verdict: FfiConverterTypeShipWifiVerdict.read(from: &buf), 
+                origin: FfiConverterTypeShipWifiOrigin.read(from: &buf), 
+                discoverySource: FfiConverterTypeShipWifiDiscoverySource.read(from: &buf), 
+                authenticatedLan: FfiConverterBool.read(from: &buf), 
+                encryptedRoundTrip: FfiConverterBool.read(from: &buf), 
+                directionsAttempted: FfiConverterTypeShipWifiDirectionsAttempted.read(from: &buf), 
+                completedSweep: FfiConverterTypeShipWifiCompletedSweep.read(from: &buf), 
+                localPermission: FfiConverterTypeShipWifiLocalPermission.read(from: &buf), 
+                vpnReadiness: FfiConverterTypeShipWifiVpnReadiness.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiResult, into buf: inout [UInt8]) {
+        FfiConverterTypeShipWifiVerdict.write(value.verdict, into: &buf)
+        FfiConverterTypeShipWifiOrigin.write(value.origin, into: &buf)
+        FfiConverterTypeShipWifiDiscoverySource.write(value.discoverySource, into: &buf)
+        FfiConverterBool.write(value.authenticatedLan, into: &buf)
+        FfiConverterBool.write(value.encryptedRoundTrip, into: &buf)
+        FfiConverterTypeShipWifiDirectionsAttempted.write(value.directionsAttempted, into: &buf)
+        FfiConverterTypeShipWifiCompletedSweep.write(value.completedSweep, into: &buf)
+        FfiConverterTypeShipWifiLocalPermission.write(value.localPermission, into: &buf)
+        FfiConverterTypeShipWifiVpnReadiness.write(value.vpnReadiness, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiResult_lift(_ buf: RustBuffer) throws -> ShipWifiResult {
+    return try FfiConverterTypeShipWifiResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiResult_lower(_ value: ShipWifiResult) -> RustBuffer {
+    return FfiConverterTypeShipWifiResult.lower(value)
+}
+
+
+public struct ShipWifiShip {
+    public var lineId: String?
+    public var shipId: String?
+    public var lineOther: String?
+    public var shipOther: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(lineId: String?, shipId: String?, lineOther: String?, shipOther: String?) {
+        self.lineId = lineId
+        self.shipId = shipId
+        self.lineOther = lineOther
+        self.shipOther = shipOther
+    }
+}
+
+
+
+extension ShipWifiShip: Equatable, Hashable {
+    public static func ==(lhs: ShipWifiShip, rhs: ShipWifiShip) -> Bool {
+        if lhs.lineId != rhs.lineId {
+            return false
+        }
+        if lhs.shipId != rhs.shipId {
+            return false
+        }
+        if lhs.lineOther != rhs.lineOther {
+            return false
+        }
+        if lhs.shipOther != rhs.shipOther {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(lineId)
+        hasher.combine(shipId)
+        hasher.combine(lineOther)
+        hasher.combine(shipOther)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiShip: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiShip {
+        return
+            try ShipWifiShip(
+                lineId: FfiConverterOptionString.read(from: &buf), 
+                shipId: FfiConverterOptionString.read(from: &buf), 
+                lineOther: FfiConverterOptionString.read(from: &buf), 
+                shipOther: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShipWifiShip, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.lineId, into: &buf)
+        FfiConverterOptionString.write(value.shipId, into: &buf)
+        FfiConverterOptionString.write(value.lineOther, into: &buf)
+        FfiConverterOptionString.write(value.shipOther, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiShip_lift(_ buf: RustBuffer) throws -> ShipWifiShip {
+    return try FfiConverterTypeShipWifiShip.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiShip_lower(_ value: ShipWifiShip) -> RustBuffer {
+    return FfiConverterTypeShipWifiShip.lower(value)
+}
+
+
 /**
  * One stored message body (DESIGN.md §7.1). `timestamp` is milliseconds
  * since the Unix epoch; `kind` matches the DESIGN.md §7.1 `kind` byte
@@ -26561,6 +27667,1666 @@ extension RelayMailboxWalkAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Wi-Fi authorization state for the phones in the observation.
+ */
+
+public enum ShipWifiAuthorization {
+    
+    case bothOnboardOnly
+    case bothPaid
+    case mixed
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiAuthorization: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiAuthorization
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiAuthorization {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bothOnboardOnly
+        
+        case 2: return .bothPaid
+        
+        case 3: return .mixed
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiAuthorization, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .bothOnboardOnly:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .bothPaid:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .mixed:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiAuthorization_lift(_ buf: RustBuffer) throws -> ShipWifiAuthorization {
+    return try FfiConverterTypeShipWifiAuthorization.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiAuthorization_lower(_ value: ShipWifiAuthorization) -> RustBuffer {
+    return FfiConverterTypeShipWifiAuthorization.lower(value)
+}
+
+
+
+extension ShipWifiAuthorization: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * `completed_sweep` in the v1 artifact. Counts of addresses are not a
+ * field and must not become one: they fingerprint a particular network
+ * more than they help aggregation.
+ */
+
+public enum ShipWifiCompletedSweep {
+    
+    case notRun
+    case foundPeer
+    case healthyButEmpty
+    case allSilent
+    case blockedByPolicy
+    case inconclusive
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiCompletedSweep: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiCompletedSweep
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiCompletedSweep {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .notRun
+        
+        case 2: return .foundPeer
+        
+        case 3: return .healthyButEmpty
+        
+        case 4: return .allSilent
+        
+        case 5: return .blockedByPolicy
+        
+        case 6: return .inconclusive
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiCompletedSweep, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .notRun:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .foundPeer:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .healthyButEmpty:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .allSilent:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .blockedByPolicy:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .inconclusive:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiCompletedSweep_lift(_ buf: RustBuffer) throws -> ShipWifiCompletedSweep {
+    return try FfiConverterTypeShipWifiCompletedSweep.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiCompletedSweep_lower(_ value: ShipWifiCompletedSweep) -> RustBuffer {
+    return FfiConverterTypeShipWifiCompletedSweep.lower(value)
+}
+
+
+
+extension ShipWifiCompletedSweep: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How many distinct probe directions ran in this session.
+ */
+
+public enum ShipWifiDirectionsAttempted {
+    
+    case none
+    case one
+    case both
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiDirectionsAttempted: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiDirectionsAttempted
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiDirectionsAttempted {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .one
+        
+        case 3: return .both
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiDirectionsAttempted, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .one:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .both:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiDirectionsAttempted_lift(_ buf: RustBuffer) throws -> ShipWifiDirectionsAttempted {
+    return try FfiConverterTypeShipWifiDirectionsAttempted.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiDirectionsAttempted_lower(_ value: ShipWifiDirectionsAttempted) -> RustBuffer {
+    return FfiConverterTypeShipWifiDirectionsAttempted.lower(value)
+}
+
+
+
+extension ShipWifiDirectionsAttempted: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a successful LAN endpoint was first obtained.
+ *
+ * `authenticated_endpoint` collapses BLE, LAN, and the pairwise-encrypted
+ * relay hint on purpose: which existing transport supplied the hint is not
+ * a compatibility fact, and publishing it would reveal whether a family
+ * bought an internet package.
+ */
+
+public enum ShipWifiDiscoverySource {
+    
+    case mdns
+    case authenticatedEndpoint
+    case cachedEndpoint
+    case boundedSweep
+    case manual
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiDiscoverySource: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiDiscoverySource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiDiscoverySource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .mdns
+        
+        case 2: return .authenticatedEndpoint
+        
+        case 3: return .cachedEndpoint
+        
+        case 4: return .boundedSweep
+        
+        case 5: return .manual
+        
+        case 6: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiDiscoverySource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .mdns:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .authenticatedEndpoint:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .cachedEndpoint:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .boundedSweep:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .manual:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiDiscoverySource_lift(_ buf: RustBuffer) throws -> ShipWifiDiscoverySource {
+    return try FfiConverterTypeShipWifiDiscoverySource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiDiscoverySource_lower(_ value: ShipWifiDiscoverySource) -> RustBuffer {
+    return FfiConverterTypeShipWifiDiscoverySource.lower(value)
+}
+
+
+
+extension ShipWifiDiscoverySource: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which existing transport handed this device a peer LAN endpoint.
+ *
+ * The report never names the source. The reducer keeps only "was it a
+ * non-LAN authenticated link?", which is a qualifying-negative precondition.
+ */
+
+public enum ShipWifiEndpointSource {
+    
+    case ble
+    case relay
+    case lan
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiEndpointSource: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiEndpointSource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiEndpointSource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ble
+        
+        case 2: return .relay
+        
+        case 3: return .lan
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiEndpointSource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .ble:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .relay:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .lan:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEndpointSource_lift(_ buf: RustBuffer) throws -> ShipWifiEndpointSource {
+    return try FfiConverterTypeShipWifiEndpointSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEndpointSource_lower(_ value: ShipWifiEndpointSource) -> RustBuffer {
+    return FfiConverterTypeShipWifiEndpointSource.lower(value)
+}
+
+
+
+extension ShipWifiEndpointSource: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Transparent evidence strength. Derived, never written into the artifact.
+ */
+
+public enum ShipWifiEvidenceStrength {
+    
+    case strongPositive
+    case positive
+    case qualifyingNegative
+    case nonQualifying
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiEvidenceStrength: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiEvidenceStrength
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiEvidenceStrength {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .strongPositive
+        
+        case 2: return .positive
+        
+        case 3: return .qualifyingNegative
+        
+        case 4: return .nonQualifying
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiEvidenceStrength, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .strongPositive:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .positive:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .qualifyingNegative:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .nonQualifying:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEvidenceStrength_lift(_ buf: RustBuffer) throws -> ShipWifiEvidenceStrength {
+    return try FfiConverterTypeShipWifiEvidenceStrength.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiEvidenceStrength_lower(_ value: ShipWifiEvidenceStrength) -> RustBuffer {
+    return FfiConverterTypeShipWifiEvidenceStrength.lower(value)
+}
+
+
+
+extension ShipWifiEvidenceStrength: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Reduced direct-connection failure class.
+ */
+
+public enum ShipWifiFailureClass {
+    
+    case timedOut
+    case refused
+    case policyDenied
+    case networkLost
+    case handshakeUnknownPeer
+    case other
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiFailureClass: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiFailureClass
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiFailureClass {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .timedOut
+        
+        case 2: return .refused
+        
+        case 3: return .policyDenied
+        
+        case 4: return .networkLost
+        
+        case 5: return .handshakeUnknownPeer
+        
+        case 6: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiFailureClass, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .timedOut:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .refused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .policyDenied:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .networkLost:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .handshakeUnknownPeer:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .other:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiFailureClass_lift(_ buf: RustBuffer) throws -> ShipWifiFailureClass {
+    return try FfiConverterTypeShipWifiFailureClass.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiFailureClass_lower(_ value: ShipWifiFailureClass) -> RustBuffer {
+    return FfiConverterTypeShipWifiFailureClass.lower(value)
+}
+
+
+
+extension ShipWifiFailureClass: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Coarse probe RTT. Accepted so a shell does not have to invent a unit,
+ * then discarded: the artifact has no timing field, and a millisecond
+ * value would be a surprising way to fingerprint a path.
+ */
+
+public enum ShipWifiLatencyBucket {
+    
+    case under100ms
+    case under500ms
+    case under2s
+    case over2s
+    case unmeasured
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiLatencyBucket: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiLatencyBucket
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiLatencyBucket {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .under100ms
+        
+        case 2: return .under500ms
+        
+        case 3: return .under2s
+        
+        case 4: return .over2s
+        
+        case 5: return .unmeasured
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiLatencyBucket, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .under100ms:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .under500ms:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .under2s:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .over2s:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .unmeasured:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiLatencyBucket_lift(_ buf: RustBuffer) throws -> ShipWifiLatencyBucket {
+    return try FfiConverterTypeShipWifiLatencyBucket.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiLatencyBucket_lower(_ value: ShipWifiLatencyBucket) -> RustBuffer {
+    return FfiConverterTypeShipWifiLatencyBucket.lower(value)
+}
+
+
+
+extension ShipWifiLatencyBucket: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Local-network permission as the reducer knows it.
+ */
+
+public enum ShipWifiLocalPermission {
+    
+    case ready
+    case denied
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiLocalPermission: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiLocalPermission
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiLocalPermission {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ready
+        
+        case 2: return .denied
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiLocalPermission, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .ready:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .denied:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiLocalPermission_lift(_ buf: RustBuffer) throws -> ShipWifiLocalPermission {
+    return try FfiConverterTypeShipWifiLocalPermission.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiLocalPermission_lower(_ value: ShipWifiLocalPermission) -> RustBuffer {
+    return FfiConverterTypeShipWifiLocalPermission.lower(value)
+}
+
+
+
+extension ShipWifiLocalPermission: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Normalized observation event.
+ *
+ * Payload-bearing variants carry only other closed enums. There is no
+ * `String` and no `Vec<u8>` a caller can pass through from the wire. A leak
+ * of an address or a contact name would require adding a field.
+ *
+ * `VpnConfirmedClear` is the one addition to the spec's event list. The
+ * list names `VpnInterferenceSuspected` but the artifact's `vpn_readiness`
+ * field also has `user_confirmed_clear`, and a current-network report (not
+ * only a guided test) can carry that value. See the rollout report.
+ */
+
+public enum ShipWifiObservationEvent {
+    
+    case networkJoined
+    case networkLost
+    case localPermissionReady
+    case localPermissionDenied
+    case vpnInterferenceSuspected
+    case vpnConfirmedClear
+    case mdnsBrowseReady
+    case mdnsPeerResolved
+    case peerEndpointReceived(source: ShipWifiEndpointSource
+    )
+    case sweepCompleted(verdict: ShipWifiSweepVerdict
+    )
+    case lanAuthenticated(discoverySource: ShipWifiDiscoverySource
+    )
+    case lanProbeSucceeded(direction: ShipWifiProbeDirection, latencyBucket: ShipWifiLatencyBucket
+    )
+    case lanProbeFailed(direction: ShipWifiProbeDirection, failureClass: ShipWifiFailureClass
+    )
+    case guidedTestStarted
+    case guidedPeerConfirmedSameShipWifi
+    case guidedTestCompleted
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiObservationEvent: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiObservationEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiObservationEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .networkJoined
+        
+        case 2: return .networkLost
+        
+        case 3: return .localPermissionReady
+        
+        case 4: return .localPermissionDenied
+        
+        case 5: return .vpnInterferenceSuspected
+        
+        case 6: return .vpnConfirmedClear
+        
+        case 7: return .mdnsBrowseReady
+        
+        case 8: return .mdnsPeerResolved
+        
+        case 9: return .peerEndpointReceived(source: try FfiConverterTypeShipWifiEndpointSource.read(from: &buf)
+        )
+        
+        case 10: return .sweepCompleted(verdict: try FfiConverterTypeShipWifiSweepVerdict.read(from: &buf)
+        )
+        
+        case 11: return .lanAuthenticated(discoverySource: try FfiConverterTypeShipWifiDiscoverySource.read(from: &buf)
+        )
+        
+        case 12: return .lanProbeSucceeded(direction: try FfiConverterTypeShipWifiProbeDirection.read(from: &buf), latencyBucket: try FfiConverterTypeShipWifiLatencyBucket.read(from: &buf)
+        )
+        
+        case 13: return .lanProbeFailed(direction: try FfiConverterTypeShipWifiProbeDirection.read(from: &buf), failureClass: try FfiConverterTypeShipWifiFailureClass.read(from: &buf)
+        )
+        
+        case 14: return .guidedTestStarted
+        
+        case 15: return .guidedPeerConfirmedSameShipWifi
+        
+        case 16: return .guidedTestCompleted
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiObservationEvent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .networkJoined:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .networkLost:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .localPermissionReady:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .localPermissionDenied:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .vpnInterferenceSuspected:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .vpnConfirmedClear:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .mdnsBrowseReady:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .mdnsPeerResolved:
+            writeInt(&buf, Int32(8))
+        
+        
+        case let .peerEndpointReceived(source):
+            writeInt(&buf, Int32(9))
+            FfiConverterTypeShipWifiEndpointSource.write(source, into: &buf)
+            
+        
+        case let .sweepCompleted(verdict):
+            writeInt(&buf, Int32(10))
+            FfiConverterTypeShipWifiSweepVerdict.write(verdict, into: &buf)
+            
+        
+        case let .lanAuthenticated(discoverySource):
+            writeInt(&buf, Int32(11))
+            FfiConverterTypeShipWifiDiscoverySource.write(discoverySource, into: &buf)
+            
+        
+        case let .lanProbeSucceeded(direction,latencyBucket):
+            writeInt(&buf, Int32(12))
+            FfiConverterTypeShipWifiProbeDirection.write(direction, into: &buf)
+            FfiConverterTypeShipWifiLatencyBucket.write(latencyBucket, into: &buf)
+            
+        
+        case let .lanProbeFailed(direction,failureClass):
+            writeInt(&buf, Int32(13))
+            FfiConverterTypeShipWifiProbeDirection.write(direction, into: &buf)
+            FfiConverterTypeShipWifiFailureClass.write(failureClass, into: &buf)
+            
+        
+        case .guidedTestStarted:
+            writeInt(&buf, Int32(14))
+        
+        
+        case .guidedPeerConfirmedSameShipWifi:
+            writeInt(&buf, Int32(15))
+        
+        
+        case .guidedTestCompleted:
+            writeInt(&buf, Int32(16))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiObservationEvent_lift(_ buf: RustBuffer) throws -> ShipWifiObservationEvent {
+    return try FfiConverterTypeShipWifiObservationEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiObservationEvent_lower(_ value: ShipWifiObservationEvent) -> RustBuffer {
+    return FfiConverterTypeShipWifiObservationEvent.lower(value)
+}
+
+
+
+extension ShipWifiObservationEvent: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which contribution path produced the result.
+ */
+
+public enum ShipWifiOrigin {
+    
+    case observedSession
+    case guidedTest
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiOrigin: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiOrigin
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiOrigin {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .observedSession
+        
+        case 2: return .guidedTest
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiOrigin, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .observedSession:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .guidedTest:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiOrigin_lift(_ buf: RustBuffer) throws -> ShipWifiOrigin {
+    return try FfiConverterTypeShipWifiOrigin.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiOrigin_lower(_ value: ShipWifiOrigin) -> RustBuffer {
+    return FfiConverterTypeShipWifiOrigin.lower(value)
+}
+
+
+
+extension ShipWifiOrigin: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Calendar precision of the observation period.
+ */
+
+public enum ShipWifiPeriodPrecision {
+    
+    case month
+    case year
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiPeriodPrecision: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiPeriodPrecision
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiPeriodPrecision {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .month
+        
+        case 2: return .year
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiPeriodPrecision, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .month:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .year:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPeriodPrecision_lift(_ buf: RustBuffer) throws -> ShipWifiPeriodPrecision {
+    return try FfiConverterTypeShipWifiPeriodPrecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPeriodPrecision_lower(_ value: ShipWifiPeriodPrecision) -> RustBuffer {
+    return FfiConverterTypeShipWifiPeriodPrecision.lower(value)
+}
+
+
+
+extension ShipWifiPeriodPrecision: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Reporting client platform. Desktop exists in this repo but is not a v1
+ * field-report path; unknown platforms are rejected rather than stored as
+ * free text.
+ */
+
+public enum ShipWifiPlatform {
+    
+    case android
+    case ios
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiPlatform: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiPlatform
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiPlatform {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .android
+        
+        case 2: return .ios
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiPlatform, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .android:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .ios:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPlatform_lift(_ buf: RustBuffer) throws -> ShipWifiPlatform {
+    return try FfiConverterTypeShipWifiPlatform.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiPlatform_lower(_ value: ShipWifiPlatform) -> RustBuffer {
+    return FfiConverterTypeShipWifiPlatform.lower(value)
+}
+
+
+
+extension ShipWifiPlatform: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Direction of one direct probe. Never serialized as a peer identifier;
+ * the artifact only records how many distinct directions were attempted.
+ */
+
+public enum ShipWifiProbeDirection {
+    
+    case outbound
+    case inbound
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiProbeDirection: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiProbeDirection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiProbeDirection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .outbound
+        
+        case 2: return .inbound
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiProbeDirection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .outbound:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .inbound:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiProbeDirection_lift(_ buf: RustBuffer) throws -> ShipWifiProbeDirection {
+    return try FfiConverterTypeShipWifiProbeDirection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiProbeDirection_lower(_ value: ShipWifiProbeDirection) -> RustBuffer {
+    return FfiConverterTypeShipWifiProbeDirection.lower(value)
+}
+
+
+
+extension ShipWifiProbeDirection: Equatable, Hashable {}
+
+
+
+
+public enum ShipWifiReportError {
+
+    
+    
+    case TooLarge
+    case UnknownField(key: String
+    )
+    case ForbiddenField(key: String
+    )
+    case NetworkIdentifierInValue
+    case Invalid(reason: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiReportError: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiReportError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiReportError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .TooLarge
+        case 2: return .UnknownField(
+            key: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .ForbiddenField(
+            key: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .NetworkIdentifierInValue
+        case 5: return .Invalid(
+            reason: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiReportError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case .TooLarge:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .UnknownField(key):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(key, into: &buf)
+            
+        
+        case let .ForbiddenField(key):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(key, into: &buf)
+            
+        
+        case .NetworkIdentifierInValue:
+            writeInt(&buf, Int32(4))
+        
+        
+        case let .Invalid(reason):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+extension ShipWifiReportError: Equatable, Hashable {}
+
+extension ShipWifiReportError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Approximate phone separation. CruiseMesh must not infer this from radio
+ * or topology; only the user may set it.
+ */
+
+public enum ShipWifiSeparation {
+    
+    case sameArea
+    case differentShipAreas
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiSeparation: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiSeparation
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiSeparation {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sameArea
+        
+        case 2: return .differentShipAreas
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiSeparation, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sameArea:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .differentShipAreas:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiSeparation_lift(_ buf: RustBuffer) throws -> ShipWifiSeparation {
+    return try FfiConverterTypeShipWifiSeparation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiSeparation_lower(_ value: ShipWifiSeparation) -> RustBuffer {
+    return FfiConverterTypeShipWifiSeparation.lower(value)
+}
+
+
+
+extension ShipWifiSeparation: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Platform sweep classification, as already computed by the shells.
+ *
+ * Distinct from [`ShipWifiCompletedSweep`]: the live sweep still says
+ * `isolation_suspected`, and the report field records that as `all_silent`
+ * so the published artifact never uses the stronger word.
+ */
+
+public enum ShipWifiSweepVerdict {
+    
+    case foundPeer
+    case healthyButEmpty
+    case isolationSuspected
+    case blockedByPolicy
+    case inconclusive
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiSweepVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiSweepVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiSweepVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .foundPeer
+        
+        case 2: return .healthyButEmpty
+        
+        case 3: return .isolationSuspected
+        
+        case 4: return .blockedByPolicy
+        
+        case 5: return .inconclusive
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiSweepVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .foundPeer:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .healthyButEmpty:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .isolationSuspected:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .blockedByPolicy:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .inconclusive:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiSweepVerdict_lift(_ buf: RustBuffer) throws -> ShipWifiSweepVerdict {
+    return try FfiConverterTypeShipWifiSweepVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiSweepVerdict_lower(_ value: ShipWifiSweepVerdict) -> RustBuffer {
+    return FfiConverterTypeShipWifiSweepVerdict.lower(value)
+}
+
+
+
+extension ShipWifiSweepVerdict: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Serialized compatibility verdict.
+ */
+
+public enum ShipWifiVerdict {
+    
+    case directConfirmed
+    case discoveryFilteredDirectWorked
+    case likelyIsolated
+    case osOrVpnInterference
+    case noPeerEvidence
+    case inconclusive
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .directConfirmed
+        
+        case 2: return .discoveryFilteredDirectWorked
+        
+        case 3: return .likelyIsolated
+        
+        case 4: return .osOrVpnInterference
+        
+        case 5: return .noPeerEvidence
+        
+        case 6: return .inconclusive
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .directConfirmed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .discoveryFilteredDirectWorked:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .likelyIsolated:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .osOrVpnInterference:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .noPeerEvidence:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .inconclusive:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiVerdict_lift(_ buf: RustBuffer) throws -> ShipWifiVerdict {
+    return try FfiConverterTypeShipWifiVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiVerdict_lower(_ value: ShipWifiVerdict) -> RustBuffer {
+    return FfiConverterTypeShipWifiVerdict.lower(value)
+}
+
+
+
+extension ShipWifiVerdict: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * VPN / Private Relay readiness.
+ *
+ * The spec's event list names only [`ShipWifiObservationEvent::VpnInterferenceSuspected`].
+ * The artifact also has `user_confirmed_clear`, which cannot be reached from
+ * that event alone, so this module accepts the sibling
+ * [`ShipWifiObservationEvent::VpnConfirmedClear`]. See the module report
+ * for the spec gap.
+ */
+
+public enum ShipWifiVpnReadiness {
+    
+    case userConfirmedClear
+    case interferenceSuspected
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShipWifiVpnReadiness: FfiConverterRustBuffer {
+    typealias SwiftType = ShipWifiVpnReadiness
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShipWifiVpnReadiness {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .userConfirmedClear
+        
+        case 2: return .interferenceSuspected
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ShipWifiVpnReadiness, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .userConfirmedClear:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .interferenceSuspected:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiVpnReadiness_lift(_ buf: RustBuffer) throws -> ShipWifiVpnReadiness {
+    return try FfiConverterTypeShipWifiVpnReadiness.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShipWifiVpnReadiness_lower(_ value: ShipWifiVpnReadiness) -> RustBuffer {
+    return FfiConverterTypeShipWifiVpnReadiness.lower(value)
+}
+
+
+
+extension ShipWifiVpnReadiness: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What the shell must do as a result of the last gesture event.
  */
 
@@ -29074,6 +31840,31 @@ fileprivate struct FfiConverterSequenceTypeCoreTransport: FfiConverterRustBuffer
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeShipWifiObservationEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [ShipWifiObservationEvent]
+
+    public static func write(_ value: [ShipWifiObservationEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeShipWifiObservationEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ShipWifiObservationEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ShipWifiObservationEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeShipWifiObservationEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Apply a verified member-authored update. Name changes use the deterministic
  * `(revision, changed_by)` winner. Member ids are always unioned, even for a
@@ -30414,6 +33205,98 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
     uniffi_cruisemesh_core_fn_func_core_relay_shadow_sample(
         FfiConverterTypeCoreRelayShadowSampler.lower(state),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Assemble a report from reducer output and user-approved attribution.
+ */
+public func coreShipWifiBuildReport(snapshot: ShipWifiEvidenceSnapshot, attribution: ShipWifiReportAttribution)throws  -> ShipWifiReport {
+    return try  FfiConverterTypeShipWifiReport.lift(try rustCallWithError(FfiConverterTypeShipWifiReportError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_build_report(
+        FfiConverterTypeShipWifiEvidenceSnapshot.lower(snapshot),
+        FfiConverterTypeShipWifiReportAttribution.lower(attribution),$0
+    )
+})
+}
+/**
+ * Evidence strength from the submitted fields plus user-approved separation.
+ *
+ * The service is specified to recompute this and ignore a client label, so
+ * this function is the local preview and the test oracle, not a field in
+ * the artifact.
+ */
+public func coreShipWifiEvidenceStrength(snapshot: ShipWifiEvidenceSnapshot, separation: ShipWifiSeparation) -> ShipWifiEvidenceStrength {
+    return try!  FfiConverterTypeShipWifiEvidenceStrength.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_evidence_strength(
+        FfiConverterTypeShipWifiEvidenceSnapshot.lower(snapshot),
+        FfiConverterTypeShipWifiSeparation.lower(separation),$0
+    )
+})
+}
+public func coreShipWifiForbiddenKeys() -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_forbidden_keys($0
+    )
+})
+}
+public func coreShipWifiGenerateNonce() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_generate_nonce($0
+    )
+})
+}
+/**
+ * Import a draft. Unknown keys, forbidden keys, and IP/MAC-shaped values
+ * are rejected. Accepted drafts are not rewritten: the returned value is
+ * what was in the file, and a later serialize only canonicalizes
+ * whitespace and key order.
+ */
+public func coreShipWifiParseReport(json: String)throws  -> ShipWifiReport {
+    return try  FfiConverterTypeShipWifiReport.lift(try rustCallWithError(FfiConverterTypeShipWifiReportError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_parse_report(
+        FfiConverterString.lower(json),$0
+    )
+})
+}
+/**
+ * Fold a complete event sequence into a snapshot. Golden fixtures and both
+ * shells should go through this so an Android UniFFI caller and an iOS
+ * UniFFI caller cannot disagree.
+ */
+public func coreShipWifiReduce(events: [ShipWifiObservationEvent]) -> ShipWifiEvidenceSnapshot {
+    return try!  FfiConverterTypeShipWifiEvidenceSnapshot.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_reduce(
+        FfiConverterSequenceTypeShipWifiObservationEvent.lower(events),$0
+    )
+})
+}
+public func coreShipWifiReportFileName() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_report_file_name($0
+    )
+})
+}
+public func coreShipWifiReportMaxBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_report_max_bytes($0
+    )
+})
+}
+public func coreShipWifiSchemaVersion() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_schema_version($0
+    )
+})
+}
+/**
+ * Canonical pretty-printed JSON, at most 8 KiB, with a trailing newline.
+ * `device_model` is omitted when unset, per the spec's production rule.
+ */
+public func coreShipWifiSerializeReport(report: ShipWifiReport)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeShipWifiReportError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_ship_wifi_serialize_report(
+        FfiConverterTypeShipWifiReport.lower(report),$0
     )
 })
 }
@@ -33041,6 +35924,36 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_build_report() != 57483) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_evidence_strength() != 55241) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_forbidden_keys() != 40144) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_generate_nonce() != 15611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_parse_report() != 24177) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_reduce() != 7270) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_report_file_name() != 20161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_report_max_bytes() != 29525) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_schema_version() != 19604) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_serialize_report() != 16712) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 65218) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34160,6 +37073,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_seenids_record() != 24410) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_shipwifiobservation_build_report() != 22019) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_shipwifiobservation_observe() != 51285) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_shipwifiobservation_reset() != 7813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_shipwifiobservation_snapshot() != 4049) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_constructor_bleframereassembler_new() != 1261) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -34197,6 +37122,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_seenids_new() != 63283) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_shipwifiobservation_new() != 49206) {
         return InitializationResult.apiChecksumMismatch
     }
 
