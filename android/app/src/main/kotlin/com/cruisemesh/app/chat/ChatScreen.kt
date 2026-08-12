@@ -4,10 +4,6 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
-import android.media.MediaPlayer
 import android.net.Uri
 import android.os.SystemClock
 import android.widget.Toast
@@ -70,7 +66,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -120,11 +115,12 @@ import com.cruisemesh.app.media.AttachmentPayload
 import com.cruisemesh.app.media.ChatImageDecoder
 import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
+import com.cruisemesh.app.media.LocalVoiceMessagePlayback
 import com.cruisemesh.app.media.MediaCompressor
-import com.cruisemesh.app.media.VoicePlaybackDisplay
 import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
+import com.cruisemesh.app.media.rememberVoiceMessagePlayback
 import com.cruisemesh.app.mesh.ContactReachability
 import com.cruisemesh.app.notify.ChatMuteStore
 import com.cruisemesh.app.mesh.ReachabilityLevel
@@ -1715,6 +1711,7 @@ fun MessageBubbleVisual(
                         } else {
                             AttachmentBubbleContent(
                                 attachment = attachment,
+                                messageKey = messageItemKey(message),
                                 contentColor = contentColor,
                                 isOwn = isOwn,
                                 bodyActions = bodyActions,
@@ -1967,6 +1964,12 @@ private fun messageArrivalText(arrival: MessageArrival): String {
 @Composable
 internal fun AttachmentBubbleContent(
     attachment: AttachmentPayload,
+    /**
+     * Identifies the message across reloads ([messageItemKey]), so voice
+     * playback follows the message rather than the payload array the store
+     * happened to hand back this time.
+     */
+    messageKey: String,
     contentColor: Color,
     // A caption is a message body -- iOS linkifies it, so this does too, or a
     // link is tappable on one platform and dead on the other (6.6).
@@ -1987,6 +1990,7 @@ internal fun AttachmentBubbleContent(
         }
         AttachmentPayload.MediaType.AUDIO -> {
             VoiceMemoPlayer(
+                messageKey = messageKey,
                 blob = attachment.blob,
                 durationMs = attachment.durationMs,
                 contentColor = contentColor,
@@ -2067,257 +2071,81 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
  * Inline voice-message bubble: play/pause, a progress bar, and elapsed over
  * total.
  *
- * The player is media-usage/speech-content and asks for transient audio focus
- * while a message plays, so music from another app ducks under it and comes
- * back afterwards, the same way the iOS spoken-audio session behaves. It
- * deliberately does **not** grab a communication route: on this project the mesh
- * keeps running through every audio state, and a communication route would pull
- * a connected headset onto its hands-free profile and fight the same radio the
- * mesh is using. Losing focus pauses playback and nothing else — the mesh
- * service has never listened to audio focus and must not start.
+ * Draws whatever the conversation's
+ * [com.cruisemesh.app.media.VoiceMessagePlayback] says about this
+ * message and hands taps back to it; it owns no player of its own, so a chat
+ * reload or a scroll cannot stop a message that is playing. See that class for
+ * the bug that put it there.
  */
 @Composable
 private fun VoiceMemoPlayer(
+    messageKey: String,
     blob: ByteArray,
     durationMs: Int,
     contentColor: Color,
 ) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var playing by remember(blob) { mutableStateOf(false) }
-    // Guards against a double-tap starting a second load (and a second temp
-    // file / MediaPlayer) while the first one is still preparing.
-    var loading by remember(blob) { mutableStateOf(false) }
-    var player by remember(blob) { mutableStateOf<MediaPlayer?>(null) }
-    // FA11: the play-<ts>.m4a temp file this player is backed by, if any --
-    // tracked so every exit path (manual stop, dispose, completion) can
-    // delete it instead of only the completion listener doing so.
-    var tempFile by remember(blob) { mutableStateOf<File?>(null) }
-    var positionMs by remember(blob) { mutableIntStateOf(0) }
-    // The sender's stated duration until the decoder reports its own, which is
-    // the honest one for the progress bar. A decode/prepare/playback failure
-    // raises `failed` but never blanks `totalMs`: the bubble keeps the manifest
-    // duration and shows a "couldn't play" line, the same as the iOS bubble.
-    var display by remember(blob) { mutableStateOf(VoicePlaybackDisplay.initial(durationMs)) }
-    val audioManager = remember(context) {
-        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    }
-    val playbackAttributes = remember {
-        AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-    }
-    var focusRequest by remember(blob) { mutableStateOf<AudioFocusRequest?>(null) }
-
-    fun abandonFocus() {
-        focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-        focusRequest = null
-    }
-
-    fun releasePlayer() {
-        player?.let { mp ->
-            try {
-                mp.stop()
-            } catch (_: IllegalStateException) {
-                // Already stopped/released elsewhere -- nothing more to do to the player.
-            }
-            mp.release()
-        }
-        player = null
-        playing = false
-        positionMs = 0
-        tempFile?.delete()
-        tempFile = null
-        abandonFocus()
-    }
-
-    fun pausePlayback() {
-        val mp = player
-        playing = false
-        if (mp != null) {
-            try {
-                mp.pause()
-            } catch (_: IllegalStateException) {
-                releasePlayer()
-                return
-            }
-        }
-        abandonFocus()
-    }
-
-    /**
-     * Ducks or pauses whatever else is playing for the length of the message.
-     * Playback goes ahead either way — the user asked for it — so this returns
-     * nothing; the request is only good manners toward other apps.
-     */
-    fun requestFocus() {
-        if (focusRequest != null) return
-        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-            .setAudioAttributes(playbackAttributes)
-            .setOnAudioFocusChangeListener { change ->
-                // Focus is about speakers, never about the mesh: MeshService
-                // keeps running through every one of these.
-                if (change == AudioManager.AUDIOFOCUS_LOSS ||
-                    change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT
-                ) {
-                    pausePlayback()
-                }
-            }
-            .build()
-        if (audioManager.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-            focusRequest = request
-        }
-    }
-
-    DisposableEffect(blob) {
-        onDispose { releasePlayer() }
-    }
-
-    LaunchedEffect(playing) {
-        while (playing) {
-            player?.let { positionMs = it.currentPosition.coerceAtLeast(0) }
-            delay(100)
-        }
-    }
+    // Outside a conversation -- a preview, a bubble on its own in a test --
+    // there is nothing to stay continuous with, so the bubble plays its own.
+    val playback = LocalVoiceMessagePlayback.current ?: rememberVoiceMessagePlayback()
+    val state = playback.stateFor(messageKey, durationMs)
 
     Column {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        IconButton(
-            onClick = {
-                val existing = player
-                when {
-                    playing && existing != null -> pausePlayback()
-                    existing != null -> {
-                        requestFocus()
-                        try {
-                            existing.start()
-                            playing = true
-                        } catch (_: IllegalStateException) {
-                            // A player that errored mid-message is unusable;
-                            // throw it away rather than crash the chat screen,
-                            // and let the next tap decode from scratch. Surface
-                            // the failure but keep the manifest duration.
-                            releasePlayer()
-                            display = display.withFailure()
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(
+                onClick = { playback.toggle(messageKey, blob, durationMs) },
+                // FA10: keep the 40dp visual size, but restore a 48dp touch target
+                // (a caller-supplied .size() below IconButton's own would otherwise
+                // shrink its built-in minimum back down).
+                modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
+            ) {
+                Icon(
+                    imageVector = if (state.isPlaying) ComposerPauseIcon else Icons.Default.PlayArrow,
+                    contentDescription = stringResource(
+                        if (state.isPlaying) R.string.ui_pause_voice_message else R.string.ui_play_voice_message,
+                    ),
+                    tint = contentColor,
+                )
+            }
+            Column(modifier = Modifier.widthIn(min = 132.dp)) {
+                Text(
+                    text = stringResource(
+                        R.string.ui_voice_message_progress,
+                        formatDurationMs(state.positionMs),
+                        formatDurationMs(state.display.totalMs),
+                    ),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = contentColor,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    progress = {
+                        if (state.display.totalMs > 0) {
+                            (state.positionMs.toFloat() / state.display.totalMs).coerceIn(0f, 1f)
+                        } else {
+                            0f
                         }
-                    }
-                    loading -> Unit
-                    else -> {
-                        loading = true
-                        display = display.retrying()
-                        scope.launch {
-                            // FA11: writing the blob to disk and MediaPlayer.prepare()
-                            // (a blocking decode of the audio headers) both used to
-                            // run synchronously on the main thread in this click handler.
-                            val prepared = withContext(Dispatchers.IO) {
-                                try {
-                                    val temp = File(context.cacheDir, "play-${System.currentTimeMillis()}.m4a")
-                                    temp.writeBytes(blob)
-                                    val mp = MediaPlayer()
-                                    mp.setAudioAttributes(
-                                        AudioAttributes.Builder()
-                                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                            .build(),
-                                    )
-                                    mp.setDataSource(temp.absolutePath)
-                                    mp.prepare()
-                                    temp to mp
-                                } catch (_: Exception) {
-                                    null
-                                }
-                            }
-                            loading = false
-                            if (prepared == null) {
-                                display = display.withFailure()
-                                return@launch
-                            }
-                            val (temp, mp) = prepared
-                            if (!isActive) {
-                                // The screen was left mid-load -- don't leak the player or its temp file.
-                                mp.release()
-                                temp.delete()
-                                return@launch
-                            }
-                            // A finished message hands its decoder back. A
-                            // MediaPlayer is a hardware-codec instance and the
-                            // device has a small global pool of them; holding
-                            // one open per played bubble to save a re-decode on
-                            // replay costs the next message the ability to play
-                            // at all.
-                            mp.setOnCompletionListener { releasePlayer() }
-                            mp.setOnErrorListener { _, _, _ ->
-                                // The player is in the Error state now; every
-                                // later call on it would throw.
-                                releasePlayer()
-                                display = display.withFailure()
-                                true
-                            }
-                            display = display.withDecoderDuration(mp.duration)
-                            tempFile = temp
-                            player = mp
-                            positionMs = 0
-                            requestFocus()
-                            playing = true
-                            mp.start()
-                        }
-                    }
-                }
-            },
-            // FA10: keep the 40dp visual size, but restore a 48dp touch target
-            // (a caller-supplied .size() below IconButton's own would otherwise
-            // shrink its built-in minimum back down).
-            modifier = Modifier.minimumInteractiveComponentSize().size(40.dp),
-        ) {
-            Icon(
-                imageVector = if (playing) ComposerPauseIcon else Icons.Default.PlayArrow,
-                contentDescription = stringResource(
-                    if (playing) R.string.ui_pause_voice_message else R.string.ui_play_voice_message,
-                ),
-                tint = contentColor,
-            )
+                    },
+                    color = contentColor,
+                    trackColor = contentColor.copy(alpha = 0.25f),
+                    drawStopIndicator = {},
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        // Not `contentDescription = ""`: that leaves the node's
+                        // progress range in place and TalkBack reads a percentage
+                        // over the "0:04 / 0:12" line right above it.
+                        .clearAndSetSemantics {},
+                )
+            }
         }
-        Column(modifier = Modifier.widthIn(min = 132.dp)) {
+        if (state.display.failed) {
             Text(
-                text = stringResource(
-                    R.string.ui_voice_message_progress,
-                    formatDurationMs(positionMs),
-                    formatDurationMs(display.totalMs),
-                ),
-                style = MaterialTheme.typography.bodyMedium,
-                color = contentColor,
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            LinearProgressIndicator(
-                progress = {
-                    if (display.totalMs > 0) {
-                        (positionMs.toFloat() / display.totalMs).coerceIn(0f, 1f)
-                    } else {
-                        0f
-                    }
-                },
-                color = contentColor,
-                trackColor = contentColor.copy(alpha = 0.25f),
-                drawStopIndicator = {},
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    // Not `contentDescription = ""`: that leaves the node's
-                    // progress range in place and TalkBack reads a percentage
-                    // over the "0:04 / 0:12" line right above it.
-                    .clearAndSetSemantics {},
+                text = stringResource(R.string.ui_could_not_play_voice_message),
+                style = MaterialTheme.typography.bodySmall,
+                color = contentColor.copy(alpha = 0.8f),
+                modifier = Modifier.padding(top = 2.dp),
             )
         }
-    }
-    if (display.failed) {
-        Text(
-            text = stringResource(R.string.ui_could_not_play_voice_message),
-            style = MaterialTheme.typography.bodySmall,
-            color = contentColor.copy(alpha = 0.8f),
-            modifier = Modifier.padding(top = 2.dp),
-        )
-    }
     }
 }
 

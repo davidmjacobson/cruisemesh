@@ -19,6 +19,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Stable
@@ -35,6 +36,8 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
 import com.cruisemesh.app.media.AttachmentPayload
+import com.cruisemesh.app.media.LocalVoiceMessagePlayback
+import com.cruisemesh.app.media.rememberVoiceMessagePlayback
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import uniffi.cruisemesh_core.StoredMessage
@@ -272,6 +275,26 @@ fun ConversationScaffold(
     listContent: LazyListScope.() -> Unit,
     belowList: @Composable ColumnScope.() -> Unit,
     overlays: @Composable () -> Unit = {},
+) {
+    // One voice player for the whole conversation, owned here rather than by
+    // the bubble that starts a message: this outlives both a store reload and
+    // the LazyColumn disposing a scrolled-away bubble, either of which used to
+    // cut a message off mid-sentence (see [VoiceMessagePlayback]). It covers
+    // the overlays too, so a message playing in the list keeps playing under
+    // the focus overlay.
+    CompositionLocalProvider(LocalVoiceMessagePlayback provides rememberVoiceMessagePlayback()) {
+        ConversationScaffoldContent(host, topBar, snackbarHostState, listContent, belowList, overlays)
+    }
+}
+
+@Composable
+private fun ConversationScaffoldContent(
+    host: ConversationHost,
+    topBar: @Composable () -> Unit,
+    snackbarHostState: SnackbarHostState,
+    listContent: LazyListScope.() -> Unit,
+    belowList: @Composable ColumnScope.() -> Unit,
+    overlays: @Composable () -> Unit,
 ) {
     val density = LocalDensity.current
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
