@@ -1959,8 +1959,8 @@ private fun expiryRemainingText(remainingMs: Long): String {
 
 internal fun transportRouteText(transport: Int): String =
     when (transport) {
-        0 -> "direct BLE"
-        1 -> "another device over BLE"
+        0 -> "direct Bluetooth"
+        1 -> "another device over Bluetooth"
         2 -> "relay"
         3 -> "local Wi-Fi"
         4 -> "another device over local Wi-Fi"

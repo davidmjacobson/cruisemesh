@@ -1032,8 +1032,8 @@ private func expiryRemainingText(_ remainingMs: Int64) -> String {
 
 func transportRouteText(_ transport: UInt8) -> String {
     switch transport {
-    case 0: return "direct BLE"
-    case 1: return "another device over BLE"
+    case 0: return "direct Bluetooth"
+    case 1: return "another device over Bluetooth"
     case 2: return "relay"
     case 3: return "local Wi-Fi"
     case 4: return "another device over local Wi-Fi"
