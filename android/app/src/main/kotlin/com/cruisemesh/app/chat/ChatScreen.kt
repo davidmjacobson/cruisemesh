@@ -44,6 +44,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -256,6 +257,9 @@ fun ChatScreen(
     // A photo picked but not yet sent: shown as a preview card above the composer
     // so a caption can ride along with it in a single attachment (see [onSend]).
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    // The staged photo currently open in the markup editor, or null when it is
+    // closed (specs/photo-markup.md).
+    var drawingPhoto by remember { mutableStateOf<ByteArray?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     val voiceRecorder = remember { VoiceRecorder(context) }
@@ -385,6 +389,7 @@ fun ChatScreen(
         onDraftChange = { draft = it },
         pendingPhoto = pendingPhoto,
         onClearPendingPhoto = { pendingPhoto = null },
+        onDrawPendingPhoto = { drawingPhoto = pendingPhoto },
         onSend = {
             val text = draft.trim()
             val photo = pendingPhoto
@@ -510,6 +515,22 @@ fun ChatScreen(
         shareAvailability = shareAvailability,
         onShareContact = { onShareContact(currentContact) },
     )
+
+    // Placed at the screen's outer level, like the photo viewer, so it covers
+    // the whole conversation rather than nesting inside a composer slot.
+    val photoBeingDrawnOn = drawingPhoto
+    if (photoBeingDrawnOn != null) {
+        PhotoMarkupEditor(
+            jpeg = photoBeingDrawnOn,
+            onCancel = { drawingPhoto = null },
+            onConfirm = { annotated ->
+                drawingPhoto = null
+                // Same staging path as a freshly picked photo, so the caption
+                // and reply target already in the composer are untouched.
+                stagePhoto(annotated)
+            },
+        )
+    }
 }
 
 internal fun launchCamera(context: android.content.Context, onReady: (Uri) -> Unit) {
@@ -536,6 +557,7 @@ private fun ConversationScreen(
     onSend: () -> Unit,
     pendingPhoto: ByteArray? = null,
     onClearPendingPhoto: () -> Unit = {},
+    onDrawPendingPhoto: () -> Unit = {},
     onPickGallery: () -> Unit = {},
     onPickCamera: () -> Unit = {},
     onStartVoice: () -> Boolean = { false },
@@ -701,7 +723,11 @@ private fun ConversationScreen(
             ComposerReachNotice(reach = composerReach, contactName = displayName)
 
             if (pendingPhoto != null) {
-                PendingPhotoCard(bytes = pendingPhoto, onRemove = onClearPendingPhoto)
+                PendingPhotoCard(
+                    bytes = pendingPhoto,
+                    onRemove = onClearPendingPhoto,
+                    onDraw = onDrawPendingPhoto,
+                )
             }
 
             if (replyingToPreview != null) {
@@ -936,9 +962,13 @@ internal fun ComposerReachNotice(reach: ComposerReach, contactName: String, modi
  * Preview card for a photo that's been picked but not yet sent. Shown just
  * above the composer with a remove button, so the user can type a caption that
  * rides along with the image in a single attachment.
+ *
+ * [onDraw] opens the markup editor (`specs/photo-markup.md`). This card is the
+ * one entry point, which is what lets a single editor serve the gallery, the
+ * camera, 1:1 chats and groups.
  */
 @Composable
-internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
+internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit, onDraw: () -> Unit) {
     val density = LocalDensity.current
     val previewPx = with(density) { 72.dp.toPx().roundToInt() }
     var bitmap by remember(bytes, previewPx) { mutableStateOf<ImageBitmap?>(null) }
@@ -992,7 +1022,17 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
         Text(text = stringResource(R.string.ui_photo_ready_add_a_caption_or_send),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.weight(1f),
         )
+        TextButton(onClick = onDraw) {
+            Icon(
+                Icons.Default.Edit,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(stringResource(R.string.ui_draw))
+        }
     }
 }
 

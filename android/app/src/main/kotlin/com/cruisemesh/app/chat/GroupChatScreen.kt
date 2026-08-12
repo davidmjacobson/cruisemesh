@@ -111,6 +111,9 @@ fun GroupChatScreen(
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
     var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    // The staged photo currently open in the markup editor, or null when it is
+    // closed (specs/photo-markup.md).
+    var drawingPhoto by remember { mutableStateOf<ByteArray?>(null) }
     var isMuted by remember(group.id) { mutableStateOf(ChatMuteStore.isMuted(context, group.id)) }
     var pendingCameraUri by remember { mutableStateOf<Uri?>(null) }
     var showDetails by remember { mutableStateOf(false) }
@@ -320,7 +323,11 @@ fun GroupChatScreen(
             }
 
             pendingPhoto?.let { photo ->
-                PendingPhotoCard(bytes = photo, onRemove = { pendingPhoto = null })
+                PendingPhotoCard(
+                    bytes = photo,
+                    onRemove = { pendingPhoto = null },
+                    onDraw = { drawingPhoto = photo },
+                )
             }
             MessageComposer(
                 draft = draft,
@@ -745,6 +752,22 @@ fun GroupChatScreen(
                 },
                 nowMs = System.currentTimeMillis(),
             ),
+        )
+    }
+
+    // Placed at the screen's outer level so it covers the whole conversation
+    // rather than nesting inside a composer slot.
+    val photoBeingDrawnOn = drawingPhoto
+    if (photoBeingDrawnOn != null) {
+        PhotoMarkupEditor(
+            jpeg = photoBeingDrawnOn,
+            onCancel = { drawingPhoto = null },
+            onConfirm = { annotated ->
+                drawingPhoto = null
+                // Same staging path as a freshly picked photo, so the caption
+                // and reply target already in the composer are untouched.
+                stagePhoto(annotated)
+            },
         )
     }
 }

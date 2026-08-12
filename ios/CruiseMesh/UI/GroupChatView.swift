@@ -31,6 +31,9 @@ struct GroupChatView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
     @State private var pendingPhoto: Data?
+    /// The staged photo currently open in the markup editor, or nil when it is
+    /// closed (`specs/photo-markup.md`).
+    @State private var drawingPhoto: DrawingPhoto?
     @State private var showVoice = false
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
@@ -170,6 +173,10 @@ struct GroupChatView: View {
                 canSend: canSend,
                 onCancelReply: { replyingTo = nil },
                 onRemovePhoto: { pendingPhoto = nil },
+                onDrawPhoto: {
+                    guard let pendingPhoto else { return }
+                    drawingPhoto = DrawingPhoto(jpeg: pendingPhoto)
+                },
                 onSend: sendCurrentDraft,
                 onVoiceFinished: sendVoice,
                 onVoiceError: { statusMessage = $0 }
@@ -267,6 +274,21 @@ struct GroupChatView: View {
         }
         .fullScreenCover(item: $viewedPhoto) { photo in
             PhotoViewerOverlay(jpeg: photo.jpeg)
+        }
+        // Presented at the screen's outer level, like the photo viewer, so it
+        // covers the whole conversation rather than nesting inside the composer.
+        .fullScreenCover(item: $drawingPhoto) { photo in
+            PhotoMarkupEditor(
+                jpeg: photo.jpeg,
+                onCancel: { drawingPhoto = nil },
+                onConfirm: { annotated in
+                    // Straight back into the staged slot, so the caption and
+                    // reply target already in the composer are untouched. The
+                    // editor has already re-run the size guard on these bytes.
+                    pendingPhoto = annotated
+                    drawingPhoto = nil
+                }
+            )
         }
         .alert("Notice", isPresented: Binding(
             get: { statusMessage != nil },

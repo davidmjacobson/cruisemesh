@@ -28,6 +28,9 @@ struct ChatView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showCamera = false
     @State private var pendingPhoto: Data?
+    /// The staged photo currently open in the markup editor, or nil when it is
+    /// closed (`specs/photo-markup.md`).
+    @State private var drawingPhoto: DrawingPhoto?
     @State private var statusMessage: String?
     @State private var cancellable: AnyCancellable?
     @State private var voiceRecorder = VoiceRecorder()
@@ -227,6 +230,10 @@ struct ChatView: View {
                 canSend: canSend,
                 onCancelReply: { replyingTo = nil },
                 onRemovePhoto: { pendingPhoto = nil },
+                onDrawPhoto: {
+                    guard let pendingPhoto else { return }
+                    drawingPhoto = DrawingPhoto(jpeg: pendingPhoto)
+                },
                 onSend: sendCurrentDraft,
                 onVoiceFinished: sendVoice,
                 onVoiceError: { statusMessage = $0 }
@@ -380,6 +387,21 @@ struct ChatView: View {
         }
         .fullScreenCover(item: $viewedPhoto) { photo in
             PhotoViewerOverlay(jpeg: photo.jpeg)
+        }
+        // Presented at the screen's outer level, like the photo viewer, so it
+        // covers the whole conversation rather than nesting inside the composer.
+        .fullScreenCover(item: $drawingPhoto) { photo in
+            PhotoMarkupEditor(
+                jpeg: photo.jpeg,
+                onCancel: { drawingPhoto = nil },
+                onConfirm: { annotated in
+                    // Straight back into the staged slot, so the caption and
+                    // reply target already in the composer are untouched. The
+                    // editor has already re-run the size guard on these bytes.
+                    pendingPhoto = annotated
+                    drawingPhoto = nil
+                }
+            )
         }
         .alert("Delete contact?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
@@ -910,9 +932,15 @@ struct ComposerReachNotice: View {
     }
 }
 
+/// Preview card for a photo that's been picked but not yet sent.
+///
+/// `onDraw` opens the markup editor (`specs/photo-markup.md`). This card is the
+/// one entry point, which is what lets a single editor serve the gallery, the
+/// camera, 1:1 chats and groups.
 struct PendingPhotoPreview: View {
     let jpeg: Data
     let onRemove: () -> Void
+    let onDraw: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -930,7 +958,13 @@ struct PendingPhotoPreview: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+            Spacer(minLength: 4)
+            Button(action: onDraw) {
+                Label("Draw", systemImage: "pencil.tip")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(minHeight: 44)
+            }
+            .accessibilityIdentifier("chat.pending-photo.draw")
             Button(action: onRemove) {
                 Image(systemName: "xmark.circle.fill")
                     .font(.title3)
@@ -1066,6 +1100,14 @@ private extension StoredMessage {
 }
 
 struct ViewedPhoto: Identifiable {
+    let id = UUID()
+    let jpeg: Data
+}
+
+/// The staged photo currently open in the markup editor
+/// (`specs/photo-markup.md`), keyed so `.fullScreenCover(item:)` has something
+/// `Identifiable` to present from -- the same shape as `ViewedPhoto`.
+struct DrawingPhoto: Identifiable {
     let id = UUID()
     let jpeg: Data
 }

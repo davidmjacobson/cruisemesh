@@ -713,6 +713,16 @@
         }
       }
     },
+    "Black": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Black"
+          }
+        }
+      }
+    },
     "Block": {
       "localizations": {
         "en": {
@@ -889,6 +899,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Choose profile photo"
+          }
+        }
+      }
+    },
+    "Clear": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Clear"
           }
         }
       }
@@ -1103,6 +1123,16 @@
         }
       }
     },
+    "Could not prepare photo": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Could not prepare photo"
+          }
+        }
+      }
+    },
     "Could not save that voice message": {
       "localizations": {
         "en": {
@@ -1179,6 +1209,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Diagnostic logging is on. Reproduce the problem, then return here to share it."
+          }
+        }
+      }
+    },
+    "Draw": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Draw"
+          }
+        }
+      }
+    },
+    "Drawing area": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Drawing area"
           }
         }
       }
@@ -1289,6 +1339,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Manage Shore Pass"
+          }
+        }
+      }
+    },
+    "Medium pen": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Medium pen"
           }
         }
       }
@@ -1515,6 +1575,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Recent events"
+          }
+        }
+      }
+    },
+    "Red": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Red"
           }
         }
       }
@@ -1821,12 +1891,62 @@
         }
       }
     },
+    "Thick pen": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thick pen"
+          }
+        }
+      }
+    },
+    "Thin pen": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Thin pen"
+          }
+        }
+      }
+    },
+    "Undo": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Undo"
+          }
+        }
+      }
+    },
     "Voice messages stop automatically after %lld seconds.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Voice messages stop automatically after %lld seconds."
+          }
+        }
+      }
+    },
+    "White": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "White"
+          }
+        }
+      }
+    },
+    "Yellow": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yellow"
           }
         }
       }
