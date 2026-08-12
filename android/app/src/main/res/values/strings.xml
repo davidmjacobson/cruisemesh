@@ -57,6 +57,7 @@
     <string name="ui_connectivity">Connectivity</string>
     <string name="ui_contacts">Contacts</string>
     <string name="ui_copy">Copy</string>
+    <string name="ui_save_image">Save image</string>
     <string name="ui_copy_this_phone_s_address">Copy this phone\'s address</string>
     <string name="ui_cruisemesh_lan_address">CruiseMesh LAN address</string>
     <string name="ui_cruisemesh_setup">CruiseMesh setup</string>

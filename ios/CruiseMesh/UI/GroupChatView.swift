@@ -568,10 +568,7 @@ private struct GroupMessageRow: View {
                                 case .image:
                                     ChatImageView(
                                         jpeg: attachment.blob,
-                                        canReply: canReply,
-                                        onReply: onReply,
-                                        onOpen: onPhotoTap,
-                                        onStatus: { _ in }
+                                        onOpen: onPhotoTap
                                     )
                                 case .audio:
                                     VoiceMemoPlayerView(
@@ -614,10 +611,15 @@ private struct GroupMessageRow: View {
                                 .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
                         )
                         .foregroundStyle(isOwn ? Color.white : Color.primary)
+                        .contentShape(
+                            .contextMenuPreview,
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        )
                         .contextMenu {
                             MessageActionsMenu(
                                 canReply: canReply,
                                 copyText: messageCopyText(message),
+                                imageData: messageImageData(message),
                                 ownReaction: reactions.first(where: { $0.reactedByOwnUser })?.emoji,
                                 onReact: onReact,
                                 onReply: onReply,
@@ -625,6 +627,7 @@ private struct GroupMessageRow: View {
                                     UIPasteboard.general.string = messageCopyText(message)
                                     onStatus("Copied")
                                 },
+                                onStatus: onStatus,
                                 onInfo: { showInfo = true }
                             )
                         }

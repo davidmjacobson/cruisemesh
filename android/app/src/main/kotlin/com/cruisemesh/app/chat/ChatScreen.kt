@@ -668,6 +668,11 @@ private fun ConversationScreen(
 
                     MessageBubble(
                         message = message,
+                        isFocused = host.focused?.target == MessageTarget(
+                            message.senderUserId,
+                            message.lamport,
+                            message.kind,
+                        ),
                         isOwn = isOwn,
                         tick = if (isOwn) tickStatusFor(message.lamport, deliveredThrough, readThrough) else null,
                         contactColor = if (isOwn) null else contactColor,
@@ -785,6 +790,7 @@ private fun ConversationScreen(
                     val focusedTick = if (focusedIsOwn) tickStatusFor(focusedMessage.lamport, deliveredThrough, readThrough) else null
                     val focusedReactions = reactions[currentFocused.target.stableKey].orEmpty()
                     val focusedCopyText = remember(focusedMessage.payload, focusedMessage.kind) { messageCopyText(focusedMessage) }
+                    val focusedImage = remember(focusedMessage.payload, focusedMessage.kind) { messageImageBytes(focusedMessage) }
                     val focusedOwnReaction = focusedReactions.firstOrNull { it.reactedByOwnUser }?.emoji
                     val focusedReplyMetadata = replyMetadata[messageStableKey(focusedMessage)]
 
@@ -809,6 +815,17 @@ private fun ConversationScreen(
                                 Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                             }
                             closeOverlay()
+                        },
+                        onSaveImage = focusedImage?.let { jpeg ->
+                            {
+                                val saved = ImageGallery.saveJpeg(context, jpeg)
+                                Toast.makeText(
+                                    context,
+                                    if (saved != null) "Saved to Pictures/CruiseMesh" else "Could not save image",
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                                closeOverlay()
+                            }
                         },
                         onInfo = {
                             host.openInfo(focusedMessage)
@@ -1486,6 +1503,7 @@ fun bubbleShapeFor(isOwn: Boolean, grouping: BubbleGrouping): RoundedCornerShape
 @Composable
 private fun MessageBubble(
     message: StoredMessage,
+    isFocused: Boolean,
     isOwn: Boolean,
     tick: TickStatus?,
     contactColor: Color?,
@@ -1599,6 +1617,10 @@ private fun MessageBubble(
                     onLongClick = { onLongPress(target, boundsInRoot) },
                 ),
                 modifier = Modifier
+                    // The overlay redraws this visual at its source position
+                    // before moving it. Hide the list copy so the motion does
+                    // not leave a dim "ghost" bubble behind.
+                    .alpha(if (isFocused) 0f else 1f)
                     .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                     .messageActions(
                         onClick = onBubbleClick,
@@ -1838,7 +1860,7 @@ fun ReactionRow(
     }
 }
 
-private fun messageCopyText(message: StoredMessage): String =
+internal fun messageCopyText(message: StoredMessage): String =
     when (message.kind) {
         KIND_ATTACHMENT_MANIFEST -> AttachmentPayload.decode(message.payload)?.caption.orEmpty()
         else -> message.payload.toString(Charsets.UTF_8)

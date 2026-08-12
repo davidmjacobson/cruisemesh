@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -57,6 +58,10 @@ import androidx.compose.ui.unit.toSize
 import kotlinx.coroutines.launch
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
+import com.cruisemesh.app.ui.MessageCopyIcon
+import com.cruisemesh.app.ui.MessageInfoIcon
+import com.cruisemesh.app.ui.MessageSaveIcon
+import com.cruisemesh.app.ui.ReplyIcon
 
 /** Captured at long-press time: which message and where its bubble sits on screen (root coords, unclipped). */
 data class FocusedMessage(
@@ -81,19 +86,21 @@ private const val ENTRANCE_MS = 150
 private const val EXIT_MS = 120
 
 // Rough pre-measurement estimate for the bar (6 circular 40dp-visual reaction
-// buttons, each with a 48dp touch target -- FA10) and menu (three
+// buttons, each with a 48dp touch target -- FA10) and menu (up to four
 // DropdownMenuItems) so the very first frame already places them close to
 // correct instead of snapping in from a zero-size guess.
 private val ESTIMATED_BAR_SIZE = DpSize(314.dp, 60.dp)
-private val ESTIMATED_MENU_SIZE = DpSize(180.dp, 144.dp)
+private val ESTIMATED_MENU_WIDTH = 180.dp
+private val ESTIMATED_MENU_ROW_HEIGHT = 48.dp
 
 /**
  * Full-screen scrim over everything (list, top
  * bar, composer) with the pressed bubble re-drawn undimmed at its original
- * screen position via [bubbleContent], plus a floating reaction bar above it
- * and an action menu below -- as overlay layers, not inserted into the
- * message stream. [focused].bounds anchors the bubble in window coordinates;
- * [OverlayPlacement] works out where the bar/menu land in the overlay.
+ * source position via [bubbleContent], then springs that preview to a fitted
+ * position with a floating reaction bar above it and an action menu below --
+ * as overlay layers, not inserted into the message stream. [focused].bounds
+ * anchors the source in window coordinates; [OverlayPlacement] works out
+ * where the complete stack lands in the overlay.
  */
 @Composable
 fun MessageFocusOverlay(
@@ -106,28 +113,38 @@ fun MessageFocusOverlay(
     onReact: (String) -> Unit,
     onReply: () -> Unit,
     onCopy: () -> Unit,
+    onSaveImage: (() -> Unit)?,
     onInfo: () -> Unit,
     bubbleContent: @Composable () -> Unit,
 ) {
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val entrance = remember { Animatable(0f) }
-    val pulse = remember { Animatable(1f) }
+    val bubbleTranslation = remember(focused) { Animatable(0f) }
+    // Signal's selected snapshot starts slightly enlarged, then settles while
+    // moving to its fitted position.
+    val pulse = remember(focused) { Animatable(1.04f) }
     var dismissing by remember { mutableStateOf(false) }
 
     fun dismiss() {
         if (dismissing) return
         dismissing = true
         scope.launch {
-            entrance.animateTo(0f, tween(EXIT_MS))
+            launch { entrance.animateTo(0f, tween(EXIT_MS)) }
+            bubbleTranslation.animateTo(0f, tween(EXIT_MS))
             onDismiss()
         }
     }
 
     LaunchedEffect(Unit) {
         launch { entrance.animateTo(1f, tween(ENTRANCE_MS)) }
-        pulse.animateTo(1.05f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
-        pulse.animateTo(1f, spring(dampingRatio = Spring.DampingRatioMediumBouncy))
+        pulse.animateTo(
+            1f,
+            spring(
+                dampingRatio = Spring.DampingRatioMediumBouncy,
+                stiffness = Spring.StiffnessMediumLow,
+            ),
+        )
     }
 
     BackHandler(onBack = ::dismiss)
@@ -136,7 +153,14 @@ fun MessageFocusOverlay(
         IntSize(ESTIMATED_BAR_SIZE.width.roundToPx(), ESTIMATED_BAR_SIZE.height.roundToPx())
     }
     val estimatedMenuSize = with(density) {
-        IntSize(ESTIMATED_MENU_SIZE.width.roundToPx(), ESTIMATED_MENU_SIZE.height.roundToPx())
+        val rowCount = 1 +
+            (if (canReply) 1 else 0) +
+            (if (canCopy) 1 else 0) +
+            (if (onSaveImage != null) 1 else 0)
+        IntSize(
+            ESTIMATED_MENU_WIDTH.roundToPx(),
+            (ESTIMATED_MENU_ROW_HEIGHT * rowCount).roundToPx(),
+        )
     }
     var barSize by remember { mutableStateOf(estimatedBarSize) }
     var menuSize by remember { mutableStateOf(estimatedMenuSize) }
@@ -186,11 +210,22 @@ fun MessageFocusOverlay(
             isOwn = isOwn,
         )
 
+        LaunchedEffect(placement.bubbleTop, bubbleBounds.top) {
+            bubbleTranslation.animateTo(
+                placement.bubbleTop - bubbleBounds.top,
+                spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessMediumLow,
+                ),
+            )
+        }
+
         // The focused bubble copy: undimmed (drawn above the scrim background),
-        // pulses once on open, swallows taps so tapping it doesn't dismiss.
+        // settles from the long-press scale while moving, and swallows taps so
+        // tapping it doesn't dismiss.
         Box(
             modifier = Modifier
-                .offset(bubbleBounds.left, placement.bubbleTop)
+                .offset(bubbleBounds.left, bubbleBounds.top + bubbleTranslation.value)
                 .graphicsLayer {
                     scaleX = pulse.value
                     scaleY = pulse.value
@@ -225,8 +260,10 @@ fun MessageFocusOverlay(
             MessageActionPanel(
                 canReply = canReply,
                 canCopy = canCopy,
+                canSaveImage = onSaveImage != null,
                 onReply = onReply,
                 onCopy = onCopy,
+                onSaveImage = { onSaveImage?.invoke() },
                 onInfo = onInfo,
             )
         }
@@ -290,8 +327,10 @@ private fun ReactionPickerBar(
 private fun MessageActionPanel(
     canReply: Boolean,
     canCopy: Boolean,
+    canSaveImage: Boolean,
     onReply: () -> Unit,
     onCopy: () -> Unit,
+    onSaveImage: () -> Unit,
     onInfo: () -> Unit,
 ) {
     Surface(
@@ -307,18 +346,30 @@ private fun MessageActionPanel(
             .widthIn(min = 176.dp, max = 220.dp),
     ) {
         Column(modifier = Modifier.padding(vertical = 6.dp)) {
-            DropdownMenuItem(
-                text = { Text(stringResource(R.string.ui_reply)) },
-                enabled = canReply,
-                onClick = onReply,
-            )
-            DropdownMenuItem(
-                text = { Text(stringResource(R.string.ui_copy)) },
-                enabled = canCopy,
-                onClick = onCopy,
-            )
+            if (canReply) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.ui_reply)) },
+                    leadingIcon = { Icon(ReplyIcon, contentDescription = null) },
+                    onClick = onReply,
+                )
+            }
+            if (canSaveImage) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.ui_save_image)) },
+                    leadingIcon = { Icon(MessageSaveIcon, contentDescription = null) },
+                    onClick = onSaveImage,
+                )
+            }
+            if (canCopy) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.ui_copy)) },
+                    leadingIcon = { Icon(MessageCopyIcon, contentDescription = null) },
+                    onClick = onCopy,
+                )
+            }
             DropdownMenuItem(
                 text = { Text(stringResource(R.string.ui_info)) },
+                leadingIcon = { Icon(MessageInfoIcon, contentDescription = null) },
                 onClick = onInfo,
             )
         }

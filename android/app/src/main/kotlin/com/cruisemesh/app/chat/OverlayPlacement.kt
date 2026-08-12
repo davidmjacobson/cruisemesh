@@ -2,10 +2,11 @@ package com.cruisemesh.app.chat
 
 /**
  * Pure placement math for [MessageFocusOverlay]:
- * keeps the reaction bar above and the
- * action menu below the focused bubble when there is room. The bubble itself
- * stays anchored at the long-press position; when an edge is tight, the bar
- * and menu move around that fixed anchor. Kept free of Compose/Android types
+ * keeps the reaction bar above and the action menu below the focused bubble.
+ * When that complete stack fits in the viewport, the bubble moves just far
+ * enough to make room at an edge -- the defining Signal interaction. Very
+ * tall messages fall back to placing the controls around a fixed anchor.
+ * Kept free of Compose/Android types
  * so it's unit-testable without a Compose host, same pattern as
  * [ConversationLayout] / `MeshRouterState`.
  */
@@ -40,55 +41,73 @@ object OverlayPlacement {
     ): Result {
         // The bubble can be taller than the viewport or partly scrolled past an
         // edge, so free space is measured around its on-screen portion.
-        val anchorTop = bubbleBounds.top.coerceIn(screenTop, screenBottom)
-        val anchorBottom = bubbleBounds.bottom.coerceIn(screenTop, screenBottom)
-        val aboveRoom = anchorTop - screenTop
-        val belowRoom = screenBottom - anchorBottom
+        val bubbleHeight = bubbleBounds.height.coerceAtLeast(0f)
+        val viewportHeight = (screenBottom - screenTop).coerceAtLeast(0f)
         val barNeed = barHeight + spacing
         val menuNeed = menuHeight + spacing
-        val stackNeed = barNeed + menuNeed
-        val barFitsAbove = aboveRoom >= barNeed
-        val menuFitsBelow = belowRoom >= menuNeed
+        val completeStackHeight = barNeed + bubbleHeight + menuNeed
 
+        var bubbleTop = bubbleBounds.top
         var barTop: Float
         var menuTop: Float
-        when {
-            // Natural: bar above the bubble, menu below it.
-            barFitsAbove && menuFitsBelow -> {
-                barTop = anchorTop - barNeed
-                menuTop = anchorBottom + spacing
-            }
-            // Menu can't go below: stack bar-then-menu above when both fit...
-            barFitsAbove && aboveRoom >= stackNeed -> {
-                menuTop = anchorTop - menuNeed
-                barTop = menuTop - barNeed
-            }
-            // ...or split them around the bubble (menu above, bar below).
-            barFitsAbove && aboveRoom >= menuNeed && belowRoom >= barNeed -> {
-                menuTop = anchorTop - menuNeed
-                barTop = anchorBottom + spacing
-            }
-            // Menu fits nowhere around the bubble: bar keeps its natural spot,
-            // menu pins to the bottom edge over the bubble.
-            barFitsAbove -> {
-                barTop = anchorTop - barNeed
-                menuTop = screenBottom - menuHeight
-            }
-            // Bar can't go above: stack bar-then-menu below when both fit.
-            menuFitsBelow && belowRoom >= stackNeed -> {
-                barTop = anchorBottom + spacing
-                menuTop = barTop + barNeed
-            }
-            // Menu keeps its natural spot below; bar pins to the top edge over the bubble.
-            menuFitsBelow -> {
-                barTop = screenTop
-                menuTop = anchorBottom + spacing
-            }
-            // No room on either side (bubble fills the viewport): pin both over
-            // the bubble at opposite edges.
-            else -> {
-                barTop = screenTop
-                menuTop = screenBottom - menuHeight
+
+        if (completeStackHeight <= viewportHeight) {
+            // Signal keeps the three pieces in their natural order and moves
+            // the pressed message preview. At the bottom this visibly lifts
+            // the bubble until the whole menu clears the navigation inset;
+            // the corresponding top-edge case moves it down.
+            val minBubbleTop = screenTop + barHeight + spacing
+            val maxBubbleTop = screenBottom - menuHeight - spacing - bubbleHeight
+            bubbleTop = bubbleBounds.top.coerceIn(minBubbleTop, maxBubbleTop)
+            barTop = bubbleTop - spacing - barHeight
+            menuTop = bubbleTop + bubbleHeight + spacing
+        } else {
+            val anchorTop = bubbleBounds.top.coerceIn(screenTop, screenBottom)
+            val anchorBottom = bubbleBounds.bottom.coerceIn(screenTop, screenBottom)
+            val aboveRoom = anchorTop - screenTop
+            val belowRoom = screenBottom - anchorBottom
+            val stackNeed = barNeed + menuNeed
+            val barFitsAbove = aboveRoom >= barNeed
+            val menuFitsBelow = belowRoom >= menuNeed
+
+            when {
+                // Natural: bar above the bubble, menu below it.
+                barFitsAbove && menuFitsBelow -> {
+                    barTop = anchorTop - barNeed
+                    menuTop = anchorBottom + spacing
+                }
+                // Menu can't go below: stack bar-then-menu above when both fit...
+                barFitsAbove && aboveRoom >= stackNeed -> {
+                    menuTop = anchorTop - menuNeed
+                    barTop = menuTop - barNeed
+                }
+                // ...or split them around the bubble (menu above, bar below).
+                barFitsAbove && aboveRoom >= menuNeed && belowRoom >= barNeed -> {
+                    menuTop = anchorTop - menuNeed
+                    barTop = anchorBottom + spacing
+                }
+                // Menu fits nowhere around the bubble: bar keeps its natural spot,
+                // menu pins to the bottom edge over the bubble.
+                barFitsAbove -> {
+                    barTop = anchorTop - barNeed
+                    menuTop = screenBottom - menuHeight
+                }
+                // Bar can't go above: stack bar-then-menu below when both fit.
+                menuFitsBelow && belowRoom >= stackNeed -> {
+                    barTop = anchorBottom + spacing
+                    menuTop = barTop + barNeed
+                }
+                // Menu keeps its natural spot below; bar pins to the top edge over the bubble.
+                menuFitsBelow -> {
+                    barTop = screenTop
+                    menuTop = anchorBottom + spacing
+                }
+                // No room on either side (bubble fills the viewport): pin both over
+                // the bubble at opposite edges.
+                else -> {
+                    barTop = screenTop
+                    menuTop = screenBottom - menuHeight
+                }
             }
         }
 
@@ -114,7 +133,7 @@ object OverlayPlacement {
         }
 
         return Result(
-            bubbleTop = bubbleBounds.top,
+            bubbleTop = bubbleTop,
             barTop = barTop,
             menuTop = menuTop,
             barLeft = horizontalLeft(barWidth),
