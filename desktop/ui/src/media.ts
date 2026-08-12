@@ -1,3 +1,4 @@
+import { userCopy } from "./presentation";
 import type { AttachmentDraft } from "./types";
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -21,7 +22,11 @@ async function imageElement(file: File): Promise<HTMLImageElement> {
   }
 }
 
-export async function prepareAttachment(file: File, maxBytes: number): Promise<AttachmentDraft> {
+export async function prepareAttachment(
+  file: File,
+  maxBytes: number,
+  durationMs = 0,
+): Promise<AttachmentDraft> {
   if (file.type.startsWith("image/")) {
     const image = await imageElement(file);
     const longest = Math.max(image.naturalWidth, image.naturalHeight);
@@ -44,14 +49,14 @@ export async function prepareAttachment(file: File, maxBytes: number): Promise<A
         };
       }
     }
-    throw new Error("That photo cannot be reduced below the 180 KiB CruiseMesh limit.");
+    throw new Error(userCopy.photoTooLarge);
   }
   if (file.type.startsWith("audio/")) {
-    if (file.size > maxBytes) throw new Error("That recording is above the 180 KiB CruiseMesh limit.");
+    if (file.size > maxBytes) throw new Error(userCopy.voiceTooLong);
     return {
       kind: "audio",
       mime_type: file.type || "audio/webm",
-      duration_ms: 0,
+      duration_ms: durationMs,
       data_base64: bytesToBase64(new Uint8Array(await file.arrayBuffer())),
       caption: "",
     };

@@ -39,17 +39,23 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 import { QRCodeSVG } from "qrcode.react";
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, Fragment, useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
 import { prepareAttachment } from "./media";
 import {
   connectionSummary,
   contactRouteLabel,
+  formatDay,
+  formatDurationMs,
   friendWebLink,
+  isNewDay,
   kindNumber,
   tickLabel,
   tickVisual,
+  userCopy,
 } from "./presentation";
+import { VoicePlayer } from "./VoicePlayer";
+import { voicePlayback } from "./voice";
 import type {
   AppSnapshot,
   Conversation,
@@ -162,6 +168,10 @@ export function App() {
   }, [conversation?.messages.length, selectedId]);
 
   useEffect(() => {
+    voicePlayback.stop();
+  }, [selectedId]);
+
+  useEffect(() => {
     let unlisten: (() => void) | undefined;
     const activate = (args: string[]) => {
       const link = args.find((value) => value.toLowerCase().startsWith("cruisemesh:"));
@@ -192,11 +202,15 @@ export function App() {
     }
   }
 
-  async function attach(file?: File) {
+  async function attach(file?: File, durationMs = 0) {
     if (!file || !selectedId || !snapshot) return;
     setBusy(true);
     try {
-      const prepared = await prepareAttachment(file, snapshot.attachment_max_blob_bytes);
+      const prepared = await prepareAttachment(
+        file,
+        snapshot.attachment_max_blob_bytes,
+        durationMs,
+      );
       await api.sendAttachment(selectedId, prepared, reply?.id);
       setReply(undefined);
       await Promise.all([refreshConversation(), refreshSnapshot()]);
@@ -450,17 +464,21 @@ export function App() {
                 <div className="empty-chat">
                   <Avatar name={conversation.title} size={72} color="colorful" />
                   <Text size={500} weight="semibold">Start a private conversation</Text>
-                  <Text>The node will choose Wi-Fi or Shore Pass automatically.</Text>
+                  <Text>{userCopy.emptyConversation}</Text>
                 </div>
               )}
-              {conversation.messages.map((message) => (
-                <MessageBubble
-                  key={`${message.sender_id}:${message.lamport}`}
-                  message={message}
-                  messages={conversation.messages}
-                  onReply={() => setReply(message)}
-                  onReact={(emoji) => void react(message, emoji)}
-                />
+              {conversation.messages.map((message, index) => (
+                <Fragment key={`${message.sender_id}:${message.lamport}`}>
+                  {isNewDay(message.timestamp_ms, conversation.messages[index - 1]?.timestamp_ms) && (
+                    <div className="day-chip" role="separator">{formatDay(message.timestamp_ms)}</div>
+                  )}
+                  <MessageBubble
+                    message={message}
+                    messages={conversation.messages}
+                    onReply={() => setReply(message)}
+                    onReact={(emoji) => void react(message, emoji)}
+                  />
+                </Fragment>
               ))}
               <div ref={messagesEnd} />
             </div>
@@ -481,7 +499,13 @@ export function App() {
                   onChange={(event) => void attach(event.target.files?.[0])}
                 />
                 <Button type="button" appearance="subtle" icon={<Attach24Regular />} aria-label="Attach photo or recording" title="Attach photo or recording" disabled={busy} onClick={() => fileInput.current?.click()} />
-                <VoiceButton disabled={busy} onRecorded={(file) => void attach(file)} onError={(value) => setError(value)} />
+                <VoiceButton
+                  disabled={busy}
+                  minDurationMs={snapshot.voice_min_duration_ms ?? 700}
+                  maxDurationMs={snapshot.voice_max_duration_ms ?? 60_000}
+                  onRecorded={(file, durationMs) => void attach(file, durationMs)}
+                  onError={(value) => setError(value)}
+                />
                 <Textarea
                   aria-label="Message"
                   placeholder="Message"
@@ -550,15 +574,34 @@ function MessageBubble({ message, messages, onReply, onReact }: { message: Messa
   const replied = message.reply_to_id ? messages.find((item) => item.id === message.reply_to_id) : undefined;
   const source = message.attachment ? `data:${message.attachment.mime_type};base64,${message.attachment.data_base64}` : "";
   const [imageFailed, setImageFailed] = useState(false);
+  const [photoOpen, setPhotoOpen] = useState(false);
+  useEffect(() => {
+    if (!photoOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPhotoOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [photoOpen]);
   return (
     <article className={`message ${message.own ? "own" : "other"}`}>
       {!message.own && <span className="sender-name">{message.sender_name}</span>}
       <div className="bubble">
         {replied && <div className="quoted"><strong>{replied.sender_name}</strong><br />{replied.text || (replied.kind === "image" ? "Photo" : "Voice message")}</div>}
         {message.kind === "text" && <div className="message-text">{message.text}</div>}
-        {message.kind === "image" && !imageFailed && <img className="attachment-image" src={source} alt={message.attachment?.caption || "Shared photo"} onError={() => setImageFailed(true)} />}
+        {message.kind === "image" && !imageFailed && (
+          <button type="button" className="attachment-image-button" onClick={() => setPhotoOpen(true)}>
+            <img className="attachment-image" src={source} alt={message.attachment?.caption || "Shared photo"} onError={() => setImageFailed(true)} />
+          </button>
+        )}
         {message.kind === "image" && imageFailed && <div className="attachment-error">This photo could not be displayed.</div>}
-        {message.kind === "audio" && <audio controls preload="metadata" src={source}>Voice message</audio>}
+        {message.kind === "audio" && (
+          <VoicePlayer
+            messageKey={`${message.sender_id}:${message.lamport}`}
+            src={source}
+            durationMs={message.attachment?.duration_ms ?? 0}
+          />
+        )}
         {message.kind === "group_invite" && <div>Group created</div>}
         {message.kind === "unsupported_attachment" && <div className="attachment-error">{message.text || "This attachment could not be displayed."}</div>}
         {message.attachment?.caption && <div>{message.attachment.caption}</div>}
@@ -569,39 +612,117 @@ function MessageBubble({ message, messages, onReply, onReact }: { message: Messa
         {["👍", "❤️", "😂"].map((emoji) => <button key={emoji} aria-label={`React ${emoji}`} onClick={() => onReact(emoji)}>{emoji}</button>)}
         <button aria-label="Reply" onClick={onReply}><ArrowReply24Regular /></button>
       </div>
+      {photoOpen && (
+        <div className="photo-lightbox" role="dialog" aria-modal="true" aria-label="Shared photo" onClick={() => setPhotoOpen(false)}>
+          <img src={source} alt={message.attachment?.caption || "Shared photo"} onClick={(event) => event.stopPropagation()} />
+          <Button appearance="secondary" onClick={() => setPhotoOpen(false)}>Close</Button>
+        </div>
+      )}
     </article>
   );
 }
 
-function VoiceButton({ disabled, onRecorded, onError }: { disabled: boolean; onRecorded: (file: File) => void; onError: (error: string) => void }) {
+function VoiceButton({
+  disabled,
+  minDurationMs,
+  maxDurationMs,
+  onRecorded,
+  onError,
+}: {
+  disabled: boolean;
+  minDurationMs: number;
+  maxDurationMs: number;
+  onRecorded: (file: File, durationMs: number) => void;
+  onError: (error: string) => void;
+}) {
   const [recording, setRecording] = useState(false);
+  const [elapsedMs, setElapsedMs] = useState(0);
   const recorder = useRef<MediaRecorder | undefined>(undefined);
   const chunks = useRef<Blob[]>([]);
+  const startedAt = useRef(0);
+  const discard = useRef(false);
+  const maxTimer = useRef(0);
+
+  useEffect(() => () => {
+    window.clearInterval(maxTimer.current);
+    const current = recorder.current;
+    if (current && current.state !== "inactive") {
+      discard.current = true;
+      current.stop();
+    }
+  }, []);
+
+  function cleanup(stream?: MediaStream) {
+    window.clearInterval(maxTimer.current);
+    stream?.getTracks().forEach((track) => track.stop());
+    setRecording(false);
+    setElapsedMs(0);
+    recorder.current = undefined;
+  }
+
+  function finish(send: boolean) {
+    window.clearInterval(maxTimer.current);
+    const current = recorder.current;
+    if (!current) return;
+    discard.current = !send;
+    recorder.current = undefined;
+    if (current.state !== "inactive") current.stop();
+  }
+
   async function toggle() {
     if (recorder.current && recording) {
-      recorder.current.stop();
+      finish(true);
       return;
     }
     try {
+      voicePlayback.stop();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const next = new MediaRecorder(stream);
       chunks.current = [];
+      discard.current = false;
+      startedAt.current = Date.now();
       next.ondataavailable = (event) => { if (event.data.size) chunks.current.push(event.data); };
       next.onstop = () => {
+        const durationMs = Date.now() - startedAt.current;
         const blob = new Blob(chunks.current, { type: next.mimeType || "audio/webm" });
-        stream.getTracks().forEach((track) => track.stop());
-        setRecording(false);
-        onRecorded(new File([blob], "voice-message.webm", { type: blob.type }));
+        cleanup(stream);
+        if (discard.current) return;
+        if (durationMs < minDurationMs) {
+          onError(userCopy.recordingTooShort);
+          return;
+        }
+        onRecorded(new File([blob], "voice-message.webm", { type: blob.type }), durationMs);
       };
       next.start();
       recorder.current = next;
       setRecording(true);
+      maxTimer.current = window.setInterval(() => {
+        const elapsed = Date.now() - startedAt.current;
+        setElapsedMs(elapsed);
+        if (elapsed >= maxDurationMs) finish(true);
+      }, 200);
     } catch (error) {
       onError(errorText(error));
     }
   }
-  const label = recording ? "Stop recording" : "Record voice message";
-  return <Button type="button" appearance={recording ? "primary" : "subtle"} icon={<Mic24Regular />} aria-label={label} title={label} disabled={disabled} onClick={() => void toggle()} />;
+
+  const label = recording ? userCopy.sendVoiceMessage : userCopy.recordVoiceMessage;
+  return (
+    <>
+      {recording && (
+        <span className="recording-status" aria-live="polite">
+          <span className="recording-pip" />
+          {userCopy.recordingLabel}… {formatDurationMs(elapsedMs)}
+        </span>
+      )}
+      {recording && (
+        <Button type="button" appearance="subtle" onClick={() => finish(false)}>
+          {userCopy.cancelRecording}
+        </Button>
+      )}
+      <Button type="button" appearance={recording ? "primary" : "subtle"} icon={<Mic24Regular />} aria-label={label} title={label} disabled={disabled} onClick={() => void toggle()} />
+    </>
+  );
 }
 
 function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard, busy, backupPassphrase, setBackupPassphrase, exportBackup, restoreBackup, profileName, setProfileName, updateProfile, updatePreferences }: { snapshot: AppSnapshot; relayText: string; setRelayText: (value: string) => void; importRelay: () => void; showCard: () => void; busy: boolean; backupPassphrase: string; setBackupPassphrase: (value: string) => void; exportBackup: () => void; restoreBackup: () => void; profileName: string; setProfileName: (value: string) => void; updateProfile: () => void; updatePreferences: (preventSleepOnAc: boolean, shareOnline: boolean) => void }) {
@@ -653,7 +774,7 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
           {recent.map((row) => <div className="activity-row" key={row.id}><span><strong>{row.title}</strong><small>{row.preview || "Activity"}</small></span><time>{formatTime(row.timestamp_ms)}</time></div>)}
         </div>
       </section>
-      <div className="settings-card column"><Text size={500} weight="semibold">Shore Pass</Text><Text>Paste a CMRELAY1 card or cruisemesh.app relay setup link. The member credential is protected with Windows DPAPI and never exposed to this window.</Text><Textarea value={relayText} onChange={(_, data) => setRelayText(data.value)} placeholder="Paste Shore Pass" /><Button appearance="primary" disabled={busy || !relayText.trim()} onClick={importRelay}>Import Shore Pass</Button></div>
+      <div className="settings-card column"><Text size={500} weight="semibold">Shore Pass</Text><Text>{userCopy.shorePassHelp}</Text><Textarea value={relayText} onChange={(_, data) => setRelayText(data.value)} placeholder="Paste Shore Pass" /><Button appearance="primary" disabled={busy || !relayText.trim()} onClick={importRelay}>Import Shore Pass</Button></div>
       <div className="settings-card column"><Text size={500} weight="semibold">Encrypted backup & restore</Text><Text>Portable .cmbak files can migrate this identity between Android, iOS, and Windows. Do not run the restored identity on two devices at once.</Text><Input type="password" value={backupPassphrase} onChange={(_, data) => setBackupPassphrase(data.value)} placeholder="Passphrase (10+ characters)" aria-label="Backup passphrase" /><div className="settings-actions"><Button appearance="primary" disabled={busy || backupPassphrase.length < 10} onClick={exportBackup}>Save encrypted backup</Button><Button appearance="secondary" disabled={busy || backupPassphrase.length < 10} onClick={restoreBackup}>Restore from backup</Button></div></div>
       <section className="settings-card column" aria-labelledby="advanced-heading">
         <div><Text id="advanced-heading" size={500} weight="semibold">Advanced</Text><Text block size={200}>Background operation, privacy, and support details.</Text></div>
@@ -661,7 +782,7 @@ function SettingsView({ snapshot, relayText, setRelayText, importRelay, showCard
         <label className="setting-switch"><span><strong>Share when I’m online</strong><small>Lets accepted friends see recent Shore Pass availability.</small></span><Switch checked={snapshot.preferences.share_online} disabled={busy} aria-label="Share when I’m online" onChange={(_, data) => updatePreferences(snapshot.preferences.prevent_sleep_on_ac, data.checked)} /></label>
         <div className="settings-subsection">
           <Text weight="semibold">Runtime</Text>
-          <div className="detail-grid"><span>Helper version</span><strong>{snapshot.diagnostics.helper_version}</strong><span>LAN listener</span><strong>TCP {snapshot.diagnostics.listening_port}</strong><span>Contacts</span><strong>{snapshot.node.contacts}</strong><span>Groups</span><strong>{snapshot.conversations.filter((row) => row.kind === "group").length}</strong><span>Background operation</span><strong>Running from tray</strong><span>Identity protection</span><strong>Windows account</strong></div>
+          <div className="detail-grid"><span>Helper version</span><strong>{snapshot.diagnostics.helper_version}</strong><span>{userCopy.wifiPort}</span><strong>{snapshot.diagnostics.listening_port}</strong><span>Contacts</span><strong>{snapshot.node.contacts}</strong><span>Groups</span><strong>{snapshot.conversations.filter((row) => row.kind === "group").length}</strong><span>Background operation</span><strong>Running from tray</strong><span>Identity protection</span><strong>Windows account</strong></div>
         </div>
         <details className="technical-disclosure"><summary>Support locations</summary><div><span>Data</span><code>{snapshot.diagnostics.data_directory}</code><span>Logs</span><code>{snapshot.diagnostics.logs_directory}</code></div></details>
         <Text size={200}>Identity and Shore Pass secrets are protected for this Windows account. Logs and diagnostics exclude names, message bodies, keys, and relay credentials.</Text>
@@ -687,7 +808,7 @@ function PeopleSection({ title, contacts }: { title: string; contacts: AppSnapsh
 
 function FriendDialog({ open, text, setText, busy, onClose, onImport, onShowCard }: { open: boolean; text: string; setText: (value: string) => void; busy: boolean; onClose: () => void; onImport: () => void; onShowCard: () => void }) {
   const [scanning, setScanning] = useState(false);
-  return <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) { setScanning(false); onClose(); } }}><DialogSurface><DialogBody><DialogTitle>Add a friend</DialogTitle><DialogContent className="dialog-stack"><Text>Scan their CruiseMesh QR code, or paste a friend link or CMFRIEND card.</Text>{scanning ? <CameraScanner onValue={(value) => { setText(value); setScanning(false); }} onCancel={() => setScanning(false)} /> : <Button appearance="secondary" icon={<QrCode24Regular />} onClick={() => setScanning(true)}>Scan with webcam</Button>}<Textarea autoFocus={!scanning} value={text} onChange={(_, data) => setText(data.value)} placeholder="https://cruisemesh.app/f#CMFRIEND3:…" /><Button appearance="subtle" icon={<QrCode24Regular />} onClick={onShowCard}>Show my card instead</Button></DialogContent><DialogActions><Button appearance="secondary" onClick={onClose}>Cancel</Button><Button appearance="primary" disabled={busy || !text.trim()} onClick={onImport}>Add friend</Button></DialogActions></DialogBody></DialogSurface></Dialog>;
+  return <Dialog open={open} onOpenChange={(_, data) => { if (!data.open) { setScanning(false); onClose(); } }}><DialogSurface><DialogBody><DialogTitle>Add a friend</DialogTitle><DialogContent className="dialog-stack"><Text>{userCopy.addFriendHelp}</Text>{scanning ? <CameraScanner onValue={(value) => { setText(value); setScanning(false); }} onCancel={() => setScanning(false)} /> : <Button appearance="secondary" icon={<QrCode24Regular />} onClick={() => setScanning(true)}>Scan with webcam</Button>}<Textarea autoFocus={!scanning} value={text} onChange={(_, data) => setText(data.value)} placeholder="https://cruisemesh.app/f#…" /><Button appearance="subtle" icon={<QrCode24Regular />} onClick={onShowCard}>Show my card instead</Button></DialogContent><DialogActions><Button appearance="secondary" onClick={onClose}>Cancel</Button><Button appearance="primary" disabled={busy || !text.trim()} onClick={onImport}>Add friend</Button></DialogActions></DialogBody></DialogSurface></Dialog>;
 }
 
 function CameraScanner({ onValue, onCancel }: { onValue: (value: string) => void; onCancel: () => void }) {
@@ -704,7 +825,7 @@ function CameraScanner({ onValue, onCancel }: { onValue: (value: string) => void
     async function start() {
       const Detector = (window as unknown as { BarcodeDetector?: new (options: { formats: string[] }) => { detect(source: HTMLVideoElement): Promise<Array<{ rawValue: string }>> } }).BarcodeDetector;
       if (!Detector) {
-        setCameraError("This WebView2 version does not provide QR scanning. Paste the link instead.");
+        setCameraError(userCopy.cameraScanUnavailable);
         return;
       }
       try {

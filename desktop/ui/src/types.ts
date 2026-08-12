@@ -54,6 +54,8 @@ export interface AppSnapshot {
   contacts: Contact[];
   conversations: ConversationSummary[];
   attachment_max_blob_bytes: number;
+  voice_min_duration_ms: number;
+  voice_max_duration_ms: number;
 }
 
 export interface Attachment {

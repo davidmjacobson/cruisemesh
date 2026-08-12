@@ -36,9 +36,25 @@ button, textarea, input { font: inherit; }
 .tick-sent { opacity: 0.88; }
 .tick-delivered { opacity: 0.74; }
 .tick-read { color: var(--colorBrandForeground1); }
+.attachment-image-button { display: block; padding: 0; border: 0; background: transparent; cursor: zoom-in; }
 .attachment-image { display: block; max-width: 100%; max-height: 420px; border-radius: 8px; }
 .attachment-error { padding: 12px; border: 1px solid var(--colorPaletteRedBorder2); border-radius: 8px; color: var(--colorPaletteRedForeground1); }
-audio { width: min(360px, 100%); }
+.voice-player { display: flex; align-items: center; gap: 8px; min-width: 196px; max-width: 280px; padding: 2px 0 4px; }
+.voice-player .fui-Button { min-width: 36px; width: 36px; height: 36px; }
+.voice-track { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.voice-times { font-size: 13px; line-height: 1.2; }
+.voice-bar { position: relative; height: 8px; border-radius: 999px; background: var(--colorNeutralStroke2); cursor: pointer; }
+.voice-bar-fill { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--colorBrandForeground1); }
+.voice-error { color: var(--colorPaletteRedForeground1); font-size: 12px; }
+.recording-status { display: inline-flex; align-items: center; gap: 8px; min-width: 7.5rem; color: var(--colorPaletteRedForeground1); font-size: 13px; font-weight: 600; }
+.recording-pip { width: 8px; height: 8px; border-radius: 50%; background: var(--colorPaletteRedForeground1); }
+@keyframes recording-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: no-preference) {
+  .recording-pip { animation: recording-pulse 1s ease-in-out infinite; }
+}
+.day-chip { align-self: center; margin: 10px 0 4px; padding: 3px 10px; border-radius: 999px; background: var(--colorNeutralBackground1); color: var(--colorNeutralForeground3); font-size: 12px; }
+.photo-lightbox { position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; background: rgb(0 0 0 / 72%); }
+.photo-lightbox img { max-width: min(1100px, 100%); max-height: calc(100% - 72px); border-radius: 8px; box-shadow: var(--shadow16); }
 .quoted { padding: 7px 9px; margin-bottom: 7px; border-left: 3px solid var(--colorBrandForeground1); border-radius: 4px; background: rgb(0 0 0 / 6%); font-size: 12px; }
 .reaction-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: -3px; padding: 0 8px; position: relative; z-index: 2; }
 .message-actions { position: absolute; top: 50%; right: 0; display: none; align-items: center; transform: translateY(-50%); padding: 3px; border-radius: 16px; background: var(--colorNeutralBackground1); box-shadow: var(--shadow4); }
