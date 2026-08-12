@@ -214,6 +214,29 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertFalse(element("chat.composer.send").exists)
     }
 
+    func testRecipientNameStaysVisibleWhileComposing() {
+        launch(scenario: "chat")
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
+
+        let bob = app.staticTexts["Bob"].firstMatch
+        XCTAssertTrue(bob.waitForExistence(timeout: 10))
+        bob.tap()
+
+        let composer = element("chat.composer.text").waitForExistence(timeout: 10)
+            ? element("chat.composer.text")
+            : (app.textFields.firstMatch.waitForExistence(timeout: 5)
+                ? app.textFields.firstMatch
+                : app.textViews.firstMatch)
+        XCTAssertTrue(composer.waitForExistence(timeout: 10))
+        composer.tap()
+        composer.typeText("Checking the header")
+
+        let recipientHeader = element("chat.contact-details")
+        XCTAssertTrue(recipientHeader.waitForExistence(timeout: 5))
+        XCTAssertTrue(recipientHeader.isHittable)
+        XCTAssertTrue(recipientHeader.label.contains("Bob"))
+    }
+
     func testContactVerificationAndDeleteCancellationAreSafe() {
         launch(scenario: "chat")
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
