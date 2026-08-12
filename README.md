@@ -14,6 +14,8 @@ hand-me-down phone with no SIM or a Wi-Fi-only tablet.
 
 [![Rust](https://github.com/davidmjacobson/cruisemesh/actions/workflows/rust.yml/badge.svg)](https://github.com/davidmjacobson/cruisemesh/actions/workflows/rust.yml)
 [![iOS](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ios.yml/badge.svg)](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ios.yml)
+[![Android UI](https://github.com/davidmjacobson/cruisemesh/actions/workflows/android-ui.yml/badge.svg)](https://github.com/davidmjacobson/cruisemesh/actions/workflows/android-ui.yml)
+[![Localization](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ui-localization.yml/badge.svg)](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ui-localization.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
 A Rust core with native iOS and Android shells, plus a relay server you can run
@@ -59,17 +61,27 @@ airplane mode, switch Bluetooth back on (airplane mode turns it off), and send
 a message. It arrives with no internet involved at all. That is the same
 delivery path a family uses at sea.
 
+Add each other as friends while you still have signal. Friending exchanges
+public keys over a QR code or a friend card, and that has to happen before you
+lose the internet, not after.
+
 ## Status
 
-Both apps are at **1.0.7** and in release testing — Play closed track and
-TestFlight — with store listings going public in mid-August 2026. The Rust
-workspace, the Android unit suite, and the iOS build and test suite gate every
-pull request.
+Both apps are in release testing — Play closed track and TestFlight — ahead of
+public store listings. The Rust workspace and the Android unit suite gate every
+pull request; the iOS build and test suite runs on any change touching `ios/`
+or `core/`, and nightly.
 
 What works today: 1:1 and group messaging, delivery and read receipts, photos
-and push-to-talk voice messages (inline, up to 180 KiB), QR friending with a spoken 4-word
-fingerprint, friends-of-friends introductions, all four delivery routes above,
-block and report, and passphrase-encrypted local backup and restore.
+with drawing and push-to-talk voice messages (inline, up to 180 KiB), QR
+friending with a spoken 4-word fingerprint, friends-of-friends introductions,
+all four delivery routes above, block and report, and passphrase-encrypted
+local backup and restore.
+
+There is an unsigned dogfood build of a Windows desktop client in `desktop/` —
+a tray node that carries and relays like a phone, plus a messenger window. It
+isn't released to anyone yet; [`specs/windows-app.md`](specs/windows-app.md)
+is the design.
 
 What isn't here: chunked transfer for media too large to inline, multi-device
 identity, and history sync for someone who joins a group late. There is no
@@ -125,11 +137,14 @@ encryption or receipts, no artificial limits.
   never in one platform's shell.
 - `android/` — Android app (Kotlin, Jetpack Compose).
 - `ios/` — iOS app (SwiftUI + CoreBluetooth); see [`ios/README.md`](ios/README.md).
+- `desktop/` — Windows desktop client: a tray mesh node plus a messenger
+  window, both in Rust. Dogfood only so far.
 - `relayd/` — the relay mailbox server (Axum + SQLite, Docker).
 - `specs/` — protocol specs for individual features (same-LAN transport,
   friends-of-friends, group management, friend-card format).
 - `fuzz/` — `cargo-fuzz` targets for the pre-authentication decoders; see
   [`fuzz/README.md`](fuzz/README.md).
+- `tools/` — build, release, and two-phone field-test scripts.
 
 ## Building
 
@@ -194,7 +209,11 @@ the API and its ack rules are DESIGN.md §9.
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | DCO, CLA, and what makes a good PR here. |
 | [AGENTS.md](AGENTS.md) | Build and bindgen recipes, including the fast paths. |
+| [`ios/README.md`](ios/README.md) | iOS shell layout, XcodeGen, and the checked-in Swift bindings. |
 | [`specs/android-ui-testing.md`](specs/android-ui-testing.md) | Android host, screenshot, and managed-emulator UI gates. |
+| [`specs/ios-ui-testing.md`](specs/ios-ui-testing.md) | iOS simulator and XCUITest gates, run on GitHub's macOS runners. |
+| [`specs/windows-app.md`](specs/windows-app.md) | The Windows desktop client design. |
+| [`fuzz/README.md`](fuzz/README.md) | Fuzz targets for the pre-authentication decoders. |
 | [`relayd/DEPLOY.md`](relayd/DEPLOY.md) | Running a relay in production. |
 | `specs/` | Per-feature protocol specs. |
 

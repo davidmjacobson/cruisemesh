@@ -139,6 +139,15 @@ sealed envelopes to whatever links are up. Same-LAN TCP uses that seam without
 changing crypto, storage, receipts, deduplication, or mule behavior; future transports
 such as Wi-Fi Aware can do the same.
 
+A third client shares the same core. `desktop/` is a Windows build in two
+pieces: a tray node that owns identity, SQLite, LAN, relay, and carry, and a
+messenger window that talks to it over a named pipe. Being Rust itself, it
+links `cruisemesh-core` directly rather than through UniFFI, so it exercises
+the same store and sync engine the phones do without a binding layer in
+between. It has no BLE — on a laptop the LAN and relay transports carry
+everything. It is dogfood-only so far; `specs/windows-app.md` is the design
+and §10 has the stack.
+
 ---
 
 ## 5. Transport layer
@@ -167,19 +176,28 @@ Each phone runs **both** GATT roles simultaneously, bitchat-style:
 
 On connect, peers run a short sync handshake (§7.3), exchange frames, and stay
 connected while in range. Frames are length-prefixed binary; envelopes larger than
-negotiated MTU (~180–500 B typical) are fragmented at the link layer with a 2-byte
-fragment header. Realistic throughput is single-digit KB/s — fine for text,
-disqualifying for multi-hop media (§8).
+negotiated MTU (~180–500 B typical) are fragmented at the link layer with a
+four-byte fragment header (`index16 | total16`, big-endian — `core/src/framing.rs`).
+Realistic throughput is single-digit KB/s — fine for text, disqualifying for
+multi-hop media (§8).
 
 ### 5.3 Gossip / mesh relaying
 
-- Every envelope has a random 16-byte `msg_id`. Each node keeps a seen-ID LRU
-  (bloom-filter-backed, ~50k entries) and forwards each envelope at most once.
+- Every envelope has a random 16-byte `msg_id`. Each node keeps a bounded
+  seen-ID set (~50k entries) and forwards each envelope at most once.
+  It is an **exact** set, not the bloom filter an earlier draft of this
+  document specified: at family scale 50k exact 16-byte ids cost well under a
+  megabyte, and an exact set can never false-positive-drop a genuinely new
+  message. Eviction is FIFO rather than true access-ordered LRU — once an id
+  is seen the frame is dropped and the id is never touched again, so
+  recency-of-use and recency-of-insertion coincide here. `core/src/gossip.rs`
+  carries the full argument.
 - `hop_ttl` starts at 7 (bitchat's number; plenty for a ship) and decrements per hop.
 - `expiry` timestamp (default 7 days) after which carriers drop the envelope.
 - **Carry queue**: nodes store envelopes addressed to known contacts/groups
-  indefinitely until expiry, and a bounded budget (e.g. 5 MB) of foreign envelopes
-  for altruistic muling. Family messages always win eviction fights.
+  indefinitely until expiry, and mule foreign envelopes within a bounded total
+  carry budget (64 MB, `core/src/store.rs`). Family messages always win
+  eviction fights.
 - No routing tables, no path discovery. At family scale, epidemic flooding with
   dedupe is strictly better than anything cleverer.
 
@@ -382,8 +400,14 @@ subtle gap indicator, not an error).
 
 ### 7.3 Sync protocol (peer meets peer)
 
-On BLE connect (or relay poll), peers exchange **digests**: per-chat (chat id,
-highest-contiguous lamport, recent msg_id bloom filter). Each side then sends what
+On BLE connect (or relay poll), peers exchange **digests**. One digest frame
+covers one chat: the chat id, then one entry per sender in that chat —
+`(sender_user_id, through_lamport)`, meaning "I have this sender's messages
+contiguously through this lamport" — then an exact list of recent `msg_id`s
+(a count followed by the 16-byte ids). The recent-id component is an exact
+list rather than the bloom filter an earlier draft specified, for the same
+reason §5.3 gives. `core/src/protocol.rs` documents the byte layout. Each
+side then sends what
 the other is missing, receipts first (they're smallest and unblock the most UI),
 then messages oldest-first, then foreign mule traffic. Idempotent by msg_id, safe to
 interrupt mid-transfer — reconnection just re-runs the digest exchange.
@@ -433,6 +457,20 @@ A deliberately dumb mailbox:
   `recipient_hint`, `sealed`) rather than plaintext message metadata; relay-side
   dedupe is by `(family_token, msg_id)`, fetch is by `recipient_hint` since cursor,
   delete-on-ack, 30-day retention.
+- The rest of the surface, all of it as dumb as the mailbox itself
+  (`relayd/src/lib.rs`):
+
+  | Route | What it does |
+  |---|---|
+  | `POST /envelopes/ack` | Acknowledges and deletes fetched envelopes, subject to §9's ack rules. |
+  | `GET /ws` | Push channel — tells a client mail arrived so it need not poll. |
+  | `POST /presence` | Announces and queries opaque presence blobs, so a phone can tell whether a contact has been reachable through this relay recently. |
+  | `PUT /push/registrations` | Registers an APNs token so a backgrounded iPhone can be woken for mail. The relay learns a device token; it still cannot read a byte of content. |
+  | `GET /healthz` | Liveness, unauthenticated. |
+  | `/admin/families`, `/admin/families/{token}` | Provision, list, inspect, patch, and delete family tokens. Admin-credentialed, and how the hosted passes are minted — see `tools/relay_admin.sh`. |
+
+  Presence and push registration are the two places the relay holds anything
+  beyond sealed mail, which is why both are scoped per family token and expire.
 - **A fetch page is bounded by bytes as well as rows.** `limit=` caps the row
   count, but one `sealed` payload may be 512 KiB, so a row-counted window over
   a backlog of large attachments can exceed what a client will decode — and
@@ -582,6 +620,10 @@ crypto/protocol logic that must behave identically on both platforms.
   BLE APIs are so platform-idiosyncratic (especially iOS background behavior) that
   native code there is less work than fighting a cross-platform BLE plugin —
   the consistent failure theme in Flutter/RN mesh attempts.
+- **Windows shell** (`desktop/`, §4): Rust throughout, so it links the core
+  crate directly and skips UniFFI entirely — a tray node process plus a
+  messenger window over a named pipe. No BLE; LAN and relay carry everything.
+  Dogfood only, design in `specs/windows-app.md`.
 - Precedent: Berty runs a Go core under native shells; bitchat is native Swift with
   a separate Android port (and its divergence bugs show why the shared core matters).
 
