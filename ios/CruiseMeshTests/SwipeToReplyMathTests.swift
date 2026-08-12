@@ -25,6 +25,39 @@ final class SwipeToReplyMathTests: XCTestCase {
         XCTAssertTrue(SwipeToReplyMath.shouldReply(offset: 80, threshold: 56))
     }
 
+    func testVerticalDragLeavesTheBubbleToTheScrollingThread() {
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: 10, height: -120), alreadyEngaged: false
+        ))
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: 10, height: 120), alreadyEngaged: false
+        ))
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: 0, height: 60), alreadyEngaged: false
+        ))
+    }
+
+    func testSidewaysDragEngagesTheBubble() {
+        XCTAssertTrue(SwipeToReplyMath.engages(
+            translation: CGSize(width: 40, height: 10), alreadyEngaged: false
+        ))
+    }
+
+    func testLeftwardDragNeverEngages() {
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: -40, height: 0), alreadyEngaged: false
+        ))
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: -40, height: 0), alreadyEngaged: true
+        ))
+    }
+
+    func testEngagedSwipeSurvivesACurvingFinger() {
+        XCTAssertTrue(SwipeToReplyMath.engages(
+            translation: CGSize(width: 40, height: 200), alreadyEngaged: true
+        ))
+    }
+
     func testProgressIsClampedZeroToOne() {
         XCTAssertEqual(SwipeToReplyMath.progress(offset: 0, threshold: 56), 0)
         XCTAssertEqual(SwipeToReplyMath.progress(offset: 28, threshold: 56), 0.5, accuracy: 0.001)

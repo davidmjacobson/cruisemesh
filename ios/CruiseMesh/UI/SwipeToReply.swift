@@ -7,6 +7,23 @@ enum SwipeToReplyMath {
     /// Past `maxDrag` the bubble keeps moving but at a fraction of the finger.
     static let rubberBand: CGFloat = 0.15
 
+    /// How far a finger travels before it counts as a swipe at all.
+    static let engageDistance: CGFloat = 15
+
+    /// Whether a drag of `translation` should move the bubble, given whether the
+    /// bubble is already moving.
+    ///
+    /// A bubble only takes over a drag that starts out sideways-dominant; the
+    /// thread owns every other drag, so an up/down swipe that happens to land on
+    /// a bubble still scrolls and still dismisses the keyboard. Once a swipe has
+    /// taken over, it keeps the drag even if the finger curves, so a reply in
+    /// progress doesn't snap back mid-gesture.
+    static func engages(translation: CGSize, alreadyEngaged: Bool) -> Bool {
+        guard translation.width > 0 else { return false }
+        if alreadyEngaged { return true }
+        return abs(translation.width) > abs(translation.height)
+    }
+
     /// Offset the bubble should show for a raw rightward drag of `rawDrag` px.
     /// Leftward drags are ignored; past `maxDrag` the offset rubber-bands.
     static func clampOffset(_ rawDrag: CGFloat, maxDrag: CGFloat) -> CGFloat {
@@ -29,8 +46,9 @@ enum SwipeToReplyMath {
 
 /// Signal-style swipe-to-reply: a rightward drag translates the bubble and
 /// reveals a reply arrow; releasing past the threshold starts a reply. The drag
-/// only engages for horizontal-dominant movement so the conversation still
-/// scrolls vertically.
+/// recognises alongside the thread's own scrolling and only engages for
+/// horizontal-dominant movement, so a drag that starts on a bubble still
+/// scrolls the conversation.
 private struct SwipeToReplyModifier: ViewModifier {
     let onReply: () -> Void
 
@@ -50,10 +68,28 @@ private struct SwipeToReplyModifier: ViewModifier {
                 .scaleEffect(0.7 + 0.3 * progress)
             content
                 .offset(x: offset)
-                .gesture(
-                    DragGesture(minimumDistance: 15)
+                // Simultaneous, not `.gesture`: an exclusive drag gesture on a
+                // bubble beats the enclosing thread's scroll gesture, so every
+                // bubble became a dead zone -- a tall photo worst of all --
+                // where the thread would not scroll and dragging down would not
+                // dismiss the keyboard. Recognising alongside the scroll keeps
+                // the thread moving; the direction check below keeps the bubble
+                // still while it does.
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: SwipeToReplyMath.engageDistance)
                         .onChanged { value in
-                            guard abs(value.translation.width) > abs(value.translation.height) else { return }
+                            guard SwipeToReplyMath.engages(
+                                translation: value.translation,
+                                alreadyEngaged: offset > 0
+                            ) else {
+                                // The thread owns this drag. Reset rather than
+                                // ignore: scrolling cancels our gesture, so
+                                // `onEnded` may never arrive to spring a
+                                // part-swiped bubble back.
+                                if offset != 0 { offset = 0 }
+                                if triggered { triggered = false }
+                                return
+                            }
                             offset = SwipeToReplyMath.clampOffset(value.translation.width, maxDrag: maxDrag)
                             if !triggered, SwipeToReplyMath.shouldReply(offset: offset, threshold: threshold) {
                                 triggered = true
