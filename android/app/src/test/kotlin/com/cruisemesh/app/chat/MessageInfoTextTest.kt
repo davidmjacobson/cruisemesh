@@ -50,7 +50,7 @@ class MessageInfoTextTest {
         val rows = messageInfoRows(message(), isOwn = false, tick = null, arrival = arrival)
 
         val arrivalRow = rows.last().asSentence()
-        assertTrue(arrivalRow.text.startsWith("Arrived via another device over BLE · ~1 hop ·"))
+        assertTrue(arrivalRow.text.startsWith("Arrived via another device over Bluetooth · ~1 hop ·"))
     }
 
     /**

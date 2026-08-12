@@ -40,12 +40,12 @@ final class MessageInfoRowTests: XCTestCase {
         guard case .sentence(let text)? = rows.last else {
             return XCTFail("expected the arrival line to be a plain sentence, got \(String(describing: rows.last))")
         }
-        XCTAssertTrue(text.hasPrefix("Arrived via another device over BLE · ~2 hops · "))
+        XCTAssertTrue(text.hasPrefix("Arrived via another device over Bluetooth · ~2 hops · "))
         // The whole "h:mm a" time (with its colon) survives intact inside
         // the one row -- nothing downstream ever splits on ":".
         XCTAssertTrue(text.contains(":"), "arrival time should still contain its colon")
         XCTAssertFalse(rows.contains { row in
-            if case .labeled(let label, _) = row { return label == "Arrived via another device over BLE · ~2 hops · 5" }
+            if case .labeled(let label, _) = row { return label == "Arrived via another device over Bluetooth · ~2 hops · 5" }
             return false
         })
     }
@@ -64,7 +64,7 @@ final class MessageInfoRowTests: XCTestCase {
         guard case .sentence(let arrivalText) = rows[2] else {
             return XCTFail("expected a plain arrival sentence")
         }
-        XCTAssertTrue(arrivalText.hasPrefix("Arrived via direct BLE · ~0 hops · "))
+        XCTAssertTrue(arrivalText.hasPrefix("Arrived via direct Bluetooth · ~0 hops · "))
     }
 
     func testReceivedMessageWithNoArrivalDataOmitsArrivalRow() {
