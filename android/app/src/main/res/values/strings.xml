@@ -821,7 +821,4 @@
     <string name="ui_pen_thin">Thin pen</string>
     <string name="ui_pen_medium">Medium pen</string>
     <string name="ui_pen_thick">Thick pen</string>
-    <!-- Shown when a picked photo, or a photo the drawing made too detailed,
-         cannot be made small enough to send. -->
-    <string name="ui_could_not_prepare_photo">Could not prepare photo (too large or unreadable)</string>
 </resources>

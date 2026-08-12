@@ -46,7 +46,9 @@ struct PhotoMarkupEditor: View {
             VStack(spacing: 0) {
                 topBar
 
-                Group {
+                // SwiftUI.Group, not Group: the generated core bindings put a
+                // chat `Group` in this module, and it wins the bare name.
+                SwiftUI.Group {
                     if let image {
                         GeometryReader { geometry in
                             canvasLayer(image: image, viewSize: geometry.size)
