@@ -809,4 +809,19 @@
     <string name="ui_no_one_is_waiting_to_connect">No one is waiting to connect.</string>
     <string name="ui_share_code_too_large">This contact\'s code is too large to show.</string>
     <string name="ui_friends_of_friends_detail">Let friends introduce you to people they know, and share your contact card with someone they choose. Messages and phone contacts are never shared.</string>
+    <!-- Draw on a photo before sending (specs/photo-markup.md). The control is
+         called Draw, not markup or annotate. -->
+    <string name="ui_draw">Draw</string>
+    <string name="ui_undo">Undo</string>
+    <string name="ui_drawing_area">Drawing area</string>
+    <string name="ui_color_red">Red</string>
+    <string name="ui_color_yellow">Yellow</string>
+    <string name="ui_color_white">White</string>
+    <string name="ui_color_black">Black</string>
+    <string name="ui_pen_thin">Thin pen</string>
+    <string name="ui_pen_medium">Medium pen</string>
+    <string name="ui_pen_thick">Thick pen</string>
+    <!-- Shown when a picked photo, or a photo the drawing made too detailed,
+         cannot be made small enough to send. -->
+    <string name="ui_could_not_prepare_photo">Could not prepare photo (too large or unreadable)</string>
 </resources>

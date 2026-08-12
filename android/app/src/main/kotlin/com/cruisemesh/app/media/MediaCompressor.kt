@@ -65,6 +65,24 @@ object MediaCompressor {
         }
     }
 
+    /**
+     * Compresses an already-decoded, already-upright bitmap through the exact
+     * quality ladder [compressImageUri] uses, so an annotated photo behaves
+     * identically to an unannotated one for size and quality.
+     *
+     * No EXIF pass here on purpose: the caller's bitmap came from bytes this
+     * object already produced, which have their orientation baked into the
+     * pixels. Re-applying a rotation matrix would turn an upright photo
+     * sideways. Returns null when even the smallest encoding cannot fit
+     * [AttachmentPayload.MAX_BLOB_BYTES] -- the caller's cue to warn.
+     */
+    fun compressBitmap(bitmap: Bitmap): ByteArray? = try {
+        compressJpeg(bitmap)
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to compress bitmap: ${e.message}")
+        null
+    }
+
     private fun sampleSizeFor(width: Int, height: Int, maxEdge: Int): Int {
         var sample = 1
         var w = width

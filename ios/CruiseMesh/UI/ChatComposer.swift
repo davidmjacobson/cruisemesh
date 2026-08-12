@@ -43,6 +43,8 @@ struct ChatComposerBar: View {
     let canSend: Bool
     let onCancelReply: () -> Void
     let onRemovePhoto: () -> Void
+    /// Opens the markup editor on the staged photo (`specs/photo-markup.md`).
+    let onDrawPhoto: () -> Void
     let onSend: () -> Void
     let onVoiceFinished: (URL, Int32) -> Void
     let onVoiceError: (String) -> Void
@@ -61,7 +63,11 @@ struct ChatComposerBar: View {
                 ReplyComposerPreview(preview: replyingToPreview, onCancel: onCancelReply)
             }
             if let pendingPhoto, !voiceCapturing {
-                PendingPhotoPreview(jpeg: pendingPhoto, onRemove: onRemovePhoto)
+                PendingPhotoPreview(
+                    jpeg: pendingPhoto,
+                    onRemove: onRemovePhoto,
+                    onDraw: onDrawPhoto
+                )
             }
             HStack(alignment: .bottom, spacing: 8) {
                 if !voiceCapturing {
@@ -281,7 +287,7 @@ private struct AttachmentPickerModifiers: ViewModifier {
                     do {
                         guard let data = try await item.loadTransferable(type: Data.self) else {
                             Self.log.error("Selected photo did not provide transferable bytes")
-                            onAttachmentError("Could not prepare photo")
+                            onAttachmentError(String(localized: "Could not prepare photo"))
                             photoItem = nil
                             return
                         }
@@ -290,7 +296,7 @@ private struct AttachmentPickerModifiers: ViewModifier {
                             Self.log.error(
                                 "Could not decode or compress selected photo (\(data.count, privacy: .public) bytes)"
                             )
-                            onAttachmentError("Could not prepare photo")
+                            onAttachmentError(String(localized: "Could not prepare photo"))
                             photoItem = nil
                             return
                         }
@@ -300,7 +306,7 @@ private struct AttachmentPickerModifiers: ViewModifier {
                         Self.log.error(
                             "Could not load selected photo: \(error.localizedDescription, privacy: .public)"
                         )
-                        onAttachmentError("Could not prepare photo")
+                        onAttachmentError(String(localized: "Could not prepare photo"))
                     }
                     photoItem = nil
                 }
@@ -310,7 +316,7 @@ private struct AttachmentPickerModifiers: ViewModifier {
                     if let jpeg = MediaCompressor.compress(image: image) {
                         onPhotoReady(jpeg)
                     } else {
-                        onAttachmentError("Could not prepare photo")
+                        onAttachmentError(String(localized: "Could not prepare photo"))
                     }
                 }
             }
