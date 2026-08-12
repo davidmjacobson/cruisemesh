@@ -1,14 +1,21 @@
 package com.cruisemesh.app.ui
 
+import android.content.Context
+import android.provider.Settings
+import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
 import java.util.TimeZone
 
+@RunWith(RobolectricTestRunner::class)
 class ConversationLayoutTest {
 
     private val utc = TimeZone.getTimeZone("UTC")
+    private val context: Context = ApplicationProvider.getApplicationContext()
 
     @Test
     fun `same sender within five minutes joins into one group`() {
@@ -70,7 +77,11 @@ class ConversationLayoutTest {
     }
 
     @Test
-    fun `conversation timestamp uses signal style clock format`() {
-        assertEquals("2:40 PM", formatConversationTimestamp(1_783_608_000_000L, timeZone = utc))
+    fun `conversation timestamp follows the device clock format`() {
+        Settings.System.putString(context.contentResolver, Settings.System.TIME_12_24, "12")
+        assertEquals("2:40 PM", formatConversationTimestamp(context, 1_783_608_000_000L, utc))
+
+        Settings.System.putString(context.contentResolver, Settings.System.TIME_12_24, "24")
+        assertEquals("14:40", formatConversationTimestamp(context, 1_783_608_000_000L, utc))
     }
 }

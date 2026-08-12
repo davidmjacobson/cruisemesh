@@ -165,6 +165,7 @@ fun MessageFocusOverlay(
     var barSize by remember { mutableStateOf(estimatedBarSize) }
     var menuSize by remember { mutableStateOf(estimatedMenuSize) }
     var overlayBoundsInRoot by remember { mutableStateOf(Rect.Zero) }
+    val dismissLabel = stringResource(R.string.ui_dismiss_message_options)
 
     BoxWithConstraints(
         modifier = Modifier
@@ -172,7 +173,7 @@ fun MessageFocusOverlay(
             .onGloballyPositioned { coords -> overlayBoundsInRoot = coords.unclippedBoundsInRoot() }
             .background(Color.Black.copy(alpha = SCRIM_ALPHA * entrance.value))
             .pointerInput(Unit) { detectTapGestures { dismiss() } }
-            .semantics { contentDescription = "Dismiss message options" },
+            .semantics { contentDescription = dismissLabel },
     ) {
         val edgeClearancePx = with(density) { OVERLAY_EDGE_CLEARANCE.toPx() }
         val screenRightPx = with(density) { maxWidth.toPx() }

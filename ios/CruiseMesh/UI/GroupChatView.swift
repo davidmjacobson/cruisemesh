@@ -464,8 +464,8 @@ struct GroupChatRowModel: Equatable {
 
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        f.locale = .current
+        f.timeStyle = .short
+        f.dateStyle = .none
         return f
     }()
 

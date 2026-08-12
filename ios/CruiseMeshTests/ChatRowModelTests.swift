@@ -37,8 +37,8 @@ final class ChatRowModelTests: XCTestCase {
 
     private func expectedTimeLabel(_ ms: Int64) -> String {
         let f = DateFormatter()
-        f.dateFormat = "h:mm a"
-        f.locale = .current
+        f.timeStyle = .short
+        f.dateStyle = .none
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000))
     }
 

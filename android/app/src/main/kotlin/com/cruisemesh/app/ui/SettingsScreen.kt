@@ -88,7 +88,10 @@ fun SettingsScreen(
                 title = { Text(stringResource(R.string.ui_settings)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.ui_back),
+                        )
                     }
                 },
             )
@@ -101,7 +104,7 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
         ) {
-            SettingsGroup("Shore Pass") {
+            SettingsGroup(stringResource(R.string.ui_shore_pass)) {
                 SettingsLink(
                     title = relayTitle(relayHealth, relayConfigured),
                     detail = relayDetail(relayHealth, relayConfigured),
@@ -111,7 +114,7 @@ fun SettingsScreen(
             }
 
             SettingsGap()
-            SettingsGroup("CruiseMesh operation") {
+            SettingsGroup(stringResource(R.string.ui_cruisemesh_operation)) {
                 SettingsSwitch(
                     title = stringResource(R.string.ui_mesh_running),
                     detail = stringResource(R.string.ui_mesh_running_detail),
@@ -133,21 +136,21 @@ fun SettingsScreen(
                     },
                 )
                 SettingsLink(
-                    title = "Connection details",
-                    detail = "See active paths, people, recent activity, and support diagnostics.",
+                    title = stringResource(R.string.ui_connection_details),
+                    detail = stringResource(R.string.ui_connection_details_summary),
                     onClick = onConnectionDetails,
                 )
                 if (showInternalTools) {
                     SettingsLink(
-                        title = "Internal field tools",
-                        detail = "Manual local-network probes, raw route counters, and diagnostic exports.",
+                        title = stringResource(R.string.ui_internal_field_tools),
+                        detail = stringResource(R.string.ui_internal_field_tools_summary),
                         onClick = onInternalTools,
                     )
                 }
             }
 
             SettingsGap()
-            SettingsGroup("Privacy") {
+            SettingsGroup(stringResource(R.string.ui_privacy)) {
                 SettingsSwitch(
                     // One switch, one meaning: it governs manual "Share
                     // contact" as well as automatic introductions
@@ -161,8 +164,8 @@ fun SettingsScreen(
                     },
                 )
                 SettingsSwitch(
-                    title = "Share when I'm online",
-                    detail = "Let accepted friends see recent relay availability.",
+                    title = stringResource(R.string.ui_share_when_online),
+                    detail = stringResource(R.string.ui_share_when_online_summary),
                     checked = shareOnline,
                     onCheckedChange = {
                         shareOnline = it
@@ -172,23 +175,23 @@ fun SettingsScreen(
             }
 
             SettingsGap()
-            SettingsGroup("Backup") {
+            SettingsGroup(stringResource(R.string.ui_backup)) {
                 SettingsLink(
-                    title = "Back up account",
-                    detail = "Export an encrypted copy of your identity and messages.",
+                    title = stringResource(R.string.ui_back_up_account),
+                    detail = stringResource(R.string.ui_backup_account_summary),
                     onClick = onBackUp,
                 )
             }
 
             SettingsGap()
-            SettingsGroup("About & legal") {
-                SettingsLink("Help & support", SUPPORT_URL) {
+            SettingsGroup(stringResource(R.string.ui_about_legal)) {
+                SettingsLink(stringResource(R.string.ui_help_support), SUPPORT_URL) {
                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(SUPPORT_URL)))
                 }
-                SettingsLink("Terms of use", null) {
+                SettingsLink(stringResource(R.string.ui_terms_of_use), null) {
                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(TERMS_OF_USE_URL)))
                 }
-                SettingsLink("Privacy policy", null) {
+                SettingsLink(stringResource(R.string.ui_privacy_policy), null) {
                     context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(PRIVACY_POLICY_URL)))
                 }
             }

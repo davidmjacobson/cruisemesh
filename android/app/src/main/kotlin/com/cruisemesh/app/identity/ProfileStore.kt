@@ -30,15 +30,16 @@ object ProfileStore {
      * @param durable when the caller is about to exit the process (restore),
      *   write synchronously so the name cannot be lost in flight.
      */
-    fun saveDisplayName(context: Context, displayName: String, durable: Boolean = false) {
-        val normalized = displayName.trim()
+    fun saveDisplayName(context: Context, displayName: String, durable: Boolean = false): Boolean {
+        val normalized = normalizedDisplayName(displayName) ?: return false
         val edit = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
-        if (normalized.isEmpty()) {
-            edit.remove(PREF_DISPLAY_NAME).persist(durable)
-            return
-        }
         edit.putString(PREF_DISPLAY_NAME, normalized).persist(durable)
+        return true
     }
+
+    /** Blank edits never replace the real name onboarding required. */
+    fun normalizedDisplayName(displayName: String): String? =
+        displayName.trim().takeIf { it.isNotEmpty() }
 
     fun loadOwnAvatarEpoch(context: Context): Long {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

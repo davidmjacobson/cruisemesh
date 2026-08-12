@@ -327,7 +327,11 @@ fun ChatScreen(
                 cameraLauncher.launch(uri)
             }
         } else {
-            Toast.makeText(context, "Camera permission is required to take photos", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_camera_permission_required_for_photos),
+                Toast.LENGTH_SHORT,
+            ).show()
         }
     }
 
@@ -812,7 +816,7 @@ private fun ConversationScreen(
                         onCopy = {
                             if (focusedCopyText.isNotBlank()) {
                                 clipboard.setText(AnnotatedString(focusedCopyText))
-                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, R.string.ui_copied, Toast.LENGTH_SHORT).show()
                             }
                             closeOverlay()
                         },
@@ -821,7 +825,13 @@ private fun ConversationScreen(
                                 val saved = ImageGallery.saveJpeg(context, jpeg)
                                 Toast.makeText(
                                     context,
-                                    if (saved != null) "Saved to Pictures/CruiseMesh" else "Could not save image",
+                                    context.getString(
+                                        if (saved != null) {
+                                            R.string.ui_saved_to_pictures
+                                        } else {
+                                            R.string.ui_could_not_save_image
+                                        },
+                                    ),
                                     Toast.LENGTH_SHORT,
                                 ).show()
                                 closeOverlay()
@@ -932,6 +942,7 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
     val density = LocalDensity.current
     val previewPx = with(density) { 72.dp.toPx().roundToInt() }
     var bitmap by remember(bytes, previewPx) { mutableStateOf<ImageBitmap?>(null) }
+    val removePhotoLabel = stringResource(R.string.ui_remove_photo)
     LaunchedEffect(bytes, previewPx) {
         bitmap = withContext(Dispatchers.IO) {
             ChatImageDecoder.decodeSampled(bytes, previewPx, previewPx)?.asImageBitmap()
@@ -948,7 +959,7 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
             if (currentBitmap != null) {
                 Image(
                     bitmap = currentBitmap,
-                    contentDescription = "Photo to send",
+                    contentDescription = stringResource(R.string.ui_photo_to_send),
                     contentScale = ContentScale.Crop,
                     modifier = Modifier
                         .size(72.dp)
@@ -966,7 +977,7 @@ internal fun PendingPhotoCard(bytes: ByteArray, onRemove: () -> Unit) {
                     .clip(CircleShape)
                     .background(Color.Black.copy(alpha = 0.55f))
                     .clickable(onClick = onRemove)
-                    .semantics { contentDescription = "Remove photo" },
+                    .semantics { contentDescription = removePhotoLabel },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -1046,6 +1057,8 @@ internal fun MessageComposer(
     val holdToTalkLabel = stringResource(R.string.ui_hold_to_talk)
     val startVoiceLabel = stringResource(R.string.ui_start_voice_message)
     val sendVoiceLabel = stringResource(R.string.ui_send_voice_message)
+    val attachPhotoLabel = stringResource(R.string.ui_attach_photo_from_library)
+    val sendLabel = stringResource(R.string.ui_send)
     val recording = capture.value.phase != VoiceCapturePhase.IDLE
     // A staged photo can be sent on its own, so the send button shows whenever
     // there's text *or* a pending attachment; the mic only takes over when the
@@ -1132,7 +1145,7 @@ internal fun MessageComposer(
                 .clip(CircleShape)
                 .background(ownBubbleColor)
                 .clickable(onClick = onPickGallery)
-                .semantics { contentDescription = "Attach photo from library" },
+                .semantics { contentDescription = attachPhotoLabel },
             contentAlignment = Alignment.Center,
         ) {
             Icon(Icons.Default.Add, contentDescription = null, tint = onBubbleColor)
@@ -1162,7 +1175,10 @@ internal fun MessageComposer(
                         onClick = onPickCamera,
                         modifier = Modifier.size(48.dp),
                     ) {
-                        Icon(ComposerCameraIcon, contentDescription = "Take photo")
+                        Icon(
+                            ComposerCameraIcon,
+                            contentDescription = stringResource(R.string.ui_take_photo),
+                        )
                     }
                 },
                 shape = RoundedCornerShape(24.dp),
@@ -1192,7 +1208,7 @@ internal fun MessageComposer(
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                         onSend()
                     }
-                    .semantics { contentDescription = "Send" },
+                    .semantics { contentDescription = sendLabel },
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(ComposerSendIcon, contentDescription = null, tint = onBubbleColor)
@@ -1381,6 +1397,7 @@ internal fun ConversationTopBar(
     onBack: () -> Unit,
     onOpenDetails: () -> Unit,
 ) {
+    val contactDetailsLabel = stringResource(R.string.ui_contact_details_for, displayName)
     // T8: the contact's name + photo already live in Scaffold's topBar slot
     // (pinned above the message LazyColumn, never inside it), so they stay
     // visible while the conversation scrolls. A small persistent elevation
@@ -1392,7 +1409,7 @@ internal fun ConversationTopBar(
                 IconButton(onClick = onBack) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back",
+                        contentDescription = stringResource(R.string.ui_back),
                     )
                 }
             },
@@ -1403,7 +1420,7 @@ internal fun ConversationTopBar(
                         .clickable(onClick = onOpenDetails)
                         .semantics {
                             role = Role.Button
-                            contentDescription = "Contact details for $displayName"
+                            contentDescription = contactDetailsLabel
                         },
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -1520,6 +1537,7 @@ private fun MessageBubble(
     onSwipeReply: () -> Unit = {},
     onLinkClick: (MessageLink) -> Unit = {},
 ) {
+    val context = LocalContext.current
     var showLegend by remember { mutableStateOf(false) }
     var boundsInRoot by remember { mutableStateOf(Rect.Zero) }
     val topPadding = if (grouping.joinsPrevious) 2.dp else 10.dp
@@ -1629,7 +1647,7 @@ private fun MessageBubble(
             )
             if (grouping.showTimestamp) {
                 Text(
-                    text = formatConversationTimestamp(message.timestamp),
+                    text = formatConversationTimestamp(context, message.timestamp),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
@@ -1641,7 +1659,10 @@ private fun MessageBubble(
             // sender's time; this says when it reached us.
             if (lateArrivalMs != null) {
                 Text(
-                    text = stringResource(R.string.ui_arrived_at, formatConversationTimestamp(lateArrivalMs)),
+                    text = stringResource(
+                        R.string.ui_arrived_at,
+                        formatConversationTimestamp(context, lateArrivalMs),
+                    ),
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(horizontal = 12.dp),
@@ -2079,7 +2100,7 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
         } else {
             Image(
                 bitmap = currentBitmap,
-                contentDescription = "Photo — tap to view full screen",
+                contentDescription = stringResource(R.string.ui_photo_tap_to_view_full_screen),
                 contentScale = ContentScale.Fit,
                 modifier = Modifier
                     .size(widthDp, heightDp)

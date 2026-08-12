@@ -86,7 +86,7 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 title = { Text(stringResource(R.string.ui_internal_tools)) },
                 navigationIcon = {
                     IconButton(onClick = ::saveAndBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )
@@ -140,8 +140,10 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 )
                 TextButton(onClick = {
                     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh LAN address", endpoint))
-                    Toast.makeText(context, "Local address copied", Toast.LENGTH_SHORT).show()
+                    clipboard.setPrimaryClip(
+                        ClipData.newPlainText(context.getString(R.string.ui_cruisemesh_lan_address), endpoint),
+                    )
+                    Toast.makeText(context, R.string.ui_local_address_copied, Toast.LENGTH_SHORT).show()
                 }) { Text(stringResource(R.string.ui_copy_this_phone_s_address)) }
                 TextButton(onClick = {
                     showLanQrEndpoint = parseLanManualEndpoint(endpoint, lanDefaultTcpPort().toInt())
@@ -312,7 +314,7 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                     if (intent != null) {
                         context.startActivity(Intent.createChooser(intent, "Share debug log"))
                     } else {
-                        Toast.makeText(context, "No log captured yet", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, R.string.ui_no_log_captured_yet, Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -346,7 +348,7 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     Image(
                         bitmap = qr,
-                        contentDescription = "CruiseMesh LAN address QR code",
+                        contentDescription = stringResource(R.string.ui_cruisemesh_lan_address_qr_code),
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(stringResource(R.string.ui_scan_with_the_other_phone_s_camera_to),

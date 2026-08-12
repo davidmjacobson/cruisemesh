@@ -141,7 +141,10 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 title = { Text(stringResource(R.string.ui_back_up_account)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.ui_back),
+                        )
                     }
                 },
             )
@@ -155,32 +158,33 @@ fun BackupExportScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
         ) {
             Spacer(Modifier.height(8.dp))
-            WarningCard(
-                "This file is your account. Anyone with the file and this " +
-                    "passphrase can read your messages and impersonate you — and " +
-                    "if you forget the passphrase, the backup can't be recovered. " +
-                    "Store both carefully.",
-            )
+            WarningCard(stringResource(R.string.ui_backup_security_warning))
             Spacer(Modifier.height(16.dp))
 
             BackupChoice(
                 checked = includeHistory,
                 onCheckedChange = { includeHistory = it },
-                title = "Include my message history",
+                title = stringResource(R.string.ui_include_message_history),
                 detail = inventory?.let {
-                    "${it.messageCount} messages · ${formatBackupBytes(it.messageBytes)}; " +
-                        "${it.pendingOwnDeliveryCount} pending deliveries from me"
-                } ?: "Counting messages…",
+                    stringResource(
+                        R.string.ui_backup_history_summary,
+                        it.messageCount,
+                        formatBackupBytes(it.messageBytes),
+                        it.pendingOwnDeliveryCount,
+                    )
+                } ?: stringResource(R.string.ui_counting_messages),
             )
             BackupChoice(
                 checked = includeCourier,
                 onCheckedChange = { includeCourier = it },
-                title = "Include pending deliveries for others",
+                title = stringResource(R.string.ui_include_pending_for_others),
                 detail = inventory?.let {
-                    "${it.pendingCourierDeliveryCount} encrypted messages · " +
-                        formatBackupBytes(it.pendingCourierDeliveryBytes) +
-                        ". They are unreadable on this phone."
-                } ?: "Counting encrypted courier messages…",
+                    stringResource(
+                        R.string.ui_backup_courier_summary,
+                        it.pendingCourierDeliveryCount,
+                        formatBackupBytes(it.pendingCourierDeliveryBytes),
+                    )
+                } ?: stringResource(R.string.ui_counting_courier_messages),
             )
             Text(
                 stringResource(R.string.ui_backup_identity_always_included),
@@ -303,7 +307,10 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 title = { Text(stringResource(R.string.ui_restore_from_backup)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.ui_back),
+                        )
                     }
                 },
             )
@@ -317,10 +324,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState()),
         ) {
             Spacer(Modifier.height(8.dp))
-            WarningCard(
-                "Restoring replaces this device's identity and message history " +
-                    "with the backup's. Do this on a fresh install.",
-            )
+            WarningCard(stringResource(R.string.ui_restore_replaces_identity_warning))
             Spacer(Modifier.height(16.dp))
 
             Button(
@@ -392,16 +396,22 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 BackupChoice(
                     checked = includeHistory,
                     onCheckedChange = { includeHistory = it },
-                    title = "Restore my message history",
-                    detail = "${reviewed.inventory.messageCount} messages · " +
+                    title = stringResource(R.string.ui_restore_message_history),
+                    detail = stringResource(
+                        R.string.ui_restore_history_summary,
+                        reviewed.inventory.messageCount,
                         formatBackupBytes(reviewed.inventory.messageBytes),
+                    ),
                 )
                 BackupChoice(
                     checked = includeCourier,
                     onCheckedChange = { includeCourier = it },
-                    title = "Restore pending deliveries for others",
-                    detail = "${reviewed.inventory.pendingCourierDeliveryCount} encrypted messages · " +
+                    title = stringResource(R.string.ui_restore_pending_for_others),
+                    detail = stringResource(
+                        R.string.ui_restore_courier_summary,
+                        reviewed.inventory.pendingCourierDeliveryCount,
                         formatBackupBytes(reviewed.inventory.pendingCourierDeliveryBytes),
+                    ),
                 )
                 Text(
                     stringResource(R.string.ui_backup_identity_always_restored),

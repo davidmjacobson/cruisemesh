@@ -110,15 +110,17 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
     val store = remember { AppStore.get(context) }
     val savedRelay = remember { RelayConfigStore.load(context) }
     var name by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
+    var savedName by remember { mutableStateOf(ProfileStore.loadDisplayName(context)) }
     var relayUrl by remember { mutableStateOf(savedRelay?.relayUrl.orEmpty()) }
     var relayToken by remember { mutableStateOf(savedRelay?.relayToken.orEmpty()) }
     var showAdvanced by remember { mutableStateOf(false) }
     var connectedFriend by remember { mutableStateOf<FriendAddedOutcome?>(null) }
     val pendingImports by FriendImportEvents.pendingImports.collectAsState()
-    val friendLink = remember(name, relayUrl, relayToken, identity) {
+    val effectiveName = ProfileStore.normalizedDisplayName(name) ?: savedName
+    val friendLink = remember(effectiveName, relayUrl, relayToken, identity) {
         runCatching {
             val cardJson = makeFriendCard(
-                name.trim().ifEmpty { ProfileStore.defaultDisplayName() },
+                effectiveName,
                 identity,
                 relayUrl.trim().ifEmpty { null },
                 relayToken.trim().ifEmpty { null },
@@ -149,7 +151,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 title = { Text(stringResource(R.string.ui_my_friend_card)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )
@@ -177,7 +179,7 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 ) {
                     Image(
                         bitmap = qrBitmap,
-                        contentDescription = "Friend card QR code",
+                        contentDescription = stringResource(R.string.ui_friend_card_qr_code),
                         modifier = Modifier
                             .padding(16.dp)
                             .size(240.dp),
@@ -196,10 +198,19 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                 value = name,
                 onValueChange = {
                     name = it
-                    ProfileStore.saveDisplayName(context, it)
+                    ProfileStore.normalizedDisplayName(it)?.let { normalized ->
+                        ProfileStore.saveDisplayName(context, normalized)
+                        savedName = normalized
+                    }
                 },
                 label = { Text(stringResource(R.string.ui_your_name)) },
                 singleLine = true,
+                isError = name.isBlank(),
+                supportingText = if (name.isBlank()) {
+                    { Text(stringResource(R.string.ui_profile_name_required)) }
+                } else {
+                    null
+                },
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -270,8 +281,13 @@ fun MyQrScreen(identity: Identity, onSayHi: (Contact) -> Unit, onBack: () -> Uni
                     onClick = {
                         val link = appLink ?: return@TextButton
                         val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                        clipboard.setPrimaryClip(ClipData.newPlainText("CruiseMesh friend card", link))
-                        Toast.makeText(context, "Copied friend card link", Toast.LENGTH_SHORT).show()
+                        clipboard.setPrimaryClip(
+                            ClipData.newPlainText(
+                                context.getString(R.string.ui_cruisemesh_friend_card),
+                                link,
+                            ),
+                        )
+                        Toast.makeText(context, R.string.ui_copied_friend_card_link, Toast.LENGTH_SHORT).show()
                     },
                 ) {
                     Text(stringResource(R.string.ui_copy))
@@ -577,7 +593,7 @@ fun AddFriendScreen(
                 title = { Text(stringResource(R.string.ui_add_a_friend)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 },
             )
@@ -817,7 +833,7 @@ fun ContactsScreen(
                 title = { Text(stringResource(R.string.ui_new_chat)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = stringResource(R.string.ui_back))
                     }
                 }
             )

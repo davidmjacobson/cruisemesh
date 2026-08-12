@@ -105,12 +105,15 @@ final class ChatListLogicTests: XCTestCase {
         XCTAssertFalse(weekday.isEmpty)
         XCTAssertFalse(monthDay.isEmpty)
 
-        // Explicit en_US path: if same calendar day, expect AM/PM time.
+        // Same-day output uses the device's localized short-time preference.
         let localCal = Calendar.current
         let nowDate = Date(timeIntervalSince1970: TimeInterval(nowMs) / 1000)
         let sameDate = Date(timeIntervalSince1970: TimeInterval(sameDay) / 1000)
         if localCal.isDate(nowDate, inSameDayAs: sameDate) {
-            XCTAssertTrue(sameDayLabel.contains("AM") || sameDayLabel.contains("PM"))
+            XCTAssertEqual(
+                sameDayLabel,
+                DateFormatter.localizedString(from: sameDate, dateStyle: .none, timeStyle: .short)
+            )
         }
     }
 

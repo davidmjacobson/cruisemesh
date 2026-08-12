@@ -369,7 +369,11 @@ fun showSendFailureSnackbar(
  */
 fun stagePhotoOrWarn(context: Context, jpeg: ByteArray?, onStaged: (ByteArray) -> Unit) {
     if (jpeg == null) {
-        Toast.makeText(context, "Could not prepare photo (too large or unreadable)", Toast.LENGTH_SHORT).show()
+        Toast.makeText(
+            context,
+            context.getString(R.string.ui_could_not_prepare_photo),
+            Toast.LENGTH_SHORT,
+        ).show()
         return
     }
     onStaged(jpeg)

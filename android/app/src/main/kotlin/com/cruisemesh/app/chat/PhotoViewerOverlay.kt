@@ -72,6 +72,7 @@ fun PhotoViewerOverlay(
     jpeg: ByteArray,
     onDismiss: () -> Unit,
 ) {
+    val viewerLabel = stringResource(R.string.ui_full_screen_photo_viewer)
     val context = LocalContext.current
     val bitmap = remember(jpeg) {
         BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)?.asImageBitmap()
@@ -146,12 +147,12 @@ fun PhotoViewerOverlay(
                         },
                     )
                 }
-                .semantics { contentDescription = "Full-screen photo viewer" },
+                .semantics { contentDescription = viewerLabel },
         ) {
             if (bitmap != null) {
                 Image(
                     bitmap = bitmap,
-                    contentDescription = "Full-screen photo",
+                    contentDescription = stringResource(R.string.ui_full_screen_photo),
                     contentScale = ContentScale.Fit,
                     modifier = Modifier
                         .fillMaxSize()
@@ -177,14 +178,24 @@ fun PhotoViewerOverlay(
                     .padding(horizontal = 12.dp, vertical = 8.dp),
             ) {
                 IconButton(onClick = onDismiss) {
-                    Icon(Icons.Default.Close, contentDescription = "Close photo", tint = Color.White)
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = stringResource(R.string.ui_close_photo),
+                        tint = Color.White,
+                    )
                 }
                 TextButton(
                     onClick = {
                         val saved = ImageGallery.saveJpeg(context, jpeg)
                         Toast.makeText(
                             context,
-                            if (saved != null) "Saved to Pictures/CruiseMesh" else "Could not save image",
+                            context.getString(
+                                if (saved != null) {
+                                    R.string.ui_saved_to_pictures
+                                } else {
+                                    R.string.ui_could_not_save_image
+                                },
+                            ),
                             Toast.LENGTH_SHORT,
                         ).show()
                     },

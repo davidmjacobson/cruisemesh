@@ -5,12 +5,24 @@ enum ProfileStore {
     private static let ownAvatarEpochKey = "cruisemesh.ownAvatarEpoch"
 
     static func loadDisplayName() -> String {
-        AppDefaults.current.string(forKey: displayNameKey) ?? ""
+        let stored = loadStoredDisplayName()
+        return stored.isEmpty ? defaultDisplayName : stored
     }
 
-    static func saveDisplayName(_ name: String) {
-        AppDefaults.current.set(name.trimmingCharacters(in: .whitespacesAndNewlines), forKey: displayNameKey)
+    static func loadStoredDisplayName() -> String {
+        AppDefaults.current.string(forKey: displayNameKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
+
+    @discardableResult
+    static func saveDisplayName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        AppDefaults.current.set(normalized, forKey: displayNameKey)
+        return true
+    }
+
+    static let defaultDisplayName = "CruiseMesh user"
 
     static func loadOwnAvatarEpoch() -> Int64 {
         let value = AppDefaults.current.object(forKey: ownAvatarEpochKey) as? NSNumber
