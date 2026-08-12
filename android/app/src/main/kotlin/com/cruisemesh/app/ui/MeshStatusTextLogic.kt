@@ -110,6 +110,9 @@ object MeshStatusTextLogic {
             is RelayHealth.Ok -> "$serviceName ✓"
             RelayHealth.Checking -> "checking $serviceName"
             RelayHealth.NoInternet -> "no internet"
+            // Deliberate, not broken: worded as a wait so the pill never
+            // reads like something went wrong.
+            RelayHealth.DeferredRoaming -> "waiting for non-roaming internet"
             // Only reachable with a service configured (the null case returned
             // above): a saved card the running mesh has not checked yet.
             RelayHealth.NoConfig -> "no internet delivery set up"

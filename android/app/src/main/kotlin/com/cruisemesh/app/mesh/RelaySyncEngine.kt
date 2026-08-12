@@ -30,6 +30,9 @@ import uniffi.cruisemesh_core.CoreRelayPassOutcome
 import uniffi.cruisemesh_core.CoreRelayPassPlan
 import uniffi.cruisemesh_core.CoreRelayShadowLane
 import uniffi.cruisemesh_core.CoreRelayTransportError
+import uniffi.cruisemesh_core.CoreRelayNetworkVerdict
+import uniffi.cruisemesh_core.CoreRelayRoaming
+import uniffi.cruisemesh_core.coreRelayNetworkPermitted
 import uniffi.cruisemesh_core.coreRelayPassDefaultBudgets
 import uniffi.cruisemesh_core.relayClassifyHttpError
 import uniffi.cruisemesh_core.relayRetryAfterMs
@@ -221,6 +224,28 @@ internal class RelaySyncEngine(
     fun hasValidatedInternet(): Boolean =
         isDefaultValidated() || (!isDefaultVpn() && relayBindNetwork != null)
 
+    /** Network facts only: core owns the roaming/cost decision. */
+    private fun relayNetworkVerdict(): CoreRelayNetworkVerdict {
+        val network = relayBindTarget() ?: connectivityManager.activeNetwork
+        val caps = network?.let { connectivityManager.getNetworkCapabilities(it) }
+            ?: return CoreRelayNetworkVerdict.PERMITTED
+        return coreRelayNetworkPermitted(
+            // Only a cellular path can roam. Reading the capability alone
+            // would let a Wi-Fi network that happens not to carry
+            // NOT_ROAMING read as roaming and silently switch Shore Pass off.
+            roaming = if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING)
+            ) {
+                CoreRelayRoaming.NO
+            } else {
+                CoreRelayRoaming.YES
+            },
+            constrained = connectivityManager.restrictBackgroundStatus ==
+                ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED,
+            userAllowsRoaming = RelayEngineSettings.allowsRoamingData(context),
+        )
+    }
+
     /** FA3: runs on the store executor -- see the call sites in MeshService.onStartCommand. */
     fun publishInitialRelayHealth() {
         assertOffMainThreadForStore("publishInitialRelayHealth")
@@ -349,7 +374,8 @@ internal class RelaySyncEngine(
     fun updateRelayPushSubscription() {
         val identity = identityProvider()
         val config = RelayConfigStore.load(context)
-        if (identity == null || config == null || !hasValidatedInternet()) {
+        if (identity == null || config == null || !hasValidatedInternet() ||
+            relayNetworkVerdict() == CoreRelayNetworkVerdict.DEFERRED_ROAMING) {
             relayPushClient.stop()
             return
         }
@@ -407,6 +433,13 @@ internal class RelaySyncEngine(
             MeshConnectivityStatus.setRelayHealth(offlineRelayHealth(anyRelayConfigKnown))
             return
         }
+        if (relayNetworkVerdict() == CoreRelayNetworkVerdict.DEFERRED_ROAMING) {
+            // A policy deferral is offline-like: no request, retry, failure
+            // streak, endpoint rest, or rate-limit state is touched.
+            MeshConnectivityStatus.setRelayHealth(RelayHealth.DeferredRoaming)
+            updateRelayPushSubscription()
+            return
+        }
         // CP2b: honor relayd's Retry-After. Every nudge that arrives inside
         // the advertised window (poll tick, push frame, queue change)
         // coalesces into one retry at the window's end instead of hammering
@@ -441,7 +474,8 @@ internal class RelaySyncEngine(
                 val rerun = synchronized(relaySyncLock) {
                     val action = relayRerunAction(
                         pendingRequested = relaySyncPending,
-                        canSync = isRunning() && hasValidatedInternet(),
+                        canSync = isRunning() && hasValidatedInternet() &&
+                            relayNetworkVerdict() != CoreRelayNetworkVerdict.DEFERRED_ROAMING,
                         backoffRemainingMs = rateLimitedUntilMs - System.currentTimeMillis(),
                     )
                     relaySyncPending = false
@@ -529,7 +563,9 @@ internal class RelaySyncEngine(
         try {
             uploadPendingOutgoingReceiptEnvelopes(contacts, fallbackConfig, now, network, shadow)
             uploadPendingOutboundEnvelopes(contacts, fallbackConfig, now, network, shadow)
-            uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network, shadow)
+            if (relayNetworkVerdict() != CoreRelayNetworkVerdict.DEFERRED_CONSTRAINED) {
+                uploadFamilyCarriedEnvelopes(contacts, fallbackConfig, now, network, shadow)
+            }
         } finally {
             // Compared here rather than at the end of the pass: the two lanes
             // this slice speaks for are done, and everything after them

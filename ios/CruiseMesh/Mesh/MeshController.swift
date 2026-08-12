@@ -3481,6 +3481,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         updateRelayPushSubscription()
     }
 
+    /// Network facts only. iOS has no public roaming bit — `CTCarrier` was
+    /// deprecated in iOS 16 and reports dummy values on current releases — so
+    /// core receives `.unknown` and deliberately does not infer roaming from
+    /// `isExpensive`, which only means cellular and would switch Shore Pass
+    /// off for every iPhone that is away from Wi-Fi at home. A roaming iPhone
+    /// is already protected by the system Data Roaming setting, which blocks
+    /// the traffic at the modem. `isConstrained` (Low Data Mode) is a real
+    /// user signal and still defers the carried lane.
+    private func relayNetworkVerdict(_ path: NWPath?) -> CoreRelayNetworkVerdict {
+        guard let path else { return .permitted }
+        return coreRelayNetworkPermitted(
+            roaming: .unknown,
+            constrained: path.isConstrained,
+            userAllowsRoaming: RelayEngineSettings.allowsRoamingData()
+        )
+    }
+
     /// `relayTimer`'s tick: runs the authoritative poll, then reschedules
     /// itself at whatever interval `RelayPollPolicy` currently calls for.
     /// Battery, 2026-07-21: replaces the old fixed-60s repeating timer with a
@@ -3549,7 +3566,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard isRunning,
               let identity,
               let config = RelayConfigStore.load(),
-              pathMonitor?.currentPath.status == .satisfied
+              pathMonitor?.currentPath.status == .satisfied,
+              relayNetworkVerdict(pathMonitor?.currentPath) != .deferredRoaming
         else {
             relayPushClient.stop()
             return
@@ -3574,6 +3592,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         guard pathMonitor?.currentPath.status == .satisfied else {
             onMain { MeshConnectivityStatus.shared.setRelayHealth(.noInternet) }
+            return false
+        }
+        if relayNetworkVerdict(pathMonitor?.currentPath) == .deferredRoaming {
+            // A policy deferral is offline-like: it starts no pass and cannot
+            // affect failure streaks, endpoint rests, or family backoff.
+            onMain { MeshConnectivityStatus.shared.setRelayHealth(.deferredRoaming) }
+            updateRelayPushSubscription()
             return false
         }
         // CP2b: honor relayd's Retry-After. Nudges inside the advertised
@@ -4201,11 +4226,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // unreachable destination refills the batch every pass. Core
             // resolves each row's rotating recipient hint to a contact so it
             // can partition and skip. Mirrors RelaySyncEngine.kt.
-            let family = try store.familyCarriedEnvelopes(
-                limit: MeshDefaults.relayStoreBatchLimit,
-                nowMs: now,
-                skipRecipientUserIds: skipRecipients
-            )
+            // Lightweight sync continues on a constrained path, but carried
+            // envelopes remain queued for a later relay or local delivery.
+            // The rows are not even read on that path: skipping the query is
+            // the point, and an explicit type keeps the empty case unambiguous.
+            let family: [CarriedEnvelope]
+            if relayNetworkVerdict(pathMonitor?.currentPath) == .deferredConstrained {
+                family = []
+            } else {
+                family = try store.familyCarriedEnvelopes(
+                    limit: MeshDefaults.relayStoreBatchLimit,
+                    nowMs: now,
+                    skipRecipientUserIds: skipRecipients
+                )
+            }
             for env in family {
                 // Carried rows are a lane a later package owns; the canary
                 // cannot speak for them, so each is counted as unshadowed.

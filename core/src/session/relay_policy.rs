@@ -65,6 +65,62 @@ use blake2::Blake2bVar;
 
 use crate::relay_status::{relay_fault_rank, CoreRelayFault};
 
+// ---------------------------------------------------------------------------
+// Network cost policy
+// ---------------------------------------------------------------------------
+
+/// Whether the operating system can say that the selected internet path is
+/// roaming. iOS deliberately reports [`CoreRelayRoaming::Unknown`]: it has no
+/// public roaming bit, and core must not invent one from a transport name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreRelayRoaming {
+    Yes,
+    No,
+    Unknown,
+}
+
+/// What the relay gate should do for the selected network path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreRelayNetworkVerdict {
+    /// The path may run every relay lane.
+    Permitted,
+    /// Do not start a relay pass. This is an offline-like deferral, never a
+    /// relay failure.
+    DeferredRoaming,
+    /// Run lightweight sync, but leave carried-envelope uploads queued.
+    DeferredConstrained,
+}
+
+/// Decide whether the current network permits Shore Pass work.
+///
+/// Android supplies a real roaming bit and is gated precisely on it. iOS has
+/// no public roaming API — `CTCarrier` was deprecated in iOS 16 and reports
+/// dummy values on current releases — so it supplies `Unknown`, and core
+/// deliberately declines to guess. The only signal iOS could stand in with is
+/// "expensive", which means cellular, so inferring roaming from it would take
+/// Shore Pass away from every iPhone that is off Wi-Fi at home. That trade is
+/// not worth making: a roaming iPhone is already protected by the system's own
+/// Data Roaming setting, which blocks the traffic at the modem and is stronger
+/// than any policy this function could express.
+///
+/// Constrained paths (Android Data Saver, iOS Low Data Mode) still permit
+/// lightweight sync while their carried lane is deferred by
+/// [`CoreRelayNetworkVerdict::DeferredConstrained`], on both platforms.
+#[uniffi::export]
+pub fn core_relay_network_permitted(
+    roaming: CoreRelayRoaming,
+    constrained: bool,
+    user_allows_roaming: bool,
+) -> CoreRelayNetworkVerdict {
+    if roaming == CoreRelayRoaming::Yes && !user_allows_roaming {
+        return CoreRelayNetworkVerdict::DeferredRoaming;
+    }
+    if constrained {
+        return CoreRelayNetworkVerdict::DeferredConstrained;
+    }
+    CoreRelayNetworkVerdict::Permitted
+}
+
 /// A phone's conservative share of the family request budget: one request per
 /// 500 ms, serialized. Deployed value; do not change it without a relayd-side
 /// measurement, because the bucket it spends from is shared family-wide.
@@ -807,6 +863,45 @@ pub fn core_family_relay_health_vectors() -> Vec<CoreRelayHealthVector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_network_permission_states_the_whole_matrix() {
+        use CoreRelayNetworkVerdict::{DeferredConstrained, DeferredRoaming, Permitted};
+        use CoreRelayRoaming::{No, Unknown, Yes};
+
+        // Every (roaming, constrained, override) combination, with the
+        // expected verdict written out by hand. A table that recomputes the
+        // policy instead of stating it agrees with itself and pins nothing.
+        let cases = [
+            // A path we know is roaming waits until the user opts in.
+            (Yes, false, false, DeferredRoaming),
+            (Yes, true, false, DeferredRoaming),
+            // The override is honored; a constrained path still holds the
+            // carried lane back, because that is a separate signal.
+            (Yes, false, true, Permitted),
+            (Yes, true, true, DeferredConstrained),
+            // A path we know is not roaming is never deferred for roaming.
+            (No, false, false, Permitted),
+            (No, true, false, DeferredConstrained),
+            (No, false, true, Permitted),
+            (No, true, true, DeferredConstrained),
+            // iOS, where roaming is unknowable and therefore never inferred:
+            // Shore Pass keeps working on cellular at home, and the system's
+            // own Data Roaming setting is what stops roaming spend.
+            (Unknown, false, false, Permitted),
+            (Unknown, true, false, DeferredConstrained),
+            (Unknown, false, true, Permitted),
+            (Unknown, true, true, DeferredConstrained),
+        ];
+
+        for (roaming, constrained, user_allows_roaming, expected) in cases {
+            assert_eq!(
+                core_relay_network_permitted(roaming, constrained, user_allows_roaming),
+                expected,
+                "roaming={roaming:?} constrained={constrained} override={user_allows_roaming}",
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Vectors: the same tables the two shells consume

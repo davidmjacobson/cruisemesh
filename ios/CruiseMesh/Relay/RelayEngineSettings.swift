@@ -36,6 +36,7 @@ enum RelayEngineSettings {
     /// Absent means `.legacy`.
     private static let passEngineKey = "cruisemesh.relay.passEngineCore"
     private static let shadowEnabledKey = "cruisemesh.relay.passEngineShadow"
+    private static let allowRoamingDataKey = "cruisemesh.relay.allowRoamingData"
     private static let shadowDayKey = "cruisemesh.relay.passEngineShadowDay"
     private static let shadowCountKey = "cruisemesh.relay.passEngineShadowCount"
     private static let shadowLastMsKey = "cruisemesh.relay.passEngineShadowLastMs"
@@ -71,6 +72,14 @@ enum RelayEngineSettings {
 
     static func setShadowEnabled(_ enabled: Bool) {
         AppDefaults.current.set(enabled, forKey: shadowEnabledKey)
+    }
+
+    static func allowsRoamingData() -> Bool {
+        AppDefaults.current.bool(forKey: allowRoamingDataKey)
+    }
+
+    static func setAllowsRoamingData(_ enabled: Bool) {
+        AppDefaults.current.set(enabled, forKey: allowRoamingDataKey)
     }
 
     /// The canary's sampling state, across process launches.

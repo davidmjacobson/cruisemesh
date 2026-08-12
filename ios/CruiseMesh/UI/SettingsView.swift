@@ -79,6 +79,22 @@ struct SettingsView: View {
                         .onChange(of: shareOnline) { RelayConfigStore.setShareOnline($0) }
                 }
 
+                // No roaming toggle here, unlike Android. iOS cannot tell an
+                // app whether the cellular path is roaming, so a switch of
+                // ours would gate nothing and quietly lie. The control that
+                // does work is Apple's own, and it is stronger than ours:
+                // with Data Roaming off, the modem carries no roaming data at
+                // all. Point at it rather than imitating it.
+                Section("Advanced") {
+                    Text(
+                        String(
+                            localized: "Roaming data is controlled by iOS. To prevent roaming charges at sea, turn off Data Roaming in Settings, under Cellular, then Cellular Data Options."
+                        )
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+
                 Section("Backup") {
                     NavigationLink {
                         BackupExportView()
@@ -149,6 +165,7 @@ struct SettingsView: View {
         case .checking: return "Checking Shore Pass setup…"
         case .ok: return "Shore Pass is working"
         case .noInternet: return "Shore Pass is waiting for internet"
+        case .deferredRoaming: return String(localized: "Waiting for non-roaming internet to avoid roaming charges")
         case .failing: return "Shore Pass needs attention"
         case .expired: return "Shore Pass expired"
         case .suspended: return "Shore Pass suspended"
@@ -168,6 +185,7 @@ struct SettingsView: View {
         case .checking: return "Setup is saved; CruiseMesh has not completed an authenticated check yet."
         case .ok(let lastSyncMs): return "Internet delivery is ready · checked \(relativeAge(lastSyncMs))."
         case .noInternet: return "Configured; this phone is currently offline."
+        case .deferredRoaming: return String(localized: "Waiting for non-roaming internet to avoid roaming charges")
         case .failing: return "The relay could not be reached."
         case .expired: return "Renew your pass to resume internet delivery."
         case .suspended: return "Contact support for help with this pass."

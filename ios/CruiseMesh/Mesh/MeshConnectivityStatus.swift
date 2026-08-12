@@ -13,6 +13,8 @@ enum RelayHealth: Equatable {
     case ok(lastSyncMs: Int64)
     case checking
     case noInternet
+    /// Relay work is intentionally waiting for a non-roaming path.
+    case deferredRoaming
     case noConfig
     case failing(lastAttemptMs: Int64)
     case expired(lastAttemptMs: Int64)
