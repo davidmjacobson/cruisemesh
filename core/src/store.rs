@@ -7513,33 +7513,53 @@ fn enforce_carried_budgets_protecting(
 // consumption still goes through the shared inbound authority and an explicit
 // `remove_carried_envelope` only after delivery succeeds.
 impl MessageStore {
-    /// Bounded recent history for crate-linked presentation shells.
+    /// Bounded recent read-model rows for crate-linked presentation shells.
     ///
     /// Kept outside the UniFFI export impl because mobile already owns its
-    /// paging surface. Desktop must not marshal an unbounded conversation over
-    /// its named pipe; SQL selects newest-first under the limit, then restores
-    /// the normal oldest-first presentation order.
-    pub fn recent_messages_for_chat(
+    /// paging surface. Visible rows and reactions have independent limits so
+    /// hidden protocol traffic cannot crowd chat history out of the page and
+    /// reactions cannot crowd out the messages they annotate. SQL selects
+    /// newest-first under each limit, then restores oldest-first order.
+    pub fn recent_presentation_messages_for_chat(
         &self,
         chat_id: Vec<u8>,
-        limit: u64,
+        visible_limit: u64,
+        reaction_limit: u64,
     ) -> Result<Vec<StoredMessage>, CoreError> {
         let conn = lock_conn(&self.conn);
+        let visible = visible_chat_kind_sql_list();
         let mut stmt = conn
-            .prepare(
-                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
-                 FROM (
+            .prepare(&format!(
+                "WITH recent_visible AS (
                     SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
-                    FROM messages WHERE chat_id = ?1
+                    FROM messages
+                    WHERE chat_id = ?1 AND kind IN ({visible})
                     ORDER BY timestamp DESC, id DESC
                     LIMIT ?2
+                 ), recent_reactions AS (
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    FROM messages
+                    WHERE chat_id = ?1 AND kind = ?3
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?4
+                 )
+                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 FROM (
+                    SELECT * FROM recent_visible
+                    UNION ALL
+                    SELECT * FROM recent_reactions
                  )
                  ORDER BY timestamp ASC, id ASC",
-            )
+            ))
             .map_err(store_err)?;
         let rows = stmt
             .query_map(
-                params![chat_id, limit.min(i64::MAX as u64) as i64],
+                params![
+                    chat_id,
+                    visible_limit.min(i64::MAX as u64) as i64,
+                    crate::KIND_REACTION as i64,
+                    reaction_limit.min(i64::MAX as u64) as i64,
+                ],
                 row_to_message,
             )
             .map_err(store_err)?;

@@ -25,6 +25,7 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 // response cap after base64 and JSON expansion. Paging can extend this later
 // without ever making a single pipe response unbounded.
 const CHAT_HISTORY_ROW_LIMIT: u64 = 50;
+const REACTION_HISTORY_ROW_LIMIT: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct ChatService {
@@ -112,6 +113,7 @@ pub enum MessageKind {
     Image,
     Audio,
     GroupInvite,
+    UnsupportedAttachment,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,7 +231,11 @@ impl ChatService {
             ),
         };
         let store = self.bootstrap.store();
-        let all = store.recent_messages_for_chat(chat_id.clone(), CHAT_HISTORY_ROW_LIMIT)?;
+        let all = store.recent_presentation_messages_for_chat(
+            chat_id.clone(),
+            CHAT_HISTORY_ROW_LIMIT,
+            REACTION_HISTORY_ROW_LIMIT,
+        )?;
         let reaction_map = reaction_map(&all, &self.bootstrap.identity().user_id);
         let visible = core_visible_chat_messages(all);
         let delivered = store.receipt_through(
@@ -597,24 +603,29 @@ impl ChatService {
                 Some(String::from_utf8_lossy(&message.payload).into_owned()),
                 None,
             ),
-            KIND_ATTACHMENT_MANIFEST => {
-                let value = decode_attachment_payload(message.payload.clone())
-                    .context("stored attachment is malformed")?;
-                let kind = match value.media_type {
-                    AttachmentMediaType::Image => MessageKind::Image,
-                    AttachmentMediaType::Audio => MessageKind::Audio,
-                };
-                (
-                    kind,
+            KIND_ATTACHMENT_MANIFEST => match decode_attachment_payload(message.payload.clone()) {
+                Some(value) => {
+                    let kind = match value.media_type {
+                        AttachmentMediaType::Image => MessageKind::Image,
+                        AttachmentMediaType::Audio => MessageKind::Audio,
+                    };
+                    (
+                        kind,
+                        None,
+                        Some(AttachmentView {
+                            mime_type: value.mime_type,
+                            duration_ms: value.duration_ms,
+                            data_base64: BASE64.encode(value.blob),
+                            caption: value.caption,
+                        }),
+                    )
+                }
+                None => (
+                    MessageKind::UnsupportedAttachment,
+                    Some("This attachment could not be displayed.".into()),
                     None,
-                    Some(AttachmentView {
-                        mime_type: value.mime_type,
-                        duration_ms: value.duration_ms,
-                        data_base64: BASE64.encode(value.blob),
-                        caption: value.caption,
-                    }),
-                )
-            }
+                ),
+            },
             KIND_GROUP_INVITE => (MessageKind::GroupInvite, None, None),
             _ => bail!("non-visible message escaped the core visibility policy"),
         };
@@ -693,12 +704,14 @@ fn summary_from_preview(
 fn preview_text(message: &StoredMessage) -> Option<String> {
     match message.kind {
         KIND_TEXT => Some(String::from_utf8_lossy(&message.payload).into_owned()),
-        KIND_ATTACHMENT_MANIFEST => {
-            decode_attachment_payload(message.payload.clone()).map(|value| match value.media_type {
-                AttachmentMediaType::Image => "Photo".into(),
-                AttachmentMediaType::Audio => "Voice message".into(),
-            })
-        }
+        KIND_ATTACHMENT_MANIFEST => Some(
+            decode_attachment_payload(message.payload.clone())
+                .map(|value| match value.media_type {
+                    AttachmentMediaType::Image => "Photo".into(),
+                    AttachmentMediaType::Audio => "Voice message".into(),
+                })
+                .unwrap_or_else(|| "Unsupported attachment".into()),
+        ),
         KIND_GROUP_INVITE => Some("Group created".into()),
         _ => None,
     }
@@ -853,12 +866,15 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cruisemesh_core::{generate_identity, make_friend_card, make_friend_link};
+    use cruisemesh_core::{
+        generate_identity, make_friend_card, make_friend_link, CoreInboundDisposition,
+        CoreInboundSource, Identity,
+    };
     use tempfile::TempDir;
 
     use crate::{lan::endpoint_cache::EndpointCache, store_paths::AppPaths};
 
-    fn service() -> (TempDir, Arc<BootstrapStore>, ChatService, Contact) {
+    fn service() -> (TempDir, Arc<BootstrapStore>, ChatService, Contact, Identity) {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::under(temp.path().join("CruiseMesh")).unwrap();
         let bootstrap = Arc::new(BootstrapStore::open(paths.clone()).unwrap());
@@ -880,12 +896,12 @@ mod tests {
             inbound,
             Arc::new(tokio::sync::Notify::new()),
         );
-        (temp, bootstrap, service, contact)
+        (temp, bootstrap, service, contact, friend)
     }
 
     #[tokio::test]
     async fn text_is_core_authored_and_visible_in_the_read_model() {
-        let (_temp, _bootstrap, service, contact) = service();
+        let (_temp, _bootstrap, service, contact, _friend) = service();
         let id = person_id(&contact.user_id);
         let sent = service
             .send_text(&id, "Hello from Windows".into(), None)
@@ -901,9 +917,126 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn hidden_traffic_and_a_bad_photo_cannot_blank_visible_history() {
+        let (_temp, bootstrap, service, contact, _friend) = service();
+        let store = bootstrap.store();
+        store
+            .insert_message(StoredMessage {
+                chat_id: contact.user_id.clone(),
+                sender_user_id: contact.user_id.clone(),
+                lamport: 1,
+                timestamp: 1,
+                kind: KIND_TEXT,
+                payload: b"history survives".to_vec(),
+            })
+            .unwrap();
+        store
+            .insert_message(StoredMessage {
+                chat_id: contact.user_id.clone(),
+                sender_user_id: contact.user_id.clone(),
+                lamport: 2,
+                timestamp: 2,
+                kind: KIND_ATTACHMENT_MANIFEST,
+                payload: b"not-an-attachment".to_vec(),
+            })
+            .unwrap();
+        for lamport in 3..=80 {
+            store
+                .insert_message(StoredMessage {
+                    chat_id: contact.user_id.clone(),
+                    sender_user_id: contact.user_id.clone(),
+                    lamport,
+                    timestamp: lamport as i64,
+                    kind: KIND_PROFILE_SYNC,
+                    payload: Vec::new(),
+                })
+                .unwrap();
+        }
+
+        let conversation = service.conversation(&person_id(&contact.user_id)).unwrap();
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(
+            conversation.messages[0].text.as_deref(),
+            Some("history survives")
+        );
+        assert!(matches!(
+            conversation.messages[1].kind,
+            MessageKind::UnsupportedAttachment
+        ));
+    }
+
+    #[tokio::test]
+    async fn android_style_photo_survives_the_windows_inbound_and_read_model() {
+        let (_temp, bootstrap, service, contact, phone) = service();
+        let phone_store = MessageStore::open(":memory:".into()).unwrap();
+        let windows = Contact {
+            user_id: bootstrap.identity().user_id.clone(),
+            name: "Cabin PC".into(),
+            sign_pk: bootstrap.identity().sign_pk.clone(),
+            agree_pk: bootstrap.identity().agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        };
+        let expected_photo = vec![0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+        let text = phone_store
+            .author_pairwise_message(
+                phone.clone(),
+                windows.clone(),
+                KIND_TEXT,
+                b"before photo".to_vec(),
+                None,
+                1,
+            )
+            .unwrap();
+        let photo = phone_store
+            .author_pairwise_message(
+                phone,
+                windows,
+                KIND_ATTACHMENT_MANIFEST,
+                encode_attachment_payload(CoreAttachmentPayload {
+                    media_type: AttachmentMediaType::Image,
+                    mime_type: "image/jpeg".into(),
+                    duration_ms: 0,
+                    blob: expected_photo.clone(),
+                    caption: "from Android".into(),
+                })
+                .unwrap(),
+                None,
+                2,
+            )
+            .unwrap();
+
+        for authored in [text, photo] {
+            let result = service
+                .inbound
+                .process(CoreInboundSource::Relay, authored.frame, 10)
+                .await
+                .unwrap();
+            assert_eq!(result.disposition, CoreInboundDisposition::Consumed);
+        }
+
+        let conversation = service.conversation(&person_id(&contact.user_id)).unwrap();
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(
+            conversation.messages[0].text.as_deref(),
+            Some("before photo")
+        );
+        let image = &conversation.messages[1];
+        assert!(matches!(image.kind, MessageKind::Image));
+        let attachment = image.attachment.as_ref().unwrap();
+        assert_eq!(attachment.mime_type, "image/jpeg");
+        assert_eq!(attachment.caption, "from Android");
+        assert_eq!(
+            BASE64.decode(&attachment.data_base64).unwrap(),
+            expected_photo
+        );
+    }
+
     #[tokio::test]
     async fn group_creation_uses_accepted_contacts_and_queues_invites() {
-        let (_temp, bootstrap, service, contact) = service();
+        let (_temp, bootstrap, service, contact, _friend) = service();
         let id = service
             .create_group("Family".into(), vec![person_id(&contact.user_id)])
             .await

@@ -533,15 +533,18 @@ function ConversationRow({ row, selected, onClick }: { row: ConversationSummary;
 function MessageBubble({ message, messages, onReply, onReact }: { message: Message; messages: Message[]; onReply: () => void; onReact: (emoji: string) => void }) {
   const replied = message.reply_to_id ? messages.find((item) => item.id === message.reply_to_id) : undefined;
   const source = message.attachment ? `data:${message.attachment.mime_type};base64,${message.attachment.data_base64}` : "";
+  const [imageFailed, setImageFailed] = useState(false);
   return (
     <article className={`message ${message.own ? "own" : "other"}`}>
       {!message.own && <span className="sender-name">{message.sender_name}</span>}
       <div className="bubble">
         {replied && <div className="quoted"><strong>{replied.sender_name}</strong><br />{replied.text || (replied.kind === "image" ? "Photo" : "Voice message")}</div>}
         {message.kind === "text" && <div className="message-text">{message.text}</div>}
-        {message.kind === "image" && <img className="attachment-image" src={source} alt={message.attachment?.caption || "Shared photo"} />}
+        {message.kind === "image" && !imageFailed && <img className="attachment-image" src={source} alt={message.attachment?.caption || "Shared photo"} onError={() => setImageFailed(true)} />}
+        {message.kind === "image" && imageFailed && <div className="attachment-error">This photo could not be displayed.</div>}
         {message.kind === "audio" && <audio controls preload="metadata" src={source}>Voice message</audio>}
         {message.kind === "group_invite" && <div>Group created</div>}
+        {message.kind === "unsupported_attachment" && <div className="attachment-error">{message.text || "This attachment could not be displayed."}</div>}
         {message.attachment?.caption && <div>{message.attachment.caption}</div>}
         <div className="message-meta"><time>{formatTime(message.timestamp_ms)}</time><TickIcon tick={message.tick} /></div>
       </div>
