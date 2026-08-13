@@ -5,14 +5,15 @@ review. `altool --upload-app` gets the binary to App Store Connect but does NOT
 make it visible to an external group's testers -- that needs the group + review
 steps below.
 
-Exit code is the verdict: 0 means the build really is sitting in the beta
-group, anything else means it is not. This used to return 0 on every giving-up
-path -- build never visible, still processing, group not found -- which made the
-caller write "Distributed build ... to the beta group" to the run summary for a
-build no tester could see. 1.0.4 shipped to TestFlight and reached nobody
-exactly that way. The release job keeps `continue-on-error` on this step, so a
-slow processing queue still does not red a landed release; it just stops
-claiming a distribution that did not happen.
+Exit code is the verdict: 0 means the build is in the beta group and
+review-submit did not fail. Anything else means testers may not see it.
+This used to return 0 on every giving-up path -- build never visible,
+still processing, group not found -- which made the caller write
+"Distributed build ... to the beta group" to the run summary for a build
+no tester could see. 1.0.4 shipped to TestFlight and reached nobody
+exactly that way. The release job keeps `continue-on-error` on this
+step, so a slow processing queue still does not red a landed release; it
+just stops claiming a distribution that did not happen.
 
 Usage: testflight_distribute.py <key.p8> <key_id> <issuer_id> <build_number> [group_name]
 
@@ -157,19 +158,19 @@ def main() -> None:
     )
     print(f"add to '{GROUP_NAME}': HTTP {resp.status_code}")
     if resp.status_code >= 300:
-        die(f"could not add the build to '{GROUP_NAME}': {resp.text[:300]}")
+        # 409 on a re-run is expected once the build is already in the group.
+        # Membership GET below is the verdict.
+        print(f"add returned {resp.status_code}: {resp.text[:300]}")
 
     resp = api(
         "POST",
         "/v1/betaAppReviewSubmissions",
         {"data": {"type": "betaAppReviewSubmissions", "relationships": {"build": {"data": {"type": "builds", "id": build_id}}}}},
     )
-    # A build whose version was already beta-approved re-submits cleanly / is a
-    # no-op; only log the body when it's an unexpected error.
+    # A build whose version was already beta-approved re-submits cleanly.
     if resp.status_code >= 300 and "already" not in resp.text.lower():
-        print(f"beta review submit: HTTP {resp.status_code}: {resp.text[:300]}")
-    else:
-        print(f"beta review submit: HTTP {resp.status_code}")
+        die(f"beta review submit HTTP {resp.status_code}: {resp.text[:300]}")
+    print(f"beta review submit: HTTP {resp.status_code}")
 
     # Read the membership back rather than trusting the POST: this is the exact
     # fact the run summary claims, so assert it against App Store Connect.
@@ -184,7 +185,13 @@ def main() -> None:
         )
 
     detail = (api("GET", f"/v1/builds/{build_id}/buildBetaDetail").json().get("data") or {}).get("attributes", {})
-    print(f"DONE: internal={detail.get('internalBuildState')} external={detail.get('externalBuildState')}")
+    external = detail.get("externalBuildState")
+    if external == "MISSING_EXPORT_COMPLIANCE":
+        die(
+            f"build {BUILD_NUMBER} is in '{GROUP_NAME}' but externalBuildState="
+            f"{external}; testers cannot install."
+        )
+    print(f"DONE: internal={detail.get('internalBuildState')} external={external}")
     print(f"Build {BUILD_NUMBER} is in '{GROUP_NAME}'.")
 
 

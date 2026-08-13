@@ -67,10 +67,24 @@ if manifest.get("NSPrivacyCollectedDataTypes") != []:
 if manifest.get("NSPrivacyTrackingDomains") != []:
     problems.append("NSPrivacyTrackingDomains is not empty, but the app declares no tracking")
 
-# The app reads disk space, file timestamps and UserDefaults; an empty list here
-# means a stub manifest shipped, which Apple rejects on required-reason APIs.
-if not manifest.get("NSPrivacyAccessedAPITypes"):
-    problems.append("NSPrivacyAccessedAPITypes is empty -- required-reason API declarations are missing")
+# Presence-only would accept a stub. Require the three APIs this app uses
+# and the reason codes in ios/CruiseMesh/PrivacyInfo.xcprivacy.
+REQUIRED_API_TYPES = {
+    "NSPrivacyAccessedAPICategoryDiskSpace": {"E174.1"},
+    "NSPrivacyAccessedAPICategoryFileTimestamp": {"C617.1", "3B52.1"},
+    "NSPrivacyAccessedAPICategoryUserDefaults": {"CA92.1"},
+}
+declared = {}
+for entry in manifest.get("NSPrivacyAccessedAPITypes") or []:
+    api_type = entry.get("NSPrivacyAccessedAPIType")
+    if api_type:
+        declared[api_type] = set(entry.get("NSPrivacyAccessedAPITypeReasons") or [])
+for api_type, reasons in REQUIRED_API_TYPES.items():
+    if api_type not in declared:
+        problems.append(f"{api_type} is missing")
+    elif not reasons.issubset(declared[api_type]):
+        missing = ", ".join(sorted(reasons - declared[api_type]))
+        problems.append(f"{api_type} is missing reason(s): {missing}")
 
 if problems:
     print(f"FAIL: privacy manifest in {target} does not match the declared answers:")
@@ -78,10 +92,6 @@ if problems:
         print(f"  - {problem}")
     sys.exit(1)
 
-reasons = sorted(
-    entry.get("NSPrivacyAccessedAPIType", "?")
-    for entry in manifest["NSPrivacyAccessedAPITypes"]
-)
 print(f"Privacy manifest present in {target}: no tracking, no collected data.")
-print(f"Required-reason APIs declared: {', '.join(reasons)}")
+print(f"Required-reason APIs declared: {', '.join(sorted(declared))}")
 PY
