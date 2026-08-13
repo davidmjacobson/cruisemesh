@@ -1,18 +1,20 @@
 package com.cruisemesh.app.debug
 
 /**
- * Knows when a share target actually took the diagnostics archive.
+ * Confirmation for a diagnostics share. The chooser result is not a read:
+ * Drive only opens the FileProvider URI after a folder is chosen.
  *
- * The system share sheet does not tell us that. [Intent.createChooser] returns
- * as soon as Drive (or Files, or mail) is picked, which is before the folder
- * picker and before any bytes move. Drive then reads the FileProvider URI
- * only after the folder is chosen. That read is the first honest "it left
- * this phone" signal, and it is what [CruiseMeshFileProvider] reports here.
- *
- * The screen shows the confirmation on resume so the toast is not buried
- * under Drive's picker.
+ * Camera and other clients share that provider, so a match is the armed URI
+ * plus a third-party read. Compose-window previews from the system resolver
+ * are ignored; backing out of the chooser disarms an unused share.
  */
 object DiagnosticsShareHandoff {
+    private val INTENT_RESOLVER_PACKAGES = setOf(
+        "com.android.intentresolver",
+        "com.google.android.intentresolver",
+        "com.android.systemui",
+    )
+
     @Volatile
     private var pending: String? = null
 
@@ -20,32 +22,51 @@ object DiagnosticsShareHandoff {
     private var consumed: Boolean = false
 
     @Volatile
+    private var targetChosen: Boolean = false
+
+    @Volatile
     private var listener: (() -> Unit)? = null
 
-    /** Arm for the URI this share is about to hand to the sheet. */
     fun expect(key: String) {
         pending = key
         consumed = false
+        targetChosen = false
     }
 
-    /**
-     * The receiving app opened [key]. Ignored unless it is the armed archive:
-     * camera captures and other FileProvider clients share this provider.
-     */
-    fun onOpened(key: String) {
+    /** The user picked a share target. Opens before this are resolver preview. */
+    fun markTargetChosen() {
+        if (pending != null) targetChosen = true
+    }
+
+    /** Chooser dismissed with nothing handed off. Leaves an already-read share. */
+    fun cancelPending() {
+        if (consumed) return
+        pending = null
+        targetChosen = false
+    }
+
+    fun onOpened(
+        key: String,
+        mode: String = "r",
+        callerPackage: String? = null,
+        ownPackage: String? = null,
+    ) {
+        if (!targetChosen) return
+        if (!isCountableOpen(mode, callerPackage, ownPackage)) return
         if (key != pending) return
         consumed = true
         listener?.invoke()
     }
 
     /**
-     * True once, if the armed archive was opened. Clears the pending share so
-     * a later open of the same file (preview, retry) does not toast again.
+     * True once, if the armed archive was opened. Cleared so a later preview
+     * of the same file does not toast again.
      */
     fun takeIfConsumed(): Boolean {
         if (!consumed) return false
         consumed = false
         pending = null
+        targetChosen = false
         return true
     }
 
@@ -56,6 +77,19 @@ object DiagnosticsShareHandoff {
     fun reset() {
         pending = null
         consumed = false
+        targetChosen = false
         listener = null
+    }
+
+    internal fun isCountableOpen(
+        mode: String,
+        callerPackage: String?,
+        ownPackage: String?,
+    ): Boolean {
+        if (!mode.contains('r')) return false
+        if (callerPackage.isNullOrEmpty()) return true
+        if (ownPackage != null && callerPackage == ownPackage) return false
+        if (callerPackage in INTENT_RESOLVER_PACKAGES) return false
+        return true
     }
 }

@@ -105,13 +105,33 @@ final class DiagnosticsArchiveTests: XCTestCase {
         )
     }
 
-    /// Drive (and Files) dismiss without saying they took the archive. The
-    /// page only confirms when the system share sheet reports completion.
     func testShareConfirmationRequiresCompletion() {
         XCTAssertEqual(
             DiagnosticsShareFeedback.confirmationMessage(completed: true),
             String(localized: "Diagnostics shared.")
         )
         XCTAssertNil(DiagnosticsShareFeedback.confirmationMessage(completed: false))
+    }
+
+    func testShareOutcomePresentsOnceFromEitherCallbackOrder() {
+        let dismissFirst = DiagnosticsShareOutcome()
+        XCTAssertFalse(dismissFirst.takeIfReady())
+        dismissFirst.mark(true)
+        XCTAssertTrue(dismissFirst.takeIfReady())
+        XCTAssertFalse(dismissFirst.takeIfReady())
+
+        let completeFirst = DiagnosticsShareOutcome()
+        completeFirst.mark(true)
+        XCTAssertTrue(completeFirst.takeIfReady())
+        XCTAssertFalse(completeFirst.takeIfReady())
+    }
+
+    func testShareOutcomeIgnoresCancelThenAllowsALaterShare() {
+        let outcome = DiagnosticsShareOutcome()
+        outcome.mark(false)
+        XCTAssertFalse(outcome.takeIfReady())
+        outcome.reset()
+        outcome.mark(true)
+        XCTAssertTrue(outcome.takeIfReady())
     }
 }

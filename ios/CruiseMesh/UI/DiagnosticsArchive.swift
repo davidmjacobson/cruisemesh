@@ -99,11 +99,31 @@ enum DiagnosticsArchive {
     }
 }
 
-/// Confirmation after the system share sheet finishes. The sheet itself
-/// does not tell the page it succeeded, so Connection Details has to.
 enum DiagnosticsShareFeedback {
     static func confirmationMessage(completed: Bool) -> String? {
         completed ? String(localized: "Diagnostics shared.") : nil
+    }
+}
+
+/// Folds share-sheet completion and SwiftUI `onDismiss` into one presentation.
+/// Either callback can arrive first; a success is shown once.
+final class DiagnosticsShareOutcome {
+    private var completed = false
+    private var presented = false
+
+    func mark(_ success: Bool) {
+        if success { completed = true }
+    }
+
+    func takeIfReady() -> Bool {
+        guard completed, !presented else { return false }
+        presented = true
+        return true
+    }
+
+    func reset() {
+        completed = false
+        presented = false
     }
 }
 

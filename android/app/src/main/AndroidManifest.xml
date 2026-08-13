@@ -101,9 +101,8 @@
             android:name=".notify.NotificationActionReceiver"
             android:exported="false" />
 
-        <!-- Camera capture target for in-chat photos (TakePicture contract).
-             Subclassed so Share diagnostics can see Drive actually read the
-             archive; the stock FileProvider has no such callback. -->
+        <!-- Camera capture and Share diagnostics. Subclassed so a diagnostics
+             read can be distinguished from the chooser returning. -->
         <provider
             android:name=".CruiseMeshFileProvider"
             android:authorities="${applicationId}.fileprovider"

@@ -45,9 +45,7 @@ object DiagnosticsShare {
         if (files.isEmpty()) return null
         val archive = writeArchive(files, archiveFile(context))
         val uri = uriFor(context, archive ?: files.first())
-        // Drive (and most other targets) only open this URI after the user
-        // picks a folder or hits send. That open is what the confirmation
-        // toast waits on -- the chooser result fires too early.
+        // Chooser result is not a read; confirmation waits for this URI.
         DiagnosticsShareHandoff.expect(uri.toString())
         return Intent(Intent.ACTION_SEND).apply {
             if (archive != null) {
