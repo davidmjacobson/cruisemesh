@@ -31,7 +31,7 @@ use cruisemesh_core::{
     generate_identity, generate_msg_id, seal_group_message, seal_message, CarriedEnvelope,
     CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundSource, CoreMeetRequest,
     CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreTransport, Group,
-    Identity, MessageStore, SeenIds, DEFAULT_HOP_TTL,
+    Identity, MessageStore, SeenIds, StoredMessage, DEFAULT_HOP_TTL, KIND_TEXT,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -53,6 +53,10 @@ struct SimNode {
     router: CoreMeshRouterState,
     /// Per-device spray cadence / burst bucket.
     spray: CoreSprayPolicy,
+    /// Monotonic stream position for the rows [`SimNode::record_delivery`]
+    /// persists, so two opened messages never collide into the conflict
+    /// quarantine and get dropped from the digest.
+    delivered_seq: u64,
 }
 
 impl SimNode {
@@ -67,7 +71,40 @@ impl SimNode {
             inbox: Vec::new(),
             router,
             spray: CoreSprayPolicy::new(),
+            delivered_seq: 0,
         }
+    }
+
+    /// The shells' kind dispatch, reduced to the one effect the DTN rules
+    /// depend on: an opened payload becomes a durable `messages` row.
+    ///
+    /// This is what makes a node's next DIGEST able to name what it consumed
+    /// (`core_digest_advertised_msg_ids` reads `messages`), which is the only
+    /// evidence that ever retires a mule's 1:1 carry under `CARRY-01`. While
+    /// the sim opened straight into an in-memory `inbox` and skipped this, no
+    /// mule could ever obtain proof of receipt, and the suite could not tell a
+    /// correct planner from one that deleted at dispatch.
+    ///
+    /// The sim seals raw plaintext rather than an encoded `ExtendedMessageBody`
+    /// (see `author_and_flood`), so the row is synthesized from what a shell
+    /// would have decoded. Ordering matches the production callers: persist
+    /// first, commit the inbound transaction second — never the reverse.
+    fn record_delivery(&mut self, payload: &[u8], sender_user_id: &[u8], msg_id: Vec<u8>) {
+        self.delivered_seq += 1;
+        self.store
+            .insert_incoming_message(
+                StoredMessage {
+                    chat_id: sender_user_id.to_vec(),
+                    sender_user_id: sender_user_id.to_vec(),
+                    lamport: self.delivered_seq,
+                    timestamp: self.delivered_seq as i64,
+                    kind: KIND_TEXT,
+                    payload: payload.to_vec(),
+                },
+                msg_id,
+                None,
+            )
+            .expect("persist opened message");
     }
 
     fn user_id(&self) -> Vec<u8> {
@@ -94,7 +131,12 @@ impl SimNode {
                 now,
             )
             .expect("process inbound mesh frame");
+        let sender = outcome.delivered_sender.clone();
+        let delivered_msg_id = outcome.commit.as_ref().map(|commit| commit.msg_id.clone());
         for payload in outcome.delivered_payloads {
+            if let (Some(sender), Some(msg_id)) = (sender.as_ref(), delivered_msg_id.as_ref()) {
+                self.record_delivery(&payload, sender, msg_id.clone());
+            }
             self.inbox.push(payload);
         }
         // DTN D4: the sim's in-memory delivery cannot fail, so a delivered
@@ -131,7 +173,12 @@ impl SimNode {
                 now,
             )
             .expect("process inbound relay frame");
+        let sender = outcome.delivered_sender.clone();
+        let delivered_msg_id = outcome.commit.as_ref().map(|commit| commit.msg_id.clone());
         for payload in outcome.delivered_payloads {
+            if let (Some(sender), Some(msg_id)) = (sender.as_ref(), delivered_msg_id.as_ref()) {
+                self.record_delivery(&payload, sender, msg_id.clone());
+            }
             self.inbox.push(payload);
         }
         // DTN D4: commit the deferred `seen`/hidden-evidence bookkeeping now the
@@ -509,19 +556,13 @@ fn hop_ttl_bounds_the_flood() {
     );
 }
 
-// The hoisted planner encodes CARRY-01: a carried 1:1 is removed only on
-// digest-proof that the recipient holds it, never at dispatch. This test
-// expected the mule to drop its copy in the same `meet()` that handed the
-// envelope over — the old `Network::meet` shortcut
-// `if !sender_knows_group { remove_carried_envelope(...) }`. After one
-// encounter the recipient has opened the frame (inbox), but their digest
-// cannot advertise that `msg_id`: the sim's receive path does not persist a
-// `messages` row, so `core_digest_advertised_msg_ids` has nothing consumed
-// to name. Confirm therefore removes nothing, the mule still holds the
-// envelope, and `carried_len() == 0` fails. That assertion documents the
-// shortcut, not the invariant; leaving it green would require either
-// deleting on dispatch or silently changing receive to persist messages.
-#[ignore = "CARRY-01: mule must not drop a 1:1 carry at dispatch; sim receive does not persist a consumed msg_id the next digest could prove"]
+// This test used to assert the mule dropped its copy in the same `meet()`
+// that handed the envelope over — which is delete-on-dispatch, the opposite
+// of CARRY-01. It now walks the real sequence: offer, then proof on a later
+// encounter. Production Android never had the shortcut
+// (`InboundEnvelopeProcessor.drainCarriedEnvelopesTo` is offer-only:
+// "Never remove carried on send — digest proof only"); only this simulation
+// did, which meant the canonical DTN scenario was verifying the wrong rule.
 #[test]
 fn a_single_mule_carries_a_message_across_a_time_gap() {
     // The canonical DTN win: sender and recipient are never in contact, but a
@@ -554,10 +595,23 @@ fn a_single_mule_carries_a_message_across_a_time_gap() {
         vec![2],
         "the mule delivered it to the recipient"
     );
+    // CARRY-01: handing the frame over is not proof the peer stored it. The
+    // digest the mule read in THIS encounter was built before the delivery
+    // landed, so the durable copy must survive.
+    assert_eq!(
+        net.nodes[1].store.carried_len().unwrap(),
+        1,
+        "dispatch is not digest-proof; the mule keeps its copy"
+    );
+
+    // Round 3: they meet again. The recipient's digest now names the msg_id it
+    // consumed, and that proof — not the earlier send — is what retires the
+    // carry.
+    net.meet(later + 30_000);
     assert_eq!(
         net.nodes[1].store.carried_len().unwrap(),
         0,
-        "mule dropped it once delivered"
+        "mule dropped it once the recipient's digest proved receipt"
     );
 }
 
