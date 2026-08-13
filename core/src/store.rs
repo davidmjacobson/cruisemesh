@@ -1640,10 +1640,10 @@ impl MessageStore {
         Ok(out)
     }
 
-    /// Record that another live device presented `user_id` (the `.cmbak`-clone
-    /// failure mode in `specs/multi-device-v1.md` §1 / WPT). Shells call this
-    /// when a HELLO arrives with our own UserID. Stream-conflict quarantine
-    /// is the other detection path and does not need a separate write.
+    /// Record a durable clone warning for `user_id`. Stream-conflict
+    /// quarantine writes the same row so eviction of diagnostic
+    /// `message_conflicts` cannot hide the banner. Do not persist this from
+    /// an unauthenticated HELLO — that frame is spoofable.
     pub fn record_identity_clone_warning(
         &self,
         user_id: Vec<u8>,
@@ -1655,21 +1655,13 @@ impl MessageStore {
             ));
         }
         let conn = lock_conn(&self.conn);
-        conn.execute(
-            "INSERT INTO identity_clone_warnings (user_id, first_seen_at, last_seen_at)
-             VALUES (?1, ?2, ?2)
-             ON CONFLICT(user_id) DO UPDATE SET
-                 last_seen_at = MAX(identity_clone_warnings.last_seen_at, excluded.last_seen_at)",
-            params![user_id, now_ms],
-        )
-        .map_err(store_err)?;
-        Ok(())
+        upsert_identity_clone_warning(&conn, &user_id, now_ms)
     }
 
-    /// Whether this identity has been seen authoring from two live devices:
-    /// a recorded HELLO clone, or a quarantined stream conflict from that
-    /// sender. The shells use this to surface a safety warning instead of
-    /// leaving the quarantine silent.
+    /// Whether this identity has been seen authoring from two live devices.
+    /// `identity_clone_warnings` is the durable signal; `message_conflicts`
+    /// is still OR'd so a row that landed before the upsert still surfaces
+    /// until it is evicted.
     pub fn has_identity_clone_warning(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
         let conn = lock_conn(&self.conn);
         conn.query_row(
@@ -1984,6 +1976,22 @@ fn message_conflict_fingerprint(
     digest
 }
 
+fn upsert_identity_clone_warning(
+    conn: &Connection,
+    user_id: &[u8],
+    now_ms: i64,
+) -> Result<(), CoreError> {
+    conn.execute(
+        "INSERT INTO identity_clone_warnings (user_id, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET
+             last_seen_at = MAX(identity_clone_warnings.last_seen_at, excluded.last_seen_at)",
+        params![user_id, now_ms],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn quarantine_message_conflict(
     tx: &Transaction<'_>,
@@ -2048,6 +2056,9 @@ fn quarantine_message_conflict(
         ],
     )
     .map_err(store_err)?;
+    if !incoming.sender_user_id.is_empty() {
+        upsert_identity_clone_warning(tx, &incoming.sender_user_id, observed_at)?;
+    }
     tx.execute(
         "DELETE FROM message_conflicts
          WHERE id IN (
@@ -10645,9 +10656,9 @@ mod tests {
             b"from phone 1"
         );
 
-        // A HELLO from our own identity is the other half of the same guard
-        // (the two clones met on the mesh). It is recorded even before any
-        // stream conflict lands.
+        // Authenticated callers can still persist a warning without a
+        // conflict row (tests / a future proven-key path). Unauthenticated
+        // HELLO must not.
         let alice_phone = MessageStore::open(":memory:".to_string()).unwrap();
         alice_phone
             .record_identity_clone_warning(alice.to_vec(), 50_000)
@@ -10682,6 +10693,12 @@ mod tests {
         assert_eq!(
             store.message_conflict_summaries(1_000).unwrap().len(),
             MESSAGE_CONFLICT_QUARANTINE_LIMIT as usize
+        );
+        assert!(
+            store
+                .has_identity_clone_warning(b"sender".to_vec())
+                .unwrap(),
+            "clone warning must survive eviction of diagnostic quarantine rows"
         );
     }
 

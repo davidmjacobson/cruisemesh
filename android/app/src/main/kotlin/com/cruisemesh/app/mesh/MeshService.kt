@@ -32,7 +32,6 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.R
-import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
@@ -1175,7 +1174,6 @@ class MeshService : Service() {
         val previouslySelectedAddress = MeshRouter.routeFor(userId)?.second
         MeshRouter.onConnected(address, MeshRouterState.Transport.LAN)
         noteLinkChangeAndReevaluate("LAN peer authenticated")
-        notePossibleIdentityClone(userId)
         if (!MeshRouter.onHello(address, userId)) {
             Log.w(TAG, "Authenticated LAN link could not be registered")
             return
@@ -1462,7 +1460,6 @@ class MeshService : Service() {
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
             is Frame.Hello2 -> {
-                notePossibleIdentityClone(parsed.userId)
                 MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
             }
             is Frame.Envelope -> envelopeProcessor?.processInboundEnvelope(address, parsed, identity)
@@ -1656,14 +1653,6 @@ class MeshService : Service() {
      * a stranger. But the digest is still worth sending for the carried
      * `msg_id` suppression above.
      */
-    /** WPT clone guard: two live devices presenting the same identity. */
-    private fun notePossibleIdentityClone(userId: ByteArray) {
-        val own = identity?.userId ?: return
-        if (!userId.contentEquals(own)) return
-        runCatching { store.recordIdentityCloneWarning(userId, System.currentTimeMillis()) }
-        ChatEvents.notifyChatChanged(userId)
-    }
-
     private fun handleHello(address: String, userId: ByteArray, identity: Identity) {
         // Register the address->userId mapping before anything else --
         // including the log line below -- to shrink the window for the
@@ -1674,7 +1663,6 @@ class MeshService : Service() {
         // visible.
         val previouslySelectedAddress = MeshRouter.routeFor(userId)?.second
         MeshRouter.setLocalUserId(identity.userId)
-        notePossibleIdentityClone(userId)
         if (!MeshRouter.onHello(address, userId)) {
             Log.w(TAG, "Dropping HELLO that conflicts with the authenticated identity for $address")
             return
