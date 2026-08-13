@@ -104,4 +104,14 @@ final class DiagnosticsArchiveTests: XCTestCase {
             "unexpected archive name: \(name)"
         )
     }
+
+    /// Drive (and Files) dismiss without saying they took the archive. The
+    /// page only confirms when the system share sheet reports completion.
+    func testShareConfirmationRequiresCompletion() {
+        XCTAssertEqual(
+            DiagnosticsShareFeedback.confirmationMessage(completed: true),
+            String(localized: "Diagnostics shared.")
+        )
+        XCTAssertNil(DiagnosticsShareFeedback.confirmationMessage(completed: false))
+    }
 }

@@ -44,16 +44,21 @@ object DiagnosticsShare {
         val files = capturedFiles(context)
         if (files.isEmpty()) return null
         val archive = writeArchive(files, archiveFile(context))
+        val uri = uriFor(context, archive ?: files.first())
+        // Drive (and most other targets) only open this URI after the user
+        // picks a folder or hits send. That open is what the confirmation
+        // toast waits on -- the chooser result fires too early.
+        DiagnosticsShareHandoff.expect(uri.toString())
         return Intent(Intent.ACTION_SEND).apply {
             if (archive != null) {
                 type = "application/zip"
-                putExtra(Intent.EXTRA_STREAM, uriFor(context, archive))
+                putExtra(Intent.EXTRA_STREAM, uri)
             } else {
                 // Zipping is a disk write and can fail -- a full device, most
                 // likely. Sending the log alone beats telling someone who has
                 // captured diagnostics that they have none.
                 type = mimeFor(files.first())
-                putExtra(Intent.EXTRA_STREAM, uriFor(context, files.first()))
+                putExtra(Intent.EXTRA_STREAM, uri)
             }
             putExtra(Intent.EXTRA_SUBJECT, "CruiseMesh diagnostics")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

@@ -1,6 +1,9 @@
 package com.cruisemesh.app.ui
 
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
 import androidx.compose.foundation.border
@@ -73,6 +76,8 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
@@ -80,6 +85,7 @@ import com.cruisemesh.app.debug.ConflictDiagnosticsExport
 import com.cruisemesh.app.debug.ProtocolEventExport
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.debug.DiagnosticsShare
+import com.cruisemesh.app.debug.DiagnosticsShareHandoff
 import com.cruisemesh.app.debug.FieldMetricsExport
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
@@ -1250,6 +1256,36 @@ private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: 
         mutableStateOf(DiagnosticsShare.hasAnythingCaptured(context))
     }
     var supportMessage by remember { mutableStateOf<String?>(null) }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val mainHandler = Handler(Looper.getMainLooper())
+        fun showShared() {
+            supportMessage = context.getString(R.string.ui_diagnostics_shared)
+            Toast.makeText(context, R.string.ui_diagnostics_shared, Toast.LENGTH_LONG).show()
+        }
+        fun tryShowShared() {
+            if (DiagnosticsShareHandoff.takeIfConsumed()) showShared()
+        }
+        // Drive opens the URI on a binder thread, often while its folder
+        // picker is still up. Toast then if we are already back; otherwise
+        // wait for ON_RESUME so the confirmation is not hidden behind Drive.
+        DiagnosticsShareHandoff.setListener {
+            mainHandler.post {
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    tryShowShared()
+                }
+            }
+        }
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) tryShowShared()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            DiagnosticsShareHandoff.setListener(null)
+            mainHandler.removeCallbacksAndMessages(null)
+        }
+    }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.weight(1f)) {

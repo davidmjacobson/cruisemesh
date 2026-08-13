@@ -141,9 +141,14 @@ struct ShareableFile: Identifiable {
 /// Minimal UIActivityViewController bridge for sharing an on-demand file.
 struct ActivityShareView: UIViewControllerRepresentable {
     let items: [Any]
+    var onComplete: ((Bool) -> Void)? = nil
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, completed, _, _ in
+            onComplete?(completed)
+        }
+        return controller
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}

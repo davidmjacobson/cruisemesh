@@ -99,6 +99,14 @@ enum DiagnosticsArchive {
     }
 }
 
+/// Confirmation after the system share sheet finishes. The sheet itself
+/// does not tell the page it succeeded, so Connection Details has to.
+enum DiagnosticsShareFeedback {
+    static func confirmationMessage(completed: Bool) -> String? {
+        completed ? String(localized: "Diagnostics shared.") : nil
+    }
+}
+
 enum DiagnosticsSharePlan: Equatable {
     case nothingCaptured
     case archive(URL)
