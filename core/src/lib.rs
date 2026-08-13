@@ -205,6 +205,10 @@ pub use ship_wifi::{
 // Package C0, driven from Android by package C1. Android reaches it only
 // behind a whole-pass engine selection that defaults to the legacy engine;
 // iOS does not reach it at all yet and compiles against this surface.
+// Plain Rust, deliberately not `#[uniffi::export]`: the shells still run
+// their own encounter loops. The sim is the first caller; a later package
+// can freeze a UniFFI surface once the planner is the only implementation.
+pub use session::mesh_meet::{CoreMeetOutcome, CoreMeetRequest, CoreMeetWork};
 pub use session::mesh_receive::{
     CoreInboundCommit, CoreInboundOutcome, CoreInboundSource, CoreInboundWork,
 };
