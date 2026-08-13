@@ -9,18 +9,16 @@
 //!
 //! It drives the **real** core primitives -- `seal_message`/`open_message`,
 //! the §6.4 frame codec, [`SeenIds`], and the [`MessageStore`] carry queue:
-//!   * receive: since package D0 this is no longer a third copy. `SimNode::receive`
+//!   * receive: this is no longer a third copy. `SimNode::receive`
 //!     and `SimNode::receive_from_relay` both call the one production inbound
 //!     transaction, [`MessageStore::process_inbound_frame`], which owns dedupe,
 //!     expiry, open-for-self/group-with-membership-guard, flood/carry
 //!     classification, and the ack-safety evidence. The sim only supplies the
 //!     frame and records the delivered payload; the disposition is core's.
-//!   * meeting (HELLO): first drain carried envelopes whose `recipient_hint`
-//!     matches the peer, handing each over and dropping it once delivered;
-//!     then spray the remaining carried envelopes onward to a non-recipient
-//!     mule, excluding any `msg_id`s that mule's digest says it already knows.
-//!     `Network::meet` still composes this from store primitives -- hoisting
-//!     the encounter/spray planner into core is package D2.
+//!   * meeting (HELLO): [`MessageStore::plan_mesh_meet`] owns the encounter
+//!     (targeted drain, digest exclusion, digest-confirm, budgeted spray).
+//!     `Network::meet` only decides who is adjacent and moves the returned
+//!     frames between them.
 //!   * relay: group-addressed uploads fan out into one row per member hint;
 //!     each node polls its own hints and, through the same core transaction,
 //!     only acks rows it consumed.
@@ -31,9 +29,9 @@ use std::sync::Arc;
 use cruisemesh_core::{
     compute_recipient_hint, core_group_fanout_rows, default_expiry, encode_envelope_frame,
     generate_identity, generate_msg_id, seal_group_message, seal_message, CarriedEnvelope,
-    CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundSource, CoreMeshRouterState,
-    CoreRelayEnvelopeDisposition, CoreTransport, Group, Identity, MessageStore, SeenIds,
-    DEFAULT_HOP_TTL,
+    CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundSource, CoreMeetRequest,
+    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreTransport, Group,
+    Identity, MessageStore, SeenIds, StoredMessage, DEFAULT_HOP_TTL, KIND_TEXT,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -51,16 +49,62 @@ struct SimNode {
     seen: Arc<SeenIds>,
     /// Plaintext of every message this node was the recipient of and opened.
     inbox: Vec<Vec<u8>>,
+    /// Per-device encounter state the planner records walk cursors on.
+    router: CoreMeshRouterState,
+    /// Per-device spray cadence / burst bucket.
+    spray: CoreSprayPolicy,
+    /// Monotonic stream position for the rows [`SimNode::record_delivery`]
+    /// persists, so two opened messages never collide into the conflict
+    /// quarantine and get dropped from the digest.
+    delivered_seq: u64,
 }
 
 impl SimNode {
     fn new() -> Self {
+        let identity = generate_identity();
+        let router = CoreMeshRouterState::new();
+        router.set_local_user_id(identity.user_id.clone());
         SimNode {
-            identity: generate_identity(),
+            identity,
             store: MessageStore::open(":memory:".to_string()).expect("open in-memory store"),
             seen: Arc::new(SeenIds::new()),
             inbox: Vec::new(),
+            router,
+            spray: CoreSprayPolicy::new(),
+            delivered_seq: 0,
         }
+    }
+
+    /// The shells' kind dispatch, reduced to the one effect the DTN rules
+    /// depend on: an opened payload becomes a durable `messages` row.
+    ///
+    /// This is what makes a node's next DIGEST able to name what it consumed
+    /// (`core_digest_advertised_msg_ids` reads `messages`), which is the only
+    /// evidence that ever retires a mule's 1:1 carry under `CARRY-01`. While
+    /// the sim opened straight into an in-memory `inbox` and skipped this, no
+    /// mule could ever obtain proof of receipt, and the suite could not tell a
+    /// correct planner from one that deleted at dispatch.
+    ///
+    /// The sim seals raw plaintext rather than an encoded `ExtendedMessageBody`
+    /// (see `author_and_flood`), so the row is synthesized from what a shell
+    /// would have decoded. Ordering matches the production callers: persist
+    /// first, commit the inbound transaction second — never the reverse.
+    fn record_delivery(&mut self, payload: &[u8], sender_user_id: &[u8], msg_id: Vec<u8>) {
+        self.delivered_seq += 1;
+        self.store
+            .insert_incoming_message(
+                StoredMessage {
+                    chat_id: sender_user_id.to_vec(),
+                    sender_user_id: sender_user_id.to_vec(),
+                    lamport: self.delivered_seq,
+                    timestamp: self.delivered_seq as i64,
+                    kind: KIND_TEXT,
+                    payload: payload.to_vec(),
+                },
+                msg_id,
+                None,
+            )
+            .expect("persist opened message");
     }
 
     fn user_id(&self) -> Vec<u8> {
@@ -87,7 +131,12 @@ impl SimNode {
                 now,
             )
             .expect("process inbound mesh frame");
+        let sender = outcome.delivered_sender.clone();
+        let delivered_msg_id = outcome.commit.as_ref().map(|commit| commit.msg_id.clone());
         for payload in outcome.delivered_payloads {
+            if let (Some(sender), Some(msg_id)) = (sender.as_ref(), delivered_msg_id.as_ref()) {
+                self.record_delivery(&payload, sender, msg_id.clone());
+            }
             self.inbox.push(payload);
         }
         // DTN D4: the sim's in-memory delivery cannot fail, so a delivered
@@ -124,7 +173,12 @@ impl SimNode {
                 now,
             )
             .expect("process inbound relay frame");
+        let sender = outcome.delivered_sender.clone();
+        let delivered_msg_id = outcome.commit.as_ref().map(|commit| commit.msg_id.clone());
         for payload in outcome.delivered_payloads {
+            if let (Some(sender), Some(msg_id)) = (sender.as_ref(), delivered_msg_id.as_ref()) {
+                self.record_delivery(&payload, sender, msg_id.clone());
+            }
             self.inbox.push(payload);
         }
         // DTN D4: commit the deferred `seen`/hidden-evidence bookkeeping now the
@@ -143,18 +197,6 @@ impl SimNode {
             hints.extend(recent_hints(&group.id, now));
         }
         hints
-    }
-
-    fn recognizes_group_hint(&self, recipient_hint: &[u8], now: i64) -> bool {
-        self.store
-            .list_groups()
-            .expect("list groups")
-            .into_iter()
-            .any(|group| {
-                recent_hints(&group.id, now)
-                    .iter()
-                    .any(|hint| hint == recipient_hint)
-            })
     }
 }
 
@@ -400,74 +442,58 @@ impl Network {
         }
     }
 
-    /// Every in-contact pair does the HELLO sync: first targeted carried
-    /// delivery to the true recipient, then spray-on-connect to a non-recipient
-    /// mule excluding any `msg_id`s the peer already knows. Mirrors
-    /// `MeshService.drainCarriedEnvelopesTo` plus `sprayCarriedEnvelopesTo`,
-    /// run in both directions for each edge.
+    /// Transport half of a HELLO encounter: each in-contact pair identifies,
+    /// the sender reads the peer's digest off the wire-equivalent store API,
+    /// core plans the encounter, and this method only moves the returned
+    /// frames. No disposition, spray, exclusion, or carried-removal policy
+    /// lives here.
     fn meet(&mut self, now: i64) {
         let n = self.nodes.len();
         for a in 0..n {
             let neighbors = self.adjacency[a].clone();
             for b in neighbors {
+                let address = format!("sim:{a}->{b}");
+                let peer_user_id = self.nodes[b].user_id();
+                // What the peer would put on a DIGEST frame. Fetching it is
+                // transport; acting on it is core's.
                 let peer_known_msg_ids = self.nodes[b]
                     .store
-                    .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
-                    .expect("peer carried msg ids");
-                let hints = self.nodes[b].recent_delivery_hints(now);
-                let drained = self.nodes[a]
-                    .store
-                    .carried_envelopes_for_hints(hints, now)
-                    .expect("query carried");
-                for env in drained {
-                    let sender_knows_group =
-                        self.nodes[a].recognizes_group_hint(&env.recipient_hint, now);
-                    if sender_knows_group
-                        && peer_known_msg_ids
-                            .iter()
-                            .any(|known_msg_id| known_msg_id == &env.msg_id)
-                    {
-                        continue;
+                    .core_digest_advertised_msg_ids()
+                    .expect("peer digest");
+                let frames = {
+                    let node = &self.nodes[a];
+                    if node.router.user_id_for(address.clone()).is_none() {
+                        node.router
+                            .on_connected(address.clone(), CoreTransport::Lan);
+                        assert!(node.router.on_hello(address.clone(), peer_user_id.clone()));
                     }
-                    if !sender_knows_group {
-                        self.nodes[a]
-                            .store
-                            .remove_carried_envelope(env.msg_id.clone())
-                            .expect("remove carried");
-                    }
-                    let frame = encode_envelope_frame(
-                        env.msg_id.clone(),
-                        env.hop_ttl,
-                        env.expiry,
-                        env.recipient_hint,
-                        env.sealed,
-                    );
+                    let outcome = node
+                        .store
+                        .plan_mesh_meet(
+                            &node.router,
+                            &node.spray,
+                            CoreMeetRequest {
+                                own_user_id: node.user_id(),
+                                peer_user_id,
+                                peer_address: address,
+                                peer_known_msg_ids,
+                                // The sim is a closed, trusted graph — meetings
+                                // here stand in for an identified session, not a
+                                // spoofable cleartext HELLO. CARRY-02 is owned by
+                                // the planner's `peer_authenticated` flag and the
+                                // module tests; flipping this to false would
+                                // disable digest-confirm for every sim edge.
+                                peer_authenticated: true,
+                                now_ms: now,
+                            },
+                        )
+                        .expect("plan encounter");
+                    outcome.frames().cloned().collect::<Vec<_>>()
+                };
+                for frame in frames {
                     self.transmissions += 1;
-                    // The peer opens it if it's theirs; if not (only on a hint
-                    // collision, vanishingly rare) they'd re-carry -- ignore the
-                    // relay return here, meetings don't cascade floods.
-                    let _ = self.nodes[b].receive(&frame, now);
-                }
-
-                let spray = self.nodes[a]
-                    .store
-                    .carried_envelopes_for_peer_sync(
-                        self.nodes[b].recent_delivery_hints(now),
-                        peer_known_msg_ids,
-                        now,
-                        u64::MAX,
-                        None,
-                    )
-                    .expect("query spray candidates");
-                for env in spray.rows {
-                    let frame = encode_envelope_frame(
-                        env.msg_id,
-                        env.hop_ttl,
-                        env.expiry,
-                        env.recipient_hint,
-                        env.sealed,
-                    );
-                    self.transmissions += 1;
+                    // Meetings do not cascade floods; the inbound path may
+                    // still return a re-flood frame, which we drop.
                     let _ = self.nodes[b].receive(&frame, now);
                 }
             }
@@ -530,6 +556,13 @@ fn hop_ttl_bounds_the_flood() {
     );
 }
 
+// This test used to assert the mule dropped its copy in the same `meet()`
+// that handed the envelope over — which is delete-on-dispatch, the opposite
+// of CARRY-01. It now walks the real sequence: offer, then proof on a later
+// encounter. Production Android never had the shortcut
+// (`InboundEnvelopeProcessor.drainCarriedEnvelopesTo` is offer-only:
+// "Never remove carried on send — digest proof only"); only this simulation
+// did, which meant the canonical DTN scenario was verifying the wrong rule.
 #[test]
 fn a_single_mule_carries_a_message_across_a_time_gap() {
     // The canonical DTN win: sender and recipient are never in contact, but a
@@ -562,10 +595,23 @@ fn a_single_mule_carries_a_message_across_a_time_gap() {
         vec![2],
         "the mule delivered it to the recipient"
     );
+    // CARRY-01: handing the frame over is not proof the peer stored it. The
+    // digest the mule read in THIS encounter was built before the delivery
+    // landed, so the durable copy must survive.
+    assert_eq!(
+        net.nodes[1].store.carried_len().unwrap(),
+        1,
+        "dispatch is not digest-proof; the mule keeps its copy"
+    );
+
+    // Round 3: they meet again. The recipient's digest now names the msg_id it
+    // consumed, and that proof — not the earlier send — is what retires the
+    // carry.
+    net.meet(later + 30_000);
     assert_eq!(
         net.nodes[1].store.carried_len().unwrap(),
         0,
-        "mule dropped it once delivered"
+        "mule dropped it once the recipient's digest proved receipt"
     );
 }
 

@@ -24,12 +24,20 @@
 //! intents. It is the single authority `core/tests/mesh_sim.rs` and (in D1) the
 //! shells' inbound processors call, replacing their duplicated receive logic.
 //!
+//! [`mesh_meet`] owns the encounter sequence: one call takes the peer's
+//! identity, their advertised digest, an explicit `now_ms`, and the process
+//! router / spray-policy objects, then returns the targeted-drain and
+//! budgeted-spray frames. Removal of a carried 1:1 is digest-confirm only
+//! (`CARRY-01` / `CARRY-02`). It is the single authority
+//! `core/tests/mesh_sim.rs` calls in place of the third copy it used to keep.
+//!
 //! [`relay_shadow`] is the migration canary's read-only planner: pure
 //! functions over values a shell captured from a legacy pass, so the two
 //! engines can be compared without either of them running twice. It calls
 //! `relay_pass`'s own planning helpers rather than restating them, and it is
 //! deleted with the legacy engine it exists to check.
 
+pub mod mesh_meet;
 pub mod mesh_receive;
 pub mod relay_pass;
 pub mod relay_policy;
