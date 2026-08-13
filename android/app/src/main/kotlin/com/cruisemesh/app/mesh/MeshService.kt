@@ -141,12 +141,12 @@ class MeshService : Service() {
     private var relaySync: RelaySyncEngine? = null
 
     /**
-     * Group digests this process has actually answered, keyed
-     * `peerHex/groupHex`. The 1:1 fallback still resends any shared group
-     * that is not in this set. Insert only after the spray gate allows —
-     * a gated first digest must not suppress later catch-up.
+     * Group digests answered on each live link. The 1:1 fallback still
+     * resends any shared group this link has not answered for. Record only
+     * after the spray gate allows — a gated first digest must not suppress
+     * later catch-up.
      */
-    private val groupDigestAnswers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val groupDigestAnswers = GroupDigestAnswers()
 
     /** Cached once; avoids re-reading [android.content.pm.ApplicationInfo.flags] on every [assertOffMainThreadForStore] call. */
     private val isDebuggableBuild: Boolean by lazy { DebugFileLog.isDebuggableBuild(this) }
@@ -1140,6 +1140,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
         if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
@@ -1157,6 +1158,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
         if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
@@ -1233,6 +1235,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
@@ -1905,7 +1908,7 @@ class MeshService : Service() {
             queuedBytes += envelopeProcessor?.syncGroupReceiptsToPeer(identity, contact, address) ?: 0L
         }
         SprayPolicy.noteBytesQueued(address, queuedBytes)
-        groupDigestAnswers += groupDigestAnswerKey(peerUserId, group.id)
+        groupDigestAnswers.note(address, group.id)
     }
 
     private fun scheduleDigestMaintenance() {
@@ -2159,9 +2162,6 @@ class MeshService : Service() {
      * Returns the sealed bytes queued so the caller can charge the link's
      * burst allowance (#280).
      */
-    private fun groupDigestAnswerKey(peerUserId: ByteArray, groupId: ByteArray): String =
-        "${UserIdHex.encode(peerUserId)}/${UserIdHex.encode(groupId)}"
-
     private fun resendGroupOutboundToPeer(
         address: String,
         peerUserId: ByteArray,
@@ -2173,7 +2173,7 @@ class MeshService : Service() {
         var queuedBytes = 0L
         for (group in store.listGroups()) {
             if (onlyGroupId != null && !group.id.contentEquals(onlyGroupId)) continue
-            if (skipAnsweredGroups && groupDigestAnswerKey(peerUserId, group.id) in groupDigestAnswers) continue
+            if (skipAnsweredGroups && groupDigestAnswers.answered(address, group.id)) continue
             if (!group.memberUserIds.any { it.contentEquals(peerUserId) }) continue
             if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
             val envelopes = store.outboundEnvelopesAfter(group.id, identity.userId, afterLamport)
