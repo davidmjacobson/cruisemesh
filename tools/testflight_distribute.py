@@ -5,21 +5,31 @@ review. `altool --upload-app` gets the binary to App Store Connect but does NOT
 make it visible to an external group's testers -- that needs the group + review
 steps below.
 
-Best-effort by design: it logs outcomes and never raises to fail the release
-(the caller runs it continue-on-error), because the upload -- the hard part --
-has already succeeded by the time this runs. A slow processing queue or a
-transient API hiccup should not red a release whose build is safely on
-TestFlight.
+Exit code is the verdict: 0 means the build is in the beta group and
+review-submit did not fail. Anything else means testers may not see it.
+This used to return 0 on every giving-up path -- build never visible,
+still processing, group not found -- which made the caller write
+"Distributed build ... to the beta group" to the run summary for a build
+no tester could see. 1.0.4 shipped to TestFlight and reached nobody
+exactly that way. The release job keeps `continue-on-error` on this
+step, so a slow processing queue still does not red a landed release; it
+just stops claiming a distribution that did not happen.
 
 Usage: testflight_distribute.py <key.p8> <key_id> <issuer_id> <build_number> [group_name]
+
+Set EXPECT_MARKETING_VERSION to have the build's own marketing version checked
+before distributing -- the build number alone does not prove App Store Connect
+matched the version this release meant to ship.
 
 Auth uses PyJWT's ES256 (App Store Connect keys are ECDSA P-256); PyJWT handles
 the JOSE raw-signature encoding that a hand-rolled cryptography signer would get
 wrong.
 """
 import json
+import os
 import sys
 import time
+from typing import NoReturn
 
 import jwt
 import requests
@@ -29,6 +39,7 @@ KEY_ID = sys.argv[2]
 ISSUER_ID = sys.argv[3]
 BUILD_NUMBER = sys.argv[4]
 GROUP_NAME = sys.argv[5] if len(sys.argv) > 5 else "Family Cruise"
+EXPECT_MARKETING_VERSION = os.environ.get("EXPECT_MARKETING_VERSION", "").strip()
 
 BUNDLE_ID = "com.cruisemesh.app"
 API = "https://api.appstoreconnect.apple.com"
@@ -58,6 +69,31 @@ def api(method: str, path: str, body: dict = None) -> requests.Response:
     )
 
 
+def die(message: str) -> NoReturn:
+    """Stop with a nonzero exit so the caller's summary tells the truth."""
+    print(f"FAIL: {message}")
+    sys.exit(1)
+
+
+def get_list(path: str, what: str) -> list:
+    """GET a collection, refusing to treat an API error as 'no results'.
+
+    Every caller below used to index `["data"][0]` straight off the response,
+    which turns an auth failure or a 500 into a KeyError traceback rather than a
+    legible verdict -- and an empty list into an IndexError.
+    """
+    resp = api("GET", path)
+    if resp.status_code >= 300:
+        die(f"{what} query HTTP {resp.status_code}: {resp.text[:300]}")
+    try:
+        data = resp.json().get("data")
+    except ValueError:
+        die(f"{what} query returned non-JSON: {resp.text[:300]}")
+    if not isinstance(data, list):
+        die(f"{what} query returned no data list: {resp.text[:300]}")
+    return data
+
+
 def main() -> None:
     build = None
     for i in range(POLL_TRIES):
@@ -77,23 +113,42 @@ def main() -> None:
         time.sleep(POLL_SECONDS)
 
     if not build:
-        print("WARN: build never became visible; it's uploaded — distribute manually if needed.")
-        return
+        die(
+            f"build {BUILD_NUMBER} never became visible after "
+            f"{POLL_TRIES * POLL_SECONDS // 60} minutes; it is uploaded but with no tester. "
+            "Re-run this script once App Store Connect shows the build."
+        )
     state = build["attributes"]["processingState"]
     if state != "VALID":
-        print(f"WARN: processingState={state}, not VALID; skipping distribution.")
-        return
+        die(f"processingState={state}, not VALID; nothing was distributed.")
     build_id = build["id"]
 
-    app_id = api("GET", f"/v1/apps?filter[bundleId]={BUNDLE_ID}").json()["data"][0]["id"]
+    # The build number alone can match a build App Store Connect assembled from
+    # a different marketing version; check the train before handing it to
+    # testers.
+    if EXPECT_MARKETING_VERSION:
+        pre = api("GET", f"/v1/builds/{build_id}/preReleaseVersion")
+        if pre.status_code >= 300:
+            die(f"preReleaseVersion query HTTP {pre.status_code}: {pre.text[:300]}")
+        actual = ((pre.json().get("data") or {}).get("attributes") or {}).get("version")
+        if actual != EXPECT_MARKETING_VERSION:
+            die(
+                f"build {BUILD_NUMBER} reports marketing version {actual!r}, "
+                f"expected {EXPECT_MARKETING_VERSION!r}; refusing to distribute."
+            )
+        print(f"marketing version {actual} matches the release.")
+
+    apps = get_list(f"/v1/apps?filter[bundleId]={BUNDLE_ID}", "apps")
+    if not apps:
+        die(f"no app with bundle id {BUNDLE_ID} is visible to this API key.")
+    app_id = apps[0]["id"]
     groups = [
         g
-        for g in api("GET", f"/v1/betaGroups?filter[app]={app_id}&limit=200").json()["data"]
+        for g in get_list(f"/v1/betaGroups?filter[app]={app_id}&limit=200", "beta groups")
         if g["attributes"]["name"] == GROUP_NAME
     ]
     if not groups:
-        print(f"WARN: beta group '{GROUP_NAME}' not found; skipping distribution.")
-        return
+        die(f"beta group '{GROUP_NAME}' not found; nothing was distributed.")
     group_id = groups[0]["id"]
 
     resp = api(
@@ -102,21 +157,42 @@ def main() -> None:
         {"data": [{"type": "builds", "id": build_id}]},
     )
     print(f"add to '{GROUP_NAME}': HTTP {resp.status_code}")
+    if resp.status_code >= 300:
+        # 409 on a re-run is expected once the build is already in the group.
+        # Membership GET below is the verdict.
+        print(f"add returned {resp.status_code}: {resp.text[:300]}")
 
     resp = api(
         "POST",
         "/v1/betaAppReviewSubmissions",
         {"data": {"type": "betaAppReviewSubmissions", "relationships": {"build": {"data": {"type": "builds", "id": build_id}}}}},
     )
-    # A build whose version was already beta-approved re-submits cleanly / is a
-    # no-op; only log the body when it's an unexpected error.
+    # A build whose version was already beta-approved re-submits cleanly.
     if resp.status_code >= 300 and "already" not in resp.text.lower():
-        print(f"beta review submit: HTTP {resp.status_code}: {resp.text[:300]}")
-    else:
-        print(f"beta review submit: HTTP {resp.status_code}")
+        die(f"beta review submit HTTP {resp.status_code}: {resp.text[:300]}")
+    print(f"beta review submit: HTTP {resp.status_code}")
+
+    # Read the membership back rather than trusting the POST: this is the exact
+    # fact the run summary claims, so assert it against App Store Connect.
+    member_of = [
+        g["attributes"]["name"]
+        for g in get_list(f"/v1/builds/{build_id}/betaGroups?limit=200", "build beta groups")
+    ]
+    if GROUP_NAME not in member_of:
+        die(
+            f"'{GROUP_NAME}' is not among the build's beta groups after the add "
+            f"(saw: {member_of or 'none'})."
+        )
 
     detail = (api("GET", f"/v1/builds/{build_id}/buildBetaDetail").json().get("data") or {}).get("attributes", {})
-    print(f"DONE: internal={detail.get('internalBuildState')} external={detail.get('externalBuildState')}")
+    external = detail.get("externalBuildState")
+    if external == "MISSING_EXPORT_COMPLIANCE":
+        die(
+            f"build {BUILD_NUMBER} is in '{GROUP_NAME}' but externalBuildState="
+            f"{external}; testers cannot install."
+        )
+    print(f"DONE: internal={detail.get('internalBuildState')} external={external}")
+    print(f"Build {BUILD_NUMBER} is in '{GROUP_NAME}'.")
 
 
 if __name__ == "__main__":

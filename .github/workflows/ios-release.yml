@@ -95,6 +95,13 @@ jobs:
             -archivePath build/CruiseMesh.xcarchive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
 
+      # Runs whether or not signing secrets are set, so an unsigned dry run
+      # still catches a missing manifest before a real release does.
+      - name: Assert the privacy manifest is in the archive
+        run: |
+          tools/assert_privacy_manifest.sh \
+            ios/build/CruiseMesh.xcarchive/Products/Applications/CruiseMesh.app
+
       - name: Import signing certificate and profile
         if: env.IOS_ENABLED == 'true'
         env:
@@ -143,6 +150,7 @@ jobs:
             -archivePath build/CruiseMesh.xcarchive \
             -exportPath build/export \
             -exportOptionsPlist ExportOptions-AppStoreConnect.plist
+          ../tools/assert_privacy_manifest.sh build/export/CruiseMesh.ipa
           xcrun altool --upload-app \
             -f build/export/CruiseMesh.ipa \
             -t ios \
@@ -150,11 +158,12 @@ jobs:
             --apiIssuer "$ASC_API_ISSUER_ID"
           echo "Uploaded build ${{ steps.version.outputs.build }} (${{ steps.version.outputs.marketing }}) to TestFlight."
 
-      # Best-effort: wait for processing, add to the beta group, submit for beta
-      # review. continue-on-error so a slow queue never reds a landed release --
-      # but that also means a REAL failure here is silent, and the job still
-      # reports success, so the step writes its own verdict to the run summary.
-      # 1.0.4 shipped to TestFlight and reached nobody exactly this way.
+      # Wait for processing, add to the beta group, submit for beta review.
+      # continue-on-error so a slow queue never reds a landed release -- the
+      # step writes its own verdict to the run summary instead. That only works
+      # because the script's exit code is honest: it exits nonzero on every
+      # giving-up path rather than returning 0 with a warning, which is how
+      # 1.0.4 reported a distribution that reached nobody.
       #
       # Install into a venv rather than `python3 -m pip install`: the runner's
       # python3 is Homebrew's, and Homebrew marks it externally managed
@@ -166,6 +175,7 @@ jobs:
         env:
           ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
           ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          EXPECT_MARKETING_VERSION: ${{ steps.version.outputs.marketing }}
         run: |
           set -o pipefail
           venv="$RUNNER_TEMP/testflight-venv"

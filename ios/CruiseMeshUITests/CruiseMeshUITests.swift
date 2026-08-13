@@ -5,6 +5,13 @@ final class CruiseMeshUITests: XCTestCase {
     private var app: XCUIApplication!
     private var scenario = ""
 
+    /// Waits here are about a busy shared CI runner, not about product latency:
+    /// the simulator shares a machine with a build, so an element that appears
+    /// instantly by hand can take seconds there. Short timeouts made this suite
+    /// fail on a different test every run. A too-generous timeout costs nothing
+    /// when the element does appear; a too-tight one reds the only gate iOS has.
+    private static let uiTimeout: TimeInterval = 10
+
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
@@ -165,7 +172,7 @@ final class CruiseMeshUITests: XCTestCase {
         // through the UI-test-only control that uses the same bindings as the
         // human path, then assert the keyboard accessory is hittable.
         let seed = element("friends.uitest-seed-card")
-        XCTAssertTrue(seed.waitForExistence(timeout: 5), "UI-test seed control missing")
+        XCTAssertTrue(seed.waitForExistence(timeout: Self.uiTimeout), "UI-test seed control missing")
         // Section sits under QR actions; scroll until the seed control is tappable.
         for _ in 0..<6 where !seed.isHittable {
             app.swipeUp()
@@ -182,11 +189,8 @@ final class CruiseMeshUITests: XCTestCase {
 
     func testComposerSendsOneVisibleMessageAndClearsDraft() {
         launch(scenario: "chat")
-        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
-
-        let bob = app.staticTexts["Bob"].firstMatch
-        XCTAssertTrue(bob.waitForExistence(timeout: 10))
-        bob.tap()
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
+        openChat(named: "Bob")
 
         let composer = element("chat.composer.text").waitForExistence(timeout: 10)
             ? element("chat.composer.text")
@@ -216,11 +220,8 @@ final class CruiseMeshUITests: XCTestCase {
 
     func testRecipientNameStaysVisibleWhileComposing() {
         launch(scenario: "chat")
-        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
-
-        let bob = app.staticTexts["Bob"].firstMatch
-        XCTAssertTrue(bob.waitForExistence(timeout: 10))
-        bob.tap()
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
+        openChat(named: "Bob")
 
         let composer = element("chat.composer.text").waitForExistence(timeout: 10)
             ? element("chat.composer.text")
@@ -239,9 +240,8 @@ final class CruiseMeshUITests: XCTestCase {
 
     func testContactVerificationAndDeleteCancellationAreSafe() {
         launch(scenario: "chat")
-        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
-        app.staticTexts["Bob"].firstMatch.tap()
-        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 5))
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
+        openChat(named: "Bob")
 
         element("chat.contact-details").tap()
         XCTAssertTrue(element("screen.contact-details").waitForExistence(timeout: 5))
@@ -268,25 +268,21 @@ final class CruiseMeshUITests: XCTestCase {
 
     func testChatListMarkReadAndDeleteRequireDeliberateActions() {
         launch(scenario: "chat-list-actions")
-        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
         let dad = app.staticTexts["Dad"].firstMatch
-        XCTAssertTrue(dad.waitForExistence(timeout: 5), "Saved nickname should label the chat row")
-        let dadRow = app.cells.containing(.staticText, identifier: "Dad").firstMatch
-        XCTAssertTrue(dadRow.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            dad.waitForExistence(timeout: Self.uiTimeout),
+            "Saved nickname should label the chat row"
+        )
 
-        dadRow.swipeLeft()
-        let markRead = app.buttons["Mark as read"]
-        XCTAssertTrue(markRead.waitForExistence(timeout: 3))
-        markRead.tap()
+        revealSwipeAction(inRowLabeled: "Dad", named: "Mark as read").tap()
 
-        let refreshedDadRow = app.cells.containing(.staticText, identifier: "Dad").firstMatch
-        XCTAssertTrue(refreshedDadRow.waitForExistence(timeout: 3))
-        refreshedDadRow.swipeLeft()
+        // Marking read removes that action, so the second swipe should offer
+        // Delete alone.
+        let delete = revealSwipeAction(inRowLabeled: "Dad", named: "Delete")
         XCTAssertFalse(app.buttons["Mark as read"].exists)
-        let delete = app.buttons["Delete"]
-        XCTAssertTrue(delete.waitForExistence(timeout: 3))
         delete.tap()
-        XCTAssertTrue(app.alerts["Delete Dad?"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.alerts["Delete Dad?"].waitForExistence(timeout: Self.uiTimeout))
         app.alerts["Delete Dad?"].buttons["Cancel"].tap()
         XCTAssertTrue(dad.exists)
         attachScreenshot(named: "Chat-list-actions-nickname-mark-read-delete-cancel")
@@ -294,14 +290,13 @@ final class CruiseMeshUITests: XCTestCase {
 
     func testIncomingMessageWhileReadingHistoryShowsUsableJumpAction() {
         launch(scenario: "chat-late-arrival")
-        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: 10))
-        app.staticTexts["Bob"].firstMatch.tap()
-        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["History message 32"].waitForExistence(timeout: 5))
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
+        openChat(named: "Bob")
+        XCTAssertTrue(app.staticTexts["History message 32"].waitForExistence(timeout: Self.uiTimeout))
 
         for _ in 0..<4 { app.swipeDown() }
         let inject = element("chat.uitest-inject-incoming")
-        XCTAssertTrue(inject.waitForExistence(timeout: 3))
+        XCTAssertTrue(inject.waitForExistence(timeout: Self.uiTimeout))
         inject.tap()
 
         // Assert the control through the name VoiceOver users interact with.
@@ -309,7 +304,7 @@ final class CruiseMeshUITests: XCTestCase {
         // current SDK, but does not propagate its view identifier into the
         // accessibility snapshot.
         let jump = app.buttons["New messages"].firstMatch
-        XCTAssertTrue(jump.waitForExistence(timeout: 5))
+        XCTAssertTrue(jump.waitForExistence(timeout: Self.uiTimeout))
         XCTAssertTrue(jump.isHittable)
         attachScreenshot(named: "Chat-new-messages-action")
         jump.tap()
@@ -331,6 +326,70 @@ final class CruiseMeshUITests: XCTestCase {
 
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// Taps a chat-list row and waits for the thread to actually be on screen.
+    ///
+    /// Tests used to tap the row and go straight to querying the composer, so a
+    /// tap the list swallowed while it was still settling surfaced much later
+    /// as "the composer does not exist" — a confusing failure a long way from
+    /// its cause. Assert the navigation happened, and retry the tap once.
+    private func openChat(
+        named contact: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let row = app.staticTexts[contact].firstMatch
+        XCTAssertTrue(
+            row.waitForExistence(timeout: Self.uiTimeout),
+            "No chat row for \(contact)",
+            file: file,
+            line: line
+        )
+        row.tap()
+        let chat = element("screen.chat")
+        if chat.waitForExistence(timeout: Self.uiTimeout) { return }
+        app.staticTexts[contact].firstMatch.tap()
+        XCTAssertTrue(
+            chat.waitForExistence(timeout: Self.uiTimeout),
+            "Tapping \(contact) did not open the chat thread",
+            file: file,
+            line: line
+        )
+    }
+
+    /// Reveals a trailing swipe action on a chat-list row and returns it.
+    ///
+    /// Both halves matter on CI. The row is re-queried on every attempt: a row
+    /// captured before a swipe can refer to a cell the list has since rebuilt,
+    /// and swiping it does nothing visible. And the swipe itself is retried,
+    /// because a single dropped gesture on a loaded runner was reliably reading
+    /// as "the app never offered Delete". Safe to repeat: the list declares
+    /// `allowsFullSwipe: false`, so an extra swipe can never fire the
+    /// destructive action on its own.
+    @discardableResult
+    private func revealSwipeAction(
+        inRowLabeled label: String,
+        named action: String,
+        attempts: Int = 3,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) -> XCUIElement {
+        for _ in 0..<attempts {
+            let row = app.cells.containing(.staticText, identifier: label).firstMatch
+            guard row.waitForExistence(timeout: Self.uiTimeout) else { continue }
+            row.swipeLeft()
+            let button = app.buttons[action]
+            if button.waitForExistence(timeout: Self.uiTimeout), button.isHittable {
+                return button
+            }
+        }
+        XCTFail(
+            "Swiping the '\(label)' row never revealed '\(action)' in \(attempts) attempts",
+            file: file,
+            line: line
+        )
+        return app.buttons[action]
     }
 
     private func attachScreenshot(named name: String) {
