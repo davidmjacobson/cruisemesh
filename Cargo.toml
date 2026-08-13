@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["core", "relayd", "desktop"]
-default-members = ["core", "relayd"]
+default-members = ["core", "relayd", "desktop"]
 exclude = ["desktop/ui/src-tauri"]
 
 [workspace.package]
