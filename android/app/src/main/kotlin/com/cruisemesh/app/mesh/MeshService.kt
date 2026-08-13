@@ -141,12 +141,12 @@ class MeshService : Service() {
     private var relaySync: RelaySyncEngine? = null
 
     /**
-     * Peers that have sent us at least one group-scoped DIGEST this process.
-     * Once they have, the lamport-0 group catch-up is redundant and we send
-     * only what their watermark asked for. Old clients never send those
-     * frames, so they keep the fallback.
+     * Group digests this process has actually answered, keyed
+     * `peerHex/groupHex`. The 1:1 fallback still resends any shared group
+     * that is not in this set. Insert only after the spray gate allows —
+     * a gated first digest must not suppress later catch-up.
      */
-    private val groupDigestPeers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val groupDigestAnswers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     /** Cached once; avoids re-reading [android.content.pm.ApplicationInfo.flags] on every [assertOffMainThreadForStore] call. */
     private val isDebuggableBuild: Boolean by lazy { DebugFileLog.isDebuggableBuild(this) }
@@ -1893,7 +1893,6 @@ class MeshService : Service() {
             Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
             return
         }
-        groupDigestPeers += UserIdHex.encode(peerUserId)
         val gate = SprayPolicy.maySpray(peerUserId, address, CoreSprayTrigger.PEER_DIGEST)
         if (!gate.allow) {
             Log.i(TAG, "Skipping group DIGEST for $address: ${gate.reason}")
@@ -1906,6 +1905,7 @@ class MeshService : Service() {
             queuedBytes += envelopeProcessor?.syncGroupReceiptsToPeer(identity, contact, address) ?: 0L
         }
         SprayPolicy.noteBytesQueued(address, queuedBytes)
+        groupDigestAnswers += groupDigestAnswerKey(peerUserId, group.id)
     }
 
     private fun scheduleDigestMaintenance() {
@@ -2131,9 +2131,14 @@ class MeshService : Service() {
             MeshRouter.recordHiddenOffered(address, newlyOffered)
             // New peers advertise per-group watermarks. Old clients never do,
             // so they still get the lamport-0 catch-up (inserts are idempotent).
-            if (UserIdHex.encode(resolvedPeerUserId) !in groupDigestPeers) {
-                queuedBytes += resendGroupOutboundToPeer(address, resolvedPeerUserId, identity, 0uL)
-            }
+            // Skip only groups this peer already got an answered digest for.
+            queuedBytes += resendGroupOutboundToPeer(
+                address,
+                resolvedPeerUserId,
+                identity,
+                0uL,
+                skipAnsweredGroups = true,
+            )
         }
         // Charged before the plan is built, so `sprayDigestPlanTo`'s own
         // admission sees a link allowance that already reflects what this
@@ -2154,16 +2159,21 @@ class MeshService : Service() {
      * Returns the sealed bytes queued so the caller can charge the link's
      * burst allowance (#280).
      */
+    private fun groupDigestAnswerKey(peerUserId: ByteArray, groupId: ByteArray): String =
+        "${UserIdHex.encode(peerUserId)}/${UserIdHex.encode(groupId)}"
+
     private fun resendGroupOutboundToPeer(
         address: String,
         peerUserId: ByteArray,
         identity: Identity,
         afterLamport: ULong,
         onlyGroupId: ByteArray? = null,
+        skipAnsweredGroups: Boolean = false,
     ): Long {
         var queuedBytes = 0L
         for (group in store.listGroups()) {
             if (onlyGroupId != null && !group.id.contentEquals(onlyGroupId)) continue
+            if (skipAnsweredGroups && groupDigestAnswerKey(peerUserId, group.id) in groupDigestAnswers) continue
             if (!group.memberUserIds.any { it.contentEquals(peerUserId) }) continue
             if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
             val envelopes = store.outboundEnvelopesAfter(group.id, identity.userId, afterLamport)

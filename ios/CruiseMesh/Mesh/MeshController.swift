@@ -87,9 +87,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// mesh event state.
     private let failoverResumeDebounce = FailoverResumeDebounce()
     private var identity: Identity!
-    /// Peers that have sent a group-scoped DIGEST this process. Old clients
-    /// never do, so they keep the lamport-0 group catch-up.
-    private var groupDigestPeers = Set<Data>()
+    /// Group digests this process has actually answered, keyed
+    /// `peerHex/groupHex`. The 1:1 fallback still resends any shared group
+    /// that is not in this set. Insert only after the spray gate allows.
+    private var groupDigestAnswers = Set<String>()
     private var relayTimer: DispatchSourceTimer?
     /// CP2b: epoch ms until which relayd asked us not to sync again
     /// (`Retry-After` on a 429); 0 = no backoff. `runRelaySync` drops nudges
@@ -1247,7 +1248,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.warning("Dropping DIGEST from \(address, privacy: .public)")
             return
         }
-        groupDigestPeers.insert(peerUserId)
         let gate = SprayPolicy.maySpray(
             peerUserId: peerUserId,
             address: address,
@@ -1269,6 +1269,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             queuedBytes += syncGroupReceiptsToPeer(identity: identity, contact: contact, address: address)
         }
         SprayPolicy.noteBytesQueued(address: address, bytes: queuedBytes)
+        groupDigestAnswers.insert(groupDigestAnswerKey(peerUserId: peerUserId, groupId: group.id))
     }
 
     /// Battery, 2026-07-21: foreground-only (see `setAppForeground`). This
@@ -1461,14 +1462,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             }
             MeshRouter.recordHiddenOffered(address: address, msgIds: newlyOffered)
         }
-        if !groupDigestPeers.contains(peerUserId) {
-            queuedBytes += resendGroupOutboundToPeer(
-                address: address,
-                peerUserId: peerUserId,
-                identity: identity,
-                afterLamport: 0
-            )
-        }
+        queuedBytes += resendGroupOutboundToPeer(
+            address: address,
+            peerUserId: peerUserId,
+            identity: identity,
+            afterLamport: 0,
+            skipAnsweredGroups: true
+        )
         // Charged before the plan is built, so `sprayDigestPlanTo`'s own
         // admission sees a link allowance that already reflects what this
         // encounter has queued.
@@ -3052,19 +3052,28 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// always restarts at lamport 0, so cutting it would make later envelopes
     /// unreachable. Charging it means the *next* trigger on this link waits for
     /// the radio instead (#280).
+    private func groupDigestAnswerKey(peerUserId: Data, groupId: Data) -> String {
+        "\(UserIdHex.encode(peerUserId))/\(UserIdHex.encode(groupId))"
+    }
+
     @discardableResult
     private func resendGroupOutboundToPeer(
         address: String,
         peerUserId: Data,
         identity: Identity,
         afterLamport: UInt64,
-        onlyGroupId: Data? = nil
+        onlyGroupId: Data? = nil,
+        skipAnsweredGroups: Bool = false
     ) -> Int {
         var queuedBytes = 0
         let groups = (try? store.listGroups()) ?? []
         for group in groups where group.memberUserIds.contains(peerUserId)
             && group.memberUserIds.contains(identity.userId) {
             if let onlyGroupId, group.id != onlyGroupId { continue }
+            if skipAnsweredGroups,
+               groupDigestAnswers.contains(groupDigestAnswerKey(peerUserId: peerUserId, groupId: group.id)) {
+                continue
+            }
             let envelopes = (try? store.outboundEnvelopesAfter(
                 chatId: group.id,
                 senderUserId: identity.userId,

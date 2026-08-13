@@ -2481,10 +2481,12 @@ impl MessageStore {
             .optional()
             .map_err(store_err)?
             .unwrap_or(0);
+        let last_message_timestamp = last_message.as_ref().map(|m| m.timestamp).unwrap_or(0);
         let (own_delivered_through, own_read_through) = group_preview_watermarks(
             &conn,
             &chat_id,
             &own_user_id,
+            last_message_timestamp,
             own_delivered_through,
             own_read_through,
         )?;
@@ -8185,11 +8187,14 @@ fn unix_now_ms() -> i64 {
 }
 
 /// If `chat_id` is a group, the list-row ticks are the min watermark every
-/// other current member has reported. 1:1 chats keep the `receipts` values.
+/// other member who already belonged when the last message was sent has
+/// reported. Late joiners are left out, matching `core_group_tick_status_for`.
+/// 1:1 chats keep the `receipts` values.
 fn group_preview_watermarks(
     conn: &Connection,
     chat_id: &[u8],
     own_user_id: &[u8],
+    last_message_timestamp: i64,
     pairwise_delivered: i64,
     pairwise_read: i64,
 ) -> Result<(i64, i64), CoreError> {
@@ -8204,11 +8209,25 @@ fn group_preview_watermarks(
     if is_group.is_none() {
         return Ok((pairwise_delivered, pairwise_read));
     }
-    let members = load_group_members(conn, chat_id)?;
-    let others: Vec<Vec<u8>> = members
-        .into_iter()
-        .filter(|member| member.as_slice() != own_user_id)
-        .collect();
+    let mut stmt = conn
+        .prepare("SELECT user_id, added_at_ms FROM group_members WHERE group_id = ?1")
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(params![chat_id], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(store_err)?;
+    let mut others: Vec<Vec<u8>> = Vec::new();
+    for row in rows {
+        let (member, added_at_ms) = row.map_err(store_err)?;
+        if member.as_slice() == own_user_id {
+            continue;
+        }
+        if added_at_ms > 0 && added_at_ms > last_message_timestamp {
+            continue;
+        }
+        others.push(member);
+    }
     if others.is_empty() {
         return Ok((i64::MAX, i64::MAX));
     }
@@ -15277,6 +15296,56 @@ mod tests {
             .unwrap();
         assert_eq!(founder.added_at_ms, 0);
         assert!(joiner.added_at_ms > 0);
+    }
+
+    #[test]
+    fn group_chat_preview_excludes_late_joiners_from_watermarks() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut family = group(0x11, "Family", 0x22, &[b"me", b"alice"]);
+        store.upsert_group(family.clone()).unwrap();
+        let me = test_user_id(b"me");
+        let alice = test_user_id(b"alice");
+        store
+            .insert_message(StoredMessage {
+                chat_id: family.id.clone(),
+                sender_user_id: me.clone(),
+                lamport: 3,
+                timestamp: 1_700_000_000_000,
+                kind: crate::KIND_TEXT,
+                payload: b"already read".to_vec(),
+            })
+            .unwrap();
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                alice,
+                RECEIPT_TYPE_DELIVERED,
+                3,
+                None,
+            )
+            .unwrap();
+        store
+            .record_group_receipt(
+                family.id.clone(),
+                me.clone(),
+                test_user_id(b"alice"),
+                RECEIPT_TYPE_READ,
+                3,
+                None,
+            )
+            .unwrap();
+        let before = store.chat_preview(family.id.clone(), me.clone()).unwrap();
+        assert_eq!(before.own_delivered_through, 3);
+        assert_eq!(before.own_read_through, 3);
+
+        family.member_user_ids.push(test_user_id(b"carol"));
+        family.metadata_revision = 1;
+        family.metadata_changed_by = me.clone();
+        store.upsert_group(family.clone()).unwrap();
+        let after = store.chat_preview(family.id, me).unwrap();
+        assert_eq!(after.own_delivered_through, 3);
+        assert_eq!(after.own_read_through, 3);
     }
 
     #[test]
