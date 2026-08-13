@@ -124,9 +124,8 @@ Spec: [`specs/live-ptt.md`](specs/live-ptt.md).
   capabilities lets a single device be cut off without rotating credentials
   for everyone, and is the relay-side half of multi-device revocation.
 - **Windows client.** A tray node plus a messenger window, both Rust, sharing
-  the core crate directly. Dogfood today; it becomes a first-class linked
-  device as part of the multi-device work.
-  Spec: [`specs/windows-app.md`](specs/windows-app.md).
+  the core crate directly (`desktop/`). Dogfood today; it becomes a first-class
+  linked device as part of the multi-device work.
 - **A paid independent security review**, which the project has set for itself
   as a precondition before recommending CruiseMesh beyond its stated threat
   model ([SECURITY-DESIGN.md](SECURITY-DESIGN.md)).

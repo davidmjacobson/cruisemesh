@@ -80,8 +80,8 @@ local backup and restore.
 
 There is an unsigned dogfood build of a Windows desktop client in `desktop/` —
 a tray node that carries and relays like a phone, plus a messenger window. It
-isn't released to anyone yet; [`specs/windows-app.md`](specs/windows-app.md)
-is the design.
+isn't released to anyone yet; [`desktop/DOGFOOD.md`](desktop/DOGFOOD.md) is
+how to run it.
 
 What isn't here: chunked transfer for media too large to inline, multi-device
 identity, and history sync for someone who joins a group late. There is no
@@ -212,7 +212,7 @@ the API and its ack rules are DESIGN.md §9.
 | [`ios/README.md`](ios/README.md) | iOS shell layout, XcodeGen, and the checked-in Swift bindings. |
 | [`specs/android-ui-testing.md`](specs/android-ui-testing.md) | Android host, screenshot, and managed-emulator UI gates. |
 | [`specs/ios-ui-testing.md`](specs/ios-ui-testing.md) | iOS simulator and XCUITest gates, run on GitHub's macOS runners. |
-| [`specs/windows-app.md`](specs/windows-app.md) | The Windows desktop client design. |
+| [`desktop/DOGFOOD.md`](desktop/DOGFOOD.md) | How to run the unsigned Windows dogfood build. |
 | [`fuzz/README.md`](fuzz/README.md) | Fuzz targets for the pre-authentication decoders. |
 | [`relayd/DEPLOY.md`](relayd/DEPLOY.md) | Running a relay in production. |
 | `specs/` | Per-feature protocol specs. |
