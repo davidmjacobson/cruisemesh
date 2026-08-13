@@ -145,8 +145,7 @@ messenger window that talks to it over a named pipe. Being Rust itself, it
 links `cruisemesh-core` directly rather than through UniFFI, so it exercises
 the same store and sync engine the phones do without a binding layer in
 between. It has no BLE — on a laptop the LAN and relay transports carry
-everything. It is dogfood-only so far; `specs/windows-app.md` is the design
-and §10 has the stack.
+everything. It is dogfood-only so far; §10 has the stack.
 
 ---
 
@@ -623,7 +622,7 @@ crypto/protocol logic that must behave identically on both platforms.
 - **Windows shell** (`desktop/`, §4): Rust throughout, so it links the core
   crate directly and skips UniFFI entirely — a tray node process plus a
   messenger window over a named pipe. No BLE; LAN and relay carry everything.
-  Dogfood only, design in `specs/windows-app.md`.
+  Dogfood only.
 - Precedent: Berty runs a Go core under native shells; bitchat is native Swift with
   a separate Android port (and its divergence bugs show why the shared core matters).
 
