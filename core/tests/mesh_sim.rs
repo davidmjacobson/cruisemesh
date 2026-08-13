@@ -9,7 +9,7 @@
 //!
 //! It drives the **real** core primitives -- `seal_message`/`open_message`,
 //! the §6.4 frame codec, [`SeenIds`], and the [`MessageStore`] carry queue:
-//!   * receive: since package D0 this is no longer a third copy. `SimNode::receive`
+//!   * receive: this is no longer a third copy. `SimNode::receive`
 //!     and `SimNode::receive_from_relay` both call the one production inbound
 //!     transaction, [`MessageStore::process_inbound_frame`], which owns dedupe,
 //!     expiry, open-for-self/group-with-membership-guard, flood/carry

@@ -1,4 +1,4 @@
-//! The encounter sequence, owned once, in core (package D2).
+//! The encounter sequence, owned once, in core.
 //!
 //! Every time two identified mesh nodes meet — a BLE HELLO, an authenticated
 //! LAN session, a failover resume — the *same* ordered work runs here:
