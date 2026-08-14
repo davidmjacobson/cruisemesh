@@ -123,8 +123,9 @@ mod concurrent_offer_tests {
     }
 }
 
-/// How long the foreign-carry lane of the digest spray stays parked on a link
-/// after it has walked this device's whole carry queue once.
+/// How long the foreign-carry lane of the digest spray waits, after walking
+/// this device's whole carry queue once, before it walks it again *from the
+/// top*.
 ///
 /// The walk itself is paced by a per-round byte budget and resumed by a
 /// cursor, so a courier converges: each re-digest offers the next page, and
@@ -135,7 +136,31 @@ mod concurrent_offer_tests {
 /// frame can be lost in the link's FIFO on a disconnect mid-write and only a
 /// fresh pass would find it again; half an hour is far longer than the 3-5
 /// minute re-digest, so the steady state of a converged pair is quiet.
+///
+/// What this interval does *not* gate is mail that arrived after the walk
+/// finished. A completed walk keeps its tail cursor
+/// ([`CoreMeshRouterState::record_carried_progress`]), and rounds inside the
+/// cooldown resume from it, so anything enqueued since is offered on the very
+/// next re-digest while everything already refused stays behind the cursor.
 pub const CARRIED_REWALK_MIN_INTERVAL_MS: i64 = 30 * 60_000;
+
+/// How long a logical peer's carry-offering state is kept once it stops being
+/// used.
+///
+/// The state is deliberately not dropped on disconnect: one phone shows up
+/// under many BLE addresses and rotates them, and restarting the walk per
+/// address is what multiplied a single peer's backlog offer. But nothing else
+/// removed it either, so a device that meets a busy fleet accumulated one
+/// entry per user id it had ever handshaken with, for the life of the process.
+///
+/// A day is chosen because it is far longer than anything the state is useful
+/// for and short enough to bound the map by the peers actually met recently.
+/// Past [`CARRIED_REWALK_MIN_INTERVAL_MS`] the only thing an idle entry still
+/// decides is where a re-walk resumes, and after this long the honest answer
+/// is "from the top" -- which is exactly what a peer with no entry gets. So
+/// expiry costs at most one extra full pass toward a peer not seen in a day,
+/// and it can never suppress an offer.
+pub const LOGICAL_CARRY_STATE_TTL_MS: i64 = 24 * 60 * 60_000;
 
 /// Whether a long-lived link is due to re-run its digest exchange (D8).
 ///
@@ -232,14 +257,94 @@ struct LogicalCarryState {
     /// sets, so their cursors remain disjoint even though both are peer-keyed.
     targeted_carried_cursor: Option<CoreCarriedCursor>,
     targeted_carried_walk_done_at_ms: Option<i64>,
+    /// Last round (either lane) that used this entry, for the
+    /// [`LOGICAL_CARRY_STATE_TTL_MS`] sweep. `None` on an entry a handshake
+    /// created but no round has touched yet: it holds nothing but defaults,
+    /// so the sweep may drop it and lose no progress.
+    last_used_ms: Option<i64>,
+}
+
+/// Cursor to record when a walk reaches the tail having offered no row of its
+/// own to resume behind -- an empty queue, or one whose every eligible row was
+/// already excluded. `now_ms` is the walk's own clock and carried rows are
+/// stamped with the same clock when enqueued, so this resumes exactly at "what
+/// arrives from here on". The empty `msg_id` is the low end of the blob order
+/// the keyset compares against, so a row landing on this very millisecond is
+/// still included.
+fn tail_cursor_at(now_ms: i64) -> CoreCarriedCursor {
+    CoreCarriedCursor {
+        received_at: now_ms,
+        msg_id: Vec::new(),
+    }
+}
+
+/// Resolve one lane's stored progress into what it should do this round. Both
+/// carry lanes share the rule; only the pair of fields they read differs.
+fn lane_from(
+    walk_done_at_ms: Option<i64>,
+    cursor: Option<&CoreCarriedCursor>,
+    now_ms: i64,
+) -> CoreCarriedLane {
+    match walk_done_at_ms {
+        // A `done_at` in the future (clock skew) reads as not-yet-due, the
+        // same direction `should_redigest` errs in: worst case the full
+        // re-walk waits longer on a link that is still offering new arrivals
+        // from its tail cursor every round.
+        Some(done_at) if now_ms.saturating_sub(done_at) < CARRIED_REWALK_MIN_INTERVAL_MS => {
+            match cursor {
+                Some(tail) => CoreCarriedLane {
+                    skip: false,
+                    after: Some(tail.clone()),
+                },
+                None => CoreCarriedLane {
+                    skip: true,
+                    after: None,
+                },
+            }
+        }
+        Some(_) => CoreCarriedLane {
+            skip: false,
+            after: None,
+        },
+        None => CoreCarriedLane {
+            skip: false,
+            after: cursor.cloned(),
+        },
+    }
+}
+
+/// Touch `user_id`'s carry state (creating it if absent) and drop every other
+/// peer's state that no round has used within [`LOGICAL_CARRY_STATE_TTL_MS`].
+///
+/// Sweeping here, on the paths that already hold the lock and already know the
+/// clock, keeps the map bounded without a timer: a device that is meeting
+/// peers is exactly the device whose map is growing. A clock that jumped
+/// backwards reads as "used in the future", which keeps the entry -- erring
+/// toward remembering progress rather than re-offering a backlog.
+fn touch_and_sweep<'a>(
+    carry: &'a mut HashMap<Vec<u8>, LogicalCarryState>,
+    user_id: &[u8],
+    now_ms: i64,
+) -> &'a mut LogicalCarryState {
+    carry.retain(|id, state| {
+        id.as_slice() == user_id
+            || state
+                .last_used_ms
+                .is_some_and(|used| now_ms.saturating_sub(used) < LOGICAL_CARRY_STATE_TTL_MS)
+    });
+    let state = carry.entry(user_id.to_vec()).or_default();
+    state.last_used_ms = Some(now_ms);
+    state
 }
 
 /// What the foreign-carry lane should do on this link right now
 /// ([`CoreMeshRouterState::carried_lane_for`]).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CoreCarriedLane {
-    /// Offer no carried frames at all this round: the walk is complete and
-    /// still inside its re-walk cooldown.
+    /// Offer no carried frames at all this round: the walk is complete, still
+    /// inside its re-walk cooldown, and has no tail to resume behind. A
+    /// completed walk that *does* know its tail sets this `false` and resumes
+    /// there instead, so new arrivals never wait out the cooldown.
     pub skip: bool,
     /// Resume point to hand to the spray plan. `None` is a fresh full pass.
     pub after: Option<CoreCarriedCursor>,
@@ -378,14 +483,23 @@ impl CoreMeshRouterState {
     ///
     /// Three states, in order:
     /// * mid-walk -- resume after the last row offered;
-    /// * walked, still in cooldown -- skip, the peer has already been offered
-    ///   everything and re-walking would just re-offer refused rows;
+    /// * walked, still in cooldown -- resume after the *tail* the walk reached,
+    ///   so this round offers only what has been enqueued since and never
+    ///   re-offers a refused row. This is what keeps a message that arrives
+    ///   during the cooldown from waiting it out: the lane used to sit the
+    ///   whole half hour out, so a courier that had converged with a peer and
+    ///   then picked up new mail for them held it, on a live link, until the
+    ///   re-walk came due;
     /// * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
     ///   deliberately not a resume. A write accepted by the transport is not a
     ///   frame the peer received; a link that dropped mid-write lost whatever
     ///   was still queued behind it, and only a pass from the top finds those
     ///   rows again. Anything the peer really does hold it advertises in its
     ///   digest, so the re-walk excludes it in SQL and costs nothing.
+    ///
+    /// A completed walk with no tail cursor at all still skips the round: with
+    /// no resume point, the only alternative is a full pass, which is the churn
+    /// the cooldown exists to prevent.
     ///
     /// An unknown address reads as a fresh pass: the caller is about to spray
     /// down a link this state has no record of, and offering is always safe.
@@ -401,43 +515,31 @@ impl CoreMeshRouterState {
                 after: None,
             };
         };
-        let carry = self.logical_carry.lock_recoverable();
-        let Some(peer) = carry.get(&user_id) else {
-            return CoreCarriedLane {
-                skip: false,
-                after: None,
-            };
-        };
-        match peer.carried_walk_done_at_ms {
-            // A `done_at` in the future (clock skew) reads as not-yet-due,
-            // the same direction `should_redigest` errs in: worst case the
-            // lane stays quiet a while longer on a link that already has
-            // nothing new to offer.
-            Some(done_at) if now_ms.saturating_sub(done_at) < CARRIED_REWALK_MIN_INTERVAL_MS => {
-                CoreCarriedLane {
-                    skip: true,
-                    after: None,
-                }
-            }
-            Some(_) => CoreCarriedLane {
-                skip: false,
-                after: None,
-            },
-            None => CoreCarriedLane {
-                skip: false,
-                after: peer.carried_cursor.clone(),
-            },
-        }
+        let mut carry = self.logical_carry.lock_recoverable();
+        let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
+        lane_from(
+            peer.carried_walk_done_at_ms,
+            peer.carried_cursor.as_ref(),
+            now_ms,
+        )
     }
 
     /// Record what the carried lane just offered down this link: `next` is the
     /// plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
     ///
-    /// Reaching the tail parks the lane (and drops the cursor, so the eventual
-    /// re-walk starts from the top). A page that stopped on the budget just
+    /// Reaching the tail starts the cooldown and *keeps* a cursor there, so
+    /// rounds inside the cooldown offer only rows enqueued behind the tail and
+    /// the re-walk when the cooldown ends still starts from the top
+    /// ([`Self::carried_lane_for`]). A page that stopped on the budget just
     /// advances the cursor. A round that offered nothing without reaching the
     /// tail -- the lane's zero-budget off switch -- changes nothing, so the
     /// next round reconsiders exactly the same page.
+    ///
+    /// The kept cursor is offering bookkeeping only: it decides what is
+    /// re-offered and never what is removed. Carried mail is still dropped
+    /// only on digest-proof of receipt, eviction, or expiry, and a cursor
+    /// pointing at a row that has since been removed stays valid because the
+    /// keyset compares `(received_at, msg_id)` values rather than positions.
     pub fn record_carried_progress(
         &self,
         address: String,
@@ -454,9 +556,9 @@ impl CoreMeshRouterState {
             return;
         };
         let mut carry = self.logical_carry.lock_recoverable();
-        let peer = carry.entry(user_id).or_default();
+        let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
         if exhausted {
-            peer.carried_cursor = None;
+            peer.carried_cursor = Some(next.unwrap_or_else(|| tail_cursor_at(now_ms)));
             peer.carried_walk_done_at_ms = Some(now_ms);
         } else if next.is_some() {
             peer.carried_cursor = next;
@@ -478,29 +580,13 @@ impl CoreMeshRouterState {
                 after: None,
             };
         };
-        let carry = self.logical_carry.lock_recoverable();
-        let Some(peer) = carry.get(&user_id) else {
-            return CoreCarriedLane {
-                skip: false,
-                after: None,
-            };
-        };
-        match peer.targeted_carried_walk_done_at_ms {
-            Some(done_at) if now_ms.saturating_sub(done_at) < CARRIED_REWALK_MIN_INTERVAL_MS => {
-                CoreCarriedLane {
-                    skip: true,
-                    after: None,
-                }
-            }
-            Some(_) => CoreCarriedLane {
-                skip: false,
-                after: None,
-            },
-            None => CoreCarriedLane {
-                skip: false,
-                after: peer.targeted_carried_cursor.clone(),
-            },
-        }
+        let mut carry = self.logical_carry.lock_recoverable();
+        let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
+        lane_from(
+            peer.targeted_carried_walk_done_at_ms,
+            peer.targeted_carried_cursor.as_ref(),
+            now_ms,
+        )
     }
 
     /// Record progress of a targeted HELLO carried drain (G2).
@@ -520,9 +606,9 @@ impl CoreMeshRouterState {
             return;
         };
         let mut carry = self.logical_carry.lock_recoverable();
-        let peer = carry.entry(user_id).or_default();
+        let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
         if exhausted {
-            peer.targeted_carried_cursor = None;
+            peer.targeted_carried_cursor = Some(next.unwrap_or_else(|| tail_cursor_at(now_ms)));
             peer.targeted_carried_walk_done_at_ms = Some(now_ms);
         } else if next.is_some() {
             peer.targeted_carried_cursor = next;
@@ -1287,16 +1373,17 @@ mod tests {
             }
         );
 
-        // Tail reached: the lane parks for the cooldown.
+        // Tail reached: the cooldown starts, and rounds inside it resume from
+        // the tail so only mail enqueued since is offered.
         router.record_carried_progress("ble".into(), Some(cursor(3)), true, now + 5);
         let done_at = now + 5;
         assert_eq!(
             router.carried_lane_for("ble".into(), done_at + CARRIED_REWALK_MIN_INTERVAL_MS - 1),
             CoreCarriedLane {
-                skip: true,
-                after: None
+                skip: false,
+                after: Some(cursor(3))
             },
-            "still inside the cooldown: offer nothing at all"
+            "inside the cooldown: offer only what landed behind the tail"
         );
 
         // Cooldown elapsed: a fresh FULL pass, not a resume -- frames lost in
@@ -1316,10 +1403,10 @@ mod tests {
         assert_eq!(
             router.carried_lane_for("ble".into(), done_at + 1),
             CoreCarriedLane {
-                skip: true,
-                after: None
+                skip: false,
+                after: Some(cursor(4))
             },
-            "a new handshake for one user shares its parked logical lane"
+            "a new handshake for one user shares its completed logical lane"
         );
 
         // Disconnect/reconnect under a rotated address also retains progress.
@@ -1331,8 +1418,8 @@ mod tests {
         assert_eq!(
             router.carried_lane_for("rotated".into(), done_at + 2),
             CoreCarriedLane {
-                skip: true,
-                after: None
+                skip: false,
+                after: Some(cursor(4))
             },
             "reconnect does not restart a completed logical-peer walk"
         );
@@ -1340,6 +1427,234 @@ mod tests {
         // resurrected peer entry.
         router.record_carried_progress("ble".into(), Some(cursor(6)), false, done_at);
         assert_eq!(router.connected_user_count(), 1);
+    }
+
+    /// One carry queue, ordered the way the store orders it.
+    fn queue_rows(start_received_at: i64, count: u32) -> Vec<CoreCarriedCursor> {
+        (0..count)
+            .map(|index| CoreCarriedCursor {
+                received_at: start_received_at + index as i64,
+                msg_id: index.to_be_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    /// Stand-in for the store's budgeted keyset page: rows ordered by
+    /// `(received_at, msg_id)`, everything at or before `after` skipped, at
+    /// most `page` rows returned. `exhausted` is false only when the page
+    /// stopped on the budget, which is exactly the store's rule.
+    fn page_after(
+        rows: &[CoreCarriedCursor],
+        after: Option<&CoreCarriedCursor>,
+        page: usize,
+    ) -> (Vec<CoreCarriedCursor>, bool) {
+        let key = |cursor: &CoreCarriedCursor| (cursor.received_at, cursor.msg_id.clone());
+        let mut remaining: Vec<CoreCarriedCursor> = rows
+            .iter()
+            .filter(|row| after.is_none_or(|resume| key(row) > key(resume)))
+            .cloned()
+            .collect();
+        remaining.sort_by_key(&key);
+        let exhausted = remaining.len() <= page;
+        remaining.truncate(page);
+        (remaining, exhausted)
+    }
+
+    /// Run one foreign-carry round against `rows` and return what it offered.
+    fn carry_round(
+        router: &CoreMeshRouterState,
+        address: &str,
+        rows: &[CoreCarriedCursor],
+        page: usize,
+        now_ms: i64,
+    ) -> Vec<CoreCarriedCursor> {
+        let lane = router.carried_lane_for(address.to_string(), now_ms);
+        if lane.skip {
+            return Vec::new();
+        }
+        let (offered, exhausted) = page_after(rows, lane.after.as_ref(), page);
+        router.record_carried_progress(
+            address.to_string(),
+            offered.last().cloned(),
+            exhausted,
+            now_ms,
+        );
+        offered
+    }
+
+    #[test]
+    fn a_second_full_offer_cycle_on_one_address_offers_only_the_new_mail() {
+        // Field shape: a courier and a peer stay linked at the same address
+        // while the courier walks a 220-row backlog to the tail, then picks up
+        // another 220 rows for the same peer. The second cycle must offer the
+        // new rows promptly and must not re-offer the first 220 -- and the
+        // walk must not simply stop for the half-hour cooldown either, which
+        // is what held new mail on a live link.
+        let router = CoreMeshRouterState::new();
+        router.on_connected("ble".into(), CoreTransport::Central);
+        assert!(router.on_hello("ble".into(), vec![1; 16]));
+
+        let now = 1_700_000_000_000_i64;
+        let first: Vec<CoreCarriedCursor> = queue_rows(now, 220);
+        let mut clock = now;
+        let mut offered = Vec::new();
+        for _ in 0..40 {
+            clock += 1_000;
+            let round = carry_round(&router, "ble", &first, 20, clock);
+            if round.is_empty() {
+                break;
+            }
+            offered.extend(round);
+        }
+        assert_eq!(offered, first, "the first cycle walks all 220 rows once");
+        let done_at = clock;
+
+        // 220 more rows land for the same peer while the link stays up.
+        let mut queue = first.clone();
+        queue.extend(queue_rows(done_at + 1, 220));
+
+        let mut second = Vec::new();
+        for _ in 0..40 {
+            clock += 1_000;
+            assert!(
+                clock - done_at < CARRIED_REWALK_MIN_INTERVAL_MS,
+                "the whole second cycle must run inside the cooldown"
+            );
+            let round = carry_round(&router, "ble", &queue, 20, clock);
+            if round.is_empty() {
+                break;
+            }
+            second.extend(round);
+        }
+        assert_eq!(
+            second,
+            queue[220..].to_vec(),
+            "the second cycle offers exactly the new rows, none of the first 220"
+        );
+
+        // And a converged pair goes quiet again: nothing new, nothing offered.
+        clock += 1_000;
+        assert!(carry_round(&router, "ble", &queue, 20, clock).is_empty());
+
+        // The cooldown still buys the safety re-walk from the top, so a row
+        // lost in a link's FIFO is eventually found again.
+        let lane = router.carried_lane_for("ble".into(), clock + CARRIED_REWALK_MIN_INTERVAL_MS);
+        assert_eq!(
+            lane,
+            CoreCarriedLane {
+                skip: false,
+                after: None
+            }
+        );
+    }
+
+    #[test]
+    fn one_user_behind_many_rotating_addresses_walks_its_backlog_once() {
+        // Field shape: one phone, seen under a long sequence of rotating BLE
+        // addresses, one short link each. Keying the walk by logical peer is
+        // what makes the backlog advance across those links instead of
+        // restarting -- and the tail cursor must survive the rotation too, so
+        // the address the peer happens to wear when new mail arrives does not
+        // decide whether it gets offered.
+        let router = CoreMeshRouterState::new();
+        let alice = vec![1; 16];
+        let now = 1_700_000_000_000_i64;
+        let rows = queue_rows(now, 220);
+
+        let mut clock = now;
+        let mut offered = Vec::new();
+        for rotation in 0..30 {
+            let address = format!("ble-{rotation}");
+            router.on_connected(address.clone(), CoreTransport::Central);
+            assert!(router.on_hello(address.clone(), alice.clone()));
+            clock += 1_000;
+            offered.extend(carry_round(&router, &address, &rows, 20, clock));
+            router.on_disconnected(address);
+        }
+        assert_eq!(
+            offered, rows,
+            "each address continues the same logical walk, offering every row exactly once"
+        );
+
+        // New mail, and yet another address: it is offered on that address's
+        // first round rather than waiting out the cooldown.
+        let mut queue = rows.clone();
+        queue.extend(queue_rows(clock + 1, 5));
+        router.on_connected("ble-fresh".into(), CoreTransport::Central);
+        assert!(router.on_hello("ble-fresh".into(), alice));
+        clock += 1_000;
+        assert_eq!(
+            carry_round(&router, "ble-fresh", &queue, 20, clock),
+            queue[220..].to_vec(),
+        );
+    }
+
+    #[test]
+    fn carry_state_for_a_peer_not_seen_for_a_day_is_swept() {
+        let router = CoreMeshRouterState::new();
+        let now = 1_700_000_000_000_i64;
+        let cursor = CoreCarriedCursor {
+            received_at: now,
+            msg_id: vec![9; 16],
+        };
+        for index in 0..8_u8 {
+            let address = format!("ble-{index}");
+            router.on_connected(address.clone(), CoreTransport::Central);
+            assert!(router.on_hello(address.clone(), vec![index; 16]));
+            router.record_carried_progress(address.clone(), Some(cursor.clone()), false, now);
+            router.on_disconnected(address);
+        }
+        assert_eq!(router.logical_carry.lock_recoverable().len(), 8);
+
+        // A round for one more peer, a day later, sweeps the idle entries but
+        // keeps the peer it is serving.
+        let later = now + LOGICAL_CARRY_STATE_TTL_MS;
+        router.on_connected("ble-new".into(), CoreTransport::Central);
+        assert!(router.on_hello("ble-new".into(), vec![200; 16]));
+        router.record_carried_progress("ble-new".into(), Some(cursor.clone()), false, later);
+        let carry = router.logical_carry.lock_recoverable();
+        assert_eq!(carry.len(), 1);
+        assert!(carry.contains_key(&vec![200; 16]));
+        drop(carry);
+
+        // Sweeping only ever costs a full re-walk; it never suppresses one.
+        assert_eq!(
+            router.carried_lane_for("ble-new".into(), later + 1),
+            CoreCarriedLane {
+                skip: false,
+                after: Some(cursor)
+            }
+        );
+    }
+
+    #[test]
+    fn a_peer_seen_inside_the_ttl_keeps_its_progress() {
+        let router = CoreMeshRouterState::new();
+        let now = 1_700_000_000_000_i64;
+        let cursor = CoreCarriedCursor {
+            received_at: now,
+            msg_id: vec![9; 16],
+        };
+        router.on_connected("idle".into(), CoreTransport::Central);
+        assert!(router.on_hello("idle".into(), vec![1; 16]));
+        router.record_carried_progress("idle".into(), Some(cursor.clone()), false, now);
+
+        router.on_connected("busy".into(), CoreTransport::Central);
+        assert!(router.on_hello("busy".into(), vec![2; 16]));
+        router.record_carried_progress(
+            "busy".into(),
+            Some(cursor.clone()),
+            false,
+            now + LOGICAL_CARRY_STATE_TTL_MS - 1,
+        );
+
+        assert_eq!(
+            router
+                .carried_lane_for("idle".into(), now + LOGICAL_CARRY_STATE_TTL_MS - 1)
+                .after,
+            Some(cursor),
+            "a peer still inside the retention window resumes where it stopped"
+        );
     }
 
     #[test]
