@@ -43,8 +43,8 @@ object ChatSummaryLoader {
                 group = g,
                 lastMessage = preview.lastMessage,
                 unreadCount = preview.unreadCount.toInt(),
-                ownDeliveredThrough = 0uL,
-                ownReadThrough = 0uL,
+                ownDeliveredThrough = preview.ownDeliveredThrough,
+                ownReadThrough = preview.ownReadThrough,
                 draft = DraftStore.load(context, g.id),
                 isMuted = ChatMuteStore.isMuted(context, g.id),
             )

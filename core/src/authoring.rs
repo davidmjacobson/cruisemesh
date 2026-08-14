@@ -451,6 +451,7 @@ impl MessageStore {
             sender_user_id: acked_sender_user_id.clone(),
             lamport: through_lamport,
             receipt_type,
+            group_id: None,
         })?;
         let body = encode_message_body(MessageBody {
             kind: KIND_RECEIPT,
@@ -580,6 +581,7 @@ impl MessageStore {
             sender_user_id: acked_sender_user_id.clone(),
             lamport: desired,
             receipt_type,
+            group_id: None,
         })?;
         let body = encode_message_body(MessageBody {
             kind: KIND_RECEIPT,
@@ -600,6 +602,135 @@ impl MessageStore {
             expiry: default_expiry(timestamp_ms),
             recipient_hint: compute_recipient_hint(contact.user_id.clone(), timestamp_ms),
             sealed: seal_message(identity, contact.agree_pk, body)?,
+        };
+        tx.execute(
+            "INSERT INTO outgoing_receipt_envelopes
+                (chat_id, sender_user_id, receipt_type, through_lamport, msg_id,
+                 recipient_user_id, timestamp, hop_ttl, expiry, recipient_hint, sealed, queued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
+                through_lamport = excluded.through_lamport, msg_id = excluded.msg_id,
+                recipient_user_id = excluded.recipient_user_id, timestamp = excluded.timestamp,
+                hop_ttl = excluded.hop_ttl, expiry = excluded.expiry,
+                recipient_hint = excluded.recipient_hint, sealed = excluded.sealed,
+                queued_at = excluded.queued_at, relay_posted_at = NULL",
+            params![
+                &envelope.chat_id,
+                &envelope.sender_user_id,
+                receipt_type as i64,
+                desired as i64,
+                &envelope.msg_id,
+                &envelope.recipient_user_id,
+                timestamp_ms,
+                envelope.hop_ttl as i64,
+                envelope.expiry,
+                &envelope.recipient_hint,
+                &envelope.sealed,
+                timestamp_ms
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(authored_receipt(envelope))
+    }
+
+    /// Seal a pairwise group receipt to `author`: "I have delivered/read
+    /// your messages in `group_id` through `through_lamport`." The envelope
+    /// is stored under `chat_id = group_id` so it does not collide with the
+    /// 1:1 receipt we may also owe this contact. The sealed body carries
+    /// `group_id` in the optional D9 tail; 1:1 receipt bytes are untouched.
+    pub fn ensure_authored_group_receipt(
+        &self,
+        identity: Identity,
+        author: Contact,
+        group_id: Vec<u8>,
+        receipt_type: u8,
+        through_lamport: u64,
+        timestamp_ms: i64,
+    ) -> Result<AuthoredReceipt, CoreError> {
+        if receipt_type != RECEIPT_TYPE_DELIVERED && receipt_type != RECEIPT_TYPE_READ {
+            return Err(CoreError::Malformed("invalid receipt type".to_string()));
+        }
+        if through_lamport == 0 {
+            return Err(CoreError::Malformed(
+                "receipt watermark must be positive".to_string(),
+            ));
+        }
+        if group_id.len() != crate::GROUP_ID_LEN {
+            return Err(CoreError::Malformed(format!(
+                "group receipt id must be exactly {} bytes",
+                crate::GROUP_ID_LEN
+            )));
+        }
+        validate_sqlite_lamport("receipt watermark", through_lamport)?;
+
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction().map_err(store_err)?;
+        let current: Option<i64> = tx
+            .query_row(
+                "SELECT through_lamport FROM outgoing_receipts
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![&group_id, &author.user_id, receipt_type as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let desired = through_lamport.max(current.unwrap_or(0) as u64);
+        let existing: Option<OutgoingReceiptEnvelope> = tx
+            .query_row(
+                "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, receipt_type,
+                        through_lamport, timestamp, hop_ttl, expiry, recipient_hint, sealed
+                 FROM outgoing_receipt_envelopes
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+                params![&group_id, &author.user_id, receipt_type as i64],
+                row_to_outgoing_receipt,
+            )
+            .optional()
+            .map_err(store_err)?;
+        if let Some(envelope) = existing.filter(|item| item.through_lamport >= desired) {
+            return Ok(authored_receipt(envelope));
+        }
+
+        tx.execute(
+            "INSERT INTO outgoing_receipts (chat_id, sender_user_id, receipt_type, through_lamport)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id, sender_user_id, receipt_type) DO UPDATE SET
+                through_lamport = MAX(through_lamport, excluded.through_lamport)",
+            params![
+                &group_id,
+                &author.user_id,
+                receipt_type as i64,
+                desired as i64
+            ],
+        )
+        .map_err(store_err)?;
+
+        let content = encode_receipt_content(ReceiptContent {
+            chat_id: identity.user_id.clone(),
+            sender_user_id: author.user_id.clone(),
+            lamport: desired,
+            receipt_type,
+            group_id: Some(group_id.clone()),
+        })?;
+        let body = encode_message_body(MessageBody {
+            kind: KIND_RECEIPT,
+            chat_id: identity.user_id.clone(),
+            lamport: 0,
+            timestamp: timestamp_ms,
+            content,
+        })?;
+        let envelope = OutgoingReceiptEnvelope {
+            msg_id: generate_msg_id(),
+            recipient_user_id: author.user_id.clone(),
+            chat_id: group_id.clone(),
+            sender_user_id: author.user_id.clone(),
+            receipt_type,
+            through_lamport: desired,
+            timestamp: timestamp_ms,
+            hop_ttl: DEFAULT_HOP_TTL,
+            expiry: default_expiry(timestamp_ms),
+            recipient_hint: compute_recipient_hint(author.user_id.clone(), timestamp_ms),
+            sealed: seal_message(identity, author.agree_pk, body)?,
         };
         tx.execute(
             "INSERT INTO outgoing_receipt_envelopes
@@ -982,8 +1113,8 @@ mod tests {
     use super::*;
     use crate::{
         create_group, decode_extended_message_body, decode_group_metadata_update,
-        decode_message_body, encode_attachment_payload, generate_identity, open_group_message,
-        open_message, AttachmentMediaType, CoreAttachmentPayload,
+        decode_message_body, decode_receipt_content, encode_attachment_payload, generate_identity,
+        open_group_message, open_message, AttachmentMediaType, CoreAttachmentPayload,
     };
 
     fn contact(identity: &Identity, name: &str) -> Contact {
@@ -1278,5 +1409,60 @@ mod tests {
                 .unwrap(),
             7
         );
+    }
+
+    #[test]
+    fn group_receipt_seals_pairwise_and_does_not_change_one_to_one_bytes() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let family = create_group(
+            "Family".to_string(),
+            vec![alice.user_id.clone(), bob.user_id.clone()],
+        )
+        .unwrap();
+        store.upsert_group(family.clone()).unwrap();
+
+        let one_to_one = store
+            .ensure_authored_receipt(
+                alice.clone(),
+                contact(&bob, "Bob"),
+                bob.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                20,
+            )
+            .unwrap();
+        let pairwise = decode_receipt_content(
+            decode_message_body(
+                open_message(bob.clone(), one_to_one.envelope.sealed.clone())
+                    .unwrap()
+                    .payload,
+            )
+            .unwrap()
+            .content,
+        )
+        .unwrap();
+        assert_eq!(pairwise.group_id, None);
+
+        let group = store
+            .ensure_authored_group_receipt(
+                alice,
+                contact(&bob, "Bob"),
+                family.id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                21,
+            )
+            .unwrap();
+        assert_eq!(group.envelope.chat_id, family.id);
+        assert_eq!(group.envelope.recipient_user_id, bob.user_id);
+        let opened = open_message(bob.clone(), group.envelope.sealed).unwrap();
+        let body = decode_message_body(opened.payload).unwrap();
+        let receipt = decode_receipt_content(body.content).unwrap();
+        assert_eq!(receipt.group_id.as_deref(), Some(family.id.as_slice()));
+        assert_eq!(receipt.sender_user_id, bob.user_id);
+        assert_eq!(receipt.lamport, 2);
+        assert_ne!(group.envelope.msg_id, one_to_one.envelope.msg_id);
     }
 }

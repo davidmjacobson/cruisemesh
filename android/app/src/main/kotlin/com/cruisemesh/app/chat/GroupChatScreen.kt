@@ -78,8 +78,10 @@ import com.cruisemesh.app.ui.bubbleGroupingFor
 import com.cruisemesh.app.ui.formatConversationTimestamp
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
+import uniffi.cruisemesh_core.GroupReceiptState
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.coreGroupTickStatusFor
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.formatUserId
 import kotlinx.coroutines.Dispatchers
@@ -91,7 +93,7 @@ import com.cruisemesh.app.R
 
 /**
  * Group chat thread (DESIGN.md §6.5). Local `chat_id` is the group id.
- * Group wire receipts are deferred — no ✓/✓✓ ticks yet.
+ * Own-message ticks come from per-member D9 watermarks in [GroupReceiptState].
  */
 @Composable
 fun GroupChatScreen(
@@ -109,6 +111,9 @@ fun GroupChatScreen(
     val context = LocalContext.current
     var currentGroup by remember(group.id) { mutableStateOf(group) }
     var messages by remember(group.id) { mutableStateOf(store.messagesForChat(group.id)) }
+    var receiptState by remember(group.id) {
+        mutableStateOf(store.groupReceiptState(group.id, ownUserId, group.memberUserIds))
+    }
     var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
     // The staged photo currently open in the markup editor, or null when it is
@@ -131,6 +136,16 @@ fun GroupChatScreen(
     fun reload() {
         messages = store.messagesForChat(currentGroup.id)
         store.getGroup(currentGroup.id)?.let { currentGroup = it }
+        receiptState = store.groupReceiptState(currentGroup.id, ownUserId, currentGroup.memberUserIds)
+    }
+
+    fun tickFor(message: StoredMessage): TickStatus? {
+        if (!message.senderUserId.contentEquals(ownUserId)) return null
+        return when (coreGroupTickStatusFor(message.lamport, message.timestamp, ownUserId, receiptState)) {
+            uniffi.cruisemesh_core.CoreTickStatus.READ -> TickStatus.READ
+            uniffi.cruisemesh_core.CoreTickStatus.DELIVERED -> TickStatus.DELIVERED
+            uniffi.cruisemesh_core.CoreTickStatus.SENT -> TickStatus.SENT
+        }
     }
 
     fun showSendFailure() = showSendFailureSnackbar(coroutineScope, snackbarHostState)
@@ -288,6 +303,7 @@ fun GroupChatScreen(
                 val isOwn = message.senderUserId.contentEquals(ownUserId)
                 GroupMessageBubble(
                     message = message,
+                    tick = tickFor(message),
                     isFocused = host.focused?.target == MessageTarget(
                         message.senderUserId,
                         message.lamport,
@@ -710,6 +726,7 @@ fun GroupChatScreen(
                 GroupMessageBubbleVisual(
                     message = focusedMessage,
                     isOwn = focusedIsOwn,
+                    tick = tickFor(focusedMessage),
                     senderLabel = focusedSenderLabel,
                     shape = focusedShape,
                     showTimestamp = focusedGrouping.showTimestamp,
@@ -740,11 +757,14 @@ fun GroupChatScreen(
         }
         MessageInfoBottomSheet(
             onDismiss = { host.closeInfo() },
-            rows = messageInfoRows(
+            rows = groupMessageInfoRows(
                 currentInfoMessage,
                 infoIsOwn,
-                null,
+                tickFor(currentInfoMessage),
                 infoArrival,
+                receiptState,
+                ownUserId,
+                senderName = { senderName(it) },
                 outboundExpiryMs = if (infoIsOwn) {
                     chatExtras.outboundExpiryMs[messageStableKey(currentInfoMessage)]
                 } else {
@@ -840,6 +860,7 @@ private fun GroupConversationTopBar(
 @Composable
 private fun GroupMessageBubble(
     message: StoredMessage,
+    tick: TickStatus?,
     isFocused: Boolean,
     isOwn: Boolean,
     senderLabel: String?,
@@ -892,6 +913,7 @@ private fun GroupMessageBubble(
         GroupMessageBubbleVisual(
             message = message,
             isOwn = isOwn,
+            tick = tick,
             senderLabel = senderLabel,
             shape = shape,
             showTimestamp = grouping.showTimestamp,
@@ -941,6 +963,7 @@ private fun GroupMessageBubble(
 fun GroupMessageBubbleVisual(
     message: StoredMessage,
     isOwn: Boolean,
+    tick: TickStatus? = null,
     senderLabel: String?,
     shape: RoundedCornerShape,
     showTimestamp: Boolean,
@@ -1027,17 +1050,17 @@ fun GroupMessageBubbleVisual(
                                 color = contentColor.copy(alpha = 0.7f),
                             )
                         }
-                        if (isOwn) {
-                            // Group receipts aren't on the wire yet (D9), so
-                            // SENT — "sealed and queued", true at authoring —
-                            // is the only honest state; without it an own
-                            // group bubble reads as never-sent next to 1:1
-                            // chats. Tint mirrors ChatScreen's tick row.
+                        if (isOwn && tick != null) {
                             val tickBaseColor =
                                 if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White
+                            val tint = when (tick) {
+                                TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
+                                TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
+                                TickStatus.READ -> tickBaseColor
+                            }
                             SignalTick(
-                                status = TickStatus.SENT,
-                                tint = tickBaseColor.copy(alpha = 0.88f),
+                                status = tick,
+                                tint = tint,
                                 bubbleColor = bubbleColor,
                                 modifier = Modifier.padding(start = 6.dp),
                             )
@@ -1054,4 +1077,41 @@ fun GroupMessageBubbleVisual(
             )
         }
     }
+}
+
+internal fun groupMessageInfoRows(
+    message: StoredMessage,
+    isOwn: Boolean,
+    tick: TickStatus?,
+    arrival: uniffi.cruisemesh_core.MessageArrival?,
+    receiptState: GroupReceiptState,
+    ownUserId: ByteArray,
+    senderName: (ByteArray) -> String,
+    outboundExpiryMs: Long? = null,
+    nowMs: Long = System.currentTimeMillis(),
+): List<MessageInfoRow> {
+    val rows = messageInfoRows(
+        message,
+        isOwn,
+        tick,
+        arrival,
+        outboundExpiryMs = outboundExpiryMs,
+        nowMs = nowMs,
+    ).toMutableList()
+    if (!isOwn) return rows
+    for (member in receiptState.members) {
+        if (member.memberUserId.contentEquals(ownUserId)) continue
+        if (member.addedAtMs > 0L && member.addedAtMs > message.timestamp) continue
+        val memberTick = tickStatusFor(message.lamport, member.deliveredThrough, member.readThrough)
+        val status = when (memberTick) {
+            TickStatus.READ -> "Read"
+            TickStatus.DELIVERED -> "Delivered"
+            TickStatus.SENT -> "Waiting"
+        }
+        val route = member.deliveredViaTransport?.let { transport ->
+            " · ${transportRouteText(transport.toInt())}"
+        }.orEmpty()
+        rows.add(MessageInfoRow.LabelValue(senderName(member.memberUserId), status + route))
+    }
+    return rows
 }

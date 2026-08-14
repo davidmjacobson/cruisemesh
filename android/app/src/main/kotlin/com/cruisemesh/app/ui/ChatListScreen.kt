@@ -452,7 +452,7 @@ fun ChatRow(
                         groupName = if (summary.isGroup) summary.title else null,
                     )
                     
-                    if (isOwn && !summary.isGroup) {
+                    if (isOwn) {
                         val tick = tickStatusFor(
                             summary.lastMessage.lamport,
                             summary.ownDeliveredThrough,

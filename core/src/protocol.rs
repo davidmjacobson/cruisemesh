@@ -79,7 +79,15 @@
 //!                                    messages this receipt acknowledges)
 //! 4+N+M   8     lamport             (u64 BE; cumulative through this value)
 //! 12+N+M  1     receipt_type        (u8; delivered=1, read=2)
+//! then, optionally (D9 group receipts):
+//!         2     group_id_len        (u16 BE; must be 16)
+//!         16    group_id            (the group this watermark is about)
 //! ```
+//!
+//! A 1:1 receipt omits the optional tail, so its bytes are unchanged. A group
+//! receipt appends the group id; old decoders reject the trailing bytes
+//! (`finish`) and drop the envelope, which is the compatibility path — they
+//! must not record it as a 1:1 watermark.
 //!
 //! ## Group invites (DESIGN.md §6.5, §7.1)
 //!
@@ -192,11 +200,13 @@
 //! the other side can send just the difference (via the store's
 //! `messages_after`). One digest frame covers **one** chat -- in the 1:1
 //! case the chat is named by the sender's own UserID, per the wire
-//! convention the Android `MeshService` already uses for envelopes -- and
-//! carries one entry per sender in that chat: "(sender_user_id,
-//! through_lamport)", i.e. "I have this sender's messages contiguously
-//! through this lamport" ([`crate::DigestEntry`], computed by the store's
-//! `chat_digest`). Layout (big-endian, like everything else here):
+//! convention the Android `MeshService` already uses for envelopes; a
+//! group-scoped digest (D9) uses the group id instead and is dropped by old
+//! clients via [`crate::digest_is_expected_chat_id`]. Each frame carries one
+//! entry per sender in that chat: "(sender_user_id, through_lamport)", i.e.
+//! "I have this sender's messages contiguously through this lamport"
+//! ([`crate::DigestEntry`], computed by the store's `chat_digest`). Layout
+//! (big-endian, like everything else here):
 //!
 //! ```text
 //! offset  size  field
@@ -248,6 +258,9 @@ pub const KIND_TEXT: u8 = 1;
 /// `MessageBody.kind` value for a receipt (DESIGN.md §7.1, §7.2); `content`
 /// is an encoded [`ReceiptContent`].
 pub const KIND_RECEIPT: u8 = 2;
+/// Group ids are 16 random bytes, the same width as a UserID. A group
+/// receipt's optional tail must be exactly this long (T4-10).
+pub const GROUP_ID_LEN: usize = 16;
 /// `MessageBody.kind` value for a signed friend-request envelope (DESIGN.md
 /// §6.2, §7.1). The payload is application-defined contact-import content.
 pub const KIND_FRIEND_REQUEST: u8 = 3;
@@ -542,6 +555,10 @@ pub struct ReceiptContent {
     pub sender_user_id: Vec<u8>,
     pub lamport: u64,
     pub receipt_type: u8,
+    /// When set, this receipt is about `sender_user_id`'s stream **in this
+    /// group**, not the 1:1 chat with the envelope sender. Absent on every
+    /// 1:1 receipt so those bytes stay identical to the pre-D9 layout.
+    pub group_id: Option<Vec<u8>>,
 }
 
 /// The decoded form of a profile-sync `content` (a `MessageBody` with
@@ -770,12 +787,25 @@ pub fn encode_receipt_content(content: ReceiptContent) -> Result<Vec<u8>, CoreEr
     {
         return Err(CoreError::Malformed("receipt identity is too long".into()));
     }
-    let mut out =
-        Vec::with_capacity(2 + content.chat_id.len() + 2 + content.sender_user_id.len() + 8 + 1);
+    let mut out = Vec::with_capacity(
+        2 + content.chat_id.len()
+            + 2
+            + content.sender_user_id.len()
+            + 8
+            + 1
+            + content
+                .group_id
+                .as_ref()
+                .map(|id| 2 + id.len())
+                .unwrap_or(0),
+    );
     write_bytes16(&mut out, &content.chat_id);
     write_bytes16(&mut out, &content.sender_user_id);
     out.extend_from_slice(&content.lamport.to_be_bytes());
     out.push(content.receipt_type);
+    if let Some(group_id) = &content.group_id {
+        write_bytes16(&mut out, group_id);
+    }
     Ok(out)
 }
 
@@ -788,12 +818,18 @@ pub fn decode_receipt_content(bytes: Vec<u8>) -> Result<ReceiptContent, CoreErro
     let sender_user_id = cursor.take_bytes16()?;
     let lamport = cursor.take_u64()?;
     let receipt_type = cursor.take_u8()?;
+    let group_id = if cursor.is_finished() {
+        None
+    } else {
+        Some(cursor.take_bytes16()?)
+    };
     cursor.finish()?;
     let content = ReceiptContent {
         chat_id,
         sender_user_id,
         lamport,
         receipt_type,
+        group_id,
     };
     validate_receipt_content(&content)?;
     Ok(content)
@@ -842,6 +878,13 @@ fn validate_receipt_content(content: &ReceiptContent) -> Result<(), CoreError> {
         return Err(CoreError::Malformed(
             "receipt lamport exceeds the supported range".into(),
         ));
+    }
+    if let Some(group_id) = &content.group_id {
+        if group_id.len() != GROUP_ID_LEN {
+            return Err(CoreError::Malformed(format!(
+                "group receipt id must be exactly {GROUP_ID_LEN} bytes"
+            )));
+        }
     }
     Ok(())
 }
@@ -2005,7 +2048,29 @@ mod tests {
             sender_user_id: b"alice-user-id-16".to_vec(),
             lamport: 7,
             receipt_type: RECEIPT_TYPE_DELIVERED,
+            group_id: None,
         }
+    }
+
+    /// The pre-D9 decoder: after `receipt_type` the input must be exhausted.
+    /// Group receipts append a length-prefixed group id, so this is what an
+    /// old client does with them — reject, drop, do not record as 1:1.
+    fn decode_receipt_content_v1(bytes: Vec<u8>) -> Result<ReceiptContent, CoreError> {
+        let mut cursor = Cursor::new(&bytes);
+        let chat_id = cursor.take_bytes16()?;
+        let sender_user_id = cursor.take_bytes16()?;
+        let lamport = cursor.take_u64()?;
+        let receipt_type = cursor.take_u8()?;
+        cursor.finish()?;
+        let content = ReceiptContent {
+            chat_id,
+            sender_user_id,
+            lamport,
+            receipt_type,
+            group_id: None,
+        };
+        validate_receipt_content(&content)?;
+        Ok(content)
     }
 
     fn sample_profile_sync() -> ProfileSyncContent {
@@ -2522,6 +2587,41 @@ mod tests {
     fn receipt_content_decode_rejects_garbage() {
         let err = decode_receipt_content(vec![0xFF, 0xFF, 0xFF]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
+    }
+
+    #[test]
+    fn one_to_one_receipt_bytes_are_unchanged_without_a_group_id() {
+        let receipt = sample_receipt();
+        let encoded = encode_receipt_content(receipt.clone()).unwrap();
+        // chat_id_len(2) + chat_id + sender_len(2) + sender + lamport(8) + type(1)
+        let expected_len = 2 + receipt.chat_id.len() + 2 + receipt.sender_user_id.len() + 8 + 1;
+        assert_eq!(encoded.len(), expected_len);
+        assert_eq!(decode_receipt_content_v1(encoded.clone()).unwrap(), receipt);
+        assert_eq!(decode_receipt_content(encoded).unwrap(), receipt);
+    }
+
+    #[test]
+    fn group_receipt_round_trips_and_is_dropped_by_the_v1_decoder() {
+        let mut receipt = sample_receipt();
+        receipt.group_id = Some(vec![0x11; GROUP_ID_LEN]);
+        let encoded = encode_receipt_content(receipt.clone()).unwrap();
+        assert!(
+            decode_receipt_content_v1(encoded.clone()).is_err(),
+            "old clients must reject the trailing group id"
+        );
+        assert_eq!(decode_receipt_content(encoded).unwrap(), receipt);
+    }
+
+    #[test]
+    fn group_receipt_rejects_wrong_id_width() {
+        let mut receipt = sample_receipt();
+        receipt.group_id = Some(vec![0x11; 8]);
+        assert!(encode_receipt_content(receipt).is_err());
+
+        let mut encoded = encode_receipt_content(sample_receipt()).unwrap();
+        encoded.extend_from_slice(&8u16.to_be_bytes());
+        encoded.extend_from_slice(&[0x11; 8]);
+        assert!(decode_receipt_content(encoded).is_err());
     }
 
     #[test]

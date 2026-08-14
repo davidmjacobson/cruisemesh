@@ -88,14 +88,25 @@ impl DeliveryDispatcher {
                 if receipt.sender_user_id != self.identity.user_id {
                     bail!("receipt does not acknowledge this helper's messages");
                 }
-                self.store.record_receipt(
-                    sender_user_id.clone(),
-                    self.identity.user_id.clone(),
-                    receipt.receipt_type,
-                    receipt.lamport,
-                    Some(arrival.transport),
-                    Some(arrival.received_at),
-                )?;
+                if let Some(group_id) = receipt.group_id {
+                    self.store.record_group_receipt(
+                        group_id,
+                        self.identity.user_id.clone(),
+                        sender_user_id.clone(),
+                        receipt.receipt_type,
+                        receipt.lamport,
+                        Some(arrival.transport),
+                    )?;
+                } else {
+                    self.store.record_receipt(
+                        sender_user_id.clone(),
+                        self.identity.user_id.clone(),
+                        receipt.receipt_type,
+                        receipt.lamport,
+                        Some(arrival.transport),
+                        Some(arrival.received_at),
+                    )?;
+                }
             }
             KIND_LAN_ENDPOINT_HINT if pairwise => {
                 let content = decode_lan_endpoint_content(body.content.clone())?;

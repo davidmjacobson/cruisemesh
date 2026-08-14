@@ -50,6 +50,7 @@ import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.digestIsSharedGroup
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.coreIsHiddenSprayKind
 import uniffi.cruisemesh_core.coreOwnCapabilities
@@ -138,6 +139,14 @@ class MeshService : Service() {
      */
     private var envelopeProcessor: InboundEnvelopeProcessor? = null
     private var relaySync: RelaySyncEngine? = null
+
+    /**
+     * Group digests answered on each live link. The 1:1 fallback still
+     * resends any shared group this link has not answered for. Record only
+     * after the spray gate allows — a gated first digest must not suppress
+     * later catch-up.
+     */
+    private val groupDigestAnswers = GroupDigestAnswers()
 
     /** Cached once; avoids re-reading [android.content.pm.ApplicationInfo.flags] on every [assertOffMainThreadForStore] call. */
     private val isDebuggableBuild: Boolean by lazy { DebugFileLog.isDebuggableBuild(this) }
@@ -1131,6 +1140,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
         if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
@@ -1148,6 +1158,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         pendingLanHints.clear(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
         if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
@@ -1224,6 +1235,7 @@ class MeshService : Service() {
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
         MeshRouter.onDisconnected(address)
+        groupDigestAnswers.forget(address)
         lanHealthTracker.remove(address)
         LanTransportDiagnostics.disconnected(address)
         MeshConnectivityStatus.refreshNearbyRoutes()
@@ -1831,6 +1843,72 @@ class MeshService : Service() {
         }
         MeshRouter.sendToAddress(address, digestFrame)
         SprayPolicy.noteDigestSent(userId, address)
+        sendGroupDigestsTo(address, userId, identity)
+    }
+
+    /**
+     * One DIGEST per group we share with [userId], keyed by the group id so
+     * a new peer can answer with only the missing envelopes. Old clients
+     * drop these via [digestIsExpectedChatId].
+     */
+    private fun sendGroupDigestsTo(address: String, userId: ByteArray, identity: Identity) {
+        val advertised = try {
+            store.coreDigestAdvertisedMsgIds()
+        } catch (_: CoreException) {
+            emptyList()
+        }
+        for (group in store.listGroups()) {
+            if (!group.memberUserIds.any { it.contentEquals(userId) }) continue
+            if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
+            val entries = try {
+                store.chatDigest(group.id)
+            } catch (_: CoreException) {
+                emptyList()
+            }
+            val digestFrame = try {
+                encodeDigest(group.id, entries, advertised)
+            } catch (error: CoreException) {
+                Log.w(TAG, "Could not encode group DIGEST for $address", error)
+                continue
+            }
+            MeshRouter.sendToAddress(address, digestFrame)
+        }
+    }
+
+    /**
+     * A DIGEST whose chat_id is a group we share with this link peer.
+     * Old clients never get here: they drop via [DigestSync.isExpectedChatId].
+     * Not stashed on the cadence gate — that slot is the 1:1 digest.
+     */
+    private fun handleGroupDigest(
+        address: String,
+        chatId: ByteArray,
+        entries: List<DigestEntry>,
+        peerUserId: ByteArray?,
+        identity: Identity,
+    ) {
+        if (peerUserId == null) {
+            Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
+            return
+        }
+        val group = store.getGroup(chatId)
+        if (group == null || !digestIsSharedGroup(chatId, peerUserId, identity.userId, group)) {
+            Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
+            return
+        }
+        val gate = SprayPolicy.maySpray(peerUserId, address, CoreSprayTrigger.PEER_DIGEST)
+        if (!gate.allow) {
+            Log.i(TAG, "Skipping group DIGEST for $address: ${gate.reason}")
+            return
+        }
+        val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
+        var queuedBytes = resendGroupOutboundToPeer(address, peerUserId, identity, peerHasThrough, group.id)
+        val contact = store.getContact(peerUserId)
+        if (contact != null) {
+            queuedBytes += envelopeProcessor?.syncGroupReceiptsToPeer(identity, contact, address) ?: 0L
+        }
+        SprayPolicy.noteBytesQueued(address, queuedBytes)
+        groupDigestAnswers.note(address, group.id)
     }
 
     private fun scheduleDigestMaintenance() {
@@ -1922,7 +2000,7 @@ class MeshService : Service() {
     ) {
         val peerUserId = MeshRouter.userIdFor(address)
         if (!DigestSync.isExpectedChatId(chatId, peerUserId)) {
-            Log.w(TAG, "Dropping DIGEST from $address: chatId doesn't match this link's HELLO (or no HELLO seen yet)")
+            handleGroupDigest(address, chatId, entries, peerUserId, identity)
             return
         }
 
@@ -2026,6 +2104,7 @@ class MeshService : Service() {
         val contact = store.getContact(resolvedPeerUserId)
         if (contact != null) {
             queuedBytes += envelopeProcessor?.syncReceiptsFirst(identity, contact, address) ?: 0L
+            queuedBytes += envelopeProcessor?.syncGroupReceiptsToPeer(identity, contact, address) ?: 0L
             val peerHasThrough = DigestSync.throughLamportForSelf(entries, identity.userId)
             val queuedByLamport = store
                 .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)
@@ -2053,10 +2132,16 @@ class MeshService : Service() {
                 }
             }
             MeshRouter.recordHiddenOffered(address, newlyOffered)
-            // Group digests are not on the wire yet (1:1 digest only). At family
-            // scale, re-offer every outbound group envelope we authored for
-            // groups this peer is in; their insert is idempotent.
-            queuedBytes += resendGroupOutboundToPeer(address, resolvedPeerUserId, identity)
+            // New peers advertise per-group watermarks. Old clients never do,
+            // so they still get the lamport-0 catch-up (inserts are idempotent).
+            // Skip only groups this peer already got an answered digest for.
+            queuedBytes += resendGroupOutboundToPeer(
+                address,
+                resolvedPeerUserId,
+                identity,
+                0uL,
+                skipAnsweredGroups = true,
+            )
         }
         // Charged before the plan is built, so `sprayDigestPlanTo`'s own
         // admission sees a link allowance that already reflects what this
@@ -2069,25 +2154,29 @@ class MeshService : Service() {
     }
 
     /**
-     * Best-effort group catch-up on reconnect: send our sealed group traffic
-     * (and any queued pairwise invites addressed to this peer) for groups the
-     * peer belongs to. Without per-group digests we resend from lamport 0;
-     * duplicates are safe on the receiver.
+     * Best-effort group catch-up: send our sealed group traffic (and any
+     * queued pairwise invites addressed to this peer) for groups the peer
+     * belongs to, starting after [afterLamport]. A group digest supplies the
+     * watermark; the 1:1 fallback still passes 0 for old clients.
      *
-     * Returns the sealed bytes queued. This is the encounter's largest lane by
-     * some distance -- every group envelope this device ever authored, for
-     * every shared group -- and it is the one lane no spray plan can see, so
-     * the caller charges it against the link's burst allowance. It is not
-     * truncated: cutting it would make later envelopes unreachable, because
-     * the walk always restarts at lamport 0. Charging it means the *next*
-     * trigger on this link waits for the radio instead (#280).
+     * Returns the sealed bytes queued so the caller can charge the link's
+     * burst allowance (#280).
      */
-    private fun resendGroupOutboundToPeer(address: String, peerUserId: ByteArray, identity: Identity): Long {
+    private fun resendGroupOutboundToPeer(
+        address: String,
+        peerUserId: ByteArray,
+        identity: Identity,
+        afterLamport: ULong,
+        onlyGroupId: ByteArray? = null,
+        skipAnsweredGroups: Boolean = false,
+    ): Long {
         var queuedBytes = 0L
         for (group in store.listGroups()) {
+            if (onlyGroupId != null && !group.id.contentEquals(onlyGroupId)) continue
+            if (skipAnsweredGroups && groupDigestAnswers.answered(address, group.id)) continue
             if (!group.memberUserIds.any { it.contentEquals(peerUserId) }) continue
             if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
-            val envelopes = store.outboundEnvelopesAfter(group.id, identity.userId, 0uL)
+            val envelopes = store.outboundEnvelopesAfter(group.id, identity.userId, afterLamport)
             for (envelope in envelopes) {
                 // Pairwise invites are only useful to their intended recipient;
                 // group-sealed text has recipientUserId = group.id.

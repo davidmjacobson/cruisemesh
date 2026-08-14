@@ -100,6 +100,7 @@ fn author_receipt(
         sender_user_id: original_sender_user_id,
         lamport: through_lamport,
         receipt_type,
+        group_id: None,
     })
     .unwrap();
     let body = MessageBody {

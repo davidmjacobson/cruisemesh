@@ -39,6 +39,7 @@ import uniffi.cruisemesh_core.MessageBody
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OpenedMessage
 import uniffi.cruisemesh_core.OutboundEnvelope
+import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.PendingSharedRequest
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.applyGroupMetadataUpdate
@@ -1014,7 +1015,8 @@ internal class InboundEnvelopeProcessor(
      * Delivers a group-sealed envelope we opened with an imported group key
      * (DESIGN.md §6.5). Wire [MessageBody.chatId] is the group id; the
      * verified signer must be a current member (core does not check this).
-     * Group receipts are deferred — we only store + notify.
+     * D9 group receipts go pairwise back to the author after the local
+     * watermark advances.
      */
     private fun deliverOpenedGroupEnvelope(
         address: String,
@@ -1067,6 +1069,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                identity,
             )
             KIND_GROUP_METADATA_UPDATE -> handleIncomingGroupMetadataUpdate(
                 address,
@@ -1152,6 +1155,7 @@ internal class InboundEnvelopeProcessor(
         arrival: MessageArrival,
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
+        identity: Identity,
     ) {
         val outcome = store.insertIncomingMessageWithArrival(
             StoredMessage(
@@ -1175,14 +1179,15 @@ internal class InboundEnvelopeProcessor(
         recordInboundChatArrival(senderUserId, body.kind, arrival)
         ChatEvents.notifyChatChanged(group.id)
 
-        // Local read watermark only (group wire receipts are deferred).
         // See [PeerStreamWatermark] for why this is a plain MAX.
         val throughLamport = PeerStreamWatermark.through(store, group.id, senderUserId)
         store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_DELIVERED, throughLamport)
         val isVisible = ChatVisibility.isVisible(group.id)
         if (isVisible) {
             store.recordOutgoingReceipt(group.id, senderUserId, RECEIPT_TYPE_READ, throughLamport)
-        } else if (isVisibleChatKind(body.kind)) {
+        }
+        emitGroupReceiptsToAuthor(group, senderUserId, identity)
+        if (!isVisible && isVisibleChatKind(body.kind)) {
             val senderName = store.getContact(senderUserId)?.let(::coreContactDisplayName)
                 ?: UserIdHex.encode(senderUserId).take(8)
             val preview = if (body.kind == KIND_ATTACHMENT_MANIFEST) {
@@ -1999,6 +2004,18 @@ internal class InboundEnvelopeProcessor(
             Log.w(TAG, "Dropping receipt from $address: failed to decode (${e.message})")
             return
         }
+        val groupId = receipt.groupId
+        if (groupId != null) {
+            handleIncomingGroupReceipt(
+                address,
+                envelopeSenderUserId,
+                receipt,
+                groupId,
+                identity,
+                arrival,
+            )
+            return
+        }
         if (!receipt.senderUserId.contentEquals(identity.userId)) {
             Log.w(
                 TAG,
@@ -2060,6 +2077,63 @@ internal class InboundEnvelopeProcessor(
     }
 
     /**
+     * A pairwise-sealed D9 group receipt: [envelopeSenderUserId] is the member
+     * acking our authored stream in [groupId]. Isolated from the 1:1
+     * `receipts` table so it cannot paint ticks on a pairwise chat.
+     */
+    private fun handleIncomingGroupReceipt(
+        address: String,
+        envelopeSenderUserId: ByteArray,
+        receipt: ReceiptContent,
+        groupId: ByteArray,
+        identity: Identity,
+        arrival: MessageArrival,
+    ) {
+        if (!receipt.senderUserId.contentEquals(identity.userId)) {
+            Log.w(
+                TAG,
+                "Dropping group receipt from $address: acks senderUserId=${UserIdHex.encode(receipt.senderUserId)}, not us",
+            )
+            return
+        }
+        val group = store.getGroup(groupId)
+        if (group == null) {
+            Log.w(TAG, "Dropping group receipt from $address: unknown group")
+            return
+        }
+        if (!group.memberUserIds.any { it.contentEquals(envelopeSenderUserId) } ||
+            !group.memberUserIds.any { it.contentEquals(identity.userId) }
+        ) {
+            Log.w(TAG, "Dropping group receipt from $address: sender or we are not a member")
+            return
+        }
+        if (store.getContact(envelopeSenderUserId) == null) {
+            Log.w(TAG, "Dropping group receipt from $address: envelope sender is not a known contact")
+            return
+        }
+        SprayPolicy.noteReceiptProgress(envelopeSenderUserId)
+        store.recordGroupReceipt(
+            groupId = groupId,
+            authorUserId = identity.userId,
+            memberUserId = envelopeSenderUserId,
+            receiptType = receipt.receiptType,
+            throughLamport = receipt.lamport,
+            viaTransport = arrival.transport,
+        )
+        if (receipt.receiptType == RECEIPT_TYPE_DELIVERED) {
+            runCatching {
+                store.recordDeliveredMetric(
+                    chatId = groupId,
+                    throughLamport = receipt.lamport,
+                    deliveredAtMs = arrival.receivedAt,
+                    viaTransport = arrival.transport,
+                )
+            }
+        }
+        ChatEvents.notifyChatChanged(groupId)
+    }
+
+    /**
      * Persist the latest relay-uploadable sealed receipt envelope for one
      * cumulative outgoing watermark. Same watermark is a no-op so the stored
      * `msg_id` stays stable; higher watermark replaces it with a newly sealed
@@ -2118,6 +2192,11 @@ internal class InboundEnvelopeProcessor(
      */
     fun handleChatViewed(peerUserId: ByteArray) {
         val identity = identityProvider() ?: return
+        val group = store.getGroup(peerUserId)
+        if (group != null) {
+            emitGroupReadReceipts(group, identity)
+            return
+        }
         val contact = store.getContact(peerUserId) ?: return
         // highestLamport (plain MAX), not highestContiguousLamport: the
         // latter counts contiguously from lamport 1 and returns 0 at the
@@ -2192,6 +2271,126 @@ internal class InboundEnvelopeProcessor(
         GossipState.seenIds.record(authored.envelope.msgId)
         if (!MeshRouter.sendToUserId(contact.userId, authored.frame)) {
             Log.i(TAG, "Receipt to ${UserIdHex.encode(contact.userId)} queued; not currently connected")
+        }
+    }
+
+    /**
+     * Author and send the current delivered/read group watermarks we owe
+     * [authorUserId] in [group]. No-op when the author is not a contact
+     * (we cannot pairwise-seal to them).
+     */
+    private fun emitGroupReceiptsToAuthor(
+        group: Group,
+        authorUserId: ByteArray,
+        identity: Identity,
+    ) {
+        val contact = store.getContact(authorUserId) ?: return
+        var queued = false
+        for (owed in ReceiptRepair.owedForGroup(store, group.id, authorUserId)) {
+            if (queueOutgoingGroupReceiptForRelay(identity, contact, group.id, owed.receiptType, owed.throughLamport)) {
+                queued = true
+            }
+            sendGroupReceiptToContact(identity, contact, group.id, owed.receiptType, owed.throughLamport)
+        }
+        if (queued) RelaySyncEvents.requestSync()
+    }
+
+    private fun emitGroupReadReceipts(group: Group, identity: Identity) {
+        if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) return
+        for (memberId in group.memberUserIds) {
+            if (memberId.contentEquals(identity.userId)) continue
+            val throughLamport = PeerStreamWatermark.through(store, group.id, memberId)
+            if (throughLamport == 0uL) continue
+            store.recordOutgoingReceipt(group.id, memberId, RECEIPT_TYPE_READ, throughLamport)
+            emitGroupReceiptsToAuthor(group, memberId, identity)
+        }
+    }
+
+    /** Receipts we owe [peerUserId] as an author in every shared group. */
+    fun syncGroupReceiptsToPeer(
+        identity: Identity,
+        contact: Contact,
+        address: String,
+    ): Long {
+        var queuedBytes = 0L
+        for (group in store.listGroups()) {
+            if (!group.memberUserIds.any { it.contentEquals(contact.userId) }) continue
+            if (!group.memberUserIds.any { it.contentEquals(identity.userId) }) continue
+            for (owed in ReceiptRepair.owedForGroup(store, group.id, contact.userId)) {
+                queuedBytes += sendGroupReceiptOnAddress(
+                    identity,
+                    contact,
+                    group.id,
+                    address,
+                    owed.receiptType,
+                    owed.throughLamport,
+                )
+            }
+        }
+        return queuedBytes
+    }
+
+    private fun queueOutgoingGroupReceiptForRelay(
+        identity: Identity,
+        author: Contact,
+        groupId: ByteArray,
+        receiptType: UByte,
+        throughLamport: ULong,
+        timestamp: Long = System.currentTimeMillis(),
+    ): Boolean {
+        if (throughLamport == 0uL) return false
+        val existing = store.outgoingReceiptEnvelope(groupId, author.userId, receiptType)
+        val authored = store.ensureAuthoredGroupReceipt(
+            identity,
+            author,
+            groupId,
+            receiptType,
+            throughLamport,
+            timestamp,
+        )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        return existing == null || existing.throughLamport < authored.envelope.throughLamport
+    }
+
+    private fun sendGroupReceiptOnAddress(
+        identity: Identity,
+        author: Contact,
+        groupId: ByteArray,
+        address: String,
+        receiptType: UByte,
+        throughLamport: ULong,
+    ): Long {
+        val authored = store.ensureAuthoredGroupReceipt(
+            identity,
+            author,
+            groupId,
+            receiptType,
+            throughLamport,
+            System.currentTimeMillis(),
+        )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        if (!MeshRouter.sendToAddress(address, authored.frame)) return 0L
+        return authored.envelope.sealed.size.toLong()
+    }
+
+    private fun sendGroupReceiptToContact(
+        identity: Identity,
+        author: Contact,
+        groupId: ByteArray,
+        receiptType: UByte,
+        throughLamport: ULong,
+    ) {
+        val authored = store.ensureAuthoredGroupReceipt(
+            identity,
+            author,
+            groupId,
+            receiptType,
+            throughLamport,
+            System.currentTimeMillis(),
+        )
+        GossipState.seenIds.record(authored.envelope.msgId)
+        if (!MeshRouter.sendToUserId(author.userId, authored.frame)) {
+            Log.i(TAG, "Group receipt to ${UserIdHex.encode(author.userId)} queued; not currently connected")
         }
     }
 

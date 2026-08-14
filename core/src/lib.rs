@@ -136,7 +136,7 @@ pub use protocol::{
     parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
-    CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL,
+    CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN,
     KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
     KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST,
     KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE,
@@ -183,9 +183,10 @@ pub use relay_wire::{
     RelayEndpoint,
 };
 pub use semantic::{
-    core_is_visible_chat_kind, core_last_visible_message, core_reaction_summaries_by_target,
-    core_tick_status_for, core_unread_count, core_visible_chat_messages, core_visible_gap_indices,
-    CoreReactionSummary, CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
+    core_group_tick_status_for, core_is_visible_chat_kind, core_last_visible_message,
+    core_reaction_summaries_by_target, core_tick_status_for, core_unread_count,
+    core_visible_chat_messages, core_visible_gap_indices, CoreReactionSummary,
+    CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
 pub use ship_wifi::{
     core_ship_wifi_build_report, core_ship_wifi_evidence_strength, core_ship_wifi_forbidden_keys,
@@ -258,19 +259,20 @@ pub use store::{
     BackupSanitizationReport, CarriedEnvelope, ConsumedHiddenLamport, Contact,
     ContactDiscoveryPolicy, ContactProvenance, ContactRelayRejection, ContactRelayUnreachable,
     CoreCarriedCursor, CoreCarriedSyncPage, CoreChatPreview, CoreMessageReceivedAt,
-    CoreRecipientDeliveryStatus, DigestEntry, FriendSuggestion, IncomingMessageInsertOutcome,
-    MessageArrival, MessageConflictSummary, MessageOrigin, MessageReference, MessageStore,
-    OutboundEnvelope, OutgoingReceiptEnvelope, PeerConnectionEvent, PeerConnectionEventKind,
-    PeerConnectionSummary, PeerConnectionTransport, PendingSharedRequest, RelayFetchCursor,
-    StoredMessage,
+    CoreRecipientDeliveryStatus, DigestEntry, FriendSuggestion, GroupMemberReceipt,
+    GroupReceiptState, IncomingMessageInsertOutcome, MessageArrival, MessageConflictSummary,
+    MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
+    PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
+    PendingSharedRequest, RelayFetchCursor, StoredMessage,
 };
 pub use transport_policy::{
-    core_transport_send_plan, digest_is_expected_chat_id, digest_through_lamport_for_sender,
-    may_start_carried_offer, CoreCarriedLane, CoreIdentifiedRoute, CoreLanHealthAction,
-    CoreLanHealthDecision, CoreLanHealthTracker, CoreMeshRouterState, CoreReconnectBackoffTracker,
-    CoreTransport, CoreTransportRoute, CARRIED_REWALK_MIN_INTERVAL_MS, DEFAULT_INITIAL_BACKOFF_MS,
-    DEFAULT_LAN_HEALTH_MAX_TIMEOUTS, DEFAULT_LAN_HEALTH_TIMEOUT_MS, DEFAULT_MAX_BACKOFF_MS,
-    DEFAULT_MAX_CONSECUTIVE_FAILURES, MAX_CONCURRENT_CARRIED_OFFERS,
+    core_transport_send_plan, digest_is_expected_chat_id, digest_is_shared_group,
+    digest_through_lamport_for_sender, may_start_carried_offer, CoreCarriedLane,
+    CoreIdentifiedRoute, CoreLanHealthAction, CoreLanHealthDecision, CoreLanHealthTracker,
+    CoreMeshRouterState, CoreReconnectBackoffTracker, CoreTransport, CoreTransportRoute,
+    CARRIED_REWALK_MIN_INTERVAL_MS, DEFAULT_INITIAL_BACKOFF_MS, DEFAULT_LAN_HEALTH_MAX_TIMEOUTS,
+    DEFAULT_LAN_HEALTH_TIMEOUT_MS, DEFAULT_MAX_BACKOFF_MS, DEFAULT_MAX_CONSECUTIVE_FAILURES,
+    MAX_CONCURRENT_CARRIED_OFFERS,
 };
 pub use voice::{
     voice_capture_bytes, voice_capture_cancel, voice_capture_drag, voice_capture_elapsed,

@@ -420,6 +420,39 @@ impl MessageStore {
                 msg_ids.push(authored.envelope.msg_id);
             }
         }
+        let own_user_id = identity.user_id.clone();
+        for group in self.list_groups()? {
+            if !group.member_user_ids.iter().any(|m| m == &own_user_id) {
+                continue;
+            }
+            for member_id in group.member_user_ids {
+                if member_id == own_user_id {
+                    continue;
+                }
+                let Some(author) = self.get_contact(member_id.clone())? else {
+                    continue;
+                };
+                for receipt_type in [RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ] {
+                    let through = self.outgoing_receipt_through(
+                        group.id.clone(),
+                        author.user_id.clone(),
+                        receipt_type,
+                    )?;
+                    if through == 0 {
+                        continue;
+                    }
+                    let authored = self.ensure_authored_group_receipt(
+                        identity.clone(),
+                        author.clone(),
+                        group.id.clone(),
+                        receipt_type,
+                        through,
+                        now_ms,
+                    )?;
+                    msg_ids.push(authored.envelope.msg_id);
+                }
+            }
+        }
         Ok(msg_ids)
     }
 }

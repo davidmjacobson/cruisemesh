@@ -61,4 +61,17 @@ enum ReceiptRepair {
             return OwedReceipt(receiptType: receiptType, throughLamport: through)
         }
     }
+
+    /// Receipts we owe `authorUserId` for their stream in `groupId`.
+    static func owedForGroup(store: MessageStore, groupId: Data, authorUserId: Data) -> [OwedReceipt] {
+        [ReceiptType.delivered, ReceiptType.read].compactMap { receiptType in
+            let through = (try? store.outgoingReceiptThrough(
+                chatId: groupId,
+                senderUserId: authorUserId,
+                receiptType: receiptType
+            )) ?? 0
+            guard through > 0 else { return nil }
+            return OwedReceipt(receiptType: receiptType, throughLamport: through)
+        }
+    }
 }

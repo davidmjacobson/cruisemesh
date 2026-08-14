@@ -312,6 +312,28 @@ class CoreBindingSmokeTest {
      * a float at all, so this executes the lowering rather than trusting it.
      */
     @Test
+    fun `receipt content optional group id crosses present and absent`() {
+        val pairwise = uniffi.cruisemesh_core.ReceiptContent(
+            chatId = byteArrayOf(1, 2, 3),
+            senderUserId = byteArrayOf(4, 5, 6),
+            lamport = 7uL,
+            receiptType = 1u,
+            groupId = null,
+        )
+        val encoded = uniffi.cruisemesh_core.encodeReceiptContent(pairwise)
+        val decoded = uniffi.cruisemesh_core.decodeReceiptContent(encoded)
+        assertNull(decoded.groupId)
+        assertEquals(7uL, decoded.lamport)
+
+        val groupId = ByteArray(16) { 0x11 }
+        val grouped = pairwise.copy(groupId = groupId)
+        val groupDecoded = uniffi.cruisemesh_core.decodeReceiptContent(
+            uniffi.cruisemesh_core.encodeReceiptContent(grouped),
+        )
+        assertArrayEquals(groupId, groupDecoded.groupId)
+    }
+
+    @Test
     fun `a float crosses the boundary and lands in a nested record`() {
         val plan = voiceCapturePlan()
         assertTrue("cancel threshold arrived as ${plan.cancelSlideDp}", plan.cancelSlideDp > 1f)

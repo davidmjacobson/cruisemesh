@@ -4080,6 +4080,15 @@ public protocol MessageStoreProtocol : AnyObject {
     func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64) throws  -> Bool
     
     /**
+     * Seal a pairwise group receipt to `author`: "I have delivered/read
+     * your messages in `group_id` through `through_lamport`." The envelope
+     * is stored under `chat_id = group_id` so it does not collide with the
+     * 1:1 receipt we may also owe this contact. The sealed body carries
+     * `group_id` in the optional D9 tail; 1:1 receipt bytes are untouched.
+     */
+    func ensureAuthoredGroupReceipt(identity: Identity, author: Contact, groupId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64) throws  -> AuthoredReceipt
+    
+    /**
      * Return a durably queued sealed receipt for at least the requested
      * watermark. Existing equal/newer envelopes are reused byte-for-byte;
      * a missing or stale envelope is advanced atomically with the local
@@ -4205,6 +4214,25 @@ public protocol MessageStoreProtocol : AnyObject {
      * unchanged.
      */
     func groupOpenCandidates(hint: Data, ownUserId: Data, nowMs: Int64) throws  -> [Group]
+    
+    /**
+     * Per-member delivered/read snapshot for `author_user_id`'s stream in
+     * this group. `member_user_ids` is the current roster the caller wants
+     * considered (typically `group.member_user_ids`); members not in that
+     * list are omitted so a departed member cannot hold the aggregate tick.
+     */
+    func groupReceiptState(groupId: Data, authorUserId: Data, memberUserIds: [Data]) throws  -> GroupReceiptState
+    
+    /**
+     * Cumulative group watermark `member` has reported for `author`'s
+     * stream in `group_id`. 0 if none has been recorded.
+     */
+    func groupReceiptThrough(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8) throws  -> UInt64
+    
+    /**
+     * T6 route the member's `receipt_type` watermark last advanced on, if any.
+     */
+    func groupReceiptViaTransport(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8) throws  -> UInt8?
     
     /**
      * Every imported group whose recent-day hints include `hint`, in
@@ -5036,6 +5064,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * stamps the messages it newly covers). Metadata only.
      */
     func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredAtMs: Int64, viaTransport: UInt8?) throws 
+    
+    /**
+     * Record that `member_user_id` has delivered/read messages authored by
+     * `author_user_id` in `group_id` through `through_lamport`. Monotonic
+     * and isolated from the 1:1 `receipts` table so a group watermark can
+     * never paint ticks on a pairwise chat.
+     */
+    func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
     
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
@@ -6601,6 +6637,26 @@ open func enqueueRelayCarriedEnvelope(envelope: CarriedEnvelope, nowMs: Int64)th
 }
     
     /**
+     * Seal a pairwise group receipt to `author`: "I have delivered/read
+     * your messages in `group_id` through `through_lamport`." The envelope
+     * is stored under `chat_id = group_id` so it does not collide with the
+     * 1:1 receipt we may also owe this contact. The sealed body carries
+     * `group_id` in the optional D9 tail; 1:1 receipt bytes are untouched.
+     */
+open func ensureAuthoredGroupReceipt(identity: Identity, author: Contact, groupId: Data, receiptType: UInt8, throughLamport: UInt64, timestampMs: Int64)throws  -> AuthoredReceipt {
+    return try  FfiConverterTypeAuthoredReceipt.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_ensure_authored_group_receipt(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeContact.lower(author),
+        FfiConverterData.lower(groupId),
+        FfiConverterUInt8.lower(receiptType),
+        FfiConverterUInt64.lower(throughLamport),
+        FfiConverterInt64.lower(timestampMs),$0
+    )
+})
+}
+    
+    /**
      * Return a durably queued sealed receipt for at least the requested
      * watermark. Existing equal/newer envelopes are reused byte-for-byte;
      * a missing or stale envelope is advanced atomically with the local
@@ -6808,6 +6864,51 @@ open func groupOpenCandidates(hint: Data, ownUserId: Data, nowMs: Int64)throws  
         FfiConverterData.lower(hint),
         FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Per-member delivered/read snapshot for `author_user_id`'s stream in
+     * this group. `member_user_ids` is the current roster the caller wants
+     * considered (typically `group.member_user_ids`); members not in that
+     * list are omitted so a departed member cannot hold the aggregate tick.
+     */
+open func groupReceiptState(groupId: Data, authorUserId: Data, memberUserIds: [Data])throws  -> GroupReceiptState {
+    return try  FfiConverterTypeGroupReceiptState.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_group_receipt_state(self.uniffiClonePointer(),
+        FfiConverterData.lower(groupId),
+        FfiConverterData.lower(authorUserId),
+        FfiConverterSequenceData.lower(memberUserIds),$0
+    )
+})
+}
+    
+    /**
+     * Cumulative group watermark `member` has reported for `author`'s
+     * stream in `group_id`. 0 if none has been recorded.
+     */
+open func groupReceiptThrough(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_group_receipt_through(self.uniffiClonePointer(),
+        FfiConverterData.lower(groupId),
+        FfiConverterData.lower(authorUserId),
+        FfiConverterData.lower(memberUserId),
+        FfiConverterUInt8.lower(receiptType),$0
+    )
+})
+}
+    
+    /**
+     * T6 route the member's `receipt_type` watermark last advanced on, if any.
+     */
+open func groupReceiptViaTransport(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8)throws  -> UInt8? {
+    return try  FfiConverterOptionUInt8.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_group_receipt_via_transport(self.uniffiClonePointer(),
+        FfiConverterData.lower(groupId),
+        FfiConverterData.lower(authorUserId),
+        FfiConverterData.lower(memberUserId),
+        FfiConverterUInt8.lower(receiptType),$0
     )
 })
 }
@@ -8070,6 +8171,24 @@ open func recordDeliveredMetric(chatId: Data, throughLamport: UInt64, deliveredA
         FfiConverterData.lower(chatId),
         FfiConverterUInt64.lower(throughLamport),
         FfiConverterInt64.lower(deliveredAtMs),
+        FfiConverterOptionUInt8.lower(viaTransport),$0
+    )
+}
+}
+    
+    /**
+     * Record that `member_user_id` has delivered/read messages authored by
+     * `author_user_id` in `group_id` through `through_lamport`. Monotonic
+     * and isolated from the 1:1 `receipts` table so a group watermark can
+     * never paint ticks on a pairwise chat.
+     */
+open func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_group_receipt(self.uniffiClonePointer(),
+        FfiConverterData.lower(groupId),
+        FfiConverterData.lower(authorUserId),
+        FfiConverterData.lower(memberUserId),
+        FfiConverterUInt8.lower(receiptType),
+        FfiConverterUInt64.lower(throughLamport),
         FfiConverterOptionUInt8.lower(viaTransport),$0
     )
 }
@@ -18673,6 +18792,102 @@ public func FfiConverterTypeGroup_lower(_ value: Group) -> RustBuffer {
 
 
 /**
+ * One member's delivered/read watermarks for messages authored by a given
+ * sender in a group (D9). `added_at_ms` is 0 for founding members (or
+ * members imported before this column existed); a later joiner has the
+ * wall-clock of the upsert that first listed them.
+ */
+public struct GroupMemberReceipt {
+    public var memberUserId: Data
+    public var deliveredThrough: UInt64
+    public var readThrough: UInt64
+    public var deliveredViaTransport: UInt8?
+    public var addedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(memberUserId: Data, deliveredThrough: UInt64, readThrough: UInt64, deliveredViaTransport: UInt8?, addedAtMs: Int64) {
+        self.memberUserId = memberUserId
+        self.deliveredThrough = deliveredThrough
+        self.readThrough = readThrough
+        self.deliveredViaTransport = deliveredViaTransport
+        self.addedAtMs = addedAtMs
+    }
+}
+
+
+
+extension GroupMemberReceipt: Equatable, Hashable {
+    public static func ==(lhs: GroupMemberReceipt, rhs: GroupMemberReceipt) -> Bool {
+        if lhs.memberUserId != rhs.memberUserId {
+            return false
+        }
+        if lhs.deliveredThrough != rhs.deliveredThrough {
+            return false
+        }
+        if lhs.readThrough != rhs.readThrough {
+            return false
+        }
+        if lhs.deliveredViaTransport != rhs.deliveredViaTransport {
+            return false
+        }
+        if lhs.addedAtMs != rhs.addedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(memberUserId)
+        hasher.combine(deliveredThrough)
+        hasher.combine(readThrough)
+        hasher.combine(deliveredViaTransport)
+        hasher.combine(addedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupMemberReceipt: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupMemberReceipt {
+        return
+            try GroupMemberReceipt(
+                memberUserId: FfiConverterData.read(from: &buf), 
+                deliveredThrough: FfiConverterUInt64.read(from: &buf), 
+                readThrough: FfiConverterUInt64.read(from: &buf), 
+                deliveredViaTransport: FfiConverterOptionUInt8.read(from: &buf), 
+                addedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupMemberReceipt, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.memberUserId, into: &buf)
+        FfiConverterUInt64.write(value.deliveredThrough, into: &buf)
+        FfiConverterUInt64.write(value.readThrough, into: &buf)
+        FfiConverterOptionUInt8.write(value.deliveredViaTransport, into: &buf)
+        FfiConverterInt64.write(value.addedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMemberReceipt_lift(_ buf: RustBuffer) throws -> GroupMemberReceipt {
+    return try FfiConverterTypeGroupMemberReceipt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupMemberReceipt_lower(_ value: GroupMemberReceipt) -> RustBuffer {
+    return FfiConverterTypeGroupMemberReceipt.lower(value)
+}
+
+
+/**
  * An add-only membership snapshot plus a convergent group-name update.
  * Membership is merged as a set so reordered concurrent additions cannot
  * remove a member. The `(revision, changed_by)` tuple orders name changes.
@@ -18764,6 +18979,68 @@ public func FfiConverterTypeGroupMetadataUpdate_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeGroupMetadataUpdate_lower(_ value: GroupMetadataUpdate) -> RustBuffer {
     return FfiConverterTypeGroupMetadataUpdate.lower(value)
+}
+
+
+/**
+ * Per-member group receipt snapshot used to derive the aggregate tick
+ * (`✓✓` = every eligible current member is at or above the message lamport).
+ */
+public struct GroupReceiptState {
+    public var members: [GroupMemberReceipt]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(members: [GroupMemberReceipt]) {
+        self.members = members
+    }
+}
+
+
+
+extension GroupReceiptState: Equatable, Hashable {
+    public static func ==(lhs: GroupReceiptState, rhs: GroupReceiptState) -> Bool {
+        if lhs.members != rhs.members {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(members)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeGroupReceiptState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> GroupReceiptState {
+        return
+            try GroupReceiptState(
+                members: FfiConverterSequenceTypeGroupMemberReceipt.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: GroupReceiptState, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeGroupMemberReceipt.write(value.members, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupReceiptState_lift(_ buf: RustBuffer) throws -> GroupReceiptState {
+    return try FfiConverterTypeGroupReceiptState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeGroupReceiptState_lower(_ value: GroupReceiptState) -> RustBuffer {
+    return FfiConverterTypeGroupReceiptState.lower(value)
 }
 
 
@@ -20791,14 +21068,26 @@ public struct ReceiptContent {
     public var senderUserId: Data
     public var lamport: UInt64
     public var receiptType: UInt8
+    /**
+     * When set, this receipt is about `sender_user_id`'s stream **in this
+     * group**, not the 1:1 chat with the envelope sender. Absent on every
+     * 1:1 receipt so those bytes stay identical to the pre-D9 layout.
+     */
+    public var groupId: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(chatId: Data, senderUserId: Data, lamport: UInt64, receiptType: UInt8) {
+    public init(chatId: Data, senderUserId: Data, lamport: UInt64, receiptType: UInt8, 
+        /**
+         * When set, this receipt is about `sender_user_id`'s stream **in this
+         * group**, not the 1:1 chat with the envelope sender. Absent on every
+         * 1:1 receipt so those bytes stay identical to the pre-D9 layout.
+         */groupId: Data?) {
         self.chatId = chatId
         self.senderUserId = senderUserId
         self.lamport = lamport
         self.receiptType = receiptType
+        self.groupId = groupId
     }
 }
 
@@ -20818,6 +21107,9 @@ extension ReceiptContent: Equatable, Hashable {
         if lhs.receiptType != rhs.receiptType {
             return false
         }
+        if lhs.groupId != rhs.groupId {
+            return false
+        }
         return true
     }
 
@@ -20826,6 +21118,7 @@ extension ReceiptContent: Equatable, Hashable {
         hasher.combine(senderUserId)
         hasher.combine(lamport)
         hasher.combine(receiptType)
+        hasher.combine(groupId)
     }
 }
 
@@ -20840,7 +21133,8 @@ public struct FfiConverterTypeReceiptContent: FfiConverterRustBuffer {
                 chatId: FfiConverterData.read(from: &buf), 
                 senderUserId: FfiConverterData.read(from: &buf), 
                 lamport: FfiConverterUInt64.read(from: &buf), 
-                receiptType: FfiConverterUInt8.read(from: &buf)
+                receiptType: FfiConverterUInt8.read(from: &buf), 
+                groupId: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -20849,6 +21143,7 @@ public struct FfiConverterTypeReceiptContent: FfiConverterRustBuffer {
         FfiConverterData.write(value.senderUserId, into: &buf)
         FfiConverterUInt64.write(value.lamport, into: &buf)
         FfiConverterUInt8.write(value.receiptType, into: &buf)
+        FfiConverterOptionData.write(value.groupId, into: &buf)
     }
 }
 
@@ -31544,6 +31839,31 @@ fileprivate struct FfiConverterSequenceTypeGroup: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeGroupMemberReceipt: FfiConverterRustBuffer {
+    typealias SwiftType = [GroupMemberReceipt]
+
+    public static func write(_ value: [GroupMemberReceipt], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeGroupMemberReceipt.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [GroupMemberReceipt] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [GroupMemberReceipt]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeGroupMemberReceipt.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeGroupRelayMember: FfiConverterRustBuffer {
     typealias SwiftType = [GroupRelayMember]
 
@@ -32661,6 +32981,26 @@ public func coreGroupPeople(people: [CorePersonHealthInput], ownRelayUsable: Boo
 })
 }
 /**
+ * Aggregate group tick (DESIGN.md §7.2): ✓✓ iff every *eligible* current
+ * member has delivered (filled iff every eligible member has read).
+ *
+ * A member is eligible for message `lamport` at `message_timestamp` when
+ * they are not the author and they were already in the group when the
+ * message was sent (`added_at_ms == 0` means founding / unknown-old, so
+ * they count; a later `added_at_ms` after the message does not). An empty
+ * eligible set — only the author remains — is vacuously Read.
+ */
+public func coreGroupTickStatusFor(lamport: UInt64, messageTimestamp: Int64, authorUserId: Data, state: GroupReceiptState) -> CoreTickStatus {
+    return try!  FfiConverterTypeCoreTickStatus.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_group_tick_status_for(
+        FfiConverterUInt64.lower(lamport),
+        FfiConverterInt64.lower(messageTimestamp),
+        FfiConverterData.lower(authorUserId),
+        FfiConverterTypeGroupReceiptState.lower(state),$0
+    )
+})
+}
+/**
  * A link may establish its identity once. Repeating the same HELLO is
  * harmless; changing identity on an authenticated link is rejected.
  */
@@ -33684,6 +34024,21 @@ public func digestIsExpectedChatId(digestChatId: Data, helloUserId: Data?) -> Bo
     uniffi_cruisemesh_core_fn_func_digest_is_expected_chat_id(
         FfiConverterData.lower(digestChatId),
         FfiConverterOptionData.lower(helloUserId),$0
+    )
+})
+}
+/**
+ * A DIGEST whose `chat_id` is a group this device shares with the link
+ * peer. Old clients never reach this helper: they drop those frames via
+ * [`digest_is_expected_chat_id`] (group id ≠ HELLO user id).
+ */
+public func digestIsSharedGroup(digestChatId: Data, helloUserId: Data?, ownUserId: Data, group: Group) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_digest_is_shared_group(
+        FfiConverterData.lower(digestChatId),
+        FfiConverterOptionData.lower(helloUserId),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterTypeGroup.lower(group),$0
     )
 })
 }
@@ -35822,6 +36177,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_group_people() != 2035) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_group_tick_status_for() != 38727) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_hello_identity_matches() != 7419) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -36042,6 +36400,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_digest_is_expected_chat_id() != 2744) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_digest_is_shared_group() != 37529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_digest_through_lamport_for_sender() != 47244) {
@@ -36746,6 +37107,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_enqueue_relay_carried_envelope() != 33391) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_group_receipt() != 59119) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ensure_authored_receipt() != 16297) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -36783,6 +37147,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_group_open_candidates() != 15202) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_group_receipt_state() != 14170) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_group_receipt_through() != 24186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_group_receipt_via_transport() != 31513) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_groups_matching_hint() != 61300) {
@@ -36969,6 +37342,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_delivered_metric() != 16840) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_group_receipt() != 26756) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {

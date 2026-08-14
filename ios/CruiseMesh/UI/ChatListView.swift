@@ -454,6 +454,7 @@ struct ChatListView: View {
         let groups = (try? store.listGroups()) ?? []
         let groupSummaries: [ChatSummary] = groups.map { g in
             let messages = (try? store.messagesForChat(chatId: g.id)) ?? []
+            let preview = try? store.chatPreview(chatId: g.id, ownUserId: identity.userId)
             let unread = (try? store.semanticUnreadCount(
                 chatId: g.id,
                 ownUserId: identity.userId
@@ -466,8 +467,8 @@ struct ChatListView: View {
                 group: g,
                 lastMessage: ChatListLogic.lastVisibleMessage(messages),
                 unreadCount: Int(unread),
-                ownDeliveredThrough: 0,
-                ownReadThrough: 0,
+                ownDeliveredThrough: preview?.ownDeliveredThrough ?? 0,
+                ownReadThrough: preview?.ownReadThrough ?? 0,
                 avatarData: nil,
                 draft: DraftStore.load(chatId: g.id),
                 isMuted: ChatMuteStore.isMuted(g.id)
@@ -524,7 +525,7 @@ private struct ChatRowView: View {
                             .lineLimit(1)
                     } else if let last = summary.lastMessage {
                         let isOwn = last.senderUserId == ownUserId
-                        if isOwn && !summary.isGroup {
+                        if isOwn {
                             SignalTickView(status: tickStatusFor(
                                 lamport: last.lamport,
                                 deliveredThrough: summary.ownDeliveredThrough,

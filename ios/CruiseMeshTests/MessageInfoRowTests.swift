@@ -128,4 +128,44 @@ final class MessageInfoRowTests: XCTestCase {
         // confirmed route to report.
         XCTAssertEqual(rows.count, 3)
     }
+
+    func testGroupMessageInfoListsPerMemberStatusAndSkipsLateJoiners() {
+        let author = Data(repeating: 2, count: 16)
+        let alice = Data(repeating: 3, count: 16)
+        let late = Data(repeating: 4, count: 16)
+        let timestamp: Int64 = 1_700_000_000_000
+        let state = GroupReceiptState(members: [
+            GroupMemberReceipt(
+                memberUserId: author,
+                deliveredThrough: 0,
+                readThrough: 0,
+                deliveredViaTransport: nil,
+                addedAtMs: 0
+            ),
+            GroupMemberReceipt(
+                memberUserId: alice,
+                deliveredThrough: 1,
+                readThrough: 0,
+                deliveredViaTransport: 0,
+                addedAtMs: 0
+            ),
+            GroupMemberReceipt(
+                memberUserId: late,
+                deliveredThrough: 0,
+                readThrough: 0,
+                deliveredViaTransport: nil,
+                addedAtMs: timestamp + 1
+            ),
+        ])
+        let rows = groupMessageInfoRows(
+            message: message(timestampMs: timestamp),
+            isOwn: true,
+            tick: .delivered,
+            receiptState: state,
+            ownUserId: author,
+            senderName: { $0 == alice ? "Alice" : "Other" }
+        )
+        XCTAssertTrue(rows.contains(.labeled(label: "Alice", value: "Delivered · direct Bluetooth")))
+        XCTAssertFalse(rows.contains { if case .labeled(let label, _) = $0 { return label == "Other" }; return false })
+    }
 }
