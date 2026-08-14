@@ -841,4 +841,5 @@
     <string name="ui_two_copies_of_this_contact_banner">CruiseMesh saw two copies of this contact. The messages already on this phone were kept.</string>
     <string name="ui_another_phone_is_using_your_backup">Another phone is using your CruiseMesh backup</string>
     <string name="ui_another_phone_is_using_your_backup_detail">Both phones will get out of sync. Use one phone until you can link them.</string>
+    <string name="ui_this_is_my_only_phone">This is my only phone</string>
 </resources>

@@ -1092,6 +1092,13 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         meshStatusText = transientMeshStatus ?: pillStatus.text,
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
         ownCloneWarning = ownCloneWarning,
+        onDismissOwnCloneWarning = {
+            summaryScope.launch(Dispatchers.IO) {
+                if (runCatching { store.clearIdentityCloneWarning(identity.userId) }.isSuccess) {
+                    withContext(Dispatchers.Main.immediate) { ownCloneWarning = false }
+                }
+            }
+        },
         connectivityWarning = when {
             !hasPermissions -> ConnectivityWarning(
                 title = stringResource(R.string.ui_permissions_required_mesh_off),

@@ -4876,6 +4876,16 @@
           }
         }
       }
+    },
+    "This is my only phone": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This is my only phone"
+          }
+        }
+      }
     }
   },
   "version": "1.0"

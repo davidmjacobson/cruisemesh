@@ -32,6 +32,7 @@ import androidx.core.content.ContextCompat
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.MainActivity
 import com.cruisemesh.app.R
+import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.identity.IdentityStore
@@ -1685,6 +1686,7 @@ class MeshService : Service() {
         val id = identity ?: return
         runCatching {
             store.recordIdentityCloneWarning(id.userId, System.currentTimeMillis())
+            ChatEvents.notifyChatChanged(id.userId)
         }.onFailure { error ->
             Log.w(TAG, "Could not record identity clone warning: ${error.message}")
         }

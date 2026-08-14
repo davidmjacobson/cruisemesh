@@ -985,6 +985,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
         do {
             try store.recordIdentityCloneWarning(userId: identity.userId, nowMs: nowMs)
+            ChatEvents.notifyChatChanged(identity.userId)
         } catch {
             log.warning("Could not record identity clone warning")
         }

@@ -3640,6 +3640,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearFriendSuggestions() throws 
     
     /**
+     * Clear this device's clone warning after the person has confirmed that
+     * no other phone is using their backup. A later authenticated sighting
+     * records a fresh row and surfaces the warning again.
+     */
+    func clearIdentityCloneWarning(userId: Data) throws 
+    
+    /**
      * Erase quarantined conflict branches and their metadata. Diagnostic
      * export deliberately exposes only redacted summaries, but the retained
      * rows contain message bodies for a future recovery rule. The user-facing
@@ -6045,6 +6052,18 @@ open func clearDeliveryMetrics()throws  {try rustCallWithError(FfiConverterTypeC
     
 open func clearFriendSuggestions()throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_clear_friend_suggestions(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Clear this device's clone warning after the person has confirmed that
+     * no other phone is using their backup. A later authenticated sighting
+     * records a fresh row and surfaces the warning again.
+     */
+open func clearIdentityCloneWarning(userId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_identity_clone_warning(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
     )
 }
 }
@@ -37132,6 +37151,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_friend_suggestions() != 35411) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_identity_clone_warning() != 4057) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_message_conflicts() != 52976) {
