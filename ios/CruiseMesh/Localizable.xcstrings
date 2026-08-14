@@ -4756,6 +4756,86 @@
           }
         }
       }
+    },
+    "This link needs a newer version of CruiseMesh. Update the app, then try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link needs a newer version of CruiseMesh. Update the app, then try again."
+          }
+        }
+      }
+    },
+    "That looks like a friend card but part of it is missing. Copy the whole message and try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "That looks like a friend card but part of it is missing. Copy the whole message and try again."
+          }
+        }
+      }
+    },
+    "Not a CruiseMesh friend card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not a CruiseMesh friend card"
+          }
+        }
+      }
+    },
+    "CruiseMesh saw two copies of this contact. The messages already on this phone were kept.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh saw two copies of this contact. The messages already on this phone were kept."
+          }
+        }
+      }
+    },
+    "Two copies of this contact": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Two copies of this contact"
+          }
+        }
+      }
+    },
+    "CruiseMesh saw two phones using the same identity. The messages already on this phone were kept. This can happen if they restored a backup onto another phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "CruiseMesh saw two phones using the same identity. The messages already on this phone were kept. This can happen if they restored a backup onto another phone."
+          }
+        }
+      }
+    },
+    "Another phone is using your CruiseMesh backup": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Another phone is using your CruiseMesh backup"
+          }
+        }
+      }
+    },
+    "Both phones will get out of sync. Use one phone until you can link them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Both phones will get out of sync. Use one phone until you can link them."
+          }
+        }
+      }
     }
   },
   "version": "1.0"

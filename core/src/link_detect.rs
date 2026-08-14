@@ -728,6 +728,11 @@ mod tests {
             ["https://cruisemesh.app/f#CMFRIEND3:aB-_cD"]
         );
         assert_spans_match_text("Add me: https://cruisemesh.app/f#CMFRIEND3:aB-_cD thanks");
+        // v4 is the same URL shape; link detection must not drop the fragment.
+        assert_eq!(
+            urls("https://cruisemesh.app/f#CMFRIEND4:aB-_cD"),
+            ["https://cruisemesh.app/f#CMFRIEND4:aB-_cD"]
+        );
     }
 
     #[test]

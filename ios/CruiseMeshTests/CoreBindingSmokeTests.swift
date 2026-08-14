@@ -260,6 +260,45 @@ final class CoreBindingSmokeTests: XCTestCase {
         XCTAssertGreaterThan(answer, UInt64(Int64.max), "top bit lost")
     }
 
+    /// FriendCard gained an optional roster-head field (WPT / CMFRIEND4).
+    /// Absent and present must stay distinguishable after a nested-record
+    /// round trip.
+    func testFriendCardOptionalRosterHeadHashSurvivesANestedRecordTrip() {
+        let owner = generateIdentity()
+        let absent = FriendCard(
+            name: "Dana",
+            signPk: owner.signPk,
+            agreePk: owner.agreePk,
+            relayUrl: nil,
+            relayToken: nil,
+            signature: nil,
+            rosterHeadHash: nil
+        )
+        let hash = Data(repeating: 0xAB, count: 32)
+        var present = absent
+        present.rosterHeadHash = hash
+        let echoedAbsent = try! createSharedFriendCard(
+            sharer: owner, card: absent, sharedPolicyRevision: 1, nowMs: now
+        ).card
+        let echoedPresent = try! createSharedFriendCard(
+            sharer: owner, card: present, sharedPolicyRevision: 1, nowMs: now
+        ).card
+        XCTAssertNil(echoedAbsent.rosterHeadHash)
+        XCTAssertEqual(echoedPresent.rosterHeadHash, hash)
+    }
+
+    /// The new UnsupportedLink error variant must lift as itself.
+    func testUnsupportedLinkErrorVariantLifts() {
+        do {
+            _ = try parseFriendText(text: "CMFRIEND5:abc")
+            XCTFail("expected UnsupportedLink")
+        } catch CoreError.UnsupportedLink {
+            // shape only
+        } catch {
+            XCTFail("lifted as \(error)")
+        }
+    }
+
     // MARK: - Helpers
 
     /// Swift's generated enums are not `CaseIterable`, so the lists are

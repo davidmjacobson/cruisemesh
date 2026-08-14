@@ -87,6 +87,7 @@ struct ChatListView: View {
     @State private var bluetoothAudioWarningDismissed = false
     @State private var publishedFriendDirectory = false
     @State private var showStoreRecoveryNotice = false
+    @State private var ownCloneWarning = false
     @State private var pendingDeleteSummary: ChatSummary?
     @State private var path = NavigationPath()
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
@@ -263,6 +264,17 @@ struct ChatListView: View {
                         .padding(10)
                         .background(Color.orange.opacity(0.16))
                     }
+                    if ownCloneWarning {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Another phone is using your CruiseMesh backup")
+                                .font(.subheadline.weight(.semibold))
+                            Text("Both phones will get out of sync. Use one phone until you can link them.")
+                                .font(.caption)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color.red.opacity(0.12))
+                    }
                     if let warning = connectivityWarning {
                         ConnectivityWarningBanner(
                             warning: warning,
@@ -418,6 +430,7 @@ struct ChatListView: View {
 
     private func reload() {
         let store = AppStore.get()
+        ownCloneWarning = (try? store.hasIdentityCloneWarning(userId: identity.userId)) ?? false
         let contacts = (try? store.listContacts()) ?? []
         hasContacts = !contacts.isEmpty
         let direct: [ChatSummary] = contacts.map { c in

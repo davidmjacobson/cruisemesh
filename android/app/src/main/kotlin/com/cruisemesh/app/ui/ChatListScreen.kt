@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.MoreVert
@@ -35,6 +36,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -123,6 +125,7 @@ fun ChatListScreen(
     connectivityWarning: ConnectivityWarning? = null,
     onConnectivityWarningClick: () -> Unit = {},
     onConnectivityWarningSecondaryClick: (() -> Unit)? = null,
+    ownCloneWarning: Boolean = false,
     summaries: List<ChatSummary>
 ) {
     var showHomeMenu by remember { mutableStateOf(false) }
@@ -231,6 +234,29 @@ fun ChatListScreen(
                     onClick = onConnectivityWarningClick,
                     onSecondaryClick = onConnectivityWarningSecondaryClick,
                 )
+            }
+            if (ownCloneWarning) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                        Text(
+                            text = stringResource(R.string.ui_another_phone_is_using_your_backup),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = stringResource(R.string.ui_another_phone_is_using_your_backup_detail),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
+                }
             }
 
             MeshStatusPill(

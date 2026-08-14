@@ -66,7 +66,9 @@ struct CruiseMeshApp: App {
                 else { return }
                 switch route {
                 case .friend:
-                    guard (try? parseFriendText(text: fragment)) != nil else { return }
+                    // Always hand the fragment to the friends screen. A future
+                    // CMFRIEND4+/CMLINK scheme must fail soft there with
+                    // "update the app", not vanish.
                     appModel.pendingFriendToken = fragment
                 case .relaySetup:
                     guard (try? parseRelaySetupText(text: fragment)) != nil else { return }

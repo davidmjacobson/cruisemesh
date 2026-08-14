@@ -249,6 +249,9 @@ fun ChatScreen(
     var draft by remember(contact.userId) { mutableStateOf(DraftStore.load(context, contact.userId)) }
     var isMuted by remember(contact.userId) { mutableStateOf(ChatMuteStore.isMuted(context, contact.userId)) }
     var isBlocked by remember(contact.userId) { mutableStateOf(store.isUserBlocked(contact.userId)) }
+    var identityCloneWarning by remember(contact.userId) {
+        mutableStateOf(runCatching { store.hasIdentityCloneWarning(contact.userId) }.getOrDefault(false))
+    }
     val shareAvailability = remember(contact.userId, isBlocked) {
         ShareContactPolicy.availability(store.getContactDiscoveryPolicy(contact.userId), isBlocked)
     }
@@ -275,6 +278,9 @@ fun ChatScreen(
         deliveredThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
         readThrough = store.receiptThrough(currentContact.userId, ownUserId, RECEIPT_TYPE_READ)
         deliveredVia = store.receiptViaTransport(currentContact.userId, ownUserId, RECEIPT_TYPE_DELIVERED)
+        identityCloneWarning = runCatching {
+            store.hasIdentityCloneWarning(currentContact.userId)
+        }.getOrDefault(false)
     }
 
     fun stagePhoto(jpeg: ByteArray?) = stagePhotoOrWarn(context, jpeg) { pendingPhoto = it }
@@ -476,6 +482,7 @@ fun ChatScreen(
         reachabilityStatusText = reachabilityStatusText,
         reachabilityDetailsText = reachabilityDetailsText,
         relayCardIsStale = relayCardIsStale,
+        identityCloneWarning = identityCloneWarning,
         composerReach = composerReach,
         isMuted = isMuted,
         onMutedChange = {
@@ -572,6 +579,7 @@ private fun ConversationScreen(
     reachabilityDetailsText: String = reachabilityStatusText,
     /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
     relayCardIsStale: Boolean = false,
+    identityCloneWarning: Boolean = false,
     composerReach: ComposerReach = ComposerReach.FINE,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
@@ -720,6 +728,9 @@ private fun ConversationScreen(
             }
         },
         belowList = {
+            if (identityCloneWarning) {
+                IdentityCloneNotice()
+            }
             ComposerReachNotice(reach = composerReach, contactName = displayName)
 
             if (pendingPhoto != null) {
@@ -770,6 +781,7 @@ private fun ConversationScreen(
                         onReport()
                     },
                     relayCardIsStale = relayCardIsStale,
+                    identityCloneWarning = identityCloneWarning,
                     shareAvailability = shareAvailability,
                     onShareContact = {
                         showContactDetails = false
@@ -939,6 +951,24 @@ private fun ConversationScreen(
  * tick forever and no screen explains why -- so it has to be where the typing
  * happens, and it has to stay put.
  */
+@Composable
+internal fun IdentityCloneNotice(modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+    ) {
+        Text(
+            text = stringResource(R.string.ui_two_copies_of_this_contact_banner),
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        )
+    }
+}
+
 @Composable
 internal fun ComposerReachNotice(reach: ComposerReach, contactName: String, modifier: Modifier = Modifier) {
     val stringRes = ComposerReachCopy.stringResFor(reach) ?: return

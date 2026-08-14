@@ -36,6 +36,13 @@ const SHARED_CARD_PREFIX: &str = "CMSHARE1:";
 /// ~265 to ~175 characters. This is the form [`make_friend_link`] now emits
 /// (see [`EMIT_FRIEND_LINK_V3`]).
 const FRIEND_LINK_PREFIX_V3: &str = "CMFRIEND3:";
+/// Compact link form v4 (`specs/multi-device-v1.md` §12): the v3 layout plus a
+/// trailing roster-head field so a new friendship can start multi-device-aware.
+/// Parser ships first; emit stays v3 until the fleet parses v4 (WP8).
+const FRIEND_LINK_PREFIX_V4: &str = "CMFRIEND4:";
+/// Device-link ceremony (`specs/multi-device-v1.md` §9). This build does not
+/// implement linking; seeing the prefix is the "update the app" fail-soft.
+const DEVICE_LINK_PREFIX: &str = "CMLINK1:";
 
 /// Phase 2 of the friend-card self-signing rollout (`specs/friend-card-v3.md`
 /// §Rollout): emit signed `CMFRIEND3:` links. The fleet has shipped the v3
@@ -45,6 +52,10 @@ const FRIEND_LINK_PREFIX_V3: &str = "CMFRIEND3:";
 /// running a build that emits signed cards — signed cards must be circulating
 /// before unsigned imports can be refused.
 const EMIT_FRIEND_LINK_V3: bool = true;
+/// v4 emit stays off until the fleet parses `CMFRIEND4:` (`specs/multi-device-v1.md`
+/// §12 / WP8). The encoder and parser are fully implemented; this is the one
+/// line the later flip changes.
+const EMIT_FRIEND_LINK_V4: bool = false;
 
 /// v3 relay-URL field tags.
 const V3_URL_TAG_NONE: u8 = 0x00;
@@ -57,6 +68,12 @@ const V3_TOKEN_TAG_HEX: u8 = 0x02;
 /// v3 self-signature field tags (`specs/friend-card-v3.md`).
 const V3_SIG_TAG_NONE: u8 = 0x00;
 const V3_SIG_TAG_PRESENT: u8 = 0x01;
+/// v4 roster-head field tags (`specs/multi-device-v1.md` §12). The roster
+/// document itself is WP1; v4 carries only a 32-byte hash so a later build
+/// can start a friendship already multi-device-aware.
+const V4_ROSTER_TAG_NONE: u8 = 0x00;
+const V4_ROSTER_TAG_HASH: u8 = 0x01;
+const ROSTER_HEAD_HASH_LEN: usize = 32;
 
 /// Length of an Ed25519 signature; the card's self-signature is exactly this.
 const FRIEND_CARD_SIGNATURE_LEN: usize = 64;
@@ -113,6 +130,12 @@ pub struct FriendCard {
     pub relay_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
+    /// BLAKE2b-256 of the person's current roster (`specs/multi-device-v1.md`
+    /// §12). `None` on every v1–v3 card and on a v4 card that has not yet
+    /// gossiped a roster. Ignored by this build; parsed so a later WP can
+    /// persist it without a second fleet update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_head_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -129,6 +152,11 @@ pub enum CoreError {
     SignatureInvalid,
     #[error("malformed wire data: {0}")]
     Malformed(String),
+    /// A friend-card or deep-link scheme this build does not implement
+    /// (`CMFRIEND5:`, `CMLINK1:`, …). Shells map this to "update the app"
+    /// copy; it is never a crash and never a half-parsed contact.
+    #[error("this link needs a newer version of CruiseMesh")]
+    UnsupportedLink,
 }
 
 /// Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
@@ -277,6 +305,7 @@ pub fn make_friend_card(
         relay_url,
         relay_token,
         signature: None,
+        roster_head_hash: None,
     };
     validate_friend_card(&card)?;
     // Self-sign under the card owner's own key over the final field values
@@ -312,6 +341,12 @@ fn friend_card_signed_bytes(card: &FriendCard) -> Vec<u8> {
     push_opt_len_prefixed(&mut out, card.relay_url.as_deref().map(str::as_bytes));
     push_opt_len_prefixed(&mut out, card.relay_token.as_deref().map(str::as_bytes));
     push_len_prefixed(&mut out, card.name.as_bytes());
+    // Roster head is appended only when present so every existing v3
+    // signature keeps verifying. Absence vs presence is therefore distinct
+    // without a presence byte on every card.
+    if let Some(hash) = card.roster_head_hash.as_deref() {
+        push_len_prefixed(&mut out, hash);
+    }
     out
 }
 
@@ -399,6 +434,13 @@ pub fn make_friend_link(card_json: String) -> Result<String, CoreError> {
     // concern). This also keeps the emitter working for callers that mint a
     // card with synthetic keys, e.g. wire-format golden vectors.
     let card = friend_card_from_json(&card_json)?;
+    if EMIT_FRIEND_LINK_V4 {
+        let binary = encode_friend_card_binary_v4(&card)?;
+        return Ok(format!(
+            "{FRIEND_LINK_PREFIX_V4}{}",
+            BASE64URL_NOPAD.encode(&binary)
+        ));
+    }
     if EMIT_FRIEND_LINK_V3 {
         let binary = encode_friend_card_binary_v3(&card)?;
         return Ok(format!(
@@ -481,6 +523,7 @@ fn decode_friend_card_binary(bytes: &[u8]) -> Result<FriendCard, CoreError> {
         relay_url,
         relay_token,
         signature: None,
+        roster_head_hash: None,
     };
     validate_friend_card(&card)?;
     Ok(card)
@@ -651,12 +694,87 @@ fn decode_friend_card_binary_v3(bytes: &[u8]) -> Result<FriendCard, CoreError> {
         relay_url,
         relay_token,
         signature,
+        roster_head_hash: None,
     };
     validate_friend_card(&card)?;
     // v3 is an import path: a present-but-invalid self-signature is rejected,
     // never silently downgraded to unsigned (TM-01).
     verify_friend_card_self_signature(&card)?;
     Ok(card)
+}
+
+/// Binary FriendCard layout for the `CMFRIEND4:` link form
+/// (`specs/multi-device-v1.md` §12): the v3 layout plus a trailing
+/// `roster_head_field`. Tags: `0x00` absent, `0x01` a 32-byte roster-head
+/// hash. The rest of the roster type is WP1; this field is parse-only so a
+/// later emit flip does not have to wait on another fleet update.
+fn encode_friend_card_binary_v4(card: &FriendCard) -> Result<Vec<u8>, CoreError> {
+    let mut out = encode_friend_card_binary_v3(card)?;
+    encode_v4_roster_head_field(&mut out, card.roster_head_hash.as_deref())?;
+    Ok(out)
+}
+
+fn encode_v4_roster_head_field(out: &mut Vec<u8>, hash: Option<&[u8]>) -> Result<(), CoreError> {
+    match hash {
+        None => out.push(V4_ROSTER_TAG_NONE),
+        Some(hash) => {
+            if hash.len() != ROSTER_HEAD_HASH_LEN {
+                return Err(CoreError::InvalidFriendCard(format!(
+                    "roster head hash must be {ROSTER_HEAD_HASH_LEN} bytes"
+                )));
+            }
+            out.push(V4_ROSTER_TAG_HASH);
+            out.extend_from_slice(hash);
+        }
+    }
+    Ok(())
+}
+
+fn decode_friend_card_binary_v4(bytes: &[u8]) -> Result<FriendCard, CoreError> {
+    let mut pos = 0usize;
+    let sign_pk = read_binary_slice(bytes, &mut pos, 32)?.to_vec();
+    let agree_pk = read_binary_slice(bytes, &mut pos, 32)?.to_vec();
+    let name_len = read_binary_slice(bytes, &mut pos, 1)?[0] as usize;
+    let name_bytes = read_binary_slice(bytes, &mut pos, name_len)?;
+    let name = std::str::from_utf8(name_bytes)
+        .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?
+        .to_string();
+    let relay_url = decode_v3_url_field(bytes, &mut pos)?;
+    let relay_token = decode_v3_token_field(bytes, &mut pos)?;
+    let signature = decode_v3_signature_field(bytes, &mut pos)?;
+    let roster_head_hash = decode_v4_roster_head_field(bytes, &mut pos)?;
+    if pos != bytes.len() {
+        return Err(CoreError::InvalidFriendCard(
+            "trailing bytes after friend card".to_string(),
+        ));
+    }
+    let card = FriendCard {
+        name,
+        sign_pk,
+        agree_pk,
+        relay_url,
+        relay_token,
+        signature,
+        roster_head_hash,
+    };
+    validate_friend_card(&card)?;
+    verify_friend_card_self_signature(&card)?;
+    Ok(card)
+}
+
+fn decode_v4_roster_head_field(
+    bytes: &[u8],
+    pos: &mut usize,
+) -> Result<Option<Vec<u8>>, CoreError> {
+    match read_binary_slice(bytes, pos, 1)?[0] {
+        V4_ROSTER_TAG_NONE => Ok(None),
+        V4_ROSTER_TAG_HASH => Ok(Some(
+            read_binary_slice(bytes, pos, ROSTER_HEAD_HASH_LEN)?.to_vec(),
+        )),
+        other => Err(CoreError::InvalidFriendCard(format!(
+            "invalid roster-head tag {other}"
+        ))),
+    }
 }
 
 fn decode_v3_signature_field(bytes: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, CoreError> {
@@ -746,10 +864,13 @@ pub fn parse_friend_card(json: String) -> Result<FriendCard, CoreError> {
 }
 
 /// Parse a shared friend card in any form ever emitted: the compact binary
-/// `CMFRIEND3:` link (smallest, parsed here before anything emits it), the
-/// binary `CMFRIEND2:` link (what we emit now), the legacy `CMFRIEND1:` JSON
-/// link, any of them embedded in a `https://cruisemesh.app/f#…` URL or
-/// surrounding prose, or a raw FriendCard JSON blob.
+/// `CMFRIEND4:` link (parsed here before anything emits it), the
+/// `CMFRIEND3:` link (what we emit now), the binary `CMFRIEND2:` link, the
+/// legacy `CMFRIEND1:` JSON link, any of them embedded in a
+/// `https://cruisemesh.app/f#…` URL or surrounding prose, or a raw FriendCard
+/// JSON blob. A newer scheme than this build implements
+/// ([`CoreError::UnsupportedLink`]) fails soft so the shells can ask the
+/// user to update rather than treating the card as garbage.
 #[uniffi::export]
 pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
     if text.len() > MAX_FRIEND_TEXT_BYTES {
@@ -758,10 +879,20 @@ pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
         ));
     }
     let trimmed = text.trim();
+    if let Some(error) = unsupported_link_error(trimmed) {
+        return Err(error);
+    }
 
     // Newest form first, then older ones; every form may appear bare, wrapped
     // in a URL fragment, or inside prose ("Add me on CruiseMesh: …"). The
     // prefixes include their trailing colon, so they cannot shadow each other.
+    if let Some(encoded) = extract_link_body(trimmed, FRIEND_LINK_PREFIX_V4) {
+        let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
+        let binary = BASE64URL_NOPAD
+            .decode(compact.as_bytes())
+            .map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+        return decode_friend_card_binary_v4(&binary);
+    }
     if let Some(encoded) = extract_link_body(trimmed, FRIEND_LINK_PREFIX_V3) {
         let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
         let binary = BASE64URL_NOPAD
@@ -808,6 +939,39 @@ fn extract_link_body<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     Some(&tail[..end])
 }
 
+/// Highest friend-card version this build parses. Anything above is
+/// [`CoreError::UnsupportedLink`], not a generic "not a friend card".
+const MAX_PARSED_FRIEND_CARD_VERSION: u32 = 4;
+
+/// A future scheme this build cannot honour. Detected by prefix, not by
+/// attempting to parse the body — a half-decoded `CMFRIEND5:` must never
+/// become a contact.
+fn unsupported_link_error(text: &str) -> Option<CoreError> {
+    if cruise_scheme_version(text, "CMFRIEND")
+        .is_some_and(|version| version == 0 || version > MAX_PARSED_FRIEND_CARD_VERSION)
+    {
+        return Some(CoreError::UnsupportedLink);
+    }
+    if cruise_scheme_version(text, "CMLINK").is_some() || text.contains(DEVICE_LINK_PREFIX) {
+        return Some(CoreError::UnsupportedLink);
+    }
+    if cruise_scheme_version(text, "CMSHARE").is_some_and(|version| version != 1) {
+        return Some(CoreError::UnsupportedLink);
+    }
+    None
+}
+
+/// `NAME` + digits + `:` anywhere in `text` (bare, URL fragment, or prose).
+fn cruise_scheme_version(text: &str, name: &str) -> Option<u32> {
+    let start = text.find(name)?;
+    let rest = &text[start + name.len()..];
+    let digit_end = rest.find(|c: char| !c.is_ascii_digit())?;
+    if rest.as_bytes().get(digit_end) != Some(&b':') || digit_end == 0 {
+        return None;
+    }
+    rest[..digit_end].parse().ok()
+}
+
 fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
     if card.name.len() > MAX_DISPLAY_NAME_BYTES {
         return Err(CoreError::InvalidFriendCard(format!(
@@ -852,6 +1016,15 @@ fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
         .is_some_and(|sig| sig.len() != FRIEND_CARD_SIGNATURE_LEN)
     {
         return Err(CoreError::SignatureInvalid);
+    }
+    if card
+        .roster_head_hash
+        .as_ref()
+        .is_some_and(|hash| hash.len() != ROSTER_HEAD_HASH_LEN)
+    {
+        return Err(CoreError::InvalidFriendCard(format!(
+            "roster head hash must be {ROSTER_HEAD_HASH_LEN} bytes"
+        )));
     }
     Ok(())
 }
@@ -956,6 +1129,9 @@ pub fn parse_friend_import(text: String) -> Result<FriendImport, CoreError> {
         ));
     }
     let trimmed = text.trim();
+    if let Some(error) = unsupported_link_error(trimmed) {
+        return Err(error);
+    }
     if let Some(encoded) = extract_link_body(trimmed, SHARED_CARD_PREFIX) {
         let compact: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
         let binary = BASE64URL_NOPAD
@@ -1277,6 +1453,7 @@ mod tests {
             relay_url: Some("https://relay.example".to_string()),
             relay_token: Some("deposit-token".to_string()),
             signature: None,
+            roster_head_hash: None,
         };
         let shared = create_shared_friend_card(sharer.clone(), card.clone(), 7, 1_000_000).unwrap();
         (sharer, shared_person, card, shared)
@@ -1653,7 +1830,30 @@ mod tests {
     #[test]
     fn parse_friend_text_rejects_unknown_prefix() {
         let err = parse_friend_text("CMFRIEND7:abc".to_string()).unwrap_err();
-        assert!(matches!(err, CoreError::InvalidFriendCard(_)));
+        assert!(
+            matches!(err, CoreError::UnsupportedLink),
+            "a newer card version must fail soft as update-the-app, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_friend_text_and_import_fail_soft_on_future_link_schemes() {
+        for text in [
+            "CMLINK1:abc",
+            "Add me: https://cruisemesh.app/f#CMFRIEND5:abc",
+            "CMSHARE2:abc",
+        ] {
+            let err = parse_friend_text(text.to_string()).unwrap_err();
+            assert!(
+                matches!(err, CoreError::UnsupportedLink),
+                "{text} -> {err:?}"
+            );
+            let err = parse_friend_import(text.to_string()).unwrap_err();
+            assert!(
+                matches!(err, CoreError::UnsupportedLink),
+                "import {text} -> {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1756,6 +1956,7 @@ mod tests {
             relay_url: relay_url.map(str::to_string),
             relay_token: relay_token.map(str::to_string),
             signature: None,
+            roster_head_hash: None,
         }
     }
 
@@ -1778,6 +1979,7 @@ mod tests {
             decoded.relay_token.as_deref().map(str::as_bytes),
             original.relay_token.as_deref().map(str::as_bytes)
         );
+        assert_eq!(decoded.roster_head_hash, original.roster_head_hash);
     }
 
     /// The v3 contract in one test: for every combination of name, relay URL
@@ -2064,6 +2266,67 @@ mod tests {
             parse_friend_text(tampered),
             Err(CoreError::SignatureInvalid)
         ));
+
+        // WPT / WP8: emit stays v3 until the fleet parses v4.
+        assert!(!EMIT_FRIEND_LINK_V4);
+        assert!(!link.starts_with(FRIEND_LINK_PREFIX_V4));
+    }
+
+    // ---- CMFRIEND4 (specs/multi-device-v1.md §12, parse-only) --------------
+
+    fn v4_link(card: &FriendCard) -> String {
+        format!(
+            "{FRIEND_LINK_PREFIX_V4}{}",
+            BASE64URL_NOPAD.encode(&encode_friend_card_binary_v4(card).unwrap())
+        )
+    }
+
+    #[test]
+    fn parse_friend_text_accepts_v4_with_and_without_roster_head() {
+        let mut card = v3_card("Dana", Some(OFFICIAL_URL), Some(HEX_TOKEN));
+        let unsigned = parse_friend_text(v4_link(&card)).expect("unsigned v4");
+        assert_eq!(unsigned.name, "Dana");
+        assert_eq!(unsigned.roster_head_hash, None);
+        assert_fields_identical(&card, &unsigned);
+
+        card.roster_head_hash = Some(vec![0xAB; ROSTER_HEAD_HASH_LEN]);
+        let with_hash = parse_friend_text(v4_link(&card)).expect("v4 with roster hash");
+        assert_eq!(with_hash.roster_head_hash, card.roster_head_hash);
+        assert_fields_identical(&card, &with_hash);
+    }
+
+    #[test]
+    fn signed_v4_card_round_trips_and_covers_roster_head() {
+        let owner = generate_identity();
+        let json = make_friend_card("Dana".into(), owner.clone(), None, None).unwrap();
+        let mut card = parse_friend_card(json).unwrap();
+        card.roster_head_hash = Some(vec![0xCD; ROSTER_HEAD_HASH_LEN]);
+        card.signature = Some(sign_friend_card(&card, &owner.sign_sk).unwrap());
+
+        let decoded = parse_friend_text(v4_link(&card)).expect("signed v4 verifies");
+        assert_eq!(decoded.roster_head_hash, card.roster_head_hash);
+        assert_eq!(decoded.signature, card.signature);
+
+        // Tampering the roster hash must fail verification, not import unsigned.
+        let body = &v4_link(&card)[FRIEND_LINK_PREFIX_V4.len()..];
+        let mut binary = BASE64URL_NOPAD.decode(body.as_bytes()).unwrap();
+        *binary.last_mut().unwrap() ^= 0x01;
+        let tampered = format!("{FRIEND_LINK_PREFIX_V4}{}", BASE64URL_NOPAD.encode(&binary));
+        assert!(matches!(
+            parse_friend_text(tampered),
+            Err(CoreError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn v4_unknown_roster_tag_and_truncation_are_clean_errors() {
+        let card = v3_card("Dana", None, None);
+        let mut binary = encode_friend_card_binary_v4(&card).unwrap();
+        *binary.last_mut().unwrap() = 0x99;
+        assert!(decode_friend_card_binary_v4(&binary).is_err());
+
+        binary.pop();
+        assert!(decode_friend_card_binary_v4(&binary).is_err());
     }
 
     #[test]

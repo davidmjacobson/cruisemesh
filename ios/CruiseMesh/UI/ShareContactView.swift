@@ -84,7 +84,8 @@ struct ShareContactView: View {
             // No primary self-signature when re-sharing: the sharer never holds
             // the contact's signing key. Integrity of a shared card comes from
             // the sharer's own SharedFriendCard signature instead.
-            signature: nil
+            signature: nil,
+            rosterHeadHash: nil
         )
         guard let shared = try? createSharedFriendCard(
             sharer: identity,

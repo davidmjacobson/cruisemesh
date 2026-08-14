@@ -32,6 +32,11 @@ import uniffi.cruisemesh_core.voiceCaptureDrag
 import uniffi.cruisemesh_core.voiceCapturePlan
 import uniffi.cruisemesh_core.voiceCapturePress
 import uniffi.cruisemesh_core.voiceCaptureIdleState
+import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.FriendCard
+import uniffi.cruisemesh_core.createSharedFriendCard
+import uniffi.cruisemesh_core.generateIdentity
+import uniffi.cruisemesh_core.parseFriendText
 
 /**
  * The *shape* of the UniFFI boundary, not the policy behind it.
@@ -341,6 +346,45 @@ class CoreBindingSmokeTest {
         val holding = voiceCapturePress(voiceCaptureIdleState()).state
         assertTrue(voiceCaptureDrag(holding, -(plan.cancelSlideDp + 1f), 0f).state.cancelArmed)
         assertTrue(!voiceCaptureDrag(holding, -(plan.cancelSlideDp - 1f), 0f).state.cancelArmed)
+    }
+
+    /**
+     * FriendCard gained an optional roster-head field (WPT / CMFRIEND4).
+     * Absent and present must stay distinguishable after a nested-record
+     * round trip; a converter that dropped the new field would collapse them.
+     */
+    @Test
+    fun `friend card optional roster head hash survives a nested record trip`() {
+        val owner = generateIdentity()
+        val absent = FriendCard(
+            name = "Dana",
+            signPk = owner.signPk,
+            agreePk = owner.agreePk,
+            relayUrl = null,
+            relayToken = null,
+            signature = null,
+            rosterHeadHash = null,
+        )
+        val hash = ByteArray(32) { 0xAB.toByte() }
+        val present = absent.copy(rosterHeadHash = hash)
+        val echoedAbsent = createSharedFriendCard(owner, absent, 1u, NOW).card
+        val echoedPresent = createSharedFriendCard(owner, present, 1u, NOW).card
+        assertNull(echoedAbsent.rosterHeadHash)
+        assertArrayEquals(hash, echoedPresent.rosterHeadHash)
+    }
+
+    /**
+     * The new UnsupportedLink error variant must lift as itself. A shifted
+     * discriminant would land on another CoreException case or panic.
+     */
+    @Test
+    fun `unsupported link error variant lifts`() {
+        try {
+            parseFriendText("CMFRIEND5:abc")
+            throw AssertionError("expected UnsupportedLink")
+        } catch (_: CoreException.UnsupportedLink) {
+            // shape only
+        }
     }
 
     private fun person(

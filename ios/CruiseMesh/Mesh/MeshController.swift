@@ -383,6 +383,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 guard let self, self.isRunning else { return }
                 let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
                 MeshRouter.onConnected(address: address, transport: .lan)
+                self.notePossibleIdentityClone(userId: userId)
                 guard MeshRouter.onHello(address: address, userId: userId) else { return }
                 let seenAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
                 self.onMain {
@@ -743,6 +744,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case .hello(let userId):
             handleHello(address: address, userId: userId, identity: identity)
         case .hello2(let userId, let capabilities):
+            notePossibleIdentityClone(userId: userId)
             MeshRouter.onHello2(address: address, userId: userId, capabilities: capabilities)
         case .envelope(let msgId, let hopTtl, let expiry, let recipientHint, let sealed):
             processInboundEnvelope(
@@ -954,6 +956,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// WPT clone guard: two live devices presenting the same identity.
+    private func notePossibleIdentityClone(userId: Data) {
+        guard let own = identity?.userId, own == userId else { return }
+        try? store.recordIdentityCloneWarning(userId: userId, nowMs: Int64(Date().timeIntervalSince1970 * 1_000))
+        ChatEvents.notifyChatChanged(userId)
+    }
+
     private func handleHello(address: String, userId: Data, identity: Identity) {
         let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
         // Match Android's per-HELLO reaffirmation. Startup ordering already
@@ -961,6 +970,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // HELLO processing prevents a future lifecycle reorder from silently
         // restoring the central-first fallback.
         MeshRouter.setLocalUserId(identity.userId)
+        notePossibleIdentityClone(userId: userId)
         guard MeshRouter.onHello(address: address, userId: userId) else {
             log.warning("Dropping HELLO that conflicts with the authenticated link identity")
             return
@@ -2013,7 +2023,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         _ outcome: IncomingMessageInsertOutcome,
         sourceLabel: String,
         kind: UInt8,
-        lamport: UInt64
+        lamport: UInt64,
+        senderUserId: Data
     ) -> Bool {
         switch outcome {
         case .inserted:
@@ -2027,6 +2038,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.warning(
                 "Quarantined message stream conflict kind=\(kind, privacy: .public) lamport=\(lamport, privacy: .public) on \(sourceLabel, privacy: .public); retained visible branch"
             )
+            ChatEvents.notifyChatChanged(senderUserId)
             return false
         }
     }
@@ -2082,7 +2094,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: sourceLabel,
             kind: body.kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         if let updated {
             do {
@@ -2129,7 +2142,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: "group transport",
             kind: body.kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         recordInboundChatArrival(senderUserId: senderUserId, kind: body.kind, arrival: arrival)
         ChatEvents.notifyChatChanged(group.id)
@@ -2275,7 +2289,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: sourceAddress ?? "relay",
             kind: kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         ChatEvents.notifyChatChanged(senderUserId)
 

@@ -4256,6 +4256,14 @@ public protocol MessageStoreProtocol : AnyObject {
     func hasDeliveryMetrics() throws  -> Bool
     
     /**
+     * Whether this identity has been seen authoring from two live devices:
+     * a recorded HELLO clone, or a quarantined stream conflict from that
+     * sender. The shells use this to surface a safety warning instead of
+     * leaving the quarantine silent.
+     */
+    func hasIdentityCloneWarning(userId: Data) throws  -> Bool
+    
+    /**
      * Whether the bounded conflict quarantine contains any rows. This is the
      * cheap predicate used by diagnostics screens; unlike CSV export it does
      * not materialise the retained summaries or touch the filesystem.
@@ -5072,6 +5080,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * never paint ticks on a pairwise chat.
      */
     func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
+    
+    /**
+     * Record that another live device presented `user_id` (the `.cmbak`-clone
+     * failure mode in `specs/multi-device-v1.md` §1 / WPT). Shells call this
+     * when a HELLO arrives with our own UserID. Stream-conflict quarantine
+     * is the other detection path and does not need a separate write.
+     */
+    func recordIdentityCloneWarning(userId: Data, nowMs: Int64) throws 
     
     /**
      * Attach first-arrival diagnostics to an already inserted incoming
@@ -6947,6 +6963,20 @@ open func hasDeliveryMetrics()throws  -> Bool {
 }
     
     /**
+     * Whether this identity has been seen authoring from two live devices:
+     * a recorded HELLO clone, or a quarantined stream conflict from that
+     * sender. The shells use this to surface a safety warning instead of
+     * leaving the quarantine silent.
+     */
+open func hasIdentityCloneWarning(userId: Data)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_has_identity_clone_warning(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
      * Whether the bounded conflict quarantine contains any rows. This is the
      * cheap predicate used by diagnostics screens; unlike CSV export it does
      * not materialise the retained summaries or touch the filesystem.
@@ -8190,6 +8220,20 @@ open func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Da
         FfiConverterUInt8.lower(receiptType),
         FfiConverterUInt64.lower(throughLamport),
         FfiConverterOptionUInt8.lower(viaTransport),$0
+    )
+}
+}
+    
+    /**
+     * Record that another live device presented `user_id` (the `.cmbak`-clone
+     * failure mode in `specs/multi-device-v1.md` §1 / WPT). Shells call this
+     * when a HELLO arrives with our own UserID. Stream-conflict quarantine
+     * is the other detection path and does not need a separate write.
+     */
+open func recordIdentityCloneWarning(userId: Data, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_record_identity_clone_warning(self.uniffiClonePointer(),
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 }
 }
@@ -18286,16 +18330,30 @@ public struct FriendCard {
     public var relayUrl: String?
     public var relayToken: String?
     public var signature: Data?
+    /**
+     * BLAKE2b-256 of the person's current roster (`specs/multi-device-v1.md`
+     * §12). `None` on every v1–v3 card and on a v4 card that has not yet
+     * gossiped a roster. Ignored by this build; parsed so a later WP can
+     * persist it without a second fleet update.
+     */
+    public var rosterHeadHash: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, signature: Data?) {
+    public init(name: String, signPk: Data, agreePk: Data, relayUrl: String?, relayToken: String?, signature: Data?, 
+        /**
+         * BLAKE2b-256 of the person's current roster (`specs/multi-device-v1.md`
+         * §12). `None` on every v1–v3 card and on a v4 card that has not yet
+         * gossiped a roster. Ignored by this build; parsed so a later WP can
+         * persist it without a second fleet update.
+         */rosterHeadHash: Data?) {
         self.name = name
         self.signPk = signPk
         self.agreePk = agreePk
         self.relayUrl = relayUrl
         self.relayToken = relayToken
         self.signature = signature
+        self.rosterHeadHash = rosterHeadHash
     }
 }
 
@@ -18321,6 +18379,9 @@ extension FriendCard: Equatable, Hashable {
         if lhs.signature != rhs.signature {
             return false
         }
+        if lhs.rosterHeadHash != rhs.rosterHeadHash {
+            return false
+        }
         return true
     }
 
@@ -18331,6 +18392,7 @@ extension FriendCard: Equatable, Hashable {
         hasher.combine(relayUrl)
         hasher.combine(relayToken)
         hasher.combine(signature)
+        hasher.combine(rosterHeadHash)
     }
 }
 
@@ -18347,7 +18409,8 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
                 agreePk: FfiConverterData.read(from: &buf), 
                 relayUrl: FfiConverterOptionString.read(from: &buf), 
                 relayToken: FfiConverterOptionString.read(from: &buf), 
-                signature: FfiConverterOptionData.read(from: &buf)
+                signature: FfiConverterOptionData.read(from: &buf), 
+                rosterHeadHash: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -18358,6 +18421,7 @@ public struct FfiConverterTypeFriendCard: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
         FfiConverterOptionData.write(value.signature, into: &buf)
+        FfiConverterOptionData.write(value.rosterHeadHash, into: &buf)
     }
 }
 
@@ -23899,6 +23963,12 @@ public enum CoreError {
     case SignatureInvalid
     case Malformed(String
     )
+    /**
+     * A friend-card or deep-link scheme this build does not implement
+     * (`CMFRIEND5:`, `CMLINK1:`, …). Shells map this to "update the app"
+     * copy; it is never a crash and never a half-parsed contact.
+     */
+    case UnsupportedLink
 }
 
 
@@ -23932,6 +24002,7 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         case 6: return .Malformed(
             try FfiConverterString.read(from: &buf)
             )
+        case 7: return .UnsupportedLink
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -23973,6 +24044,10 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
             FfiConverterString.write(v1, into: &buf)
             
+        
+        case .UnsupportedLink:
+            writeInt(&buf, Int32(7))
+        
         }
     }
 }
@@ -34793,10 +34868,13 @@ public func parseFriendRequestContent(json: String)throws  -> FriendRequestConte
 }
 /**
  * Parse a shared friend card in any form ever emitted: the compact binary
- * `CMFRIEND3:` link (smallest, parsed here before anything emits it), the
- * binary `CMFRIEND2:` link (what we emit now), the legacy `CMFRIEND1:` JSON
- * link, any of them embedded in a `https://cruisemesh.app/f#…` URL or
- * surrounding prose, or a raw FriendCard JSON blob.
+ * `CMFRIEND4:` link (parsed here before anything emits it), the
+ * `CMFRIEND3:` link (what we emit now), the binary `CMFRIEND2:` link, the
+ * legacy `CMFRIEND1:` JSON link, any of them embedded in a
+ * `https://cruisemesh.app/f#…` URL or surrounding prose, or a raw FriendCard
+ * JSON blob. A newer scheme than this build implements
+ * ([`CoreError::UnsupportedLink`]) fails soft so the shells can ask the
+ * user to update rather than treating the card as garbage.
  */
 public func parseFriendText(text: String)throws  -> FriendCard {
     return try  FfiConverterTypeFriendCard.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -36564,7 +36642,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_parse_friend_request_content() != 35709) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 40105) {
+    if (uniffi_cruisemesh_core_checksum_func_parse_friend_text() != 33618) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_relay_setup_text() != 37250) {
@@ -37164,6 +37242,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_delivery_metrics() != 11580) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_identity_clone_warning() != 30610) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_message_conflicts() != 27119) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -37345,6 +37426,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_group_receipt() != 26756) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_identity_clone_warning() != 40132) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
