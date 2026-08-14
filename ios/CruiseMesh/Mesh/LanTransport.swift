@@ -1324,6 +1324,10 @@ func trustedLanPeerUserId(contacts: [Contact], remoteStaticKey: Data) -> Data? {
     contacts.first(where: { $0.agreePk == remoteStaticKey })?.userId
 }
 
+func ownLanStaticKeyMatches(ownAgreePk: Data, remoteStaticKey: Data) -> Bool {
+    ownAgreePk == remoteStaticKey
+}
+
 func appleLanServiceType() -> String {
     lanServiceType().trimmingCharacters(in: CharacterSet(charactersIn: "."))
 }

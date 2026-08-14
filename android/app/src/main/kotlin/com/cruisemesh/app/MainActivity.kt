@@ -707,10 +707,10 @@ internal fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
     val fragment = uri.fragment ?: return null
     return when (route) {
         DeepLinkRoute.FRIEND ->
-            // Always hand the fragment to the friends screen. A future
-            // CMFRIEND4+/CMLINK scheme must fail soft there with "update
-            // the app", not vanish.
-            PendingDeepLink(friendToken = fragment)
+            // Always hand a non-empty fragment to the friends screen. A
+            // future CMFRIEND4+/CMLINK scheme must fail soft there with
+            // "update the app", not vanish. An empty `#` is not a card.
+            fragment.takeIf { it.isNotBlank() }?.let { PendingDeepLink(friendToken = it) }
         DeepLinkRoute.RELAY_SETUP ->
             fragment.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
                 ?.let { PendingDeepLink(relayCard = it) }
@@ -934,14 +934,16 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             maxLatencyMs = ChatSummaryRefreshPolicy.MAX_LATENCY_MS,
             load = {
                 withContext(Dispatchers.IO) {
-                    ChatSummaryLoader.loadAll(context, store, identity)
+                    val loaded = ChatSummaryLoader.loadAll(context, store, identity)
+                    val warning = runCatching {
+                        store.hasIdentityCloneWarning(identity.userId)
+                    }.getOrDefault(false)
+                    loaded to warning
                 }
             },
-            onLoaded = { loaded ->
+            onLoaded = { (loaded, warning) ->
                 summaries = loaded
-                ownCloneWarning = runCatching {
-                    store.hasIdentityCloneWarning(identity.userId)
-                }.getOrDefault(false)
+                ownCloneWarning = warning
             },
         )
     }

@@ -238,7 +238,12 @@ async fn authenticate(
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
         noise.read_handshake_message(read_packet(&mut stream).await?)?;
-        let contact = trusted_contact(&services.store, noise.remote_static_key(), expected_peer)?;
+        let contact = trusted_contact(
+            &services.store,
+            &services.identity,
+            noise.remote_static_key(),
+            expected_peer,
+        )?;
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
         Ok((stream, noise, contact))
@@ -247,17 +252,27 @@ async fn authenticate(
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
         noise.read_handshake_message(read_packet(&mut stream).await?)?;
-        let contact = trusted_contact(&services.store, noise.remote_static_key(), expected_peer)?;
+        let contact = trusted_contact(
+            &services.store,
+            &services.identity,
+            noise.remote_static_key(),
+            expected_peer,
+        )?;
         Ok((stream, noise, contact))
     }
 }
 
 fn trusted_contact(
     store: &MessageStore,
+    identity: &Identity,
     remote_static: Option<Vec<u8>>,
     expected_peer: Option<Vec<u8>>,
 ) -> Result<Contact> {
     let remote_static = remote_static.context("Noise did not reveal the remote static key")?;
+    if remote_static == identity.agree_pk {
+        let _ = store.record_identity_clone_warning(identity.user_id.clone(), now_ms());
+        bail!("Noise static key is this device's own identity");
+    }
     let contact = store
         .list_contacts()?
         .into_iter()
@@ -548,12 +563,17 @@ mod tests {
                 nickname: None,
             })
             .unwrap();
+        let us = generate_identity();
         assert_eq!(
-            trusted_contact(&store, Some(peer.agree_pk), None)
+            trusted_contact(&store, &us, Some(peer.agree_pk), None)
                 .unwrap()
                 .user_id,
             peer.user_id
         );
-        assert!(trusted_contact(&store, Some(vec![9; 32]), None).is_err());
+        assert!(trusted_contact(&store, &us, Some(vec![9; 32]), None).is_err());
+        assert!(trusted_contact(&store, &us, Some(us.agree_pk.clone()), None).is_err());
+        assert!(store
+            .has_identity_clone_warning(us.user_id.clone())
+            .unwrap());
     }
 }

@@ -93,6 +93,8 @@ final class LanTransportTests: XCTestCase {
                 remoteStaticKey: Data(repeating: 9, count: 32)
             )
         )
+        XCTAssertTrue(ownLanStaticKeyMatches(ownAgreePk: alice.agreePk, remoteStaticKey: alice.agreePk))
+        XCTAssertFalse(ownLanStaticKeyMatches(ownAgreePk: alice.agreePk, remoteStaticKey: bob.agreePk))
     }
 
     func testManualEndpointParserAndLinkRoundTrip() {

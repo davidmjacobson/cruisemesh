@@ -1644,6 +1644,10 @@ internal class LanTransport(
 internal fun trustedLanPeerUserId(contacts: List<Contact>, remoteStaticKey: ByteArray): ByteArray? =
     contacts.firstOrNull { it.agreePk.contentEquals(remoteStaticKey) }?.userId?.copyOf()
 
+/** True when the Noise static key is this device's own agreement key — a live clone. */
+internal fun ownLanStaticKeyMatches(ownAgreePk: ByteArray, remoteStaticKey: ByteArray): Boolean =
+    ownAgreePk.contentEquals(remoteStaticKey)
+
 internal fun sameLanServiceType(value: String): Boolean =
     value.trimEnd('.') == lanServiceType().trimEnd('.')
 

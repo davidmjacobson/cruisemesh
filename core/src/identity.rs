@@ -434,6 +434,11 @@ pub fn make_friend_link(card_json: String) -> Result<String, CoreError> {
     // concern). This also keeps the emitter working for callers that mint a
     // card with synthetic keys, e.g. wire-format golden vectors.
     let card = friend_card_from_json(&card_json)?;
+    if card.roster_head_hash.is_some() && card.signature.is_some() && !EMIT_FRIEND_LINK_V4 {
+        return Err(CoreError::InvalidFriendCard(
+            "a signed card with a roster head cannot be emitted as CMFRIEND3".into(),
+        ));
+    }
     if EMIT_FRIEND_LINK_V4 {
         let binary = encode_friend_card_binary_v4(&card)?;
         return Ok(format!(
@@ -743,11 +748,8 @@ fn decode_friend_card_binary_v4(bytes: &[u8]) -> Result<FriendCard, CoreError> {
     let relay_token = decode_v3_token_field(bytes, &mut pos)?;
     let signature = decode_v3_signature_field(bytes, &mut pos)?;
     let roster_head_hash = decode_v4_roster_head_field(bytes, &mut pos)?;
-    if pos != bytes.len() {
-        return Err(CoreError::InvalidFriendCard(
-            "trailing bytes after friend card".to_string(),
-        ));
-    }
+    // Ignore any bytes after the roster-head field so a later additive
+    // v4 field still imports on this parser.
     let card = FriendCard {
         name,
         sign_pk,
@@ -947,8 +949,11 @@ const MAX_PARSED_FRIEND_CARD_VERSION: u32 = 4;
 /// attempting to parse the body — a half-decoded `CMFRIEND5:` must never
 /// become a contact.
 fn unsupported_link_error(text: &str) -> Option<CoreError> {
-    if cruise_scheme_version(text, "CMFRIEND")
-        .is_some_and(|version| version == 0 || version > MAX_PARSED_FRIEND_CARD_VERSION)
+    let friend_versions = cruise_scheme_versions(text, "CMFRIEND");
+    if !friend_versions.is_empty()
+        && friend_versions
+            .iter()
+            .all(|&version| version == 0 || version > MAX_PARSED_FRIEND_CARD_VERSION)
     {
         return Some(CoreError::UnsupportedLink);
     }
@@ -963,13 +968,33 @@ fn unsupported_link_error(text: &str) -> Option<CoreError> {
 
 /// `NAME` + digits + `:` anywhere in `text` (bare, URL fragment, or prose).
 fn cruise_scheme_version(text: &str, name: &str) -> Option<u32> {
-    let start = text.find(name)?;
-    let rest = &text[start + name.len()..];
+    cruise_scheme_versions(text, name).into_iter().next()
+}
+
+fn cruise_scheme_versions(text: &str, name: &str) -> Vec<u32> {
+    let mut versions = Vec::new();
+    let mut search = text;
+    while let Some(start) = search.find(name) {
+        let rest = &search[start + name.len()..];
+        if let Some(version) = parse_scheme_version_digits(rest) {
+            versions.push(version);
+        }
+        search = &search[start + name.len()..];
+    }
+    versions
+}
+
+fn parse_scheme_version_digits(rest: &str) -> Option<u32> {
     let digit_end = rest.find(|c: char| !c.is_ascii_digit())?;
     if rest.as_bytes().get(digit_end) != Some(&b':') || digit_end == 0 {
         return None;
     }
-    rest[..digit_end].parse().ok()
+    let digits = &rest[..digit_end];
+    if digits.as_bytes().first() == Some(&b'0') && digit_end > 1 {
+        // CMFRIEND05: is not v5; treat padded schemes as unimplemented.
+        return Some(u32::MAX);
+    }
+    Some(digits.parse().unwrap_or(u32::MAX))
 }
 
 fn validate_friend_card(card: &FriendCard) -> Result<(), CoreError> {
@@ -2327,6 +2352,50 @@ mod tests {
 
         binary.pop();
         assert!(decode_friend_card_binary_v4(&binary).is_err());
+    }
+
+    #[test]
+    fn v4_ignores_trailing_bytes_after_a_complete_card() {
+        let card = v3_card("Dana", None, None);
+        let mut binary = encode_friend_card_binary_v4(&card).unwrap();
+        binary.extend_from_slice(&[0x02, 0x00, 0x01]);
+        let decoded = decode_friend_card_binary_v4(&binary).expect("trailing bytes are additive");
+        assert_eq!(decoded.name, "Dana");
+        assert_eq!(decoded.roster_head_hash, None);
+    }
+
+    #[test]
+    fn make_friend_link_rejects_a_signed_roster_head_while_emit_is_v3() {
+        let owner = generate_identity();
+        let json = make_friend_card("Dana".into(), owner.clone(), None, None).unwrap();
+        let mut card = parse_friend_card(json).unwrap();
+        card.roster_head_hash = Some(vec![0xCD; ROSTER_HEAD_HASH_LEN]);
+        card.signature = Some(sign_friend_card(&card, &owner.sign_sk).unwrap());
+        let err = make_friend_link(serde_json::to_string(&card).unwrap()).unwrap_err();
+        assert!(matches!(err, CoreError::InvalidFriendCard(_)));
+    }
+
+    #[test]
+    fn parse_friend_text_uses_a_v3_card_even_if_a_newer_scheme_is_quoted() {
+        let identity = generate_identity();
+        let json = make_friend_card("Dana".into(), identity, None, None).unwrap();
+        let v3 = make_friend_link(json).unwrap();
+        let mixed = format!("old: {v3} newer: CMFRIEND5:abc");
+        let card = parse_friend_text(mixed).expect("usable v3 must win over a quoted v5");
+        assert_eq!(card.name, "Dana");
+    }
+
+    #[test]
+    fn parse_friend_text_treats_overflow_and_padded_schemes_as_unsupported() {
+        for text in ["CMFRIEND4294967296:abc", "CMFRIEND05:abc"] {
+            assert!(
+                matches!(
+                    parse_friend_text(text.to_string()),
+                    Err(CoreError::UnsupportedLink)
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
