@@ -55,13 +55,23 @@ sealed interface PeripheralAdmissionDecision {
  * dual-role link (or via a different mule) rather than fighting for an inbound
  * slot. Only a link that genuinely goes away frees a slot ([release]).
  *
- * ## What a rejection deliberately does not do
+ * ## Stop advertising while every slot is held
  *
- * A phone at cap keeps advertising. It is still a useful DTN carrier for
- * everyone it *is* linked to, other peers can still reach it by carrying via
- * someone else, and going dark would additionally take the phone out of the
- * fleet for the peers whose links it already holds -- see
- * [BleAdvertiserStateMachine] for how expensive an unadvertised phone is.
+ * A phone at cap suspends connectable advertising until [release] opens a
+ * slot. Existing GATT links keep carrying while advertising is stopped, and
+ * the central role keeps scanning and opening outbound links, so this does not
+ * take the phone out of the mesh. It only stops inviting a connection this
+ * class is guaranteed to reject.
+ *
+ * This is part of the cap rather than an optional optimization. Android can
+ * take several seconds to deliver the disconnect callback after
+ * `BluetoothGattServer.cancelConnection`, while modern peers can present a
+ * fresh private address on every retry. The old "keep advertising and let the
+ * rejected central's per-address backoff converge" policy therefore produced
+ * an unbounded connect/reject loop: the backoff never saw one address twice,
+ * and the GATT server accumulated transient links faster than it could tear
+ * them down. [acceptsNewLinks] is the single capacity predicate the Android
+ * advertiser uses to close that loop.
  *
  * ## When the decision is made
  *
@@ -169,8 +179,64 @@ class PeripheralLinkAdmission(private val maxLinks: Int) {
     @Synchronized
     fun activeCount(): Int = held.size
 
+    /** Whether advertising may invite another inbound mesh connection. */
+    @Synchronized
+    fun acceptsNewLinks(): Boolean = held.size < maxLinks
+
     @Synchronized
     fun clearAll() = held.clear()
+}
+
+/**
+ * Timing for a rejected central's bounded `cancelConnection` ladder.
+ *
+ * Android reports the result asynchronously through
+ * `BluetoothGattServerCallback.onConnectionStateChange`. Repeating the binder
+ * request can help a stuck teardown, but the final request also needs a longer
+ * grace period before the link is declared undroppable: the field capture that
+ * motivated this class showed every one of 403 supposedly-undroppable links
+ * disconnecting after adoption (median 2.84s, maximum 7.88s). In other words,
+ * the old four-second final wait was observing callback latency, not a link
+ * that had survived teardown.
+ *
+ * [FINAL_DISCONNECT_GRACE_MS] is deliberately the same size as the peer
+ * central's connect watchdog. The whole ladder remains bounded at 20 seconds,
+ * but a normal asynchronous disconnect can finish before the last-resort
+ * adoption sends a HELLO and records a slot over the cap.
+ */
+class PeripheralRejectionSchedule(
+    private val maxAttempts: Int = MAX_ATTEMPTS,
+    private val retryDelayMs: Long = RETRY_DELAY_MS,
+    private val finalDisconnectGraceMs: Long = FINAL_DISCONNECT_GRACE_MS,
+) {
+    companion object {
+        const val MAX_ATTEMPTS = 3
+        const val RETRY_DELAY_MS = 4_000L
+        const val FINAL_DISCONNECT_GRACE_MS = 12_000L
+    }
+
+    init {
+        require(maxAttempts > 0) { "maxAttempts must be positive" }
+        require(retryDelayMs > 0) { "retryDelayMs must be positive" }
+        require(finalDisconnectGraceMs > 0) { "finalDisconnectGraceMs must be positive" }
+    }
+
+    /** What to do after [attempt] has just called `cancelConnection`. */
+    fun after(attempt: Int): PeripheralRejectionFollowUp {
+        require(attempt in 1..maxAttempts) { "attempt must be within the configured ladder" }
+        return if (attempt < maxAttempts) {
+            PeripheralRejectionFollowUp.Retry(attempt + 1, retryDelayMs)
+        } else {
+            PeripheralRejectionFollowUp.Adopt(finalDisconnectGraceMs)
+        }
+    }
+}
+
+sealed interface PeripheralRejectionFollowUp {
+    val delayMs: Long
+
+    data class Retry(val attempt: Int, override val delayMs: Long) : PeripheralRejectionFollowUp
+    data class Adopt(override val delayMs: Long) : PeripheralRejectionFollowUp
 }
 
 /**

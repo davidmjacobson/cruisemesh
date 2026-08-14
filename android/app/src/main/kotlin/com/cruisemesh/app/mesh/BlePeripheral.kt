@@ -71,16 +71,6 @@ private const val AT_CAP_LOG_INTERVAL_MS = 10_000L
 // give-up probe -- which is the whole point of turning it away.
 private const val GATT_INSUFFICIENT_RESOURCES = 0x11
 
-// A rejected central is dropped by a posted cancelConnection. If the central is
-// still there afterwards the call did not take (a racing stop() nulled the
-// server, the main looper was blocked past the peer's supervision timeout, or
-// the server-role cancelConnection simply failed to drop a client-initiated
-// ACL), so re-issue it a bounded number of times rather than leaving the
-// address ignored forever. Three attempts 4s apart covers the far side's own
-// 12s connect watchdog, after which nothing more is going to change by waiting.
-private const val REJECT_TEARDOWN_RETRY_MS = 4_000L
-private const val MAX_REJECT_TEARDOWN_ATTEMPTS = 3
-
 /**
  * Pure decision behind [BlePeripheral]'s frame-start pacing, extracted so it
  * is unit-testable without any Android/BLE dependency: pace only when the
@@ -261,6 +251,9 @@ class BlePeripheral(
      */
     private val rejections = PeripheralRejectionLedger()
 
+    /** Bounded cancel/retry/final-grace policy; Android-free and unit-tested. */
+    private val rejectionSchedule = PeripheralRejectionSchedule()
+
     /** Monotonic ms of the last at-cap log; throttles it per [AT_CAP_LOG_INTERVAL_MS]. Guarded by [lock]. */
     private var lastAtCapLogMs = 0L
 
@@ -407,13 +400,12 @@ class BlePeripheral(
                     // about -- which is what silently answered
                     // ADVERTISE_FAILED_ALREADY_STARTED until 2026-08-07.
                     //
-                    // This runs unconditionally, including for a connection
-                    // that is about to be turned away at the cap: the framework
-                    // has stopped the advertisement either way, so making the
-                    // restart conditional would make being at cap the one thing
-                    // that reliably turns this phone dark. A phone at cap stays
-                    // discoverable on purpose -- see PeripheralLinkAdmission.
-                    restartAdvertisingAfterConnect()
+                    // The framework has stopped the advertisement either way.
+                    // Restart only while a subscription slot is available. At
+                    // the cap a restart invites a connection we are guaranteed
+                    // to reject, and rotating private addresses keep the peer's
+                    // per-address backoff from ever converging.
+                    reconcileAdvertisingWithInboundCapacity(restartAfterConnect = true)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     rejections.clear(device.address)
@@ -508,6 +500,12 @@ class BlePeripheral(
             }
             if (rejected) return
             if (isOutboundCccdEnable) {
+                if (decision?.activeCount == MAX_PERIPHERAL_LINKS) {
+                    // The last free slot was just taken. Existing links keep
+                    // carrying without an advertisement; stop inviting a fourth
+                    // connection until a real teardown reopens capacity.
+                    reconcileAdvertisingWithInboundCapacity(restartAfterConnect = false)
+                }
                 // The central has subscribed to our outbound notify
                 // characteristic: this link can carry frames from us now, so
                 // fire the peripheral-side half of the HELLO handshake
@@ -632,7 +630,7 @@ class BlePeripheral(
                 TAG,
                 "At inbound link cap (${decision.activeCount}/$MAX_PERIPHERAL_LINKS); turning away newly " +
                     "subscribing centrals (e.g. ${device.address}) until a slot frees -- established links are " +
-                    "kept, and this phone stays discoverable",
+                    "kept, and connectable advertising is paused while the cap is full",
             )
         }
         handler.post { enforceRejection(device, attempt = 1, generation = generation) }
@@ -640,7 +638,7 @@ class BlePeripheral(
 
     /**
      * One `cancelConnection` attempt against a central that was turned away,
-     * re-armed up to [MAX_REJECT_TEARDOWN_ATTEMPTS] times. Two things this
+     * re-armed according to [PeripheralRejectionSchedule]. Two things this
      * bounded loop exists for, both of which the first naive single `post`
      * got wrong:
      *
@@ -665,12 +663,16 @@ class BlePeripheral(
         if (!rejections.ownsRejection(device.address, generation)) return
         runCatching { gattServer?.cancelConnection(device) }
             .onFailure { Log.w(TAG, "cancelConnection for a rejected central failed: ${it.message}") }
-        val next: () -> Unit = if (attempt < MAX_REJECT_TEARDOWN_ATTEMPTS) {
-            { enforceRejection(device, attempt + 1, generation) }
-        } else {
-            { adoptUndroppableCentral(device, generation) }
+        val followUp = rejectionSchedule.after(attempt)
+        val next: () -> Unit = when (followUp) {
+            is PeripheralRejectionFollowUp.Retry -> {
+                { enforceRejection(device, followUp.attempt, generation) }
+            }
+            is PeripheralRejectionFollowUp.Adopt -> {
+                { adoptUndroppableCentral(device, generation) }
+            }
         }
-        handler.postDelayed({ next() }, REJECT_TEARDOWN_RETRY_MS)
+        handler.postDelayed({ next() }, followUp.delayMs)
     }
 
     /**
@@ -707,10 +709,12 @@ class BlePeripheral(
         }
         Log.w(
             TAG,
-            "Rejected central ${device.address} survived $MAX_REJECT_TEARDOWN_ATTEMPTS cancelConnection " +
+            "Rejected central ${device.address} survived ${PeripheralRejectionSchedule.MAX_ATTEMPTS} " +
+                "cancelConnection " +
                 "attempts; adopting the link it is holding anyway rather than ignoring it " +
                 "($activeCount inbound links now held, over the cap of $MAX_PERIPHERAL_LINKS)",
         )
+        reconcileAdvertisingWithInboundCapacity(restartAfterConnect = false)
         // Outside [lock] on purpose: this callout re-enters MeshService, which
         // sends our HELLO straight back into sendFrame.
         onCentralSubscribed(device.address)
@@ -760,15 +764,11 @@ class BlePeripheral(
 
     /**
      * (Re)starts connectable advertising unless it is already running or a
-     * start is already in flight. Called from [start] and after every link
-     * teardown, so the peripheral stays discoverable for additional and
-     * subsequent centrals instead of going dark after its first connection.
+     * start is already in flight. Called for the initial [start]; subsequent
+     * capacity-aware starts go through
+     * [reconcileAdvertisingWithInboundCapacity].
      * [BleAdvertiserStateMachine] absorbs the redundant calls (e.g. a teardown
      * while other links are still up) so they can't thrash the advertiser.
-     *
-     * A central connect uses [restartAdvertisingAfterConnect] instead: there
-     * the framework has already stopped the set underneath us, so the current
-     * generation has to be retired rather than left alone.
      */
     private fun beginAdvertising() {
         synchronized(advertiseLock) {
@@ -776,10 +776,21 @@ class BlePeripheral(
         }
     }
 
-    /** See [BleAdvertiserStateMachine.onConnectRestartRequested]. */
-    private fun restartAdvertisingAfterConnect() {
+    /**
+     * Serializes the capacity check with the advertiser action so a concurrent
+     * subscribe/release cannot leave the final radio state disagreeing with
+     * [PeripheralLinkAdmission]. [restartAfterConnect] selects the stronger
+     * restart action needed when Android stopped the legacy set underneath us;
+     * an ordinary admission/teardown only needs start-if-idle.
+     */
+    private fun reconcileAdvertisingWithInboundCapacity(restartAfterConnect: Boolean) {
         synchronized(advertiseLock) {
-            applyAdvertiseAction(advertiseMachine.onConnectRestartRequested(SystemClock.elapsedRealtime()))
+            val action = when {
+                !linkAdmission.acceptsNewLinks() -> advertiseMachine.onStopRequested()
+                restartAfterConnect -> advertiseMachine.onConnectRestartRequested(SystemClock.elapsedRealtime())
+                else -> advertiseMachine.onStartRequested(SystemClock.elapsedRealtime())
+            }
+            applyAdvertiseAction(action)
         }
     }
 
@@ -935,10 +946,11 @@ class BlePeripheral(
             // Closing and un-publishing the server belongs under the same lock
             // as the stop decision. Released early, it leaves a window where a
             // GATT binder thread delivering STATE_DISCONNECTED runs
-            // tearDownLink -> beginAdvertising, sees IDLE and a still-non-null
-            // gattServer, and starts a generation against a server this method
-            // is about to close -- leaving the machine STARTING for an
-            // advertiser that cannot exist, which absorbs the next start().
+            // tearDownLink -> reconcileAdvertisingWithInboundCapacity, sees
+            // IDLE and a still-non-null gattServer, and starts a generation
+            // against a server this method is about to close -- leaving the
+            // machine STARTING for an advertiser that cannot exist, which
+            // absorbs the next start().
             runCatching { gattServer?.close() }
             gattServer = null
         }
@@ -1157,9 +1169,12 @@ class BlePeripheral(
             inFlightFragment.remove(address)
             notifyFailures.clear(address)
             onCentralDisconnected(address)
-            // A link just dropped; make sure we're advertising again so this peer
-            // stays reachable. No-ops if advertising is already up.
-            beginAdvertising()
+            // Resume only once the teardown actually opens an inbound slot. A
+            // rejected/unadmitted central disconnecting while the three held
+            // links remain must not reopen the connect/reject loop. The helper
+            // rechecks under advertiseLock so a racing subscribe cannot invert
+            // the final decision.
+            reconcileAdvertisingWithInboundCapacity(restartAfterConnect = false)
         }
     }
 
