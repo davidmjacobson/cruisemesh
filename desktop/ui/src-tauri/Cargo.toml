@@ -2,6 +2,7 @@
 name = "cruisemesh-desktop-ui"
 version = "0.2.0"
 edition = "2021"
+publish = false
 license = "AGPL-3.0-or-later"
 description = "CruiseMesh messenger shell for Windows"
 
