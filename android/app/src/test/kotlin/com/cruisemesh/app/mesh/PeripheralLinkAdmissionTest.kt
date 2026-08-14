@@ -16,9 +16,11 @@ class PeripheralLinkAdmissionTest {
     fun `admits up to the cap and turns the next arrival away`() {
         val admission = PeripheralLinkAdmission(maxLinks = 3)
 
+        assertTrue(admission.acceptsNewLinks())
         assertEquals(PeripheralAdmissionDecision.Admitted(1), admission.admit("a"))
         assertEquals(PeripheralAdmissionDecision.Admitted(2), admission.admit("b"))
         assertEquals(PeripheralAdmissionDecision.Admitted(3), admission.admit("c"))
+        assertFalse(admission.acceptsNewLinks())
 
         val rejected = admission.admit("d")
         assertEquals(PeripheralAdmissionDecision.Rejected(3), rejected)
@@ -73,6 +75,7 @@ class PeripheralLinkAdmissionTest {
         assertEquals(PeripheralAdmissionDecision.Rejected(2), admission.admit("c"))
 
         assertTrue(admission.release("a"))
+        assertTrue(admission.acceptsNewLinks())
         assertEquals(PeripheralAdmissionDecision.Admitted(2), admission.admit("c"))
     }
 
@@ -155,8 +158,16 @@ class PeripheralLinkAdmissionTest {
         admission.admit("a")
         admission.forceHold("stuck")
 
+        assertFalse(admission.acceptsNewLinks())
         assertEquals(PeripheralAdmissionDecision.Rejected(2), admission.admit("newcomer"))
         assertFalse(admission.holds("newcomer"))
+
+        // Dropping only the over-cap link returns to the cap, not below it, so
+        // advertising must remain suspended until one more real slot opens.
+        admission.release("stuck")
+        assertFalse(admission.acceptsNewLinks())
+        admission.release("a")
+        assertTrue(admission.acceptsNewLinks())
     }
 
     @Test
