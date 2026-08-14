@@ -208,6 +208,49 @@ pub fn core_reaction_summaries_by_target(
         .collect()
 }
 
+/// Return the current reactors for one emoji on one message.
+///
+/// Reaction messages are last-write-wins per reactor and target: changing to a
+/// different emoji replaces the old reaction, while a blank emoji clears it.
+/// The returned user ids are byte-sorted so both shells present a stable list
+/// before applying their local contact names.
+#[uniffi::export]
+pub fn core_reactors_for_reaction(
+    messages: Vec<StoredMessage>,
+    target: CoreMessageTarget,
+    emoji: String,
+) -> Vec<Vec<u8>> {
+    let mut reactors: HashMap<Vec<u8>, (u64, String)> = HashMap::new();
+    for message in messages
+        .into_iter()
+        .filter(|message| message.kind == KIND_REACTION)
+    {
+        let Some(reaction) = decode_reaction_payload(message.payload) else {
+            continue;
+        };
+        if reaction.target != target {
+            continue;
+        }
+        if reactors
+            .get(&message.sender_user_id)
+            .is_some_and(|old| old.0 > message.lamport)
+        {
+            continue;
+        }
+        if reaction.emoji.trim().is_empty() {
+            reactors.remove(&message.sender_user_id);
+        } else {
+            reactors.insert(message.sender_user_id, (message.lamport, reaction.emoji));
+        }
+    }
+    let mut matching: Vec<_> = reactors
+        .into_iter()
+        .filter_map(|(user_id, (_, current_emoji))| (current_emoji == emoji).then_some(user_id))
+        .collect();
+    matching.sort();
+    matching
+}
+
 #[uniffi::export]
 pub fn core_visible_gap_indices(
     messages: Vec<StoredMessage>,
@@ -395,6 +438,45 @@ mod tests {
                 count: 1,
                 reacted_by_own_user: false
             }]
+        );
+    }
+
+    #[test]
+    fn reaction_reactors_are_current_filtered_and_stably_sorted() {
+        let target = CoreMessageTarget {
+            sender_user_id: vec![2],
+            lamport: 1,
+            kind: KIND_TEXT,
+        };
+        let other_target = CoreMessageTarget {
+            sender_user_id: vec![2],
+            lamport: 2,
+            kind: KIND_TEXT,
+        };
+        let reaction = |sender, lamport, target: &CoreMessageTarget, emoji: &str| {
+            msg(
+                sender,
+                lamport,
+                KIND_REACTION,
+                encode_reaction_payload(CoreReactionPayload {
+                    target: target.clone(),
+                    emoji: emoji.into(),
+                })
+                .unwrap(),
+            )
+        };
+        let messages = vec![
+            reaction(3, 1, &target, "❤️"),
+            reaction(1, 1, &target, "❤️"),
+            reaction(3, 2, &target, "👍"),
+            reaction(4, 1, &target, "❤️"),
+            reaction(4, 2, &target, ""),
+            reaction(5, 1, &other_target, "❤️"),
+        ];
+
+        assert_eq!(
+            core_reactors_for_reaction(messages, target, "❤️".into()),
+            vec![vec![1]]
         );
     }
 

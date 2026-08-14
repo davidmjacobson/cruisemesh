@@ -146,6 +146,27 @@ final class ChatRowModelTests: XCTestCase {
         XCTAssertEqual(untouchedRow?.reactions ?? [], [])
     }
 
+    func testReactionDetailsReturnCurrentReactorsOnly() {
+        let base = startOfTodayMs() + 3_600_000
+        let thirdId = Data([3])
+        let targetMessage = message(sender: peerId, lamport: 1, timestampMs: base)
+        let target = MessageTarget(
+            senderUserId: targetMessage.senderUserId,
+            lamport: targetMessage.lamport,
+            kind: targetMessage.kind
+        )
+        let messages = [
+            reactionMessage(on: targetMessage, emoji: "❤️", sender: thirdId, lamport: 1, timestampMs: base + 1),
+            reactionMessage(on: targetMessage, emoji: "❤️", sender: ownId, lamport: 1, timestampMs: base + 2),
+            reactionMessage(on: targetMessage, emoji: "👍", sender: thirdId, lamport: 2, timestampMs: base + 3),
+        ]
+
+        XCTAssertEqual(
+            reactorUserIdsForReaction(messages: messages, target: target, emoji: "❤️"),
+            [ownId]
+        )
+    }
+
     // MARK: - GroupChatRowModel (group chat)
 
     func testGroupSenderLabelOnlyOnNewRun() {

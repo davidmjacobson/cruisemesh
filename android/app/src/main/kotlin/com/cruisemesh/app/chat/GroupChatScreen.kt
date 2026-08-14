@@ -32,6 +32,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -116,6 +117,8 @@ fun GroupChatScreen(
     }
     var draft by remember(group.id) { mutableStateOf(DraftStore.load(context, group.id)) }
     var pendingPhoto by remember { mutableStateOf<ByteArray?>(null) }
+    var viewerPhoto by remember(group.id) { mutableStateOf<ByteArray?>(null) }
+    var reactionDetails by remember(group.id) { mutableStateOf<GroupReactionDetails?>(null) }
     // The staged photo currently open in the markup editor, or null when it is
     // closed (specs/photo-markup.md).
     var drawingPhoto by remember { mutableStateOf<ByteArray?>(null) }
@@ -228,6 +231,17 @@ fun GroupChatScreen(
             )
     }
 
+    fun showReactionDetails(target: MessageTarget, emoji: String) {
+        val members = reactorUserIdsForReaction(messages, target, emoji).map { userId ->
+            GroupReactionMember(userId, senderName(userId))
+        }.sortedWith(
+            compareBy<GroupReactionMember> { !it.userId.contentEquals(ownUserId) }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name }
+                .thenBy { UserIdHex.encode(it.userId) },
+        )
+        reactionDetails = GroupReactionDetails(emoji, members)
+    }
+
     LaunchedEffect(group.id) {
         ChatEvents.changes.collect { changedChatId ->
             if (changedChatId.contentEquals(group.id)) {
@@ -324,8 +338,9 @@ fun GroupChatScreen(
                     onQuotedClick = { target -> scrollToMessage(target) },
                     reactions = reactions[MessageTarget(message.senderUserId, message.lamport, message.kind).stableKey].orEmpty(),
                     onReact = { emoji ->
-                        toggleReaction(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
+                        showReactionDetails(MessageTarget(message.senderUserId, message.lamport, message.kind), emoji)
                     },
+                    onPhotoClick = { viewerPhoto = it },
                     lateArrivalMs = chatExtras.lateArrivalMs[messageStableKey(message)],
                     onLongPress = { target, bounds -> openOverlay(target, bounds) },
                     onLinkClick = { link -> linkHandler.open(link) },
@@ -751,8 +766,8 @@ fun GroupChatScreen(
                     showTimestamp = focusedGrouping.showTimestamp,
                     reactions = focusedReactions,
                     onReact = { emoji ->
-                        toggleReaction(currentFocused.target, emoji)
                         closeOverlay()
+                        showReactionDetails(currentFocused.target, emoji)
                     },
                     quoted = focusedReplyMetadata?.quoted,
                 )
@@ -796,6 +811,22 @@ fun GroupChatScreen(
         )
     }
 
+    val currentViewerPhoto = viewerPhoto
+    if (currentViewerPhoto != null) {
+        PhotoViewerOverlay(
+            jpeg = currentViewerPhoto,
+            onDismiss = { viewerPhoto = null },
+        )
+    }
+
+    val currentReactionDetails = reactionDetails
+    if (currentReactionDetails != null) {
+        GroupReactionDetailsSheet(
+            details = currentReactionDetails,
+            onDismiss = { reactionDetails = null },
+        )
+    }
+
     // Placed at the screen's outer level so it covers the whole conversation
     // rather than nesting inside a composer slot.
     val photoBeingDrawnOn = drawingPhoto
@@ -810,6 +841,57 @@ fun GroupChatScreen(
                 stagePhoto(annotated)
             },
         )
+    }
+}
+
+private class GroupReactionMember(
+    val userId: ByteArray,
+    val name: String,
+)
+
+private class GroupReactionDetails(
+    val emoji: String,
+    val members: List<GroupReactionMember>,
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun GroupReactionDetailsSheet(
+    details: GroupReactionDetails,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(details.emoji, style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.ui_reactions), style = MaterialTheme.typography.titleLarge)
+            }
+            for (member in details.members) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    AvatarBadge(
+                        userId = member.userId,
+                        name = member.name,
+                        displayId = formatUserId(member.userId),
+                        size = 36.dp,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(member.name, style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        }
     }
 }
 
@@ -879,7 +961,7 @@ private fun GroupConversationTopBar(
 }
 
 @Composable
-private fun GroupMessageBubble(
+internal fun GroupMessageBubble(
     message: StoredMessage,
     tick: TickStatus?,
     isFocused: Boolean,
@@ -891,6 +973,7 @@ private fun GroupMessageBubble(
     onQuotedClick: (StoredMessage) -> Unit = {},
     reactions: List<ReactionSummary> = emptyList(),
     onReact: (String) -> Unit = {},
+    onPhotoClick: (ByteArray) -> Unit = {},
     /** When this message reached this device, if its place in the thread needs explaining. */
     lateArrivalMs: Long? = null,
     onLongPress: (MessageTarget, Rect) -> Unit = { _, _ -> },
@@ -920,6 +1003,10 @@ private fun GroupMessageBubble(
     val target = remember(message.senderUserId, message.lamport, message.kind) {
         MessageTarget(message.senderUserId, message.lamport, message.kind)
     }
+    val photoBytes = remember(message.kind, message.payload) { messageImageBytes(message) }
+    val onBubbleClick: () -> Unit = {
+        if (photoBytes != null) onPhotoClick(photoBytes)
+    }
 
     Column(
         modifier = Modifier
@@ -947,13 +1034,14 @@ private fun GroupMessageBubble(
             // reaction/copy overlay still opens from anywhere in the bubble.
             bodyActions = MessageBodyActions(
                 onLinkClick = onLinkClick,
-                onClick = {},
+                onClick = onBubbleClick,
                 onLongClick = { onLongPress(target, boundsInRoot) },
             ),
             modifier = Modifier
                 .alpha(if (isFocused) 0f else 1f)
                 .onGloballyPositioned { coords -> boundsInRoot = coords.unclippedBoundsInRoot() }
                 .messageActions(
+                    onClick = onBubbleClick,
                     onLongClick = { onLongPress(target, boundsInRoot) },
                 ),
         )

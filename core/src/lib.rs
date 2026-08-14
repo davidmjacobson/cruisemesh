@@ -185,8 +185,8 @@ pub use relay_wire::{
 };
 pub use semantic::{
     core_group_tick_status_for, core_is_visible_chat_kind, core_last_visible_message,
-    core_reaction_summaries_by_target, core_tick_status_for, core_unread_count,
-    core_visible_chat_messages, core_visible_gap_indices, CoreReactionSummary,
+    core_reaction_summaries_by_target, core_reactors_for_reaction, core_tick_status_for,
+    core_unread_count, core_visible_chat_messages, core_visible_gap_indices, CoreReactionSummary,
     CoreReactionTargetSummary, CoreReplyMetadata, CoreTickStatus,
 };
 pub use ship_wifi::{
