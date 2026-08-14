@@ -7,6 +7,7 @@ import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.decodeReactionPayload
 import uniffi.cruisemesh_core.encodeReactionPayload
 import uniffi.cruisemesh_core.coreReactionSummariesByTarget
+import uniffi.cruisemesh_core.coreReactorsForReaction
 import uniffi.cruisemesh_core.coreVisibleGapIndices
 import uniffi.cruisemesh_core.StoredMessage
 
@@ -68,6 +69,16 @@ fun reactionSummariesByTarget(
         key to target.reactions.map { ReactionSummary(it.emoji, it.count.toInt(), it.reactedByOwnUser) }
     }
 }
+
+fun reactorUserIdsForReaction(
+    messages: List<StoredMessage>,
+    target: MessageTarget,
+    emoji: String,
+): List<ByteArray> = coreReactorsForReaction(
+    messages,
+    CoreMessageTarget(target.senderUserId, target.lamport, target.kind),
+    emoji,
+)
 
 fun visibleGapIndices(
     messages: List<StoredMessage>,

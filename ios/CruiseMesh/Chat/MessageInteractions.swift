@@ -62,6 +62,22 @@ func reactionSummariesByTarget(messages: [StoredMessage], ownUserId: Data) -> [S
     })
 }
 
+func reactorUserIdsForReaction(
+    messages: [StoredMessage],
+    target: MessageTarget,
+    emoji: String
+) -> [Data] {
+    coreReactorsForReaction(
+        messages: messages,
+        target: CoreMessageTarget(
+            senderUserId: target.senderUserId,
+            lamport: target.lamport,
+            kind: target.kind
+        ),
+        emoji: emoji
+    )
+}
+
 struct ReactionPillRow: View {
     let reactions: [ReactionSummary]
     let isOwn: Bool

@@ -33402,6 +33402,23 @@ public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: 
 })
 }
 /**
+ * Return the current reactors for one emoji on one message.
+ *
+ * Reaction messages are last-write-wins per reactor and target: changing to a
+ * different emoji replaces the old reaction, while a blank emoji clears it.
+ * The returned user ids are byte-sorted so both shells present a stable list
+ * before applying their local contact names.
+ */
+public func coreReactorsForReaction(messages: [StoredMessage], target: CoreMessageTarget, emoji: String) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_reactors_for_reaction(
+        FfiConverterSequenceTypeStoredMessage.lower(messages),
+        FfiConverterTypeCoreMessageTarget.lower(target),
+        FfiConverterString.lower(emoji),$0
+    )
+})
+}
+/**
  * Ack ids among `items` using [`core_should_ack_inbound`] alone -- i.e.
  * Consumed/Expired only. Deliberately does not know about the
  * consumed-SEEN rule (it has no store access to check it): a caller that
@@ -36329,6 +36346,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_reactors_for_reaction() != 63484) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {

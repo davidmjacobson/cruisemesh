@@ -318,6 +318,7 @@
     <string name="ui_you">You</string>
     <string name="ui_unknown_group_member">Unknown member</string>
     <string name="ui_sender_id">Sender ID</string>
+    <string name="ui_reactions">Reactions</string>
     <string name="ui_cruisemesh_operation">CruiseMesh operation</string>
     <string name="ui_privacy">Privacy</string>
     <string name="ui_backup">Backup</string>

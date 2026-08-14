@@ -1619,6 +1619,16 @@
         }
       }
     },
+    "Reactions": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Reactions"
+          }
+        }
+      }
+    },
     "Roaming data is controlled by iOS. To prevent roaming charges at sea, turn off Data Roaming in Settings, under Cellular, then Cellular Data Options.": {
       "localizations": {
         "en": {

@@ -39,6 +39,7 @@ struct GroupChatView: View {
     @State private var voiceRecording = false
     @State private var statusMessage: String?
     @State private var viewedPhoto: ViewedPhoto?
+    @State private var reactionDetails: GroupReactionDetails?
     @State private var isMuted = false
     @State private var updatedGroup: Group?
     @State private var receiptState = GroupReceiptState(members: [])
@@ -98,6 +99,9 @@ struct GroupChatView: View {
                                         arrivalLabel: row.arrivalLabel,
                                         onReact: { emoji in
                                             sendReaction(to: message, emoji: emoji)
+                                        },
+                                        onReactionDetails: { emoji in
+                                            showReactionDetails(for: message, emoji: emoji)
                                         },
                                         onReply: {
                                             replyingTo = message
@@ -273,6 +277,9 @@ struct GroupChatView: View {
                 showDetails = false
                 confirmDelete = true
             }
+        }
+        .sheet(item: $reactionDetails) { details in
+            GroupReactionDetailsSheet(details: details, nameForMember: senderName)
         }
         .fullScreenCover(item: $viewedPhoto) { photo in
             PhotoViewerOverlay(jpeg: photo.jpeg)
@@ -485,6 +492,61 @@ struct GroupChatView: View {
         sender.sendReaction(group: activeGroup, target: target, emoji: existingOwn ? "" : emoji)
         reload()
     }
+
+    private func showReactionDetails(for message: StoredMessage, emoji: String) {
+        let target = MessageTarget(
+            senderUserId: message.senderUserId,
+            lamport: message.lamport,
+            kind: message.kind
+        )
+        let memberUserIds = reactorUserIdsForReaction(
+            messages: messages,
+            target: target,
+            emoji: emoji
+        ).sorted { lhs, rhs in
+            if lhs == rhs { return false }
+            if lhs == identity.userId { return true }
+            if rhs == identity.userId { return false }
+            let nameOrder = senderName(lhs).localizedCaseInsensitiveCompare(senderName(rhs))
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.lexicographicallyPrecedes(rhs)
+        }
+        reactionDetails = GroupReactionDetails(
+            emoji: emoji,
+            memberUserIds: memberUserIds
+        )
+    }
+}
+
+private struct GroupReactionDetails: Identifiable {
+    let id = UUID()
+    let emoji: String
+    let memberUserIds: [Data]
+}
+
+private struct GroupReactionDetailsSheet: View {
+    let details: GroupReactionDetails
+    let nameForMember: (Data) -> String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List(details.memberUserIds, id: \.self) { memberId in
+                let name = nameForMember(memberId)
+                HStack(spacing: 12) {
+                    AvatarView(userId: memberId, name: name, size: 36)
+                    Text(name)
+                }
+            }
+            .navigationTitle("\(details.emoji) \(String(localized: "Reactions"))")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
 }
 
 /// A single row of a group chat thread, precomputed once per `reload()`
@@ -564,6 +626,7 @@ private struct GroupMessageRow: View {
     let timeLabel: String
     var arrivalLabel: String? = nil
     let onReact: (String) -> Void
+    let onReactionDetails: (String) -> Void
     let onReply: () -> Void
     let onPhotoTap: (Data) -> Void
     let onQuotedTap: (StoredMessage) -> Void
@@ -671,7 +734,11 @@ private struct GroupMessageRow: View {
                             )
                         }
                     if !reactions.isEmpty {
-                        ReactionPillRow(reactions: reactions, isOwn: isOwn, onReact: onReact)
+                        ReactionPillRow(
+                            reactions: reactions,
+                            isOwn: isOwn,
+                            onReact: onReactionDetails
+                        )
                     }
                     Text(timeLabel)
                         .font(.caption2)

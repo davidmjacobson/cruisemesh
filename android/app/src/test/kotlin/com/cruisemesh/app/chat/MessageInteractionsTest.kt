@@ -39,6 +39,22 @@ class MessageInteractionsTest {
     }
 
     @Test
+    fun reactionDetailsReturnCurrentReactorsOnly() {
+        val thirdUserId = byteArrayOf(0x03)
+        val target = MessageTarget(peerUserId, 1uL, KIND_TEXT)
+        val messages = listOf(
+            reaction(thirdUserId, 1uL, target, "❤️"),
+            reaction(ownUserId, 1uL, target, "❤️"),
+            reaction(thirdUserId, 2uL, target, "👍"),
+        )
+
+        val reactors = reactorUserIdsForReaction(messages, target, "❤️")
+
+        assertEquals(1, reactors.size)
+        assertTrue(reactors.single().contentEquals(ownUserId))
+    }
+
+    @Test
     fun hiddenReactionDoesNotCreateVisibleGap() {
         val messages = listOf(
             text(peerUserId, 1uL, "one"),
