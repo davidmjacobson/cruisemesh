@@ -104,4 +104,34 @@ final class DiagnosticsArchiveTests: XCTestCase {
             "unexpected archive name: \(name)"
         )
     }
+
+    func testShareConfirmationRequiresCompletion() {
+        XCTAssertEqual(
+            DiagnosticsShareFeedback.confirmationMessage(completed: true),
+            String(localized: "Diagnostics shared.")
+        )
+        XCTAssertNil(DiagnosticsShareFeedback.confirmationMessage(completed: false))
+    }
+
+    func testShareOutcomePresentsOnceFromEitherCallbackOrder() {
+        let dismissFirst = DiagnosticsShareOutcome()
+        XCTAssertFalse(dismissFirst.takeIfReady())
+        dismissFirst.mark(true)
+        XCTAssertTrue(dismissFirst.takeIfReady())
+        XCTAssertFalse(dismissFirst.takeIfReady())
+
+        let completeFirst = DiagnosticsShareOutcome()
+        completeFirst.mark(true)
+        XCTAssertTrue(completeFirst.takeIfReady())
+        XCTAssertFalse(completeFirst.takeIfReady())
+    }
+
+    func testShareOutcomeIgnoresCancelThenAllowsALaterShare() {
+        let outcome = DiagnosticsShareOutcome()
+        outcome.mark(false)
+        XCTAssertFalse(outcome.takeIfReady())
+        outcome.reset()
+        outcome.mark(true)
+        XCTAssertTrue(outcome.takeIfReady())
+    }
 }

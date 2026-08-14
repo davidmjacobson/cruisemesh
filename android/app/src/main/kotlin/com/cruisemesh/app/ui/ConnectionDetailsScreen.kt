@@ -1,6 +1,12 @@
 package com.cruisemesh.app.ui
 
+import android.app.Activity
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.PluralsRes
 import androidx.annotation.StringRes
 import androidx.compose.foundation.border
@@ -73,6 +79,8 @@ import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.UserIdHex
@@ -80,6 +88,7 @@ import com.cruisemesh.app.debug.ConflictDiagnosticsExport
 import com.cruisemesh.app.debug.ProtocolEventExport
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.debug.DiagnosticsShare
+import com.cruisemesh.app.debug.DiagnosticsShareHandoff
 import com.cruisemesh.app.debug.FieldMetricsExport
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
@@ -251,6 +260,47 @@ fun ConnectionDetailsScreen(
 
     var showClear by remember { mutableStateOf(false) }
     var troubleshootingExpanded by remember { mutableStateOf(false) }
+    var diagnosticsSharedMessage by remember { mutableStateOf<String?>(null) }
+
+    val shareLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_CANCELED) {
+            DiagnosticsShareHandoff.cancelPending()
+        } else {
+            DiagnosticsShareHandoff.markTargetChosen()
+        }
+    }
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val mainHandler = Handler(Looper.getMainLooper())
+        fun showShared() {
+            diagnosticsSharedMessage = context.getString(R.string.ui_diagnostics_shared)
+            Toast.makeText(context, R.string.ui_diagnostics_shared, Toast.LENGTH_LONG).show()
+        }
+        fun tryShowShared() {
+            if (DiagnosticsShareHandoff.takeIfConsumed()) showShared()
+        }
+        // Consume immediately: Drive may have already read the zip while this
+        // page was gone, and ON_RESUME will not fire again if we are resumed.
+        tryShowShared()
+        DiagnosticsShareHandoff.setListener {
+            mainHandler.post {
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    tryShowShared()
+                }
+            }
+        }
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) tryShowShared()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            DiagnosticsShareHandoff.setListener(null)
+            mainHandler.removeCallbacksAndMessages(null)
+        }
+    }
     // A sheet rather than a scroll target. The spec forbids dropping a reader
     // at the top of a long section to hunt for their answer, and a sheet is
     // the only arrangement where "the explanation is on screen" is guaranteed
@@ -344,6 +394,12 @@ fun ConnectionDetailsScreen(
                 onHowToFix = { howToFix = it },
                 onClearHistory = { showClear = true },
                 onStoreChanged = signal,
+                sharedDiagnosticsMessage = diagnosticsSharedMessage,
+                onShareDiagnostics = { intent ->
+                    shareLauncher.launch(
+                        Intent.createChooser(intent, context.getString(R.string.ui_share_diagnostics)),
+                    )
+                },
             )
         }
     }
@@ -442,6 +498,8 @@ fun ConnectionDetailsContent(
     onHowToFix: (HowToFixTopic) -> Unit = {},
     onClearHistory: () -> Unit = {},
     onStoreChanged: () -> Unit = {},
+    sharedDiagnosticsMessage: String? = null,
+    onShareDiagnostics: ((Intent) -> Unit)? = null,
 ) {
     var otherPeopleExpanded by remember { mutableStateOf(false) }
     var activityExpanded by remember { mutableStateOf(false) }
@@ -593,6 +651,8 @@ fun ConnectionDetailsContent(
                 TroubleshootingControls(
                     onClearHistory = onClearHistory,
                     onStoreChanged = onStoreChanged,
+                    sharedDiagnosticsMessage = sharedDiagnosticsMessage,
+                    onShareDiagnostics = onShareDiagnostics,
                 )
             }
             Spacer(modifier = Modifier.height(24.dp))
@@ -1239,7 +1299,12 @@ private fun CollapsibleSection(
  * Share diagnostics keeps producing the single archive.
  */
 @Composable
-private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: () -> Unit) {
+private fun TroubleshootingControls(
+    onClearHistory: () -> Unit,
+    onStoreChanged: () -> Unit,
+    sharedDiagnosticsMessage: String? = null,
+    onShareDiagnostics: ((Intent) -> Unit)? = null,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var diagnosticLogging by remember { mutableStateOf(DebugFileLog.isEnabled(context)) }
@@ -1250,6 +1315,9 @@ private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: 
         mutableStateOf(DiagnosticsShare.hasAnythingCaptured(context))
     }
     var supportMessage by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(sharedDiagnosticsMessage) {
+        if (sharedDiagnosticsMessage != null) supportMessage = sharedDiagnosticsMessage
+    }
 
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.weight(1f)) {
@@ -1283,10 +1351,14 @@ private fun TroubleshootingControls(onClearHistory: () -> Unit, onStoreChanged: 
     Button(
         onClick = {
             // One button, everything captured -- see DiagnosticsShare.
-            DiagnosticsShare.shareIntent(context)?.let {
-                context.startActivity(
-                    Intent.createChooser(it, context.getString(R.string.ui_share_diagnostics)),
-                )
+            DiagnosticsShare.shareIntent(context)?.let { intent ->
+                if (onShareDiagnostics != null) {
+                    onShareDiagnostics(intent)
+                } else {
+                    context.startActivity(
+                        Intent.createChooser(intent, context.getString(R.string.ui_share_diagnostics)),
+                    )
+                }
                 hasCapturedDiagnostics = true
             } ?: run {
                 supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)

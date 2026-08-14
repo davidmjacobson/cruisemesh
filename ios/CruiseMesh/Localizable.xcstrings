@@ -2091,6 +2091,16 @@
         }
       }
     },
+    "Diagnostics shared.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diagnostics shared."
+          }
+        }
+      }
+    },
     "Dismiss": {
       "localizations": {
         "en": {

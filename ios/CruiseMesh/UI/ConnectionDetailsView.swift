@@ -555,6 +555,8 @@ struct ConnectionDetailsView: View {
     @State private var hasDiagnosticArchive = DiagnosticLogExport.hasArchive()
     @State private var shareFile: ShareableFile?
     @State private var supportMessage: String?
+    @State private var shareOutcome = DiagnosticsShareOutcome()
+    @State private var showDiagnosticsShared = false
 
     var body: some View {
         // Derived once per change in `ConnectionDetailsModel`, not once per
@@ -646,8 +648,17 @@ struct ConnectionDetailsView: View {
             } message: {
                 Text("This removes local connection events and per-person path summaries. Messages and friends are not affected.")
             }
-            .sheet(item: $shareFile) { file in
-                ActivityShareView(items: file.urls)
+            .sheet(item: $shareFile, onDismiss: {
+                presentDiagnosticsSharedIfNeeded()
+            }) { file in
+                ActivityShareView(items: file.urls) { completed in
+                    shareOutcome.mark(completed)
+                    if completed { shareFile = nil }
+                    presentDiagnosticsSharedIfNeeded()
+                }
+            }
+            .alert("Diagnostics shared.", isPresented: $showDiagnosticsShared) {
+                Button("OK", role: .cancel) {}
             }
             .sheet(isPresented: $showShorePass, onDismiss: {
                 model.refreshRelayConfigured()
@@ -1167,7 +1178,18 @@ struct ConnectionDetailsView: View {
             shareFile = nil
         case .archive(let archive):
             supportMessage = nil
+            shareOutcome.reset()
             shareFile = ShareableFile(url: archive)
+        }
+    }
+
+    /// Completion and `onDismiss` can arrive in either order. Present once,
+    /// on the next turn, so the alert is not requested while the sheet is leaving.
+    private func presentDiagnosticsSharedIfNeeded() {
+        guard shareOutcome.takeIfReady() else { return }
+        supportMessage = DiagnosticsShareFeedback.confirmationMessage(completed: true)
+        DispatchQueue.main.async {
+            showDiagnosticsShared = true
         }
     }
 

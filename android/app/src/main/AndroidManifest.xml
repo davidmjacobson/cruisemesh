@@ -101,9 +101,10 @@
             android:name=".notify.NotificationActionReceiver"
             android:exported="false" />
 
-        <!-- Camera capture target for in-chat photos (TakePicture contract). -->
+        <!-- Camera capture and Share diagnostics. Subclassed so a diagnostics
+             read can be distinguished from the chooser returning. -->
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name=".CruiseMeshFileProvider"
             android:authorities="${applicationId}.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
