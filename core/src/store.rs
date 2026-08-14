@@ -1675,6 +1675,19 @@ impl MessageStore {
         .map_err(store_err)
     }
 
+    /// Clear this device's clone warning after the person has confirmed that
+    /// no other phone is using their backup. A later authenticated sighting
+    /// records a fresh row and surfaces the warning again.
+    pub fn clear_identity_clone_warning(&self, user_id: Vec<u8>) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "DELETE FROM identity_clone_warnings WHERE user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Whether the bounded conflict quarantine contains any rows. This is the
     /// cheap predicate used by diagnostics screens; unlike CSV export it does
     /// not materialise the retained summaries or touch the filesystem.
@@ -10669,6 +10682,25 @@ mod tests {
         assert!(!alice_phone
             .has_identity_clone_warning(b"bob".to_vec())
             .unwrap());
+
+        alice_phone
+            .clear_identity_clone_warning(alice.to_vec())
+            .unwrap();
+        assert!(
+            !alice_phone
+                .has_identity_clone_warning(alice.to_vec())
+                .unwrap(),
+            "a person who confirms this is their only phone can clear the banner"
+        );
+        alice_phone
+            .record_identity_clone_warning(alice.to_vec(), 65_000)
+            .unwrap();
+        assert!(
+            alice_phone
+                .has_identity_clone_warning(alice.to_vec())
+                .unwrap(),
+            "a later authenticated sighting must surface the warning again"
+        );
 
         alice_phone.upsert_contact(contact(alice, "Alice")).unwrap();
         assert!(alice_phone.delete_contact(alice.to_vec()).unwrap());

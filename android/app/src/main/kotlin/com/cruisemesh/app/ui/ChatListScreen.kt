@@ -126,6 +126,7 @@ fun ChatListScreen(
     onConnectivityWarningClick: () -> Unit = {},
     onConnectivityWarningSecondaryClick: (() -> Unit)? = null,
     ownCloneWarning: Boolean = false,
+    onDismissOwnCloneWarning: () -> Unit = {},
     summaries: List<ChatSummary>
 ) {
     var showHomeMenu by remember { mutableStateOf(false) }
@@ -255,6 +256,12 @@ fun ChatListScreen(
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(top = 4.dp),
                         )
+                        TextButton(
+                            onClick = onDismissOwnCloneWarning,
+                            modifier = Modifier.padding(top = 4.dp),
+                        ) {
+                            Text(stringResource(R.string.ui_this_is_my_only_phone))
+                        }
                     }
                 }
             }

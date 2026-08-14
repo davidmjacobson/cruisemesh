@@ -270,6 +270,12 @@ struct ChatListView: View {
                                 .font(.subheadline.weight(.semibold))
                             Text("Both phones will get out of sync. Use one phone until you can link them.")
                                 .font(.caption)
+                            Button("This is my only phone") {
+                                try? AppStore.get().clearIdentityCloneWarning(userId: identity.userId)
+                                ownCloneWarning = false
+                            }
+                            .font(.caption.weight(.semibold))
+                            .accessibilityIdentifier("home.dismiss-clone-warning")
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
