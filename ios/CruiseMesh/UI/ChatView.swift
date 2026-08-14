@@ -1297,6 +1297,7 @@ private struct VoiceMemoSeekBar: View {
     var progress: Double
     var progressLabel: String
     var onSeek: (Double) -> Void
+    @State private var scrubbing = false
 
     var body: some View {
         GeometryReader { geo in
@@ -1307,16 +1308,27 @@ private struct VoiceMemoSeekBar: View {
                     .frame(width: max(4, geo.size.width * progress))
             }
             .contentShape(Rectangle())
-            .gesture(
+            // High-priority so this drag wins over the bubble's
+            // simultaneous swipe-to-reply. VoiceSeekDrag is set
+            // synchronously because preference updates are a frame late.
+            .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
+                        if !scrubbing {
+                            scrubbing = true
+                            VoiceSeekDrag.begin()
+                        }
                         guard geo.size.width > 0 else { return }
                         onSeek(Double(value.location.x / geo.size.width))
+                    }
+                    .onEnded { _ in
+                        endScrub()
                     }
             )
         }
         .frame(width: 120, height: 22)
         .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("voice.seek")
         .accessibilityLabel(Text("Voice message position"))
         .accessibilityValue(Text(progressLabel))
         .accessibilityAdjustableAction { direction in
@@ -1327,6 +1339,13 @@ private struct VoiceMemoSeekBar: View {
             default: break
             }
         }
+        .onDisappear { endScrub() }
+    }
+
+    private func endScrub() {
+        guard scrubbing else { return }
+        scrubbing = false
+        VoiceSeekDrag.end()
     }
 }
 

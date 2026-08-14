@@ -238,6 +238,31 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(recipientHeader.label.contains("Bob"))
     }
 
+    func testScrubbingAVoiceMessageDoesNotStartAReply() {
+        launch(scenario: "chat")
+        XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
+        openChat(named: "Bob")
+        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: Self.uiTimeout))
+
+        let seek = element("voice.seek")
+        XCTAssertTrue(
+            seek.waitForExistence(timeout: Self.uiTimeout),
+            "The seeded voice message should expose a seek bar"
+        )
+
+        // Travel well past the 56 pt swipe-to-reply threshold. Before the
+        // seek bar claimed the drag, this started a reply.
+        let start = seek.coordinate(withNormalizedOffset: CGVector(dx: 0.1, dy: 0.5))
+        let end = seek.coordinate(withNormalizedOffset: CGVector(dx: 2.5, dy: 0.5))
+        start.press(forDuration: 0.05, thenDragTo: end)
+
+        XCTAssertFalse(
+            element("chat.reply-preview").exists,
+            "A rightward scrub on the seek bar must not start a swipe-to-reply"
+        )
+        XCTAssertFalse(app.buttons["Cancel reply"].exists)
+    }
+
     func testContactVerificationAndDeleteCancellationAreSafe() {
         launch(scenario: "chat")
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))

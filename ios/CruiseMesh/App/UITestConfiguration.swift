@@ -98,7 +98,12 @@ enum UITestConfiguration {
             ProfileStore.saveDisplayName("UI Tester")
         case .chat:
             ProfileStore.saveDisplayName("UI Tester")
-            _ = seedContact(name: "Bob")
+            let bob = seedContact(name: "Bob")
+            insertVoiceMessage(
+                chatId: bob.userId,
+                senderUserId: bob.userId,
+                lamport: 2
+            )
         case .chatListActions:
             ProfileStore.saveDisplayName("UI Tester")
             let contact = seedContact(name: "Robert", nickname: "Dad")
@@ -164,6 +169,31 @@ enum UITestConfiguration {
             preconditionFailure("Could not reload seeded UI-test contact")
         }
         return stored
+    }
+
+    private static func insertVoiceMessage(
+        chatId: Data,
+        senderUserId: Data,
+        lamport: UInt64
+    ) {
+        let payload = AttachmentPayload(
+            mediaType: .audio,
+            mimeType: "audio/mp4",
+            durationMs: 16_000,
+            blob: Data([0, 1, 2, 3])
+        )
+        do {
+            _ = try AppStore.get().insertMessage(message: StoredMessage(
+                chatId: chatId,
+                senderUserId: senderUserId,
+                lamport: lamport,
+                timestamp: 1_700_000_000_000 + Int64(lamport) * 1_000,
+                kind: ProtocolKind.attachmentManifest,
+                payload: payload.encode()
+            ))
+        } catch {
+            preconditionFailure("Could not seed UI-test voice message: \(error)")
+        }
     }
 
     private static func insertMessage(

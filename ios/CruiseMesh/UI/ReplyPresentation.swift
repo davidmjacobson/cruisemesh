@@ -127,6 +127,7 @@ struct ReplyComposerPreview: View {
             }
             .accessibilityLabel("Cancel reply")
         }
+        .accessibilityIdentifier("chat.reply-preview")
         .padding(6)
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)

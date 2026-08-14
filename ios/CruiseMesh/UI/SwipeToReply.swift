@@ -18,7 +18,15 @@ enum SwipeToReplyMath {
     /// a bubble still scrolls and still dismisses the keyboard. Once a swipe has
     /// taken over, it keeps the drag even if the finger curves, so a reply in
     /// progress doesn't snap back mid-gesture.
-    static func engages(translation: CGSize, alreadyEngaged: Bool) -> Bool {
+    static func engages(
+        translation: CGSize,
+        alreadyEngaged: Bool,
+        scrubbing: Bool = false
+    ) -> Bool {
+        // A voice-message seek bar lives inside the bubble. Its drag is
+        // simultaneous with this swipe, so a rightward scrub past the
+        // reply threshold would also start a reply unless we opt out.
+        if scrubbing { return false }
         guard translation.width > 0 else { return false }
         if alreadyEngaged { return true }
         return abs(translation.width) > abs(translation.height)
@@ -33,14 +41,45 @@ enum SwipeToReplyMath {
     }
 
     /// Whether releasing at `offset` should start a reply.
-    static func shouldReply(offset: CGFloat, threshold: CGFloat) -> Bool {
-        offset >= threshold
+    static func shouldReply(
+        offset: CGFloat,
+        threshold: CGFloat,
+        scrubbing: Bool = false
+    ) -> Bool {
+        if scrubbing { return false }
+        return offset >= threshold
     }
 
     /// Fraction 0...1 of the way to the trigger threshold, for icon fade/scale.
     static func progress(offset: CGFloat, threshold: CGFloat) -> CGFloat {
         guard threshold > 0 else { return 0 }
         return min(max(offset / threshold, 0), 1)
+    }
+}
+
+/// Synchronous handshake with `VoiceMemoSeekBar`. Preference updates land
+/// a frame late, so the first 15 pt of a rightward scrub can already have
+/// engaged swipe-to-reply; this flag is set in the seek bar's `onChanged`.
+enum VoiceSeekDrag {
+    private static let lock = NSLock()
+    private static var count = 0
+
+    static var isActive: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return count > 0
+    }
+
+    static func begin() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    static func end() {
+        lock.lock()
+        count = max(0, count - 1)
+        lock.unlock()
     }
 }
 
@@ -78,26 +117,36 @@ private struct SwipeToReplyModifier: ViewModifier {
                 .simultaneousGesture(
                     DragGesture(minimumDistance: SwipeToReplyMath.engageDistance)
                         .onChanged { value in
+                            let scrubbing = VoiceSeekDrag.isActive
                             guard SwipeToReplyMath.engages(
                                 translation: value.translation,
-                                alreadyEngaged: offset > 0
+                                alreadyEngaged: offset > 0,
+                                scrubbing: scrubbing
                             ) else {
-                                // The thread owns this drag. Reset rather than
-                                // ignore: scrolling cancels our gesture, so
-                                // `onEnded` may never arrive to spring a
-                                // part-swiped bubble back.
+                                // The thread owns this drag, or a seek bar
+                                // does. Reset rather than ignore: scrolling
+                                // cancels our gesture, so `onEnded` may never
+                                // arrive to spring a part-swiped bubble back.
                                 if offset != 0 { offset = 0 }
                                 if triggered { triggered = false }
                                 return
                             }
                             offset = SwipeToReplyMath.clampOffset(value.translation.width, maxDrag: maxDrag)
-                            if !triggered, SwipeToReplyMath.shouldReply(offset: offset, threshold: threshold) {
+                            if !triggered, SwipeToReplyMath.shouldReply(
+                                offset: offset,
+                                threshold: threshold,
+                                scrubbing: scrubbing
+                            ) {
                                 triggered = true
                                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             }
                         }
                         .onEnded { _ in
-                            if SwipeToReplyMath.shouldReply(offset: offset, threshold: threshold) {
+                            if SwipeToReplyMath.shouldReply(
+                                offset: offset,
+                                threshold: threshold,
+                                scrubbing: VoiceSeekDrag.isActive
+                            ) {
                                 onReply()
                             }
                             triggered = false
