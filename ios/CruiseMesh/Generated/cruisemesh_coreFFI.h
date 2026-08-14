@@ -1618,6 +1618,11 @@ int8_t uniffi_cruisemesh_core_fn_method_seenids_check_and_record(void*_Nonnull p
 int8_t uniffi_cruisemesh_core_fn_method_seenids_contains(void*_Nonnull ptr, RustBuffer msg_id, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_SEENIDS_IS_EMPTY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_SEENIDS_IS_EMPTY
+int8_t uniffi_cruisemesh_core_fn_method_seenids_is_empty(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_SEENIDS_LEN
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_SEENIDS_LEN
 uint64_t uniffi_cruisemesh_core_fn_method_seenids_len(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -5973,6 +5978,12 @@ uint16_t uniffi_cruisemesh_core_checksum_method_seenids_check_and_record(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_SEENIDS_CONTAINS
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_SEENIDS_CONTAINS
 uint16_t uniffi_cruisemesh_core_checksum_method_seenids_contains(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_SEENIDS_IS_EMPTY
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_SEENIDS_IS_EMPTY
+uint16_t uniffi_cruisemesh_core_checksum_method_seenids_is_empty(void
     
 );
 #endif

@@ -8916,6 +8916,8 @@ public protocol SeenIdsProtocol : AnyObject {
      */
     func contains(msgId: Data)  -> Bool
     
+    func isEmpty()  -> Bool
+    
     /**
      * Current number of retained ids (for tests/diagnostics).
      */
@@ -9045,6 +9047,13 @@ open func contains(msgId: Data) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_seenids_contains(self.uniffiClonePointer(),
         FfiConverterData.lower(msgId),$0
+    )
+})
+}
+    
+open func isEmpty() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_seenids_is_empty(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -37667,6 +37676,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_contains() != 35440) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_seenids_is_empty() != 25772) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_seenids_len() != 1292) {
