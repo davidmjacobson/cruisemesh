@@ -158,11 +158,7 @@ pub fn create_group_metadata_update(
     member_user_ids: Vec<Vec<u8>>,
 ) -> Result<GroupMetadataUpdate, CoreError> {
     validate_group(&group)?;
-    if !group
-        .member_user_ids
-        .iter()
-        .any(|member| *member == changed_by)
-    {
+    if !group.member_user_ids.contains(&changed_by) {
         return Err(CoreError::Malformed(
             "group metadata author is not a member".to_string(),
         ));
@@ -214,11 +210,7 @@ pub fn apply_group_metadata_update(
             "group metadata signer does not match changed_by".to_string(),
         ));
     }
-    if !group
-        .member_user_ids
-        .iter()
-        .any(|member| *member == sender_user_id)
-    {
+    if !group.member_user_ids.contains(&sender_user_id) {
         return Err(CoreError::Malformed(
             "group metadata signer is not a member".to_string(),
         ));
@@ -706,13 +698,13 @@ mod tests {
         assert!(create_group("x".repeat(MAX_GROUP_NAME_BYTES + 1), vec![user(1)],).is_err());
 
         let mut invite = vec![0x11; GROUP_ID_LEN];
-        invite.extend_from_slice(&vec![0x22; GROUP_KEY_LEN]);
+        invite.extend_from_slice(&[0x22; GROUP_KEY_LEN]);
         write_bytes16(&mut invite, b"Family");
         invite.extend_from_slice(&((MAX_GROUP_MEMBERS + 1) as u16).to_be_bytes());
         assert!(decode_group_invite_content(invite).is_err());
 
         let mut metadata = vec![GROUP_METADATA_VERSION];
-        metadata.extend_from_slice(&vec![0x11; GROUP_ID_LEN]);
+        metadata.extend_from_slice(&[0x11; GROUP_ID_LEN]);
         metadata.extend_from_slice(&1u64.to_be_bytes());
         write_bytes16(&mut metadata, &user(1));
         write_bytes16(&mut metadata, b"Family");

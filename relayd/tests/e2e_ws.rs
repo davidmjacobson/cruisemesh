@@ -239,7 +239,13 @@ async fn ws_replay_on_connect_matches_poll() {
     post_envelope(&router, "family-a", &env1).await;
     post_envelope(&router, "family-a", &env2).await;
 
-    let polled = get_envelopes_json(&router, "family-a", &[env1.recipient_hint.clone()], 0).await;
+    let polled = get_envelopes_json(
+        &router,
+        "family-a",
+        std::slice::from_ref(&env1.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(polled["envelopes"].as_array().unwrap().len(), 2);
 
     let url = format!(
@@ -306,7 +312,7 @@ async fn ws_replay_drains_a_backlog_cut_short_by_the_byte_budget() {
     // Precondition: one page really is cut short by bytes. Without this the
     // rest of the test would pass even against the old break-on-short-batch
     // replay loop.
-    let polled = get_envelopes_json(&router, "family-a", &[hint.clone()], 0).await;
+    let polled = get_envelopes_json(&router, "family-a", std::slice::from_ref(&hint), 0).await;
     let first_page = polled["envelopes"].as_array().unwrap().len();
     assert!(
         first_page > 0 && first_page < ENVELOPE_COUNT,
@@ -330,11 +336,14 @@ async fn ws_replay_drains_a_backlog_cut_short_by_the_byte_budget() {
             )
         };
         let text = loop {
-            let msg = tokio::time::timeout(Duration::from_secs(60), socket.next())
+            let next = tokio::time::timeout(Duration::from_secs(60), socket.next())
                 .await
-                .unwrap_or_else(|_| panic!("{}", stalled("stalled")))
-                .unwrap_or_else(|| panic!("{}", stalled("closed the socket")))
-                .unwrap();
+                .unwrap_or_else(|_| panic!("{}", stalled("stalled")));
+            let msg = match next {
+                Some(Ok(msg)) => msg,
+                Some(Err(error)) => panic!("{}: {error}", stalled("socket error")),
+                None => panic!("{}", stalled("closed the socket")),
+            };
             match msg {
                 tokio_tungstenite::tungstenite::Message::Text(text) => break text,
                 tokio_tungstenite::tungstenite::Message::Ping(_)

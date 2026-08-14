@@ -334,9 +334,7 @@ pub fn resolved_contact_delivery_relay(
             fallback_token,
         );
     }
-    let Some(fallback) = relay_endpoint_from(fallback_url, fallback_token) else {
-        return None;
-    };
+    let fallback = relay_endpoint_from(fallback_url, fallback_token)?;
     // Only worth a request if it is somewhere other than the host we just
     // wrote off; otherwise report "nowhere to post" honestly rather than
     // retrying the same dead host under a different name.
@@ -1291,13 +1289,13 @@ mod tests {
         // by 4/3, so a body under the cap can never decode to more than the
         // cap's worth of payload, and a decode bound above it would be dead
         // code pretending to be a limit.
-        assert!(RELAY_FETCH_MAX_DECODED_BYTES <= RELAY_MAX_RESPONSE_BODY_BYTES);
+        const { assert!(RELAY_FETCH_MAX_DECODED_BYTES <= RELAY_MAX_RESPONSE_BODY_BYTES) };
         // A single maximum-size row must still fit, or a legitimate large
         // attachment chunk could never be fetched at all.
-        assert!(RELAY_MAX_SEALED_BYTES <= RELAY_FETCH_MAX_DECODED_BYTES);
+        const { assert!(RELAY_MAX_SEALED_BYTES <= RELAY_FETCH_MAX_DECODED_BYTES) };
         // relayd's MAX_FETCH_LIMIT is 500 (relayd/src/lib.rs); asking for
         // more than the deployed server accepts would rely on its clamp.
-        assert!(RELAY_FETCH_MAX_ROWS <= 500);
+        const { assert!(RELAY_FETCH_MAX_ROWS <= 500) };
         assert_eq!(relay_fetch_batch_limit() as usize, RELAY_FETCH_MAX_ROWS);
     }
 

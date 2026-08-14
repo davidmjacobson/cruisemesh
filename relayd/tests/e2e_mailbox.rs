@@ -202,7 +202,13 @@ async fn real_sealed_text_post_fetch_open_ack_gone() {
     let id = posted["id"].as_i64().unwrap();
     assert!(id > 0);
 
-    let fetched = get_envelopes(&app, "family-a", &[env.recipient_hint.clone()], 0).await;
+    let fetched = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     let envelopes = fetched["envelopes"].as_array().unwrap();
     assert_eq!(envelopes.len(), 1);
     assert_eq!(envelopes[0]["msg_id"], b64(&env.msg_id));
@@ -220,11 +226,23 @@ async fn real_sealed_text_post_fetch_open_ack_gone() {
     assert_eq!(body.lamport, 1);
 
     // Still present until ack.
-    let again = get_envelopes(&app, "family-a", &[env.recipient_hint.clone()], 0).await;
+    let again = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(again["envelopes"].as_array().unwrap().len(), 1);
 
     assert_eq!(ack(&app, "family-a", &[id]).await, 1);
-    let gone = get_envelopes(&app, "family-a", &[env.recipient_hint.clone()], 0).await;
+    let gone = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     assert!(gone["envelopes"].as_array().unwrap().is_empty());
     assert_eq!(gone["next_cursor"].as_i64().unwrap(), 0);
 }
@@ -252,7 +270,13 @@ async fn receipt_envelope_round_trip_is_content_agnostic() {
     let receipt_id = posted["id"].as_i64().unwrap();
 
     // Alice polls with her own day-hint and gets the receipt (not Bob's text).
-    let for_alice = get_envelopes(&app, "family-a", &[receipt.recipient_hint.clone()], 0).await;
+    let for_alice = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&receipt.recipient_hint),
+        0,
+    )
+    .await;
     let envs = for_alice["envelopes"].as_array().unwrap();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0]["msg_id"], b64(&receipt.msg_id));
@@ -268,11 +292,23 @@ async fn receipt_envelope_round_trip_is_content_agnostic() {
 
     // Bob still has his text waiting (different hint) — receipts don't
     // interfere with text rows on the same family token.
-    let for_bob = get_envelopes(&app, "family-a", &[text.recipient_hint.clone()], 0).await;
+    let for_bob = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&text.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(for_bob["envelopes"].as_array().unwrap().len(), 1);
 
     assert_eq!(ack(&app, "family-a", &[receipt_id]).await, 1);
-    let gone = get_envelopes(&app, "family-a", &[receipt.recipient_hint.clone()], 0).await;
+    let gone = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&receipt.recipient_hint),
+        0,
+    )
+    .await;
     assert!(gone["envelopes"].as_array().unwrap().is_empty());
 }
 
@@ -298,7 +334,13 @@ async fn mixed_text_and_read_receipt_share_mailbox_without_kind_filter() {
     post_envelope(&app, "family-a", &text).await;
     post_envelope(&app, "family-a", &receipt).await;
 
-    let page = get_envelopes(&app, "family-a", &[text.recipient_hint.clone()], 0).await;
+    let page = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&text.recipient_hint),
+        0,
+    )
+    .await;
     let envs = page["envelopes"].as_array().unwrap();
     assert_eq!(
         envs.len(),
@@ -339,16 +381,34 @@ async fn msg_id_dedupe_within_family_and_cross_family_isolation() {
         other_family["id"].as_i64().unwrap()
     );
 
-    let for_a = get_envelopes(&app, "family-a", &[env.recipient_hint.clone()], 0).await;
+    let for_a = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(for_a["envelopes"].as_array().unwrap().len(), 1);
 
-    let for_b = get_envelopes(&app, "family-b", &[env.recipient_hint.clone()], 0).await;
+    let for_b = get_envelopes(
+        &app,
+        "family-b",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(for_b["envelopes"].as_array().unwrap().len(), 1);
 
     // family-a ack must not remove family-b's copy.
     let a_id = for_a["envelopes"][0]["id"].as_i64().unwrap();
     assert_eq!(ack(&app, "family-a", &[a_id]).await, 1);
-    let for_b_after = get_envelopes(&app, "family-b", &[env.recipient_hint.clone()], 0).await;
+    let for_b_after = get_envelopes(
+        &app,
+        "family-b",
+        std::slice::from_ref(&env.recipient_hint),
+        0,
+    )
+    .await;
     assert_eq!(for_b_after["envelopes"].as_array().unwrap().len(), 1);
 }
 
@@ -505,7 +565,13 @@ async fn expiry_pruning_drops_stale_sealed_envelopes() {
         .unwrap();
     post_envelope(&app, "family-a", &live).await;
 
-    let page = get_envelopes(&app, "family-a", &[live.recipient_hint.clone()], 0).await;
+    let page = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&live.recipient_hint),
+        0,
+    )
+    .await;
     let envs = page["envelopes"].as_array().unwrap();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0]["msg_id"], b64(&live.msg_id));
@@ -583,7 +649,13 @@ async fn a_bluetooth_consumed_receipt_is_acked_off_the_relay_but_a_muled_one_is_
     // Next relay walk: both rows come back and both dedupe to SEEN (the
     // consumed one because it really is a duplicate; the other stands in for
     // any row this device has no evidence for).
-    let page = get_envelopes(&app, "family-a", &[consumed.recipient_hint.clone()], 0).await;
+    let page = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&consumed.recipient_hint),
+        0,
+    )
+    .await;
     let envs = page["envelopes"].as_array().unwrap();
     assert_eq!(envs.len(), 2);
 
@@ -609,7 +681,13 @@ async fn a_bluetooth_consumed_receipt_is_acked_off_the_relay_but_a_muled_one_is_
 
     // The consumed row is gone from the mailbox for good; the other one is
     // still there for whoever still needs it.
-    let after = get_envelopes(&app, "family-a", &[consumed.recipient_hint.clone()], 0).await;
+    let after = get_envelopes(
+        &app,
+        "family-a",
+        std::slice::from_ref(&consumed.recipient_hint),
+        0,
+    )
+    .await;
     let remaining = after["envelopes"].as_array().unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0]["id"].as_i64().unwrap(), survivor_id);

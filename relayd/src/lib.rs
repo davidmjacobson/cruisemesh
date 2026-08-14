@@ -79,6 +79,8 @@ const MSG_ID_LEN: usize = 16;
 const DEFAULT_FETCH_LIMIT: usize = 100;
 const MAX_FETCH_LIMIT: usize = 500;
 
+type EnvelopeBatchRow = (String, Vec<u8>, u8, Vec<u8>, Vec<u8>, i64, i64);
+
 /// The response body ceiling every first-party client enforces before it will
 /// decode a fetch page (`core/src/relay_wire.rs`
 /// `RELAY_MAX_RESPONSE_BODY_BYTES`, exported as `relay_max_response_bytes()`).
@@ -1187,6 +1189,10 @@ impl RelayStore {
         expiry_ms.min(created_at_ms.saturating_add(MAX_RETENTION_MS))
     }
 
+    // These are the independently validated persisted-envelope columns. A
+    // request struct would obscure ownership at the HTTP/store boundary while
+    // providing no shared invariant beyond the checks immediately below.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_envelope(
         &self,
         family_token: &str,
@@ -1260,6 +1266,9 @@ impl RelayStore {
     /// Atomically admit a new row under the per-family sealed-byte quota.
     /// The dedupe check, usage calculation, optional expiry pruning, and insert
     /// all run while holding one store lock and one SQLite transaction.
+    // Kept parallel to `insert_envelope`: quota admission must receive the
+    // same individual stored columns plus its family-level quota.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_envelope_with_quota(
         &self,
         family_token: &str,
@@ -1365,10 +1374,7 @@ impl RelayStore {
     /// rather than a signalled conflict — but it likewise never overwrites the
     /// stored bytes, so no ingest path can silently replace one msg_id's
     /// content with another's.
-    pub fn insert_envelopes_batch(
-        &self,
-        rows: &[(String, Vec<u8>, u8, Vec<u8>, Vec<u8>, i64, i64)],
-    ) -> Result<(), String> {
+    pub fn insert_envelopes_batch(&self, rows: &[EnvelopeBatchRow]) -> Result<(), String> {
         for (_, _, _, _, sealed, _, _) in rows {
             if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
                 return Err(format!(
@@ -1533,8 +1539,7 @@ impl RelayStore {
             return Err(format!("at most {MAX_ACK_IDS} ack ids are allowed"));
         }
         let conn = self.conn.lock().expect("relay store mutex poisoned");
-        let placeholders = std::iter::repeat("?")
-            .take(ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -3185,13 +3190,15 @@ async fn ws_handler(
         .on_upgrade(move |socket| {
             handle_ws(
                 socket,
-                state,
-                token,
-                hints,
-                hints_base64,
-                after,
-                global_permit,
-                per_token_permit,
+                WsSession {
+                    state,
+                    family_token: token,
+                    hints,
+                    hints_base64,
+                    after,
+                    global_permit,
+                    per_token_permit,
+                },
             )
         })
         .into_response())
@@ -3248,19 +3255,29 @@ async fn ws_send_ping(socket: &mut WebSocket) -> bool {
     )
 }
 
-async fn handle_ws(
-    mut socket: WebSocket,
+struct WsSession {
     state: AppState,
     family_token: String,
     hints: Vec<Vec<u8>>,
     hints_base64: HashSet<String>,
-    mut after: i64,
+    after: i64,
     // FR6: RAII connection-cap permits -- held for the socket's whole
     // lifetime; dropped (and the slot freed) whenever this function
     // returns, on any disconnect path.
-    _global_permit: OwnedSemaphorePermit,
-    _per_token_permit: OwnedSemaphorePermit,
-) {
+    global_permit: OwnedSemaphorePermit,
+    per_token_permit: OwnedSemaphorePermit,
+}
+
+async fn handle_ws(mut socket: WebSocket, session: WsSession) {
+    let WsSession {
+        state,
+        family_token,
+        hints,
+        hints_base64,
+        mut after,
+        global_permit: _global_permit,
+        per_token_permit: _per_token_permit,
+    } = session;
     // FR2: WS lifecycle logging. `family` is a short, non-secret prefix
     // (see `token_prefix`) so log lines correlate a session across
     // connect/disconnect without printing the bearer token.
@@ -4870,8 +4887,7 @@ mod tests {
     async fn fetch_and_ack_cardinality_caps_fail_before_dynamic_sql() {
         let app = test_app();
         let hint = encode_base64_field(&sample_hint(1));
-        let hints = std::iter::repeat(hint)
-            .take(MAX_FETCH_HINTS + 1)
+        let hints = std::iter::repeat_n(hint, MAX_FETCH_HINTS + 1)
             .collect::<Vec<_>>()
             .join(",");
         let fetch = Request::builder()
@@ -5874,13 +5890,12 @@ mod tests {
     #[test]
     fn the_page_budget_can_never_truncate_a_sixteen_row_ask() {
         const DEPLOYED_CLIENT_FETCH_LIMIT: usize = 16;
-        assert!(
-            MAX_FETCH_PAGE_SEALED_BYTES >= DEPLOYED_CLIENT_FETCH_LIMIT * MAX_ENVELOPE_SEALED_BYTES,
-            "the byte budget ({MAX_FETCH_PAGE_SEALED_BYTES}) must cover \
-             {DEPLOYED_CLIENT_FETCH_LIMIT} maximum-size envelopes \
-             ({MAX_ENVELOPE_SEALED_BYTES} each), or deployed clients read a \
-             truncated page as the end of the mailbox"
-        );
+        const {
+            assert!(
+                MAX_FETCH_PAGE_SEALED_BYTES
+                    >= DEPLOYED_CLIENT_FETCH_LIMIT * MAX_ENVELOPE_SEALED_BYTES
+            )
+        };
     }
 
     /// Duplicated from `core/src/relay_wire.rs`'s

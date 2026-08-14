@@ -358,6 +358,12 @@ pub struct CoreMeshRouterState {
     next_connected_sequence: AtomicU64,
 }
 
+impl Default for CoreMeshRouterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[uniffi::export]
 impl CoreMeshRouterState {
     #[uniffi::constructor]
@@ -891,7 +897,7 @@ impl CoreReconnectBackoffTracker {
         self.state
             .lock_recoverable()
             .get(&address)
-            .map_or(true, |state| now_ms >= state.next_eligible_at_ms)
+            .is_none_or(|state| now_ms >= state.next_eligible_at_ms)
     }
 
     /// True once the address is past the consecutive-failure budget and in

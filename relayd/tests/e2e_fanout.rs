@@ -59,7 +59,7 @@ async fn post_row(app: &Router, msg_id: &[u8], hint: &[u8]) -> Response {
                 "msg_id": b64(msg_id),
                 "hop_ttl": 7,
                 "recipient_hint": b64(hint),
-                "sealed": b64(&vec![9u8; 64]),
+                "sealed": b64(&[9u8; 64]),
                 "expiry_ms": now_ms() + 60_000,
             })
             .to_string(),

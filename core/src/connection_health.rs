@@ -1405,6 +1405,15 @@ pub fn core_classify_delivery_line(input: CoreDeliveryLineInput) -> Option<CoreD
 mod tests {
     use super::*;
 
+    type RouteCase = (
+        Option<CoreDirectLink>,
+        bool,
+        bool,
+        bool,
+        CorePersonRoute,
+        &'static str,
+    );
+
     const NOW: i64 = 1_700_000_000_000;
 
     fn healthy() -> CoreConnectionHealthInput {
@@ -2863,14 +2872,7 @@ mod tests {
     fn the_best_route_is_the_routers_answer_and_never_the_pages() {
         // (direct link, own relay usable, they have an endpoint, resting,
         //  route, what it is)
-        let cases: [(
-            Option<CoreDirectLink>,
-            bool,
-            bool,
-            bool,
-            CorePersonRoute,
-            &str,
-        ); 7] = [
+        let cases: [RouteCase; 7] = [
             (
                 Some(CoreDirectLink::Bluetooth),
                 false,

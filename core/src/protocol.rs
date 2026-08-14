@@ -866,10 +866,8 @@ fn validate_message_body_fields(
                 return Err(CoreError::Malformed("invalid attachment payload".into()));
             }
         }
-        KIND_REACTION => {
-            if crate::content::decode_reaction_payload(content.to_vec()).is_none() {
-                return Err(CoreError::Malformed("invalid reaction payload".into()));
-            }
+        KIND_REACTION if crate::content::decode_reaction_payload(content.to_vec()).is_none() => {
+            return Err(CoreError::Malformed("invalid reaction payload".into()));
         }
         _ => {}
     }
@@ -1170,7 +1168,7 @@ fn validate_friend_directory(content: &FriendDirectoryContent) -> Result<(), Cor
     }
     for entry in &content.entries {
         validate_id(&entry.candidate.user_id, "candidate UserID")?;
-        if entry.candidate.name.as_bytes().len() > PROFILE_SYNC_MAX_NAME_BYTES {
+        if entry.candidate.name.len() > PROFILE_SYNC_MAX_NAME_BYTES {
             return Err(CoreError::Malformed(
                 "candidate name is too long".to_string(),
             ));
@@ -1999,7 +1997,7 @@ mod tests {
             encode_message_body_with_reply(sample_body(), vec![1; MSG_ID_LEN]).unwrap();
         duplicated.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
         duplicated.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
-        duplicated.extend_from_slice(&vec![2; MSG_ID_LEN]);
+        duplicated.extend_from_slice(&[2; MSG_ID_LEN]);
         let error = decode_extended_message_body(duplicated).unwrap_err();
         assert!(matches!(error, CoreError::Malformed(_)));
     }
@@ -2583,7 +2581,7 @@ mod tests {
 
         let mut encoded = vec![PROFILE_SYNC_VERSION];
         encoded.extend_from_slice(&1i64.to_be_bytes());
-        write_bytes16(&mut encoded, &vec![b'x'; PROFILE_SYNC_MAX_NAME_BYTES + 1]);
+        write_bytes16(&mut encoded, &[b'x'; PROFILE_SYNC_MAX_NAME_BYTES + 1]);
         encoded.extend_from_slice(&0u32.to_be_bytes());
         encoded.extend_from_slice(&[1, 0]);
         encoded.extend_from_slice(&0u64.to_be_bytes());

@@ -651,6 +651,10 @@ impl MessageStore {
     /// and its young tail starved. Removal of a carried copy remains gated on
     /// digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
     /// nothing here acks.
+    // This is a frozen UniFFI ABI used by both mobile shells. Its fields are
+    // intentionally flat so callers do not need a second exported request
+    // record merely to forward the digest frame's independent wire fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn core_digest_spray_plan(
         &self,
         own_user_id: Vec<u8>,

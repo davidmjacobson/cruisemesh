@@ -12,6 +12,8 @@ use crate::{
     KIND_TEXT, RECEIPT_TYPE_READ,
 };
 
+type ReplyReference = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreTickStatus {
     Sent,
@@ -349,7 +351,7 @@ impl MessageStore {
     ) -> Result<Vec<CoreReplyMetadata>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         messages.into_iter().map(|message| {
-            let reference: Option<(Option<Vec<u8>>, Option<Vec<u8>>)> = conn.query_row(
+            let reference: Option<ReplyReference> = conn.query_row(
                 "SELECT msg_id, reply_to_msg_id FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
                 params![message.chat_id, message.sender_user_id, message.lamport as i64],
