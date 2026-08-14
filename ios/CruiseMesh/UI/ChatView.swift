@@ -1297,7 +1297,11 @@ private struct VoiceMemoSeekBar: View {
     var progress: Double
     var progressLabel: String
     var onSeek: (Double) -> Void
-    @State private var scrubbing = false
+    /// `GestureState` goes false if the system cancels the drag, so the
+    /// process-wide `VoiceSeekDrag` flag cannot leak and disable reply
+    /// on every other bubble. `begin()` is still called from `onChanged`
+    /// so the flag is set on the first pixel, not a frame later.
+    @GestureState private var dragging = false
 
     var body: some View {
         GeometryReader { geo in
@@ -1313,16 +1317,15 @@ private struct VoiceMemoSeekBar: View {
             // synchronously because preference updates are a frame late.
             .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
+                    .updating($dragging) { _, state, _ in
+                        state = true
+                    }
                     .onChanged { value in
-                        if !scrubbing {
-                            scrubbing = true
+                        if !VoiceSeekDrag.isActive {
                             VoiceSeekDrag.begin()
                         }
                         guard geo.size.width > 0 else { return }
                         onSeek(Double(value.location.x / geo.size.width))
-                    }
-                    .onEnded { _ in
-                        endScrub()
                     }
             )
         }
@@ -1339,13 +1342,11 @@ private struct VoiceMemoSeekBar: View {
             default: break
             }
         }
-        .onDisappear { endScrub() }
-    }
-
-    private func endScrub() {
-        guard scrubbing else { return }
-        scrubbing = false
-        VoiceSeekDrag.end()
+        .onChange(of: dragging) { isDragging in
+            if !isDragging, VoiceSeekDrag.isActive {
+                VoiceSeekDrag.end()
+            }
+        }
     }
 }
 

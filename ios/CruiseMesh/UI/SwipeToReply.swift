@@ -93,6 +93,10 @@ private struct SwipeToReplyModifier: ViewModifier {
 
     @State private var offset: CGFloat = 0
     @State private var triggered = false
+    /// Sticky for the life of this finger. `VoiceSeekDrag` drops on the seek
+    /// bar's `onEnded`, which can run before ours; without this a scrub that
+    /// had already passed 56 pt would fire `onReply` on lift.
+    @State private var blockedByScrub = false
 
     private let threshold: CGFloat = 56
     private let maxDrag: CGFloat = 80
@@ -118,10 +122,11 @@ private struct SwipeToReplyModifier: ViewModifier {
                     DragGesture(minimumDistance: SwipeToReplyMath.engageDistance)
                         .onChanged { value in
                             let scrubbing = VoiceSeekDrag.isActive
+                            if scrubbing { blockedByScrub = true }
                             guard SwipeToReplyMath.engages(
                                 translation: value.translation,
                                 alreadyEngaged: offset > 0,
-                                scrubbing: scrubbing
+                                scrubbing: scrubbing || blockedByScrub
                             ) else {
                                 // The thread owns this drag, or a seek bar
                                 // does. Reset rather than ignore: scrolling
@@ -135,21 +140,23 @@ private struct SwipeToReplyModifier: ViewModifier {
                             if !triggered, SwipeToReplyMath.shouldReply(
                                 offset: offset,
                                 threshold: threshold,
-                                scrubbing: scrubbing
+                                scrubbing: scrubbing || blockedByScrub
                             ) {
                                 triggered = true
                                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                             }
                         }
                         .onEnded { _ in
+                            let scrubbing = VoiceSeekDrag.isActive || blockedByScrub
                             if SwipeToReplyMath.shouldReply(
                                 offset: offset,
                                 threshold: threshold,
-                                scrubbing: VoiceSeekDrag.isActive
+                                scrubbing: scrubbing
                             ) {
                                 onReply()
                             }
                             triggered = false
+                            blockedByScrub = false
                             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { offset = 0 }
                         }
                 )

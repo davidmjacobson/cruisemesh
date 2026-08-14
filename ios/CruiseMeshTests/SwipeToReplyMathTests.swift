@@ -72,6 +72,8 @@ final class SwipeToReplyMathTests: XCTestCase {
     }
 
     func testVoiceSeekDragIsActiveOnlyWhileAScrubIsHeld() {
+        // Leave the flag clear even if an earlier test leaked a begin().
+        while VoiceSeekDrag.isActive { VoiceSeekDrag.end() }
         XCTAssertFalse(VoiceSeekDrag.isActive)
         VoiceSeekDrag.begin()
         XCTAssertTrue(VoiceSeekDrag.isActive)
