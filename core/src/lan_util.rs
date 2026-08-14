@@ -118,6 +118,35 @@ pub fn lan_hosts_share_local_network(local_host: String, candidate_host: String)
     routable_ipv6_prefix_64(&candidate_host).is_some_and(|candidate| candidate == local)
 }
 
+/// Whether two LAN host literals identify the same network address.
+///
+/// This is intentionally stricter than "same network": it is the shared
+/// guard both transports use to keep a stale hint or cached endpoint from
+/// dialing this phone's own listener after its address changes. Textual IPv6
+/// spelling and interface-zone differences do not make an address different,
+/// and an IPv4-mapped IPv6 literal compares equal to its IPv4 spelling.
+/// Hostnames and malformed values never compare equal.
+#[uniffi::export]
+pub fn lan_hosts_are_same_address(left_host: String, right_host: String) -> bool {
+    normalized_lan_ip(&left_host)
+        .is_some_and(|left| normalized_lan_ip(&right_host).is_some_and(|right| right == left))
+}
+
+fn normalized_lan_ip(host: &str) -> Option<std::net::IpAddr> {
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let without_zone = unbracketed.split('%').next()?;
+    match without_zone.parse::<std::net::IpAddr>().ok()? {
+        std::net::IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .or(Some(std::net::IpAddr::V6(address))),
+        address => Some(address),
+    }
+}
+
 /// The /64 of an IPv6 literal that can fingerprint a network, or `None` when
 /// the address cannot (link-local, loopback, unspecified, or unparseable). A
 /// zone suffix (`fe80::1%wlan0`) is stripped before parsing -- Android hands
@@ -325,6 +354,9 @@ pub fn lan_endpoint_cache_encode_update(
 /// (a link-local IPv6 address, identical on every link there has ever been) no
 /// future load can judge it either -- unprovable is exactly what #271 said may
 /// not be remembered -- so that is a terminal answer and the entry goes.
+/// An entry equal to this phone's own current address is also terminal and is
+/// checked before provenance: an earlier successful handshake at an address
+/// does not license dialing it after DHCP assigns that address to this phone.
 ///
 /// Nothing here discovers or forwards an address; every value examined is one
 /// this phone already holds.
@@ -338,6 +370,12 @@ pub fn lan_endpoint_cache_decision(
         return LanEndpointCacheDecision::Evict;
     }
     if !lan_endpoint_host_is_local(entry.host.clone()) {
+        return LanEndpointCacheDecision::Evict;
+    }
+    if local_host
+        .as_ref()
+        .is_some_and(|host| lan_hosts_are_same_address(host.clone(), entry.host.clone()))
+    {
         return LanEndpointCacheDecision::Evict;
     }
     if entry.provenance == LanEndpointProvenance::Authenticated {
@@ -584,6 +622,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn address_equality_normalizes_ip_literals_without_trusting_names() {
+        for (left, right) in [
+            ("192.168.86.20", "192.168.86.20"),
+            ("2001:db8::1", "2001:0db8:0:0:0:0:0:1"),
+            ("fe80::1%en0", "[fe80:0:0:0:0:0:0:1%wlan0]"),
+            ("192.168.86.20", "::ffff:192.168.86.20"),
+        ] {
+            assert!(
+                lan_hosts_are_same_address(left.into(), right.into()),
+                "{left} vs {right}"
+            );
+        }
+        for (left, right) in [
+            ("192.168.86.20", "192.168.86.21"),
+            ("phone.local", "phone.local"),
+            ("", ""),
+            ("192.168.86.20:45892", "192.168.86.20"),
+        ] {
+            assert!(
+                !lan_hosts_are_same_address(left.into(), right.into()),
+                "{left} vs {right}"
+            );
+        }
+    }
+
     fn entry(host: &str, provenance: LanEndpointProvenance) -> LanEndpointCacheEntry {
         LanEndpointCacheEntry {
             host: host.into(),
@@ -708,6 +772,34 @@ mod tests {
             .expect("legacy value parses");
         assert_eq!(
             lan_endpoint_cache_decision(same_subnet, local, now),
+            LanEndpointCacheDecision::Use
+        );
+    }
+
+    #[test]
+    fn cache_never_dials_this_phones_own_current_address() {
+        for provenance in [
+            LanEndpointProvenance::Hinted,
+            LanEndpointProvenance::Authenticated,
+        ] {
+            assert_eq!(
+                lan_endpoint_cache_decision(
+                    entry("192.168.86.20", provenance),
+                    Some("192.168.86.20".into()),
+                    2_000
+                ),
+                LanEndpointCacheDecision::Evict
+            );
+        }
+
+        // Proven cross-subnet peers remain valid: equality, not subnet
+        // difference, is the exceptional condition ahead of provenance.
+        assert_eq!(
+            lan_endpoint_cache_decision(
+                entry("10.80.209.68", LanEndpointProvenance::Authenticated),
+                Some("192.168.86.20".into()),
+                2_000
+            ),
             LanEndpointCacheDecision::Use
         );
     }

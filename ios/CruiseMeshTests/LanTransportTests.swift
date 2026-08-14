@@ -1,4 +1,5 @@
 import XCTest
+import Network
 @testable import CruiseMesh
 
 final class LanTransportTests: XCTestCase {
@@ -74,6 +75,27 @@ final class LanTransportTests: XCTestCase {
             lanHintMayBeCached(localHost: "2001:db8:1:2::31", candidateHost: "2001:db8:1:3::23")
         )
         XCTAssertFalse(lanHintMayBeCached(localHost: "fe80::1", candidateHost: "fe80::2"))
+        XCTAssertFalse(
+            lanHintMayBeCached(localHost: "192.168.86.31", candidateHost: "192.168.86.31")
+        )
+    }
+
+    func testOutboundDialRejectsOnlyThisPhonesConcreteAddress() {
+        let selfEndpoint = NWEndpoint.hostPort(host: "192.168.86.20", port: 45_892)
+        let peerEndpoint = NWEndpoint.hostPort(host: "192.168.86.23", port: 45_892)
+        let unresolvedService = NWEndpoint.service(
+            name: "stale",
+            type: "_cruisemesh._tcp",
+            domain: "local",
+            interface: nil
+        )
+
+        XCTAssertTrue(lanEndpointIsSelf(localHost: "192.168.86.20", endpoint: selfEndpoint))
+        XCTAssertFalse(lanEndpointIsSelf(localHost: "192.168.86.20", endpoint: peerEndpoint))
+        XCTAssertFalse(lanEndpointIsSelf(localHost: nil, endpoint: selfEndpoint))
+        // Network.framework service endpoints are checked again after their
+        // ready path resolves to a concrete host-port endpoint.
+        XCTAssertFalse(lanEndpointIsSelf(localHost: "192.168.86.20", endpoint: unresolvedService))
     }
 
     func testNoiseStaticKeyResolvesOnlyAcceptedContact() {

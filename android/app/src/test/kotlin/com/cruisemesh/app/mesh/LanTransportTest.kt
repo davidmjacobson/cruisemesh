@@ -1,6 +1,7 @@
 package com.cruisemesh.app.mesh
 
 import android.os.Build
+import java.net.InetSocketAddress
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -185,6 +186,20 @@ class LanTransportTest {
         assertTrue(
             !lanHostsShareLocalNetwork(localHost = "fe80::1", candidateHost = "fe80::2"),
         )
+        assertTrue(!lanHintMayBeCached("192.168.86.31", "192.168.86.31"))
+    }
+
+    @Test
+    fun `outbound dialing removes self without dropping other resolved addresses`() {
+        val self = InetSocketAddress("192.168.86.20", 45_892)
+        val peer = InetSocketAddress("192.168.86.23", 45_892)
+
+        assertEquals(
+            listOf(peer),
+            remoteLanEndpoints("192.168.86.20", listOf(self, peer)),
+        )
+        assertTrue(remoteLanEndpoints("192.168.86.20", listOf(self)).isEmpty())
+        assertEquals(listOf(self, peer), remoteLanEndpoints(null, listOf(self, peer)))
     }
 
     @Test

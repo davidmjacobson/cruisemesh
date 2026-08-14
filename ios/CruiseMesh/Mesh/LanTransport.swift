@@ -564,6 +564,12 @@ final class LanTransport {
         advertised: LanManualEndpoint? = nil
     ) {
         guard started else { return }
+        guard !lanEndpointIsSelf(localHost: announcedEndpoint?.host, endpoint: endpoint) else {
+            discoveredEndpoints.removeValue(forKey: serviceKey)
+            reconnectAttempts.removeValue(forKey: serviceKey)
+            log.info("Ignoring LAN endpoint that resolves to this phone")
+            return
+        }
         guard connections.count < Self.maxConnections else {
             // The link table is full, which with a friend on one of those
             // links is the healthiest network there is -- not an empty one.
@@ -648,6 +654,13 @@ final class LanTransport {
         trustedPeerForStaticKey(remoteStaticKey)
     }
 
+    fileprivate func connectionResolvedToSelf(_ connection: NWConnection) -> Bool {
+        lanEndpointIsSelf(
+            localHost: announcedEndpoint?.host,
+            endpoint: connection.currentPath?.remoteEndpoint ?? connection.endpoint
+        )
+    }
+
     fileprivate func connectionAuthenticated(_ link: LanConnection, userId: Data) {
         guard started, connections[link.address] === link else {
             link.close()
@@ -689,7 +702,14 @@ final class LanTransport {
         connections.removeValue(forKey: link.address)
         if let serviceKey = link.serviceKey {
             outboundAddresses.removeValue(forKey: serviceKey)
-            if link.abortedDuplicateLink {
+            if link.abortedSelfDial {
+                // A Bonjour service endpoint cannot be compared until
+                // Network.framework resolves it. If its ready path points
+                // back at this phone, retire the result instead of retrying
+                // the stale self advertisement.
+                discoveredEndpoints.removeValue(forKey: serviceKey)
+                reconnectAttempts.removeValue(forKey: serviceKey)
+            } else if link.abortedDuplicateLink {
                 // Not a failure: the contact already has a live LAN link.
                 // No retry -- rediscovery covers a later drop of the
                 // surviving link.
@@ -1112,6 +1132,10 @@ private final class LanConnection {
     /// Set when the initiator-side handshake found the contact already
     /// linked over LAN: the close is deliberate, not a failure to retry.
     private(set) var abortedDuplicateLink = false
+    /// The resolved ready path points back at this phone's own listener.
+    /// Service endpoints reveal no address before connection setup, so this
+    /// is the Bonjour equivalent of the pre-connect host-port guard.
+    private(set) var abortedSelfDial = false
 
     private weak var owner: LanTransport?
     private let connection: NWConnection
@@ -1155,6 +1179,11 @@ private final class LanConnection {
             guard let self else { return }
             switch state {
             case .ready:
+                if initiator, owner?.connectionResolvedToSelf(connection) == true {
+                    abortedSelfDial = true
+                    close()
+                    return
+                }
                 if initiator {
                     do {
                         try sendPacket(noise.writeHandshakeMessage())

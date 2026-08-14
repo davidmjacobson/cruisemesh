@@ -34544,6 +34544,9 @@ public func lanDefaultTcpPort() -> UInt16 {
  * (a link-local IPv6 address, identical on every link there has ever been) no
  * future load can judge it either -- unprovable is exactly what #271 said may
  * not be remembered -- so that is a terminal answer and the entry goes.
+ * An entry equal to this phone's own current address is also terminal and is
+ * checked before provenance: an earlier successful handshake at an address
+ * does not license dialing it after DHCP assigns that address to this phone.
  *
  * Nothing here discovers or forwards an address; every value examined is one
  * this phone already holds.
@@ -34643,6 +34646,24 @@ public func lanEndpointHostIsLocal(host: String) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_endpoint_host_is_local(
         FfiConverterString.lower(host),$0
+    )
+})
+}
+/**
+ * Whether two LAN host literals identify the same network address.
+ *
+ * This is intentionally stricter than "same network": it is the shared
+ * guard both transports use to keep a stale hint or cached endpoint from
+ * dialing this phone's own listener after its address changes. Textual IPv6
+ * spelling and interface-zone differences do not make an address different,
+ * and an IPv4-mapped IPv6 literal compares equal to its IPv4 spelling.
+ * Hostnames and malformed values never compare equal.
+ */
+public func lanHostsAreSameAddress(leftHost: String, rightHost: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_hosts_are_same_address(
+        FfiConverterString.lower(leftHost),
+        FfiConverterString.lower(rightHost),$0
     )
 })
 }
@@ -36616,7 +36637,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_default_tcp_port() != 33372) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decision() != 52054) {
+    if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decision() != 54067) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_cache_decode() != 30229) {
@@ -36632,6 +36653,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_host_is_local() != 16139) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_hosts_are_same_address() != 764) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_hosts_share_local_network() != 4244) {
