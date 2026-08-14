@@ -4367,6 +4367,16 @@
         }
       }
     },
+    "Voice message position": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Voice message position"
+          }
+        }
+      }
+    },
     "Waiting": {
       "localizations": {
         "en": {

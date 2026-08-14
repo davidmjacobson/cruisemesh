@@ -1197,6 +1197,8 @@ internal fun groupMessageInfoRows(
     ownUserId: ByteArray,
     senderName: (ByteArray) -> String,
     outboundExpiryMs: Long? = null,
+    senderDisplayId: String? = null,
+    senderIdLabel: String? = null,
     nowMs: Long = System.currentTimeMillis(),
 ): List<MessageInfoRow> {
     val rows = messageInfoRows(
@@ -1205,6 +1207,8 @@ internal fun groupMessageInfoRows(
         tick,
         arrival,
         outboundExpiryMs = outboundExpiryMs,
+        senderDisplayId = senderDisplayId,
+        senderIdLabel = senderIdLabel,
         nowMs = nowMs,
     ).toMutableList()
     if (!isOwn) return rows

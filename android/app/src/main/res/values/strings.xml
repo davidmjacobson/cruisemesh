@@ -196,6 +196,7 @@
     <string name="ui_send_voice_message">Send voice message</string>
     <string name="ui_play_voice_message">Play voice message</string>
     <string name="ui_pause_voice_message">Pause voice message</string>
+    <string name="ui_voice_message_position">Voice message position</string>
     <string name="ui_could_not_play_voice_message">Could not play that voice message</string>
     <string name="ui_could_not_save_voice_message">Could not save that voice message</string>
     <string name="ui_voice_message_too_large">That voice message is too long to send. Try a shorter one.</string>

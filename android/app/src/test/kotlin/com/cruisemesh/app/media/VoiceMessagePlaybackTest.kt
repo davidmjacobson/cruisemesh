@@ -28,6 +28,10 @@ class VoiceMessagePlaybackTest {
             pauses += 1
         }
 
+        override fun seekTo(positionMs: Int) {
+            this.positionMs = positionMs
+        }
+
         override fun release() {
             released = true
         }
@@ -212,6 +216,56 @@ class VoiceMessagePlaybackTest {
         assertEquals(0, state.positionMs)
         assertEquals(4_000, state.display.totalMs)
         assertFalse(state.display.failed)
+    }
+
+    @Test
+    fun `seek before the decoder reports a duration is a no-op`() {
+        val player = FakePlayer(durationMs = 0)
+        val playback = playback(Loader(player))
+
+        playback.toggle(KEY_A, byteArrayOf(1), 16_000)
+        playback.seek(KEY_A, 0.5f)
+
+        assertEquals(0, playback.stateFor(KEY_A, 16_000).positionMs)
+    }
+
+    @Test
+    fun `seek while paused jumps and stays paused`() {
+        val player = FakePlayer()
+        val playback = playback(Loader(player))
+
+        playback.toggle(KEY_A, byteArrayOf(1), 16_000)
+        playback.toggle(KEY_A, byteArrayOf(1), 16_000)
+        playback.seek(KEY_A, 0.25f)
+
+        assertFalse(playback.stateFor(KEY_A, 16_000).isPlaying)
+        assertEquals(4_000, playback.stateFor(KEY_A, 16_000).positionMs)
+        assertEquals(4_000, player.positionMs)
+        assertEquals(1, player.starts)
+    }
+
+    @Test
+    fun `seek while playing jumps and stays playing`() {
+        val player = FakePlayer()
+        val playback = playback(Loader(player))
+
+        playback.toggle(KEY_A, byteArrayOf(1), 16_000)
+        playback.seek(KEY_A, 0.5f)
+
+        assertTrue(playback.stateFor(KEY_A, 16_000).isPlaying)
+        assertEquals(8_000, playback.stateFor(KEY_A, 16_000).positionMs)
+        assertEquals(1, player.starts)
+    }
+
+    @Test
+    fun `seek on another message does not move this one`() {
+        val player = FakePlayer()
+        val playback = playback(Loader(player))
+
+        playback.toggle(KEY_A, byteArrayOf(1), 16_000)
+        playback.seek(KEY_B, 0.5f)
+
+        assertEquals(0, playback.stateFor(KEY_A, 16_000).positionMs)
     }
 
     @Test

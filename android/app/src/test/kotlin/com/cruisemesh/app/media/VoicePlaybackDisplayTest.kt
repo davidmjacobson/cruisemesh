@@ -57,4 +57,34 @@ class VoicePlaybackDisplayTest {
         val afterRetry = afterFailure.retrying()
         assertEquals(15_000, afterRetry.totalMs)
     }
+
+    @Test
+    fun `a bar showing only the sender duration cannot be seeked`() {
+        val display = VoicePlaybackDisplay.initial(16_000)
+        assertFalse(display.canSeek)
+        assertEquals(null, display.seekTargetMs(0.5f))
+        assertEquals(null, VoicePlaybackDisplay.seekTargetMs(null, 0.5f))
+        assertEquals(null, VoicePlaybackDisplay.seekTargetMs(0, 0.5f))
+        assertEquals(null, VoicePlaybackDisplay.seekTargetMs(-1, 0.5f))
+    }
+
+    @Test
+    fun `a decoder duration turns a bar fraction into a clamped millisecond target`() {
+        val display = VoicePlaybackDisplay.initial(9_000).withDecoderDuration(10_000)
+        assertTrue(display.canSeek)
+        assertEquals(0, display.seekTargetMs(0f))
+        assertEquals(5_000, display.seekTargetMs(0.5f))
+        assertEquals(10_000, display.seekTargetMs(1f))
+        assertEquals(0, display.seekTargetMs(-2f))
+        assertEquals(10_000, display.seekTargetMs(3f))
+        assertEquals(null, display.seekTargetMs(Float.NaN))
+    }
+
+    @Test
+    fun `progress is zero when the total is not a length`() {
+        assertEquals(0f, VoicePlaybackDisplay.progressFraction(4_000, 0), 0f)
+        assertEquals(0.25f, VoicePlaybackDisplay.progressFraction(4_000, 16_000), 0f)
+        assertEquals(0f, VoicePlaybackDisplay.progressFraction(-1, 16_000), 0f)
+        assertEquals(1f, VoicePlaybackDisplay.progressFraction(20_000, 16_000), 0f)
+    }
 }

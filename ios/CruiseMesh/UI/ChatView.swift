@@ -1232,8 +1232,9 @@ struct ChatImageView: View {
 }
 
 /// A voice message in the timeline: play/pause, elapsed over total, and a
-/// progress bar. The total is the decoder's once a player exists, falling back
-/// to the duration the sender stated until then.
+/// seekable bar. The total is the decoder's once a player exists, falling back
+/// to the duration the sender stated until then — that fallback is display
+/// only and is never a seek target.
 struct VoiceMemoPlayerView: View {
     let blob: Data
     let durationMs: Int32
@@ -1243,9 +1244,15 @@ struct VoiceMemoPlayerView: View {
         playback.total > 0 ? playback.total : TimeInterval(max(0, durationMs)) / 1000
     }
 
+    private var progressLabel: String {
+        "\(Self.clock(playback.elapsed)) / \(Self.clock(total))"
+    }
+
     private var progress: Double {
-        guard total > 0 else { return 0 }
-        return min(1, max(0, playback.elapsed / total))
+        VoicePlaybackDisplay.progressFraction(
+            positionMs: Int((playback.elapsed * 1000).rounded(.down)),
+            totalMs: Int((total * 1000).rounded(.down))
+        )
     }
 
     var body: some View {
@@ -1258,12 +1265,14 @@ struct VoiceMemoPlayerView: View {
                 }
                 .accessibilityLabel(playback.isPlaying ? "Pause voice message" : "Play voice message")
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(verbatim: "\(Self.clock(playback.elapsed)) / \(Self.clock(total))")
+                    Text(verbatim: progressLabel)
                         .font(.subheadline.monospacedDigit())
-                    ProgressView(value: progress)
-                        .progressViewStyle(.linear)
-                        .frame(width: 120)
                         .accessibilityHidden(true)
+                    VoiceMemoSeekBar(
+                        progress: progress,
+                        progressLabel: progressLabel,
+                        onSeek: { playback.seek(fraction: $0) }
+                    )
                 }
             }
             if playback.playbackFailed {
@@ -1278,6 +1287,66 @@ struct VoiceMemoPlayerView: View {
     private static func clock(_ seconds: TimeInterval) -> String {
         let whole = Int(seconds.rounded(.down))
         return "\(whole / 60):" + String(format: "%02d", whole % 60)
+    }
+}
+
+/// Exclusive drag so a scrub is not also a swipe-to-reply or a context-menu
+/// long-press. VoiceOver treats it as an adjustable with the elapsed/total
+/// line as its spoken value.
+private struct VoiceMemoSeekBar: View {
+    var progress: Double
+    var progressLabel: String
+    var onSeek: (Double) -> Void
+    /// `GestureState` goes false if the system cancels the drag, so the
+    /// process-wide `VoiceSeekDrag` flag cannot leak and disable reply
+    /// on every other bubble. `begin()` is still called from `onChanged`
+    /// so the flag is set on the first pixel, not a frame later.
+    @GestureState private var dragging = false
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.primary.opacity(0.25))
+                Capsule()
+                    .fill(.primary)
+                    .frame(width: max(4, geo.size.width * progress))
+            }
+            .contentShape(Rectangle())
+            // High-priority so this drag wins over the bubble's
+            // simultaneous swipe-to-reply. VoiceSeekDrag is set
+            // synchronously because preference updates are a frame late.
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 0)
+                    .updating($dragging) { _, state, _ in
+                        state = true
+                    }
+                    .onChanged { value in
+                        if !VoiceSeekDrag.isActive {
+                            VoiceSeekDrag.begin()
+                        }
+                        guard geo.size.width > 0 else { return }
+                        onSeek(Double(value.location.x / geo.size.width))
+                    }
+            )
+        }
+        .frame(width: 120, height: 22)
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("voice.seek")
+        .accessibilityLabel(Text("Voice message position"))
+        .accessibilityValue(Text(progressLabel))
+        .accessibilityAdjustableAction { direction in
+            let step = 0.1
+            switch direction {
+            case .increment: onSeek(min(1, progress + step))
+            case .decrement: onSeek(max(0, progress - step))
+            default: break
+            }
+        }
+        .onChange(of: dragging) { isDragging in
+            if !isDragging, VoiceSeekDrag.isActive {
+                VoiceSeekDrag.end()
+            }
+        }
     }
 }
 

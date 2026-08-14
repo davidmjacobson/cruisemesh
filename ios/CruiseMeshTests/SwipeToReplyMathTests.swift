@@ -58,6 +58,37 @@ final class SwipeToReplyMathTests: XCTestCase {
         ))
     }
 
+    func testAVoiceScrubDoesNotEngageSwipeToReply() {
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: 80, height: 0),
+            alreadyEngaged: false,
+            scrubbing: true
+        ))
+        XCTAssertFalse(SwipeToReplyMath.engages(
+            translation: CGSize(width: 80, height: 0),
+            alreadyEngaged: true,
+            scrubbing: true
+        ))
+    }
+
+    func testVoiceSeekDragIsActiveOnlyWhileAScrubIsHeld() {
+        // Leave the flag clear even if an earlier test leaked a begin().
+        while VoiceSeekDrag.isActive { VoiceSeekDrag.end() }
+        XCTAssertFalse(VoiceSeekDrag.isActive)
+        VoiceSeekDrag.begin()
+        XCTAssertTrue(VoiceSeekDrag.isActive)
+        VoiceSeekDrag.begin()
+        VoiceSeekDrag.end()
+        XCTAssertTrue(VoiceSeekDrag.isActive)
+        VoiceSeekDrag.end()
+        XCTAssertFalse(VoiceSeekDrag.isActive)
+    }
+
+    func testAVoiceScrubDoesNotStartAReplyOnRelease() {
+        XCTAssertFalse(SwipeToReplyMath.shouldReply(offset: 80, threshold: 56, scrubbing: true))
+        XCTAssertTrue(SwipeToReplyMath.shouldReply(offset: 80, threshold: 56, scrubbing: false))
+    }
+
     func testProgressIsClampedZeroToOne() {
         XCTAssertEqual(SwipeToReplyMath.progress(offset: 0, threshold: 56), 0)
         XCTAssertEqual(SwipeToReplyMath.progress(offset: 28, threshold: 56), 0.5, accuracy: 0.001)

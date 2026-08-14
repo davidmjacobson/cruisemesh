@@ -50,8 +50,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.SnackbarDuration
@@ -96,13 +97,16 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -118,6 +122,7 @@ import com.cruisemesh.app.media.ImageGallery
 import com.cruisemesh.app.media.KIND_ATTACHMENT_MANIFEST
 import com.cruisemesh.app.media.LocalVoiceMessagePlayback
 import com.cruisemesh.app.media.MediaCompressor
+import com.cruisemesh.app.media.VoicePlaybackDisplay
 import com.cruisemesh.app.media.VoiceRecorder
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.media.isVisibleChatKind
@@ -2186,7 +2191,7 @@ private fun ChatImageAttachment(jpeg: ByteArray) {
 }
 
 /**
- * Inline voice-message bubble: play/pause, a progress bar, and elapsed over
+ * Inline voice-message bubble: play/pause, a seekable bar, and elapsed over
  * total.
  *
  * Draws whatever the conversation's
@@ -2206,6 +2211,16 @@ private fun VoiceMemoPlayer(
     // there is nothing to stay continuous with, so the bubble plays its own.
     val playback = LocalVoiceMessagePlayback.current ?: rememberVoiceMessagePlayback()
     val state = playback.stateFor(messageKey, durationMs)
+    val progressLabel = stringResource(
+        R.string.ui_voice_message_progress,
+        formatDurationMs(state.positionMs),
+        formatDurationMs(state.display.totalMs),
+    )
+    val positionLabel = stringResource(R.string.ui_voice_message_position)
+    val fraction = VoicePlaybackDisplay.progressFraction(
+        state.positionMs,
+        state.display.totalMs,
+    )
 
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -2226,33 +2241,33 @@ private fun VoiceMemoPlayer(
             }
             Column(modifier = Modifier.widthIn(min = 132.dp)) {
                 Text(
-                    text = stringResource(
-                        R.string.ui_voice_message_progress,
-                        formatDurationMs(state.positionMs),
-                        formatDurationMs(state.display.totalMs),
-                    ),
+                    text = progressLabel,
                     style = MaterialTheme.typography.bodyMedium,
                     color = contentColor,
+                    // The slider speaks this string as its value. Leaving the
+                    // line readable to TalkBack would double it.
+                    modifier = Modifier
+                        .clearAndSetSemantics {}
+                        .testTag("voice.progress"),
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                LinearProgressIndicator(
-                    progress = {
-                        if (state.display.totalMs > 0) {
-                            (state.positionMs.toFloat() / state.display.totalMs).coerceIn(0f, 1f)
-                        } else {
-                            0f
-                        }
-                    },
-                    color = contentColor,
-                    trackColor = contentColor.copy(alpha = 0.25f),
-                    drawStopIndicator = {},
+                Slider(
+                    value = fraction,
+                    onValueChange = { playback.seek(messageKey, it) },
+                    colors = SliderDefaults.colors(
+                        thumbColor = contentColor,
+                        activeTrackColor = contentColor,
+                        inactiveTrackColor = contentColor.copy(alpha = 0.25f),
+                        disabledThumbColor = contentColor.copy(alpha = 0.6f),
+                        disabledActiveTrackColor = contentColor.copy(alpha = 0.6f),
+                        disabledInactiveTrackColor = contentColor.copy(alpha = 0.2f),
+                    ),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(3.dp)
-                        // Not `contentDescription = ""`: that leaves the node's
-                        // progress range in place and TalkBack reads a percentage
-                        // over the "0:04 / 0:12" line right above it.
-                        .clearAndSetSemantics {},
+                        .semantics {
+                            contentDescription = positionLabel
+                            stateDescription = progressLabel
+                            progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+                        },
                 )
             }
         }

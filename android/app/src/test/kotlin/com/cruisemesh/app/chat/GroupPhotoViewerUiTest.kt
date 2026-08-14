@@ -47,6 +47,7 @@ class GroupPhotoViewerUiTest {
             CruiseMeshTheme {
                 GroupMessageBubble(
                     message = message,
+                    tick = null,
                     isFocused = false,
                     isOwn = false,
                     senderLabel = "Alice",
