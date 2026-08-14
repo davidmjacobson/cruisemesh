@@ -1,0 +1,16 @@
+name: Dependency audit
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Rust dependency advisories, licenses, and bans
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses
