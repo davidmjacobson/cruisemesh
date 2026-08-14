@@ -271,8 +271,13 @@ struct ChatListView: View {
                             Text("Both phones will get out of sync. Use one phone until you can link them.")
                                 .font(.caption)
                             Button("This is my only phone") {
-                                try? AppStore.get().clearIdentityCloneWarning(userId: identity.userId)
-                                ownCloneWarning = false
+                                do {
+                                    try AppStore.get().clearIdentityCloneWarning(userId: identity.userId)
+                                    ownCloneWarning = false
+                                } catch {
+                                    // Keep the safety warning visible unless the
+                                    // durable row was actually removed.
+                                }
                             }
                             .font(.caption.weight(.semibold))
                             .accessibilityIdentifier("home.dismiss-clone-warning")
