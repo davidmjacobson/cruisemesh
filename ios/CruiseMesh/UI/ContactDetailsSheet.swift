@@ -17,6 +17,7 @@ struct ContactDetailsSheet: View {
     /// `contact_relay_health`), so we have stopped posting to it. Defaulted
     /// false so previews and existing call sites are unaffected.
     var relayCardIsStale: Bool = false
+    var identityCloneWarning: Bool = false
     /// Hand this one contact's card to somebody standing in front of you
     /// (specs/share-contact.md). Optional so existing call sites that have
     /// nowhere to show the code are unaffected.
@@ -115,6 +116,15 @@ struct ContactDetailsSheet: View {
                             // card is stale, and the whole failure mode is
                             // that nobody finds out. The generic hint stays
                             // where it is for the case we only suspect it.
+                            if identityCloneWarning {
+                                Text("Two copies of this contact")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.red)
+                                    .padding(.top, 12)
+                                Text("CruiseMesh saw two phones using the same identity. The messages already on this phone were kept. This can happen if they restored a backup onto another phone.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                             if relayCardIsStale {
                                 Text("Their friend card is out of date")
                                     .font(.subheadline.weight(.semibold))

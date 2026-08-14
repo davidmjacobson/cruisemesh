@@ -639,6 +639,10 @@ class MeshService : Service() {
             identity = loadedIdentity,
             trustedPeerForStaticKey = { remoteStaticKey ->
                 trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
+                    ?: run {
+                        recordOwnIdentityCloneIfAuthenticated(remoteStaticKey)
+                        null
+                    }
             },
             unlinkedCapableContacts = ::countUnlinkedCapableContacts,
             onNetworkReady = ::onLanNetworkReady,
@@ -1459,7 +1463,11 @@ class MeshService : Service() {
         }
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
-            is Frame.Hello2 -> MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
+            is Frame.Hello2 -> {
+                if (!noteOwnIdentityHello(address, parsed.userId, identity)) {
+                    MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
+                }
+            }
             is Frame.Envelope -> envelopeProcessor?.processInboundEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
             is Frame.LanEndpoint -> handleLanEndpointHint(address, parsed)
@@ -1651,7 +1659,40 @@ class MeshService : Service() {
      * a stranger. But the digest is still worth sending for the carried
      * `msg_id` suppression above.
      */
+    /**
+     * A HELLO claiming our user id is the `.cmbak`-clone meeting. Persist
+     * only when this link is already Noise-authenticated (LAN). A cleartext
+     * BLE HELLO can name any user id, so it is logged and dropped.
+     * Returns true when the frame was about us and must not become a route.
+     */
+    private fun noteOwnIdentityHello(address: String, userId: ByteArray, identity: Identity): Boolean {
+        if (!userId.contentEquals(identity.userId)) return false
+        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN) {
+            recordOwnIdentityClone()
+        } else {
+            Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")
+        }
+        return true
+    }
+
+    private fun recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: ByteArray) {
+        val id = identity ?: return
+        if (!ownLanStaticKeyMatches(id.agreePk, remoteStaticKey)) return
+        recordOwnIdentityClone()
+    }
+
+    private fun recordOwnIdentityClone() {
+        val id = identity ?: return
+        runCatching {
+            store.recordIdentityCloneWarning(id.userId, System.currentTimeMillis())
+        }.onFailure { error ->
+            Log.w(TAG, "Could not record identity clone warning: ${error.message}")
+        }
+        Log.w(TAG, "Another device presented our identity")
+    }
+
     private fun handleHello(address: String, userId: ByteArray, identity: Identity) {
+        if (noteOwnIdentityHello(address, userId, identity)) return
         // Register the address->userId mapping before anything else --
         // including the log line below -- to shrink the window for the
         // benign digest-before-HELLO race (see class KDoc / HANDOFF known

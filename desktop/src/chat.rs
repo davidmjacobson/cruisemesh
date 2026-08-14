@@ -705,6 +705,7 @@ impl ChatService {
             relay_url: contact.relay_url,
             relay_token: contact.relay_token,
             signature: None,
+            roster_head_hash: None,
         };
         let shared = cruisemesh_core::create_shared_friend_card(
             self.bootstrap.identity().clone(),

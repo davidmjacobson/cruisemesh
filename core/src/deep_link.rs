@@ -101,6 +101,7 @@ mod tests {
             "CMFRIEND1:eyJuYW1lIjoiRGF2ZSJ9",
             "CMFRIEND2:aB-_cD",
             "CMFRIEND3:aB-_cD",
+            "CMFRIEND4:aB-_cD",
         ] {
             let url = format!("https://{WEB_HOST}/f#{card}");
             let (before_fragment, _) = url.split_once('#').unwrap();

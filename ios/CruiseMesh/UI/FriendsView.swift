@@ -421,9 +421,7 @@ struct FriendsView: View {
         do {
             imported = try parseFriendImport(text: text)
         } catch {
-            self.error = text.contains("CMFRIEND")
-                ? "That looks like a friend card but part of it is missing. Copy the whole message and try again."
-                : "Not a CruiseMesh friend card"
+            self.error = friendImportFailureText(error, text: text)
             return
         }
         let card: FriendCard

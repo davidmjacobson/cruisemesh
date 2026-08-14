@@ -324,11 +324,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         let lan = LanTransport(
             identity: identity,
-            trustedPeerForStaticKey: { [store = self.store] remoteStaticKey in
-                trustedLanPeerUserId(
+            trustedPeerForStaticKey: { [weak self, store = self.store] remoteStaticKey in
+                if let userId = trustedLanPeerUserId(
                     contacts: (try? store.listContacts()) ?? [],
                     remoteStaticKey: remoteStaticKey
-                )
+                ) {
+                    return userId
+                }
+                self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
+                return nil
             }
         )
         lanTransport = lan
@@ -743,7 +747,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case .hello(let userId):
             handleHello(address: address, userId: userId, identity: identity)
         case .hello2(let userId, let capabilities):
-            MeshRouter.onHello2(address: address, userId: userId, capabilities: capabilities)
+            if !noteOwnIdentityHello(address: address, userId: userId, identity: identity) {
+                MeshRouter.onHello2(address: address, userId: userId, capabilities: capabilities)
+            }
         case .envelope(let msgId, let hopTtl, let expiry, let recipientHint, let sealed):
             processInboundEnvelope(
                 sourceAddress: address,
@@ -954,7 +960,39 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// A HELLO claiming our user id is the `.cmbak`-clone meeting. Persist
+    /// only on an already Noise-authenticated LAN link. Returns true when the
+    /// frame was about us and must not become a route.
+    @discardableResult
+    private func noteOwnIdentityHello(address: String, userId: Data, identity: Identity) -> Bool {
+        guard userId == identity.userId else { return false }
+        if MeshRouter.transportFor(address: address) == .lan {
+            recordOwnIdentityClone()
+        } else {
+            log.warning("Ignoring unauthenticated HELLO that claims our identity")
+        }
+        return true
+    }
+
+    private func recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: Data) {
+        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) else {
+            return
+        }
+        recordOwnIdentityClone()
+    }
+
+    private func recordOwnIdentityClone() {
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        do {
+            try store.recordIdentityCloneWarning(userId: identity.userId, nowMs: nowMs)
+        } catch {
+            log.warning("Could not record identity clone warning")
+        }
+        log.warning("Another device presented our identity")
+    }
+
     private func handleHello(address: String, userId: Data, identity: Identity) {
+        if noteOwnIdentityHello(address: address, userId: userId, identity: identity) { return }
         let previouslySelectedAddress = MeshRouter.routeFor(userId: userId)?.1
         // Match Android's per-HELLO reaffirmation. Startup ordering already
         // installs this in `configure`, but keeping election input adjacent to
@@ -2013,7 +2051,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         _ outcome: IncomingMessageInsertOutcome,
         sourceLabel: String,
         kind: UInt8,
-        lamport: UInt64
+        lamport: UInt64,
+        senderUserId: Data
     ) -> Bool {
         switch outcome {
         case .inserted:
@@ -2027,6 +2066,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.warning(
                 "Quarantined message stream conflict kind=\(kind, privacy: .public) lamport=\(lamport, privacy: .public) on \(sourceLabel, privacy: .public); retained visible branch"
             )
+            ChatEvents.notifyChatChanged(senderUserId)
             return false
         }
     }
@@ -2082,7 +2122,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: sourceLabel,
             kind: body.kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         if let updated {
             do {
@@ -2129,7 +2170,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: "group transport",
             kind: body.kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         recordInboundChatArrival(senderUserId: senderUserId, kind: body.kind, arrival: arrival)
         ChatEvents.notifyChatChanged(group.id)
@@ -2275,7 +2317,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             outcome,
             sourceLabel: sourceAddress ?? "relay",
             kind: kind,
-            lamport: body.lamport
+            lamport: body.lamport,
+            senderUserId: senderUserId
         ) else { return }
         ChatEvents.notifyChatChanged(senderUserId)
 

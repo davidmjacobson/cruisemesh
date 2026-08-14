@@ -34,6 +34,15 @@ class NavigationRegressionUiTest {
     }
 
     @Test
+    fun emptyFriendFragmentIsNotAPendingDeepLink() {
+        val intent = Intent(
+            Intent.ACTION_VIEW,
+            android.net.Uri.parse("https://cruisemesh.app/f#"),
+        )
+        assertNull(derivePendingDeepLink(intent))
+    }
+
+    @Test
     fun backFromOnlyDestinationFinishesInsteadOfBlankingActivity() {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()
         val nav = controller(activity)

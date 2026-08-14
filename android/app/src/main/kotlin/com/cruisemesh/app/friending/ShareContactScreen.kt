@@ -74,6 +74,7 @@ fun ShareContactScreen(
                     // shared card comes from the sharer's own SharedFriendCard
                     // signature instead.
                     signature = null,
+                    rosterHeadHash = null,
                 ),
                 sharedPolicyRevision,
                 System.currentTimeMillis(),

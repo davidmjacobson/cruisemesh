@@ -149,6 +149,7 @@ import uniffi.cruisemesh_core.ContactProvenance
 import uniffi.cruisemesh_core.friendCardUserId
 import uniffi.cruisemesh_core.FriendImport
 import uniffi.cruisemesh_core.OutgoingSharedRequest
+import com.cruisemesh.app.friending.friendImportFailureResId
 import uniffi.cruisemesh_core.parseFriendImport
 import uniffi.cruisemesh_core.parseFriendText
 import uniffi.cruisemesh_core.parseRelaySetupText
@@ -706,8 +707,10 @@ internal fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
     val fragment = uri.fragment ?: return null
     return when (route) {
         DeepLinkRoute.FRIEND ->
-            fragment.takeIf { runCatching { parseFriendText(it) }.isSuccess }
-                ?.let { PendingDeepLink(friendToken = it) }
+            // Always hand a non-empty fragment to the friends screen. A
+            // future CMFRIEND4+/CMLINK scheme must fail soft there with
+            // "update the app", not vanish. An empty `#` is not a card.
+            fragment.takeIf { it.isNotBlank() }?.let { PendingDeepLink(friendToken = it) }
         DeepLinkRoute.RELAY_SETUP ->
             fragment.takeIf { runCatching { parseRelaySetupText(it) }.isSuccess }
                 ?.let { PendingDeepLink(relayCard = it) }
@@ -918,6 +921,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     }
 
     var summaries by remember { mutableStateOf(emptyList<ChatSummary>()) }
+    var ownCloneWarning by remember { mutableStateOf(false) }
     val summaryScope = rememberCoroutineScope()
     // G1: never load summaries on main. The coordinator debounces bursts,
     // guarantees a periodic refresh during a sustained storm, and never
@@ -930,10 +934,17 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
             maxLatencyMs = ChatSummaryRefreshPolicy.MAX_LATENCY_MS,
             load = {
                 withContext(Dispatchers.IO) {
-                    ChatSummaryLoader.loadAll(context, store, identity)
+                    val loaded = ChatSummaryLoader.loadAll(context, store, identity)
+                    val warning = runCatching {
+                        store.hasIdentityCloneWarning(identity.userId)
+                    }.getOrDefault(false)
+                    loaded to warning
                 }
             },
-            onLoaded = { summaries = it },
+            onLoaded = { (loaded, warning) ->
+                summaries = loaded
+                ownCloneWarning = warning
+            },
         )
     }
 
@@ -1080,6 +1091,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onMeshStatusClick = { showMeshStatusLegend = true },
         meshStatusText = transientMeshStatus ?: pillStatus.text,
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
+        ownCloneWarning = ownCloneWarning,
         connectivityWarning = when {
             !hasPermissions -> ConnectivityWarning(
                 title = stringResource(R.string.ui_permissions_required_mesh_off),
@@ -1340,12 +1352,8 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                         }
                     }
                 }
-            } catch (_: Exception) {
-                if (text.contains("CMFRIEND")) {
-                    ImportFriendResult.Error("That looks like a friend card but part of it is missing. Copy the whole message and try again.")
-                } else {
-                    ImportFriendResult.Error("Not a CruiseMesh friend card")
-                }
+            } catch (e: Exception) {
+                ImportFriendResult.Error(context.getString(friendImportFailureResId(e, text)))
             }
         },
         onConfirmContact = { preview ->

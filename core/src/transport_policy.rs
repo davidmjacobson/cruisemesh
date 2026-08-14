@@ -1213,6 +1213,14 @@ mod tests {
             crate::protocol::core_own_capabilities()
         ));
         assert!(router.peer_acks_hidden_kinds("ble".into()));
+        // WPT: unknown capability bits (including reserved CAP_MULTI_DEVICE)
+        // are stored, not rejected. Known-bit checks still see the bits they
+        // care about.
+        let future_caps = crate::protocol::core_own_capabilities()
+            | crate::protocol::CAP_MULTI_DEVICE
+            | (1 << 31);
+        assert!(router.on_hello2("ble".into(), vec![1; 16], future_caps));
+        assert!(router.peer_acks_hidden_kinds("ble".into()));
         assert!(!router.on_hello2("ble".into(), vec![2; 16], 1));
 
         // Disconnect drops the whole peer record, offers included.

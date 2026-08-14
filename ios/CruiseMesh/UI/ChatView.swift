@@ -47,6 +47,7 @@ struct ChatView: View {
     /// when we accepted them? A durable fact, so it is read once per chat
     /// rather than on every connectivity tick.
     @State private var addedNearby = false
+    @State private var identityCloneWarning = false
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -216,6 +217,9 @@ struct ChatView: View {
                 }
             }
 
+            if identityCloneWarning {
+                IdentityCloneNotice()
+            }
             ComposerReachNotice(reach: composerReachVerdict, contactName: resolvedName)
 
             ChatComposerBar(
@@ -368,6 +372,7 @@ struct ChatView: View {
                     }
                 },
                 relayCardIsStale: connectivity.staleRelayContacts.contains(contact.userId),
+                identityCloneWarning: identityCloneWarning,
                 onShareContact: {
                     showDetails = false
                     // One sheet at a time: let the details sheet finish
@@ -490,6 +495,7 @@ struct ChatView: View {
         )) ?? 0
         let provenance = try? store.getContactProvenance(userId: contact.userId)
         addedNearby = provenance?.addedNearby ?? false
+        identityCloneWarning = (try? store.hasIdentityCloneWarning(userId: contact.userId)) ?? false
     }
 
     private func sendVoice(url: URL, durationMs: Int32) {
@@ -888,6 +894,20 @@ private struct MessageBubbleView: View {
             bottomTrailingRadius: isOwn && grouping.joinsNext ? 6 : 18,
             topTrailingRadius: isOwn && grouping.joinsPrevious ? 6 : 18
         )
+    }
+}
+
+struct IdentityCloneNotice: View {
+    var body: some View {
+        Text("CruiseMesh saw two copies of this contact. The messages already on this phone were kept.")
+            .font(.caption)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(Color.red.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .padding(.horizontal, 12)
+            .padding(.bottom, 4)
     }
 }
 

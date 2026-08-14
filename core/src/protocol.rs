@@ -343,6 +343,12 @@ pub const CAP_ACKS_HIDDEN_KINDS: u32 = 1;
 /// mixed-version resend chatter HELLO2 was introduced to end.
 pub const CAP_RELAY_UPDATE: u32 = 1 << 1;
 
+/// Capability bit reserved for multi-device (`specs/multi-device-v1.md` §12).
+/// Not advertised until the identity split ships (WP1+). Defined here so the
+/// bit assignment cannot drift, and so WPT can pin that an unknown future
+/// bit on a peer is ignored rather than treated as a parse failure.
+pub const CAP_MULTI_DEVICE: u32 = 1 << 2;
+
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
 #[uniffi::export]
@@ -1957,6 +1963,32 @@ mod tests {
         assert_eq!(extended.content, body.content);
     }
 
+    /// WPT: the open path must skip unknown trailing sealed-body TLVs rather
+    /// than reject the envelope. §5 of multi-device-v1 depends on every
+    /// fielded build behaving this way.
+    #[test]
+    fn unknown_sealed_body_fields_survive_seal_and_open() {
+        let sender = generate_identity();
+        let recipient = generate_identity();
+        let body = sample_body();
+        let reply_to = vec![7; MSG_ID_LEN];
+        let mut payload = encode_message_body_with_reply(body.clone(), reply_to.clone()).unwrap();
+        // A future sender_device_id / roster-ref TLV (type 0x20) after the
+        // known reply extension. Well-formed, unknown, must be ignored.
+        payload.push(0x20);
+        payload.extend_from_slice(&8u16.to_be_bytes());
+        payload.extend_from_slice(&[0x11; 8]);
+        payload.push(0x21);
+        payload.extend_from_slice(&0u16.to_be_bytes());
+
+        let sealed = seal_message(sender, recipient.agree_pk.clone(), payload).expect("seals");
+        let opened = open_message(recipient, sealed).expect("opens");
+        let decoded = decode_extended_message_body(opened.payload.clone()).expect("decodes");
+        assert_eq!(decoded.content, body.content);
+        assert_eq!(decoded.reply_to_msg_id, Some(reply_to));
+        assert_eq!(decode_message_body(opened.payload).unwrap(), body);
+    }
+
     #[test]
     fn reply_extension_requires_one_msg_id() {
         let error =
@@ -2834,6 +2866,22 @@ mod tests {
         // a relay-change notice unhandled.
         assert_ne!(core_own_capabilities() & CAP_RELAY_UPDATE, 0);
         assert_ne!(CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE);
+        // WPT: CAP_MULTI_DEVICE is reserved but not advertised. A peer that
+        // sets it (or any other unknown high bit) must still parse.
+        assert_eq!(core_own_capabilities() & CAP_MULTI_DEVICE, 0);
+        let user_id = vec![7_u8; 16];
+        let future_caps = core_own_capabilities() | CAP_MULTI_DEVICE | (1 << 31);
+        let frame = encode_hello2(user_id.clone(), future_caps).unwrap();
+        match parse_frame(frame).unwrap() {
+            Frame::Hello2 {
+                user_id: parsed,
+                capabilities,
+            } => {
+                assert_eq!(parsed, user_id);
+                assert_eq!(capabilities, future_caps);
+            }
+            other => panic!("HELLO2 with unknown cap bits parsed as {other:?}"),
+        }
     }
 
     #[test]

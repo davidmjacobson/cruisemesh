@@ -72,6 +72,7 @@ fun ContactDetailsSheet(
      * false so previews and existing call sites are unaffected.
      */
     relayCardIsStale: Boolean = false,
+    identityCloneWarning: Boolean = false,
     /**
      * Whether this contact may be handed on as a shared card, decided from
      * their advertised discovery policy (specs/share-contact.md decision 4).
@@ -98,6 +99,7 @@ fun ContactDetailsSheet(
             onBlockedChange = onBlockedChange,
             onReport = onReport,
             relayCardIsStale = relayCardIsStale,
+            identityCloneWarning = identityCloneWarning,
             shareAvailability = shareAvailability,
             onShareContact = onShareContact,
             modifier = Modifier.padding(bottom = 24.dp),
@@ -124,6 +126,7 @@ fun ContactDetailsSheetContent(
      * false so previews and existing call sites are unaffected.
      */
     relayCardIsStale: Boolean = false,
+    identityCloneWarning: Boolean = false,
     shareAvailability: ShareContactAvailability = ShareContactAvailability.HIDDEN,
     onShareContact: () -> Unit = {},
 ) {
@@ -241,6 +244,21 @@ fun ContactDetailsSheetContent(
                     // actually rejected us we KNOW the card is stale, and the
                     // whole failure mode is that nobody finds out. The generic
                     // hint stays where it is for the case we only suspect it.
+                    if (identityCloneWarning) {
+                        Text(
+                            text = stringResource(R.string.ui_two_copies_of_this_contact),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        Text(
+                            text = stringResource(R.string.ui_two_copies_of_this_contact_detail),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 4.dp),
+                        )
+                    }
                     if (relayCardIsStale) {
                         Text(
                             text = stringResource(R.string.ui_delivery_card_out_of_date),

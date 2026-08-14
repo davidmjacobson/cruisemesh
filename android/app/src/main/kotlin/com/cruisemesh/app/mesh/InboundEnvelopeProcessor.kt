@@ -1106,6 +1106,7 @@ internal class InboundEnvelopeProcessor(
                 "Quarantined message stream conflict kind=$kind from $address " +
                     "sender=${UserIdHex.encode(senderUserId)} lamport=$lamport; retained visible branch",
             )
+            ChatEvents.notifyChatChanged(senderUserId)
             false
         }
     }

@@ -391,7 +391,7 @@ fun ScanScreen(
                                         }
                                     }
                                 } catch (e: Exception) {
-                                    status = "Not a CruiseMesh friend card"
+                                    status = ctx.getString(friendImportFailureResId(e, decoded))
                                 }
                             },
                         )

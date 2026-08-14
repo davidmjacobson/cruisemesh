@@ -79,6 +79,8 @@ class LanTransportTest {
             trustedLanPeerUserId(listOf(alice, bob), bob.agreePk),
         )
         assertNull(trustedLanPeerUserId(listOf(alice, bob), ByteArray(32) { 9 }))
+        assertTrue(ownLanStaticKeyMatches(alice.agreePk, alice.agreePk.copyOf()))
+        assertTrue(!ownLanStaticKeyMatches(alice.agreePk, bob.agreePk))
     }
 
     @Test

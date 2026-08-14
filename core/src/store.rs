@@ -1640,6 +1640,41 @@ impl MessageStore {
         Ok(out)
     }
 
+    /// Record a durable clone warning for `user_id`. Callers must have
+    /// authenticated proof (a Noise static key equal to this identity's
+    /// agreement key). Do not persist this from an unauthenticated HELLO —
+    /// that frame is spoofable — and do not persist it from a stream
+    /// conflict: a replacement phone that reused lamports after a restore
+    /// is not two live copies.
+    pub fn record_identity_clone_warning(
+        &self,
+        user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        if user_id.is_empty() {
+            return Err(CoreError::Malformed(
+                "identity clone warning needs a user id".into(),
+            ));
+        }
+        let conn = lock_conn(&self.conn);
+        upsert_identity_clone_warning(&conn, &user_id, now_ms)
+    }
+
+    /// Whether this identity has been seen live on a second device.
+    /// Only an authenticated sighting writes this table — a stream conflict
+    /// is not enough (a replacement phone that reused lamports after a
+    /// restore is not two live copies).
+    pub fn has_identity_clone_warning(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM identity_clone_warnings WHERE user_id = ?1)",
+            params![user_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .map_err(store_err)
+    }
+
     /// Whether the bounded conflict quarantine contains any rows. This is the
     /// cheap predicate used by diagnostics screens; unlike CSV export it does
     /// not materialise the retained summaries or touch the filesystem.
@@ -1662,6 +1697,8 @@ impl MessageStore {
     pub fn clear_message_conflicts(&self) -> Result<(), CoreError> {
         let conn = lock_conn(&self.conn);
         conn.execute("DELETE FROM message_conflicts", [])
+            .map_err(store_err)?;
+        conn.execute("DELETE FROM identity_clone_warnings", [])
             .map_err(store_err)?;
         Ok(())
     }
@@ -1937,6 +1974,22 @@ fn message_conflict_fingerprint(
         .finalize_variable(&mut digest)
         .expect("digest output has configured length");
     digest
+}
+
+fn upsert_identity_clone_warning(
+    conn: &Connection,
+    user_id: &[u8],
+    now_ms: i64,
+) -> Result<(), CoreError> {
+    conn.execute(
+        "INSERT INTO identity_clone_warnings (user_id, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?2)
+         ON CONFLICT(user_id) DO UPDATE SET
+             last_seen_at = MAX(identity_clone_warnings.last_seen_at, excluded.last_seen_at)",
+        params![user_id, now_ms],
+    )
+    .map_err(store_err)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5229,6 +5282,11 @@ impl MessageStore {
         .map_err(store_err)?;
         tx.execute(
             "DELETE FROM friend_directory_state WHERE introducer_user_id = ?1",
+            params![user_id],
+        )
+        .map_err(store_err)?;
+        tx.execute(
+            "DELETE FROM identity_clone_warnings WHERE user_id = ?1",
             params![user_id],
         )
         .map_err(store_err)?;
@@ -8525,6 +8583,16 @@ CREATE TABLE IF NOT EXISTS message_conflicts (
 CREATE INDEX IF NOT EXISTS idx_message_conflicts_recent
     ON message_conflicts(last_seen_at DESC, id DESC);
 
+-- WPT clone guard (`specs/multi-device-v1.md` §13): a second live device
+-- presenting this identity, proven by an authenticated Noise static key,
+-- is stored here so the shells can surface a safety warning. Stream
+-- conflicts are diagnostic only and do not write this table.
+CREATE TABLE IF NOT EXISTS identity_clone_warnings (
+    user_id       BLOB PRIMARY KEY,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at  INTEGER NOT NULL
+);
+
 -- The highest lamport this device has ever authored into a chat, kept
 -- separately from `messages` so it SURVIVES delete_contact. Deleting a
 -- contact clears our copy of a chat, but the peer keeps theirs; if our
@@ -10542,6 +10610,9 @@ mod tests {
         assert!(!csv.contains("current-visible"));
         assert!(!csv.contains("stale-restored"));
         assert!(store.has_message_conflicts().unwrap());
+        // A stream conflict is not a clone: a replacement phone that reused
+        // lamports after a restore produces the same quarantine.
+        assert!(!store.has_identity_clone_warning(b"david".to_vec()).unwrap());
         store.clear_message_conflicts().unwrap();
         assert!(!store.has_message_conflicts().unwrap());
         assert_eq!(
@@ -10556,6 +10627,67 @@ mod tests {
             store.messages_for_chat(b"katie".to_vec()).unwrap()[0].payload,
             b"current-visible",
             "clearing diagnostics must not touch the accepted visible branch"
+        );
+    }
+
+    /// Two live devices restored from the same `.cmbak` author colliding
+    /// lamports (`specs/multi-device-v1.md` §1 / WPT). The visible branch is
+    /// kept and the other is quarantined; that is not by itself a clone
+    /// warning (a replacement phone does the same thing).
+    #[test]
+    fn two_live_clones_keep_the_visible_branch_instead_of_silent_delete() {
+        let bob = MessageStore::open(":memory:".to_string()).unwrap();
+        let alice = b"alice-clone";
+        let chat = alice; // 1:1 chat id is the sender's user id
+        assert!(bob
+            .insert_message(msg(chat, alice, 1, "from phone 1"))
+            .unwrap());
+        let from_phone_2 = msg(chat, alice, 1, "from phone 2");
+        assert_eq!(
+            bob.insert_incoming_message_classified(from_phone_2, vec![0x11; MESSAGE_ID_LEN], None,)
+                .unwrap(),
+            IncomingMessageInsertOutcome::QuarantinedConflict
+        );
+        assert!(!bob.has_identity_clone_warning(alice.to_vec()).unwrap());
+        assert_eq!(
+            bob.messages_for_chat(chat.to_vec()).unwrap()[0].payload,
+            b"from phone 1"
+        );
+
+        // Authenticated callers persist a warning without a conflict row.
+        // Unauthenticated HELLO must not.
+        let alice_phone = MessageStore::open(":memory:".to_string()).unwrap();
+        alice_phone
+            .record_identity_clone_warning(alice.to_vec(), 50_000)
+            .unwrap();
+        alice_phone
+            .record_identity_clone_warning(alice.to_vec(), 60_000)
+            .unwrap();
+        assert!(alice_phone
+            .has_identity_clone_warning(alice.to_vec())
+            .unwrap());
+        assert!(!alice_phone
+            .has_identity_clone_warning(b"bob".to_vec())
+            .unwrap());
+
+        alice_phone.upsert_contact(contact(alice, "Alice")).unwrap();
+        assert!(alice_phone.delete_contact(alice.to_vec()).unwrap());
+        assert!(
+            !alice_phone
+                .has_identity_clone_warning(alice.to_vec())
+                .unwrap(),
+            "deleting the contact must clear its clone warning"
+        );
+
+        alice_phone
+            .record_identity_clone_warning(alice.to_vec(), 70_000)
+            .unwrap();
+        alice_phone.clear_message_conflicts().unwrap();
+        assert!(
+            !alice_phone
+                .has_identity_clone_warning(alice.to_vec())
+                .unwrap(),
+            "delete-captured-diagnostics must clear clone warnings"
         );
     }
 
@@ -10578,6 +10710,12 @@ mod tests {
         assert_eq!(
             store.message_conflict_summaries(1_000).unwrap().len(),
             MESSAGE_CONFLICT_QUARANTINE_LIMIT as usize
+        );
+        assert!(
+            !store
+                .has_identity_clone_warning(b"sender".to_vec())
+                .unwrap(),
+            "a bounded conflict quarantine is not a clone warning"
         );
     }
 
