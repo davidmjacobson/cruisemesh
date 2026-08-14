@@ -1629,6 +1629,16 @@
         }
       }
     },
+    "Sender ID": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sender ID"
+          }
+        }
+      }
+    },
     "Seen %@": {
       "localizations": {
         "en": {
@@ -1907,6 +1917,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Thin pen"
+          }
+        }
+      }
+    },
+    "Unknown member": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Unknown member"
           }
         }
       }

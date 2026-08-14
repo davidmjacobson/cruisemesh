@@ -276,14 +276,18 @@ final class CruiseMeshUITests: XCTestCase {
         )
 
         revealSwipeAction(inRowLabeled: "Dad", named: "Mark as read").tap()
+        // Wait for the first swipe chrome to dismiss. CI has hung here
+        // treating the envelope button as an interrupting element.
+        XCTAssertTrue(app.buttons["Mark as read"].waitForNonExistence(timeout: Self.uiTimeout))
 
-        // Marking read removes that action, so the second swipe should offer
-        // Delete alone.
         let delete = revealSwipeAction(inRowLabeled: "Dad", named: "Delete")
         XCTAssertFalse(app.buttons["Mark as read"].exists)
         delete.tap()
-        XCTAssertTrue(app.alerts["Delete Dad?"].waitForExistence(timeout: Self.uiTimeout))
-        app.alerts["Delete Dad?"].buttons["Cancel"].tap()
+        let alert = app.alerts["Delete Dad?"]
+        XCTAssertTrue(alert.waitForExistence(timeout: Self.uiTimeout))
+        let cancel = alert.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: Self.uiTimeout))
+        cancel.tap()
         XCTAssertTrue(dad.exists)
         attachScreenshot(named: "Chat-list-actions-nickname-mark-read-delete-cancel")
     }
@@ -375,10 +379,14 @@ final class CruiseMeshUITests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) -> XCUIElement {
-        for _ in 0..<attempts {
+        for attempt in 0..<attempts {
+            if element("screen.chat").exists, !element("screen.chat-list").exists {
+                app.navigationBars.buttons.firstMatch.tap()
+                _ = element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout)
+            }
             let row = app.cells.containing(.staticText, identifier: label).firstMatch
             guard row.waitForExistence(timeout: Self.uiTimeout) else { continue }
-            row.swipeLeft()
+            row.swipeLeft(velocity: attempt == 0 ? .slow : XCUIGestureVelocity(250))
             let button = app.buttons[action]
             if button.waitForExistence(timeout: Self.uiTimeout), button.isHittable {
                 return button

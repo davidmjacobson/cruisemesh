@@ -23,6 +23,18 @@ final class MessageInfoRowTests: XCTestCase {
         )
     }
 
+    func testIncomingGroupMessageCanExposeFullSenderId() {
+        let senderId = "CM-2QTG-3FYD-DSQS-SR2D-M25I-PGCZ-AI"
+        let rows = messageInfoRows(
+            message: message(timestampMs: 1_700_000_000_000),
+            isOwn: false,
+            tick: nil,
+            senderDisplayId: senderId
+        )
+
+        XCTAssertTrue(rows.contains(.labeled(label: "Sender ID", value: senderId)))
+    }
+
     /// The bug's exact reproduction: a received message's arrival line
     /// contains a "h:mm a" time, which always contains a colon. The old
     /// text-splitting renderer would mis-split this into a bogus

@@ -29,6 +29,20 @@ class MessageInfoTextTest {
         rows.filterIsInstance<MessageInfoRow.LabelValue>().firstOrNull { it.label == label }
 
     @Test
+    fun incomingGroupMessageCanExposeFullSenderId() {
+        val senderId = "CM-2QTG-3FYD-DSQS-SR2D-M25I-PGCZ-AI"
+        val rows = messageInfoRows(
+            message(),
+            isOwn = false,
+            tick = null,
+            senderDisplayId = senderId,
+            senderIdLabel = "Sender ID",
+        )
+
+        assertEquals(senderId, labelValue(rows, "Sender ID")?.value)
+    }
+
+    @Test
     fun messageInfoDoesNotExposeLamportClock() {
         val rows = messageInfoRows(message(lamport = 42uL), isOwn = true, tick = TickStatus.READ)
 

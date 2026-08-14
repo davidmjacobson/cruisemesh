@@ -222,7 +222,10 @@ fun GroupChatScreen(
         if (userId.contentEquals(ownUserId)) return context.getString(R.string.ui_you)
         val contact = contactsByUserId[UserIdHex.encode(userId)]
         return contact?.let(::coreContactDisplayName)?.takeIf { it.isNotBlank() }
-            ?: formatUserId(userId)
+            ?: ChatListLogic.unknownGroupMemberLabel(
+                formatUserId(userId),
+                context.getString(R.string.ui_unknown_group_member),
+            )
     }
 
     LaunchedEffect(group.id) {
@@ -476,10 +479,17 @@ fun GroupChatScreen(
                     }
                     for (memberId in currentGroup.memberUserIds) {
                         val memberKey = UserIdHex.encode(memberId)
+                        val memberContactName = contactsByUserId[memberKey]
+                            ?.let(::coreContactDisplayName)
+                            ?.takeIf { it.isNotBlank() }
+                        val isUnknownMember = !memberId.contentEquals(ownUserId) && memberContactName == null
                         val memberName = if (memberId.contentEquals(ownUserId)) {
                             "You"
                         } else {
-                            senderName(memberId)
+                            memberContactName ?: ChatListLogic.unknownGroupMemberLabel(
+                                formatUserId(memberId),
+                                context.getString(R.string.ui_unknown_group_member),
+                            )
                         }
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
@@ -487,7 +497,7 @@ fun GroupChatScreen(
                         ) {
                             AvatarBadge(
                                 userId = memberId,
-                                name = memberName,
+                                name = if (isUnknownMember) "" else memberName,
                                 displayId = memberKey,
                                 size = 36.dp,
                                 reachability = if (memberId.contentEquals(ownUserId)) {
@@ -497,7 +507,16 @@ fun GroupChatScreen(
                                 },
                             )
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text(memberName, style = MaterialTheme.typography.bodyMedium)
+                            Column {
+                                Text(memberName, style = MaterialTheme.typography.bodyMedium)
+                                if (isUnknownMember) {
+                                    Text(
+                                        formatUserId(memberId),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -770,6 +789,8 @@ fun GroupChatScreen(
                 } else {
                     null
                 },
+                senderDisplayId = if (infoIsOwn) null else formatUserId(currentInfoMessage.senderUserId),
+                senderIdLabel = if (infoIsOwn) null else context.getString(R.string.ui_sender_id),
                 nowMs = System.currentTimeMillis(),
             ),
         )
