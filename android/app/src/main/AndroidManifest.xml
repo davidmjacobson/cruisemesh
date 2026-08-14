@@ -47,12 +47,23 @@
 
         <!-- singleTop: a message-notification tap while the app is already
              open must land in the running activity's onNewIntent (warm-start
-             deep link into that chat) instead of relaunching it. -->
+             deep link into that chat) instead of relaunching it.
+
+             adjustResize rather than the platform default: with the mode left
+             unspecified the system is free to pan the whole window up when the
+             keyboard opens, which carries the conversation's top bar (the
+             contact's name and photo) off the top of the screen, so people
+             type without seeing who they are writing to. The chat layout is
+             written for a resized viewport throughout: ConversationScaffold
+             measures the usable bottom edge and OverlayKeyboardFreeze pins it
+             through the IME animation. This declaration is what that code
+             already assumes it has. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:theme="@style/Theme.CruiseMesh">
+            android:theme="@style/Theme.CruiseMesh"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
