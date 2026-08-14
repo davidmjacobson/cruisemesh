@@ -303,10 +303,13 @@ private fun ConversationScaffoldContent(
             topBar = topBar,
             snackbarHost = { SnackbarHost(snackbarHostState) },
         ) { innerPadding ->
-            // This device uses adjustResize, so the viewport already excludes the
-            // IME. Track its usable bottom edge rather than adding IME padding a
-            // second time; OverlayKeyboardFreeze pins that edge while the keyboard
-            // animates away and back.
+            // MainActivity declares adjustResize (see AndroidManifest.xml), so the
+            // viewport already excludes the IME. Track its usable bottom edge
+            // rather than adding IME padding a second time; OverlayKeyboardFreeze
+            // pins that edge while the keyboard animates away and back. This read
+            // as a claim about the device until that declaration existed: with the
+            // mode unspecified the window panned instead, and the top bar left
+            // with it.
             val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
             val contentBottomPx = viewportHeightPx - bottomInsetPx
             val imeVisible = WindowInsets.ime.getBottom(density) > 0
