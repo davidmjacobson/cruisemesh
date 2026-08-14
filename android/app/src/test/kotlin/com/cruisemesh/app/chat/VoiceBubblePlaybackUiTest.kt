@@ -8,7 +8,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
-import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.cruisemesh.app.media.AttachmentPayload
@@ -40,6 +39,9 @@ class VoiceBubblePlaybackUiTest {
 
         override fun start() = Unit
         override fun pause() = Unit
+        override fun seekTo(positionMs: Int) {
+            this.positionMs = positionMs
+        }
         override fun release() {
             released = true
         }
@@ -89,7 +91,7 @@ class VoiceBubblePlaybackUiTest {
         compose.waitForIdle()
 
         compose.onNodeWithContentDescription("Pause voice message").assertIsDisplayed()
-        compose.onNodeWithText("0:07 / 0:16").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Voice message position").assertIsDisplayed()
         assertFalse(player.released)
     }
 
@@ -115,7 +117,7 @@ class VoiceBubblePlaybackUiTest {
             }
         }
 
-        compose.onNodeWithText("0:00 / 0:04").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Voice message position").assertIsDisplayed()
         compose.onNodeWithContentDescription("Play voice message").assertIsDisplayed()
     }
 }

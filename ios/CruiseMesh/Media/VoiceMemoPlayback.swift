@@ -111,6 +111,20 @@ final class VoiceMemoPlaybackController: ObservableObject {
         self.deactivateAudioSession = deactivateAudioSession
     }
 
+    /// Jump to `fraction` of the decoder's duration. A no-op until the
+    /// decoder has reported a length. Playing stays playing; paused stays paused.
+    func seek(fraction: Double) {
+        guard let player else { return }
+        let decoderMs = Int((total * 1000).rounded(.down))
+        guard let targetMs = VoicePlaybackDisplay.seekTargetMs(
+            decoderDurationMs: decoderMs,
+            fraction: fraction
+        ) else { return }
+        let target = TimeInterval(targetMs) / 1_000
+        player.currentTime = target
+        elapsed = target
+    }
+
     /// Play, or pause a message that is already playing. A paused message
     /// resumes where it stopped rather than starting over.
     func toggle(blob: Data) {

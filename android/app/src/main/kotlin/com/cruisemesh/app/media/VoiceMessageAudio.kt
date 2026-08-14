@@ -131,6 +131,10 @@ private class MediaPlayerVoiceMessageAudioPlayer(
         if (!released) runCatching { player.pause() }
     }
 
+    override fun seekTo(positionMs: Int) {
+        if (!released) runCatching { player.seekTo(positionMs) }
+    }
+
     override fun release() {
         if (released) return
         released = true

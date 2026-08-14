@@ -165,6 +165,58 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertTrue(second.isPlaying)
     }
 
+    func testSeekBeforeTheDecoderReportsADurationIsANoOp() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 0
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(blob: Data([1]))
+        playback.seek(fraction: 0.5)
+
+        XCTAssertEqual(fake.currentTime, 0)
+        XCTAssertEqual(playback.elapsed, 0)
+    }
+
+    func testSeekWhilePausedJumpsAndStaysPaused() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 16
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(blob: Data([1]))
+        playback.toggle(blob: Data([1]))
+        playback.seek(fraction: 0.25)
+
+        XCTAssertFalse(playback.isPlaying)
+        XCTAssertEqual(fake.currentTime, 4, accuracy: 0.001)
+        XCTAssertEqual(playback.elapsed, 4, accuracy: 0.001)
+        XCTAssertTrue(fake.paused)
+    }
+
+    func testSeekWhilePlayingJumpsAndStaysPlaying() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 16
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(blob: Data([1]))
+        playback.seek(fraction: 0.5)
+
+        XCTAssertTrue(playback.isPlaying)
+        XCTAssertEqual(fake.currentTime, 8, accuracy: 0.001)
+        XCTAssertEqual(playback.elapsed, 8, accuracy: 0.001)
+    }
+
     func testStoppingClearsProgress() {
         let fake = FakeVoiceMemoAudioPlayer()
         fake.duration = 8

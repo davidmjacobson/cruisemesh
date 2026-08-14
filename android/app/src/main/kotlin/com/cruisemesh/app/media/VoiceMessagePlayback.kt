@@ -22,6 +22,9 @@ interface VoiceMessageAudioPlayer {
 
     fun pause()
 
+    /** Jump to [positionMs]. A no-op on a released player. */
+    fun seekTo(positionMs: Int)
+
     /** Releases the decoder and any temp file behind it. Idempotent. */
     fun release()
 
@@ -130,6 +133,19 @@ class VoiceMessagePlayback(
             key == loadingKey -> Unit
             else -> start(key, blob, manifestDurationMs)
         }
+    }
+
+    /**
+     * Jump [key] to [fraction] of the decoder's duration. A no-op until the
+     * decoder has reported a length, and a no-op for any other message.
+     * Playing stays playing; paused stays paused.
+     */
+    fun seek(key: String, fraction: Float) {
+        val current = player ?: return
+        if (key != activeKey) return
+        val target = activeDisplay.seekTargetMs(fraction) ?: return
+        current.seekTo(target)
+        positionMs = target
     }
 
     private fun start(key: String, blob: ByteArray, manifestDurationMs: Int) {
