@@ -4256,10 +4256,10 @@ public protocol MessageStoreProtocol : AnyObject {
     func hasDeliveryMetrics() throws  -> Bool
     
     /**
-     * Whether this identity has been seen authoring from two live devices:
-     * a recorded HELLO clone, or a quarantined stream conflict from that
-     * sender. The shells use this to surface a safety warning instead of
-     * leaving the quarantine silent.
+     * Whether this identity has been seen live on a second device.
+     * Only an authenticated sighting writes this table — a stream conflict
+     * is not enough (a replacement phone that reused lamports after a
+     * restore is not two live copies).
      */
     func hasIdentityCloneWarning(userId: Data) throws  -> Bool
     
@@ -5082,10 +5082,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Data, receiptType: UInt8, throughLamport: UInt64, viaTransport: UInt8?) throws 
     
     /**
-     * Record that another live device presented `user_id` (the `.cmbak`-clone
-     * failure mode in `specs/multi-device-v1.md` §1 / WPT). Shells call this
-     * when a HELLO arrives with our own UserID. Stream-conflict quarantine
-     * is the other detection path and does not need a separate write.
+     * Record a durable clone warning for `user_id`. Callers must have
+     * authenticated proof (a Noise static key equal to this identity's
+     * agreement key). Do not persist this from an unauthenticated HELLO —
+     * that frame is spoofable — and do not persist it from a stream
+     * conflict: a replacement phone that reused lamports after a restore
+     * is not two live copies.
      */
     func recordIdentityCloneWarning(userId: Data, nowMs: Int64) throws 
     
@@ -6963,10 +6965,10 @@ open func hasDeliveryMetrics()throws  -> Bool {
 }
     
     /**
-     * Whether this identity has been seen authoring from two live devices:
-     * a recorded HELLO clone, or a quarantined stream conflict from that
-     * sender. The shells use this to surface a safety warning instead of
-     * leaving the quarantine silent.
+     * Whether this identity has been seen live on a second device.
+     * Only an authenticated sighting writes this table — a stream conflict
+     * is not enough (a replacement phone that reused lamports after a
+     * restore is not two live copies).
      */
 open func hasIdentityCloneWarning(userId: Data)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8225,10 +8227,12 @@ open func recordGroupReceipt(groupId: Data, authorUserId: Data, memberUserId: Da
 }
     
     /**
-     * Record that another live device presented `user_id` (the `.cmbak`-clone
-     * failure mode in `specs/multi-device-v1.md` §1 / WPT). Shells call this
-     * when a HELLO arrives with our own UserID. Stream-conflict quarantine
-     * is the other detection path and does not need a separate write.
+     * Record a durable clone warning for `user_id`. Callers must have
+     * authenticated proof (a Noise static key equal to this identity's
+     * agreement key). Do not persist this from an unauthenticated HELLO —
+     * that frame is spoofable — and do not persist it from a stream
+     * conflict: a replacement phone that reused lamports after a restore
+     * is not two live copies.
      */
 open func recordIdentityCloneWarning(userId: Data, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_identity_clone_warning(self.uniffiClonePointer(),
@@ -37242,7 +37246,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_delivery_metrics() != 11580) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_identity_clone_warning() != 30610) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_has_identity_clone_warning() != 59026) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_message_conflicts() != 27119) {
@@ -37428,7 +37432,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_group_receipt() != 26756) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_identity_clone_warning() != 40132) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_identity_clone_warning() != 18260) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
