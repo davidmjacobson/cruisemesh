@@ -1041,6 +1041,7 @@ func messageInfoRows(
     arrival: MessageArrival? = nil,
     deliveredViaRoute: String? = nil,
     outboundExpiryMs: Int64? = nil,
+    senderDisplayId: String? = nil,
     nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
 ) -> [MessageInfoRow] {
     let f = DateFormatter()
@@ -1050,8 +1051,11 @@ func messageInfoRows(
 
     var rows: [MessageInfoRow] = [
         .sentence(isOwn ? "Sent by you" : "Received"),
-        .labeled(label: "Time", value: sentAt),
     ]
+    if let senderDisplayId {
+        rows.append(.labeled(label: String(localized: "Sender ID"), value: senderDisplayId))
+    }
+    rows.append(.labeled(label: "Time", value: sentAt))
 
     if isOwn, tick == .sent, let expiry = outboundExpiryMs, expiry <= nowMs {
         rows.append(.labeled(label: "Status", value: "Not delivered — expired"))
@@ -1084,6 +1088,7 @@ func groupMessageInfoRows(
     ownUserId: Data,
     senderName: (Data) -> String,
     outboundExpiryMs: Int64? = nil,
+    senderDisplayId: String? = nil,
     nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
 ) -> [MessageInfoRow] {
     var rows = messageInfoRows(
@@ -1092,6 +1097,7 @@ func groupMessageInfoRows(
         tick: tick,
         arrival: arrival,
         outboundExpiryMs: outboundExpiryMs,
+        senderDisplayId: senderDisplayId,
         nowMs: nowMs
     )
     guard isOwn else { return rows }

@@ -18,6 +18,18 @@ class ChatListLogicTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
 
     @Test
+    fun unknownGroupMemberUsesStableReadableIdSuffix() {
+        assertEquals(
+            "Unknown member · CZAI",
+            ChatListLogic.unknownGroupMemberLabel(
+                "CM-2QTG-3FYD-DSQS-SR2D-M25I-PGCZ-AI",
+                "Unknown member",
+            ),
+        )
+        assertEquals("Unknown member", ChatListLogic.unknownGroupMemberLabel("---", "Unknown member"))
+    }
+
+    @Test
     fun testInitials() {
         val (_, init1) = ChatListLogic.avatarHueAndInitials(byteArrayOf(), "Alice", "CM-ABCD")
         assertEquals("AL", init1)

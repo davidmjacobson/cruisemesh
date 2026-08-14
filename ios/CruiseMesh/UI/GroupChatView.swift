@@ -371,7 +371,7 @@ struct GroupChatView: View {
             let name = coreContactDisplayName(contact: contact)
             if !name.isEmpty { return name }
         }
-        return formatUserId(userId: userId)
+        return ChatListLogic.unknownGroupMemberLabel(displayId: formatUserId(userId: userId))
     }
 
     private func messageId(_ message: StoredMessage) -> String {
@@ -712,7 +712,8 @@ private struct GroupMessageRow: View {
                         }
                         return formatUserId(userId: userId)
                     },
-                    outboundExpiryMs: outboundExpiry
+                    outboundExpiryMs: outboundExpiry,
+                    senderDisplayId: isOwn ? nil : formatUserId(userId: message.senderUserId)
                 ))
             }
         }
@@ -771,16 +772,27 @@ private struct GroupDetailsSheet: View {
                 }
                 Section("Members") {
                     ForEach(group.memberUserIds, id: \.self) { memberId in
+                        let contactName = contacts.first(where: { $0.userId == memberId }).map {
+                            coreContactDisplayName(contact: $0)
+                        }.flatMap { $0.isEmpty ? nil : $0 }
+                        let isUnknownMember = memberId != identity.userId && contactName == nil
                         HStack(spacing: 12) {
                             AvatarView(
                                 userId: memberId,
-                                name: nameForMember(memberId),
+                                name: isUnknownMember ? "" : nameForMember(memberId),
                                 size: 36,
                                 reachability: memberId == identity.userId
                                     ? nil
                                     : connectivity.level(for: memberId, nowMs: nowMs)
                             )
-                            Text(memberId == identity.userId ? "You" : nameForMember(memberId))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(memberId == identity.userId ? "You" : nameForMember(memberId))
+                                if isUnknownMember {
+                                    Text(formatUserId(userId: memberId))
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
                 }

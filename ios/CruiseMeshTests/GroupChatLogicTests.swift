@@ -6,6 +6,16 @@ final class GroupChatLogicTests: XCTestCase {
         StoredMessage(chatId: chatId, senderUserId: sender, lamport: lamport, timestamp: timestamp, kind: kind, payload: payload)
     }
 
+    func testUnknownGroupMemberUsesStableReadableIdSuffix() {
+        XCTAssertEqual(
+            ChatListLogic.unknownGroupMemberLabel(
+                displayId: "CM-2QTG-3FYD-DSQS-SR2D-M25I-PGCZ-AI"
+            ),
+            "Unknown member · CZAI"
+        )
+        XCTAssertEqual(ChatListLogic.unknownGroupMemberLabel(displayId: "---"), "Unknown member")
+    }
+
     func testGroupInviteIsVisibleWithSystemPreview() {
         let groupId = Data(repeating: 0x11, count: 16)
         let msg = message(chatId: groupId, sender: Data([1]), lamport: 1, timestamp: 1000, kind: ProtocolKind.groupInvite)

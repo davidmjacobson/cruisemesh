@@ -1983,6 +1983,8 @@ fun messageInfoRows(
     arrival: MessageArrival? = null,
     deliveredViaRoute: String? = null,
     outboundExpiryMs: Long? = null,
+    senderDisplayId: String? = null,
+    senderIdLabel: String? = null,
     nowMs: Long = System.currentTimeMillis(),
 ): List<MessageInfoRow> {
     val sentAt = java.text.SimpleDateFormat(
@@ -2007,6 +2009,9 @@ fun messageInfoRows(
     }
     return listOfNotNull(
         MessageInfoRow.Sentence(if (isOwn) "Sent by you" else "Received"),
+        senderDisplayId?.let { displayId ->
+            senderIdLabel?.let { label -> MessageInfoRow.LabelValue(label, displayId) }
+        },
         MessageInfoRow.LabelValue("Time", sentAt),
         statusValue?.let { MessageInfoRow.LabelValue("Status", it) },
         arrivalRow,

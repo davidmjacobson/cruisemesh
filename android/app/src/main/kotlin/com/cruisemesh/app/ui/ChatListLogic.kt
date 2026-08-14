@@ -18,6 +18,16 @@ object ChatListLogic {
     fun displayNameOrId(name: String, displayId: String): String =
         if (name.isNotBlank() && name != "Unknown") name else displayId
 
+    /**
+     * A group member is not necessarily a saved contact. Keep the long,
+     * verification-oriented CruiseMesh id out of the conversation label while
+     * retaining a stable suffix that distinguishes multiple unknown members.
+     */
+    fun unknownGroupMemberLabel(displayId: String, unknownMemberLabel: String): String {
+        val suffix = displayId.filter(Char::isLetterOrDigit).takeLast(4)
+        return if (suffix.isEmpty()) unknownMemberLabel else "$unknownMemberLabel · $suffix"
+    }
+
     fun avatarHueAndInitials(userId: ByteArray, name: String, displayId: String): Pair<Color, String> {
         val hue = (userId.fold(0) { acc, byte -> acc + byte.toInt() } and 0xFF) / 255f
         val color = Color.hsv(hue * 360f, 0.5f, 0.7f)

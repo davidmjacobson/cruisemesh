@@ -20,6 +20,14 @@ enum ChatListLogic {
         return displayId
     }
 
+    /// Keeps a verification-oriented CruiseMesh id out of the conversation
+    /// label while retaining enough of it to distinguish unknown members.
+    static func unknownGroupMemberLabel(displayId: String) -> String {
+        let suffix = String(displayId.filter { $0.isLetter || $0.isNumber }.suffix(4))
+        let unknownMember = String(localized: "Unknown member")
+        return suffix.isEmpty ? unknownMember : "\(unknownMember) · \(suffix)"
+    }
+
     /// Avatar colour, plus the initials to draw inside it.
     ///
     /// The initials are empty whenever there is no usable name: `AvatarView`
