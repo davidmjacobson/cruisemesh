@@ -453,6 +453,12 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                         },
                         modifier = Modifier.fillMaxWidth(),
                     ) { Text(stringResource(R.string.ui_set_up_another_phone)) }
+                    Text(
+                        stringResource(R.string.ui_bring_in_the_phones_staying_home),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
                     OutlinedButton(
                         onClick = {
                             val current = configured ?: return@OutlinedButton
