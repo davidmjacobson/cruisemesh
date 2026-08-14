@@ -41,6 +41,7 @@ import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanNoiseSession
 import uniffi.cruisemesh_core.lanDefaultTcpPort
+import uniffi.cruisemesh_core.lanHostsAreSameAddress
 import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
 
@@ -525,10 +526,7 @@ internal class LanTransport(
             // authenticates, onLanPeerAuthenticated files the endpoint on the
             // stronger authority of having reached it.
             val localHost = endpointHint?.host
-            if (
-                localHost != null &&
-                lanHostsShareLocalNetwork(localHost = localHost, candidateHost = endpoint.host)
-            ) {
+            if (lanHintMayBeCached(localHost = localHost, candidateHost = endpoint.host)) {
                 onEndpointObserved(expectedUserId, endpoint, currentNetworkId)
             }
             if (!started) return@post
@@ -728,7 +726,12 @@ internal class LanTransport(
         endpoints: List<InetSocketAddress>,
         expectedUserId: ByteArray? = null,
     ) {
-        if (endpoints.isEmpty()) return
+        val remoteEndpoints = remoteLanEndpoints(endpointHint?.host, endpoints)
+        if (remoteEndpoints.isEmpty()) {
+            reconnectTargets.remove(key)
+            Log.i(TAG, "Ignoring LAN endpoint that resolves to this phone")
+            return
+        }
         // A hinted address is one the contact told us about, not one this
         // phone discovered for itself, so it gets a single attempt: no
         // reconnect target means every scheduleReconnect for the key finds
@@ -738,7 +741,7 @@ internal class LanTransport(
         // "claimed" to "proven": runConnection remembers it then, so a link
         // that really worked still comes back on the reconnect timer.
         if (!isSingleShotLanConnectKey(key)) {
-            rememberReconnectTarget(key, endpoints, expectedUserId)
+            rememberReconnectTarget(key, remoteEndpoints, expectedUserId)
         }
         if (
             expectedUserId != null &&
@@ -758,7 +761,7 @@ internal class LanTransport(
                 var socket: Socket? = null
                 var connectedEndpoint: InetSocketAddress? = null
                 var lastError: Exception? = null
-                for (endpoint in endpoints) {
+                for (endpoint in remoteEndpoints) {
                     LanTransportDiagnostics.connecting(endpointDisplay(endpoint))
                     try {
                         socket = network.socketFactory.createSocket().apply {
@@ -775,7 +778,7 @@ internal class LanTransport(
                     }
                 }
                 if (socket == null) {
-                    val endpoint = endpoints.firstOrNull()?.let(::endpointDisplay) ?: key
+                    val endpoint = remoteEndpoints.firstOrNull()?.let(::endpointDisplay) ?: key
                     Log.d(TAG, "LAN peer connection attempt failed", lastError)
                     LanTransportDiagnostics.connectionFailed(
                         endpoint,
@@ -1851,6 +1854,27 @@ internal fun lanHintConnectKey(remoteInstanceToken: String): String =
 
 internal fun lanCachedConnectKey(userIdHex: String, endpointDisplay: String): String =
     "$LAN_CACHED_KEY_PREFIX$userIdHex:$endpointDisplay"
+
+internal fun lanHintMayBeCached(localHost: String?, candidateHost: String): Boolean =
+    localHost != null &&
+        !lanHostsAreSameAddress(leftHost = localHost, rightHost = candidateHost) &&
+        lanHostsShareLocalNetwork(localHost = localHost, candidateHost = candidateHost)
+
+/**
+ * Removes only addresses that resolve to this phone's current listener host.
+ * A Bonjour result can contain several addresses; a stale self address must
+ * not suppress a different, usable address for the peer.
+ */
+internal fun remoteLanEndpoints(
+    localHost: String?,
+    endpoints: List<InetSocketAddress>,
+): List<InetSocketAddress> {
+    if (localHost == null) return endpoints
+    return endpoints.filterNot { endpoint ->
+        val candidateHost = endpoint.address?.hostAddress ?: endpoint.hostString
+        lanHostsAreSameAddress(leftHost = localHost, rightHost = candidateHost)
+    }
+}
 
 /**
  * Whether a connection key may only ever be attempted once per piece of

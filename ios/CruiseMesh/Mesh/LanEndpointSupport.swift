@@ -1,4 +1,5 @@
 import Darwin
+import Network
 
 struct LanManualEndpoint: Codable, Equatable {
     let host: String
@@ -77,7 +78,19 @@ func isSingleShotLanConnectKey(_ serviceKey: String) -> Bool {
 /// cross-subnet peer survive the eviction rule this gate feeds.
 func lanHintMayBeCached(localHost: String?, candidateHost: String) -> Bool {
     guard let localHost else { return false }
+    guard !lanHostsAreSameAddress(leftHost: localHost, rightHost: candidateHost) else { return false }
     return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)
+}
+
+/// Whether a concrete outbound endpoint resolves to this phone's announced
+/// listener address. Service endpoints cannot be judged until Network.framework
+/// resolves them; `LanConnection` repeats this check against its ready path.
+func lanEndpointIsSelf(localHost: String?, endpoint: NWEndpoint) -> Bool {
+    guard let localHost, case let .hostPort(host, _) = endpoint else { return false }
+    return lanHostsAreSameAddress(
+        leftHost: localHost,
+        rightHost: String(describing: host)
+    )
 }
 
 /// The active Wi-Fi IPv4 address and its advertised subnet prefix.
