@@ -59,6 +59,10 @@ final class LanTransport {
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
+
+    /// Cache for `ownHostAddresses()`.
+    private var cachedOwnHostAddresses: Set<String>?
+    private var cachedOwnHostAddressesAt: TimeInterval = 0
     private var runningScan: RunningScan?
     private var scanConnections: [UUID: NWConnection] = [:]
     private var automaticScanWorkItem: DispatchWorkItem?
@@ -432,6 +436,8 @@ final class LanTransport {
     }
 
     private func tearDownNetworkLinks() {
+        cachedOwnHostAddresses = nil
+        cachedOwnHostAddressesAt = 0
         discoveredEndpoints.removeAll()
         peerEvidenceSeenKeys.removeAll()
         electionFallbackKeys.removeAll()
@@ -572,7 +578,15 @@ final class LanTransport {
         advertised: LanManualEndpoint? = nil
     ) {
         guard started else { return }
-        guard !lanEndpointIsSelf(localHost: announcedEndpoint?.host, endpoint: endpoint) else {
+        // Re-checked on every dial, against every address this phone
+        // currently holds -- not once at discovery time against the single
+        // advertised address. A retry endpoint is replayed for as long as the
+        // phone stays on this network, so an address that was not
+        // recognisable as this phone's own when it was first seen (a restart
+        // racing a Wi-Fi join, a second interface, IPv6) has to be re-checked
+        // before every attempt. Retiring it here stops the retry timer
+        // instead of letting it loop forever.
+        guard !lanEndpointIsSelf(localHosts: ownHostAddresses(), endpoint: endpoint) else {
             discoveredEndpoints.removeValue(forKey: serviceKey)
             reconnectAttempts.removeValue(forKey: serviceKey)
             log.info("Ignoring LAN endpoint that resolves to this phone")
@@ -662,11 +676,38 @@ final class LanTransport {
         trustedPeerForStaticKey(remoteStaticKey)
     }
 
+    /// Last line of defence against dialing this phone's own listener. Every
+    /// earlier gate compares advertised addresses; this one asks the resolved
+    /// path where the connection actually landed, against every address this
+    /// device holds. Without it a self-dial completes Noise with this
+    /// identity's own key, which the identity-clone check can only read as a
+    /// stranger holding our key -- a durable warning the user dismisses and
+    /// immediately sees again on the next retry.
+    ///
+    /// Genuine clone detection is untouched: this only fires for a remote
+    /// address that is demonstrably one of ours.
     fileprivate func connectionResolvedToSelf(_ connection: NWConnection) -> Bool {
-        lanEndpointIsSelf(
-            localHost: announcedEndpoint?.host,
+        let isSelf = lanEndpointIsSelf(
+            localHosts: ownHostAddresses(),
             endpoint: connection.currentPath?.remoteEndpoint ?? connection.endpoint
         )
+        if isSelf { log.info("\(Self.selfConnectionLog, privacy: .public)") }
+        return isSelf
+    }
+
+    /// Every address this device answers on, cached briefly: the enumeration
+    /// costs a handful of syscalls and addresses do not change faster than
+    /// that. Reset with the rest of the per-network state.
+    private func ownHostAddresses() -> Set<String> {
+        let now = Date().timeIntervalSince1970
+        if let cached = cachedOwnHostAddresses,
+           now - cachedOwnHostAddressesAt < Self.ownAddressCacheSeconds {
+            return cached
+        }
+        let hosts = ownLanHostAddresses(announcedHost: announcedEndpoint?.host)
+        cachedOwnHostAddresses = hosts
+        cachedOwnHostAddressesAt = now
+        return hosts
     }
 
     fileprivate func connectionAuthenticated(_ link: LanConnection, userId: Data) {
@@ -1059,6 +1100,14 @@ final class LanTransport {
     private static let scanTimeout: DispatchTimeInterval = .milliseconds(350)
     private static let initialAutomaticScanDelay: DispatchTimeInterval = .seconds(5)
     private static let reconnectAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
+
+    /// The one distinct line a self-connect logs, so a future field log names
+    /// the condition instead of showing a clone warning and a retry loop with
+    /// no explanation between them. Matches Android's `SELF_CONNECTION_LOG`.
+    static let selfConnectionLog = "Closed a connection to this phone's own listener"
+
+    /// How long `ownHostAddresses()` reuses an interface enumeration.
+    private static let ownAddressCacheSeconds: TimeInterval = 5
     // A prompt recheck after a /24 sweep completes, not an escalation
     // trigger by itself: `LanScanPlanner` only arms the full-subnet tier on
     // an empty /24 sweep and holds it off for
@@ -1190,7 +1239,10 @@ private final class LanConnection {
             guard let self else { return }
             switch state {
             case .ready:
-                if initiator, owner?.connectionResolvedToSelf(connection) == true {
+                // Checked for inbound links too: this phone accepting its own
+                // dial is the same self-connection seen from the other side,
+                // and it must not reach the handshake either.
+                if owner?.connectionResolvedToSelf(connection) == true {
                     abortedSelfDial = true
                     close()
                     return

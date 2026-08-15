@@ -98,6 +98,61 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(lanEndpointIsSelf(localHost: "192.168.86.20", endpoint: unresolvedService))
     }
 
+    func testARememberedEndpointThatNowPointsAtThisPhoneIsRecognised() {
+        // The field failure: the phone restarts as it joins a Wi-Fi network,
+        // its own previous advertisement still carries the old instance token
+        // and so reads as a foreign peer, and the address is kept as a retry
+        // endpoint before this phone knows its own address. Every replay then
+        // handshakes with this identity's own key and records a durable
+        // identity-clone warning.
+        let remembered = NWEndpoint.hostPort(host: "192.168.86.20", port: 45_892)
+
+        // Nothing known about this phone's own addresses yet: the endpoint
+        // survives, which is how it got remembered in the first place.
+        XCTAssertFalse(lanEndpointIsSelf(localHosts: [], endpoint: remembered))
+
+        // Once the phone knows its addresses, the same endpoint is retired
+        // and the retry timer stops instead of dialing this phone forever.
+        XCTAssertTrue(
+            lanEndpointIsSelf(localHosts: ["192.168.86.20", "fe80::1"], endpoint: remembered)
+        )
+    }
+
+    func testSelfCheckCoversEveryLocalAddressAndNoRemoteOne() {
+        // Every address this device answers on counts, not just the one it
+        // advertises -- a second interface or an IPv6 address is just as much
+        // this phone, and connecting to it produces the same false clone
+        // warning.
+        let locals: Set<String> = ["192.168.86.20", "10.0.0.7", "2001:db8::1"]
+        XCTAssertTrue(lanHostIsOwnDevice(localHosts: locals, candidateHost: "192.168.86.20"))
+        XCTAssertTrue(lanHostIsOwnDevice(localHosts: locals, candidateHost: "10.0.0.7"))
+        XCTAssertTrue(
+            lanHostIsOwnDevice(localHosts: locals, candidateHost: "2001:db8:0:0:0:0:0:1")
+        )
+        // A scoped literal from Network.framework still matches.
+        XCTAssertTrue(
+            lanEndpointIsSelf(
+                localHosts: ["fe80::1"],
+                endpoint: NWEndpoint.hostPort(host: "fe80::1%en0", port: 45_892)
+            )
+        )
+
+        // A genuine remote peer is never mistaken for this phone, so real
+        // clone detection keeps its teeth.
+        XCTAssertFalse(lanHostIsOwnDevice(localHosts: locals, candidateHost: "192.168.86.23"))
+        XCTAssertFalse(lanHostIsOwnDevice(localHosts: locals, candidateHost: "2001:db8::2"))
+        XCTAssertFalse(lanHostIsOwnDevice(localHosts: [], candidateHost: "192.168.86.20"))
+    }
+
+    func testThisDevicesOwnAddressesAreEnumerated() {
+        // Loopback alone proves the enumeration reached the interface list;
+        // the announced address is always included even if the platform
+        // reports nothing.
+        let hosts = ownLanHostAddresses(announcedHost: "192.168.86.20")
+        XCTAssertTrue(hosts.contains("192.168.86.20"))
+        XCTAssertTrue(hosts.contains("127.0.0.1"))
+    }
+
     func testNoiseStaticKeyResolvesOnlyAcceptedContact() {
         let alice = contact(userByte: 1, agreeByte: 7)
         let bob = contact(userByte: 2, agreeByte: 8)

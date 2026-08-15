@@ -245,6 +245,55 @@ class LanTransportTest {
     }
 
     @Test
+    fun `a remembered target that now points at this phone is dropped, not dialed`() {
+        // The field failure: the phone restarts as it joins a Wi-Fi network,
+        // its own previous advertisement still carries the old instance token
+        // and so reads as a foreign peer, and the address is remembered as a
+        // reconnect target before this phone knows its own address. The
+        // remembered target is then replayed forever, and every replay
+        // handshakes with this identity's own key and records a durable
+        // identity-clone warning.
+        val remembered = listOf(InetSocketAddress("192.168.86.20", 45_892))
+
+        // Nothing known about this phone's own addresses yet: the endpoint
+        // survives, which is how it got remembered in the first place.
+        assertEquals(remembered, remoteLanEndpoints(emptySet<String>(), remembered))
+
+        // Once the phone knows its addresses, the same remembered target has
+        // nothing left to dial -- the caller retires it and stops
+        // rescheduling instead of retrying every backoff period.
+        assertTrue(
+            remoteLanEndpoints(setOf("192.168.86.20", "fe80::1"), remembered).isEmpty(),
+        )
+
+        // A target holding a real peer alongside a self address still dials
+        // the peer.
+        val peer = InetSocketAddress("192.168.86.23", 45_892)
+        assertEquals(
+            listOf(peer),
+            remoteLanEndpoints(setOf("192.168.86.20"), remembered + peer),
+        )
+    }
+
+    @Test
+    fun `the self check covers every local address and no remote one`() {
+        // Every address this device answers on counts, not just the one it
+        // advertises -- a second interface or an IPv6 address is just as much
+        // this phone, and connecting to it produces the same false clone
+        // warning.
+        val locals = setOf("192.168.86.20", "10.0.0.7", "2001:db8::1")
+        assertTrue(lanHostIsOwnDevice(locals, "192.168.86.20"))
+        assertTrue(lanHostIsOwnDevice(locals, "10.0.0.7"))
+        assertTrue(lanHostIsOwnDevice(locals, "2001:db8:0:0:0:0:0:1"))
+
+        // A genuine remote peer is never mistaken for this phone, so real
+        // clone detection keeps its teeth.
+        assertTrue(!lanHostIsOwnDevice(locals, "192.168.86.23"))
+        assertTrue(!lanHostIsOwnDevice(locals, "2001:db8::2"))
+        assertTrue(!lanHostIsOwnDevice(emptySet(), "192.168.86.20"))
+    }
+
+    @Test
     fun `a single-shot address keeps a reconnect target only while it stays proven`() {
         // The point of single-shot is to stop dialing an address nothing ever
         // answered on. An address that completed a Noise handshake is not

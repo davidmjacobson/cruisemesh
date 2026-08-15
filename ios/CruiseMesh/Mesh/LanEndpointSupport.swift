@@ -82,15 +82,69 @@ func lanHintMayBeCached(localHost: String?, candidateHost: String) -> Bool {
     return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)
 }
 
-/// Whether a concrete outbound endpoint resolves to this phone's announced
-/// listener address. Service endpoints cannot be judged until Network.framework
+/// Whether `candidateHost` is an address this device answers on.
+///
+/// `localHosts` is every address the phone currently holds, not just the one
+/// it advertises: a phone that restarted while joining a Wi-Fi network can
+/// find its own stale advertisement under a different address (or none tracked
+/// yet) and dial itself, which reads as a stranger holding this identity's
+/// key. Matches Android's `lanHostIsOwnDevice`.
+func lanHostIsOwnDevice(localHosts: Set<String>, candidateHost: String) -> Bool {
+    localHosts.contains { lanHostsAreSameAddress(leftHost: $0, rightHost: candidateHost) }
+}
+
+/// Whether a concrete outbound endpoint resolves to one of this phone's own
+/// addresses. Service endpoints cannot be judged until Network.framework
 /// resolves them; `LanConnection` repeats this check against its ready path.
-func lanEndpointIsSelf(localHost: String?, endpoint: NWEndpoint) -> Bool {
-    guard let localHost, case let .hostPort(host, _) = endpoint else { return false }
-    return lanHostsAreSameAddress(
-        leftHost: localHost,
-        rightHost: String(describing: host)
+func lanEndpointIsSelf(localHosts: Set<String>, endpoint: NWEndpoint) -> Bool {
+    guard case let .hostPort(host, _) = endpoint else { return false }
+    return lanHostIsOwnDevice(
+        localHosts: localHosts,
+        candidateHost: unscopedLanHost(String(describing: host))
     )
+}
+
+func lanEndpointIsSelf(localHost: String?, endpoint: NWEndpoint) -> Bool {
+    lanEndpointIsSelf(localHosts: Set([localHost].compactMap { $0 }), endpoint: endpoint)
+}
+
+/// Network.framework prints a scoped IPv6 literal as `fe80::1%en0`; the core
+/// comparison wants the address on its own.
+func unscopedLanHost(_ host: String) -> String {
+    guard let percent = host.firstIndex(of: "%") else { return host }
+    return String(host[host.startIndex..<percent])
+}
+
+/// Every host address this device currently answers on, across every
+/// interface, v4 and v6. See `lanHostIsOwnDevice` for why the advertised
+/// address alone is not enough.
+func ownLanHostAddresses(announcedHost: String? = nil) -> Set<String> {
+    var hosts = Set([announcedHost].compactMap { $0 })
+    var firstAddress: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&firstAddress) == 0, let firstAddress else { return hosts }
+    defer { freeifaddrs(firstAddress) }
+
+    var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+    while let current = cursor {
+        defer { cursor = current.pointee.ifa_next }
+        guard let address = current.pointee.ifa_addr else { continue }
+        let family = address.pointee.sa_family
+        guard family == UInt8(AF_INET) || family == UInt8(AF_INET6) else { continue }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let result = getnameinfo(
+            address,
+            socklen_t(address.pointee.sa_len),
+            &host,
+            socklen_t(host.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        guard result == 0 else { continue }
+        let text = unscopedLanHost(String(cString: host))
+        if !text.isEmpty { hosts.insert(text) }
+    }
+    return hosts
 }
 
 /// The active Wi-Fi IPv4 address and its advertised subnet prefix.
