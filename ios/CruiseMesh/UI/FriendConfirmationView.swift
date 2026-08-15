@@ -176,9 +176,7 @@ struct FriendConfirmationView: View {
                 && state.delivery.lamport == 0
                 && state.delivery.reachedDirectly
         )
-        let offerHint = AirplaneDemoHintStore.shouldShow()
-        if offerHint { AirplaneDemoHintStore.markShown() }
-        _showAirplaneHint = State(initialValue: offerHint)
+        _showAirplaneHint = State(initialValue: AirplaneDemoHintStore.shouldShow())
     }
 
     var body: some View {
@@ -194,6 +192,11 @@ struct FriendConfirmationView: View {
                 .foregroundStyle(connected ? Color.accentColor : .secondary)
             if showAirplaneHint {
                 AirplaneDemoHint { showAirplaneHint = false }
+                    // Marked only once the hint has actually been on screen:
+                    // SwiftUI builds view values eagerly, so doing this in
+                    // init would burn the one-time hint for sheets that are
+                    // never presented.
+                    .onAppear { AirplaneDemoHintStore.markShown() }
             }
             Button("Say hi", action: onSayHi).buttonStyle(.borderedProminent)
             if let onAddAnother { Button("Add another", action: onAddAnother) }
