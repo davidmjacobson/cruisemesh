@@ -70,6 +70,12 @@ of it: the gap is now countable.
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 | `DEDUP-01` | A relay mailbox is keyed on `(family_token, msg_id)` by content: it keeps the first stored ciphertext and never overwrites it, an identical re-post is an idempotent dedupe, and a same-id post carrying different immutable content is a distinct reported conflict — never a success that retires the sender's retry state. | core | server enforcement in `relayd/src/lib.rs` (`insert_envelope` and `insert_envelope_with_quota` resolve a same-id re-post by comparing sealed bytes; the differing-content case returns the additive 409 `msg_id_conflict` and leaves the stored row untouched) with `relayd/tests/e2e_mailbox.rs` conflict + dedupe e2e; sender classification in `core/src/relay_status.rs` (`relay_classify_http_error` → `CoreRelayFault::MsgIdConflict`) and `core/src/session/relay_pass.rs` (a conflict is per-envelope, never reaches `apply_success`, so the row stays queued); `core/tests/relay_pass_replay.rs` drives a real pass and proves the outbound row is not marked posted |
+| `BLOB-01` | Plane separation. Blob bytes never enter an envelope, a carry queue, a digest spray plan, or any BLE frame. Only manifests and thumbnails cross the message plane, and no third party ever stores, forwards, or serves another person's blob. | unimplemented | the media integration phase, which adds blob-flavoured adversarial cases to the existing spray and carry suites; today the rule holds only because `core/src/media/` is reachable from no dispatch, carry, or framing path |
+| `BLOB-02` | Ciphertext addressing. The wire and any store see encrypted bytes only; a blob id is the digest of the ciphertext; the blob key exists only inside sealed message content. | core | `core/src/media/blob.rs` encrypt-then-name, determinism and wrong-key tests; `core/src/media/manifest.rs` seals a manifest through `seal_message` unchanged; `core/src/media/store.rs` holds no column that could carry key material; index re-asserts that the id names ciphertext and not plaintext |
+| `BLOB-03` | Pull with consent. No blob transfer starts on an expensive or roaming path without an explicit user action, and no third party is ever asked to move blob bytes. | unimplemented | the media integration phase owns the path-cost verdict, composed with the existing roaming deferral rather than duplicated. The pull-only half — a device serves only what it holds, only on request, only to a proven manifest holder — is already pinned by `core/src/media/lan_pull.rs` |
+| `BLOB-04` | Bounded everywhere on the device. The partial-transfer byte budget, its eviction rule, and each pull session's request, chunk, byte and deadline budgets are enforced; a transfer terminates or defers inside declared budgets like every other pass, and a spent budget resumes from the bitmap rather than restarting. | core | `core/src/media/store.rs` budget and LRU eviction tests (including the rows eviction may never take) and `core/src/media/lan_pull.rs` budget/deadline tests on both roles; index re-asserts a requester and a responder each stopping inside their declared budgets |
+| `BLOB-05` | Verify before trust. No blob is decrypted, shown, or retained without matching its manifest digest, and no chunk becomes progress without authenticating first. | core | `core/src/media/blob.rs` digest and per-chunk authentication tests, `core/src/media/lan_pull.rs` corrupted-chunk recovery, `core/src/media/store.rs` re-marking a failed chunk missing; index re-asserts that a corrupted chunk is neither stored nor counted |
+| `BLOB-06` | Bounded at the relay. The relay blob store's per-family quota, its aggressive expiry, and its per-request range cap are enforced and tested, separately from the mailbox quota. | unimplemented | phase 2 of the media work (relayd blob endpoints). Nothing in this repository implements a relay blob store today, and phase 1 is LAN-only by design |
 
 ### 1.1 What each rule means, for someone reading it cold
 
@@ -626,6 +632,124 @@ the path that marks a row posted. The envelope stays queued, delivers by
 mesh/carry, and resurfaces on a later pass. Older clients that do not recognise
 the code still see a non-2xx and treat the post as not delivered, which is the
 safe degrade.
+
+#### `BLOB-01` — the two planes never mix
+
+CruiseMesh's message plane is universal, and that is exactly what makes it
+expensive per byte: everything in it is eligible to sit in another family
+member's carry queue, to be re-offered against per-encounter spray budgets, to
+occupy the family's shared relay mailbox, and to cross Bluetooth at
+single-digit KB/s. A 50 MB clip in that pipeline is over an hour of
+monopolized Bluetooth, a meaningful fraction of the family's relay storage,
+and a standing occupant of every courier's queue — the exact failure classes
+the mesh's budget work exists to prevent.
+
+The blob plane exists so that raising the attachment cap never has to be the
+answer. What crosses the message plane for a photo or a clip is a manifest and
+a thumbnail, bounded to fit today's attachment envelope. The bytes themselves
+ride bulk TCP only, are pulled by the recipient rather than pushed, and are
+never touched by a third party: a courier phone does not store, forward, or
+serve someone else's blob, in any mode, including "just this once".
+
+The rule is enforced structurally rather than by review. `core/src/media/` is
+declared but reachable from no dispatch, carry, spray, or framing path, and
+nothing in it is exported over UniFFI, so there is currently no code path by
+which a blob byte could reach an envelope. That is a strong property while the
+module is dark and a weak one afterwards, which is why the owner named above
+is the integration phase: the moment a driver moves blob bytes, the spray and
+carry suites need cases that send media continuously and assert zero blob
+bytes observable in any envelope, spray plan, carry queue, or BLE frame.
+
+#### `BLOB-02` — encrypted before it is named
+
+The sender encrypts a blob with a fresh per-blob key, and the digest of the
+*ciphertext* is the blob's permanent name. Nothing that stores or serves those
+bytes can read them — not a peer, not the relay in a later phase — which is
+the posture sealed envelopes already have, extended to bulk data.
+
+The key travels only inside the manifest, which is ordinary sealed message
+content: the same sign-then-seal construction, the same suites, one sealed
+copy per recipient. There is no media-specific key wrapping and no second
+envelope format. A group send seals the same blob key into each recipient's
+copy, so the ciphertext exists once and is fetched per recipient.
+
+Naming the ciphertext rather than the plaintext is what makes a transfer
+source-agnostic: any copy fetched from anywhere can be verified before it is
+shown or stored, and a transfer may begin against one source and finish
+against another.
+
+#### `BLOB-03` — nobody's battery, storage, or money is spent by surprise
+
+Two halves.
+
+*Pull, not push.* A recipient asks; a holder answers. A holder serves only
+blobs it holds, only on request, and only to a requester that proves it holds
+the blob's manifest. It never seeks a third party to move bytes for it and
+never accepts the job for someone else.
+
+*Consent on expensive paths.* A LAN transfer is free and local and may start
+automatically. A transfer over a metered, roaming, or otherwise expensive path
+never starts without an explicit, size-aware user action, composing with the
+roaming-deferral verdict the app already has rather than duplicating it.
+
+The second half has no owner in this repository yet: phase 1 is LAN-only, so
+there is no expensive path for a blob to take. It is registered now, and
+unimplemented, because the rule is the reason the plane is shaped this way and
+would be easy to lose between phases.
+
+#### `BLOB-04` — a transfer terminates or defers, and says which
+
+Every other pass in this system declares its budgets and reports the counts
+they bound, so a transcript rather than a reading of the loop shows whether it
+stayed inside them. Blob transfer is no different: a pull session declares
+request, chunk-window, byte and deadline budgets, and a serving session
+declares fetch, chunk and byte budgets of its own.
+
+The important part is what a spent budget *means*. It is not a failure and it
+does not restart anything: the chunk bitmap is persisted, so the next session
+asks for exactly what is still missing. That is what makes a 128 MB clip
+transferable inside sessions small enough to interleave with the mesh traffic
+sharing the same link.
+
+On the device, partially fetched chunk sets have a byte budget of their own
+and are evicted oldest-use-first when it is exceeded — with two rows eviction
+may never take: a blob whose transfer is active (the file being written to),
+and a blob whose manifest message the person has not read yet (the download
+they are about to look at). If protections alone exceed the budget, eviction
+misses the budget and reports the overshoot rather than breaking a rule to
+meet a number.
+
+#### `BLOB-05` — nothing is trusted before it verifies
+
+Two granularities, one rule.
+
+Per chunk: each chunk is an independent authenticated box, so a chunk that was
+corrupted, truncated, replayed at a different index, or fabricated fails to
+open the moment it arrives. It is counted as rejected and the bitmap is left
+alone, so the chunk stays missing and is requested again. A failed chunk never
+becomes progress and is never stored.
+
+Per blob: the assembled ciphertext is checked against the manifest digest
+before anything is decrypted, shown, or kept. A mismatch discards the blob and
+re-requests it — every chunk goes back to missing, because a whole-blob digest
+cannot say which chunk lied — and a mismatch served by an *authenticated*
+source is a contract violation worth an event record.
+
+The failure a person sees is a plain retryable error. What they must never see
+is a half-rendered or wrong image, which is what verifying before trusting
+buys.
+
+#### `BLOB-06` — the relay is a transfer window, not an album
+
+Reserved for phase 2, and deliberately registered before it is built. When
+relayd gains blob endpoints, they carry a per-family byte quota separate from
+the mailbox quota, an aggressive expiry measured in days rather than weeks,
+and a per-request range cap under the same family rate-limit discipline as the
+mailbox endpoints. Expiry of a relay copy never touches anyone's manifest or
+anyone's completed download.
+
+Nothing in this repository implements any of that today. Phase 1 is LAN-only
+and changes no relay code at all.
 
 ## 2. Frames, envelopes, kinds, and limits
 

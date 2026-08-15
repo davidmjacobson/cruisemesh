@@ -21,6 +21,11 @@ mod lan_util;
 mod late_arrival;
 mod limits;
 mod link_detect;
+// The blob plane (specs/media-two-plane.md). Deliberately dark: declared so it
+// compiles and is tested, exported over no binding, reachable from neither
+// shell. Nothing is re-exported at the crate root, which is what keeps the
+// plane separation structural rather than a rule someone has to remember.
+pub mod media;
 mod outbound_retirement;
 mod protocol;
 mod protocol_event;
