@@ -12,6 +12,12 @@ You can expect an acknowledgment within a week. This is a solo-maintained
 project, so please calibrate expectations accordingly — but security reports
 jump the queue.
 
+**This page is for security vulnerabilities only.** To report abusive
+behaviour, harassment, or objectionable content from someone using the app,
+email abuse@cruisemesh.app — [`docs/moderation.md`](docs/moderation.md)
+describes the reporting and blocking process and what happens after a report
+arrives.
+
 ## What counts
 
 Especially interesting:
