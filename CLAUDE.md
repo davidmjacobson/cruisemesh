@@ -10,10 +10,16 @@ Load-bearing session knowledge. Build/bindgen detail: `AGENTS.md`.
   bindgen recipe).
 - **Commit author email** must be
   `14227840+davidmjacobson@users.noreply.github.com` or the push is rejected.
-- **Tests**: core `cargo test -p cruisemesh-core`; workspace
-  `cargo test --workspace`; Android `cd android && ./gradlew
-  :app:testDebugUnitTest --rerun-tasks`; iOS builds/tests need a Mac (setup
-  notes live outside the repo — ask before starting iOS work).
+- **Tests**: Rust — default to a bare `cargo test` (or `cargo test
+  --workspace`) at the repo root: it builds `core`, `relayd` **and**
+  `desktop`. `cargo test -p cruisemesh-core` is the fast inner loop only; it
+  skips the desktop crate, so a core export change that breaks a desktop call
+  site stays invisible locally. CI's Linux job runs `cargo test --workspace
+  --exclude cruisemesh-node`, so desktop is covered there only by the separate
+  Windows job — run the whole workspace yourself before pushing a core surface
+  change. Android `cd android && ./gradlew :app:testDebugUnitTest
+  --rerun-tasks`; iOS builds/tests need a Mac (setup notes live outside the
+  repo — ask before starting iOS work).
 - **Core-first**: shared behavior lives in the Rust core (`core/src/`),
   exported via UniFFI; never fix it in one platform's shell. Pure
   schedule/policy logic = plain classes with no Android imports, unit-tested

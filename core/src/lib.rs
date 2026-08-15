@@ -213,7 +213,8 @@ pub use ship_wifi::{
 // can freeze a UniFFI surface once the planner is the only implementation.
 pub use session::mesh_meet::{CoreMeetOutcome, CoreMeetRequest, CoreMeetWork};
 pub use session::mesh_receive::{
-    CoreInboundCommit, CoreInboundOutcome, CoreInboundSource, CoreInboundWork,
+    CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundCommit, CoreInboundDelivery,
+    CoreInboundOutcome, CoreInboundSource, CoreInboundWork, CoreLanEndpointIntent,
 };
 pub use session::relay_pass::{
     core_relay_adapter_vectors, core_relay_pass_default_budgets, CoreRelayAction,
