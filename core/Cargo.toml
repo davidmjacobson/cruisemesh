@@ -23,7 +23,7 @@ name = "protocol-replay"
 path = "src/bin/protocol_replay.rs"
 
 [dependencies]
-uniffi = { version = "0.28" }
+uniffi = { version = "0.32" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -41,10 +41,10 @@ aes-gcm = "0.10"
 pbkdf2 = "0.12"
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
 
 [dev-dependencies]
-uniffi = { version = "0.28", features = ["bindgen-tests"] }
+uniffi = { version = "0.32", features = ["bindgen-tests"] }
 
 [features]
 cli = ["uniffi/cli"]
