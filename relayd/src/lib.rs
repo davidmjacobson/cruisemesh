@@ -178,6 +178,33 @@ const PUSH_REGISTRATION_RETENTION_MS: i64 = 45 * 24 * 60 * 60 * 1000;
 const MAX_PRESENCE_ANNOUNCE: usize = 4;
 const MAX_PRESENCE_QUERY: usize = 512;
 const PRESENCE_RETENTION_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// Cross-family presence: the most query hints one *deposit*-class call may
+/// carry.
+///
+/// A member token asks on behalf of a whole family and legitimately carries
+/// hundreds of hints ([`MAX_PRESENCE_QUERY`]). A deposit credential asks on
+/// behalf of the one contact whose friend card it came from, and a contact is
+/// four rotating hints (`core/src/recipient_hints.rs::recent_presence_hints_for`).
+/// Eight is that with room for a rotation boundary, and it is the cap that
+/// keeps this route from being a bulk oracle: a holder cannot sweep a
+/// dictionary of hints per request, only ask about the person whose card they
+/// already hold.
+pub const MAX_DEPOSIT_PRESENCE_QUERY: usize = 8;
+
+/// Cross-family presence recency buckets, in milliseconds of age. A
+/// deposit-class caller is told which of these a hint falls in, never when it
+/// was actually seen.
+///
+/// The edges are the windows the shells already draw their last-seen copy
+/// from, so a coarse answer lands in the same sentence a precise one would:
+/// `core/src/connection_health.rs::CONNECTION_PRESENCE_ONLINE_WINDOW_MS`
+/// (2.5 min, "seen online") and Android's `ContactReachability.RECENT_WINDOW_MS`
+/// (15 min, "seen recently"), then a day, then whatever is left of the 48-hour
+/// [`PRESENCE_RETENTION_MS`] window.
+const PRESENCE_BUCKET_ACTIVE_MS: i64 = 150_000;
+const PRESENCE_BUCKET_RECENT_MS: i64 = 15 * 60 * 1000;
+const PRESENCE_BUCKET_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 pub const WS_MAX_INBOUND_MESSAGE_BYTES: usize = 4 * 1024;
 
 /// Capacity of the global POST→WS broadcast. Lagging subscribers that fall
@@ -340,6 +367,26 @@ pub const DEFAULT_DEPOSIT_RATE_REQUESTS_PER_MIN: u32 = 60;
 /// friend sharing photos, useless for filling a 256 MiB quota quickly.
 pub const DEFAULT_DEPOSIT_RATE_BYTES_PER_MIN: u64 = 6 * 1024 * 1024;
 
+/// Cross-family presence: how many `/presence` queries one deposit
+/// credential may make per [`DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS`],
+/// configurable via `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES`.
+///
+/// Small burst, long window — the opposite shape to every other allowance
+/// here, and deliberately so. A presence answer is advisory; nothing breaks
+/// if one is refused, so this can be sized to what a client legitimately
+/// needs rather than to what a client might want. The client-side floor is
+/// one query per contact per fifteen minutes
+/// (`core/src/session/relay_pass.rs::RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS`),
+/// so four in a window is a device asking on schedule with three spare —
+/// enough to absorb a reinstall, a clock jump, or a second device in the
+/// household holding the same friend card, and far too few to sample anyone's
+/// activity.
+pub const DEFAULT_DEPOSIT_PRESENCE_QUERIES: u32 = 4;
+
+/// The window [`DEFAULT_DEPOSIT_PRESENCE_QUERIES`] is spread over, in
+/// seconds. Matches the client's own re-ask floor.
+pub const DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS: u64 = 900;
+
 /// CP4: class prefix that marks a deposit token. Mirrors
 /// `core/src/relay_wire.rs::RELAY_DEPOSIT_TOKEN_PREFIX` — golden vectors in
 /// both crates pin the two implementations together. Member tokens are
@@ -485,6 +532,13 @@ pub struct RateLimitConfig {
     pub deposit_requests_per_min: u32,
     pub deposit_bytes_per_min: u64,
     pub global_requests_per_min: u32,
+    /// Cross-family presence: queries allowed per deposit credential per
+    /// `deposit_presence_window_secs`. Its own dimension, charged by
+    /// `AppState::check_presence_rate_limit` and by nothing else, so a
+    /// presence flood cannot spend a single request or byte of the queried
+    /// family's allowance (`PRESENCE-01`).
+    pub deposit_presence_queries: u32,
+    pub deposit_presence_window_secs: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -495,6 +549,8 @@ impl Default for RateLimitConfig {
             deposit_requests_per_min: DEFAULT_DEPOSIT_RATE_REQUESTS_PER_MIN,
             deposit_bytes_per_min: DEFAULT_DEPOSIT_RATE_BYTES_PER_MIN,
             global_requests_per_min: DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN,
+            deposit_presence_queries: DEFAULT_DEPOSIT_PRESENCE_QUERIES,
+            deposit_presence_window_secs: DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS,
         }
     }
 }
@@ -531,11 +587,25 @@ impl TokenBucket {
     /// refills at `allowance / 60` per second. Starts full — a brand-new
     /// family is not penalized for being new.
     fn per_minute(per_min: f64, now: Instant) -> Self {
-        let capacity = per_min.max(0.0);
+        Self::per_window(per_min, 60.0, now)
+    }
+
+    /// The same bucket over an arbitrary window: capacity is the whole
+    /// window's allowance and it refills across the window.
+    ///
+    /// A long window is what makes a *tight* allowance usable. The presence
+    /// bucket wants "four, then roughly one every four minutes", which
+    /// `per_minute` cannot express — rounded down to a per-minute figure it
+    /// would either be zero (refusing everything) or one (letting a holder
+    /// ask sixty times an hour). The refill rate is the allowance, and the
+    /// capacity is only how much of it may arrive at once.
+    fn per_window(allowance: f64, window_secs: f64, now: Instant) -> Self {
+        let capacity = allowance.max(0.0);
+        let window = window_secs.max(1.0);
         Self {
             tokens: capacity,
             capacity,
-            refill_per_sec: capacity / 60.0,
+            refill_per_sec: capacity / window,
             last_refill: now,
         }
     }
@@ -590,20 +660,47 @@ impl TokenBucket {
     }
 }
 
-/// The pair of buckets a single family token is charged against.
+/// The buckets a single family token is charged against.
 struct FamilyBuckets {
     requests: TokenBucket,
     bytes: TokenBucket,
+    /// Cross-family presence queries. A third *dimension*, not a share of
+    /// the first: `try_take_presence` charges this and only this, so a
+    /// presence flood arriving on a friend-card credential cannot spend the
+    /// request or byte allowance the family's own traffic rides on
+    /// (`PRESENCE-01`). Member-class presence is an ordinary read and still
+    /// charges `requests`.
+    presence: TokenBucket,
 }
 
 impl FamilyBuckets {
     /// CP4: capacities are passed per credential class
     /// (`RateLimitConfig::allowances_for`) — one bucket map holds member and
     /// deposit entries side by side, keyed by the presented credential.
-    fn new(requests_per_min: u32, bytes_per_min: u64, now: Instant) -> Self {
+    fn new(requests_per_min: u32, bytes_per_min: u64, presence: (u32, u64), now: Instant) -> Self {
+        let (presence_queries, presence_window_secs) = presence;
         Self {
             requests: TokenBucket::per_minute(f64::from(requests_per_min), now),
             bytes: TokenBucket::per_minute(bytes_per_min as f64, now),
+            presence: TokenBucket::per_window(
+                f64::from(presence_queries),
+                presence_window_secs as f64,
+                now,
+            ),
+        }
+    }
+
+    /// Charge one cross-family presence query. Deliberately touches neither
+    /// `requests` nor `bytes`: the separation is the point, and it is what
+    /// the paired e2e assertion checks.
+    fn try_take_presence(&mut self, now: Instant) -> Result<(), (RateLimitScope, u64)> {
+        if self.presence.try_take(1.0, now) {
+            Ok(())
+        } else {
+            Err((
+                RateLimitScope::PresenceQueries,
+                self.presence.retry_after_secs(1.0),
+            ))
         }
     }
 
@@ -646,6 +743,7 @@ enum RateLimitScope {
     FamilyRequests,
     FamilyBytes,
     GlobalRequests,
+    PresenceQueries,
 }
 
 impl RateLimitScope {
@@ -655,6 +753,7 @@ impl RateLimitScope {
             Self::FamilyRequests => "family_requests",
             Self::FamilyBytes => "family_bytes",
             Self::GlobalRequests => "global_requests",
+            Self::PresenceQueries => "presence_queries",
         }
     }
 
@@ -665,6 +764,7 @@ impl RateLimitScope {
             Self::FamilyRequests => "family request rate limit",
             Self::FamilyBytes => "family upload byte rate limit",
             Self::GlobalRequests => "server-wide request rate limit",
+            Self::PresenceQueries => "cross-family presence query rate limit",
         }
     }
 }
@@ -930,17 +1030,9 @@ impl AppState {
         bytes: f64,
     ) -> Result<(), ApiError> {
         let now = Instant::now();
-        let (requests_per_min, bytes_per_min) = self.rate_limits.allowances_for(access.class);
-        let family = {
-            let mut buckets = self.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
-            if buckets.len() >= RATE_BUCKET_EVICT_THRESHOLD {
-                evict_idle_rate_buckets(&mut buckets, now);
-            }
-            buckets
-                .entry(access.rate_key.clone())
-                .or_insert_with(|| FamilyBuckets::new(requests_per_min, bytes_per_min, now))
-                .try_take(requests, bytes, now)
-        };
+        let family = self.charge_family_buckets(access, now, |buckets| {
+            buckets.try_take(requests, bytes, now)
+        });
         if let Err((scope, retry_after_secs)) = family {
             return Err(reject_rate_limited(
                 &access.rate_key,
@@ -958,6 +1050,78 @@ impl AppState {
                 None
             } else {
                 Some(global.retry_after_secs(requests))
+            }
+        };
+        if let Some(retry_after_secs) = global_retry_after {
+            return Err(reject_rate_limited(
+                &access.rate_key,
+                RateLimitScope::GlobalRequests,
+                retry_after_secs,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Look this credential's buckets up (creating them at its class's
+    /// capacities) and charge them with `charge`.
+    ///
+    /// Extracted so the presence dimension cannot accidentally be added to a
+    /// second bucket map, or keyed by anything but `access.rate_key` — the
+    /// presented credential, never the family it resolves to. Keying by the
+    /// family would put a friend-card holder's traffic and the family's own
+    /// traffic in one bucket, which is precisely the starvation this exists
+    /// to prevent.
+    fn charge_family_buckets<T>(
+        &self,
+        access: &FamilyAccess,
+        now: Instant,
+        charge: impl FnOnce(&mut FamilyBuckets) -> T,
+    ) -> T {
+        let (requests_per_min, bytes_per_min) = self.rate_limits.allowances_for(access.class);
+        let presence = (
+            self.rate_limits.deposit_presence_queries,
+            self.rate_limits.deposit_presence_window_secs,
+        );
+        let mut buckets = self.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if buckets.len() >= RATE_BUCKET_EVICT_THRESHOLD {
+            evict_idle_rate_buckets(&mut buckets, now);
+        }
+        charge(
+            buckets.entry(access.rate_key.clone()).or_insert_with(|| {
+                FamilyBuckets::new(requests_per_min, bytes_per_min, presence, now)
+            }),
+        )
+    }
+
+    /// Charge one *cross-family* presence query: the presence bucket, and
+    /// then the global backstop.
+    ///
+    /// The queried family's request and byte buckets are never touched
+    /// (`PRESENCE-01`). Only the server-wide backstop is charged beyond the
+    /// presence bucket, and it is charged for the server's sake rather than
+    /// the family's: at four queries per credential per fifteen minutes, a
+    /// caller would need thousands of distinct friend cards to make a dent in
+    /// it, and holding thousands of friend cards is a different problem.
+    ///
+    /// Only ever call this after the caller's token has authorized, for the
+    /// reason spelled out on `check_rate_limit`.
+    fn check_presence_rate_limit(&self, access: &FamilyAccess) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let charged =
+            self.charge_family_buckets(access, now, |buckets| buckets.try_take_presence(now));
+        if let Err((scope, retry_after_secs)) = charged {
+            return Err(reject_rate_limited(
+                &access.rate_key,
+                scope,
+                retry_after_secs,
+            ));
+        }
+        let global_retry_after = {
+            let mut global = self.rate_global.lock().unwrap_or_else(|e| e.into_inner());
+            if global.try_take(1.0, now) {
+                None
+            } else {
+                Some(global.retry_after_secs(1.0))
             }
         };
         if let Some(retry_after_secs) = global_retry_after {
@@ -2343,6 +2507,20 @@ pub fn parse_rate_requests_per_min(raw: &str) -> Result<u32, String> {
     Ok(value)
 }
 
+/// Parse `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS` (see `DEPLOY.md`
+/// §10). `0` is rejected: a zero-length window is a division the bucket
+/// cannot make, and an operator who wants presence off should set the query
+/// allowance, not the window.
+pub fn parse_presence_window_secs(raw: &str) -> Result<u64, String> {
+    let value: u64 = raw
+        .parse()
+        .map_err(|_| format!("not a valid window in seconds: {raw:?}"))?;
+    if value == 0 {
+        return Err("presence window must be greater than 0 seconds".to_string());
+    }
+    Ok(value)
+}
+
 /// Parse `CRUISEMESH_RELAY_RATE_BYTES_PER_MIN` (see `DEPLOY.md` §10). `0` is
 /// rejected -- a family that may upload zero bytes per minute could never
 /// post anything, same reasoning as the family storage quota above.
@@ -2733,6 +2911,13 @@ struct PresenceRequest {
 struct PresenceItem {
     hint: String,
     last_seen_ms: i64,
+    /// Cross-family answers only: which coarse bucket `last_seen_ms` was
+    /// rounded into. Omitted entirely for a same-family (member-class)
+    /// answer, whose `last_seen_ms` is exact — so a client that ignores this
+    /// field reads both answers the way it always has, and a client that
+    /// reads it knows which kind it is holding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recency: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -2741,23 +2926,72 @@ struct PresenceResponse {
     presence: Vec<PresenceItem>,
 }
 
+/// Coarsen one last-seen stamp for a cross-family caller.
+///
+/// Returns the bucket name and the stamp to report: the oldest instant still
+/// inside that bucket, one millisecond in, so a reader comparing the age with
+/// `<` and a reader comparing it with `<=` land in the same tier. The answer
+/// is therefore never *newer* than the truth — a contact who synced a second
+/// ago is reported as up to two and a half minutes ago, which is the point.
+/// Watching this endpoint tells a holder that someone's phone is broadly
+/// alive; it cannot tell them when it woke up, when it went quiet, or that
+/// anything happened between two samples.
+fn coarse_presence(age_ms: i64, now_ms: i64) -> (&'static str, i64) {
+    let (bucket, ceiling) = if age_ms <= PRESENCE_BUCKET_ACTIVE_MS {
+        ("active", PRESENCE_BUCKET_ACTIVE_MS)
+    } else if age_ms <= PRESENCE_BUCKET_RECENT_MS {
+        ("recent", PRESENCE_BUCKET_RECENT_MS)
+    } else if age_ms <= PRESENCE_BUCKET_DAY_MS {
+        ("day", PRESENCE_BUCKET_DAY_MS)
+    } else {
+        ("older", PRESENCE_RETENTION_MS)
+    };
+    (bucket, now_ms.saturating_sub(ceiling.saturating_sub(1)))
+}
+
 async fn sync_presence(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<PresenceRequest>,
 ) -> Result<Json<PresenceResponse>, ApiError> {
-    let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
+    let access = authorize_bearer(&state, &headers, FamilyOp::Presence).await?;
+    let cross_family = access.class == TokenClass::Deposit;
     // Enforced only once the token has authorized (see `check_rate_limit`).
-    state.check_rate_limit(&access, 1.0, 0.0)?;
+    //
+    // The two classes are charged to different dimensions on purpose. A
+    // member asking about their own family is an ordinary read and costs an
+    // ordinary request. A friend-card holder asking about a contact is
+    // charged to the presence bucket alone, so however hard they ask, the
+    // family whose relay is answering keeps every request and every byte of
+    // its own allowance (`PRESENCE-01`).
+    if cross_family {
+        state.check_presence_rate_limit(&access)?;
+    } else {
+        state.check_rate_limit(&access, 1.0, 0.0)?;
+    }
     let family_token = access.token;
+    // A cross-family caller may ask, and may not tell. Announcing this
+    // device's hints into another family's mailbox is the half of the
+    // original per-config presence sync that carried a real privacy cost —
+    // it tells a family we exist — and reinstating the query does not
+    // reinstate it. Refused rather than silently dropped: a client that
+    // thinks it is announcing should find out.
+    if cross_family && !request.announce.is_empty() {
+        return Err(ApiError::presence_query_only());
+    }
+    let query_cap = if cross_family {
+        MAX_DEPOSIT_PRESENCE_QUERY
+    } else {
+        MAX_PRESENCE_QUERY
+    };
     if request.announce.len() > MAX_PRESENCE_ANNOUNCE {
         return Err(ApiError::bad_request(format!(
             "announce must contain at most {MAX_PRESENCE_ANNOUNCE} hints"
         )));
     }
-    if request.query.len() > MAX_PRESENCE_QUERY {
+    if request.query.len() > query_cap {
         return Err(ApiError::bad_request(format!(
-            "query must contain at most {MAX_PRESENCE_QUERY} hints"
+            "query must contain at most {query_cap} hints"
         )));
     }
     let announce = decode_presence_hints(&request.announce, "announce")?;
@@ -2772,9 +3006,22 @@ async fn sync_presence(
         now_ms: now,
         presence: rows
             .into_iter()
-            .map(|row| PresenceItem {
-                hint: encode_base64_field(&row.hint),
-                last_seen_ms: row.last_seen_ms,
+            .map(|row| {
+                if cross_family {
+                    let age = now.saturating_sub(row.last_seen_ms).max(0);
+                    let (recency, last_seen_ms) = coarse_presence(age, now);
+                    PresenceItem {
+                        hint: encode_base64_field(&row.hint),
+                        last_seen_ms,
+                        recency: Some(recency),
+                    }
+                } else {
+                    PresenceItem {
+                        hint: encode_base64_field(&row.hint),
+                        last_seen_ms: row.last_seen_ms,
+                        recency: None,
+                    }
+                }
             })
             .collect(),
     }))
@@ -3470,8 +3717,22 @@ fn raw_bearer_token(headers: &HeaderMap) -> Result<String, ApiError> {
 enum FamilyOp {
     /// Store a new envelope (`POST /envelopes`).
     Post,
-    /// Fetch/ack/presence/WS — draining the mailbox.
+    /// Fetch/ack/WS — draining the mailbox.
     Read,
+    /// `POST /presence`. Its own op rather than a `Read` because a deposit
+    /// credential may perform it and may not perform a `Read`: presence is
+    /// the one answer a friend card is *supposed* to be able to ask for, and
+    /// it discloses no mail. What it may ask, and what it gets back, is
+    /// narrowed in `sync_presence` — announce refused, query capped, answer
+    /// coarsened, own rate bucket.
+    Presence,
+}
+
+impl FamilyOp {
+    /// Whether a deposit-class credential authorizes this op at all.
+    fn allowed_for_deposit(self) -> bool {
+        matches!(self, FamilyOp::Post | FamilyOp::Presence)
+    }
 }
 
 /// The result of authenticating a family bearer credential.
@@ -3497,9 +3758,16 @@ struct FamilyAccess {
 ///
 /// CP4 enforcement lives HERE, not in handlers: every authenticated route
 /// funnels through this function with its `FamilyOp`, and a deposit-class
-/// credential authorizes `FamilyOp::Post` only — fetch/ack/presence/WS all
-/// pass `FamilyOp::Read` and get a structured 403 `deposit_only` before any
-/// handler code runs, so no individual handler can forget the check.
+/// credential authorizes `FamilyOp::Post` and `FamilyOp::Presence` and
+/// nothing else — fetch/ack/WS all pass `FamilyOp::Read` and get a structured
+/// 403 `deposit_only` before any handler code runs, so no individual handler
+/// can forget the check.
+///
+/// Presence joined that list deliberately, and it is the one op where "may"
+/// is not the whole answer: `sync_presence` narrows what a deposit credential
+/// may ask and what it is told back. Suspension and expiry are checked for it
+/// exactly as for every other op — a lapsed or suspended family answers
+/// nothing, to anyone.
 async fn authorize_family(
     state: &AppState,
     token: &str,
@@ -3515,7 +3783,7 @@ async fn authorize_family(
         });
     }
     if let Some(member) = state.static_deposit_tokens.get(token) {
-        if op != FamilyOp::Post {
+        if !op.allowed_for_deposit() {
             return Err(ApiError::deposit_only(token));
         }
         return Ok(FamilyAccess {
@@ -3539,7 +3807,7 @@ async fn authorize_family(
     };
     // Class boundary first: the op simply does not exist for a deposit
     // credential, regardless of the family's billing state.
-    if class == TokenClass::Deposit && op != FamilyOp::Post {
+    if class == TokenClass::Deposit && !op.allowed_for_deposit() {
         return Err(ApiError::deposit_only(token));
     }
     if family.status != "active" {
@@ -3735,10 +4003,26 @@ impl ApiError {
         );
         Self {
             status: StatusCode::FORBIDDEN,
-            message: "deposit tokens can only post envelopes; fetch, ack, presence, \
-                      and websocket access require the family's member token"
+            message: "deposit tokens can only post envelopes and query presence; fetch, \
+                      ack, and websocket access require the family's member token"
                 .to_string(),
             code: Some("deposit_only"),
+            retry_after_secs: None,
+        }
+    }
+
+    /// A deposit-class credential tried to *announce* presence rather than
+    /// only query it. 403 (not 400): the request is well-formed and the
+    /// credential is real — announcing into a family you are not a member of
+    /// is simply outside the class. The stable `presence_query_only` code
+    /// lets a client tell this apart from a malformed hint.
+    fn presence_query_only() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: "deposit tokens may query presence but not announce it; announcing \
+                      requires the family's member token"
+                .to_string(),
+            code: Some("presence_query_only"),
             retry_after_secs: None,
         }
     }
@@ -4375,17 +4659,28 @@ mod tests {
         let relay_id = page["envelopes"][0]["id"].as_i64().unwrap();
 
         // Every read-class operation is a structured 403 for the deposit
-        // token: fetch, ack, presence. (WS is covered in e2e_ws.rs — the
-        // upgrade needs a real socket.)
+        // token: fetch, ack. (WS is covered in e2e_ws.rs — the upgrade needs
+        // a real socket.)
         for (request, what) in [
             (fetch_request(&deposit), "fetch"),
             (ack_request(&deposit, &[relay_id]), "ack"),
-            (presence_request(&deposit), "presence"),
         ] {
             let response = app.clone().oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{what}");
             assert_eq!(body_json(response).await["code"], "deposit_only", "{what}");
         }
+        // Presence is the one exception, and it is an exception to what may
+        // be *asked*: `presence_request` announces, which a deposit
+        // credential may never do (`PRESENCE-01`), so it is refused with its
+        // own code rather than the class one. The query half, and everything
+        // the answer is narrowed to, lives in `tests/e2e_presence.rs`.
+        let response = app
+            .clone()
+            .oneshot(presence_request(&deposit))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "presence_query_only");
 
         // The failed deposit ack must not have deleted anything: the member
         // still sees the row, and member-class operations are unchanged.
@@ -6312,7 +6607,7 @@ mod tests {
         let mut buckets = HashMap::new();
         // Both families spend everything at t=0, so both look empty.
         for token in ["idle-family", "busy-family"] {
-            let mut family = FamilyBuckets::new(60, 60, start);
+            let mut family = FamilyBuckets::new(60, 60, (4, 900), start);
             assert!(family.try_take(60.0, 60.0, start).is_ok());
             buckets.insert(token.to_string(), family);
         }

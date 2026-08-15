@@ -2142,6 +2142,102 @@ impl MessageStore {
     }
 }
 
+/// Cross-family presence cache. Internal-only, for the same reason as the
+/// block below: the relay pass owns this table, and a shell reads a contact's
+/// reachability through `connection_health.rs` rather than through here.
+impl MessageStore {
+    /// Whether this device may ask a contact's own relay about them again.
+    ///
+    /// The client half of the presence budget: a contact asked about inside
+    /// `min_interval_ms` is not asked about again, whatever the last answer
+    /// was, and a contact never asked about is always due. A store error
+    /// reads as *not* due — the failure mode of a broken cache must be
+    /// asking less, never asking more.
+    pub fn contact_presence_probe_due(
+        &self,
+        user_id: Vec<u8>,
+        now_ms: i64,
+        min_interval_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let asked: Option<i64> = conn
+            .query_row(
+                "SELECT asked_at_ms FROM contact_presence WHERE user_id = ?1",
+                params![user_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some(asked) = asked else {
+            return Ok(true);
+        };
+        // A stamp in the future is a clock artifact (a restored backup, an
+        // NTP step). It reads as "asked just now", which costs one skipped
+        // query and cannot be turned into a way of asking more often.
+        if asked > now_ms {
+            return Ok(false);
+        }
+        Ok(now_ms.saturating_sub(asked) >= min_interval_ms)
+    }
+
+    /// Record that a query was issued for this contact. Called at emission,
+    /// before any answer exists.
+    pub fn mark_contact_presence_probed(
+        &self,
+        user_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO contact_presence (user_id, asked_at_ms)
+             VALUES (?1, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET asked_at_ms = excluded.asked_at_ms",
+            params![user_id, now_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Record the coarse recency a contact's relay answered with.
+    ///
+    /// `recency` is one of the bucket names in
+    /// `core/src/session/relay_pass.rs`; nothing here interprets it, and
+    /// nothing writes a last-seen timestamp derived from it, so a coarse
+    /// answer cannot be laundered into a precise one by being stored.
+    pub fn record_contact_presence(
+        &self,
+        user_id: Vec<u8>,
+        recency: &str,
+        observed_at_ms: i64,
+    ) -> Result<(), CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.execute(
+            "INSERT INTO contact_presence (user_id, recency, observed_at_ms, asked_at_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 recency = excluded.recency,
+                 observed_at_ms = excluded.observed_at_ms",
+            params![user_id, recency, observed_at_ms],
+        )
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// The cached `(recency, observed_at_ms)` for a contact, if one was ever
+    /// answered.
+    pub fn contact_presence(&self, user_id: Vec<u8>) -> Result<Option<(String, i64)>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT recency, observed_at_ms FROM contact_presence
+             WHERE user_id = ?1 AND recency IS NOT NULL AND observed_at_ms IS NOT NULL",
+            params![user_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_err)
+    }
+}
+
 /// Internal-only helpers, never exported over UniFFI: not wrapped in
 /// `#[uniffi::export]` because these are implementation details of the
 /// digest spray plan (FC2) rather than API the platform shells call
@@ -9124,6 +9220,24 @@ CREATE TABLE IF NOT EXISTS consumed_hidden_lamports (
     sender_user_id BLOB   NOT NULL,
     lamport       INTEGER NOT NULL,
     PRIMARY KEY (chat_id, sender_user_id, lamport)
+);
+
+-- Cross-family presence: the coarse recency a contact's own relay last
+-- answered with, and when this device last asked.
+--
+-- `asked_at_ms` is written when the query is *issued*, not when it is
+-- answered. It is the client half of `PRESENCE-01`: a device that asks and
+-- gets a timeout, a 403 from an older relay, or nothing at all waits exactly
+-- as long before asking again as one that got an answer, so a relay cannot be
+-- made to pay for its own failures with a retry storm. `recency` holds a
+-- bucket name, never a timestamp -- see `core/src/session/relay_pass.rs` --
+-- so this table cannot become the activity log the coarsening exists to
+-- prevent.
+CREATE TABLE IF NOT EXISTS contact_presence (
+    user_id        BLOB    NOT NULL PRIMARY KEY,
+    recency        TEXT,
+    observed_at_ms INTEGER,
+    asked_at_ms    INTEGER NOT NULL
 );
 ";
 

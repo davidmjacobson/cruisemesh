@@ -5,10 +5,10 @@ use tracing::info;
 
 use cruisemesh_relayd::{
     apns::{spawn_apns_worker, ApnsConfig},
-    app, parse_bind, parse_family_quota_bytes, parse_rate_bytes_per_min,
-    parse_rate_requests_per_min, parse_tokens, parse_ws_connection_cap, spawn_prune_task, AppState,
-    RateLimitConfig, RelayStore, WsLimitsConfig, DEFAULT_FAMILY_QUOTA_BYTES,
-    DEFAULT_PRUNE_INTERVAL,
+    app, parse_bind, parse_family_quota_bytes, parse_presence_window_secs,
+    parse_rate_bytes_per_min, parse_rate_requests_per_min, parse_tokens, parse_ws_connection_cap,
+    spawn_prune_task, AppState, RateLimitConfig, RelayStore, WsLimitsConfig,
+    DEFAULT_FAMILY_QUOTA_BYTES, DEFAULT_PRUNE_INTERVAL,
 };
 
 #[tokio::main]
@@ -80,6 +80,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(raw) = env::var("CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN") {
         rate_limits.global_requests_per_min = parse_rate_requests_per_min(&raw)?;
     }
+    // Cross-family presence: a small burst over a long window, charged to a
+    // dimension of its own so it can never draw down the queried family's
+    // request or byte allowance (see DEPLOY.md §10).
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES") {
+        rate_limits.deposit_presence_queries = parse_rate_requests_per_min(&raw)?;
+    }
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS") {
+        rate_limits.deposit_presence_window_secs = parse_presence_window_secs(&raw)?;
+    }
 
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
@@ -104,6 +113,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         deposit_rate_requests_per_min = rate_limits.deposit_requests_per_min,
         deposit_rate_bytes_per_min = rate_limits.deposit_bytes_per_min,
         rate_global_requests_per_min = rate_limits.global_requests_per_min,
+        deposit_presence_queries = rate_limits.deposit_presence_queries,
+        deposit_presence_window_secs = rate_limits.deposit_presence_window_secs,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         admin_api = admin_token.is_some(),
         apns_wakes = apns_enabled,

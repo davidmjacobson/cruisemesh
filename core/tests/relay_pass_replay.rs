@@ -3459,3 +3459,358 @@ fn a_fixture_that_states_a_derived_number_states_the_one_core_would_produce() {
         "the guard must actually reach the corpus; it checked {checked} numbers"
     );
 }
+
+// ===========================================================================
+// PRESENCE-01 — the cross-family query, and what it is allowed to cost
+// ===========================================================================
+
+/// A friend card from another family: their relay, and the post-only
+/// credential a card carries. `resolved_contact_poll_relay` drops this
+/// endpoint from the walk — a deposit token cannot read a mailbox — which is
+/// exactly the case that stopped yielding a last-seen.
+fn cross_family_contact(user_id: Vec<u8>, url: &str) -> CoreRelayContactConfig {
+    CoreRelayContactConfig {
+        user_id,
+        relay_url: Some(url.to_string()),
+        relay_token: Some(cruisemesh_core::relay_deposit_token_for(
+            CONTACT_TOKEN.to_string(),
+        )),
+        endpoint_usable: true,
+        endpoint_answering: true,
+    }
+}
+
+fn presence_requests(run: &Run) -> Vec<&Recorded> {
+    run.requests
+        .iter()
+        .filter(|r| r.request.operation == CoreRelayOperation::Presence)
+        .collect()
+}
+
+fn announce_and_query(recorded: &Recorded) -> (usize, usize) {
+    let body: serde_json::Value =
+        serde_json::from_slice(&recorded.request.body).expect("a presence body is JSON");
+    (
+        body["announce"].as_array().expect("announce").len(),
+        body["query"].as_array().expect("query").len(),
+    )
+}
+
+#[test]
+fn a_cross_family_contact_is_asked_after_once_a_pass_and_never_told_anything() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    let queries = presence_requests(&run);
+    assert_eq!(
+        queries.len(),
+        1,
+        "one contact, one question, one pass — got {} requests",
+        queries.len()
+    );
+    assert_eq!(queries[0].request.base_url, CONTACT_URL);
+    let (announce, query) = announce_and_query(queries[0]);
+    assert_eq!(
+        announce, 0,
+        "the announce half stays dropped: a cross-family query tells the answering \
+         family nothing about who is asking"
+    );
+    assert!(
+        query > 0,
+        "the query half is the whole point of the request"
+    );
+
+    // And the endpoint is still not a mailbox. Nothing about being allowed to
+    // ask made it fetchable.
+    assert!(
+        run.requests
+            .iter()
+            .all(|r| r.request.base_url != CONTACT_URL || !r.is_fetch()),
+        "a deposit-class endpoint is not polled, before or after this change"
+    );
+}
+
+#[test]
+fn the_freshest_presence_row_wins_when_a_probe_covers_several_hints() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.request.operation == CoreRelayOperation::Presence {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.request.body).expect("a presence body is JSON");
+            let hints: Vec<String> = body["query"]
+                .as_array()
+                .expect("query")
+                .iter()
+                .map(|h| h.as_str().expect("a hint is a string").to_string())
+                .collect();
+            let stale = hints.first().cloned().expect("at least one hint");
+            let fresh = hints.get(1).cloned().unwrap_or_else(|| stale.clone());
+            // The stale row deliberately comes FIRST: an implementation that
+            // takes the first row instead of the freshest caches this contact
+            // a day old while another hint saw them a minute ago.
+            let reply = serde_json::json!({
+                "now_ms": now,
+                "presence": [
+                    { "hint": stale, "last_seen_ms": now - 20 * 60 * 60 * 1000 },
+                    { "hint": fresh, "last_seen_ms": now - 60_000 },
+                ]
+            });
+            return Reply::ok(reply.to_string().into_bytes());
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(presence_requests(&run).len(), 1);
+    let (bucket, _recorded_at) = store
+        .contact_presence(contact_user_id())
+        .expect("presence readable")
+        .expect("the answer was recorded");
+    assert_eq!(
+        bucket, "active",
+        "the freshest returned row decides the bucket, not whichever row is first"
+    );
+}
+
+#[test]
+fn a_second_pass_inside_the_client_floor_asks_nothing() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let respond = |request: &Recorded, _index: usize| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    };
+
+    let mut plan = base_plan(now);
+    plan.contacts = contacts.clone();
+    let first = drive(
+        &CoreRelayPass::new(store.clone(), plan, "p1".to_string()),
+        now,
+        respond,
+    );
+    assert_eq!(presence_requests(&first).len(), 1);
+
+    // A minute later — well inside the floor — the pass runs everything else
+    // and asks nothing. The cached bucket is the answer.
+    let soon = now + 60_000;
+    let mut plan = base_plan(soon);
+    plan.contacts = contacts.clone();
+    let second = drive(
+        &CoreRelayPass::new(store.clone(), plan, "p2".to_string()),
+        soon,
+        respond,
+    );
+    assert_eq!(
+        presence_requests(&second).len(),
+        0,
+        "a limit is not a schedule: the client holds its own floor"
+    );
+
+    // Past the floor, the question is worth asking again.
+    let later = now + cruisemesh_core::RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS + 1;
+    let mut plan = base_plan(later);
+    plan.contacts = contacts;
+    let third = drive(
+        &CoreRelayPass::new(store.clone(), plan, "p3".to_string()),
+        later,
+        respond,
+    );
+    assert_eq!(presence_requests(&third).len(), 1);
+}
+
+#[test]
+fn a_relay_that_never_answers_is_not_asked_again_next_pass() {
+    // The floor is stamped when the query is *sent*. A relay that times out,
+    // or an older one that refuses the route outright, therefore costs the
+    // same wait as one that answered — a failing endpoint cannot be turned
+    // into a retry storm by failing.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let respond = |request: &Recorded, _index: usize| {
+        if request.request.base_url == CONTACT_URL {
+            // What an older relayd says: this credential may only post.
+            return Reply::status(403, "deposit_only");
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    };
+
+    let mut plan = base_plan(now);
+    plan.contacts = contacts.clone();
+    let first = drive(
+        &CoreRelayPass::new(store.clone(), plan, "p1".to_string()),
+        now,
+        respond,
+    );
+    assert_eq!(presence_requests(&first).len(), 1);
+    assert_eq!(
+        first.summary.configs_faulted, 0,
+        "a refused presence query is not a faulted mailbox: there is no mailbox here"
+    );
+    assert_eq!(
+        first.summary.silence_committed + first.summary.silence_discarded,
+        0,
+        "and it is not silence evidence either — a relay upgrade schedule must not be \
+         able to write off every cross-family endpoint in an address book"
+    );
+
+    let soon = now + 60_000;
+    let mut plan = base_plan(soon);
+    plan.contacts = contacts;
+    let second = drive(
+        &CoreRelayPass::new(store.clone(), plan, "p2".to_string()),
+        soon,
+        respond,
+    );
+    assert_eq!(presence_requests(&second).len(), 0);
+}
+
+#[test]
+fn a_resting_endpoint_contributes_no_query() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    let mut contact = cross_family_contact(contact_user_id(), CONTACT_URL);
+    contact.endpoint_usable = false;
+    plan.contacts = vec![contact];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        assert_ne!(
+            request.request.base_url, CONTACT_URL,
+            "an endpoint this device has written off is asked nothing at all"
+        );
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert_eq!(presence_requests(&run).len(), 0);
+}
+
+#[test]
+fn the_queries_are_bounded_however_large_the_address_book_is() {
+    let store = new_store();
+    let now = T0;
+    let mut plan = base_plan(now);
+    plan.contacts = (0..24u8)
+        .map(|i| cross_family_contact(vec![i; 32], &format!("https://relay-{i}.example")))
+        .collect();
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(
+        presence_requests(&run).len() as u32,
+        cruisemesh_core::RELAY_PASS_MAX_PRESENCE_PROBES,
+        "advisory work is capped by something that does not grow with an address book"
+    );
+    assert!(
+        run.summary.requests_issued <= run.summary.budgets.max_requests,
+        "LIVE-01: every query is charged against the pass's own request budget"
+    );
+}
+
+#[test]
+fn a_rate_limited_query_ends_the_pass_and_honours_retry_after() {
+    // RATE-01 is not weakened by the query being advisory: a 429 on one ends
+    // the remaining network work and the quiet window it names is a floor.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.request.base_url == CONTACT_URL {
+            return Reply::rate_limited(30);
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::RateLimited);
+    assert!(
+        run.summary.quiet_until_ms >= now + 30_000,
+        "the advertised Retry-After is a floor, not a suggestion: {} against {}",
+        run.summary.quiet_until_ms,
+        now + 30_000
+    );
+}
+
+#[test]
+fn a_same_family_contact_is_answered_by_its_own_config_not_a_second_request() {
+    // A contact whose card names a mailbox this device may poll already has
+    // its presence answered through that config. Asking twice would spend a
+    // request to learn nothing.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: true,
+        endpoint_answering: true,
+    }];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert_eq!(
+        presence_requests(&run).len(),
+        0,
+        "a pollable endpoint is walked, and its presence rides that config"
+    );
+}

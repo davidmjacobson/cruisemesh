@@ -221,9 +221,11 @@ pub use session::relay_pass::{
     CoreRelayEndpointConfig, CoreRelayHeader, CoreRelayHttpRequest, CoreRelayHttpResult,
     CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome,
     CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayProgressReason, CoreRelayStage,
-    CoreRelayTransportError, RELAY_PASS_DEADLINE_MS, RELAY_PASS_MAX_AUTHORED_UPLOADS,
-    RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES, RELAY_PASS_MAX_RECEIPT_UPLOADS,
-    RELAY_PASS_MAX_REQUESTS, RELAY_PASS_MAX_RESPONSE_BYTES,
+    CoreRelayTransportError, RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS, RELAY_PASS_DEADLINE_MS,
+    RELAY_PASS_MAX_AUTHORED_UPLOADS, RELAY_PASS_MAX_CARRIED_UPLOADS, RELAY_PASS_MAX_ENVELOPES,
+    RELAY_PASS_MAX_PRESENCE_PROBES, RELAY_PASS_MAX_RECEIPT_UPLOADS, RELAY_PASS_MAX_REQUESTS,
+    RELAY_PASS_MAX_RESPONSE_BYTES, RELAY_PRESENCE_RECENCY_ACTIVE, RELAY_PRESENCE_RECENCY_DAY,
+    RELAY_PRESENCE_RECENCY_OLDER, RELAY_PRESENCE_RECENCY_RECENT,
 };
 pub use session::relay_policy::{
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
