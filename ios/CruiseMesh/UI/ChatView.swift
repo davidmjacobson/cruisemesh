@@ -35,6 +35,12 @@ struct ChatView: View {
     @State private var cancellable: AnyCancellable?
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
+    /// Playback for every voice message in this chat, held above the list so a
+    /// message survives its bubble scrolling out of view. `@State`, not
+    /// `@StateObject`: this screen holds the player but must not redraw the
+    /// whole thread ten times a second while a message plays — the voice
+    /// bubble is the only view that observes it.
+    @State private var voicePlayback = VoiceMemoPlaybackController()
     @State private var replyingTo: StoredMessage?
     @FocusState private var composerFocused: Bool
     @State private var replyMetadata: [String: MessageReplyMetadata] = [:]
@@ -131,6 +137,7 @@ struct ChatView: View {
                                     }
                                     MessageBubbleView(
                                         message: message,
+                                        messageKey: row.rowId,
                                         isOwn: message.senderUserId == identity.userId,
                                         tick: message.senderUserId == identity.userId
                                             ? tickStatusFor(
@@ -149,6 +156,7 @@ struct ChatView: View {
                                         reactions: row.reactions,
                                         grouping: row.grouping,
                                         timeLabel: row.timeLabel,
+                                        voicePlayback: voicePlayback,
                                         arrivalLabel: row.arrivalLabel,
                                         onStatus: { statusMessage = $0 },
                                         onReact: { emoji in
@@ -297,6 +305,7 @@ struct ChatView: View {
         .onDisappear {
             ChatVisibility.clearVisible(contact.userId)
             voiceRecorder.cancel()
+            voicePlayback.stop()
         }
         .onChange(of: scenePhase) { phase in
             // Backgrounding leaves the view "appeared" (no onDisappear), so a
@@ -708,6 +717,9 @@ private struct ChatBubbleShape: Shape {
 
 private struct MessageBubbleView: View {
     let message: StoredMessage
+    /// Stable across reloads and scrolling; identifies a voice message to the
+    /// conversation's player.
+    let messageKey: String
     let isOwn: Bool
     let tick: TickStatus?
     let contactColor: Color
@@ -716,6 +728,9 @@ private struct MessageBubbleView: View {
     let reactions: [ReactionSummary]
     let grouping: MessageGrouping
     let timeLabel: String
+    /// The conversation's voice player. Not observed here: only the voice
+    /// bubble itself redraws while a message plays.
+    let voicePlayback: VoiceMemoPlaybackController
     var arrivalLabel: String? = nil
     var onStatus: (String) -> Void = { _ in }
     var onReact: (String) -> Void = { _ in }
@@ -866,7 +881,12 @@ private struct MessageBubbleView: View {
                         onOpen: onPhotoTap
                     )
                 case .audio:
-                    VoiceMemoPlayerView(blob: attachment.blob, durationMs: attachment.durationMs)
+                    VoiceMemoPlayerView(
+                        messageKey: messageKey,
+                        blob: attachment.blob,
+                        durationMs: attachment.durationMs,
+                        playback: voicePlayback
+                    )
                 }
                 if !attachment.caption.isEmpty {
                     MessageBodyText(
@@ -1235,23 +1255,32 @@ struct ChatImageView: View {
 /// seekable bar. The total is the decoder's once a player exists, falling back
 /// to the duration the sender stated until then — that fallback is display
 /// only and is never a seek target.
+///
+/// A pure view of the conversation's playback state: it owns no player. The
+/// conversation does, so a message keeps playing when this bubble scrolls out
+/// of the `LazyVStack` and is disposed — including the automatic scroll when a
+/// new message arrives — and the bubble picks the same state back up when it
+/// scrolls into view again.
 struct VoiceMemoPlayerView: View {
+    /// Identifies the message across reloads and scrolling: the conversation's
+    /// stable row key (sender and lamport), not this view's identity.
+    let messageKey: String
     let blob: Data
     let durationMs: Int32
-    @StateObject private var playback = VoiceMemoPlaybackController()
+    @ObservedObject var playback: VoiceMemoPlaybackController
 
-    private var total: TimeInterval {
-        playback.total > 0 ? playback.total : TimeInterval(max(0, durationMs)) / 1000
+    private var state: VoiceBubbleState {
+        playback.state(for: messageKey, manifestDurationMs: durationMs)
     }
 
     private var progressLabel: String {
-        "\(Self.clock(playback.elapsed)) / \(Self.clock(total))"
+        "\(Self.clock(state.elapsed)) / \(Self.clock(state.total))"
     }
 
     private var progress: Double {
         VoicePlaybackDisplay.progressFraction(
-            positionMs: Int((playback.elapsed * 1000).rounded(.down)),
-            totalMs: Int((total * 1000).rounded(.down))
+            positionMs: Int((state.elapsed * 1000).rounded(.down)),
+            totalMs: Int((state.total * 1000).rounded(.down))
         )
     }
 
@@ -1259,11 +1288,11 @@ struct VoiceMemoPlayerView: View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Button {
-                    playback.toggle(blob: blob)
+                    playback.toggle(key: messageKey, blob: blob)
                 } label: {
-                    Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill")
+                    Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
                 }
-                .accessibilityLabel(playback.isPlaying ? "Pause voice message" : "Play voice message")
+                .accessibilityLabel(state.isPlaying ? "Pause voice message" : "Play voice message")
                 VStack(alignment: .leading, spacing: 3) {
                     Text(verbatim: progressLabel)
                         .font(.subheadline.monospacedDigit())
@@ -1271,17 +1300,16 @@ struct VoiceMemoPlayerView: View {
                     VoiceMemoSeekBar(
                         progress: progress,
                         progressLabel: progressLabel,
-                        onSeek: { playback.seek(fraction: $0) }
+                        onSeek: { playback.seek(key: messageKey, fraction: $0) }
                     )
                 }
             }
-            if playback.playbackFailed {
+            if state.failed {
                 Text("Could not play that voice message")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
-        .onDisappear { playback.stop() }
     }
 
     private static func clock(_ seconds: TimeInterval) -> String {

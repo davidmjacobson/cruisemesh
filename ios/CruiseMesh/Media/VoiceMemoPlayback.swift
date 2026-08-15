@@ -47,7 +47,33 @@ final class SystemVoiceMemoAudioPlayer: NSObject, VoiceMemoAudioPlaying, AVAudio
     }
 }
 
-/// Owns one voice-message playback attempt, including the shared audio session.
+/// What one voice bubble needs to draw itself.
+struct VoiceBubbleState: Equatable {
+    let isPlaying: Bool
+    /// Seconds played so far.
+    let elapsed: TimeInterval
+    /// The decoder's length once it has spoken, otherwise the duration the
+    /// sender stated. Display only — never a seek target.
+    let total: TimeInterval
+    let failed: Bool
+}
+
+/// Owns voice-message playback for a whole conversation, above the message list.
+///
+/// It lives above the list on purpose. Playback used to be owned by the bubble
+/// itself, which meant a message stopped the moment its bubble left the screen:
+/// a `LazyVStack` disposes a row that scrolls out of view, and the bubble's
+/// `.onDisappear` stopped the player. New messages arriving mid-listen scroll
+/// the thread on their own, so a minute-long message in a live conversation was
+/// close to impossible to hear to the end. Held here, playback survives
+/// scrolling and the bubble re-attaches to it when it comes back; it stops only
+/// when the listener leaves the conversation or stops it themselves.
+///
+/// A message is identified by a stable key (its sender and lamport, by way of
+/// the conversation's row id) rather than by view identity, matching Android's
+/// `VoiceMessagePlayback`. One controller per conversation also makes "one
+/// message at a time" structural: starting a second message stops the first,
+/// and the shared audio session keeps that true across conversations.
 ///
 /// Recorded messages are MPEG-4/AAC. Supplying the M4A type hint is important:
 /// `AVAudioPlayer(data:)` does not have a filename extension from which to infer
@@ -61,8 +87,13 @@ final class VoiceMemoPlaybackController: ObservableObject {
     typealias PlayerFactory = (Data, String) throws -> VoiceMemoAudioPlaying
     private static let log = Logger(subsystem: "com.cruisemesh", category: "VoiceMessage")
 
+    /// The message loaded in the decoder, playing or paused. Nil when nothing
+    /// is loaded, including once a message has played to its end.
+    @Published private(set) var activeKey: String?
     @Published private(set) var isPlaying = false
-    @Published private(set) var playbackFailed = false
+    /// The message whose last attempt failed, if any. One at a time: a failure
+    /// is about the attempt, and starting another message is a new attempt.
+    @Published private(set) var failedKey: String?
     /// Seconds played, for the bubble's progress line.
     @Published private(set) var elapsed: TimeInterval = 0
     /// Seconds the decoder reported, or 0 until a player exists.
@@ -70,16 +101,16 @@ final class VoiceMemoPlaybackController: ObservableObject {
 
     /// The controller currently holding the shared audio session, if any.
     ///
-    /// Every voice bubble in the timeline owns its own controller, but the
-    /// process has exactly one `AVAudioSession`. Without an owner of record,
-    /// tapping a second message while a first one plays leaves both playing on
-    /// top of each other, and pausing either one deactivates the session out
-    /// from under the other. Taking the session stops whoever had it, so at most
-    /// one voice message is ever audible and `ownsAudioSession` is a true claim
+    /// Each conversation owns a controller, but the process has exactly one
+    /// `AVAudioSession`. Without an owner of record, starting a message in a
+    /// second conversation while a first one plays leaves both playing on top
+    /// of each other, and pausing either one deactivates the session out from
+    /// under the other. Taking the session stops whoever had it, so at most one
+    /// voice message is ever audible and `ownsAudioSession` is a true claim
     /// rather than a hopeful one.
     ///
-    /// Weak: a bubble that scrolls away deallocates, and a dead controller must
-    /// not keep the session reserved.
+    /// Weak: a conversation that goes away deallocates its controller, and a
+    /// dead controller must not keep the session reserved.
     private static weak var sessionHolder: VoiceMemoPlaybackController?
 
     private let playerFactory: PlayerFactory
@@ -111,10 +142,31 @@ final class VoiceMemoPlaybackController: ObservableObject {
         self.deactivateAudioSession = deactivateAudioSession
     }
 
-    /// Jump to `fraction` of the decoder's duration. A no-op until the
-    /// decoder has reported a length. Playing stays playing; paused stays paused.
-    func seek(fraction: Double) {
-        guard let player else { return }
+    /// What the bubble for `key` should draw. Every message that is not the
+    /// active one is idle at 0:00 over the duration its sender stated.
+    func state(for key: String, manifestDurationMs: Int32) -> VoiceBubbleState {
+        let stated = TimeInterval(max(0, manifestDurationMs)) / 1_000
+        guard key == activeKey else {
+            return VoiceBubbleState(
+                isPlaying: false,
+                elapsed: 0,
+                total: stated,
+                failed: key == failedKey
+            )
+        }
+        return VoiceBubbleState(
+            isPlaying: isPlaying,
+            elapsed: elapsed,
+            total: total > 0 ? total : stated,
+            failed: key == failedKey
+        )
+    }
+
+    /// Jump `key` to `fraction` of the decoder's duration. A no-op until the
+    /// decoder has reported a length, and a no-op for any other message.
+    /// Playing stays playing; paused stays paused.
+    func seek(key: String, fraction: Double) {
+        guard let player, key == activeKey else { return }
         let decoderMs = Int((total * 1000).rounded(.down))
         guard let targetMs = VoicePlaybackDisplay.seekTargetMs(
             decoderDurationMs: decoderMs,
@@ -125,19 +177,23 @@ final class VoiceMemoPlaybackController: ObservableObject {
         elapsed = target
     }
 
-    /// Play, or pause a message that is already playing. A paused message
-    /// resumes where it stopped rather than starting over.
-    func toggle(blob: Data) {
+    /// Play `key`, pause it if it is already playing, or resume it where it
+    /// stopped. Starting a different message stops whatever was playing.
+    func toggle(key: String, blob: Data) {
+        guard key == activeKey else {
+            play(key: key, blob: blob)
+            return
+        }
         if isPlaying {
             pause()
         } else if let player {
-            resume(player)
+            resume(player, key: key)
         } else {
-            play(blob: blob)
+            play(key: key, blob: blob)
         }
     }
 
-    func play(blob: Data) {
+    func play(key: String, blob: Data) {
         reset(clearFailure: true)
         do {
             Self.log.info("Preparing voice message playback (\(blob.count, privacy: .public) bytes, M4A)")
@@ -147,11 +203,12 @@ final class VoiceMemoPlaybackController: ObservableObject {
             let token = UUID()
             playbackToken = token
             player = next
+            activeKey = key
             next.onFinish = { [weak self] succeeded in
-                guard self?.playbackToken == token else { return }
-                self?.reset(clearFailure: succeeded)
-                self?.playbackFailed = !succeeded
+                guard let self, self.playbackToken == token else { return }
+                self.reset(clearFailure: succeeded)
                 if !succeeded {
+                    self.failedKey = key
                     Self.log.error("Voice message decoder stopped with an error")
                 }
             }
@@ -164,8 +221,8 @@ final class VoiceMemoPlaybackController: ObservableObject {
             isPlaying = true
             startTicking()
         } catch {
-            reset(clearFailure: false)
-            playbackFailed = true
+            reset(clearFailure: true)
+            failedKey = key
             Self.log.error("Could not start voice message playback: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -185,23 +242,24 @@ final class VoiceMemoPlaybackController: ObservableObject {
         releaseAudioSession()
     }
 
-    /// Stops and releases the player and the audio session.
+    /// Stops and releases the player and the audio session. Leaving the
+    /// conversation, or an explicit stop — not scrolling.
     func stop() {
         reset(clearFailure: true)
     }
 
-    private func resume(_ player: VoiceMemoAudioPlaying) {
+    private func resume(_ player: VoiceMemoAudioPlaying, key: String) {
         do {
             try takeAudioSession()
         } catch {
-            reset(clearFailure: false)
-            playbackFailed = true
+            reset(clearFailure: true)
+            failedKey = key
             Self.log.error("Could not reactivate the session to resume: \(error.localizedDescription, privacy: .public)")
             return
         }
         guard player.play() else {
-            reset(clearFailure: false)
-            playbackFailed = true
+            reset(clearFailure: true)
+            failedKey = key
             return
         }
         isPlaying = true
@@ -223,11 +281,12 @@ final class VoiceMemoPlaybackController: ObservableObject {
         player?.onFinish = nil
         player?.stop()
         player = nil
+        activeKey = nil
         isPlaying = false
         elapsed = 0
         total = 0
         if clearFailure {
-            playbackFailed = false
+            failedKey = nil
         }
         releaseAudioSession()
     }

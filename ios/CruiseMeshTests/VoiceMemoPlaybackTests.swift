@@ -2,6 +2,12 @@ import AVFoundation
 import XCTest
 @testable import CruiseMesh
 
+/// Message keys, in the shape the conversation builds them from a sender and a
+/// lamport. Their content does not matter here, only that they are stable and
+/// distinct.
+private let messageA = "aa:1:0"
+private let messageB = "bb:2:0"
+
 final class VoiceMemoPlaybackTests: XCTestCase {
     func testPlaybackSuppliesM4ATypeHintAndOwnsAudioSessionUntilCompletion() {
         let fake = FakeVoiceMemoAudioPlayer()
@@ -20,7 +26,7 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: { deactivations += 1 }
         )
 
-        playback.play(blob: blob)
+        playback.play(key: messageA, blob: blob)
 
         XCTAssertEqual(receivedBlob, blob)
         XCTAssertEqual(receivedHint, AVFileType.m4a.rawValue)
@@ -28,17 +34,19 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertTrue(fake.prepared)
         XCTAssertTrue(fake.played)
         XCTAssertTrue(playback.isPlaying)
-        XCTAssertFalse(playback.playbackFailed)
+        XCTAssertEqual(playback.activeKey, messageA)
+        XCTAssertNil(playback.failedKey)
 
         fake.onFinish?(true)
 
         XCTAssertFalse(playback.isPlaying)
-        XCTAssertFalse(playback.playbackFailed)
+        XCTAssertNil(playback.activeKey, "a finished message hands its decoder back")
+        XCTAssertNil(playback.failedKey)
         XCTAssertTrue(fake.stopped)
         XCTAssertEqual(deactivations, 1)
     }
 
-    func testFailedStartIsVisibleAndReleasesAudioSession() {
+    func testFailedStartIsVisibleOnThatMessageOnlyAndReleasesAudioSession() {
         let fake = FakeVoiceMemoAudioPlayer()
         fake.canPlay = false
         var deactivations = 0
@@ -48,10 +56,15 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: { deactivations += 1 }
         )
 
-        playback.play(blob: Data([1]))
+        playback.play(key: messageA, blob: Data([1]))
 
         XCTAssertFalse(playback.isPlaying)
-        XCTAssertTrue(playback.playbackFailed)
+        XCTAssertEqual(playback.failedKey, messageA)
+        XCTAssertTrue(playback.state(for: messageA, manifestDurationMs: 0).failed)
+        XCTAssertFalse(
+            playback.state(for: messageB, manifestDurationMs: 0).failed,
+            "one message failing must not mark every other bubble as failed"
+        )
         XCTAssertTrue(fake.stopped)
         XCTAssertEqual(deactivations, 1)
     }
@@ -64,8 +77,8 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.toggle(blob: Data([1]))
-        playback.toggle(blob: Data([1]))
+        playback.toggle(key: messageA, blob: Data([1]))
+        playback.toggle(key: messageA, blob: Data([1]))
 
         XCTAssertFalse(playback.isPlaying)
         XCTAssertTrue(fake.paused)
@@ -79,11 +92,11 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.play(blob: Data([1]))
+        playback.play(key: messageA, blob: Data([1]))
         fake.onFinish?(false)
 
         XCTAssertFalse(playback.isPlaying)
-        XCTAssertTrue(playback.playbackFailed)
+        XCTAssertEqual(playback.failedKey, messageA)
     }
 
     /// The bubble shows elapsed over total, so the total has to be the
@@ -103,15 +116,20 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: { deactivations += 1 }
         )
 
-        playback.play(blob: Data([1]))
+        playback.play(key: messageA, blob: Data([1]))
 
         XCTAssertEqual(playback.total, 12.5)
         XCTAssertEqual(playback.elapsed, 0)
+        XCTAssertEqual(
+            playback.state(for: messageA, manifestDurationMs: 60_000).total,
+            12.5,
+            "the decoder's length wins over the duration the sender stated"
+        )
 
         // Pausing captures where the message got to and hands the audio session
         // back, so a message left paused does not keep other apps ducked.
         fake.currentTime = 4
-        playback.toggle(blob: Data([1]))
+        playback.toggle(key: messageA, blob: Data([1]))
 
         XCTAssertFalse(playback.isPlaying)
         XCTAssertEqual(playback.elapsed, 4)
@@ -119,7 +137,7 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertEqual(deactivations, 1)
 
         // Resuming takes the session back and picks up where it stopped.
-        playback.toggle(blob: Data([1]))
+        playback.toggle(key: messageA, blob: Data([1]))
 
         XCTAssertTrue(playback.isPlaying)
         XCTAssertEqual(activations, 2)
@@ -130,9 +148,62 @@ final class VoiceMemoPlaybackTests: XCTestCase {
         XCTAssertEqual(deactivations, 2)
     }
 
-    /// Each voice bubble owns a controller, but the process owns one audio
-    /// session. Starting a second message must stop the first rather than play
-    /// over it and then have either one's pause deactivate the shared session.
+    /// The bug this ownership exists for: the bubble that is playing scrolls
+    /// out of the list and is disposed, which used to stop the message. Nothing
+    /// the list does can reach the player now — only which keys it asks about,
+    /// and a message that is not the active one is simply drawn idle.
+    func testOnlyTheActiveMessageIsPlayingAndOthersShowTheirStatedDuration() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 61
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(key: messageA, blob: Data([1]))
+
+        let playing = playback.state(for: messageA, manifestDurationMs: 60_000)
+        XCTAssertTrue(playing.isPlaying)
+        XCTAssertEqual(playing.total, 61)
+
+        let other = playback.state(for: messageB, manifestDurationMs: 8_000)
+        XCTAssertFalse(other.isPlaying)
+        XCTAssertEqual(other.elapsed, 0)
+        XCTAssertEqual(other.total, 8, "an idle bubble shows the duration its sender stated")
+
+        // And the message keeps playing throughout: nothing above released it.
+        XCTAssertTrue(playback.isPlaying)
+        XCTAssertEqual(playback.activeKey, messageA)
+        XCTAssertFalse(fake.stopped)
+    }
+
+    /// One message at a time within a conversation, now that one controller
+    /// owns them all.
+    func testStartingAnotherMessageInTheSameConversationStopsTheFirst() {
+        let firstPlayer = FakeVoiceMemoAudioPlayer()
+        let secondPlayer = FakeVoiceMemoAudioPlayer()
+        var players = [firstPlayer, secondPlayer]
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in players.removeFirst() },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(key: messageA, blob: Data([1]))
+        playback.toggle(key: messageB, blob: Data([2]))
+
+        XCTAssertEqual(playback.activeKey, messageB)
+        XCTAssertTrue(playback.isPlaying)
+        XCTAssertTrue(firstPlayer.stopped, "two voice messages must never play at once")
+        XCTAssertTrue(secondPlayer.played)
+        XCTAssertFalse(playback.state(for: messageA, manifestDurationMs: 0).isPlaying)
+    }
+
+    /// Each conversation owns a controller, but the process owns one audio
+    /// session. Starting a message in a second conversation must stop the first
+    /// rather than play over it and then have either one's pause deactivate the
+    /// shared session.
     func testStartingASecondMessageStopsTheFirst() {
         let firstPlayer = FakeVoiceMemoAudioPlayer()
         var firstDeactivations = 0
@@ -148,10 +219,10 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        first.play(blob: Data([1]))
+        first.play(key: messageA, blob: Data([1]))
         XCTAssertTrue(first.isPlaying)
 
-        second.play(blob: Data([2]))
+        second.play(key: messageB, blob: Data([2]))
 
         XCTAssertTrue(second.isPlaying)
         XCTAssertFalse(first.isPlaying, "two voice messages must never play at once")
@@ -174,8 +245,26 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.play(blob: Data([1]))
-        playback.seek(fraction: 0.5)
+        playback.play(key: messageA, blob: Data([1]))
+        playback.seek(key: messageA, fraction: 0.5)
+
+        XCTAssertEqual(fake.currentTime, 0)
+        XCTAssertEqual(playback.elapsed, 0)
+    }
+
+    /// A scrub on a bubble that is not the one playing must not move the
+    /// message that is.
+    func testSeekOnAnotherMessageIsANoOp() {
+        let fake = FakeVoiceMemoAudioPlayer()
+        fake.duration = 16
+        let playback = VoiceMemoPlaybackController(
+            playerFactory: { _, _ in fake },
+            activateAudioSession: {},
+            deactivateAudioSession: {}
+        )
+
+        playback.play(key: messageA, blob: Data([1]))
+        playback.seek(key: messageB, fraction: 0.5)
 
         XCTAssertEqual(fake.currentTime, 0)
         XCTAssertEqual(playback.elapsed, 0)
@@ -190,9 +279,9 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.play(blob: Data([1]))
-        playback.toggle(blob: Data([1]))
-        playback.seek(fraction: 0.25)
+        playback.play(key: messageA, blob: Data([1]))
+        playback.toggle(key: messageA, blob: Data([1]))
+        playback.seek(key: messageA, fraction: 0.25)
 
         XCTAssertFalse(playback.isPlaying)
         XCTAssertEqual(fake.currentTime, 4, accuracy: 0.001)
@@ -209,14 +298,16 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.play(blob: Data([1]))
-        playback.seek(fraction: 0.5)
+        playback.play(key: messageA, blob: Data([1]))
+        playback.seek(key: messageA, fraction: 0.5)
 
         XCTAssertTrue(playback.isPlaying)
         XCTAssertEqual(fake.currentTime, 8, accuracy: 0.001)
         XCTAssertEqual(playback.elapsed, 8, accuracy: 0.001)
     }
 
+    /// Leaving the conversation is the one thing that stops a message the
+    /// listener did not stop themselves.
     func testStoppingClearsProgress() {
         let fake = FakeVoiceMemoAudioPlayer()
         fake.duration = 8
@@ -226,12 +317,14 @@ final class VoiceMemoPlaybackTests: XCTestCase {
             deactivateAudioSession: {}
         )
 
-        playback.play(blob: Data([1]))
+        playback.play(key: messageA, blob: Data([1]))
         playback.stop()
 
         XCTAssertEqual(playback.elapsed, 0)
         XCTAssertEqual(playback.total, 0)
         XCTAssertFalse(playback.isPlaying)
+        XCTAssertNil(playback.activeKey)
+        XCTAssertTrue(fake.stopped)
     }
 }
 

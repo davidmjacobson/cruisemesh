@@ -37,6 +37,12 @@ struct GroupChatView: View {
     @State private var showVoice = false
     @State private var voiceRecorder = VoiceRecorder()
     @State private var voiceRecording = false
+    /// Playback for every voice message in this group, held above the list so a
+    /// message survives its bubble scrolling out of view. `@State`, not
+    /// `@StateObject`: this screen holds the player but must not redraw the
+    /// whole thread ten times a second while a message plays — the voice
+    /// bubble is the only view that observes it.
+    @State private var voicePlayback = VoiceMemoPlaybackController()
     @State private var statusMessage: String?
     @State private var viewedPhoto: ViewedPhoto?
     @State private var reactionDetails: GroupReactionDetails?
@@ -87,6 +93,7 @@ struct GroupChatView: View {
                                     let replyKey = replyMessageKey(message)
                                     GroupMessageRow(
                                         message: message,
+                                        messageKey: row.rowId,
                                         isOwn: message.senderUserId == identity.userId,
                                         tick: tickFor(message),
                                         groupName: activeGroup.name,
@@ -96,6 +103,7 @@ struct GroupChatView: View {
                                         canReply: replyMetadata[replyKey]?.msgId != nil,
                                         reactions: row.reactions,
                                         timeLabel: row.timeLabel,
+                                        voicePlayback: voicePlayback,
                                         arrivalLabel: row.arrivalLabel,
                                         onReact: { emoji in
                                             sendReaction(to: message, emoji: emoji)
@@ -224,6 +232,7 @@ struct GroupChatView: View {
             ChatVisibility.clearVisible(activeGroup.id)
             ChatEvents.notifyChatChanged(activeGroup.id)
             voiceRecorder.cancel()
+            voicePlayback.stop()
         }
         .onChange(of: scenePhase) { phase in
             // Backgrounding leaves the view "appeared" (no onDisappear), so a
@@ -615,6 +624,9 @@ struct GroupChatRowModel: Equatable {
 
 private struct GroupMessageRow: View {
     let message: StoredMessage
+    /// Stable across reloads and scrolling; identifies a voice message to the
+    /// group's player.
+    let messageKey: String
     let isOwn: Bool
     let tick: TickStatus?
     let groupName: String
@@ -624,6 +636,9 @@ private struct GroupMessageRow: View {
     let canReply: Bool
     let reactions: [ReactionSummary]
     let timeLabel: String
+    /// The group's voice player. Not observed here: only the voice bubble
+    /// itself redraws while a message plays.
+    let voicePlayback: VoiceMemoPlaybackController
     var arrivalLabel: String? = nil
     let onReact: (String) -> Void
     let onReactionDetails: (String) -> Void
@@ -679,8 +694,10 @@ private struct GroupMessageRow: View {
                                     )
                                 case .audio:
                                     VoiceMemoPlayerView(
+                                        messageKey: messageKey,
                                         blob: attachment.blob,
-                                        durationMs: attachment.durationMs
+                                        durationMs: attachment.durationMs,
+                                        playback: voicePlayback
                                     )
                                 }
                                 if !attachment.caption.isEmpty {
