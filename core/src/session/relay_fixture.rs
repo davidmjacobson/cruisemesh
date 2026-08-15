@@ -313,6 +313,10 @@ pub fn core_relay_fixture_plan(
             relay_url: Some(contact_url),
             relay_token: Some(contact_token),
             endpoint_usable: true,
+            // These fixtures replay incidents recorded before the resting
+            // endpoint was told apart from a written-off one, so their contact
+            // endpoint is answering by construction.
+            endpoint_answering: true,
         }]
     } else {
         Vec::new()
