@@ -985,7 +985,7 @@ fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
     assert_eq!(
         courier
             .store
-            .carried_envelopes_for_peer_sync(vec![], vec![], BASE_NOW, u64::MAX, None)
+            .carried_envelopes_for_peer_sync(vec![], vec![], BASE_NOW, u64::MAX, u32::MAX, None)
             .expect("courier carry queue")
             .rows
             .len(),

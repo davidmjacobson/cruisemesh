@@ -671,11 +671,15 @@ impl MessageStore {
         carried_cursor: Option<CoreCarriedCursor>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
         self.prune_expired_carried(now_ms)?;
+        // The row ceiling is core's own, not a shell parameter: it is a
+        // property of what a link can absorb in one round, and the shells have
+        // no business tuning it per call.
         let carried = self.carried_envelopes_for_peer_sync(
             peer_hints,
             peer_known_msg_ids.clone(),
             now_ms,
             carried_budget_bytes,
+            crate::store::DEFAULT_CARRIED_PAGE_MAX_ROWS,
             carried_cursor,
         )?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
@@ -2684,7 +2688,7 @@ mod tests {
         // is carried.
         assert_eq!(
             store
-                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, None)
+                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, u32::MAX, None)
                 .unwrap()
                 .rows
                 .len(),
@@ -2760,7 +2764,7 @@ mod tests {
         // Removal still waits on digest-proof of receipt.
         assert_eq!(
             store
-                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, None)
+                .carried_envelopes_for_peer_sync(vec![], vec![], now_ms, u64::MAX, u32::MAX, None)
                 .unwrap()
                 .rows
                 .len(),

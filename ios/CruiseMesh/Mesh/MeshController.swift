@@ -3540,13 +3540,41 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // G2: budgeted page + resume cursor (DTN: offer only, never remove on send).
         let lane = MeshRouter.targetedCarriedLaneFor(address: address, nowMs: now)
         if lane.skip { return 0 }
+        // G3: HELLO drains share the foreign-carry allowance with digest sprays
+        // and reserve by authenticated user, so duplicate roles or rotating
+        // addresses for one phone cannot each enqueue a full page inside one
+        // connection burst. This lane was the one still running ungated here.
+        guard let reservation = CarriedOfferEpochGate.tryReserve(
+            nowMs: now,
+            logicalPeerId: UserIdHex.encode(peerUserId)
+        ) else {
+            log.debug("Targeted carried drain deferred for \(address, privacy: .public) (foreign-carry allowance spent this window)")
+            return 0
+        }
         let hints = (try? store.deliveryHintsForPeer(peerUserId: peerUserId, nowMs: now)) ?? []
         guard let page = try? store.carriedEnvelopesForHintsPage(
             hints: hints,
             nowMs: now,
             budgetBytes: carriedBudgetBytes,
+            maxRows: coreCarriedPageMaxRows(),
             after: lane.after
-        ) else { return 0 }
+        ) else {
+            CarriedOfferEpochGate.release(reservation)
+            return 0
+        }
+        guard !page.rows.isEmpty else {
+            // Nothing offered, so the slot returns to the pool for another peer
+            // in this window. The lane still records where its walk got to.
+            CarriedOfferEpochGate.release(reservation)
+            MeshRouter.recordTargetedCarriedProgress(
+                address: address,
+                next: page.next,
+                exhausted: page.exhausted,
+                nowMs: now
+            )
+            return 0
+        }
+        CarriedOfferEpochGate.commit(reservation)
         var delivered = 0
         var queuedBytes = 0
         for env in page.rows {
@@ -3572,29 +3600,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             log.info("Attempted delivery of \(delivered)/\(page.rows.count) carried envelope(s) to \(address, privacy: .public) (budgeted HELLO drain; removal awaits their digest confirmation)")
         }
         return queuedBytes
-    }
-
-    private static let carriedOfferEpochLock = NSLock()
-    private static var carriedOfferEpochStartMs: Int64 = 0
-    private static var carriedOffersThisEpoch: UInt32 = 0
-    private static let carriedOfferEpochMs: Int64 = 5_000
-
-    private static func activeCarriedOffersInEpoch(nowMs: Int64) -> UInt32 {
-        carriedOfferEpochLock.lock(); defer { carriedOfferEpochLock.unlock() }
-        if nowMs - carriedOfferEpochStartMs > carriedOfferEpochMs {
-            carriedOfferEpochStartMs = nowMs
-            carriedOffersThisEpoch = 0
-        }
-        return carriedOffersThisEpoch
-    }
-
-    private static func noteCarriedOfferInEpoch(nowMs: Int64) {
-        carriedOfferEpochLock.lock(); defer { carriedOfferEpochLock.unlock() }
-        if nowMs - carriedOfferEpochStartMs > carriedOfferEpochMs {
-            carriedOfferEpochStartMs = nowMs
-            carriedOffersThisEpoch = 0
-        }
-        carriedOffersThisEpoch += 1
     }
 
     /// Executes Rust's complete digest-time mule plan, inside the budgets
@@ -3656,9 +3661,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // rows; once the walk reaches the tail the lane parks until its
         // cooldown elapses. A zero budget is the lane's own off switch.
         let lane = MeshRouter.carriedLaneFor(address: address, nowMs: now)
-        // G3: cap concurrent foreign-carry offers across peers.
-        let active = Self.activeCarriedOffersInEpoch(nowMs: now)
-        let allowCarried = !lane.skip && mayStartCarriedOffer(activeOffers: active)
+        // G3: cap concurrent foreign-carry offers across peers in a short
+        // window, reserving by authenticated user rather than by link address
+        // so one phone reaching us twice cannot claim the whole allowance. Own
+        // mail and receipts still flow when carried is deferred.
+        let reservation = lane.skip
+            ? nil
+            : CarriedOfferEpochGate.tryReserve(
+                nowMs: now,
+                logicalPeerId: UserIdHex.encode(peerUserId)
+            )
+        let allowCarried = reservation != nil
         guard let plan = try? store.coreDigestSprayPlan(
             ownUserId: identity.userId,
             peerUserId: peerUserId,
@@ -3673,6 +3686,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address),
             carriedCursor: lane.after
         ) else {
+            if let reservation { CarriedOfferEpochGate.release(reservation) }
             log.warning("Failed to build digest spray plan for \(address, privacy: .public)")
             return
         }
@@ -3687,6 +3701,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lanes: plan.lanes
         )
         let sendCarried = allowCarried && admission.sendCarried
+        if let reservation {
+            // A plan that offers nothing gives its slot back, so a peer that
+            // was going to be sprayed in this window still can be.
+            if !sendCarried || plan.carriedFrames.isEmpty {
+                CarriedOfferEpochGate.release(reservation)
+            } else {
+                CarriedOfferEpochGate.commit(reservation)
+            }
+        }
         guard admission.send else {
             log.info("Suppressed an unchanged digest spray to \(address, privacy: .public) (\(plan.planBytes) bytes, re-offerable in \(admission.reofferInMs)ms)")
             return
@@ -3716,9 +3739,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 exhausted: plan.carriedExhausted,
                 nowMs: now
             )
-            if !plan.carriedFrames.isEmpty {
-                Self.noteCarriedOfferInEpoch(nowMs: now)
-            }
         }
     }
 

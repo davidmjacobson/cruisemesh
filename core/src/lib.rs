@@ -255,7 +255,7 @@ pub use spray_policy::{
     SPRAY_STATE_RETENTION_MS, TOTAL_ENCOUNTER_BUDGET_BYTES,
 };
 pub use store::{
-    core_peer_transport_for_arrival, core_peer_transport_is_observed,
+    core_carried_page_max_rows, core_peer_transport_for_arrival, core_peer_transport_is_observed,
     inspect_restored_message_store, sanitize_restored_message_store,
     sanitize_restored_message_store_with_options, BackupContentOptions, BackupInventory,
     BackupSanitizationReport, CarriedEnvelope, ConsumedHiddenLamport, Contact,
@@ -265,13 +265,14 @@ pub use store::{
     GroupReceiptState, IncomingMessageInsertOutcome, MessageArrival, MessageConflictSummary,
     MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
     PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
-    PendingSharedRequest, RelayFetchCursor, StoredMessage,
+    PendingSharedRequest, RelayFetchCursor, StoredMessage, DEFAULT_CARRIED_PAGE_MAX_ROWS,
 };
 pub use transport_policy::{
-    core_transport_send_plan, digest_is_expected_chat_id, digest_is_shared_group,
-    digest_through_lamport_for_sender, may_start_carried_offer, CoreCarriedLane,
-    CoreIdentifiedRoute, CoreLanHealthAction, CoreLanHealthDecision, CoreLanHealthTracker,
-    CoreMeshRouterState, CoreReconnectBackoffTracker, CoreTransport, CoreTransportRoute,
+    core_carried_offer_epoch_ms, core_transport_send_plan, digest_is_expected_chat_id,
+    digest_is_shared_group, digest_through_lamport_for_sender, may_start_carried_offer,
+    CoreCarriedLane, CoreCarriedOfferGate, CoreCarriedOfferReservation, CoreIdentifiedRoute,
+    CoreLanHealthAction, CoreLanHealthDecision, CoreLanHealthTracker, CoreMeshRouterState,
+    CoreReconnectBackoffTracker, CoreTransport, CoreTransportRoute, CARRIED_OFFER_EPOCH_MS,
     CARRIED_REWALK_MIN_INTERVAL_MS, DEFAULT_INITIAL_BACKOFF_MS, DEFAULT_LAN_HEALTH_MAX_TIMEOUTS,
     DEFAULT_LAN_HEALTH_TIMEOUT_MS, DEFAULT_MAX_BACKOFF_MS, DEFAULT_MAX_CONSECUTIVE_FAILURES,
     MAX_CONCURRENT_CARRIED_OFFERS,

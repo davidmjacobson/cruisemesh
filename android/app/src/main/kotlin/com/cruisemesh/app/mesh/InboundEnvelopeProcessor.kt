@@ -25,6 +25,7 @@ import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDiscoveryPolicy
 import uniffi.cruisemesh_core.ContactProvenance
+import uniffi.cruisemesh_core.CoreCarriedOfferReservation
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreInboundDisposition
 import uniffi.cruisemesh_core.CoreInboundGate
@@ -43,6 +44,7 @@ import uniffi.cruisemesh_core.ReceiptContent
 import uniffi.cruisemesh_core.PendingSharedRequest
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.applyGroupMetadataUpdate
+import uniffi.cruisemesh_core.coreCarriedPageMaxRows
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
@@ -86,10 +88,12 @@ private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
 // bounds how much foreign traffic this device *stores*, not how much it offers
 // in one encounter.
 
-/** G3: rolling window in which concurrent foreign-carry offers are capped. */
-private const val CARRIED_OFFER_EPOCH_MS: Long = 5_000L
-
-private val carriedOfferGate = CarriedOfferEpochGate(CARRIED_OFFER_EPOCH_MS)
+/**
+ * G3: the shared foreign-carry allowance, whose cap and window both live in the
+ * core (see `CoreCarriedOfferGate`). Shared by the HELLO drain and the digest
+ * spray so the two lanes cannot each claim a full allowance for one peer.
+ */
+private val carriedOfferGate = CarriedOfferEpochGate()
 
 /**
  * Decoded pairwise-stream metadata carried out of the delivery switch only
@@ -698,7 +702,7 @@ internal class InboundEnvelopeProcessor(
             return 0L
         }
         val now = System.currentTimeMillis()
-        var carriedReservation: CarriedOfferEpochGate.Reservation? = null
+        var carriedReservation: CoreCarriedOfferReservation? = null
         var queuedBytes = 0L
         try {
             store.pruneExpiredCarried(now)
@@ -725,6 +729,7 @@ internal class InboundEnvelopeProcessor(
                 deliveryHints,
                 now,
                 carriedBudgetBytes,
+                coreCarriedPageMaxRows(),
                 lane.after,
             )
             if (page.rows.isEmpty()) {
@@ -2418,7 +2423,7 @@ internal class InboundEnvelopeProcessor(
         peerAuthenticated: Boolean,
     ) {
         val now = System.currentTimeMillis()
-        var carriedReservation: CarriedOfferEpochGate.Reservation? = null
+        var carriedReservation: CoreCarriedOfferReservation? = null
         try {
             // DTN D2 mule-drain-confirm (DTN_TODOS.md §3.2): confirm delivery
             // of anything this digest's advertised `msg_id`s prove the peer
