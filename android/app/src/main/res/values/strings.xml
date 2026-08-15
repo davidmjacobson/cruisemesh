@@ -15,6 +15,8 @@
     <string name="ui_add_a_friend_to_start_messaging_over_bluetooth">Add a friend to start messaging over Bluetooth — no Wi-Fi needed.</string>
     <string name="ui_connected">You\'re connected</string>
     <string name="ui_friend_added">Friend added</string>
+    <!-- One-time hint, shown once after the first friend is added -->
+    <string name="ui_hint_try_airplane_mode">Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.</string>
     <string name="ui_add_all">Add all</string>
     <string name="ui_add_all_count">Add all (%1$d)</string>
     <string name="ui_add_count">Add (%1$d)</string>
@@ -400,7 +402,7 @@
     <string name="ui_profile">Profile</string>
     <!-- Composer notice: which direction of this chat cannot cross the internet -->
     <string name="ui_composer_replies_cannot_reach_you">Your messages will reach %1$s, but their replies only arrive when you\'re near each other. Set up a Shore Pass to get replies anywhere.</string>
-    <string name="ui_composer_they_cannot_be_reached">%1$s hasn\'t set up a Shore Pass, so your messages only arrive when you\'re near each other. They need their own pass to be reached from further away.</string>
+    <string name="ui_composer_they_cannot_be_reached">Messages you send %1$s while you\'re apart wait in your family\'s Shore Pass mailbox until their phone picks them up. If their phone isn\'t set up with your pass, they\'ll wait until you\'re near each other.</string>
     <string name="ui_composer_neither_direction_works">Neither phone has a Shore Pass, so messages only cross when you\'re near each other. Either of you can set one up.</string>
     <!-- Shore Pass -->
     <string name="ui_shore_pass">Shore Pass</string>

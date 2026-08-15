@@ -2361,6 +2361,16 @@
         }
       }
     },
+    "Got it": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Got it"
+          }
+        }
+      }
+    },
     "Group": {
       "localizations": {
         "en": {
@@ -4199,6 +4209,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Try again"
+          }
+        }
+      }
+    },
+    "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through."
           }
         }
       }

@@ -10,6 +10,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -24,6 +26,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -109,6 +112,16 @@ fun FriendConfirmationSheet(
         }
     }
 
+    // Read once and written straight away: the hint is offered at the first
+    // friend-added sheet and never again, whether it is dismissed or the sheet
+    // is swiped away with it still on screen.
+    val context = LocalContext.current
+    var showAirplaneHint by remember {
+        val show = AirplaneDemoHintStore.shouldShow(context)
+        if (show) AirplaneDemoHintStore.markShown(context)
+        mutableStateOf(show)
+    }
+
     ModalBottomSheet(onDismissRequest = onDone) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp).padding(bottom = 24.dp),
@@ -143,11 +156,45 @@ fun FriendConfirmationSheet(
                 )
             }
 
+            if (showAirplaneHint) {
+                AirplaneDemoHint(onDismiss = { showAirplaneHint = false })
+            }
+
             Button(onClick = onSayHi, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_say_hi)) }
             if (onAddAnother != null) {
                 TextButton(onClick = onAddAnother, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_add_another)) }
             }
             TextButton(onClick = onDone, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_done)) }
+        }
+    }
+}
+
+/**
+ * The one-time "prove it to yourself" nudge, shown inside the friend-added
+ * sheet the first time somebody has a person to try it with. Deliberately a
+ * quiet card rather than a dialog: it is an invitation, not a warning, and the
+ * sheet's own buttons stay the primary action.
+ */
+@Composable
+private fun AirplaneDemoHint(onDismiss: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                stringResource(R.string.ui_hint_try_airplane_mode),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            TextButton(onClick = onDismiss, modifier = Modifier.align(Alignment.End)) {
+                Text(stringResource(R.string.ui_got_it))
+            }
         }
     }
 }

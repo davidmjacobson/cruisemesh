@@ -154,6 +154,10 @@ struct FriendConfirmationView: View {
     let onAddAnother: (() -> Void)?
     let onDone: () -> Void
     @State private var connected: Bool
+    /// Read once as the sheet is built, and recorded straight away: the hint
+    /// is offered at the first friend-added sheet and never again, whether it
+    /// is dismissed or the sheet is swiped away with it still on screen.
+    @State private var showAirplaneHint: Bool
 
     init(
         state: FriendAddedState,
@@ -172,6 +176,7 @@ struct FriendConfirmationView: View {
                 && state.delivery.lamport == 0
                 && state.delivery.reachedDirectly
         )
+        _showAirplaneHint = State(initialValue: AirplaneDemoHintStore.shouldShow())
     }
 
     var body: some View {
@@ -185,6 +190,14 @@ struct FriendConfirmationView: View {
             Label(statusText, systemImage: connected ? "checkmark.circle.fill" : "clock.arrow.circlepath")
                 .font(.callout)
                 .foregroundStyle(connected ? Color.accentColor : .secondary)
+            if showAirplaneHint {
+                AirplaneDemoHint { showAirplaneHint = false }
+                    // Marked only once the hint has actually been on screen:
+                    // SwiftUI builds view values eagerly, so doing this in
+                    // init would burn the one-time hint for sheets that are
+                    // never presented.
+                    .onAppear { AirplaneDemoHintStore.markShown() }
+            }
             Button("Say hi", action: onSayHi).buttonStyle(.borderedProminent)
             if let onAddAnother { Button("Add another", action: onAddAnother) }
             Button("Done", action: onDone)
@@ -217,5 +230,27 @@ struct FriendConfirmationView: View {
             return "Sending \(displayName) your card through the relay so they can message you back."
         }
         return "Your card will reach \(displayName) next time your phones are near each other. Until then, only you can start the chat."
+    }
+}
+
+/// The one-time "prove it to yourself" nudge, shown inside the friend-added
+/// sheet the first time somebody has a person to try it with. Deliberately a
+/// quiet card rather than an alert: it is an invitation, not a warning, and the
+/// sheet's own buttons stay the primary action.
+struct AirplaneDemoHint: View {
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.")
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Got it", action: onDismiss)
+                .font(.callout)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .padding(12)
+        .background(Color(.secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 }
