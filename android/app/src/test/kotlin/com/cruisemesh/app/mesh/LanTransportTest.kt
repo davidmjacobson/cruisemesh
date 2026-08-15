@@ -291,6 +291,14 @@ class LanTransportTest {
         assertTrue(!lanHostIsOwnDevice(locals, "192.168.86.23"))
         assertTrue(!lanHostIsOwnDevice(locals, "2001:db8::2"))
         assertTrue(!lanHostIsOwnDevice(emptySet(), "192.168.86.20"))
+
+        // Java's NetworkInterface reports link-local IPv6 with a zone suffix
+        // (fe80::1%wlan0); a peer-observed address arrives without one. The
+        // comparison normalizes both spellings, in either direction.
+        val scoped = setOf("fe80::1%wlan0")
+        assertTrue(lanHostIsOwnDevice(scoped, "fe80::1"))
+        assertTrue(lanHostIsOwnDevice(setOf("fe80::1"), "fe80::1%wlan0"))
+        assertTrue(!lanHostIsOwnDevice(scoped, "fe80::2"))
     }
 
     @Test
