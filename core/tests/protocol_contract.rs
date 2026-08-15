@@ -37,6 +37,18 @@ use std::sync::Arc;
 
 use data_encoding::BASE64URL_NOPAD;
 
+use cruisemesh_core::media::bitmap::ChunkBitmap;
+use cruisemesh_core::media::blob::{
+    blob_id_for_ciphertext, open_blob, seal_blob, verify_assembled, BlobKey,
+};
+use cruisemesh_core::media::lan_pull::{
+    PullActionKind, PullBudgets, PullPlan, PullResult, PullSession,
+};
+use cruisemesh_core::media::manifest::{
+    decode_media_manifest, encode_media_manifest, MediaKind, MediaManifest,
+};
+use cruisemesh_core::media::store::BlobStore;
+use cruisemesh_core::media::wire::PullFrame;
 use cruisemesh_core::{
     authored_expiry, compute_recipient_hint, core_contact_relay_unreachable_delta,
     core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
@@ -44,21 +56,21 @@ use cruisemesh_core::{
     core_own_capabilities, core_relay_ack_ids, core_relay_pass_default_budgets,
     core_relay_queue_reflects_delivery, core_relay_rerun_action, core_should_ack_inbound,
     encode_envelope_frame, encode_hello, encode_hello2, encode_message_body, generate_identity,
-    may_start_carried_offer, parse_frame, relay_classify_http_error, relay_cursor_advance,
-    relay_cursor_key, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
-    relay_mailbox_walk_action, relay_retry_after_ms, seal_message, CarriedEnvelope, Contact,
-    CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreFamilyRelayPacer, CoreInboundDisposition,
-    CoreInboundSource, CoreRelayActionKind, CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition,
-    CoreRelayFault, CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult,
-    CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome,
-    CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction,
-    CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame,
-    MessageArrival, MessageBody, MessageStore, RelayMailboxWalkAction, SeenIds,
-    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, DEFAULT_HOP_TTL,
-    FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES,
-    MAX_SPRAY_INTERVAL_MS, MS_PER_DAY, OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
-    OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
+    may_start_carried_offer, open_message, parse_frame, relay_classify_http_error,
+    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
+    relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
+    seal_message, CarriedEnvelope, Contact, CoreDeliveryVerdict, CoreDiscoveryPolicyState,
+    CoreFamilyRelayPacer, CoreInboundDisposition, CoreInboundSource, CoreRelayActionKind,
+    CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
+    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayOperation,
+    CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan,
+    CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan,
+    CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageArrival, MessageBody,
+    MessageStore, RelayMailboxWalkAction, SeenIds, CAP_ACKS_HIDDEN_KINDS,
+    CARRIED_SPRAY_BUDGET_BYTES, DEFAULT_HOP_TTL, FAMILY_RELAY_BACKOFF_BASE_MS,
+    FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT,
+    KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS, MS_PER_DAY,
+    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,12 +89,11 @@ enum Owner {
     },
     /// Nothing pins this yet.
     ///
-    /// No invariant is in this class as of package C0 — LIVE-01, PROGRESS-01,
-    /// IDEMP-01 and TXN-01 were the last four and `relay_pass.rs` owns them
-    /// now. The variant stays because the next invariant this contract gains
-    /// will start here, and deleting it would make "there is nowhere to put
-    /// an unowned rule" the reason nobody writes one down.
-    #[allow(dead_code)]
+    /// The relay-pass invariants left this class in package C0. The blob
+    /// plane's three unbuilt halves — third-party carry, expensive-path
+    /// consent, and the relay blob store — put it back to use, which is what
+    /// the class is for: a rule that is real and unowned is carried here
+    /// rather than left as prose nobody counts.
     Unimplemented { package: &'static str },
 }
 
@@ -306,6 +317,62 @@ const CONTRACT: &[Invariant] = &[
              core/src/session/relay_pass.rs keeps the row queued; \
              core/tests/relay_pass_replay.rs proves the outbound row is not marked posted",
         ),
+    },
+    Invariant {
+        id: "BLOB-01",
+        statement: "Blob bytes never enter an envelope, a carry queue, a spray plan, or a BLE \
+                    frame, and no third party stores, forwards, or serves another person's blob.",
+        owner: Owner::Unimplemented {
+            package: "the media integration phase adds blob-flavoured cases to the spray and \
+                      carry suites; today the rule holds only because core/src/media/ is \
+                      reachable from no dispatch, carry, or framing path",
+        },
+    },
+    Invariant {
+        id: "BLOB-02",
+        statement: "A blob id is the digest of the ciphertext; the blob key exists only inside \
+                    sealed message content; stores and the wire see encrypted bytes only.",
+        owner: Owner::Core(
+            "core/src/media/blob.rs encrypt-then-name and wrong-key tests, \
+             core/src/media/manifest.rs sealing round trip, core/src/media/store.rs column scan",
+        ),
+    },
+    Invariant {
+        id: "BLOB-03",
+        statement: "No blob transfer starts on an expensive or roaming path without an explicit \
+                    user action, and no third party is ever asked to move blob bytes.",
+        owner: Owner::Unimplemented {
+            package: "the media integration phase owns the path-cost verdict; the pull-only \
+                      half is already pinned by core/src/media/lan_pull.rs",
+        },
+    },
+    Invariant {
+        id: "BLOB-04",
+        statement: "The device partial-transfer budget, its eviction rule, and each session's \
+                    request, chunk, byte and deadline budgets are enforced; a spent budget \
+                    resumes from the bitmap rather than restarting.",
+        owner: Owner::Core(
+            "core/src/media/store.rs budget and LRU eviction tests + \
+             core/src/media/lan_pull.rs budget and deadline tests on both roles",
+        ),
+    },
+    Invariant {
+        id: "BLOB-05",
+        statement: "No blob is decrypted, shown, or retained without matching its manifest \
+                    digest, and no chunk becomes progress without authenticating first.",
+        owner: Owner::Core(
+            "core/src/media/blob.rs digest and per-chunk authentication tests + \
+             core/src/media/lan_pull.rs corrupted-chunk recovery",
+        ),
+    },
+    Invariant {
+        id: "BLOB-06",
+        statement: "The relay blob store's per-family quota, expiry, and per-request range cap \
+                    are enforced, separately from the mailbox quota.",
+        owner: Owner::Unimplemented {
+            package: "phase 2 of the media work (relayd blob endpoints); phase 1 is LAN-only \
+                      and changes no relay code",
+        },
     },
 ];
 
@@ -2669,7 +2736,21 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // and the client half is driven in `relay_pass_replay.rs` against a
     // scripted relay. A JSONL incident would be a third statement of the
     // cadence with no field trace behind it.
+    // The whole BLOB family is exempt for one reason: fixtures in this corpus
+    // are relay-pass incident transcripts, and the blob plane deliberately has
+    // no relay pass and no message-plane frames of its own. Its executable
+    // owners are plain unit vectors in `core/src/media/` — golden encodings, a
+    // driven requester/responder pair over a fake clock, and SQLite budget
+    // tests. Writing a JSONL trace for them would be a second statement of the
+    // same behaviour with no field incident behind it. BLOB-01, BLOB-03 and
+    // BLOB-06 are unimplemented besides.
     const NO_FIXTURE_NEEDED: &[&str] = &[
+        "BLOB-01",
+        "BLOB-02",
+        "BLOB-03",
+        "BLOB-04",
+        "BLOB-05",
+        "BLOB-06",
         "ACK-01",
         "ACK-02",
         "CARRY-02",
@@ -2715,6 +2796,233 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The blob plane
+// ---------------------------------------------------------------------------
+//
+// `core/src/media/` is dark: nothing on either shell reaches it and it is
+// exported over no binding. It is declared `pub` so this index can assert the
+// invariants it owns from outside the crate, which is the only way a contract
+// rule and its owner can be checked together while the feature waits for its
+// integration phase.
+
+#[test]
+fn blob_02_a_blob_id_names_the_ciphertext_and_never_the_plaintext() {
+    let id = lookup("BLOB-02").id;
+    let key = BlobKey([0x5A; 32]);
+    let plaintext = vec![9u8; 300_000];
+    let sealed = seal_blob(&key, &plaintext).expect("a blob seals");
+
+    contract_assert!(
+        id,
+        sealed.id == blob_id_for_ciphertext(&sealed.ciphertext),
+        "the blob id must be the digest of the bytes that cross the wire"
+    );
+    contract_assert!(
+        id,
+        sealed.id != blob_id_for_ciphertext(&plaintext),
+        "naming the plaintext would let a holder of the digest confirm content it \
+         cannot read"
+    );
+
+    // The key crosses only inside ordinary sealed message content: the same
+    // seal_message construction as every other body, with no media-specific
+    // wrapping anywhere.
+    let alice = generate_identity();
+    let bob = generate_identity();
+    let manifest = MediaManifest {
+        blob_id: sealed.id,
+        blob_key: key.clone(),
+        plaintext_bytes: sealed.geometry.plaintext_bytes,
+        kind: MediaKind::Photo,
+        mime_type: "image/jpeg".into(),
+        width: 4_032,
+        height: 3_024,
+        duration_ms: 0,
+        thumbnail: vec![0xAB; 1_024],
+        caption: "the fjords".into(),
+    };
+    let body = encode_media_manifest(&manifest).expect("a manifest encodes");
+    let envelope = seal_message(alice, bob.agree_pk.clone(), body.clone()).expect("seal");
+    contract_assert!(
+        id,
+        !envelope
+            .windows(key.as_bytes().len())
+            .any(|window| window == key.as_bytes()),
+        "the blob key must not be legible anywhere in the sealed envelope"
+    );
+    let opened = open_message(bob, envelope).expect("open");
+    contract_assert!(
+        id,
+        decode_media_manifest(&opened.payload)
+            .expect("decode")
+            .blob_key
+            == key,
+        "and it must arrive intact for the recipient the manifest was sealed to"
+    );
+}
+
+#[test]
+fn blob_04_both_roles_stop_inside_the_budgets_they_declared() {
+    let id = lookup("BLOB-04").id;
+    let key = BlobKey([0x33; 32]);
+    // Forty chunks: far more than one session's declared window.
+    let plaintext = vec![4u8; 40 * 256 * 1024];
+    let sealed = seal_blob(&key, &plaintext).expect("a blob seals");
+
+    let budgets = PullBudgets {
+        max_requests: 1,
+        ..PullBudgets::default()
+    };
+    let mut session = PullSession::new(PullPlan {
+        blob_id: sealed.id,
+        blob_key: key.clone(),
+        geometry: sealed.geometry,
+        bitmap: ChunkBitmap::empty(sealed.geometry.chunk_count).expect("bitmap"),
+        budgets,
+    });
+
+    let open = session.start(1_000);
+    let challenged = session.resume(
+        PullResult::Frame {
+            action_id: open.action_id,
+            frame: PullFrame::Challenge {
+                nonce: [0x01; 16],
+                chunks_held: sealed.geometry.chunk_count,
+            },
+        },
+        1_010,
+    );
+    let PullActionKind::Send {
+        frame: PullFrame::Fetch { ranges, .. },
+    } = &challenged.kind
+    else {
+        panic!("a fetch follows the challenge");
+    };
+    let asked: u32 = ranges.iter().map(|range| range.count).sum();
+    contract_assert!(
+        id,
+        asked <= budgets.window_chunks,
+        "one request asked for {asked} chunks against a {}-chunk window",
+        budgets.window_chunks
+    );
+
+    let summary = session.cancel(1_020);
+    contract_assert!(
+        id,
+        summary.requests_issued <= budgets.max_requests,
+        "a session issued {} requests against a budget of {}",
+        summary.requests_issued,
+        budgets.max_requests
+    );
+
+    // The device budget: eviction is bounded, deterministic, and refuses to
+    // take a row it promised not to.
+    let db = rusqlite::Connection::open_in_memory().expect("sqlite");
+    let store = BlobStore::open(&db).expect("schema");
+    let small = seal_blob(&key, &vec![1u8; 4_096]).expect("a blob seals");
+    store
+        .begin(&small.id, &small.geometry, "one.part", 1_000)
+        .expect("begin");
+    store.record_chunk(&small.id, 0, 1_010).expect("chunk");
+    let plan = store.plan_eviction(0).expect("plan");
+    contract_assert!(
+        id,
+        plan.is_empty() && plan.protected_bytes > 0,
+        "a blob whose manifest is unread must survive any pressure, and the plan must \
+         say what it could not reclaim"
+    );
+}
+
+#[test]
+fn blob_05_a_chunk_that_fails_authentication_is_never_progress() {
+    let id = lookup("BLOB-05").id;
+    let key = BlobKey([0x77; 32]);
+    let sealed = seal_blob(&key, &vec![2u8; 200_000]).expect("a blob seals");
+
+    let mut session = PullSession::new(PullPlan {
+        blob_id: sealed.id,
+        blob_key: key.clone(),
+        geometry: sealed.geometry,
+        bitmap: ChunkBitmap::empty(sealed.geometry.chunk_count).expect("bitmap"),
+        budgets: PullBudgets::default(),
+    });
+    let open = session.start(1_000);
+    let fetch = session.resume(
+        PullResult::Frame {
+            action_id: open.action_id,
+            frame: PullFrame::Challenge {
+                nonce: [0x02; 16],
+                chunks_held: sealed.geometry.chunk_count,
+            },
+        },
+        1_010,
+    );
+
+    let mut corrupt = sealed.ciphertext.clone();
+    corrupt[3] ^= 0xFF;
+    session.resume(
+        PullResult::Frame {
+            action_id: fetch.action_id,
+            frame: PullFrame::Chunk {
+                index: 0,
+                ciphertext: corrupt,
+            },
+        },
+        1_020,
+    );
+    contract_assert!(
+        id,
+        !session.bitmap().has(0),
+        "a chunk that failed authentication was marked present"
+    );
+    contract_assert!(
+        id,
+        session.take_accepted().is_empty(),
+        "a chunk that failed authentication was handed to the driver to store"
+    );
+    contract_assert!(
+        id,
+        session.summary().chunks_rejected == 1,
+        "a rejected chunk must be counted, not silently dropped"
+    );
+
+    // And at blob granularity: assembled bytes that do not match the manifest
+    // digest never open.
+    let mut assembled = sealed.ciphertext.clone();
+    assembled[0] ^= 0x01;
+    contract_assert!(
+        id,
+        verify_assembled(&sealed.id, &sealed.geometry, &assembled).is_err(),
+        "a digest mismatch must refuse before anything is decrypted"
+    );
+    contract_assert!(
+        id,
+        open_blob(&key, &sealed.id, &sealed.geometry, &assembled).is_err(),
+        "and opening must re-check rather than trust its caller"
+    );
+}
+
+#[test]
+#[ignore = "UNIMPLEMENTED: BLOB-01 plane separation has no adversarial owner yet. The media \
+            integration phase adds blob-flavoured cases to the spray and carry suites; today \
+            the rule holds only because core/src/media/ is reachable from no dispatch, carry, \
+            or framing path."]
+fn blob_01_plane_separation_has_no_adversarial_owner_yet() {}
+
+#[test]
+#[ignore = "UNIMPLEMENTED: BLOB-03's consent half has no owner. Phase 1 is LAN-only, so there \
+            is no expensive path for a blob to take; the media integration phase composes the \
+            verdict with the existing roaming deferral. The pull-only half is pinned by \
+            core/src/media/lan_pull.rs."]
+fn blob_03_expensive_path_consent_is_not_built() {}
+
+#[test]
+#[ignore = "UNIMPLEMENTED: BLOB-06 belongs to phase 2 of the media work. No relay blob store \
+            exists in this repository, so its quota, expiry and range cap have nothing to \
+            enforce them yet."]
+fn blob_06_the_relay_blob_store_does_not_exist_yet() {}
 
 // ---------------------------------------------------------------------------
 // The event ring, the contract document, and this registry must agree

@@ -261,6 +261,12 @@ pub fn protocol_event_codes() -> Vec<&'static str> {
 pub const PROTOCOL_INVARIANT_IDS: &[&str] = &[
     "ACK-01",
     "ACK-02",
+    "BLOB-01",
+    "BLOB-02",
+    "BLOB-03",
+    "BLOB-04",
+    "BLOB-05",
+    "BLOB-06",
     "CARRY-01",
     "CARRY-02",
     "CURSOR-01",
