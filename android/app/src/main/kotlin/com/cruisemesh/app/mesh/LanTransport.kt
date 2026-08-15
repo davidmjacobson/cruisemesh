@@ -22,8 +22,10 @@ import java.net.BindException
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
 import java.util.ArrayDeque
@@ -147,6 +149,13 @@ internal class LanTransport(
 
     @Volatile
     private var currentNetworkId: String? = null
+
+    // Cache for ownLanHostAddresses; see that method.
+    @Volatile
+    private var ownHostAddresses: Set<String>? = null
+
+    @Volatile
+    private var ownHostAddressesAtMs = 0L
 
     private var networkCallbackRegistered = false
     private var serverSocket: ServerSocket? = null
@@ -735,7 +744,15 @@ internal class LanTransport(
         endpoints: List<InetSocketAddress>,
         expectedUserId: ByteArray? = null,
     ) {
-        val remoteEndpoints = remoteLanEndpoints(endpointHint?.host, endpoints)
+        // Filtered here, on every dial, against every address this phone
+        // currently holds -- not once at discovery time against the single
+        // advertised address. A remembered target is replayed for as long as
+        // the phone stays on this network, so an address that was not
+        // recognisable as this phone's own when it was first seen (a restart
+        // racing a Wi-Fi join, a second interface, IPv6) has to be re-checked
+        // before every attempt. Nothing left to dial retires the target, so
+        // the retry timer stops instead of looping forever.
+        val remoteEndpoints = remoteLanEndpoints(ownLanHostAddresses(), endpoints)
         if (remoteEndpoints.isEmpty()) {
             reconnectTargets.remove(key)
             Log.i(TAG, "Ignoring LAN endpoint that resolves to this phone")
@@ -856,7 +873,23 @@ internal class LanTransport(
         var noise: LanNoiseSession? = null
         var authenticated = false
         var abortedDuplicateLink = false
+        var abortedSelfConnection = false
         try {
+            // Last line of defence against dialing this phone's own listener.
+            // Every earlier gate compares advertised addresses; this one asks
+            // the socket where it actually landed, against every address this
+            // device holds. Without it a self-dial completes Noise with this
+            // identity's own key, which the identity-clone check can only read
+            // as a stranger holding our key -- a durable warning the user
+            // dismisses and immediately sees again on the next retry.
+            //
+            // Genuine clone detection is untouched: this only fires for a
+            // remote address that is demonstrably one of ours.
+            if (isSelfConnection(socket)) {
+                abortedSelfConnection = true
+                Log.i(TAG, SELF_CONNECTION_LOG)
+                throw IOException(SELF_CONNECTION_LOG)
+            }
             socket.tcpNoDelay = true
             socket.keepAlive = true
             socket.soTimeout = HANDSHAKE_TIMEOUT_MS
@@ -973,8 +1006,8 @@ internal class LanTransport(
             Log.w(TAG, "LAN cryptographic session failed", error)
             LanTransportDiagnostics.connectionFailed(peerEndpoint, "Secure setup failed")
         } catch (error: IOException) {
-            Log.d(TAG, "LAN connection closed: ${error.message}")
-            if (!authenticated) {
+            if (!abortedSelfConnection) Log.d(TAG, "LAN connection closed: ${error.message}")
+            if (!authenticated && !abortedSelfConnection) {
                 LanTransportDiagnostics.connectionFailed(
                     peerEndpoint,
                     error.message ?: "Secure connection closed",
@@ -1002,7 +1035,12 @@ internal class LanTransport(
             outboundServiceKey?.let {
                 outboundServiceKeys.remove(it)
                 authenticatedOutboundKeys.remove(it)
-                if (abortedDuplicateLink) {
+                if (abortedSelfConnection) {
+                    // The remembered address is this phone. Retire it so the
+                    // retry timer stops instead of re-dialing ourselves every
+                    // backoff period for as long as we stay on this Wi-Fi.
+                    reconnectTargets.remove(it)
+                } else if (abortedDuplicateLink) {
                     // Not a failure: the contact already has a live LAN
                     // link. No backoff, no reconnect -- rediscovery covers
                     // a later drop of the surviving link.
@@ -1019,6 +1057,7 @@ internal class LanTransport(
             } else if (
                 outboundServiceKey != null &&
                 !abortedDuplicateLink &&
+                !abortedSelfConnection &&
                 !outboundServiceKey.startsWith("scan:")
             ) {
                 // A failed secure setup to a discovered/hinted peer: check
@@ -1087,8 +1126,17 @@ internal class LanTransport(
         endpoints: List<InetSocketAddress>,
         expectedUserId: ByteArray?,
     ) {
+        // Filed already filtered, so a target can never be created holding
+        // only this phone's own address. connectToEndpoints re-filters before
+        // every dial regardless -- this phone's addresses can change while a
+        // target sits remembered.
+        val remembered = remoteLanEndpoints(ownLanHostAddresses(), endpoints)
+        if (remembered.isEmpty()) {
+            reconnectTargets.remove(serviceKey)
+            return
+        }
         reconnectTargets[serviceKey] = ReconnectTarget(
-            endpoints = endpoints.toList(),
+            endpoints = remembered,
             expectedUserId = expectedUserId?.copyOf(),
         )
     }
@@ -1419,6 +1467,8 @@ internal class LanTransport(
         authenticatedUserIds.clear()
         endpointHint = null
         currentNetworkId = null
+        ownHostAddresses = null
+        ownHostAddressesAtMs = 0L
         LanTransportDiagnostics.waitingForWifi()
     }
 
@@ -1448,6 +1498,52 @@ internal class LanTransport(
 
     private fun releaseSocketSlot() {
         activeSocketCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    }
+
+    /**
+     * Every host address this phone currently answers on: the address it
+     * advertises plus every address on every live interface (v4 and v6).
+     *
+     * The advertised address alone is not enough. The mDNS instance token is
+     * new for every process, so after a restart this phone's own stale
+     * advertisement looks like a foreign peer; if it names an address the
+     * transport is not currently tracking -- a second interface, an IPv6
+     * address, or simply anything at all in the seconds after a Wi-Fi join
+     * before the advertised address is known -- the phone dials itself,
+     * handshakes with its own key, and records a durable identity-clone
+     * warning every retry.
+     *
+     * Enumerating interfaces costs a handful of syscalls, so the result is
+     * cached briefly; addresses do not change faster than that, and a connect
+     * during the stale window is still caught by the pre-handshake check on
+     * the socket's actual remote address.
+     */
+    private fun ownLanHostAddresses(): Set<String> {
+        val now = System.currentTimeMillis()
+        val cached = ownHostAddresses
+        if (cached != null && now - ownHostAddressesAtMs < OWN_ADDRESS_CACHE_MS) return cached
+        val hosts = linkedSetOf<String>()
+        endpointHint?.host?.let(hosts::add)
+        try {
+            for (networkInterface in NetworkInterface.getNetworkInterfaces()?.toList().orEmpty()) {
+                for (address in networkInterface.inetAddresses.toList()) {
+                    if (address.isAnyLocalAddress) continue
+                    address.hostAddress?.let(hosts::add)
+                }
+            }
+        } catch (_: SocketException) {
+            // Interface enumeration is unavailable; the advertised address
+            // (and the pre-handshake socket check) still apply.
+        }
+        ownHostAddresses = hosts
+        ownHostAddressesAtMs = now
+        return hosts
+    }
+
+    /** True when [socket] is connected to this very device. */
+    private fun isSelfConnection(socket: Socket): Boolean {
+        val remoteHost = socket.inetAddress?.hostAddress ?: return false
+        return lanHostIsOwnDevice(ownLanHostAddresses(), remoteHost)
     }
 
     private fun localEndpoint(network: Network, port: Int): LanManualEndpoint? {
@@ -1570,6 +1666,17 @@ internal class LanTransport(
 
     companion object {
         private const val TAG = "LanTransport"
+
+        /**
+         * The one distinct line a self-connect logs, so a future field log
+         * names the condition instead of showing a clone warning and a
+         * retry loop with no explanation between them.
+         */
+        internal const val SELF_CONNECTION_LOG =
+            "Closed a connection to this phone's own listener"
+
+        // How long ownLanHostAddresses reuses an interface enumeration.
+        private const val OWN_ADDRESS_CACHE_MS = 5_000L
         private const val TXT_VERSION = "v"
         private const val TXT_INSTANCE = "i"
         private const val MAX_CONNECTIONS = 8
@@ -1895,20 +2002,36 @@ internal fun lanHintMayBeCached(localHost: String?, candidateHost: String): Bool
         lanHostsShareLocalNetwork(localHost = localHost, candidateHost = candidateHost)
 
 /**
- * Removes only addresses that resolve to this phone's current listener host.
+ * Whether [candidateHost] is an address this device answers on.
+ *
+ * [localHosts] is every address this phone currently holds, not just the one
+ * it advertises: a phone that restarted while joining a Wi-Fi network can find
+ * its own stale advertisement under a different address (or none tracked yet)
+ * and dial itself, which reads as a stranger holding this identity's key.
+ */
+internal fun lanHostIsOwnDevice(localHosts: Collection<String>, candidateHost: String): Boolean =
+    localHosts.any { lanHostsAreSameAddress(leftHost = it, rightHost = candidateHost) }
+
+/**
+ * Removes only addresses that resolve to one of this phone's own hosts.
  * A Bonjour result can contain several addresses; a stale self address must
  * not suppress a different, usable address for the peer.
  */
 internal fun remoteLanEndpoints(
-    localHost: String?,
+    localHosts: Collection<String>,
     endpoints: List<InetSocketAddress>,
 ): List<InetSocketAddress> {
-    if (localHost == null) return endpoints
+    if (localHosts.isEmpty()) return endpoints
     return endpoints.filterNot { endpoint ->
         val candidateHost = endpoint.address?.hostAddress ?: endpoint.hostString
-        lanHostsAreSameAddress(leftHost = localHost, rightHost = candidateHost)
+        lanHostIsOwnDevice(localHosts, candidateHost)
     }
 }
+
+internal fun remoteLanEndpoints(
+    localHost: String?,
+    endpoints: List<InetSocketAddress>,
+): List<InetSocketAddress> = remoteLanEndpoints(listOfNotNull(localHost), endpoints)
 
 /**
  * Whether a connection key may only ever be attempted once per piece of
