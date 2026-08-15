@@ -120,6 +120,8 @@ use crate::{
     KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 
+type CarriedHintRecipient = (Vec<u8>, Vec<u8>);
+
 /// FC6: recover from mutex poisoning instead of propagating it as a panic.
 /// `Mutex::lock` returns `Err` if a prior locker panicked while holding the
 /// lock; the stdlib's default guidance is that the protected data might be
@@ -2120,9 +2122,9 @@ impl MessageStore {
     /// member who is a contact (a group carry uploads via any member's relay
     /// config). Earlier entries win on collision, matching that function's
     /// first-match-wins iteration.
-    fn carried_hint_recipients(&self, now_ms: i64) -> Result<Vec<(Vec<u8>, Vec<u8>)>, CoreError> {
+    fn carried_hint_recipients(&self, now_ms: i64) -> Result<Vec<CarriedHintRecipient>, CoreError> {
         let contacts = self.list_contacts()?;
-        let mut map: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut map: Vec<CarriedHintRecipient> = Vec::new();
         for contact in &contacts {
             for hint in crate::recipient_hints::recent_hints_for(contact.user_id.clone(), now_ms) {
                 map.push((hint, contact.user_id.clone()));
@@ -6158,8 +6160,7 @@ impl MessageStore {
             });
         }
         let conn = lock_conn(&self.conn);
-        let placeholders = std::iter::repeat("?")
-            .take(hints.len())
+        let placeholders = std::iter::repeat_n("?", hints.len())
             .collect::<Vec<_>>()
             .join(",");
         let mut sql = format!(
@@ -7678,12 +7679,10 @@ fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreErro
     }
 
     if !update_rowids.is_empty() {
-        let values_clause = std::iter::repeat("(?,?)")
-            .take(update_rowids.len())
+        let values_clause = std::iter::repeat_n("(?,?)", update_rowids.len())
             .collect::<Vec<_>>()
             .join(",");
-        let in_clause = std::iter::repeat("?")
-            .take(update_rowids.len())
+        let in_clause = std::iter::repeat_n("?", update_rowids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -7705,8 +7704,7 @@ fn migrate_carried_content_digests(conn: &mut Connection) -> Result<(), CoreErro
     }
 
     if !delete_rowids.is_empty() {
-        let in_clause = std::iter::repeat("?")
-            .take(delete_rowids.len())
+        let in_clause = std::iter::repeat_n("?", delete_rowids.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!("DELETE FROM carried_envelopes WHERE rowid IN ({in_clause})");
@@ -11185,7 +11183,7 @@ mod tests {
     #[test]
     fn group_invites_can_queue_one_pairwise_envelope_per_recipient() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        let mut invite = msg(&vec![0x11; 16], b"alice", 7, "group invite");
+        let mut invite = msg(&[0x11; 16], b"alice", 7, "group invite");
         invite.kind = KIND_GROUP_INVITE;
         let first = outbound_for(&invite, b"bob", b"msg-000000000011");
         let second = outbound_for(&invite, b"carol", b"msg-000000000012");

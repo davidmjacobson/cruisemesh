@@ -247,11 +247,7 @@ impl MessageStore {
                 "unsupported group authored kind {kind}"
             )));
         }
-        if !group
-            .member_user_ids
-            .iter()
-            .any(|member| *member == identity.user_id)
-        {
+        if !group.member_user_ids.contains(&identity.user_id) {
             return Err(CoreError::Malformed(
                 "group author is not a member".to_string(),
             ));

@@ -2293,7 +2293,7 @@ mod tests {
         ));
 
         // WPT / WP8: emit stays v3 until the fleet parses v4.
-        assert!(!EMIT_FRIEND_LINK_V4);
+        const { assert!(!EMIT_FRIEND_LINK_V4) };
         assert!(!link.starts_with(FRIEND_LINK_PREFIX_V4));
     }
 

@@ -273,7 +273,7 @@ impl MessageStore {
     ) -> Result<Vec<Vec<u8>>, CoreError> {
         let mut hints = hints_over_window(&peer_user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS);
         for group in self.list_groups()? {
-            if group.member_user_ids.iter().any(|m| *m == peer_user_id) {
+            if group.member_user_ids.contains(&peer_user_id) {
                 hints.extend(hints_over_window(
                     &group.id,
                     now_ms,
@@ -290,8 +290,7 @@ impl MessageStore {
     pub fn hint_matches_known_target(&self, hint: Vec<u8>, now_ms: i64) -> Result<bool, CoreError> {
         for contact in self.list_contacts()? {
             if hints_over_window(&contact.user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS)
-                .iter()
-                .any(|h| *h == hint)
+                .contains(&hint)
             {
                 return Ok(true);
             }
@@ -310,8 +309,7 @@ impl MessageStore {
         let contacts = self.list_contacts()?;
         for contact in &contacts {
             if hints_over_window(&contact.user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS)
-                .iter()
-                .any(|h| *h == hint)
+                .contains(&hint)
             {
                 return Ok(Some(contact.clone()));
             }
@@ -348,10 +346,7 @@ impl MessageStore {
     ) -> Result<Vec<Group>, CoreError> {
         let mut matches = Vec::new();
         for group in self.list_groups()? {
-            if hints_over_window(&group.id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS)
-                .iter()
-                .any(|h| *h == hint)
-            {
+            if hints_over_window(&group.id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS).contains(&hint) {
                 matches.push(group);
             }
         }

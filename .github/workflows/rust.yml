@@ -24,13 +24,7 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy --workspace
-        # As of 2026-07-20 the workspace is NOT clippy-clean (pre-existing
-        # warnings in core/src/{engine,gossip,identity,store,transport_policy}.rs
-        # and relayd's tests/*.rs, none introduced by FR1). Non-blocking for
-        # now so this workflow is useful immediately instead of red from
-        # the first run; a follow-up PR should clear the backlog and drop
-        # `continue-on-error`.
-        continue-on-error: true
+        # Keep the Rust workspace warning-free: this is a required CI gate.
         run: cargo clippy --workspace --exclude cruisemesh-node --all-targets -- -D warnings
       - name: cargo test --workspace
         run: cargo test --workspace --exclude cruisemesh-node

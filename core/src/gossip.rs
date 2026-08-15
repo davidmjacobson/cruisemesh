@@ -149,6 +149,14 @@ impl SeenIds {
             .order
             .len() as u64
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("seen-ids mutex poisoned")
+            .order
+            .is_empty()
+    }
 }
 
 impl Default for SeenIds {
