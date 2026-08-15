@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SettingsView: View {
     let identity: Identity
@@ -9,6 +10,11 @@ struct SettingsView: View {
 
     @State private var shareOnline = RelayConfigStore.shareOnline()
     @State private var friendsOfFriends = FriendsOfFriendsStore.isEnabled()
+    /// Debug builds show the internal-tools entry outright, as they always
+    /// have. A release build shows it once someone has done the seven-tap run
+    /// on the version line at the bottom of this screen.
+    @State private var showInternalTools = internalToolsVisible
+    @State private var unlockTaps = InternalToolsTapCounter()
 
     var body: some View {
         NavigationStack {
@@ -55,18 +61,24 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-#if DEBUG
-                    NavigationLink {
-                        InternalToolsView(appModel: appModel)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Internal field tools")
-                            Text("Manual local-network probes, raw route counters, and diagnostic exports.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                    if showInternalTools {
+                        NavigationLink {
+                            // Popping back does not re-run this view's state,
+                            // so the screen tells us when it locked itself
+                            // rather than us re-reading the flag on reappear.
+                            InternalToolsView(
+                                appModel: appModel,
+                                onLock: { showInternalTools = internalToolsVisible }
+                            )
+                        } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Internal field tools")
+                                Text("Manual local-network probes, raw route counters, and diagnostic exports.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
-#endif
                 }
 
                 Section("Privacy") {
@@ -118,9 +130,16 @@ struct SettingsView: View {
                     VStack(spacing: 6) {
                         // verbatim: a version string is data, not copy, and
                         // must not land in the localization catalog.
+                        // The version line doubles as the door to internal
+                        // tools: seven taps turn them on, seven more hide them
+                        // again. Deliberately undiscoverable -- a family member
+                        // scrolling to the bottom of Settings should never
+                        // arrive here by accident, so there is no button, no
+                        // label and nothing said for the first three taps.
                         Text(verbatim: versionLabel)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .onTapGesture { registerUnlockTap() }
                         // The author's dedication, in the traditional place for
                         // one: the very bottom of the last screen, after
                         // everything functional. Latin and untranslated -- a
@@ -140,6 +159,23 @@ struct SettingsView: View {
                 }
             }
             .accessibilityIdentifier("screen.settings")
+        }
+    }
+
+    /// One tap on the version line. Silent for the first three; a light tap of
+    /// haptic feedback for each of the next three, so a deliberate run can be
+    /// felt without anything appearing on screen; and on the seventh the
+    /// internal-tools entry appears or disappears, which is its own answer.
+    private func registerUnlockTap() {
+        switch unlockTaps.tap(at: Date().timeIntervalSince1970) {
+        case .quiet:
+            break
+        case .countdown:
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        case .reached:
+            InternalToolsUnlockStore.setUnlocked(!InternalToolsUnlockStore.isUnlocked())
+            showInternalTools = internalToolsVisible
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
         }
     }
 

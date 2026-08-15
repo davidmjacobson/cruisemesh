@@ -2,9 +2,10 @@ package com.cruisemesh.app.ui
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,7 +40,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -82,8 +85,13 @@ fun SettingsScreen(
     }
     var useRoamingData by remember { mutableStateOf(RelayEngineSettings.allowsRoamingData(context)) }
     val relayConfigured = RelayConfigStore.load(context) != null
-    val showInternalTools =
-        context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+    // Debuggable builds show the entry outright, as they always have. A
+    // release build shows it once someone has done the seven-tap run on the
+    // version line at the bottom of this screen -- the only way a closed-test
+    // tester on a release-signed build can reach the engine switches.
+    var showInternalTools by remember { mutableStateOf(internalToolsVisible(context)) }
+    val unlockTaps = remember { InternalToolsTapCounter() }
+    val haptics = LocalHapticFeedback.current
 
     Scaffold(
         topBar = {
@@ -215,6 +223,10 @@ fun SettingsScreen(
                 }
             }
 
+            // The version line doubles as the door to internal tools: seven
+            // taps turn them on, seven more hide them again. Deliberately
+            // undiscoverable -- a family member scrolling to the bottom of
+            // Settings should never arrive here by accident.
             Text(
                 appVersionLabel(context),
                 style = MaterialTheme.typography.labelSmall,
@@ -222,7 +234,46 @@ fun SettingsScreen(
                 textAlign = TextAlign.Center,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 28.dp),
+                    .padding(top = 28.dp)
+                    .clickable(
+                        // No ripple and no click role: this is a line of text
+                        // that happens to count taps, not a button, and
+                        // announcing it as one to TalkBack would advertise a
+                        // door nobody is meant to find.
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) {
+                        when (val tap = unlockTaps.tap(System.currentTimeMillis())) {
+                            InternalToolsTap.Quiet -> Unit
+                            is InternalToolsTap.Countdown -> {
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                Toast.makeText(
+                                    context,
+                                    context.resources.getQuantityString(
+                                        R.plurals.ui_internal_tools_taps_left,
+                                        tap.remaining,
+                                        tap.remaining,
+                                    ),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                            InternalToolsTap.Reached -> {
+                                val unlocked = !InternalToolsUnlockStore.isUnlocked(context)
+                                InternalToolsUnlockStore.setUnlocked(context, unlocked)
+                                showInternalTools = internalToolsVisible(context)
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                Toast.makeText(
+                                    context,
+                                    if (unlocked) {
+                                        R.string.ui_internal_tools_unlocked
+                                    } else {
+                                        R.string.ui_internal_tools_hidden
+                                    },
+                                    Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                        }
+                    },
             )
             // The author's dedication, in the traditional place for one: the
             // very bottom of the last screen, after everything functional.

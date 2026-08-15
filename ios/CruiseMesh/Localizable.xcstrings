@@ -1253,6 +1253,16 @@
         }
       }
     },
+    "Hide internal tools": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hide internal tools"
+          }
+        }
+      }
+    },
     "Hold the mic to talk": {
       "localizations": {
         "en": {
@@ -1475,6 +1485,16 @@
         }
       }
     },
+    "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received."
+          }
+        }
+      }
+    },
     "Other people (%lld)": {
       "localizations": {
         "en": {
@@ -1615,6 +1635,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Refreshing"
+          }
+        }
+      }
+    },
+    "Relay migration check": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Relay migration check"
           }
         }
       }
@@ -1927,6 +1957,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "That voice message is too long to send. Try a shorter one."
+          }
+        }
+      }
+    },
+    "These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off."
           }
         }
       }

@@ -101,6 +101,18 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),
         ) {
+            // On a release build these switches are only here because someone
+            // did the seven-tap run. Say plainly what they do before they are
+            // touched. Debuggable builds skip it -- a developer knows.
+            if (internalToolsUnlockedOnRelease(context)) {
+                Text(
+                    stringResource(R.string.ui_internal_tools_release_warning),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp),
+                )
+            }
+
             Text(stringResource(R.string.ui_relay), style = MaterialTheme.typography.titleMedium)
             OutlinedTextField(
                 value = relayUrl,
@@ -310,6 +322,35 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 modifier = Modifier.padding(top = 4.dp),
             )
 
+            // The canary switch, which iOS has already. It defaults to on and
+            // changes nothing the device sends or stores -- but a tester who
+            // has to rule the canary out as a cause of something needs a way
+            // to turn it off without a new build.
+            var relayShadow by remember {
+                mutableStateOf(RelayEngineSettings.shadowEnabled(context))
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.ui_relay_migration_canary),
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = relayShadow,
+                    onCheckedChange = {
+                        relayShadow = it
+                        RelayEngineSettings.setShadowEnabled(context, it)
+                    },
+                )
+            }
+            Text(stringResource(R.string.ui_relay_migration_canary_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
             // The receive engine switch, here for the same reason as the one
             // above: the evidence that has to be gathered before its default
             // may move can only come from a release-signed device.
@@ -369,6 +410,24 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 },
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             ) { Text(stringResource(R.string.ui_export_field_metrics)) }
+
+            // The way back out, for anyone who would rather not hunt for the
+            // version line again. Only offered where it can do anything: a
+            // debuggable build shows this screen regardless of the flag.
+            if (internalToolsUnlockedOnRelease(context)) {
+                OutlinedButton(
+                    onClick = {
+                        InternalToolsUnlockStore.setUnlocked(context, false)
+                        Toast.makeText(
+                            context,
+                            R.string.ui_internal_tools_hidden,
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        saveAndBack()
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+                ) { Text(stringResource(R.string.ui_internal_tools_hide)) }
+            }
         }
     }
 

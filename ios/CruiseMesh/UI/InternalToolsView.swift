@@ -1,9 +1,17 @@
 import SwiftUI
 import UIKit
 
-#if DEBUG
+/// Reachable on a debug build outright, and on a release build once someone has
+/// done the seven-tap run on the version line in Settings. It has to be
+/// reachable on release: a TestFlight build is signed for release, and a
+/// staged-rollout canary whose switches only exist in a developer's own build
+/// can never produce the field evidence it exists to produce.
 struct InternalToolsView: View {
     @ObservedObject var appModel: AppModel
+    /// Told when this screen hides itself again, so the Settings row it was
+    /// reached from can disappear with it.
+    var onLock: () -> Void = {}
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject private var lanDiagnostics = LanTransportDiagnostics.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
 
@@ -23,10 +31,12 @@ struct InternalToolsView: View {
         // never has to solve the entire Form as one expression (Xcode 26
         // times out on that).
         Form {
+            releaseWarningSection
             relaySection
             receiveSection
             lanFieldToolsSection
             diagnosticsSection
+            lockAgainSection
         }
         .navigationTitle("Internal tools")
         .navigationBarTitleDisplayMode(.inline)
@@ -69,6 +79,37 @@ struct InternalToolsView: View {
         }
     }
 
+    /// On a release build these switches are only here because someone did the
+    /// seven-tap run. Say plainly what they do before they are touched. A debug
+    /// build skips it -- a developer knows.
+    @ViewBuilder
+    private var releaseWarningSection: some View {
+        if internalToolsUnlockedOnRelease {
+            Section {
+                Text("These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The way back out, for anyone who would rather not hunt for the version
+    /// line again. Only offered where it can do anything: a debug build shows
+    /// this screen regardless of the flag.
+    @ViewBuilder
+    private var lockAgainSection: some View {
+        if internalToolsUnlockedOnRelease {
+            Section {
+                Button("Hide internal tools", role: .destructive) {
+                    InternalToolsUnlockStore.setUnlocked(false)
+                    RelayConfigStore.save(relayUrl: relayUrl, relayToken: relayToken)
+                    onLock()
+                    dismiss()
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var relaySection: some View {
         Section("Relay") {
@@ -105,14 +146,16 @@ struct InternalToolsView: View {
             Text("Runs the next relay pass on the rebuilt core engine. Legacy stays the default; this is for canary testing only.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Toggle("Relay migration canary", isOn: Binding(
+            // Same words as Android's switch, in plain language: a tester on a
+            // release build reads this, not a developer.
+            Toggle("Relay migration check", isOn: Binding(
                 get: { relayShadowOn },
                 set: {
                     relayShadowOn = $0
                     RelayEngineSettings.setShadowEnabled($0)
                 }
             ))
-            Text("On a few legacy passes a day, compares what the core engine would have done and records only where they differ. Sends and receives nothing extra.")
+            Text("On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -305,4 +348,3 @@ private struct LanEndpointQRView: View {
         }
     }
 }
-#endif
