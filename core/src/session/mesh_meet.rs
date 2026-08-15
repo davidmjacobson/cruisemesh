@@ -243,25 +243,43 @@ impl MessageStore {
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.iter().cloned().collect();
 
         // The cadence verdict is taken once, before any store work, and used
-        // by both the digest and the spray: consulting it twice inside one
-        // encounter would let the digest arm a window that then admits the
-        // very spray the same verdict had refused.
+        // by the spray: consulting it twice inside one encounter would let the
+        // digest arm a window that then admits the very spray the same verdict
+        // had refused.
         let gate = spray.may_spray(peer_key.clone(), peer_address.clone(), trigger, now_ms);
 
         // 2. The DIGEST exchange. Owed on a link that has never run one and
         // then on the jittered D8 window; never owed back to a peer whose own
-        // digest is what we are answering. `note_digest_sent` opens the
-        // exchange window so the peer's reply is not refused by the gate our
-        // own digest just passed.
+        // digest is what we are answering.
+        //
+        // It runs on that window alone and is deliberately NOT held behind the
+        // spray cadence. The two are different things: spray is payload we
+        // choose to push, the digest is the proof-of-receipt exchange that
+        // tells either side anything landed at all. Receipt-quiet backoff
+        // stretches the spray interval precisely when no receipts are coming
+        // back — so gating the digest on it suppresses the one mechanism that
+        // could end the quiet, and a stalled link locks itself shut for the
+        // ceiling interval. A receipt lane that self-locks is what #241 cost
+        // us once already.
+        //
+        // Two things keep this honest. The re-digest window is its own floor
+        // (minutes, jittered per peer), so "not cadence-gated" is never "every
+        // encounter". And a digest that goes out under a refusing gate opens
+        // the exchange window without arming the spray cadence — otherwise a
+        // control frame every few minutes would keep pushing the stretched
+        // spray interval permanently out of reach.
         let mut digest_frames = Vec::new();
-        if gate.allow
-            && !matches!(trigger, CoreSprayTrigger::PeerDigest)
+        if !matches!(trigger, CoreSprayTrigger::PeerDigest)
             && router.digest_due_for(&peer_address, now_ms)
         {
             digest_frames = self.plan_digest_frames(&own_user_id, &peer_user_id)?;
             if !digest_frames.is_empty() {
                 router.record_digest_sent(&peer_address, now_ms);
-                spray.note_digest_sent(peer_key.clone(), peer_address.clone(), now_ms);
+                if gate.allow {
+                    spray.note_digest_sent(peer_key.clone(), peer_address.clone(), now_ms);
+                } else {
+                    spray.note_digest_only_sent(peer_key.clone(), peer_address.clone(), now_ms);
+                }
             }
         }
 
@@ -795,6 +813,117 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.work.digests_sent, 0);
         assert!(outcome.digest_frames.is_empty());
+    }
+
+    /// The self-lock this guards against: receipt-quiet backoff stretches the
+    /// spray cadence exactly when nothing is coming back, and the digest is the
+    /// proof-of-receipt exchange that would produce something to come back. If
+    /// the digest rides the spray cadence, a quiet link shuts itself for the
+    /// ceiling interval and cannot reopen. It runs on the re-digest window
+    /// instead, which is minutes rather than half an hour.
+    #[test]
+    fn a_link_with_quiet_receipts_still_digests_on_its_own_cadence() {
+        let store = store();
+        let me = generate_identity();
+        let peer = generate_identity();
+        store
+            .upsert_contact(crate::Contact {
+                user_id: peer.user_id.clone(),
+                name: "Peer".to_string(),
+                sign_pk: peer.sign_pk.clone(),
+                agree_pk: peer.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .expect("upsert contact");
+
+        let router = router_for(&peer.user_id);
+        let spray = CoreSprayPolicy::new();
+        let offers = gate();
+        let key = peer_key(&peer.user_id);
+
+        // A first encounter, then several admitted sprays that never produce a
+        // receipt or a carry confirmation: the peer goes quiet and its spray
+        // interval stretches well past the re-digest window.
+        store
+            .plan_mesh_meet(
+                &router,
+                &spray,
+                &offers,
+                request(me.user_id.clone(), peer.user_id.clone(), vec![], true),
+            )
+            .unwrap();
+        for round in 0..5_u64 {
+            spray.admit_plan(
+                key.clone(),
+                ADDRESS.to_string(),
+                crate::spray_policy::CoreSprayPlanShape {
+                    carried: crate::spray_policy::CoreSprayLanePlan {
+                        set_digest: 0,
+                        bytes: 0,
+                    },
+                    own_outbound: crate::spray_policy::CoreSprayLanePlan {
+                        set_digest: round + 1,
+                        bytes: 1_024,
+                    },
+                    own_receipts: crate::spray_policy::CoreSprayLanePlan {
+                        set_digest: 0,
+                        bytes: 0,
+                    },
+                },
+                NOW,
+            );
+        }
+        assert!(
+            spray.quiet_rounds(key.clone()) >= 3,
+            "the peer must actually be in receipt-quiet backoff"
+        );
+
+        // One re-digest window later. The spray cadence is still shut -- that
+        // is the backoff doing its job on payload -- but the digest is due, and
+        // a digest is what could end the quiet.
+        let mut later = request(me.user_id, peer.user_id, vec![], true);
+        later.now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
+        later.trigger = CoreSprayTrigger::Maintenance;
+        assert!(
+            !spray
+                .may_spray(
+                    key.clone(),
+                    ADDRESS.to_string(),
+                    CoreSprayTrigger::Maintenance,
+                    later.now_ms
+                )
+                .allow,
+            "the spray cadence is expected to still refuse payload here"
+        );
+
+        let quiet_round_encounter = store
+            .plan_mesh_meet(&router, &spray, &offers, later)
+            .unwrap();
+        assert_eq!(
+            quiet_round_encounter.work.digests_sent, 1,
+            "a receipt-quiet link must still emit its digest within the digest cadence"
+        );
+        assert!(
+            quiet_round_encounter.spray_frames.is_empty(),
+            "payload stays gated"
+        );
+
+        // And that digest must not have armed the spray cadence: a control
+        // frame every few minutes silently resetting the stretched interval
+        // would starve the spray lane forever.
+        assert!(
+            !spray
+                .may_spray(
+                    key,
+                    ADDRESS.to_string(),
+                    CoreSprayTrigger::Maintenance,
+                    NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 2
+                )
+                .allow,
+            "a digest sent under a refusing gate must not re-arm the spray clock"
+        );
     }
 
     #[test]

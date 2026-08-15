@@ -844,6 +844,34 @@ impl CoreSprayPolicy {
 }
 
 impl CoreSprayPolicy {
+    /// A DIGEST went out on its own re-digest cadence while this peer's spray
+    /// cadence was refusing payload — the receipt-quiet case.
+    ///
+    /// It opens the exchange window, exactly like [`Self::note_digest_sent`],
+    /// so the peer's answer is admitted rather than refused by the gate our own
+    /// digest just walked past. It deliberately does **not** arm the spray
+    /// cadence: this digest went out *because* the payload cadence was
+    /// stretched, so letting it push the spray clock forward every few minutes
+    /// would starve the spray lane outright — a stretched interval that can
+    /// never elapse.
+    ///
+    /// Not exported: the shells drive this through
+    /// [`crate::MessageStore::plan_mesh_meet`], the only caller that knows a
+    /// digest went out under a refusing gate.
+    pub(crate) fn note_digest_only_sent(&self, peer_key: String, link_key: String, now_ms: i64) {
+        let mut state = self.locked();
+        Self::prune(&mut state, now_ms, self.config.retention_ms);
+        let window = self.config.exchange_window_ms;
+        let peer = state
+            .peers
+            .entry(peer_key)
+            .or_insert_with(|| PeerState::new(now_ms));
+        peer.exchange_open_until_ms = now_ms.saturating_add(window);
+        peer.touched_at_ms = now_ms;
+        // Touch the link so its allowance keeps accruing against real time.
+        let _ = self.allowance(&mut state, &link_key, now_ms);
+    }
+
     /// The archive-local name for a peer, or a placeholder when nothing is
     /// listening. Never the raw key.
     fn peer_pseudonym(&self, peer_key: &str) -> String {
