@@ -236,6 +236,21 @@ pub use session::relay_policy::{
     CoreRelayRoaming, FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_BACKOFF_CAP_MS,
     FAMILY_RELAY_JITTER_WINDOW_MS, FAMILY_RELAY_REQUEST_INTERVAL_MS,
 };
+// Test support only, and named so at every call site: the incident fixtures
+// made executable through a platform driver. No app code on either shell
+// calls any of this; the only callers are the two adapter test suites and
+// `core/tests/relay_fixture_transcript.rs`. It is exported over UniFFI rather
+// than kept in a Rust test because the whole point is that a JVM test and an
+// XCTest can run the same scenario and compare against the same expected
+// transcript instead of each writing one down.
+pub use session::relay_fixture::{
+    core_relay_fixture_expected_transcript, core_relay_fixture_ideal_observation,
+    core_relay_fixture_names, core_relay_fixture_plan, core_relay_fixture_reply,
+    core_relay_fixture_scenario, core_relay_fixture_seed_store,
+    core_relay_fixture_violated_invariants, CoreRelayFixtureEndpoint,
+    CoreRelayFixtureObservedRequest, CoreRelayFixturePassSpec, CoreRelayFixtureReply,
+    CoreRelayFixtureScenario, CoreRelayFixtureTranscript,
+};
 // The migration canary. Pure comparison over captured values, and removed
 // with the legacy engine it exists to check.
 pub use session::relay_shadow::{
