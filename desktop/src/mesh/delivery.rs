@@ -78,10 +78,10 @@ impl DeliveryDispatcher {
         }
 
         if delivery.verdict != CoreDeliveryVerdict::Applied {
-            // A terminal policy verdict, not a durability failure: the sole
-            // endpoint opened the envelope, so it is consumed and committed
-            // like any other. Retrying could not make an already-authored
-            // envelope more authorized.
+            // A terminal verdict, not a durability failure: the sole endpoint
+            // opened the envelope, so it is consumed and committed like any
+            // other. Retrying could not make an already-authored envelope more
+            // authorized, nor make a body that will not decode decode.
             tracing::warn!(
                 kind = delivery.kind,
                 verdict = ?delivery.verdict,

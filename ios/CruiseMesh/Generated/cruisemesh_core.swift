@@ -4330,14 +4330,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * then, only if this returned `Ok`, run
      * [`Self::core_commit_inbound_delivery`] with the same commit token —
      * the production `deliver → commit` order (DTN D4 / T4-06). An `Err` here
-     * is a durability or malformed-body failure: the caller drops the token
+     * is a *durability* failure and only that: the caller drops the token
      * unused, leaves the `msg_id` re-presentable and reports
-     * [`CoreInboundDisposition::Failed`]. A *policy* rejection is not an
-     * error — it comes back as a terminal
-     * [`CoreDeliveryVerdict::DroppedForeignChat`] or
-     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`], which the caller
-     * commits like any other consumption so the relay copy acks away instead
-     * of refetching forever.
+     * [`CoreInboundDisposition::Failed`], because a retry on a healthier disk
+     * can genuinely succeed.
+     *
+     * A rejection the bytes themselves earn is not an error. It comes back as
+     * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
+     * any other consumption so the relay copy acks away instead of refetching
+     * and re-failing forever. Retrying a signed body that will not decode
+     * cannot make it decode.
      *
      * The two gates it applies before any kind runs:
      *
@@ -6941,14 +6945,18 @@ open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data]
      * then, only if this returned `Ok`, run
      * [`Self::core_commit_inbound_delivery`] with the same commit token —
      * the production `deliver → commit` order (DTN D4 / T4-06). An `Err` here
-     * is a durability or malformed-body failure: the caller drops the token
+     * is a *durability* failure and only that: the caller drops the token
      * unused, leaves the `msg_id` re-presentable and reports
-     * [`CoreInboundDisposition::Failed`]. A *policy* rejection is not an
-     * error — it comes back as a terminal
-     * [`CoreDeliveryVerdict::DroppedForeignChat`] or
-     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`], which the caller
-     * commits like any other consumption so the relay copy acks away instead
-     * of refetching forever.
+     * [`CoreInboundDisposition::Failed`], because a retry on a healthier disk
+     * can genuinely succeed.
+     *
+     * A rejection the bytes themselves earn is not an error. It comes back as
+     * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
+     * any other consumption so the relay copy acks away instead of refetching
+     * and re-failing forever. Retrying a signed body that will not decode
+     * cannot make it decode.
      *
      * The two gates it applies before any kind runs:
      *
@@ -25447,6 +25455,22 @@ public enum CoreDeliveryVerdict {
      * retrying cannot make an already-authored envelope more authorized.
      */
     case droppedUnauthorizedSender
+    /**
+     * The body — or the per-kind content inside it — could not be decoded, or
+     * failed a body-shape check the sender controls (a receipt that does not
+     * acknowledge this device, a group invite whose membership omits its own
+     * sender). Terminal, not a failure: the bytes are fixed and signed, so the
+     * same decode fails identically forever. Delivering it again could only
+     * re-fail, which is why it is consumed rather than left to refetch.
+     *
+     * This matches what the shipping Android delivery path already did with an
+     * undecodable body: log it and report the envelope consumed. Only the
+     * *hidden-kind ack evidence* is withheld when the top-level body would not
+     * decode, and that falls out on its own — core fills
+     * [`CoreInboundCommit::hidden_kind`] from a successful decode and leaves it
+     * `None` otherwise, so an unreadable body can never vouch for a hidden kind.
+     */
+    case droppedMalformed
 }
 
 
@@ -25466,6 +25490,8 @@ public struct FfiConverterTypeCoreDeliveryVerdict: FfiConverterRustBuffer {
         
         case 3: return .droppedUnauthorizedSender
         
+        case 4: return .droppedMalformed
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -25484,6 +25510,10 @@ public struct FfiConverterTypeCoreDeliveryVerdict: FfiConverterRustBuffer {
         
         case .droppedUnauthorizedSender:
             writeInt(&buf, Int32(3))
+        
+        
+        case .droppedMalformed:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -39247,7 +39277,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 19708) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_deliver_inbound() != 62012) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_deliver_inbound() != 36853) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
