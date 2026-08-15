@@ -1993,10 +1993,15 @@ impl PassState {
         };
         let actor = self.probes.get(probe).and_then(|p| p.actor.clone());
         let recency = match relay_decode_presence_page(result.body) {
+            // The freshest row wins: a probe may cover several hints and the
+            // relay answers each it knows; any older row would understate the
+            // contact.
             Ok(page) => page
                 .presence
-                .first()
-                .map(|row| relay_presence_recency(page.now_ms.saturating_sub(row.last_seen_ms))),
+                .iter()
+                .map(|row| page.now_ms.saturating_sub(row.last_seen_ms))
+                .min()
+                .map(relay_presence_recency),
             Err(_) => None,
         };
         // An empty answer is a real answer: the relay has no presence row for

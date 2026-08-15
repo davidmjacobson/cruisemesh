@@ -3542,6 +3542,57 @@ fn a_cross_family_contact_is_asked_after_once_a_pass_and_never_told_anything() {
 }
 
 #[test]
+fn the_freshest_presence_row_wins_when_a_probe_covers_several_hints() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.request.operation == CoreRelayOperation::Presence {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.request.body).expect("a presence body is JSON");
+            let hints: Vec<String> = body["query"]
+                .as_array()
+                .expect("query")
+                .iter()
+                .map(|h| h.as_str().expect("a hint is a string").to_string())
+                .collect();
+            let stale = hints.first().cloned().expect("at least one hint");
+            let fresh = hints.get(1).cloned().unwrap_or_else(|| stale.clone());
+            // The stale row deliberately comes FIRST: an implementation that
+            // takes the first row instead of the freshest caches this contact
+            // a day old while another hint saw them a minute ago.
+            let reply = serde_json::json!({
+                "now_ms": now,
+                "presence": [
+                    { "hint": stale, "last_seen_ms": now - 20 * 60 * 60 * 1000 },
+                    { "hint": fresh, "last_seen_ms": now - 60_000 },
+                ]
+            });
+            return Reply::ok(reply.to_string().into_bytes());
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(presence_requests(&run).len(), 1);
+    let (bucket, _recorded_at) = store
+        .contact_presence(contact_user_id())
+        .expect("presence readable")
+        .expect("the answer was recorded");
+    assert_eq!(
+        bucket, "active",
+        "the freshest returned row decides the bucket, not whichever row is first"
+    );
+}
+
+#[test]
 fn a_second_pass_inside_the_client_floor_asks_nothing() {
     let store = new_store();
     let now = T0;
