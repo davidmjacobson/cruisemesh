@@ -196,6 +196,48 @@ final class InboundAdapterTests: XCTestCase {
         XCTAssertTrue(plan.carried)
     }
 
+    // MARK: - waking the relay pass
+
+    /// A row fetched from the relay is already durable on the relay. Waking a
+    /// pass because we carried a copy of it is the re-upload loop: every
+    /// fetched envelope asks for another pass, which fetches more. Only a
+    /// mesh-sourced carry for someone we know may wake one.
+    func testARelaySourcedCarryNeverWakesTheRelayPass() throws {
+        let world = try World()
+        let stranger = generateIdentity()
+        let frame = world.pairwiseFrame(from: world.sender, to: stranger, text: "already on the relay")
+
+        let plan = try world.run(frame, source: .relay)
+
+        XCTAssertTrue(plan.carried, "the row is still carried for its recipient")
+        XCTAssertFalse(
+            plan.wakesRelayPass(source: .relay, hintIsKnownTarget: true),
+            "a relay-fetched row must not wake a pass even when its hint names someone we know"
+        )
+    }
+
+    func testAMeshCarryForSomeoneWeKnowWakesTheRelayPass() throws {
+        let world = try World()
+        let stranger = generateIdentity()
+        let plan = try world.run(
+            world.pairwiseFrame(from: world.sender, to: stranger, text: "hand this on"),
+            source: .mesh
+        )
+
+        XCTAssertTrue(plan.carried)
+        XCTAssertTrue(plan.wakesRelayPass(source: .mesh, hintIsKnownTarget: true))
+        // An unknown target has no mailbox we could hand it to.
+        XCTAssertFalse(plan.wakesRelayPass(source: .mesh, hintIsKnownTarget: false))
+    }
+
+    func testAnEnvelopeThatWasNotCarriedNeverWakesTheRelayPass() throws {
+        let world = try World()
+        let plan = try world.run(world.pairwiseFrameToMe(text: "home"))
+
+        XCTAssertFalse(plan.carried)
+        XCTAssertFalse(plan.wakesRelayPass(source: .mesh, hintIsKnownTarget: true))
+    }
+
     func testAnExpiredEnvelopeIsDroppedWithNothingToExecute() throws {
         let world = try World()
         let plan = try world.run(world.pairwiseFrameToMe(

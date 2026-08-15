@@ -81,6 +81,24 @@ enum InboundAdapter {
 }
 
 extension InboundExecutionPlan {
+    /// Whether newly carrying this envelope is worth waking the relay pass for.
+    ///
+    /// Two things must both hold. The row has to be one a relay pass could
+    /// usefully act on — a mesh-sourced carry for someone this device knows, so
+    /// the pass can hand it to the relay for them. And the envelope must not
+    /// have come *from* the relay in the first place: a relay-fetched row is
+    /// already durable server-side, core files it through its relay-carry path
+    /// rather than the family one, and waking a pass for it is the re-upload
+    /// loop that once burned a family's whole quota — the pass finds nothing
+    /// new to send, and every fetched envelope asks for another one.
+    ///
+    /// The source test is core's own rule, written here in the same terms core
+    /// uses (`CoreInboundSource`) rather than re-derived from a link address at
+    /// the call site.
+    func wakesRelayPass(source: CoreInboundSource, hintIsKnownTarget: Bool) -> Bool {
+        carried && source == .mesh && hintIsKnownTarget
+    }
+
     /// The delivered payload and everything needed to commit it, or `nil` when
     /// this envelope had no native delivery to wait on (carried, deduped,
     /// expired, rejected, or consumed by deliberate drop).

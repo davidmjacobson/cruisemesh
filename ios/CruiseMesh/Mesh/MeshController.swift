@@ -1827,12 +1827,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 _ = MeshRouter.relayToAll(frame: relayFrame)
             }
         }
-        // A carried envelope addressed to someone this device knows is worth
-        // waking the relay pass for, exactly as `carryForeign` did. The
+        // A mesh-carried envelope addressed to someone this device knows is
+        // worth waking the relay pass for, exactly as `carryForeign` did. The
         // family test is core's own `hintMatchesKnownTarget` -- the shell reads
-        // the answer, it does not decide what "family" means.
-        if plan.carried,
-           (try? store.hintMatchesKnownTarget(hint: recipientHint, nowMs: now)) == true {
+        // the answer, it does not decide what "family" means -- and the
+        // relay-source half of the condition is core's own carry rule, so a
+        // relay-fetched row never wakes a pass to re-upload itself. See
+        // `InboundExecutionPlan.wakesRelayPass`.
+        if plan.wakesRelayPass(
+            source: InboundAdapter.source(forSourceAddress: sourceAddress),
+            hintIsKnownTarget: (try? store.hintMatchesKnownTarget(hint: recipientHint, nowMs: now)) == true
+        ) {
             RelaySyncEvents.requestSync()
         }
         if plan.droppedBlocked {
