@@ -2589,6 +2589,218 @@ public func FfiConverterTypeCoreReconnectBackoffTracker_lower(_ value: CoreRecon
 
 
 /**
+ * Accumulates one scenario's run into the text both platforms compare.
+ *
+ * A UniFFI object rather than a returned string per step because the shells
+ * must not be the ones choosing the shape: a Kotlin formatter and a Swift
+ * formatter would differ on a separator eventually, and the difference would
+ * read as a behaviour difference.
+ */
+public protocol CoreRelayFixtureTranscriptProtocol : AnyObject {
+    
+    /**
+     * The finished transcript: every pass in order, then what the store and
+     * the event ring are left holding.
+     *
+     * `own_url` and `own_token` are needed only to name the cursor row, which
+     * is keyed on the endpoint; neither reaches the text.
+     */
+    func finish(store: MessageStore, ownUrl: String, ownToken: String)  -> String
+    
+    /**
+     * One request, as core formed it and as the server received it.
+     */
+    func recordRequest(passIndex: UInt32, request: CoreRelayHttpRequest, endpoint: CoreRelayFixtureEndpoint, observed: CoreRelayFixtureObservedRequest) 
+    
+    /**
+     * What the driver reported for the request just recorded.
+     */
+    func recordResult(passIndex: UInt32, result: CoreRelayHttpResult) 
+    
+    /**
+     * The pass's summary, folded to the fields a shell can affect.
+     */
+    func recordSummary(passIndex: UInt32, spec: CoreRelayFixturePassSpec, summary: CoreRelayPassSummary) 
+    
+}
+
+/**
+ * Accumulates one scenario's run into the text both platforms compare.
+ *
+ * A UniFFI object rather than a returned string per step because the shells
+ * must not be the ones choosing the shape: a Kotlin formatter and a Swift
+ * formatter would differ on a separator eventually, and the difference would
+ * read as a behaviour difference.
+ */
+open class CoreRelayFixtureTranscript:
+    CoreRelayFixtureTranscriptProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corerelayfixturetranscript(self.pointer, $0) }
+    }
+public convenience init(fixture: String) {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corerelayfixturetranscript_new(
+        FfiConverterString.lower(fixture),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corerelayfixturetranscript(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * The finished transcript: every pass in order, then what the store and
+     * the event ring are left holding.
+     *
+     * `own_url` and `own_token` are needed only to name the cursor row, which
+     * is keyed on the endpoint; neither reaches the text.
+     */
+open func finish(store: MessageStore, ownUrl: String, ownToken: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corerelayfixturetranscript_finish(self.uniffiClonePointer(),
+        FfiConverterTypeMessageStore.lower(store),
+        FfiConverterString.lower(ownUrl),
+        FfiConverterString.lower(ownToken),$0
+    )
+})
+}
+    
+    /**
+     * One request, as core formed it and as the server received it.
+     */
+open func recordRequest(passIndex: UInt32, request: CoreRelayHttpRequest, endpoint: CoreRelayFixtureEndpoint, observed: CoreRelayFixtureObservedRequest) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corerelayfixturetranscript_record_request(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(passIndex),
+        FfiConverterTypeCoreRelayHttpRequest.lower(request),
+        FfiConverterTypeCoreRelayFixtureEndpoint.lower(endpoint),
+        FfiConverterTypeCoreRelayFixtureObservedRequest.lower(observed),$0
+    )
+}
+}
+    
+    /**
+     * What the driver reported for the request just recorded.
+     */
+open func recordResult(passIndex: UInt32, result: CoreRelayHttpResult) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corerelayfixturetranscript_record_result(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(passIndex),
+        FfiConverterTypeCoreRelayHttpResult.lower(result),$0
+    )
+}
+}
+    
+    /**
+     * The pass's summary, folded to the fields a shell can affect.
+     */
+open func recordSummary(passIndex: UInt32, spec: CoreRelayFixturePassSpec, summary: CoreRelayPassSummary) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corerelayfixturetranscript_record_summary(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(passIndex),
+        FfiConverterTypeCoreRelayFixturePassSpec.lower(spec),
+        FfiConverterTypeCoreRelayPassSummary.lower(summary),$0
+    )
+}
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixtureTranscript: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreRelayFixtureTranscript
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreRelayFixtureTranscript {
+        return CoreRelayFixtureTranscript(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreRelayFixtureTranscript) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixtureTranscript {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreRelayFixtureTranscript, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureTranscript_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreRelayFixtureTranscript {
+    return try FfiConverterTypeCoreRelayFixtureTranscript.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureTranscript_lower(_ value: CoreRelayFixtureTranscript) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreRelayFixtureTranscript.lower(value)
+}
+
+
+
+
+/**
  * One relay pass. See the module docs.
  */
 public protocol CoreRelayPassProtocol : AnyObject {
@@ -15386,6 +15598,390 @@ public func FfiConverterTypeCoreRelayFetchedEnvelope_lower(_ value: CoreRelayFet
 
 
 /**
+ * The request as the *server* saw it, which is the half of the comparison a
+ * shell contributes.
+ *
+ * Recording core's own [`CoreRelayHttpRequest`] on both sides would compare
+ * core against core and pass whatever the driver did with it. These are the
+ * bytes that actually left the device.
+ */
+public struct CoreRelayFixtureObservedRequest {
+    public var method: String
+    /**
+     * Path *including* the query string, exactly as received.
+     */
+    public var path: String
+    public var bodyLen: UInt32
+    /**
+     * The `Authorization` header the server received, if any.
+     */
+    public var authorization: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(method: String, 
+        /**
+         * Path *including* the query string, exactly as received.
+         */path: String, bodyLen: UInt32, 
+        /**
+         * The `Authorization` header the server received, if any.
+         */authorization: String?) {
+        self.method = method
+        self.path = path
+        self.bodyLen = bodyLen
+        self.authorization = authorization
+    }
+}
+
+
+
+extension CoreRelayFixtureObservedRequest: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFixtureObservedRequest, rhs: CoreRelayFixtureObservedRequest) -> Bool {
+        if lhs.method != rhs.method {
+            return false
+        }
+        if lhs.path != rhs.path {
+            return false
+        }
+        if lhs.bodyLen != rhs.bodyLen {
+            return false
+        }
+        if lhs.authorization != rhs.authorization {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(method)
+        hasher.combine(path)
+        hasher.combine(bodyLen)
+        hasher.combine(authorization)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixtureObservedRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixtureObservedRequest {
+        return
+            try CoreRelayFixtureObservedRequest(
+                method: FfiConverterString.read(from: &buf), 
+                path: FfiConverterString.read(from: &buf), 
+                bodyLen: FfiConverterUInt32.read(from: &buf), 
+                authorization: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFixtureObservedRequest, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.method, into: &buf)
+        FfiConverterString.write(value.path, into: &buf)
+        FfiConverterUInt32.write(value.bodyLen, into: &buf)
+        FfiConverterOptionString.write(value.authorization, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureObservedRequest_lift(_ buf: RustBuffer) throws -> CoreRelayFixtureObservedRequest {
+    return try FfiConverterTypeCoreRelayFixtureObservedRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureObservedRequest_lower(_ value: CoreRelayFixtureObservedRequest) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFixtureObservedRequest.lower(value)
+}
+
+
+/**
+ * One pass in a fixture scenario: the label its transcript is read by and the
+ * wall clock it runs on.
+ *
+ * The clock is fixed per pass rather than advanced per request on purpose.
+ * A shell cannot make a real socket take a scripted number of milliseconds,
+ * so a transcript that depended on elapsed time would be comparing the test
+ * machine's speed. Every time-derived field in the normalisation is therefore
+ * expressed relative to this.
+ */
+public struct CoreRelayFixturePassSpec {
+    public var label: String
+    public var nowMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(label: String, nowMs: Int64) {
+        self.label = label
+        self.nowMs = nowMs
+    }
+}
+
+
+
+extension CoreRelayFixturePassSpec: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFixturePassSpec, rhs: CoreRelayFixturePassSpec) -> Bool {
+        if lhs.label != rhs.label {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(label)
+        hasher.combine(nowMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixturePassSpec: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixturePassSpec {
+        return
+            try CoreRelayFixturePassSpec(
+                label: FfiConverterString.read(from: &buf), 
+                nowMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFixturePassSpec, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixturePassSpec_lift(_ buf: RustBuffer) throws -> CoreRelayFixturePassSpec {
+    return try FfiConverterTypeCoreRelayFixturePassSpec.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixturePassSpec_lower(_ value: CoreRelayFixturePassSpec) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFixturePassSpec.lower(value)
+}
+
+
+/**
+ * What the scripted relay answers one request with.
+ *
+ * `transport_failure` is a relay that could not be reached at all rather than
+ * one that answered badly, and a shell produces it however its fake transport
+ * can — Android disconnects the socket before the status line, iOS fails the
+ * `URLProtocol` with `cannotConnectToHost`. The distinction matters to
+ * `SILENCE-01`, which is exactly why a fixture needs to be able to script it.
+ */
+public struct CoreRelayFixtureReply {
+    public var status: UInt16
+    public var headers: [CoreRelayHeader]
+    public var body: Data
+    public var transportFailure: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(status: UInt16, headers: [CoreRelayHeader], body: Data, transportFailure: Bool) {
+        self.status = status
+        self.headers = headers
+        self.body = body
+        self.transportFailure = transportFailure
+    }
+}
+
+
+
+extension CoreRelayFixtureReply: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFixtureReply, rhs: CoreRelayFixtureReply) -> Bool {
+        if lhs.status != rhs.status {
+            return false
+        }
+        if lhs.headers != rhs.headers {
+            return false
+        }
+        if lhs.body != rhs.body {
+            return false
+        }
+        if lhs.transportFailure != rhs.transportFailure {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(status)
+        hasher.combine(headers)
+        hasher.combine(body)
+        hasher.combine(transportFailure)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixtureReply: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixtureReply {
+        return
+            try CoreRelayFixtureReply(
+                status: FfiConverterUInt16.read(from: &buf), 
+                headers: FfiConverterSequenceTypeCoreRelayHeader.read(from: &buf), 
+                body: FfiConverterData.read(from: &buf), 
+                transportFailure: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFixtureReply, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.status, into: &buf)
+        FfiConverterSequenceTypeCoreRelayHeader.write(value.headers, into: &buf)
+        FfiConverterData.write(value.body, into: &buf)
+        FfiConverterBool.write(value.transportFailure, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureReply_lift(_ buf: RustBuffer) throws -> CoreRelayFixtureReply {
+    return try FfiConverterTypeCoreRelayFixtureReply.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureReply_lower(_ value: CoreRelayFixtureReply) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFixtureReply.lower(value)
+}
+
+
+/**
+ * A fixture, as something a shell can execute.
+ */
+public struct CoreRelayFixtureScenario {
+    /**
+     * The fixture file's stem, e.g. `carry-storm`.
+     */
+    public var name: String
+    /**
+     * The invariant ids the fixture declares. The suites assert none of them
+     * is reported violated, which is the same claim `relay_pass_replay.rs`
+     * makes in Rust.
+     */
+    public var declaredInvariants: [String]
+    /**
+     * The passes to drive, in order, against one store.
+     */
+    public var passes: [CoreRelayFixturePassSpec]
+    /**
+     * Whether the plan names a contact endpoint, so a shell knows whether it
+     * needs a second fake relay standing.
+     */
+    public var usesContactEndpoint: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The fixture file's stem, e.g. `carry-storm`.
+         */name: String, 
+        /**
+         * The invariant ids the fixture declares. The suites assert none of them
+         * is reported violated, which is the same claim `relay_pass_replay.rs`
+         * makes in Rust.
+         */declaredInvariants: [String], 
+        /**
+         * The passes to drive, in order, against one store.
+         */passes: [CoreRelayFixturePassSpec], 
+        /**
+         * Whether the plan names a contact endpoint, so a shell knows whether it
+         * needs a second fake relay standing.
+         */usesContactEndpoint: Bool) {
+        self.name = name
+        self.declaredInvariants = declaredInvariants
+        self.passes = passes
+        self.usesContactEndpoint = usesContactEndpoint
+    }
+}
+
+
+
+extension CoreRelayFixtureScenario: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayFixtureScenario, rhs: CoreRelayFixtureScenario) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.declaredInvariants != rhs.declaredInvariants {
+            return false
+        }
+        if lhs.passes != rhs.passes {
+            return false
+        }
+        if lhs.usesContactEndpoint != rhs.usesContactEndpoint {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(declaredInvariants)
+        hasher.combine(passes)
+        hasher.combine(usesContactEndpoint)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixtureScenario: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixtureScenario {
+        return
+            try CoreRelayFixtureScenario(
+                name: FfiConverterString.read(from: &buf), 
+                declaredInvariants: FfiConverterSequenceString.read(from: &buf), 
+                passes: FfiConverterSequenceTypeCoreRelayFixturePassSpec.read(from: &buf), 
+                usesContactEndpoint: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayFixtureScenario, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterSequenceString.write(value.declaredInvariants, into: &buf)
+        FfiConverterSequenceTypeCoreRelayFixturePassSpec.write(value.passes, into: &buf)
+        FfiConverterBool.write(value.usesContactEndpoint, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureScenario_lift(_ buf: RustBuffer) throws -> CoreRelayFixtureScenario {
+    return try FfiConverterTypeCoreRelayFixtureScenario.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureScenario_lower(_ value: CoreRelayFixtureScenario) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFixtureScenario.lower(value)
+}
+
+
+/**
  * One HTTP header. A `Vec` of these rather than a map so the order core
  * chose is the order the driver sends, which keeps a request byte-comparable
  * across the two adapter suites (C1/C2's shared vectors).
@@ -25887,6 +26483,75 @@ extension CoreRelayFault: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which configured endpoint a request went to. A shell decides this by
+ * comparing the request's base URL against the two it configured — the one
+ * judgement it makes, and not a protocol one.
+ */
+
+public enum CoreRelayFixtureEndpoint {
+    
+    case own
+    case contact
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayFixtureEndpoint: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRelayFixtureEndpoint
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayFixtureEndpoint {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .own
+        
+        case 2: return .contact
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRelayFixtureEndpoint, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .own:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .contact:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureEndpoint_lift(_ buf: RustBuffer) throws -> CoreRelayFixtureEndpoint {
+    return try FfiConverterTypeCoreRelayFixtureEndpoint.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayFixtureEndpoint_lower(_ value: CoreRelayFixtureEndpoint) -> RustBuffer {
+    return FfiConverterTypeCoreRelayFixtureEndpoint.lower(value)
+}
+
+
+
+extension CoreRelayFixtureEndpoint: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What the relay gate should do for the selected network path.
  */
 
@@ -32042,6 +32707,31 @@ fileprivate struct FfiConverterSequenceTypeCoreRelayFetchedEnvelope: FfiConverte
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayFixturePassSpec: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayFixturePassSpec]
+
+    public static func write(_ value: [CoreRelayFixturePassSpec], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayFixturePassSpec.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayFixturePassSpec] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayFixturePassSpec]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayFixturePassSpec.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreRelayHeader: FfiConverterRustBuffer {
     typealias SwiftType = [CoreRelayHeader]
 
@@ -33957,6 +34647,116 @@ public func coreRelayAckIds(items: [CoreRelayEnvelopeDisposition]) -> [Int64] {
 public func coreRelayAdapterVectors() -> [CoreRelayAdapterVector] {
     return try!  FfiConverterSequenceTypeCoreRelayAdapterVector.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_relay_adapter_vectors($0
+    )
+})
+}
+/**
+ * The transcript this scenario produces with no shell in the loop.
+ *
+ * Same store seeding, same plan, same script, same normalisation — the only
+ * thing replaced is the HTTP, which is answered from
+ * [`core_relay_fixture_reply`] directly. A platform suite that produces a
+ * different string has found a difference its driver introduced.
+ */
+public func coreRelayFixtureExpectedTranscript(name: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_expected_transcript(
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+/**
+ * The observed form of a request that reached the server unaltered — what the
+ * reference run uses in place of a recording, and what a correct driver
+ * produces.
+ */
+public func coreRelayFixtureIdealObservation(request: CoreRelayHttpRequest) -> CoreRelayFixtureObservedRequest {
+    return try!  FfiConverterTypeCoreRelayFixtureObservedRequest.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_ideal_observation(
+        FfiConverterTypeCoreRelayHttpRequest.lower(request),$0
+    )
+})
+}
+/**
+ * The fixtures both adapter suites execute, in the order they run them.
+ *
+ * Adding a name here without the matching arms in [`scenario_of`],
+ * [`seed_for`] and [`reply_for`] fails `core/tests/relay_fixture_transcript.rs`
+ * rather than silently doing nothing.
+ */
+public func coreRelayFixtureNames() -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_names($0
+    )
+})
+}
+/**
+ * The plan for one pass of a scenario, addressed at whatever relays the
+ * caller stood up.
+ */
+public func coreRelayFixturePlan(name: String, passIndex: UInt32, ownUrl: String, ownToken: String, contactUrl: String, contactToken: String) -> CoreRelayPassPlan {
+    return try!  FfiConverterTypeCoreRelayPassPlan.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_plan(
+        FfiConverterString.lower(name),
+        FfiConverterUInt32.lower(passIndex),
+        FfiConverterString.lower(ownUrl),
+        FfiConverterString.lower(ownToken),
+        FfiConverterString.lower(contactUrl),
+        FfiConverterString.lower(contactToken),$0
+    )
+})
+}
+/**
+ * What the scripted relay answers this request with.
+ *
+ * Keyed on the operation and the endpoint rather than on the path, so a
+ * driver that mangled a path still gets the scripted answer and the mangling
+ * shows up in the transcript comparison instead of being masked by a 404.
+ */
+public func coreRelayFixtureReply(name: String, passIndex: UInt32, operation: CoreRelayOperation, endpoint: CoreRelayFixtureEndpoint) -> CoreRelayFixtureReply {
+    return try!  FfiConverterTypeCoreRelayFixtureReply.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_reply(
+        FfiConverterString.lower(name),
+        FfiConverterUInt32.lower(passIndex),
+        FfiConverterTypeCoreRelayOperation.lower(operation),
+        FfiConverterTypeCoreRelayFixtureEndpoint.lower(endpoint),$0
+    )
+})
+}
+/**
+ * The scenario for a fixture name, or a panic for an unknown one — an unknown
+ * name is a test asking for something that does not exist, and returning an
+ * empty scenario would make that pass.
+ */
+public func coreRelayFixtureScenario(name: String) -> CoreRelayFixtureScenario {
+    return try!  FfiConverterTypeCoreRelayFixtureScenario.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_scenario(
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+/**
+ * Build the store this scenario starts from.
+ *
+ * Seeding lives here rather than in each shell for the reason the whole
+ * module exists: a Kotlin seeder and a Swift seeder that drifted from the
+ * Rust one would produce three different incidents wearing one name.
+ */
+public func coreRelayFixtureSeedStore(store: MessageStore, name: String) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_seed_store(
+        FfiConverterTypeMessageStore.lower(store),
+        FfiConverterString.lower(name),$0
+    )
+}
+}
+/**
+ * Every invariant id a violation record named, for a suite to check the
+ * fixture's declared ones against. Empty is the passing case.
+ */
+public func coreRelayFixtureViolatedInvariants(store: MessageStore) -> [String] {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_fixture_violated_invariants(
+        FfiConverterTypeMessageStore.lower(store),$0
     )
 })
 }
@@ -36880,6 +37680,30 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_adapter_vectors() != 50015) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_expected_transcript() != 4024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_ideal_observation() != 64932) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_names() != 4581) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_plan() != 39980) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_reply() != 21598) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_scenario() != 31170) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_seed_store() != 56735) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_fixture_violated_invariants() != 49747) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_network_permitted() != 44955) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -37528,6 +38352,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corereconnectbackofftracker_retry_delay_ms() != 40354) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corerelayfixturetranscript_finish() != 51562) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corerelayfixturetranscript_record_request() != 26302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corerelayfixturetranscript_record_result() != 63624) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corerelayfixturetranscript_record_summary() != 30880) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_corerelaypass_cancel() != 11198) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -38141,6 +38977,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corereconnectbackofftracker_new() != 29344) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corerelayfixturetranscript_new() != 15268) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corerelaypass_new() != 55714) {

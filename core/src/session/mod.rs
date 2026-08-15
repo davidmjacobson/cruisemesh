@@ -39,6 +39,7 @@
 
 pub mod mesh_meet;
 pub mod mesh_receive;
+pub mod relay_fixture;
 pub mod relay_pass;
 pub mod relay_policy;
 pub mod relay_shadow;
