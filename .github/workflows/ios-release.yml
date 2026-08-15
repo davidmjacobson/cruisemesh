@@ -38,7 +38,7 @@ jobs:
       # Secrets can't be used in step `if:` directly; surface presence as a flag.
       IOS_ENABLED: ${{ secrets.IOS_DIST_CERT_P12_B64 != '' && secrets.ASC_API_KEY_P8 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
