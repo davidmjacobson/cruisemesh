@@ -333,6 +333,114 @@ class CoreInboundEngineTest {
         assertEquals(1, intents.flooded.size)
     }
 
+    /**
+     * A group body reaches this device *and* members who are not here. Whether
+     * our own copy persisted says nothing about theirs: core already committed
+     * the carry row and produced the hop-decremented copy before this shell
+     * ran, so a full disk on this phone must not silently drop everyone else's.
+     * The iOS driver floods before it delivers for the same reason.
+     */
+    @Test
+    fun aFailedLocalDeliveryStillFloodsTheCopyForOtherRecipients() {
+        val me = generateIdentity()
+        val member = generateIdentity()
+        val absent = generateIdentity()
+        val group = createGroup("Family", listOf(me.userId, member.userId, absent.userId))
+        val store = MessageStore.open(":memory:")
+        store.upsertGroup(group)
+        val now = System.currentTimeMillis()
+        val seen = SeenIds()
+        val intents = RecordingIntents(deliverySucceeds = false)
+        val adapter = CoreInboundAdapter(store, seen, intents) { now }
+
+        val envelope = Frame.Envelope(
+            msgId = generateMsgId(),
+            hopTtl = 7u,
+            expiry = now + 60_000,
+            recipientHint = computeRecipientHint(group.id, now),
+            sealed = sealGroupMessage(
+                member,
+                group,
+                encodeMessageBody(
+                    MessageBody(
+                        kind = KIND_TEXT,
+                        chatId = group.id,
+                        lamport = 1u,
+                        timestamp = now,
+                        content = "dinner at seven".toByteArray(),
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(
+            CoreInboundDisposition.FAILED,
+            adapter.process("AA:BB:CC:DD:EE:FF", envelope, me),
+        )
+        assertEquals("the copy for absent members still goes out", 1, intents.flooded.size)
+        val relayed = parseFrame(intents.flooded.single().second) as Frame.Envelope
+        assertTrue(relayed.msgId.contentEquals(envelope.msgId))
+        assertEquals("and it is still hop-decremented", 6.toUByte(), relayed.hopTtl)
+        // DTN D4 is unchanged: our own copy is still re-presentable and unacked.
+        assertFalse(
+            "a failed delivery must not poison the dedupe set",
+            seen.contains(envelope.msgId),
+        )
+    }
+
+    /**
+     * The carry nudge is the other half of the same rule: core committed the
+     * carry row, so the lane that could hand it onward is woken whether or not
+     * this device's own copy persisted.
+     */
+    @Test
+    fun aFailedLocalDeliveryNudgesTheCarryLaneJustLikeASuccessfulOne() {
+        val me = generateIdentity()
+        val member = generateIdentity()
+        val group = createGroup("Family", listOf(me.userId, member.userId))
+        val now = System.currentTimeMillis()
+
+        fun groupEnvelope() = Frame.Envelope(
+            msgId = generateMsgId(),
+            hopTtl = 7u,
+            expiry = now + 60_000,
+            recipientHint = computeRecipientHint(group.id, now),
+            sealed = sealGroupMessage(
+                member,
+                group,
+                encodeMessageBody(
+                    MessageBody(
+                        kind = KIND_TEXT,
+                        chatId = group.id,
+                        lamport = 1u,
+                        timestamp = now,
+                        content = "on our way".toByteArray(),
+                    ),
+                ),
+            ),
+        )
+
+        fun nudges(deliverySucceeds: Boolean): Int {
+            val store = MessageStore.open(":memory:")
+            store.upsertGroup(group)
+            val intents = RecordingIntents(deliverySucceeds = deliverySucceeds)
+            CoreInboundAdapter(store, SeenIds(), intents) { now }
+                .process("AA:BB:CC:DD:EE:FF", groupEnvelope(), me)
+            return intents.familyCarries
+        }
+
+        val whenDeliveryLands = nudges(deliverySucceeds = true)
+        assertTrue(
+            "this envelope must actually be a family carry, or the case below proves nothing",
+            whenDeliveryLands > 0,
+        )
+        assertEquals(
+            "a failed local delivery must nudge exactly what a successful one does",
+            whenDeliveryLands,
+            nudges(deliverySucceeds = false),
+        )
+    }
+
     // ---- Half two: ported disposition tests, on the core engine ---------
 
     private fun coreEngineProcessor(

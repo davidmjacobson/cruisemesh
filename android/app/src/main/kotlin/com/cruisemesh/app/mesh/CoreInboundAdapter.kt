@@ -120,6 +120,19 @@ internal class CoreInboundAdapter(
             return CoreInboundDisposition.FAILED
         }
 
+        // Flood and carry first, before the local delivery that may fail --
+        // the same order the iOS driver uses. Core has already committed the
+        // carry row and decided the hop-decremented copy exists; both are for
+        // the *other* recipients of this envelope and have nothing to do with
+        // whether this device's own copy persisted. Running them after the
+        // delivery meant a full disk silently dropped everyone else's copy on
+        // the floor, and the retry that follows a FAILED cannot bring it back:
+        // the next re-presentation dedupes or re-fails the same way.
+        outcome.relayFrame?.let { intents.flood(sourceAddress, it) }
+        if (outcome.carriedFamily) {
+            intents.onFamilyCarry()
+        }
+
         val payload = outcome.deliveredPayloads.firstOrNull()
         if (payload != null) {
             val sender = outcome.deliveredSender
@@ -150,10 +163,6 @@ internal class CoreInboundAdapter(
             store.coreCommitInboundDelivery(seenIds, commit)
         }
 
-        outcome.relayFrame?.let { intents.flood(sourceAddress, it) }
-        if (outcome.carriedFamily) {
-            intents.onFamilyCarry()
-        }
         return outcome.disposition
     }
 }
