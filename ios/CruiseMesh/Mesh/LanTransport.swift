@@ -223,6 +223,14 @@ final class LanTransport {
         }
     }
 
+    /// The Noise static key the peer on `address` proved it holds. Present for
+    /// every live LAN link, because the handshake completes before the address
+    /// becomes routable. Nil for an address this transport does not own, or
+    /// one whose link has already been torn down.
+    func remoteStaticKey(address: String) -> Data? {
+        queue.sync { connections[address]?.remoteStaticKey }
+    }
+
     func startSubnetScan() -> String? {
         guard let network = localWifiIPv4Network() else {
             return "Connect this phone to Wi-Fi before searching the local subnet"
@@ -1129,6 +1137,9 @@ private final class LanConnection {
     /// The accepted contact this link authenticated as, for the transport's
     /// duplicate-link and unlinked-capable-contact checks.
     private(set) var authenticatedUserId: Data?
+    /// The Noise static key the peer proved it holds, captured as the
+    /// handshake finishes so it stays readable after the session is closed.
+    private(set) var remoteStaticKey: Data?
     /// Set when the initiator-side handshake found the contact already
     /// linked over LAN: the close is deliberate, not a failure to retry.
     private(set) var abortedDuplicateLink = false
@@ -1313,6 +1324,7 @@ private final class LanConnection {
         phase = .transport
         wasAuthenticated = true
         authenticatedUserId = userId
+        remoteStaticKey = noise.remoteStaticKey()
         setupTimeout?.cancel()
         setupTimeout = nil
         owner?.connectionAuthenticated(self, userId: userId)
@@ -1355,6 +1367,23 @@ func trustedLanPeerUserId(contacts: [Contact], remoteStaticKey: Data) -> Data? {
 
 func ownLanStaticKeyMatches(ownAgreePk: Data, remoteStaticKey: Data) -> Bool {
     ownAgreePk == remoteStaticKey
+}
+
+/// Whether a HELLO that names this device's own user id may be persisted as an
+/// identity clone warning. The core store documents the contract: only an
+/// authenticated sighting counts. A user id in a HELLO is just a claim -- the
+/// proof is the Noise static key the link's peer actually holds, so the
+/// warning is recorded only on a LAN link whose session key is this identity's
+/// own agreement key. Anything else (a cleartext BLE HELLO, a LAN link
+/// belonging to some other peer, a link already gone) is ignored. Mirrors
+/// Android's `ownIdentityHelloIsAuthenticated`.
+func ownIdentityHelloIsAuthenticated(
+    isLanLink: Bool,
+    ownAgreePk: Data,
+    sessionRemoteStaticKey: Data?
+) -> Bool {
+    guard isLanLink, let sessionRemoteStaticKey else { return false }
+    return ownLanStaticKeyMatches(ownAgreePk: ownAgreePk, remoteStaticKey: sessionRemoteStaticKey)
 }
 
 func appleLanServiceType() -> String {

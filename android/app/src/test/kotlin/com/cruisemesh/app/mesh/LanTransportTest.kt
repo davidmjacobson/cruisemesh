@@ -85,6 +85,48 @@ class LanTransportTest {
     }
 
     @Test
+    fun `own-id HELLO records a clone only when the session key is ours`() {
+        val own = contact(1, 7)
+        val other = contact(2, 8)
+
+        // A LAN link authenticated as some other contact can still send a
+        // HELLO naming our user id. The user id is only a claim; the session
+        // key is the proof, so this one is not recorded.
+        assertTrue(
+            !ownIdentityHelloIsAuthenticated(
+                isLanLink = true,
+                ownAgreePk = own.agreePk,
+                sessionRemoteStaticKey = other.agreePk,
+            ),
+        )
+        // Same on a link whose session key is not available at all.
+        assertTrue(
+            !ownIdentityHelloIsAuthenticated(
+                isLanLink = true,
+                ownAgreePk = own.agreePk,
+                sessionRemoteStaticKey = null,
+            ),
+        )
+        // A cleartext BLE HELLO never records, whatever it names.
+        assertTrue(
+            !ownIdentityHelloIsAuthenticated(
+                isLanLink = false,
+                ownAgreePk = own.agreePk,
+                sessionRemoteStaticKey = own.agreePk.copyOf(),
+            ),
+        )
+        // A LAN link that actually holds our own agreement key is the real
+        // clone sighting.
+        assertTrue(
+            ownIdentityHelloIsAuthenticated(
+                isLanLink = true,
+                ownAgreePk = own.agreePk,
+                sessionRemoteStaticKey = own.agreePk.copyOf(),
+            ),
+        )
+    }
+
+    @Test
     fun `manual endpoint accepts an address with the default or explicit port`() {
         assertEquals(
             LanManualEndpoint("10.154.189.58", 45_892),
