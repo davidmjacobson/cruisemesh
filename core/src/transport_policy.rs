@@ -514,6 +514,11 @@ struct Peer {
     user_id: Option<Vec<u8>>,
     /// From HELLO2; `None` = peer never sent one (a pre-HELLO2 build).
     capabilities: Option<u32>,
+    /// When this *link* last put a DIGEST on the wire, for the D8 re-digest
+    /// cadence. Link state, not logical-peer state: a fresh connection has
+    /// never exchanged one and is due immediately, which is what makes a
+    /// reconnect converge. `None` = never.
+    last_digest_at_ms: Option<i64>,
     /// Hidden-kind envelope msg_ids already sprayed to this peer during this
     /// link session — the once-per-session bound for peers that can't ack
     /// hidden kinds. Cleared on a fresh legacy HELLO (new handshake) and
@@ -557,14 +562,25 @@ fn tail_cursor_at(now_ms: i64) -> CoreCarriedCursor {
     }
 }
 
-/// Resolve one lane's stored progress into what it should do this round. Both
-/// carry lanes share the rule; only the pair of fields they read differs.
+/// Resolve one lane's stored progress into what it should do this round, and
+/// record the transition. Both carry lanes share the rule; only the pair of
+/// fields they read differs.
+///
+/// Deciding a full re-walk *clears* `walk_done_at_ms`, which is what makes the
+/// cooldown a cooldown rather than a permanent state. Without that clear, a
+/// long-lived link never re-walked at all: every round inside the cooldown
+/// resumed from the tail, found nothing, reported `exhausted` again, and
+/// [`CoreMeshRouterState::record_carried_progress`] re-stamped `done_at` to
+/// *now* -- so on a link re-digesting every 3-5 minutes the 30-minute window
+/// was renewed forever and the safety pass for a frame lost in a transport
+/// FIFO could never come due. Only a pass that actually started from the top
+/// re-arms the window when it completes.
 fn lane_from(
-    walk_done_at_ms: Option<i64>,
+    walk_done_at_ms: &mut Option<i64>,
     cursor: Option<&CoreCarriedCursor>,
     now_ms: i64,
 ) -> CoreCarriedLane {
-    match walk_done_at_ms {
+    match *walk_done_at_ms {
         // A `done_at` in the future (clock skew) reads as not-yet-due, the
         // same direction `should_redigest` errs in: worst case the full
         // re-walk waits longer on a link that is still offering new arrivals
@@ -581,10 +597,13 @@ fn lane_from(
                 },
             }
         }
-        Some(_) => CoreCarriedLane {
-            skip: false,
-            after: None,
-        },
+        Some(_) => {
+            *walk_done_at_ms = None;
+            CoreCarriedLane {
+                skip: false,
+                after: None,
+            }
+        }
         None => CoreCarriedLane {
             skip: false,
             after: cursor.cloned(),
@@ -672,6 +691,7 @@ impl CoreMeshRouterState {
                 connected_sequence: self.next_connected_sequence.fetch_add(1, Ordering::Relaxed),
                 user_id: None,
                 capabilities: None,
+                last_digest_at_ms: None,
                 hidden_offered: std::collections::HashSet::new(),
             },
         );
@@ -802,11 +822,8 @@ impl CoreMeshRouterState {
         };
         let mut carry = self.logical_carry.lock_recoverable();
         let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
-        lane_from(
-            peer.carried_walk_done_at_ms,
-            peer.carried_cursor.as_ref(),
-            now_ms,
-        )
+        let cursor = peer.carried_cursor.clone();
+        lane_from(&mut peer.carried_walk_done_at_ms, cursor.as_ref(), now_ms)
     }
 
     /// Record what the carried lane just offered down this link: `next` is the
@@ -844,7 +861,10 @@ impl CoreMeshRouterState {
         let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
         if exhausted {
             peer.carried_cursor = Some(next.unwrap_or_else(|| tail_cursor_at(now_ms)));
-            peer.carried_walk_done_at_ms = Some(now_ms);
+            // A continuation round that merely re-confirms the tail must not
+            // renew a cooldown that is already running; only the pass that
+            // started it -- or a fresh full pass -- arms the window.
+            peer.carried_walk_done_at_ms.get_or_insert(now_ms);
         } else if next.is_some() {
             peer.carried_cursor = next;
             peer.carried_walk_done_at_ms = None;
@@ -867,9 +887,10 @@ impl CoreMeshRouterState {
         };
         let mut carry = self.logical_carry.lock_recoverable();
         let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
+        let cursor = peer.targeted_carried_cursor.clone();
         lane_from(
-            peer.targeted_carried_walk_done_at_ms,
-            peer.targeted_carried_cursor.as_ref(),
+            &mut peer.targeted_carried_walk_done_at_ms,
+            cursor.as_ref(),
             now_ms,
         )
     }
@@ -894,7 +915,7 @@ impl CoreMeshRouterState {
         let peer = touch_and_sweep(&mut carry, &user_id, now_ms);
         if exhausted {
             peer.targeted_carried_cursor = Some(next.unwrap_or_else(|| tail_cursor_at(now_ms)));
-            peer.targeted_carried_walk_done_at_ms = Some(now_ms);
+            peer.targeted_carried_walk_done_at_ms.get_or_insert(now_ms);
         } else if next.is_some() {
             peer.targeted_carried_cursor = next;
             peer.targeted_carried_walk_done_at_ms = None;
@@ -1077,6 +1098,72 @@ impl CoreMeshRouterState {
         self.peers.lock_recoverable().clear();
         self.logical_carry.lock_recoverable().clear();
     }
+}
+
+/// Encounter-planning accessors used by [`crate::session::mesh_meet`].
+///
+/// Deliberately outside the `#[uniffi::export]` block: the encounter planner
+/// is core-internal until the shell adapters land, and the frozen mobile ABI
+/// should not grow entry points nothing on the wire uses yet. Extending the
+/// one router (rule: never a second one) is what keeps digest cadence, carry
+/// cursors and route election reading the same peer record.
+impl CoreMeshRouterState {
+    /// Capability bits this link's peer advertised in HELLO2, or `None` for a
+    /// pre-HELLO2 build.
+    pub fn peer_capabilities_for(&self, address: &str) -> Option<u32> {
+        self.peers
+            .lock_recoverable()
+            .get(address)
+            .and_then(|peer| peer.capabilities)
+    }
+
+    /// Whether this link should put a DIGEST on the wire now (D8).
+    ///
+    /// A link that has never digested is due immediately -- that is the whole
+    /// point of a fresh session, and it is why the marker lives on the link
+    /// rather than on the logical peer (unlike the carry cursors, which
+    /// deliberately survive address rotation so a reconnect cannot multiply a
+    /// backlog offer: a digest is one small frame, a carry walk is megabytes).
+    /// After that the [`should_redigest`] window applies, jittered from the
+    /// peer's *identity* rather than from a clock or an address, so the whole
+    /// fleet does not re-digest on the same tick and one pair's phase is
+    /// stable across reconnects and address rotation.
+    ///
+    /// An address this state does not know reads as due: offering a digest is
+    /// always safe, and refusing one is how a link goes quiet forever.
+    pub fn digest_due_for(&self, address: &str, now_ms: i64) -> bool {
+        let peers = self.peers.lock_recoverable();
+        let Some(peer) = peers.get(address) else {
+            return true;
+        };
+        let Some(last) = peer.last_digest_at_ms else {
+            return true;
+        };
+        let seed = peer
+            .user_id
+            .as_deref()
+            .map_or_else(|| jitter_seed(address.as_bytes()), jitter_seed);
+        should_redigest(now_ms, last, seed)
+    }
+
+    /// A DIGEST for this link just went out; start its re-digest window.
+    pub fn record_digest_sent(&self, address: &str, now_ms: i64) {
+        if let Some(peer) = self.peers.lock_recoverable().get_mut(address) {
+            peer.last_digest_at_ms = Some(now_ms);
+        }
+    }
+}
+
+/// FNV-1a over an identity, for jitter that is deterministic per peer and
+/// carries no clock or address in it (determinism rule: identity-derived
+/// jitter, never `rand`).
+fn jitter_seed(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn route_precedes(
@@ -1598,6 +1685,43 @@ mod tests {
         router.on_disconnected("ble".into());
         assert!(router.hidden_offered_for("ble".into()).is_empty());
         assert!(!router.peer_acks_hidden_kinds("ble".into()));
+    }
+
+    #[test]
+    fn a_live_link_re_walks_after_the_cooldown_instead_of_renewing_it_forever() {
+        // The cooldown used to be re-stamped by every round that re-confirmed
+        // the tail, so on a link re-digesting every few minutes the 30-minute
+        // safety re-walk was pushed out forever and a frame lost in a
+        // transport FIFO could never be found again.
+        let router = CoreMeshRouterState::new();
+        router.on_connected("ble".into(), CoreTransport::Central);
+        assert!(router.on_hello("ble".into(), vec![7; 16]));
+        let now = 1_700_000_000_000_i64;
+        let tail = CoreCarriedCursor {
+            received_at: now,
+            msg_id: vec![1; 16],
+        };
+
+        // Round 0 walks to the tail and starts the cooldown.
+        router.record_carried_progress("ble".into(), Some(tail.clone()), true, now);
+
+        // Rounds every 5 minutes for an hour: each resumes from the tail,
+        // finds nothing, and reports exhaustion again.
+        let round_ms = 5 * 60_000;
+        let mut full_passes = 0;
+        for round in 1..=12 {
+            let at = now + round * round_ms;
+            let lane = router.carried_lane_for("ble".into(), at);
+            assert!(!lane.skip);
+            if lane.after.is_none() {
+                full_passes += 1;
+            }
+            router.record_carried_progress("ble".into(), None, true, at);
+        }
+        assert_eq!(
+            full_passes, 2,
+            "one re-walk per 30-minute cooldown -- not zero (the old renewal              bug) and not one per round (which is the churn the cooldown              exists to prevent)"
+        );
     }
 
     #[test]

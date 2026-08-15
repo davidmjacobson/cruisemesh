@@ -15,10 +15,13 @@
 //!     expiry, open-for-self/group-with-membership-guard, flood/carry
 //!     classification, and the ack-safety evidence. The sim only supplies the
 //!     frame and records the delivered payload; the disposition is core's.
-//!   * meeting (HELLO): [`MessageStore::plan_mesh_meet`] owns the encounter
-//!     (targeted drain, digest exclusion, digest-confirm, budgeted spray).
+//!   * meeting (HELLO/DIGEST): [`MessageStore::plan_mesh_meet`] owns the whole
+//!     encounter -- peer capabilities, the digest cadence and the DIGEST
+//!     frames themselves, digest-confirm, digest exclusion, the targeted
+//!     drain, the per-epoch offer allowance and the budgeted spray.
 //!     `Network::meet` only decides who is adjacent and moves the returned
-//!     frames between them.
+//!     frames between them. The simulation keeps no meet or spray arithmetic
+//!     of its own: it stopped being a third implementation.
 //!   * relay: group-addressed uploads fan out into one row per member hint;
 //!     each node polls its own hints and, through the same core transaction,
 //!     only acks rows it consumed.
@@ -27,17 +30,18 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cruisemesh_core::{
-    compute_recipient_hint, core_group_fanout_rows, default_expiry, encode_envelope_frame,
-    generate_identity, generate_msg_id, seal_group_message, seal_message, CarriedEnvelope,
-    CoreGroupFanoutRow, CoreInboundDisposition, CoreInboundSource, CoreMeetRequest,
-    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreTransport, Group,
-    Identity, MessageStore, SeenIds, StoredMessage, DEFAULT_HOP_TTL, KIND_TEXT,
+    compute_recipient_hint, core_group_fanout_rows, core_own_capabilities, default_expiry,
+    encode_envelope_frame, generate_identity, generate_msg_id, parse_frame, seal_group_message,
+    seal_message, CarriedEnvelope, CoreCarriedOfferGate, CoreGroupFanoutRow,
+    CoreInboundDisposition, CoreInboundSource, CoreMeetOutcome, CoreMeetRequest,
+    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreSprayTrigger,
+    CoreTransport, Frame, Group, Identity, MessageStore, SeenIds, StoredMessage, DEFAULT_HOP_TTL,
+    KIND_TEXT,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 const BASE_NOW: i64 = 1_700_000_000_000;
 const FOREIGN_BUDGET: i64 = 5 * 1024 * 1024;
-const DIGEST_CARRIED_MSG_IDS_LIMIT: u64 = 512;
 
 /// One mesh participant: identity + crypto, its persistent carry queue, its
 /// flood-dedupe set, and an inbox of payloads it successfully opened.
@@ -53,6 +57,9 @@ struct SimNode {
     router: CoreMeshRouterState,
     /// Per-device spray cadence / burst bucket.
     spray: CoreSprayPolicy,
+    /// Per-device allowance for how many peers may walk this device's carry
+    /// store in one short epoch (G3).
+    offers: CoreCarriedOfferGate,
     /// Monotonic stream position for the rows [`SimNode::record_delivery`]
     /// persists, so two opened messages never collide into the conflict
     /// quarantine and get dropped from the digest.
@@ -71,6 +78,7 @@ impl SimNode {
             inbox: Vec::new(),
             router,
             spray: CoreSprayPolicy::new(),
+            offers: CoreCarriedOfferGate::new(),
             delivered_seq: 0,
         }
     }
@@ -191,12 +199,40 @@ impl SimNode {
         outcome.disposition
     }
 
-    fn recent_delivery_hints(&self, now: i64) -> Vec<Vec<u8>> {
-        let mut hints = recent_hints(&self.user_id(), now);
-        for group in self.store.list_groups().expect("list groups") {
-            hints.extend(recent_hints(&group.id, now));
-        }
-        hints
+    /// One encounter through the production planner. Every argument the sim
+    /// supplies is transport-observable: who the peer is, which link this is,
+    /// what its DIGEST advertised, what brought us here, and the clock.
+    fn plan_meet(
+        &self,
+        peer_user_id: Vec<u8>,
+        peer_address: String,
+        peer_known_msg_ids: Vec<Vec<u8>>,
+        trigger: CoreSprayTrigger,
+        now: i64,
+    ) -> CoreMeetOutcome {
+        self.store
+            .plan_mesh_meet(
+                &self.router,
+                &self.spray,
+                &self.offers,
+                CoreMeetRequest {
+                    own_user_id: self.user_id(),
+                    peer_user_id,
+                    peer_address,
+                    peer_known_msg_ids,
+                    // The sim is a closed, trusted graph -- meetings here
+                    // stand in for an identified session, not a spoofable
+                    // cleartext HELLO. CARRY-02 is owned by the planner's
+                    // `peer_authenticated` flag and the module tests;
+                    // flipping this to false would disable digest-confirm for
+                    // every sim edge.
+                    peer_authenticated: true,
+                    peer_capabilities: Some(core_own_capabilities()),
+                    trigger,
+                    now_ms: now,
+                },
+            )
+            .expect("plan encounter")
     }
 }
 
@@ -312,6 +348,17 @@ impl RelayActor {
 
     fn pending_len(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Give every stored row an independently ackable twin: the retried
+    /// upload / duplicated fan-out case.
+    fn duplicate_every_row(&mut self) {
+        for index in 0..self.rows.len() {
+            let mut twin = self.rows[index].clone();
+            twin.id = self.next_id;
+            self.next_id += 1;
+            self.rows.push(twin);
+        }
     }
 }
 
@@ -445,9 +492,16 @@ impl Network {
     /// Transport half of a HELLO encounter: each in-contact pair identifies,
     /// the sender reads the peer's digest off the wire-equivalent store API,
     /// core plans the encounter, and this method only moves the returned
-    /// frames. No disposition, spray, exclusion, or carried-removal policy
-    /// lives here.
+    /// frames. No disposition, digest cadence, spray, exclusion, or
+    /// carried-removal policy lives here.
     fn meet(&mut self, now: i64) {
+        self.meet_with(now, CoreSprayTrigger::FirstContact);
+    }
+
+    /// [`Self::meet`] with an explicit trigger, for the long-lived-link
+    /// scenarios where the encounter is a maintenance re-digest rather than a
+    /// fresh HELLO.
+    fn meet_with(&mut self, now: i64, trigger: CoreSprayTrigger) {
         let n = self.nodes.len();
         for a in 0..n {
             let neighbors = self.adjacency[a].clone();
@@ -460,41 +514,33 @@ impl Network {
                     .store
                     .core_digest_advertised_msg_ids()
                     .expect("peer digest");
-                let frames = {
+                let outcome = {
                     let node = &self.nodes[a];
                     if node.router.user_id_for(address.clone()).is_none() {
                         node.router
                             .on_connected(address.clone(), CoreTransport::Lan);
                         assert!(node.router.on_hello(address.clone(), peer_user_id.clone()));
                     }
-                    let outcome = node
-                        .store
-                        .plan_mesh_meet(
-                            &node.router,
-                            &node.spray,
-                            CoreMeetRequest {
-                                own_user_id: node.user_id(),
-                                peer_user_id,
-                                peer_address: address,
-                                peer_known_msg_ids,
-                                // The sim is a closed, trusted graph — meetings
-                                // here stand in for an identified session, not a
-                                // spoofable cleartext HELLO. CARRY-02 is owned by
-                                // the planner's `peer_authenticated` flag and the
-                                // module tests; flipping this to false would
-                                // disable digest-confirm for every sim edge.
-                                peer_authenticated: true,
-                                now_ms: now,
-                            },
-                        )
-                        .expect("plan encounter");
-                    outcome.frames().cloned().collect::<Vec<_>>()
+                    node.plan_meet(peer_user_id, address, peer_known_msg_ids, trigger, now)
                 };
-                for frame in frames {
+                // The planner's own DIGEST frames go on the radio like any
+                // other frame. This sim reads a peer's advertised set straight
+                // off its store above (its stand-in for receiving the frame),
+                // so here they are only counted and checked for shape -- but
+                // they are counted, because they are airtime the encounter
+                // planner is now responsible for.
+                for frame in &outcome.digest_frames {
+                    assert!(
+                        matches!(parse_frame(frame.clone()), Ok(Frame::Digest { .. })),
+                        "the planner emitted a frame that is not a DIGEST"
+                    );
+                    self.transmissions += 1;
+                }
+                for frame in outcome.targeted_frames.iter().chain(&outcome.spray_frames) {
                     self.transmissions += 1;
                     // Meetings do not cascade floods; the inbound path may
                     // still return a re-flood frame, which we drop.
-                    let _ = self.nodes[b].receive(&frame, now);
+                    let _ = self.nodes[b].receive(frame, now);
                 }
             }
         }
@@ -847,7 +893,118 @@ fn group_relay_fanout_opens_on_every_member_and_each_copy_is_acked() {
     );
 }
 
-/// D8 + the per-link-session carried cursor: a courier parked next to one peer
+// ---------------------------------------------------------------------------
+// Encounter stress: every scenario below drives the production planner
+// (`MessageStore::plan_mesh_meet`) rather than re-composing store primitives.
+// The simulation has no meet/spray policy of its own left to drift from it.
+// ---------------------------------------------------------------------------
+
+/// One courier standing next to one peer, on one named link.
+struct Courier {
+    courier: SimNode,
+    peer: SimNode,
+    address: String,
+}
+
+impl Courier {
+    fn new(address: &str) -> Self {
+        let courier = SimNode::new();
+        let peer = SimNode::new();
+        courier
+            .router
+            .on_connected(address.to_string(), CoreTransport::Central);
+        assert!(courier.router.on_hello(address.to_string(), peer.user_id()));
+        Courier {
+            courier,
+            peer,
+            address: address.to_string(),
+        }
+    }
+
+    /// Fill the courier's carry queue with `count` envelopes for `hint`.
+    /// Distinct ciphertext per row: the queue dedupes on the (hint, sealed)
+    /// content digest, so identical filler would collapse the backlog instead
+    /// of building one.
+    fn load(&self, hint: &[u8], count: usize, sealed_len: usize, base: i64) {
+        for index in 0..count {
+            let mut sealed = vec![0xAB; sealed_len];
+            sealed[..2].copy_from_slice(&(index as u16).to_be_bytes());
+            self.courier
+                .store
+                .enqueue_carried_envelope(
+                    CarriedEnvelope {
+                        msg_id: generate_msg_id(),
+                        hop_ttl: DEFAULT_HOP_TTL,
+                        expiry: base + 7 * MS_PER_DAY,
+                        recipient_hint: hint.to_vec(),
+                        sealed,
+                    },
+                    false,
+                    base + index as i64,
+                    FOREIGN_BUDGET,
+                )
+                .expect("enqueue backlog");
+        }
+    }
+
+    /// One planned encounter, with the peer's real carry set standing in for
+    /// its DIGEST. Returns how many envelope frames went over the link.
+    fn round(&mut self, trigger: CoreSprayTrigger, now: i64) -> usize {
+        // The peer advertises everything it holds. A real DIGEST is capped, so
+        // a re-walk toward a peer holding more than the cap legitimately
+        // re-offers the un-named remainder; these tests isolate the walk
+        // arithmetic from that separate, deliberate redundancy.
+        let known = self
+            .peer
+            .store
+            .carried_msg_ids(u64::MAX)
+            .expect("peer carried msg ids");
+        self.round_with_known(known, trigger, now)
+    }
+
+    /// As [`Self::round`], but with an explicitly supplied advertised set --
+    /// for modelling a peer whose proof of receipt never arrives.
+    fn round_with_known(
+        &mut self,
+        known: Vec<Vec<u8>>,
+        trigger: CoreSprayTrigger,
+        now: i64,
+    ) -> usize {
+        let outcome = self.courier.plan_meet(
+            self.peer.user_id(),
+            self.address.clone(),
+            known,
+            trigger,
+            now,
+        );
+        let mut offered = 0;
+        for frame in outcome.targeted_frames.iter().chain(&outcome.spray_frames) {
+            offered += 1;
+            let _ = self.peer.receive(frame, now);
+        }
+        offered
+    }
+
+    /// The link died and the peer came back on another radio under a new
+    /// address. The logical-peer carry state is deliberately retained.
+    fn relink(&mut self, address: &str, transport: CoreTransport) {
+        self.courier.router.on_disconnected(self.address.clone());
+        self.courier
+            .router
+            .on_connected(address.to_string(), transport);
+        assert!(self
+            .courier
+            .router
+            .on_hello(address.to_string(), self.peer.user_id()));
+        self.address = address.to_string();
+    }
+
+    fn carried(&self) -> usize {
+        self.courier.store.carried_len().expect("carried len") as usize
+    }
+}
+
+/// D8 + the per-logical-peer carried cursor: a courier parked next to one peer
 /// for hours must hand over its whole backlog and then fall silent.
 ///
 /// The re-digest fires every 3-5 minutes on a long-lived link, and each round
@@ -860,95 +1017,27 @@ fn group_relay_fanout_opens_on_every_member_and_each_copy_is_acked() {
 /// the rest of the day, across several re-walk cooldowns.
 #[test]
 fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
-    // The shipped shell values (android MeshDefaults / iOS MeshDefaults).
-    const CARRIED_BUDGET_BYTES: u64 = 256 * 1024;
     const SEALED_LEN: usize = 4 * 1024;
     const BACKLOG: usize = 300;
-    const ROUND_MS: i64 = 4 * 60_000;
-    const ROUNDS: usize = 40;
-    const ADDRESS: &str = "ble:courier-peer";
+    // The D8 maintenance cadence, which is also the interval `may_spray`
+    // enforces for a `Maintenance` trigger.
+    const ROUND_MS: i64 = 5 * 60_000;
+    // Long enough to cover the receipt-quiet backoff: a courier holding mail
+    // for someone who is not here produces no proof of progress, so the spray
+    // cadence deliberately stretches. That is the designed cost of muling for
+    // an absent recipient -- what must not happen is the walk failing to
+    // finish, or a row crossing twice.
+    const ROUNDS: usize = 160;
 
-    let courier = SimNode::new();
-    let mut peer = SimNode::new();
+    let mut link = Courier::new("ble:courier-peer");
     let stranger = generate_identity();
-
-    // Foreign traffic addressed to someone who is not here: the courier can't
-    // open it and the peer can't either, so it stays in both carry queues and
-    // the offering path is the only thing under test.
-    let hint = compute_recipient_hint(stranger.user_id.clone(), BASE_NOW);
-    for index in 0..BACKLOG {
-        // Distinct ciphertext per row: the carry queue dedupes on the
-        // (hint, sealed) content digest, so identical filler would collapse
-        // the backlog instead of building one.
-        let mut sealed = vec![0xAB; SEALED_LEN];
-        sealed[..2].copy_from_slice(&(index as u16).to_be_bytes());
-        courier
-            .store
-            .enqueue_carried_envelope(
-                CarriedEnvelope {
-                    msg_id: generate_msg_id(),
-                    hop_ttl: DEFAULT_HOP_TTL,
-                    expiry: BASE_NOW + 7 * MS_PER_DAY,
-                    recipient_hint: hint.clone(),
-                    sealed,
-                },
-                false,
-                BASE_NOW + index as i64,
-                FOREIGN_BUDGET,
-            )
-            .expect("enqueue backlog");
-    }
-    assert_eq!(
-        courier
-            .store
-            .carried_msg_ids(u64::MAX)
-            .expect("courier carried msg ids")
-            .len(),
-        BACKLOG
-    );
-
-    // One link session for the whole run -- the phones never move apart.
-    let router = CoreMeshRouterState::new();
-    router.on_connected(ADDRESS.to_string(), CoreTransport::Central);
-    assert!(router.on_hello(ADDRESS.to_string(), peer.user_id()));
+    let hint = compute_recipient_hint(stranger.user_id, BASE_NOW);
+    link.load(&hint, BACKLOG, SEALED_LEN, BASE_NOW);
 
     let mut offers_per_round = Vec::new();
     for round in 0..ROUNDS {
         let now = BASE_NOW + (round as i64 + 1) * ROUND_MS;
-        // Exactly what `InboundEnvelopeProcessor.sprayDigestPlanTo` /
-        // `MeshController.sprayDigestPlanTo` do per re-digest.
-        let lane = router.carried_lane_for(ADDRESS.to_string(), now);
-        let plan = courier
-            .store
-            .core_digest_spray_plan(
-                courier.user_id(),
-                peer.user_id(),
-                peer.recent_delivery_hints(now),
-                peer.store
-                    .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
-                    .expect("peer carried msg ids"),
-                now,
-                if lane.skip { 0 } else { CARRIED_BUDGET_BYTES },
-                0,
-                0,
-                0,
-                true,
-                vec![],
-                lane.after,
-            )
-            .expect("digest spray plan");
-        for frame in &plan.carried_frames {
-            let _ = peer.receive(frame, now);
-        }
-        if !lane.skip {
-            router.record_carried_progress(
-                ADDRESS.to_string(),
-                plan.next_carried_cursor,
-                plan.carried_exhausted,
-                now,
-            );
-        }
-        offers_per_round.push(plan.carried_frames.len());
+        offers_per_round.push(link.round(CoreSprayTrigger::Maintenance, now));
     }
 
     let total_offered: usize = offers_per_round.iter().sum();
@@ -958,8 +1047,9 @@ fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
          re-offered, none skipped ({offers_per_round:?})"
     );
     assert_eq!(
-        peer.store
-            .carried_msg_ids(DIGEST_CARRIED_MSG_IDS_LIMIT)
+        link.peer
+            .store
+            .carried_msg_ids(u64::MAX)
             .expect("peer carried msg ids")
             .len(),
         BACKLOG,
@@ -968,11 +1058,12 @@ fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
 
     let walk_rounds = offers_per_round
         .iter()
-        .position(|offers| *offers == 0)
-        .expect("the lane must fall silent");
+        .rposition(|offers| *offers > 0)
+        .expect("the walk must offer something")
+        + 1;
     assert!(
-        walk_rounds <= 8,
-        "1.2 MiB at 256 KiB a round should converge in a handful of rounds, took {walk_rounds}"
+        walk_rounds <= 40,
+        "1.2 MiB at 256 KiB an allowed round must converge well inside the run          even with the quiet-peer backoff stretching the cadence, took {walk_rounds}"
     );
     assert!(
         offers_per_round[walk_rounds..].iter().all(|n| *n == 0),
@@ -983,13 +1074,349 @@ fn a_courier_walks_a_backlog_many_times_the_budget_once_and_then_stays_quiet() {
     // DTN ack safety: offering is not delivery. The courier still holds every
     // envelope; a carried copy is dropped only on digest-proof of receipt.
     assert_eq!(
-        courier
-            .store
-            .carried_envelopes_for_peer_sync(vec![], vec![], BASE_NOW, u64::MAX, u32::MAX, None)
-            .expect("courier carry queue")
-            .rows
-            .len(),
+        link.carried(),
         BACKLOG,
         "a completed walk offers; it never acks or deletes"
+    );
+}
+
+/// The restore case: a phone comes back from an encrypted backup with a deep
+/// carry queue and immediately meets a peer. Every round must stay inside the
+/// per-encounter budget -- one 900-row queue may not become one 900-frame
+/// burst into a single BLE FIFO -- and the walk must still converge.
+#[test]
+fn a_restore_with_a_deep_backlog_stays_bounded_per_round_and_still_converges() {
+    const SEALED_LEN: usize = 1024;
+    const BACKLOG: usize = 900;
+    const ROUND_MS: i64 = 5 * 60_000;
+    const ROUNDS: usize = 240;
+    // CARRIED_SPRAY_BUDGET_BYTES / SEALED_LEN: the most whole envelopes one
+    // round's budget can pay for.
+    const MAX_FRAMES_PER_ROUND: usize = 256 * 1024 / SEALED_LEN;
+
+    let mut link = Courier::new("ble:restored");
+    let stranger = generate_identity();
+    let hint = compute_recipient_hint(stranger.user_id, BASE_NOW);
+    link.load(&hint, BACKLOG, SEALED_LEN, BASE_NOW);
+    assert_eq!(link.carried(), BACKLOG);
+
+    let mut offers_per_round = Vec::new();
+    for round in 0..ROUNDS {
+        let now = BASE_NOW + (round as i64 + 1) * ROUND_MS;
+        let offered = link.round(CoreSprayTrigger::Maintenance, now);
+        assert!(
+            offered <= MAX_FRAMES_PER_ROUND,
+            "round {round} offered {offered} frames, past the encounter budget"
+        );
+        offers_per_round.push(offered);
+    }
+
+    assert_eq!(
+        offers_per_round.iter().sum::<usize>(),
+        BACKLOG,
+        "every restored row crosses exactly once"
+    );
+    assert_eq!(
+        link.carried(),
+        BACKLOG,
+        "a restore hands its backlog on; it never deletes on dispatch"
+    );
+}
+
+/// A mega-carrier encounter: one meeting against a queue far larger than any
+/// budget must still be a bounded, terminating amount of work.
+#[test]
+fn a_single_mega_carrier_encounter_is_bounded_and_removes_nothing() {
+    const SEALED_LEN: usize = 2 * 1024;
+    const BACKLOG: usize = 1_200;
+
+    let mut link = Courier::new("ble:mega-carrier");
+    let stranger = generate_identity();
+    let hint = compute_recipient_hint(stranger.user_id, BASE_NOW);
+    link.load(&hint, BACKLOG, SEALED_LEN, BASE_NOW);
+
+    let offered = link.round(CoreSprayTrigger::FirstContact, BASE_NOW + 1_000);
+    assert!(
+        offered > 0 && offered <= 256 * 1024 / SEALED_LEN,
+        "one encounter offers a budget's worth and no more, got {offered}"
+    );
+    assert_eq!(
+        link.carried(),
+        BACKLOG,
+        "the carrier is still the carrier afterwards"
+    );
+}
+
+/// G3: a phone walking into a busy room brings up every link at once. At most
+/// two peers may walk this device's carry store per epoch; the rest are
+/// deferred, and a deferral costs the queue nothing.
+#[test]
+fn a_busy_room_bounds_how_many_peers_walk_the_carry_store_per_epoch() {
+    let net = Network::new(6);
+    let stranger = generate_identity();
+    let hint = compute_recipient_hint(stranger.user_id, BASE_NOW);
+    for index in 0..8_u16 {
+        let mut sealed = vec![0xAB; 512];
+        sealed[..2].copy_from_slice(&index.to_be_bytes());
+        net.nodes[0]
+            .store
+            .enqueue_carried_envelope(
+                CarriedEnvelope {
+                    msg_id: generate_msg_id(),
+                    hop_ttl: DEFAULT_HOP_TTL,
+                    expiry: BASE_NOW + 7 * MS_PER_DAY,
+                    recipient_hint: hint.clone(),
+                    sealed,
+                },
+                false,
+                BASE_NOW + i64::from(index),
+                FOREIGN_BUDGET,
+            )
+            .expect("enqueue");
+    }
+
+    // Five links come up inside one 5s offer epoch.
+    let mut offered_to = 0;
+    let mut deferred = 0;
+    for peer in 1..6 {
+        let address = format!("sim:0->{peer}");
+        let peer_user_id = net.nodes[peer].user_id();
+        net.nodes[0]
+            .router
+            .on_connected(address.clone(), CoreTransport::Central);
+        assert!(net.nodes[0]
+            .router
+            .on_hello(address.clone(), peer_user_id.clone()));
+        let outcome = net.nodes[0].plan_meet(
+            peer_user_id,
+            address,
+            Vec::new(),
+            CoreSprayTrigger::FirstContact,
+            BASE_NOW + 100,
+        );
+        if outcome.work.offer_deferred {
+            deferred += 1;
+        } else if outcome.work.sprayed > 0 {
+            offered_to += 1;
+        }
+    }
+
+    assert_eq!(offered_to, 2, "the epoch's two offer slots are spent");
+    assert_eq!(deferred, 3, "the rest wait for the next epoch");
+    assert_eq!(
+        net.nodes[0].store.carried_len().unwrap(),
+        8,
+        "deferring an offer never touches the queue"
+    );
+}
+
+/// LAN dies mid-walk and the same phone comes back over BLE under a different
+/// address. The walk must *continue*, not restart: the cursors belong to the
+/// authenticated logical peer precisely so a rotated address cannot multiply
+/// one backlog offer.
+#[test]
+fn a_lan_link_dying_continues_the_carry_walk_over_ble() {
+    const SEALED_LEN: usize = 4 * 1024;
+    const BACKLOG: usize = 200;
+    const ROUND_MS: i64 = 5 * 60_000;
+
+    let mut link = Courier::new("lan:192.0.2.7");
+    let stranger = generate_identity();
+    let hint = compute_recipient_hint(stranger.user_id, BASE_NOW);
+    link.load(&hint, BACKLOG, SEALED_LEN, BASE_NOW);
+
+    let over_lan = link.round(CoreSprayTrigger::FirstContact, BASE_NOW + ROUND_MS);
+    assert!(
+        over_lan > 0 && over_lan < BACKLOG,
+        "the LAN round should walk part of the backlog, got {over_lan}"
+    );
+
+    // Wi-Fi drops. The peer is still there, over BLE, at a new address.
+    link.relink("ble:5F:2A:1C", CoreTransport::Central);
+
+    let mut over_ble = 0;
+    for round in 2..120 {
+        over_ble += link.round(CoreSprayTrigger::Maintenance, BASE_NOW + round * ROUND_MS);
+    }
+
+    assert_eq!(
+        over_lan + over_ble,
+        BACKLOG,
+        "the BLE half continued the walk: every row crossed exactly once"
+    );
+    assert_eq!(
+        link.peer
+            .store
+            .carried_msg_ids(u64::MAX)
+            .expect("peer carried")
+            .len(),
+        BACKLOG
+    );
+    assert_eq!(link.carried(), BACKLOG, "a failover never deletes");
+}
+
+/// A partition heals. The message must cross the seam once it exists, and the
+/// healed pair must not then spend the rest of the day re-offering what
+/// already landed.
+#[test]
+fn a_partition_heals_and_delivers_without_re_offering_what_landed() {
+    let mut net = Network::new(5);
+    let msg = b"we were on opposite ends of the ship";
+
+    // Partition A = {0,1,2}, partition B = {3,4}. 0 authors for 4.
+    net.set_edges(&[(0, 1), (1, 2), (3, 4)]);
+    net.author_and_flood(0, 4, msg, DEFAULT_HOP_TTL, BASE_NOW);
+    assert!(
+        net.openers_of(msg).is_empty(),
+        "the recipient is on the far side of the partition"
+    );
+    assert_eq!(net.nodes[2].store.carried_len().unwrap(), 1);
+
+    // The seam closes: 2 meets 3.
+    net.set_edges(&[(2, 3)]);
+    net.meet(BASE_NOW + 10_000);
+    assert_eq!(
+        net.nodes[3].store.carried_len().unwrap(),
+        1,
+        "the envelope crossed the healed seam"
+    );
+
+    // 3 meets the recipient.
+    net.set_edges(&[(3, 4)]);
+    net.meet(BASE_NOW + 20_000);
+    assert_eq!(net.openers_of(msg), vec![4], "delivered after the heal");
+
+    // The healed pair keeps meeting. Digest exclusion plus the cursor must
+    // make that free.
+    let after_heal = net.transmissions;
+    net.meet(BASE_NOW + 30_000);
+    net.meet(BASE_NOW + 40_000);
+    assert_eq!(
+        net.transmissions, after_heal,
+        "a converged pair goes quiet instead of re-offering"
+    );
+}
+
+/// Receipt loss: the peer really did receive the mail, but its proof never
+/// comes back (a lost DIGEST, a stuck watermark). The courier must keep the
+/// copy -- removal needs proof -- while the re-offer stays bounded, and it
+/// must not fall permanently silent either, because a frame lost in a link's
+/// FIFO is only found again by a later pass.
+#[test]
+fn a_lost_receipt_never_wedges_the_carry_or_floods_the_link() {
+    const ROUND_MS: i64 = 5 * 60_000;
+    const ROUNDS: i64 = 12;
+
+    let mut link = Courier::new("ble:silent-peer");
+    let peer_hint = compute_recipient_hint(link.peer.user_id(), BASE_NOW);
+    link.load(&peer_hint, 1, 512, BASE_NOW);
+
+    let mut offers = Vec::new();
+    for round in 1..=ROUNDS {
+        // The peer never advertises anything: its digest is lost every time.
+        offers.push(link.round_with_known(
+            Vec::new(),
+            CoreSprayTrigger::Maintenance,
+            BASE_NOW + round * ROUND_MS,
+        ));
+    }
+
+    let total: usize = offers.iter().sum();
+    assert_eq!(
+        link.carried(),
+        1,
+        "CARRY-01: no proof, no removal -- not even after a dozen offers"
+    );
+    assert!(
+        total <= 3,
+        "an unconfirmed carry is re-offered on the re-walk cooldown, not every \
+         round ({offers:?})"
+    );
+    assert!(
+        total >= 2,
+        "and it does eventually try again: a link-FIFO loss must be \
+         recoverable ({offers:?})"
+    );
+    assert_eq!(
+        link.peer.store.carried_len().unwrap(),
+        1,
+        "the peer's content dedupe makes the repeats free at the receiving end"
+    );
+}
+
+/// The relay handed us the same envelope twice (a retried upload, a fan-out
+/// row duplicated across two hint days). It must open once, and both rows must
+/// be safe to ack -- this device really was the sole endpoint consumer of that
+/// msg_id.
+#[test]
+fn a_duplicate_relay_row_opens_once_and_both_copies_are_acked() {
+    let mut net = Network::new(3);
+    let group = Group {
+        id: vec![0x88; 16],
+        name: "Muster".to_string(),
+        member_user_ids: net.nodes.iter().map(SimNode::user_id).collect(),
+        key: vec![0x99; 32],
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
+    };
+    for node in &net.nodes {
+        node.import_group(group.clone());
+    }
+    let mut relay = RelayActor::new();
+    let msg = b"muster drill, deck seven";
+    net.author_group_to_relay(&mut relay, 0, &group, msg, DEFAULT_HOP_TTL, BASE_NOW);
+    relay.duplicate_every_row();
+    assert_eq!(
+        relay.pending_len(),
+        2 * group.member_user_ids.len(),
+        "every fan-out row now has a twin"
+    );
+
+    for node in &mut net.nodes {
+        let dispositions = relay.poll(node, BASE_NOW);
+        assert_eq!(dispositions.len(), 2, "both copies were fetched");
+        assert!(
+            dispositions.contains(&CoreInboundDisposition::Consumed),
+            "the first copy opens"
+        );
+    }
+
+    assert_eq!(
+        net.openers_of(msg),
+        vec![0, 1, 2],
+        "every member got the message"
+    );
+    for node in &net.nodes {
+        assert_eq!(node.inbox.len(), 1, "and got it exactly once");
+    }
+    let residue: Vec<usize> = net
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            let hints = recent_hints(&node.user_id(), BASE_NOW);
+            relay
+                .rows
+                .iter()
+                .any(|row| hints.contains(&row.recipient_hint))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // Both twins are acked for every member that *received* the message. The
+    // author's own fan-out copy is the one exception, and deliberately so: it
+    // has a durable row for that msg_id either way, so "I consumed this
+    // envelope" and "I wrote this message" are not distinguishable evidence,
+    // and ACK-01 says an ambiguous consumer does not ack. The row ages out on
+    // expiry instead. Churn is recoverable; deleting someone else's only copy
+    // is not.
+    assert_eq!(
+        residue,
+        vec![0],
+        "only the author's own copy is left unacked for want of unambiguous          proof of consumption"
+    );
+    assert_eq!(
+        relay.pending_len(),
+        1,
+        "every copy a member genuinely consumed is acked, twin included"
     );
 }

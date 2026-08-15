@@ -211,7 +211,9 @@ pub use ship_wifi::{
 // Plain Rust, deliberately not `#[uniffi::export]`: the shells still run
 // their own encounter loops. The sim is the first caller; a later package
 // can freeze a UniFFI surface once the planner is the only implementation.
-pub use session::mesh_meet::{CoreMeetOutcome, CoreMeetRequest, CoreMeetWork};
+pub use session::mesh_meet::{
+    plan_mesh_hello_frames, CoreMeetOutcome, CoreMeetRequest, CoreMeetWork,
+};
 pub use session::mesh_receive::{
     CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundCommit, CoreInboundDelivery,
     CoreInboundOutcome, CoreInboundSource, CoreInboundWork, CoreLanEndpointIntent,
