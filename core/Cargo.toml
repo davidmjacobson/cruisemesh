@@ -25,7 +25,7 @@ path = "src/bin/protocol_replay.rs"
 [dependencies]
 uniffi = { version = "0.28" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 blake2 = "0.10"
 data-encoding = "2"
