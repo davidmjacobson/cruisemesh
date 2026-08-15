@@ -6458,6 +6458,15 @@ impl MessageStore {
     /// Delete every carried envelope whose `expiry` is at or before `now_ms`
     /// (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
     /// how many were pruned.
+    ///
+    /// Pruning never invalidates an offering cursor: a [`CoreCarriedCursor`]
+    /// is a `(received_at, msg_id)` *value* compared by the keyset predicate,
+    /// not a position or a row id, so a walk resuming behind a row this
+    /// deleted simply finds the next surviving row. That is the whole reason
+    /// the resume point is a keyset rather than an offset -- and the same
+    /// reason a confirmed delivery
+    /// ([`Self::core_confirm_carried_deliveries`]) needs no cursor fix-up
+    /// either.
     pub fn prune_expired_carried(&self, now_ms: i64) -> Result<u64, CoreError> {
         let conn = lock_conn(&self.conn);
         let pruned = conn

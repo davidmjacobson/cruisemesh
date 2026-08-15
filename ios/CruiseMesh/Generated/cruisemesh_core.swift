@@ -1579,14 +1579,23 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      *
      * Three states, in order:
      * * mid-walk -- resume after the last row offered;
-     * * walked, still in cooldown -- skip, the peer has already been offered
-     * everything and re-walking would just re-offer refused rows;
+     * * walked, still in cooldown -- resume after the *tail* the walk reached,
+     * so this round offers only what has been enqueued since and never
+     * re-offers a refused row. This is what keeps a message that arrives
+     * during the cooldown from waiting it out: the lane used to sit the
+     * whole half hour out, so a courier that had converged with a peer and
+     * then picked up new mail for them held it, on a live link, until the
+     * re-walk came due;
      * * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
      * deliberately not a resume. A write accepted by the transport is not a
      * frame the peer received; a link that dropped mid-write lost whatever
      * was still queued behind it, and only a pass from the top finds those
      * rows again. Anything the peer really does hold it advertises in its
      * digest, so the re-walk excludes it in SQL and costs nothing.
+     *
+     * A completed walk with no tail cursor at all still skips the round: with
+     * no resume point, the only alternative is a full pass, which is the churn
+     * the cooldown exists to prevent.
      *
      * An unknown address reads as a fresh pass: the caller is about to spray
      * down a link this state has no record of, and offering is always safe.
@@ -1651,11 +1660,19 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * Record what the carried lane just offered down this link: `next` is the
      * plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
      *
-     * Reaching the tail parks the lane (and drops the cursor, so the eventual
-     * re-walk starts from the top). A page that stopped on the budget just
+     * Reaching the tail starts the cooldown and *keeps* a cursor there, so
+     * rounds inside the cooldown offer only rows enqueued behind the tail and
+     * the re-walk when the cooldown ends still starts from the top
+     * ([`Self::carried_lane_for`]). A page that stopped on the budget just
      * advances the cursor. A round that offered nothing without reaching the
      * tail -- the lane's zero-budget off switch -- changes nothing, so the
      * next round reconsiders exactly the same page.
+     *
+     * The kept cursor is offering bookkeeping only: it decides what is
+     * re-offered and never what is removed. Carried mail is still dropped
+     * only on digest-proof of receipt, eviction, or expiry, and a cursor
+     * pointing at a row that has since been removed stays valid because the
+     * keyset compares `(received_at, msg_id)` values rather than positions.
      */
     func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) 
     
@@ -1770,14 +1787,23 @@ public convenience init() {
      *
      * Three states, in order:
      * * mid-walk -- resume after the last row offered;
-     * * walked, still in cooldown -- skip, the peer has already been offered
-     * everything and re-walking would just re-offer refused rows;
+     * * walked, still in cooldown -- resume after the *tail* the walk reached,
+     * so this round offers only what has been enqueued since and never
+     * re-offers a refused row. This is what keeps a message that arrives
+     * during the cooldown from waiting it out: the lane used to sit the
+     * whole half hour out, so a courier that had converged with a peer and
+     * then picked up new mail for them held it, on a live link, until the
+     * re-walk came due;
      * * walked, cooldown elapsed -- a fresh *full* pass (`after: None`),
      * deliberately not a resume. A write accepted by the transport is not a
      * frame the peer received; a link that dropped mid-write lost whatever
      * was still queued behind it, and only a pass from the top finds those
      * rows again. Anything the peer really does hold it advertises in its
      * digest, so the re-walk excludes it in SQL and costs nothing.
+     *
+     * A completed walk with no tail cursor at all still skips the round: with
+     * no resume point, the only alternative is a full pass, which is the churn
+     * the cooldown exists to prevent.
      *
      * An unknown address reads as a fresh pass: the caller is about to spray
      * down a link this state has no record of, and offering is always safe.
@@ -1922,11 +1948,19 @@ open func peerAcksHiddenKinds(address: String) -> Bool {
      * Record what the carried lane just offered down this link: `next` is the
      * plan's `next_carried_cursor` and `exhausted` its `carried_exhausted`.
      *
-     * Reaching the tail parks the lane (and drops the cursor, so the eventual
-     * re-walk starts from the top). A page that stopped on the budget just
+     * Reaching the tail starts the cooldown and *keeps* a cursor there, so
+     * rounds inside the cooldown offer only rows enqueued behind the tail and
+     * the re-walk when the cooldown ends still starts from the top
+     * ([`Self::carried_lane_for`]). A page that stopped on the budget just
      * advances the cursor. A round that offered nothing without reaching the
      * tail -- the lane's zero-budget off switch -- changes nothing, so the
      * next round reconsiders exactly the same page.
+     *
+     * The kept cursor is offering bookkeeping only: it decides what is
+     * re-offered and never what is removed. Carried mail is still dropped
+     * only on digest-proof of receipt, eviction, or expiry, and a cursor
+     * pointing at a row that has since been removed stays valid because the
+     * keyset compares `(received_at, msg_id)` values rather than positions.
      */
 open func recordCarriedProgress(address: String, next: CoreCarriedCursor?, exhausted: Bool, nowMs: Int64) {try! rustCall() {
     uniffi_cruisemesh_core_fn_method_coremeshrouterstate_record_carried_progress(self.uniffiClonePointer(),
@@ -3798,6 +3832,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * falsely claims to hold, never destroy this device's durable copy of it.
      * Only an authenticated confirm retires (removes) a carried row.
      *
+     * A confirm needs no fix-up of any lane's offering cursor
+     * ([`crate::CoreMeshRouterState::carried_lane_for`]). The cursor is a
+     * `(received_at, msg_id)` keyset value, so removing the row it names
+     * leaves it a perfectly good resume point, and a peer that just proved it
+     * holds this mail is the last peer that needs it re-offered. The one
+     * thing a removal must never do is *shorten* what gets offered elsewhere,
+     * and it does not: cursors are per logical peer.
+     *
      * Returns the number of carried envelopes removed, for caller logging.
      */
     func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], peerAuthenticated: Bool, nowMs: Int64) throws  -> UInt64
@@ -4939,6 +4981,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
      * (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
      * how many were pruned.
+     *
+     * Pruning never invalidates an offering cursor: a [`CoreCarriedCursor`]
+     * is a `(received_at, msg_id)` *value* compared by the keyset predicate,
+     * not a position or a row id, so a walk resuming behind a row this
+     * deleted simply finds the next surviving row. That is the whole reason
+     * the resume point is a keyset rather than an offset -- and the same
+     * reason a confirmed delivery
+     * ([`Self::core_confirm_carried_deliveries`]) needs no cursor fix-up
+     * either.
      */
     func pruneExpiredCarried(nowMs: Int64) throws  -> UInt64
     
@@ -6289,6 +6340,14 @@ open func coreCommitInboundDelivery(seen: SeenIds, commit: CoreInboundCommit) {t
      * from what it offers -- so a lying peer can at most decline the mail it
      * falsely claims to hold, never destroy this device's durable copy of it.
      * Only an authenticated confirm retires (removes) a carried row.
+     *
+     * A confirm needs no fix-up of any lane's offering cursor
+     * ([`crate::CoreMeshRouterState::carried_lane_for`]). The cursor is a
+     * `(received_at, msg_id)` keyset value, so removing the row it names
+     * leaves it a perfectly good resume point, and a peer that just proved it
+     * holds this mail is the last peer that needs it re-offered. The one
+     * thing a removal must never do is *shorten* what gets offered elsewhere,
+     * and it does not: cursors are per logical peer.
      *
      * Returns the number of carried envelopes removed, for caller logging.
      */
@@ -8006,6 +8065,15 @@ open func processInboundFrame(identity: Identity, seen: SeenIds, source: CoreInb
      * Delete every carried envelope whose `expiry` is at or before `now_ms`
      * (DESIGN.md §5.3: "carriers drop the envelope past this time"). Returns
      * how many were pruned.
+     *
+     * Pruning never invalidates an offering cursor: a [`CoreCarriedCursor`]
+     * is a `(received_at, msg_id)` *value* compared by the keyset predicate,
+     * not a position or a row id, so a walk resuming behind a row this
+     * deleted simply finds the next surviving row. That is the whole reason
+     * the resume point is a keyset rather than an offset -- and the same
+     * reason a confirmed delivery
+     * ([`Self::core_confirm_carried_deliveries`]) needs no cursor fix-up
+     * either.
      */
 open func pruneExpiredCarried(nowMs: Int64)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -10770,8 +10838,10 @@ public func FfiConverterTypeCoreCarriedCursor_lower(_ value: CoreCarriedCursor) 
  */
 public struct CoreCarriedLane {
     /**
-     * Offer no carried frames at all this round: the walk is complete and
-     * still inside its re-walk cooldown.
+     * Offer no carried frames at all this round: the walk is complete, still
+     * inside its re-walk cooldown, and has no tail to resume behind. A
+     * completed walk that *does* know its tail sets this `false` and resumes
+     * there instead, so new arrivals never wait out the cooldown.
      */
     public var skip: Bool
     /**
@@ -10783,8 +10853,10 @@ public struct CoreCarriedLane {
     // declare one manually.
     public init(
         /**
-         * Offer no carried frames at all this round: the walk is complete and
-         * still inside its re-walk cooldown.
+         * Offer no carried frames at all this round: the walk is complete, still
+         * inside its re-walk cooldown, and has no tail to resume behind. A
+         * completed walk that *does* know its tail sets this `false` and resumes
+         * there instead, so new arrivals never wait out the cooldown.
          */skip: Bool, 
         /**
          * Resume point to hand to the spray plan. `None` is a fresh full pass.
@@ -36937,7 +37009,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_response() != 52501) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_carried_lane_for() != 48707) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_carried_lane_for() != 28381) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_clear() != 9925) {
@@ -36979,7 +37051,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 45296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_carried_progress() != 6116) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_carried_progress() != 45270) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_hidden_offered() != 41551) {
@@ -37219,7 +37291,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_commit_inbound_delivery() != 60150) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 7270) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 19708) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
@@ -37462,7 +37534,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 43681) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 12206) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_carried() != 46791) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_consumed_hidden_msg_ids() != 10762) {

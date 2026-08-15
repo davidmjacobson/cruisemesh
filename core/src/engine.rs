@@ -873,6 +873,14 @@ impl MessageStore {
     /// falsely claims to hold, never destroy this device's durable copy of it.
     /// Only an authenticated confirm retires (removes) a carried row.
     ///
+    /// A confirm needs no fix-up of any lane's offering cursor
+    /// ([`crate::CoreMeshRouterState::carried_lane_for`]). The cursor is a
+    /// `(received_at, msg_id)` keyset value, so removing the row it names
+    /// leaves it a perfectly good resume point, and a peer that just proved it
+    /// holds this mail is the last peer that needs it re-offered. The one
+    /// thing a removal must never do is *shorten* what gets offered elsewhere,
+    /// and it does not: cursors are per logical peer.
+    ///
     /// Returns the number of carried envelopes removed, for caller logging.
     pub fn core_confirm_carried_deliveries(
         &self,
