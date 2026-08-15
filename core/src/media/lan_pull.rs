@@ -627,6 +627,10 @@ pub struct ServeSession {
     serving: Option<u32>,
     finished: Option<ServeSummary>,
     fetches_answered: u32,
+    /// Whether the batch-done for the current run of answered fetches has
+    /// already been emitted; reset by the next accepted fetch. Without it,
+    /// an idle driver polling `next()` would be handed duplicate frames.
+    batch_done_sent: bool,
     chunks_served: u32,
     bytes_served: u64,
     chunks_skipped_not_held: u32,
@@ -650,6 +654,7 @@ impl ServeSession {
             serving: None,
             finished: None,
             fetches_answered: 0,
+            batch_done_sent: false,
             chunks_served: 0,
             bytes_served: 0,
             chunks_skipped_not_held: 0,
@@ -743,7 +748,8 @@ impl ServeSession {
             return self.restate_read();
         }
         if self.queue.is_empty() {
-            if self.challenged && self.fetches_answered > 0 {
+            if self.challenged && self.fetches_answered > 0 && !self.batch_done_sent {
+                self.batch_done_sent = true;
                 return self.emit(ServeActionKind::Reply {
                     frame: PullFrame::BatchDone {
                         chunks_served: self.chunks_served,
@@ -813,6 +819,7 @@ impl ServeSession {
             }
         }
         self.fetches_answered += 1;
+        self.batch_done_sent = false;
         self.queue = queue;
         self.next(self.now_ms)
     }
@@ -1359,6 +1366,32 @@ mod tests {
         );
         assert_eq!(serve.summary().chunks_served, 3);
         assert_eq!(serve.summary().outcome, ServeOutcome::BudgetSpent);
+    }
+
+    #[test]
+    fn batch_done_is_emitted_once_and_further_polls_idle() {
+        // The driver contract says to call next() after carrying out the last
+        // action. A driver that does exactly that after sending BatchDone must
+        // be told there is nothing to do -- not handed the frame again forever.
+        let blob = sealed(4);
+        let plan = serve_plan(&blob, full_bitmap(blob.geometry.chunk_count));
+        let mut serve = ServeSession::new(plan, [0x0C; PULL_NONCE_LEN], 1_000);
+        let mut pull = PullSession::new(pull_plan(
+            &blob,
+            ChunkBitmap::empty(blob.geometry.chunk_count).unwrap(),
+        ));
+        let mut wire = Wire::new(blob.clone());
+        let summary = wire.run(&mut pull, &mut serve);
+        assert_eq!(summary.outcome, PullOutcome::Complete);
+
+        for _ in 0..3 {
+            let action = serve.next(2_000);
+            assert!(
+                matches!(action.kind, ServeActionKind::Idle),
+                "after batch-done the responder idles, got {:?}",
+                action.kind
+            );
+        }
     }
 
     #[test]
