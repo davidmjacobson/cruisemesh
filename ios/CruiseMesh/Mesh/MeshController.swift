@@ -5129,12 +5129,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// health pill and the retry/continuation timers this shell owns. It makes
     /// no protocol arithmetic itself.
     ///
-    /// Off by default; `RelayEngineSettings.passEngine` selects it. Known gaps
-    /// keep the default legacy and are recorded in the contract's §5.2 (group
-    /// fan-out, silent-endpoint fallback) and owned by later packages (ingested
-    /// pages are not yet handed to the inbound processor, and the presence
-    /// answer is not projected back — package C4). What the shell still owns on
-    /// both paths — the receipt backfill and the announce — already ran in
+    /// Off by default; `RelayEngineSettings.passEngine` selects it. The
+    /// remaining known gap keeping the default legacy is group fan-out,
+    /// recorded in the contract's §5.2. What used to sit beside it, and no
+    /// longer does: an ingested page now reaches the inbound processor through
+    /// `CoreRelayPassProjector`, so it raises the same notification the legacy
+    /// walk raises; a presence answer now reaches `MeshConnectivityStatus` the
+    /// same way; and a contact endpoint resting for *silence* is now told apart
+    /// from one that was rejected, because the plan below carries both brakes
+    /// rather than folding them into one. What the shell still owns on both
+    /// paths — the receipt backfill and the announce — already ran in
     /// `runRelaySync` before this is reached, so nothing here re-runs them.
     private func performCoreRelaySyncPass(identity: Identity, config: RelayConfig?) async {
         let store = AppStore.get()
@@ -5187,7 +5191,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                     userId: contact.userId,
                     relayUrl: contact.relayUrl,
                     relayToken: contact.relayToken,
-                    endpointUsable: endpointUsable(contact) && endpointAnswering(contact)
+                    // Two brakes, kept apart. `endpointUsable` is rejection
+                    // evidence — the endpoint answered and refused us — and an
+                    // upload for such a contact falls back to this device's own
+                    // mailbox. `endpointAnswering` is silence evidence — nothing
+                    // answered at all — and an upload for one is declined
+                    // outright this pass instead, because a host that has merely
+                    // gone quiet is not proof that somebody else's mailbox is
+                    // the right place to leave their mail. Folded into one flag,
+                    // as this call did, every rested endpoint borrowed the
+                    // rejection answer and took the fallback.
+                    endpointUsable: endpointUsable(contact),
+                    endpointAnswering: endpointAnswering(contact)
                 )
             },
             ownUserId: identity.userId,
@@ -5214,11 +5229,54 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 if waitMs > 0 { Thread.sleep(forTimeInterval: Double(waitMs) / 1_000) }
             }
         )
+        // The same inbound call the legacy walk makes, so a notification, a chat
+        // row and a receipt look identical whichever engine fetched the
+        // envelope; and the same "last seen" merge the legacy presence sync
+        // makes. Delivery is enqueued on `meshQueue` rather than awaited: it
+        // serialises with BLE and LAN frames exactly as the legacy walk's
+        // envelopes do, and nothing here needs the disposition back — core
+        // already committed the ack decision inside its own transaction.
+        let projector = CoreRelayPassProjector(
+            deliver: { [weak self] envelope, passIdentity in
+                self?.meshQueue.async {
+                    _ = MeshController.shared.processInboundEnvelope(
+                        sourceAddress: nil,
+                        msgId: envelope.msgId,
+                        hopTtl: envelope.hopTtl,
+                        expiry: envelope.expiryMs,
+                        recipientHint: envelope.recipientHint,
+                        sealed: envelope.sealed,
+                        identity: passIdentity
+                    )
+                }
+            },
+            mergePresence: { userId, seenAtMs in
+                Task { @MainActor in
+                    MeshConnectivityStatus.shared.mergePresenceLastSeen(userId: userId, seenAtMs: seenAtMs)
+                }
+            },
+            notePresenceSeen: { userId, seenAtMs in
+                try? store.recordPeerConnectionEvent(
+                    userId: userId,
+                    transport: .shorePass,
+                    kind: .presenceSeen,
+                    occurredAtMs: seenAtMs
+                )
+            }
+        )
         let summary = RelaySyncDriver(
             store: store,
             executor: executor,
             clock: { Int64(Date().timeIntervalSince1970 * 1_000) },
-            isCancelled: { [weak self] in !(self?.isRunning ?? false) }
+            isCancelled: { [weak self] in !(self?.isRunning ?? false) },
+            onProjection: { projection in
+                projector.project(
+                    projection,
+                    identity: identity,
+                    contacts: contacts,
+                    nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
+            }
         ).run(plan: plan, passId: "cp")
 
         // Only a pass that ran every stage has swept every mailbox; a cancelled,

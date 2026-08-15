@@ -240,17 +240,26 @@ final class RelaySyncDriver {
     private let executor: RelayActionExecutor
     private let clock: () -> Int64
     private let isCancelled: () -> Bool
+    private let onProjection: (CoreRelayProjection) -> Void
 
+    /// - Parameter onProjection: where what the pass committed is handed to the
+    ///   surfaces core cannot reach — notifications, the chat list, a contact's
+    ///   "last seen". Called after every result and once more at the end, so a
+    ///   page is projected while it is fresh, which is the legacy engine's
+    ///   timing. Still not a decision seam: core has committed every
+    ///   disposition, ack, cursor and marker before anything arrives here.
     init(
         store: MessageStore,
         executor: RelayActionExecutor,
         clock: @escaping () -> Int64,
-        isCancelled: @escaping () -> Bool = { false }
+        isCancelled: @escaping () -> Bool = { false },
+        onProjection: @escaping (CoreRelayProjection) -> Void = { _ in }
     ) {
         self.store = store
         self.executor = executor
         self.clock = clock
         self.isCancelled = isCancelled
+        self.onProjection = onProjection
     }
 
     /// Run one pass and return what it did.
@@ -267,26 +276,35 @@ final class RelaySyncDriver {
         var issued: Int64 = 0
         var action = pass.start(nowMs: clock())
 
+        // Every exit drains what the pass committed but has not yet handed
+        // over. A cancelled or rate-limited pass has usually still ingested a
+        // page, and a message the person never hears about because the pass
+        // ended badly is the exact failure this projection exists to prevent.
+        func ended(_ summary: CoreRelayPassSummary) -> CoreRelayPassSummary {
+            project(pass)
+            return summary
+        }
+
         while true {
             switch action.kind {
             case .finished(let summary):
-                return summary
+                return ended(summary)
 
             // A sleep means the pass refused to spend inside a quiet window and
             // has already finished; the wait itself belongs to whatever
             // schedules the next pass, not to this loop.
             case .sleep:
-                return pass.summary() ?? pass.cancel(nowMs: clock())
+                return ended(pass.summary() ?? pass.cancel(nowMs: clock()))
 
             // Unreachable after start(), and treated as an ended pass rather
             // than as a reason to call start() again: a second start would
             // re-run stage one against a store the first call already pruned.
             case .notStarted:
-                return pass.cancel(nowMs: clock())
+                return ended(pass.cancel(nowMs: clock()))
 
             case .http(let request):
                 if isCancelled() {
-                    return pass.cancel(nowMs: clock())
+                    return ended(pass.cancel(nowMs: clock()))
                 }
                 if issued >= guardLimit {
                     log.error("Core relay pass issued \(issued, privacy: .public) actions without finishing; cancelling")
@@ -295,7 +313,7 @@ final class RelaySyncDriver {
                         outcome: "pass_exceeded_driver_guard",
                         nowMs: clock()
                     )
-                    return pass.cancel(nowMs: clock())
+                    return ended(pass.cancel(nowMs: clock()))
                 }
                 issued += 1
                 let result = executor.execute(
@@ -305,9 +323,89 @@ final class RelaySyncDriver {
                     nowMs: clock()
                 )
                 action = pass.resumeHttp(result: result)
+                project(pass)
             }
         }
     }
 
+    /// Hands over whatever the pass has committed since the last drain.
+    ///
+    /// A projection that fails is a display problem: every store write the
+    /// pass made has already landed, so abandoning the loop over one would
+    /// cost the mail behind it and repair nothing.
+    private func project(_ pass: CoreRelayPass) {
+        let projection = pass.takeProjection()
+        if projection.ingested.isEmpty && projection.presence.isEmpty { return }
+        onProjection(projection)
+    }
+
     private let log = Logger(subsystem: "com.cruisemesh", category: "RelayClient")
+}
+
+/// What a core relay pass committed, shown to the person. The iOS counterpart
+/// of Android's `CoreRelayPassProjector`, seam for seam.
+///
+/// The core pass ends with everything durable already decided: which rows were
+/// persisted, which were acked, where each frontier sits, which endpoint is
+/// resting. What it cannot do is open a sealed body — that needs this device's
+/// identity key — or touch a notification, a chat list or a "last seen". So the
+/// split is exactly that: policy stayed in core's transactions, and this
+/// projects their result onto this shell's surfaces, one page at a time, in the
+/// same order and at the same moment the legacy engine does it inline.
+///
+/// Deliberately the *same* per-envelope call the legacy walk makes, and its
+/// disposition is deliberately ignored: core has already decided whether that
+/// envelope's relay copy may be acked and already committed the answer, so a
+/// second opinion computed here could only disagree with a decision that has
+/// shipped. What is wanted from the call is its effects — open, deliver,
+/// notify, refresh — and having exactly one implementation of those is what
+/// makes a device on the core engine indistinguishable from one on the legacy
+/// engine.
+struct CoreRelayPassProjector {
+
+    /// The inbound path, as the legacy walk uses it. Its return value is
+    /// ignored; see the type doc.
+    let deliver: (CoreRelayFetchedEnvelope, Identity) -> Void
+    /// `MeshConnectivityStatus.mergePresenceLastSeen`, hopped to the main actor
+    /// by whoever supplies this.
+    let mergePresence: (Data, Int64) -> Void
+    /// The durable connection-history note the legacy presence sync writes.
+    var notePresenceSeen: (Data, Int64) -> Void = { _, _ in }
+
+    /// Projects one drained `CoreRelayProjection`.
+    ///
+    /// `contacts` is this pass's address book, used only to resolve a mailbox
+    /// answer — which names a hint, never a person — back to whoever that hint
+    /// belongs to, exactly as the legacy presence sync resolves its own query.
+    /// A cross-family probe already names the contact and needs no lookup.
+    func project(
+        _ projection: CoreRelayProjection,
+        identity: Identity,
+        contacts: [Contact],
+        nowMs: Int64
+    ) {
+        for envelope in projection.ingested {
+            deliver(envelope, identity)
+        }
+        if projection.presence.isEmpty { return }
+        var contactByHint: [Data: Data] = [:]
+        for contact in contacts {
+            for hint in recentPresenceHintsFor(userId: contact.userId, nowMs: nowMs) {
+                contactByHint[hint] = contact.userId
+            }
+        }
+        for observation in projection.presence {
+            let resolved = observation.userId.isEmpty
+                ? contactByHint[observation.hint]
+                : observation.userId
+            guard let userId = resolved else { continue }
+            // The relay's clock never becomes a local timestamp: core reports
+            // how old the answer was, and the age is subtracted from the moment
+            // this device observed it — the same arithmetic the legacy presence
+            // sync does.
+            let seenAtMs = observation.observedAtMs - max(0, observation.ageMs)
+            mergePresence(userId, seenAtMs)
+            notePresenceSeen(userId, seenAtMs)
+        }
+    }
 }

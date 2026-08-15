@@ -672,23 +672,19 @@ internal class RelaySyncEngine(
      * a continuation.
      *
      * Off by default. [RelayEngineSettings.passEngine] selects it, and until
-     * canary evidence says otherwise the answer is the legacy engine. Four
-     * known gaps have to close before that default may move, and they are
-     * named here rather than left for someone to find by flipping it:
+     * canary evidence says otherwise the answer is the legacy engine. The
+     * remaining known gap is named here rather than left for someone to find
+     * by flipping it: a group-addressed row is posted as one row to one
+     * mailbox instead of being fanned out per member, so a group's mail would
+     * not arrive. It is recorded as an open divergence in
+     * `specs/protocol-contract-v1.md` §5.2.
      *
-     *  - a group-addressed row is posted as one row to one mailbox instead of
-     *    being fanned out per member, so a group's mail would not arrive;
-     *  - a contact endpoint resting for *silence* falls back to this device's
-     *    own mailbox rather than being left alone, and the posted marker is
-     *    terminal, so that misroute is permanent rather than a retry;
-     *  - a page ingested by core is persisted but never handed to
-     *    [processRelayEnvelope], so nothing raises a notification for it; and
-     *  - the presence answer core decodes is not projected back onto
-     *    [MeshConnectivityStatus], so contact "last seen" would stop moving.
-     *
-     * The first two are recorded as open divergences in
-     * `specs/protocol-contract-v1.md` §5.2 and belong to package C3; the last
-     * two are the work package C4 exists to do.
+     * What used to sit beside it, and no longer does: an ingested page now
+     * reaches [processRelayEnvelope] through [projector], so it raises the
+     * same notification the legacy walk raises; a presence answer now reaches
+     * [MeshConnectivityStatus] the same way; and a contact endpoint resting
+     * for *silence* is now told apart from one that was rejected, because the
+     * plan below carries both brakes rather than folding them into one.
      *
      * What is deliberately *not* on that list is anything the shell still owns
      * on both paths. The prunes, the receipt backfill, the silence breaker's
@@ -743,14 +739,13 @@ internal class RelaySyncEngine(
         val network = relayBindTarget()
         val plan = CoreRelayPassPlan(
             own = fallbackConfig?.let { CoreRelayEndpointConfig(it.relayUrl, it.relayToken) },
-            contacts = contacts.map { contact ->
-                CoreRelayContactConfig(
-                    userId = contact.userId,
-                    relayUrl = contact.relayUrl,
-                    relayToken = contact.relayToken,
-                    endpointUsable = contactEndpointUsable(contact) && contactEndpointAnswering(contact),
-                )
-            },
+            // Both brakes, distinctly: see [coreRelayContactConfigs] for what
+            // each one means and why folding them together misroutes mail.
+            contacts = coreRelayContactConfigs(
+                contacts,
+                endpointUsable = ::contactEndpointUsable,
+                endpointAnswering = ::contactEndpointAnswering,
+            ),
             ownUserId = identity.userId,
             fetchHints = store.relayFetchHints(identity.userId, now),
             presenceAnnounce = if (RelayConfigStore.shareOnline(context)) {
@@ -780,6 +775,9 @@ internal class RelaySyncEngine(
             },
             clock = { System.currentTimeMillis() },
             isCancelled = { !isRunning() || !hasValidatedInternet() },
+            onProjection = { projection ->
+                projector.project(projection, identity, contacts, System.currentTimeMillis())
+            },
         )
         val summary = runner.run(plan, "cp")
         // Only a pass that ran every stage to the end has actually swept every
@@ -848,6 +846,27 @@ internal class RelaySyncEngine(
             handler.postDelayed(mailboxContinuationRunnable, delay)
         }
     }
+
+    /**
+     * Where a core pass's committed work reaches this device's surfaces.
+     *
+     * The same inbound call the legacy walk makes, so a notification, a chat
+     * row and a receipt look identical whichever engine fetched the envelope;
+     * and the same "last seen" merge the legacy presence sync makes. See
+     * [CoreRelayPassProjector] for why the disposition it returns is ignored.
+     */
+    private val projector = CoreRelayPassProjector(
+        deliver = { envelope, identity -> processRelayEnvelope(envelope, identity) },
+        mergePresence = MeshConnectivityStatus::mergePresenceLastSeen,
+        notePresenceSeen = { userId, seenAtMs ->
+            store.recordPeerConnectionEvent(
+                userId,
+                PeerConnectionTransport.SHORE_PASS,
+                PeerConnectionEventKind.PRESENCE_SEEN,
+                seenAtMs,
+            )
+        },
+    )
 
     /**
      * Whether the core engine has already swept every mailbox in this process,
