@@ -13248,6 +13248,15 @@ public struct CoreInboundOutcome {
      */
     public var deliveredSender: Data?
     /**
+     * Which lane the delivered payload belongs to: `Some(group_id)` when it
+     * was opened with a group key and both membership checks passed, `None`
+     * for a pairwise delivery (and when nothing was delivered). Stated here
+     * rather than left for a shell to re-derive from the body's `chat_id`,
+     * because picking the delivery lane is a disposition decision and a
+     * driver that guessed it could route a body to the wrong handler.
+     */
+    public var deliveredGroupId: Data?
+    /**
      * The §6.4 frame to flood onward, hop-decremented, or `None` when no hops
      * remain or the frame is home / an own fan-out copy. The caller sends it;
      * a failed send cannot undo any store mutation above.
@@ -13257,6 +13266,16 @@ public struct CoreInboundOutcome {
      * Whether a carried row was newly enqueued this call.
      */
     public var carried: Bool
+    /**
+     * Whether that carried row was classified *family* — addressed to a
+     * recipient this device knows — which is the one carry class a shell may
+     * act on beyond storing it, by nudging a relay upload so an internet
+     * phone can proxy it onward. Always false for a relay-sourced row (it is
+     * already on the relay and is never re-uploaded) and for every path that
+     * carried nothing. The classification itself stays here: a driver that
+     * re-derived it from the recipient hint would be inferring carry policy.
+     */
+    public var carriedFamily: Bool
     /**
      * Whether an opened pairwise envelope was dropped because its sender is
      * blocked — consumed for ack purposes, never delivered.
@@ -13289,6 +13308,14 @@ public struct CoreInboundOutcome {
          * dispatch and notifications. `None` when nothing was delivered.
          */deliveredSender: Data?, 
         /**
+         * Which lane the delivered payload belongs to: `Some(group_id)` when it
+         * was opened with a group key and both membership checks passed, `None`
+         * for a pairwise delivery (and when nothing was delivered). Stated here
+         * rather than left for a shell to re-derive from the body's `chat_id`,
+         * because picking the delivery lane is a disposition decision and a
+         * driver that guessed it could route a body to the wrong handler.
+         */deliveredGroupId: Data?, 
+        /**
          * The §6.4 frame to flood onward, hop-decremented, or `None` when no hops
          * remain or the frame is home / an own fan-out copy. The caller sends it;
          * a failed send cannot undo any store mutation above.
@@ -13296,6 +13323,15 @@ public struct CoreInboundOutcome {
         /**
          * Whether a carried row was newly enqueued this call.
          */carried: Bool, 
+        /**
+         * Whether that carried row was classified *family* — addressed to a
+         * recipient this device knows — which is the one carry class a shell may
+         * act on beyond storing it, by nudging a relay upload so an internet
+         * phone can proxy it onward. Always false for a relay-sourced row (it is
+         * already on the relay and is never re-uploaded) and for every path that
+         * carried nothing. The classification itself stays here: a driver that
+         * re-derived it from the recipient hint would be inferring carry policy.
+         */carriedFamily: Bool, 
         /**
          * Whether an opened pairwise envelope was dropped because its sender is
          * blocked — consumed for ack purposes, never delivered.
@@ -13310,8 +13346,10 @@ public struct CoreInboundOutcome {
         self.disposition = disposition
         self.deliveredPayloads = deliveredPayloads
         self.deliveredSender = deliveredSender
+        self.deliveredGroupId = deliveredGroupId
         self.relayFrame = relayFrame
         self.carried = carried
+        self.carriedFamily = carriedFamily
         self.droppedBlocked = droppedBlocked
         self.commit = commit
         self.work = work
@@ -13331,10 +13369,16 @@ extension CoreInboundOutcome: Equatable, Hashable {
         if lhs.deliveredSender != rhs.deliveredSender {
             return false
         }
+        if lhs.deliveredGroupId != rhs.deliveredGroupId {
+            return false
+        }
         if lhs.relayFrame != rhs.relayFrame {
             return false
         }
         if lhs.carried != rhs.carried {
+            return false
+        }
+        if lhs.carriedFamily != rhs.carriedFamily {
             return false
         }
         if lhs.droppedBlocked != rhs.droppedBlocked {
@@ -13353,8 +13397,10 @@ extension CoreInboundOutcome: Equatable, Hashable {
         hasher.combine(disposition)
         hasher.combine(deliveredPayloads)
         hasher.combine(deliveredSender)
+        hasher.combine(deliveredGroupId)
         hasher.combine(relayFrame)
         hasher.combine(carried)
+        hasher.combine(carriedFamily)
         hasher.combine(droppedBlocked)
         hasher.combine(commit)
         hasher.combine(work)
@@ -13372,8 +13418,10 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
                 disposition: FfiConverterTypeCoreInboundDisposition.read(from: &buf), 
                 deliveredPayloads: FfiConverterSequenceData.read(from: &buf), 
                 deliveredSender: FfiConverterOptionData.read(from: &buf), 
+                deliveredGroupId: FfiConverterOptionData.read(from: &buf), 
                 relayFrame: FfiConverterOptionData.read(from: &buf), 
                 carried: FfiConverterBool.read(from: &buf), 
+                carriedFamily: FfiConverterBool.read(from: &buf), 
                 droppedBlocked: FfiConverterBool.read(from: &buf), 
                 commit: FfiConverterOptionTypeCoreInboundCommit.read(from: &buf), 
                 work: FfiConverterTypeCoreInboundWork.read(from: &buf)
@@ -13384,8 +13432,10 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
         FfiConverterTypeCoreInboundDisposition.write(value.disposition, into: &buf)
         FfiConverterSequenceData.write(value.deliveredPayloads, into: &buf)
         FfiConverterOptionData.write(value.deliveredSender, into: &buf)
+        FfiConverterOptionData.write(value.deliveredGroupId, into: &buf)
         FfiConverterOptionData.write(value.relayFrame, into: &buf)
         FfiConverterBool.write(value.carried, into: &buf)
+        FfiConverterBool.write(value.carriedFamily, into: &buf)
         FfiConverterBool.write(value.droppedBlocked, into: &buf)
         FfiConverterOptionTypeCoreInboundCommit.write(value.commit, into: &buf)
         FfiConverterTypeCoreInboundWork.write(value.work, into: &buf)
