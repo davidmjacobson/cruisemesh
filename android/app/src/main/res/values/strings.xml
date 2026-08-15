@@ -781,11 +781,12 @@
     <string name="ui_internal_tools">Internal tools</string>
     <string name="ui_internal_tools_release_warning">These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off.</string>
     <string name="ui_internal_tools_hide">Hide internal tools</string>
-    <string name="ui_internal_tools_unlocked">Internal tools are on. They are in Settings, under CruiseMesh operation.</string>
-    <string name="ui_internal_tools_hidden">Internal tools are hidden again.</string>
+    <!-- These three replace the version string in place, so they stay short. -->
+    <string name="ui_internal_tools_unlocked">Internal tools on. Reopen settings.</string>
+    <string name="ui_internal_tools_hidden">Internal tools hidden.</string>
     <plurals name="ui_internal_tools_taps_left">
-        <item quantity="one">%1$d more tap</item>
-        <item quantity="other">%1$d more taps</item>
+        <item quantity="one">%1$d more tap…</item>
+        <item quantity="other">%1$d more taps…</item>
     </plurals>
     <string name="ui_relay_migration_canary">Relay migration check</string>
     <string name="ui_relay_migration_canary_desc">On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received.</string>

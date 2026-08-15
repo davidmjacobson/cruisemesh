@@ -1,6 +1,7 @@
 package com.cruisemesh.app.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -76,5 +77,42 @@ class InternalToolsUnlockTest {
         counter.reset()
 
         assertEquals(InternalToolsTap.Quiet, counter.tap(700L))
+    }
+
+    @Test
+    fun `the version row says what each tap did`() {
+        assertEquals(
+            InternalToolsLabel.Version,
+            internalToolsLabelFor(InternalToolsTap.Quiet, unlockedAfterTap = false),
+        )
+        assertEquals(
+            InternalToolsLabel.Countdown(3),
+            internalToolsLabelFor(InternalToolsTap.Countdown(3), unlockedAfterTap = false),
+        )
+        assertEquals(
+            InternalToolsLabel.Unlocked,
+            internalToolsLabelFor(InternalToolsTap.Reached, unlockedAfterTap = true),
+        )
+        assertEquals(
+            InternalToolsLabel.Hidden,
+            internalToolsLabelFor(InternalToolsTap.Reached, unlockedAfterTap = false),
+        )
+    }
+
+    @Test
+    fun `an early tap clears feedback left over from an abandoned run`() {
+        // Taps one to three of a fresh run put the version string back, so a
+        // count from a run that was given up on cannot linger under a new one.
+        assertEquals(
+            InternalToolsLabel.Version,
+            internalToolsLabelFor(InternalToolsTap.Quiet, unlockedAfterTap = true),
+        )
+    }
+
+    @Test
+    fun `feedback clears before the run it belongs to expires`() {
+        // The row goes quiet while a run may still be live, never the other way
+        // round: a count that outlived its own run would be a lie on screen.
+        assertTrue(INTERNAL_TOOLS_LABEL_REVERT_MS < INTERNAL_TOOLS_TAP_WINDOW_MS)
     }
 }

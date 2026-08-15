@@ -17,6 +17,17 @@ private const val INTERNAL_TOOLS_COUNTDOWN_FROM = 4
 /** Taps further apart than this start the count over. */
 const val INTERNAL_TOOLS_TAP_WINDOW_MS = 3_000L
 
+/**
+ * How long the version row keeps showing tap feedback after the last tap.
+ *
+ * Every bit of feedback this flow gives is the row's own text swapped in place,
+ * so this is also how long the row stops reading as a version string. Shorter
+ * than [INTERNAL_TOOLS_TAP_WINDOW_MS] on purpose: a run that is still live can
+ * go quiet, which is the harmless direction. The other way round would leave a
+ * stale count on screen after the run it belonged to had already expired.
+ */
+const val INTERNAL_TOOLS_LABEL_REVERT_MS = 1_500L
+
 /** What one tap on the version row means. */
 sealed class InternalToolsTap {
     /** Too early to say anything. */
@@ -73,6 +84,42 @@ class InternalToolsTapCounter(
         started = false
     }
 }
+
+/** What the version row reads right now. */
+sealed class InternalToolsLabel {
+    /** The version string itself: the row's ordinary, resting text. */
+    object Version : InternalToolsLabel()
+
+    /** [remaining] taps still to go. */
+    data class Countdown(val remaining: Int) : InternalToolsLabel()
+
+    /** The run landed and internal tools are now on. */
+    object Unlocked : InternalToolsLabel()
+
+    /** The run landed and internal tools are hidden again. */
+    object Hidden : InternalToolsLabel()
+}
+
+/**
+ * What the version row should read after one tap.
+ *
+ * The whole of this flow's feedback, as a pure function, because the shape of
+ * it is the fix: nothing is drawn over the row and nothing is queued. The row
+ * says what happened, in its own place, at its own size, and reverts
+ * [INTERNAL_TOOLS_LABEL_REVERT_MS] after the last tap. Anything floating above
+ * the bottom of the screen -- a toast, a snackbar -- lands exactly on top of
+ * the row being tapped and swallows the next tap.
+ *
+ * [unlockedAfterTap] is the state the flag was left in, so the caller flips the
+ * flag and then asks what to say about it.
+ */
+fun internalToolsLabelFor(tap: InternalToolsTap, unlockedAfterTap: Boolean): InternalToolsLabel =
+    when (tap) {
+        InternalToolsTap.Quiet -> InternalToolsLabel.Version
+        is InternalToolsTap.Countdown -> InternalToolsLabel.Countdown(tap.remaining)
+        InternalToolsTap.Reached ->
+            if (unlockedAfterTap) InternalToolsLabel.Unlocked else InternalToolsLabel.Hidden
+    }
 
 /**
  * Whether this phone has had internal tools switched on by hand.

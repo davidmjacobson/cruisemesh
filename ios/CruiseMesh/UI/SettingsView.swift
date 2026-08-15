@@ -13,8 +13,20 @@ struct SettingsView: View {
     /// Debug builds show the internal-tools entry outright, as they always
     /// have. A release build shows it once someone has done the seven-tap run
     /// on the version line at the bottom of this screen.
+    ///
+    /// Set when the screen opens and deliberately not when a run lands:
+    /// inserting a row above the version line pushes the line out from under
+    /// the finger still tapping it, and the seventh tap of a run is usually
+    /// followed by an eighth on the way to stopping. The entry appears the next
+    /// time Settings is opened, which the row's own text says out loud.
     @State private var showInternalTools = internalToolsVisible
     @State private var unlockTaps = InternalToolsTapCounter()
+    /// What the version row reads right now, and the pending revert back to the
+    /// version string. One task, cancelled and replaced on every tap, so a run
+    /// of taps cannot queue a series of messages that keep arriving after the
+    /// tapping has stopped.
+    @State private var versionRowLabel: InternalToolsLabel = .version
+    @State private var labelRevert: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -129,14 +141,22 @@ struct SettingsView: View {
                 Section {
                     VStack(spacing: 6) {
                         // verbatim: a version string is data, not copy, and
-                        // must not land in the localization catalog.
+                        // must not land in the localization catalog. The tap
+                        // feedback that replaces it is looked up separately.
+                        //
                         // The version line doubles as the door to internal
                         // tools: seven taps turn them on, seven more hide them
                         // again. Deliberately undiscoverable -- a family member
                         // scrolling to the bottom of Settings should never
                         // arrive here by accident, so there is no button, no
                         // label and nothing said for the first three taps.
-                        Text(verbatim: versionLabel)
+                        //
+                        // All the feedback is this row's own text, swapped in
+                        // place at the same size and reverted a moment after
+                        // the last tap. Nothing is drawn over it and nothing
+                        // below it moves, so the row stays exactly where the
+                        // finger already is for the whole run.
+                        Text(verbatim: versionRowText)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .onTapGesture { registerUnlockTap() }
@@ -162,20 +182,56 @@ struct SettingsView: View {
         }
     }
 
-    /// One tap on the version line. Silent for the first three; a light tap of
-    /// haptic feedback for each of the next three, so a deliberate run can be
-    /// felt without anything appearing on screen; and on the seventh the
-    /// internal-tools entry appears or disappears, which is its own answer.
+    /// The version row's text: the version string at rest, tap feedback while a
+    /// run is in progress.
+    ///
+    /// One row, one line of text, one hit target. The alternative -- anything
+    /// that floats -- sits at the bottom of the screen, which is exactly where
+    /// this row is, and every tap it swallows makes the run longer.
+    private var versionRowText: String {
+        switch versionRowLabel {
+        case .version:
+            return versionLabel
+        case .countdown(let remaining):
+            return String(localized: "\(remaining) more taps…")
+        case .unlocked:
+            return String(localized: "Internal tools on. Reopen settings.")
+        case .hidden:
+            return String(localized: "Internal tools hidden.")
+        }
+    }
+
+    /// One tap on the version line. Silent for the first three; from the fourth
+    /// a light haptic tap and a count in the row's own text; and on the seventh
+    /// the row says which way it went. The Settings entry itself waits until
+    /// Settings is next opened, so nothing moves under the finger.
     private func registerUnlockTap() {
-        switch unlockTaps.tap(at: Date().timeIntervalSince1970) {
+        let tap = unlockTaps.tap(at: Date().timeIntervalSince1970)
+        var unlocked = InternalToolsUnlockStore.isUnlocked()
+        switch tap {
         case .quiet:
             break
         case .countdown:
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         case .reached:
-            InternalToolsUnlockStore.setUnlocked(!InternalToolsUnlockStore.isUnlocked())
-            showInternalTools = internalToolsVisible
+            unlocked.toggle()
+            InternalToolsUnlockStore.setUnlocked(unlocked)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
+        }
+        versionRowLabel = internalToolsLabel(for: tap, unlockedAfterTap: unlocked)
+        scheduleLabelRevert()
+    }
+
+    /// Puts the version string back a moment after the last tap. Cancelling the
+    /// previous task is what keeps a run of taps from leaving a trail of
+    /// messages that arrive one after another once the tapping has stopped.
+    private func scheduleLabelRevert() {
+        labelRevert?.cancel()
+        guard versionRowLabel != .version else { return }
+        labelRevert = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(internalToolsLabelRevert * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            versionRowLabel = .version
         }
     }
 
