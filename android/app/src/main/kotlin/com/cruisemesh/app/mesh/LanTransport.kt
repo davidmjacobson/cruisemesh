@@ -286,6 +286,15 @@ internal class LanTransport(
         connections[address]?.close()
     }
 
+    /**
+     * The Noise static key the peer on [address] proved it holds. Present for
+     * every live LAN link, because the handshake completes before the address
+     * exists at all. Null for an address this transport does not own, or one
+     * whose link has already been torn down.
+     */
+    fun remoteStaticKeyFor(address: String): ByteArray? =
+        connections[address]?.remoteStaticKey?.copyOf()
+
     fun startSubnetScan(
         breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET,
         automatic: Boolean = false,
@@ -1532,6 +1541,13 @@ internal class LanTransport(
         @Volatile
         private var closed = false
 
+        /**
+         * Captured while the session is still open (the handshake has just
+         * finished) so it stays readable after [markClosed] disposes the
+         * session.
+         */
+        val remoteStaticKey: ByteArray? = noise.remoteStaticKey()
+
         fun sendFrame(frame: ByteArray) {
             if (closed || socket.isClosed) return
             for (record in noise.encryptFrame(frame)) {
@@ -1650,6 +1666,24 @@ internal fun trustedLanPeerUserId(contacts: List<Contact>, remoteStaticKey: Byte
 /** True when the Noise static key is this device's own agreement key — a live clone. */
 internal fun ownLanStaticKeyMatches(ownAgreePk: ByteArray, remoteStaticKey: ByteArray): Boolean =
     ownAgreePk.contentEquals(remoteStaticKey)
+
+/**
+ * Whether a HELLO that names this device's own user id may be persisted as an
+ * identity clone warning. The core store documents the contract: only an
+ * authenticated sighting counts. A user id in a HELLO is just a claim — the
+ * proof is the Noise static key the link's peer actually holds, so the warning
+ * is recorded only on a LAN link whose session key is this identity's own
+ * agreement key. Anything else (a cleartext BLE HELLO, a LAN link belonging to
+ * some other peer, a link already gone) is ignored.
+ */
+internal fun ownIdentityHelloIsAuthenticated(
+    isLanLink: Boolean,
+    ownAgreePk: ByteArray,
+    sessionRemoteStaticKey: ByteArray?,
+): Boolean =
+    isLanLink &&
+        sessionRemoteStaticKey != null &&
+        ownLanStaticKeyMatches(ownAgreePk, sessionRemoteStaticKey)
 
 internal fun sameLanServiceType(value: String): Boolean =
     value.trimEnd('.') == lanServiceType().trimEnd('.')

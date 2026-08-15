@@ -1661,14 +1661,20 @@ class MeshService : Service() {
      * `msg_id` suppression above.
      */
     /**
-     * A HELLO claiming our user id is the `.cmbak`-clone meeting. Persist
-     * only when this link is already Noise-authenticated (LAN). A cleartext
-     * BLE HELLO can name any user id, so it is logged and dropped.
+     * A HELLO claiming our user id is the `.cmbak`-clone meeting. The user id
+     * in the frame is only a claim, so it never records the warning on its
+     * own: the link must be a LAN link whose Noise session key is this
+     * identity's own agreement key, matching the check the LAN handshake path
+     * already makes ([recordOwnIdentityCloneIfAuthenticated]) and the contract
+     * documented on the core store. Any other claim -- a cleartext BLE HELLO,
+     * or a LAN link authenticated as some other peer -- is logged and dropped.
      * Returns true when the frame was about us and must not become a route.
      */
     private fun noteOwnIdentityHello(address: String, userId: ByteArray, identity: Identity): Boolean {
         if (!userId.contentEquals(identity.userId)) return false
-        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN) {
+        val isLanLink = MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
+        val sessionKey = if (isLanLink) lanTransport?.remoteStaticKeyFor(address) else null
+        if (ownIdentityHelloIsAuthenticated(isLanLink, identity.agreePk, sessionKey)) {
             recordOwnIdentityClone()
         } else {
             Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")

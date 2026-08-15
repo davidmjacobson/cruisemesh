@@ -960,13 +960,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// A HELLO claiming our user id is the `.cmbak`-clone meeting. Persist
-    /// only on an already Noise-authenticated LAN link. Returns true when the
-    /// frame was about us and must not become a route.
+    /// A HELLO claiming our user id is the `.cmbak`-clone meeting. The user id
+    /// in the frame is only a claim, so it never records the warning on its
+    /// own: the link must be a LAN link whose Noise session key is this
+    /// identity's own agreement key, matching the check the LAN handshake path
+    /// already makes (`recordOwnIdentityCloneIfAuthenticated`) and the
+    /// contract documented on the core store. Returns true when the frame was
+    /// about us and must not become a route.
     @discardableResult
     private func noteOwnIdentityHello(address: String, userId: Data, identity: Identity) -> Bool {
         guard userId == identity.userId else { return false }
-        if MeshRouter.transportFor(address: address) == .lan {
+        let isLanLink = MeshRouter.transportFor(address: address) == .lan
+        let sessionKey = isLanLink ? lanTransport?.remoteStaticKey(address: address) : nil
+        if ownIdentityHelloIsAuthenticated(
+            isLanLink: isLanLink,
+            ownAgreePk: identity.agreePk,
+            sessionRemoteStaticKey: sessionKey
+        ) {
             recordOwnIdentityClone()
         } else {
             log.warning("Ignoring unauthenticated HELLO that claims our identity")

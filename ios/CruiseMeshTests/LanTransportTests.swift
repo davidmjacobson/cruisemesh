@@ -119,6 +119,44 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(ownLanStaticKeyMatches(ownAgreePk: alice.agreePk, remoteStaticKey: bob.agreePk))
     }
 
+    func testOwnIdentityHelloRecordsCloneOnlyWithOurSessionKey() {
+        let own = contact(userByte: 1, agreeByte: 7)
+        let other = contact(userByte: 2, agreeByte: 8)
+
+        // A LAN link authenticated as some other contact can still send a
+        // HELLO naming our user id. The user id is only a claim; the session
+        // key is the proof, so this one is not recorded.
+        XCTAssertFalse(
+            ownIdentityHelloIsAuthenticated(
+                isLanLink: true,
+                ownAgreePk: own.agreePk,
+                sessionRemoteStaticKey: other.agreePk
+            )
+        )
+        XCTAssertFalse(
+            ownIdentityHelloIsAuthenticated(
+                isLanLink: true,
+                ownAgreePk: own.agreePk,
+                sessionRemoteStaticKey: nil
+            )
+        )
+        // A cleartext BLE HELLO never records, whatever it names.
+        XCTAssertFalse(
+            ownIdentityHelloIsAuthenticated(
+                isLanLink: false,
+                ownAgreePk: own.agreePk,
+                sessionRemoteStaticKey: own.agreePk
+            )
+        )
+        XCTAssertTrue(
+            ownIdentityHelloIsAuthenticated(
+                isLanLink: true,
+                ownAgreePk: own.agreePk,
+                sessionRemoteStaticKey: own.agreePk
+            )
+        )
+    }
+
     func testManualEndpointParserAndLinkRoundTrip() {
         XCTAssertEqual(
             parseLanManualEndpoint("10.12.3.4"),
