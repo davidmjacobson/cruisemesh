@@ -195,6 +195,84 @@ internal class InboundEnvelopeProcessor(
     private val inboundAdmission = InboundEnvelopeAdmission()
 
     /**
+     * The core receive engine, selected per envelope by
+     * [InboundEngineSettings]. Its [CoreInboundAdapter.Intents] are the three
+     * things that stay native once core owns the disposition: putting the
+     * flood copy on the wire, durably delivering an opened payload through the
+     * per-kind handlers below, and nudging the relay upload lane when core
+     * classified a carry as family.
+     */
+    private val coreInbound = CoreInboundAdapter(
+        store,
+        GossipState.seenIds,
+        object : CoreInboundAdapter.Intents {
+            override fun flood(sourceAddress: String?, frame: ByteArray) {
+                val fanout = if (sourceAddress == null) {
+                    MeshRouter.relayToAll(frame)
+                } else {
+                    MeshRouter.relayToAllExcept(sourceAddress, frame)
+                }
+                if (fanout > 0) {
+                    Log.i(TAG, "Relayed foreign envelope from ${sourceAddress ?: "relay"} to $fanout link(s)")
+                }
+            }
+
+            override fun deliver(
+                sourceAddress: String?,
+                hopTtl: UByte,
+                msgId: ByteArray,
+                senderUserId: ByteArray,
+                groupId: ByteArray?,
+                payload: ByteArray,
+                identity: Identity,
+            ): Boolean {
+                val sourceLabel = sourceAddress ?: "relay"
+                val opened = OpenedMessage(senderUserId = senderUserId, payload = payload)
+                val arrival = messageArrival(sourceAddress, hopTtl, senderUserId)
+                return try {
+                    if (groupId != null) {
+                        val group = store.getGroup(groupId)
+                        if (group == null) {
+                            // Core opened this body with that group's key, so
+                            // the row disappearing between the open and here
+                            // is a store problem, not a delivery verdict:
+                            // report failure and leave the envelope
+                            // re-presentable rather than acking it away.
+                            Log.w(TAG, "Deferring group envelope from $sourceLabel: group row is gone")
+                            return false
+                        }
+                        deliverOpenedGroupEnvelope(sourceLabel, group, opened, identity, arrival, msgId)
+                    } else {
+                        val consumed = deliverOpenedEnvelope(
+                            sourceLabel,
+                            sourceAddress != null,
+                            opened,
+                            identity,
+                            arrival,
+                            msgId,
+                        )
+                        // The ACK-01 msg_id evidence rides core's commit
+                        // token; only the gap-rendering lamport is left here.
+                        if (consumed != null) {
+                            recordConsumedStreamLamport(consumed)
+                        }
+                    }
+                    true
+                } catch (e: CoreException) {
+                    // T4-06: a message that was OURS to open failed to persist.
+                    // Never let it unwind the receive thread.
+                    Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
+                    false
+                }
+            }
+
+            override fun onFamilyCarry() {
+                requestRelaySync("family carry queued")
+            }
+        },
+    )
+
+    /**
      * DESIGN.md §7.3: receipts go first on peer sync because they're the
      * smallest frames and unblock the most UI. The store persists the latest
      * cumulative delivered/read watermarks we owe [contact], so a receipt that
@@ -325,6 +403,20 @@ internal class InboundEnvelopeProcessor(
         // ordinary dedupe instead of double-delivering/double-flooding.
         if (!inboundAdmission.tryBegin(envelope.msgId)) {
             return CoreInboundDisposition.SEEN
+        }
+        // The rollout switch. Read once, here, before any disposition work
+        // starts: an envelope runs entirely on one engine or entirely on the
+        // other. Core records the seen-set entry itself, inside the call, so
+        // the claim above is released with terminal = false -- the record has
+        // already landed under this instance's lock by the time `finish` runs,
+        // which is the same guarantee the legacy returns get from the
+        // terminal = true hook.
+        if (InboundEngineSettings.inboundEngine(context) == InboundEngine.CORE) {
+            return try {
+                coreInbound.process(sourceAddress, envelope, identity)
+            } finally {
+                inboundAdmission.finish(envelope.msgId, terminal = false) {}
+            }
         }
         // Every return below must go through this so the admission claim
         // above is always released. `terminal = true` also runs
@@ -505,6 +597,18 @@ internal class InboundEnvelopeProcessor(
         } catch (e: CoreException) {
             Log.w(TAG, "Failed to record consumed hidden-kind msg_id: ${e.message}")
         }
+        recordConsumedStreamLamport(consumed)
+    }
+
+    /**
+     * The gap-rendering half of [recordConsumedHiddenKind], split out because
+     * the core engine's commit token covers the ACK-01 msg_id evidence but not
+     * this: an exact, validated pairwise lamport recorded when the handler left
+     * no message row. Core accepts that longer-lived evidence only for an
+     * established contact and an actual 1:1 stream, so stranger onboarding
+     * traffic cannot grow it indefinitely.
+     */
+    private fun recordConsumedStreamLamport(consumed: PairwiseDeliveryResult) {
         if (!consumed.recordStreamLamport) return
         try {
             if (

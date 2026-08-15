@@ -55,6 +55,8 @@ import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.mesh.InboundEngine
+import com.cruisemesh.app.mesh.InboundEngineSettings
 import com.cruisemesh.app.relay.RelayEngineSettings
 import com.cruisemesh.app.relay.RelayPassEngine
 import uniffi.cruisemesh_core.lanDefaultTcpPort
@@ -303,6 +305,37 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 )
             }
             Text(stringResource(R.string.ui_rebuilt_internet_sync_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
+            // The receive engine switch, here for the same reason as the one
+            // above: the evidence that has to be gathered before its default
+            // may move can only come from a release-signed device.
+            var rebuiltInbound by remember {
+                mutableStateOf(InboundEngineSettings.inboundEngine(context) == InboundEngine.CORE)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.ui_rebuilt_message_handling),
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = rebuiltInbound,
+                    onCheckedChange = {
+                        rebuiltInbound = it
+                        InboundEngineSettings.setInboundEngine(
+                            context,
+                            if (it) InboundEngine.CORE else InboundEngine.LEGACY,
+                        )
+                    },
+                )
+            }
+            Text(stringResource(R.string.ui_rebuilt_message_handling_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),

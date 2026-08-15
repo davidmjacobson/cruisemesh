@@ -155,12 +155,27 @@ pub struct CoreInboundOutcome {
     /// The verified sender of the delivered payload, for the caller's kind
     /// dispatch and notifications. `None` when nothing was delivered.
     pub delivered_sender: Option<Vec<u8>>,
+    /// Which lane the delivered payload belongs to: `Some(group_id)` when it
+    /// was opened with a group key and both membership checks passed, `None`
+    /// for a pairwise delivery (and when nothing was delivered). Stated here
+    /// rather than left for a shell to re-derive from the body's `chat_id`,
+    /// because picking the delivery lane is a disposition decision and a
+    /// driver that guessed it could route a body to the wrong handler.
+    pub delivered_group_id: Option<Vec<u8>>,
     /// The §6.4 frame to flood onward, hop-decremented, or `None` when no hops
     /// remain or the frame is home / an own fan-out copy. The caller sends it;
     /// a failed send cannot undo any store mutation above.
     pub relay_frame: Option<Vec<u8>>,
     /// Whether a carried row was newly enqueued this call.
     pub carried: bool,
+    /// Whether that carried row was classified *family* — addressed to a
+    /// recipient this device knows — which is the one carry class a shell may
+    /// act on beyond storing it, by nudging a relay upload so an internet
+    /// phone can proxy it onward. Always false for a relay-sourced row (it is
+    /// already on the relay and is never re-uploaded) and for every path that
+    /// carried nothing. The classification itself stays here: a driver that
+    /// re-derived it from the recipient hint would be inferring carry policy.
+    pub carried_family: bool,
     /// Whether an opened pairwise envelope was dropped because its sender is
     /// blocked — consumed for ack purposes, never delivered.
     pub dropped_blocked: bool,
@@ -179,8 +194,10 @@ impl CoreInboundOutcome {
             disposition,
             delivered_payloads: Vec::new(),
             delivered_sender: None,
+            delivered_group_id: None,
             relay_frame: None,
             carried: false,
+            carried_family: false,
             dropped_blocked: false,
             commit: None,
             work,
@@ -278,8 +295,10 @@ impl MessageStore {
                     disposition: CoreInboundDisposition::Consumed,
                     delivered_payloads: Vec::new(),
                     delivered_sender: None,
+                    delivered_group_id: None,
                     relay_frame: None,
                     carried: false,
+                    carried_family: false,
                     dropped_blocked: true,
                     commit: None,
                     work,
@@ -305,8 +324,10 @@ impl MessageStore {
                 disposition: CoreInboundDisposition::Consumed,
                 delivered_payloads: vec![opened.payload],
                 delivered_sender: Some(opened.sender_user_id),
+                delivered_group_id: None,
                 relay_frame: None,
                 carried: false,
+                carried_family: false,
                 dropped_blocked: false,
                 commit: Some(CoreInboundCommit {
                     msg_id,
@@ -362,14 +383,14 @@ impl MessageStore {
                     now_ms,
                 );
 
-            let (relay_frame, carried) = if own_fanout {
-                (None, false)
+            let (relay_frame, carry) = if own_fanout {
+                (None, CarryOutcome::default())
             } else {
                 let relay_frame = reflood_frame(&msg_id, hop_ttl, expiry, &recipient_hint, &sealed);
                 if relay_frame.is_some() {
                     work.reflooded = 1;
                 }
-                let carried = self.carry(
+                let carry = self.carry(
                     source,
                     &msg_id,
                     hop_ttl,
@@ -378,10 +399,10 @@ impl MessageStore {
                     &sealed,
                     now_ms,
                 )?;
-                if carried {
+                if carry.stored {
                     work.carried = 1;
                 }
-                (relay_frame, carried)
+                (relay_frame, carry)
             };
 
             if deliver {
@@ -394,8 +415,10 @@ impl MessageStore {
                     disposition: CoreInboundDisposition::Consumed,
                     delivered_payloads: vec![opened.payload],
                     delivered_sender: Some(opened.sender_user_id),
+                    delivered_group_id: Some(group.id.clone()),
                     relay_frame,
-                    carried,
+                    carried: carry.stored,
+                    carried_family: carry.family,
                     dropped_blocked: false,
                     commit: Some(CoreInboundCommit {
                         msg_id: msg_id.clone(),
@@ -419,8 +442,10 @@ impl MessageStore {
                 disposition: CoreInboundDisposition::Consumed,
                 delivered_payloads: Vec::new(),
                 delivered_sender: None,
+                delivered_group_id: None,
                 relay_frame,
-                carried,
+                carried: carry.stored,
+                carried_family: carry.family,
                 dropped_blocked: false,
                 commit: None,
                 work,
@@ -436,7 +461,7 @@ impl MessageStore {
         if relay_frame.is_some() {
             work.reflooded = 1;
         }
-        let carried = self.carry(
+        let carry = self.carry(
             source,
             &msg_id,
             hop_ttl,
@@ -445,7 +470,7 @@ impl MessageStore {
             &sealed,
             now_ms,
         )?;
-        if carried {
+        if carry.stored {
             work.carried = 1;
         }
         // Carried is a terminal handled state; a store failure returns Err
@@ -456,8 +481,10 @@ impl MessageStore {
             disposition: CoreInboundDisposition::Carried,
             delivered_payloads: Vec::new(),
             delivered_sender: None,
+            delivered_group_id: None,
             relay_frame,
-            carried,
+            carried: carry.stored,
+            carried_family: carry.family,
             dropped_blocked: false,
             commit: None,
             work,
@@ -513,7 +540,7 @@ impl MessageStore {
         recipient_hint: &[u8],
         sealed: &[u8],
         now_ms: i64,
-    ) -> Result<bool, CoreError> {
+    ) -> Result<CarryOutcome, CoreError> {
         let carried = CarriedEnvelope {
             msg_id: msg_id.to_vec(),
             hop_ttl: hop_ttl.saturating_sub(1),
@@ -522,18 +549,37 @@ impl MessageStore {
             sealed: sealed.to_vec(),
         };
         match source {
-            CoreInboundSource::Relay => self.enqueue_relay_carried_envelope(carried, now_ms),
+            CoreInboundSource::Relay => Ok(CarryOutcome {
+                stored: self.enqueue_relay_carried_envelope(carried, now_ms)?,
+                // A relay-sourced row is already durable server-side and is
+                // never re-uploaded, so it is never the family class a shell
+                // nudges a relay upload for.
+                family: false,
+            }),
             CoreInboundSource::Mesh => {
                 let is_family = self.hint_matches_known_target(recipient_hint.to_vec(), now_ms)?;
-                self.enqueue_carried_envelope(
+                let stored = self.enqueue_carried_envelope(
                     carried,
                     is_family,
                     now_ms,
                     FOREIGN_CARRY_BUDGET_BYTES,
-                )
+                )?;
+                Ok(CarryOutcome {
+                    stored,
+                    family: stored && is_family,
+                })
             }
         }
     }
+}
+
+/// What one carry attempt did: whether a row is now enqueued, and whether it
+/// was classified family. Internal to this module — the shells see only the
+/// two booleans folded into [`CoreInboundOutcome`].
+#[derive(Clone, Copy, Debug, Default)]
+struct CarryOutcome {
+    stored: bool,
+    family: bool,
 }
 
 /// The hop-decremented §6.4 frame to flood onward, or `None` when the hop
@@ -572,7 +618,7 @@ mod tests {
     use crate::{
         compute_recipient_hint, core_should_ack_inbound, encode_envelope_frame,
         encode_message_body, generate_identity, generate_msg_id, seal_group_message, seal_message,
-        CoreInboundDisposition, CoreInboundSource, CoreRelayEnvelopeDisposition, Group,
+        Contact, CoreInboundDisposition, CoreInboundSource, CoreRelayEnvelopeDisposition, Group,
         MessageBody, MessageStore, SeenIds, DEFAULT_HOP_TTL, KIND_PROFILE_SYNC, MS_PER_DAY,
     };
 
@@ -736,6 +782,7 @@ mod tests {
             "a spoofed-signer group body is never delivered"
         );
         assert!(outcome.carried, "but the envelope is still muled onward");
+        assert!(outcome.delivered_group_id.is_none());
 
         // Positive control: a real member's message is delivered.
         let real = seal_group_message(friend, group.clone(), b"real".to_vec()).unwrap();
@@ -750,6 +797,82 @@ mod tests {
             .process_inbound_frame(me, seen(), CoreInboundSource::Mesh, real_frame, NOW)
             .unwrap();
         assert_eq!(outcome.delivered_payloads, vec![b"real".to_vec()]);
+        assert_eq!(
+            outcome.delivered_group_id,
+            Some(group.id),
+            "a group delivery names its group so a shell never guesses the lane"
+        );
+    }
+
+    #[test]
+    fn a_mule_copy_for_a_known_contact_is_reported_family() {
+        // The one carry class a shell may act on beyond storing it: a family
+        // row is offered to the relay so an internet-connected phone can proxy
+        // it onward. The classification is stated here rather than re-derived
+        // from the recipient hint by each shell.
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let friend = generate_identity();
+        store
+            .upsert_imported_contact(Contact {
+                user_id: friend.user_id.clone(),
+                name: "Friend".to_string(),
+                sign_pk: friend.sign_pk.clone(),
+                agree_pk: friend.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+
+        let sealed = seal_message(
+            sender.clone(),
+            friend.agree_pk.clone(),
+            b"for a friend".to_vec(),
+        )
+        .unwrap();
+        let hint = compute_recipient_hint(friend.user_id.clone(), NOW);
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            expiry(),
+            hint.clone(),
+            sealed,
+        );
+        let outcome = store
+            .process_inbound_frame(me.clone(), seen(), CoreInboundSource::Mesh, frame, NOW)
+            .unwrap();
+        assert_eq!(outcome.disposition, CoreInboundDisposition::Carried);
+        assert!(outcome.carried);
+        assert!(
+            outcome.carried_family,
+            "it is addressed to a contact we know"
+        );
+
+        // The same envelope fetched FROM the relay is already durable there and
+        // is never offered back to it.
+        let relayed_sealed = seal_message(
+            sender,
+            friend.agree_pk.clone(),
+            b"a second one, from the relay".to_vec(),
+        )
+        .unwrap();
+        let relay_frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            expiry(),
+            hint,
+            relayed_sealed,
+        );
+        let outcome = store
+            .process_inbound_frame(me, seen(), CoreInboundSource::Relay, relay_frame, NOW)
+            .unwrap();
+        assert!(outcome.carried);
+        assert!(
+            !outcome.carried_family,
+            "a relay-sourced row is never re-uploaded, so it is never the family class"
+        );
     }
 
     #[test]
