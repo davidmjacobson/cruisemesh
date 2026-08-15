@@ -45,7 +45,7 @@ jobs:
           # cold-cache state before this).
           key: ${{ matrix.target }}
       - name: Cache cargo-fuzz
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cargo/bin/cargo-fuzz
           # FR9: was a single never-invalidating key -- a cargo-fuzz binary
@@ -73,7 +73,7 @@ jobs:
       # step always writes a fresh entry); restore-keys falls back to the
       # most recent previous entry for this target via prefix match.
       - name: Cache fuzz corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
