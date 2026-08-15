@@ -3476,6 +3476,7 @@ fn cross_family_contact(user_id: Vec<u8>, url: &str) -> CoreRelayContactConfig {
             CONTACT_TOKEN.to_string(),
         )),
         endpoint_usable: true,
+        endpoint_answering: true,
     }
 }
 
@@ -3796,6 +3797,7 @@ fn a_same_family_contact_is_answered_by_its_own_config_not_a_second_request() {
         relay_url: Some(CONTACT_URL.to_string()),
         relay_token: Some(CONTACT_TOKEN.to_string()),
         endpoint_usable: true,
+        endpoint_answering: true,
     }];
 
     let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
