@@ -1243,6 +1243,16 @@
         }
       }
     },
+    "Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only."
+          }
+        }
+      }
+    },
     "Hold the mic to talk": {
       "localizations": {
         "en": {
@@ -1565,6 +1575,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Received your message %@"
+          }
+        }
+      }
+    },
+    "Receiving": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Receiving"
           }
         }
       }
