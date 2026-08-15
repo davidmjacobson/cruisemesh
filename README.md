@@ -207,6 +207,7 @@ the API and its ack rules are DESIGN.md §9.
 | [ROADMAP.md](ROADMAP.md) | Milestones and near-term focus, in one page. |
 | [SECURITY-DESIGN.md](SECURITY-DESIGN.md) | What's encrypted, what leaks, what was traded away. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability. |
+| [`docs/moderation.md`](docs/moderation.md) | Reporting abuse, blocking, and what the operator can and cannot do about it. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | DCO, CLA, and what makes a good PR here. |
 | [AGENTS.md](AGENTS.md) | Build and bindgen recipes, including the fast paths. |
 | [`ios/README.md`](ios/README.md) | iOS shell layout, XcodeGen, and the checked-in Swift bindings. |
