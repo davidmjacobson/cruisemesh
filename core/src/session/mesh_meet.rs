@@ -3,13 +3,26 @@
 //! Every time two identified mesh nodes meet — a BLE HELLO, an authenticated
 //! LAN session, a failover resume — the *same* ordered work runs here:
 //!
-//! 1. digest-confirm any 1:1 carry the peer's advertised `msg_id` set proves
+//! 1. record the peer's HELLO2 capability bits, so what this encounter is
+//!    willing to re-offer is decided from what the peer said it can ack;
+//! 2. digest-confirm any 1:1 carry the peer's advertised `msg_id` set proves
 //!    they already hold ([`MessageStore::core_confirm_carried_deliveries`]);
-//! 2. targeted drain of remaining carried envelopes whose `recipient_hint`
+//! 3. the DIGEST exchange itself: whether this link owes one now (D8 cadence,
+//!    jittered from the peer's identity) and, if so, the 1:1 frame plus one
+//!    per shared group — emitted *before* the bulk lanes, because the peer's
+//!    answer has to beat the exchange window and a carry drain queued ahead of
+//!    it would not let it;
+//! 4. targeted drain of remaining carried envelopes whose `recipient_hint`
 //!    matches the peer (their own recent-day hints, plus every imported group
 //!    they belong to);
-//! 3. budgeted spray-on-connect of the rest to a non-recipient mule, excluding
+//! 5. budgeted spray-on-connect of the rest to a non-recipient mule, excluding
 //!    every `msg_id` the peer's digest already named.
+//!
+//! Steps 4 and 5 are the two lanes that offer *third party* traffic, so they
+//! share one [`CoreCarriedOfferGate`] reservation: a phone that walks into a
+//! busy room brings up many links at once, and each of them independently
+//! walking the carry store is a self-DoS that queues live mail behind courier
+//! traffic on all of them.
 //!
 //! This is the single authority `core/tests/mesh_sim.rs` calls in place of the
 //! third copy it used to keep (`Network::meet` composing store primitives to
@@ -38,16 +51,47 @@
 //!   by [`crate::CoreSprayPolicy`]; the targeted drain is the HELLO path and
 //!   is not cadence-gated, but it is still paged and charged against the
 //!   link's burst allowance.
+//! - Nothing here is a transport verdict. The planner decides what *this*
+//!   encounter offers and how fast; it never concludes that a peer, a radio,
+//!   or the relay is unnecessary. A healthy LAN link makes this link's own
+//!   lanes cheap to walk — it does not pause the relay, and there is no
+//!   return value through which it could, which is deliberate: a "cheaper
+//!   link exists" heuristic that globally quiesces relay is how a fleet
+//!   silently stops delivering to the members who are not in the room.
 //!
-//! The shells keep the radios, the HELLO/DIGEST codecs, and the send. They
-//! stop keeping the arithmetic.
+//! Everything that shapes pacing here is either observed progress
+//! ([`CoreSprayPolicy::note_receipt_progress`], fed from digest-confirmed
+//! carries), hysteresis (the re-walk cooldown and the cadence/backoff windows,
+//! all finite and computable), an explicit work cap (the per-lane byte
+//! budgets, the page row ceiling, the per-epoch offer slots), or bounded
+//! redundancy (digest exclusion plus the once-per-session hidden-kind bound).
+//! None of it is a drop: every gate in this file delays an offer.
+//!
+//! The shells keep the radios and the send. They stop keeping the arithmetic
+//! and the codecs.
 
 use std::collections::HashSet;
 
 use crate::{
-    encode_envelope_frame, CarriedEnvelope, CoreError, CoreMeshRouterState, CoreSprayPolicy,
-    CoreSprayTrigger, MessageStore, CARRIED_SPRAY_BUDGET_BYTES,
+    encode_digest, encode_envelope_frame, encode_hello, encode_hello2, CarriedEnvelope,
+    CoreCarriedOfferGate, CoreError, CoreMeshRouterState, CoreSprayPolicy, CoreSprayTrigger,
+    MessageStore, CARRIED_SPRAY_BUDGET_BYTES,
 };
+
+/// The identity frames this device puts on a fresh link, in order: the legacy
+/// HELLO first (every build understands it), then HELLO2 carrying
+/// [`crate::core_own_capabilities`].
+///
+/// Contract v1: HELLO must never grow trailing fields — a legacy parser reads
+/// its remainder as the user id — so capabilities ride the separate 0x06
+/// frame and nothing else. Both shells composing this by hand is how the two
+/// platforms could come to advertise different bits; there is one composer
+/// now.
+pub fn plan_mesh_hello_frames(own_user_id: Vec<u8>) -> Result<Vec<Vec<u8>>, CoreError> {
+    let hello = encode_hello(own_user_id.clone());
+    let hello2 = encode_hello2(own_user_id, crate::core_own_capabilities())?;
+    Ok(vec![hello, hello2])
+}
 
 /// Inputs for one encounter. Every clock is an explicit `now_ms`; every peer
 /// claim is an argument, never ambient process state.
@@ -68,6 +112,19 @@ pub struct CoreMeetRequest {
     /// cryptographically bound source (Noise-authenticated LAN, a signed
     /// receipt). `false` for a bare BLE HELLO/DIGEST. See `CARRY-02`.
     pub peer_authenticated: bool,
+    /// Capability bits off the peer's HELLO2 (0x06), if this encounter
+    /// observed one. `None` leaves whatever the router already recorded for
+    /// the link untouched — a HELLO2 arrives once per session and has to keep
+    /// counting for the re-digests that follow it.
+    ///
+    /// Unknown bits are stored, never rejected: a future build advertising
+    /// more than this one understands is a peer, not a parse failure.
+    pub peer_capabilities: Option<u32>,
+    /// What brought the two nodes together. Selects the cadence interval and
+    /// decides whether this device owes a DIGEST — answering the peer's
+    /// digest must never provoke one back, or two converged phones ping-pong
+    /// for as long as they stay in range.
+    pub trigger: CoreSprayTrigger,
     pub now_ms: i64,
 }
 
@@ -86,6 +143,14 @@ pub struct CoreMeetWork {
     pub confirmed_removed: u32,
     /// Drain candidates skipped because the peer's digest already named them.
     pub skipped_known: u32,
+    /// DIGEST frames this encounter owed and produced (the 1:1 one plus one
+    /// per shared group). Zero when the link is inside its re-digest window,
+    /// or when this encounter is itself the answer to the peer's digest.
+    pub digests_sent: u32,
+    /// The two third-party-offering lanes sat this encounter out because the
+    /// device's per-epoch offer allowance was already claimed by other peers.
+    /// A deferral, never a drop: the next round gets a slot.
+    pub offer_deferred: bool,
 }
 
 /// The result of planning one encounter through [`MessageStore::plan_mesh_meet`].
@@ -96,6 +161,13 @@ pub struct CoreMeetWork {
 /// unbounded crosses the boundary.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoreMeetOutcome {
+    /// The DIGEST frames this link owes, if any. **Send these first**: the
+    /// spray policy's exchange window is opened when the digest is enqueued,
+    /// and at a BLE link's drain rate a carry drain queued ahead of it would
+    /// hold it in the FIFO past the window, so the peer's answer would arrive
+    /// to a shut gate. The ordering used to be a convention repeated at every
+    /// shell call site; [`CoreMeetOutcome::frames`] is now what enforces it.
+    pub digest_frames: Vec<Vec<u8>>,
     /// Hint-matched carry frames for the true recipient (or a group member).
     /// Send these first: they are the HELLO drain, not the mule spray.
     pub targeted_frames: Vec<Vec<u8>>,
@@ -107,9 +179,13 @@ pub struct CoreMeetOutcome {
 }
 
 impl CoreMeetOutcome {
-    /// Drain then spray, the production send order.
+    /// Digest, then drain, then spray: the production send order, smallest
+    /// and most time-critical frame first.
     pub fn frames(&self) -> impl Iterator<Item = &Vec<u8>> {
-        self.targeted_frames.iter().chain(self.spray_frames.iter())
+        self.digest_frames
+            .iter()
+            .chain(self.targeted_frames.iter())
+            .chain(self.spray_frames.iter())
     }
 }
 
@@ -124,6 +200,7 @@ impl MessageStore {
         &self,
         router: &CoreMeshRouterState,
         spray: &CoreSprayPolicy,
+        offers: &CoreCarriedOfferGate,
         request: CoreMeetRequest,
     ) -> Result<CoreMeetOutcome, CoreError> {
         let CoreMeetRequest {
@@ -132,8 +209,19 @@ impl MessageStore {
             peer_address,
             peer_known_msg_ids,
             peer_authenticated,
+            peer_capabilities,
+            trigger,
             now_ms,
         } = request;
+
+        // 0. HELLO2. Recording the bits here rather than on a separate shell
+        // call is what makes `peer_acks_hidden_kinds` below an observation of
+        // this encounter instead of a hope about ordering: the identity check
+        // inside `on_hello2` still refuses a capability claim that contradicts
+        // the link's established user id.
+        if let Some(capabilities) = peer_capabilities {
+            router.on_hello2(peer_address.clone(), peer_user_id.clone(), capabilities);
+        }
 
         self.prune_expired_carried(now_ms)?;
 
@@ -154,7 +242,49 @@ impl MessageStore {
         let peer_hints = self.delivery_hints_for_peer(peer_user_id.clone(), now_ms)?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.iter().cloned().collect();
 
-        // 2. Targeted HELLO drain. Not cadence-gated (two phones meeting and
+        // The cadence verdict is taken once, before any store work, and used
+        // by both the digest and the spray: consulting it twice inside one
+        // encounter would let the digest arm a window that then admits the
+        // very spray the same verdict had refused.
+        let gate = spray.may_spray(peer_key.clone(), peer_address.clone(), trigger, now_ms);
+
+        // 2. The DIGEST exchange. Owed on a link that has never run one and
+        // then on the jittered D8 window; never owed back to a peer whose own
+        // digest is what we are answering. `note_digest_sent` opens the
+        // exchange window so the peer's reply is not refused by the gate our
+        // own digest just passed.
+        let mut digest_frames = Vec::new();
+        if gate.allow
+            && !matches!(trigger, CoreSprayTrigger::PeerDigest)
+            && router.digest_due_for(&peer_address, now_ms)
+        {
+            digest_frames = self.plan_digest_frames(&own_user_id, &peer_user_id)?;
+            if !digest_frames.is_empty() {
+                router.record_digest_sent(&peer_address, now_ms);
+                spray.note_digest_sent(peer_key.clone(), peer_address.clone(), now_ms);
+            }
+        }
+
+        // Both remaining lanes offer traffic this device is only holding for
+        // someone else, so they share one per-epoch slot. No slot means this
+        // peer waits for the next round; the queue is untouched either way.
+        let digests_sent = u32::try_from(digest_frames.len()).unwrap_or(u32::MAX);
+        let confirmed_removed = u32::try_from(confirmed_removed).unwrap_or(u32::MAX);
+        let Some(reservation) = offers.try_reserve(now_ms, Some(peer_key.clone())) else {
+            return Ok(CoreMeetOutcome {
+                digest_frames,
+                targeted_frames: Vec::new(),
+                spray_frames: Vec::new(),
+                work: CoreMeetWork {
+                    digests_sent,
+                    confirmed_removed,
+                    offer_deferred: true,
+                    ..CoreMeetWork::default()
+                },
+            });
+        };
+
+        // 3. Targeted HELLO drain. Not cadence-gated (two phones meeting and
         // handing over mail addressed to one of them is the product) but
         // still paged on the disjoint targeted cursor and charged against
         // the link burst so a reconnect storm cannot drain unbounded.
@@ -187,16 +317,10 @@ impl MessageStore {
             spray.note_bytes_queued(peer_address.clone(), offered_sealed, now_ms);
         }
 
-        // 3. Budgeted spray-on-connect to a non-recipient mule. Cadence,
+        // 4. Budgeted spray-on-connect to a non-recipient mule. Cadence,
         // identical-set suppression and the per-encounter byte budgets all
         // live in spray_policy; the plan itself never removes a row.
         let mut spray_frames = Vec::new();
-        let gate = spray.may_spray(
-            peer_key.clone(),
-            peer_address.clone(),
-            CoreSprayTrigger::FirstContact,
-            now_ms,
-        );
         if gate.allow {
             let lane = router.carried_lane_for(peer_address.clone(), now_ms);
             let plan = self.core_digest_spray_plan(
@@ -238,17 +362,68 @@ impl MessageStore {
             }
         }
 
+        // The slot is spent only if something was actually offered; an empty
+        // plan hands it straight back so another peer in the same epoch gets
+        // its turn.
+        if targeted_frames.is_empty() && spray_frames.is_empty() {
+            offers.release(reservation);
+        } else {
+            offers.commit(reservation);
+        }
+
         let work = CoreMeetWork {
             targeted_sent: u32::try_from(targeted_frames.len()).unwrap_or(u32::MAX),
             sprayed: u32::try_from(spray_frames.len()).unwrap_or(u32::MAX),
-            confirmed_removed: u32::try_from(confirmed_removed).unwrap_or(u32::MAX),
+            confirmed_removed,
             skipped_known,
+            digests_sent,
+            offer_deferred: false,
         };
         Ok(CoreMeetOutcome {
+            digest_frames,
             targeted_frames,
             spray_frames,
             work,
         })
+    }
+
+    /// The DIGEST frames this device owes `peer_user_id`: the 1:1 chat digest
+    /// (only for an actual contact — a stranger's link gets no chat state),
+    /// then one per group both of us are members of.
+    ///
+    /// Every frame advertises the same
+    /// [`MessageStore::core_digest_advertised_msg_ids`] known-set, because
+    /// that set is a property of this device, not of the chat. It is also the
+    /// proof-of-receipt half of the carry lifecycle: what a peer reads off
+    /// these frames is the only thing that ever retires its copy of our mail.
+    ///
+    /// A group digest's `chat_id` is the group id, which pre-HELLO2 builds
+    /// drop via [`crate::digest_is_expected_chat_id`] — an intentionally
+    /// wire-compatible extension, not a contract change.
+    fn plan_digest_frames(
+        &self,
+        own_user_id: &[u8],
+        peer_user_id: &[u8],
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let advertised = self.core_digest_advertised_msg_ids()?;
+        let mut frames = Vec::new();
+        if self.get_contact(peer_user_id.to_vec())?.is_some() {
+            let entries = self.chat_digest(peer_user_id.to_vec())?;
+            frames.push(encode_digest(
+                own_user_id.to_vec(),
+                entries,
+                advertised.clone(),
+            )?);
+        }
+        for group in self.list_groups()? {
+            let shares = |id: &[u8]| group.member_user_ids.iter().any(|member| member == id);
+            if !shares(peer_user_id) || !shares(own_user_id) {
+                continue;
+            }
+            let entries = self.chat_digest(group.id.clone())?;
+            frames.push(encode_digest(group.id, entries, advertised.clone())?);
+        }
+        Ok(frames)
     }
 }
 
@@ -306,8 +481,14 @@ mod tests {
             peer_address: ADDRESS.to_string(),
             peer_known_msg_ids,
             peer_authenticated,
+            peer_capabilities: None,
+            trigger: CoreSprayTrigger::FirstContact,
             now_ms: NOW,
         }
+    }
+
+    fn gate() -> CoreCarriedOfferGate {
+        CoreCarriedOfferGate::new()
     }
 
     fn enqueue(
@@ -355,6 +536,7 @@ mod tests {
             .plan_mesh_meet(
                 &router,
                 &spray,
+                &gate(),
                 request(me.user_id, peer.user_id, vec![], true),
             )
             .unwrap();
@@ -390,6 +572,7 @@ mod tests {
             .plan_mesh_meet(
                 &router,
                 &spray,
+                &gate(),
                 request(me.user_id, peer.user_id, vec![known_id], false),
             )
             .unwrap();
@@ -436,6 +619,7 @@ mod tests {
             .plan_mesh_meet(
                 &router,
                 &spray,
+                &gate(),
                 request(me.user_id, peer.user_id, vec![], true),
             )
             .unwrap();
@@ -472,6 +656,7 @@ mod tests {
             .plan_mesh_meet(
                 &first_router,
                 &first_spray,
+                &gate(),
                 request(me.user_id.clone(), peer.user_id.clone(), vec![], true),
             )
             .unwrap();
@@ -489,6 +674,7 @@ mod tests {
             .plan_mesh_meet(
                 &second_router,
                 &second_spray,
+                &gate(),
                 request(me.user_id, peer.user_id, vec![msg_id], true),
             )
             .unwrap();
@@ -498,6 +684,194 @@ mod tests {
             store.carried_len().unwrap(),
             1,
             "a mule-to-mule offer is never a 1:1 confirm"
+        );
+    }
+
+    #[test]
+    fn the_hello_pair_is_legacy_first_then_capabilities() {
+        let me = generate_identity();
+        let frames = plan_mesh_hello_frames(me.user_id.clone()).expect("hello frames");
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            crate::parse_frame(frames[0].clone()).ok(),
+            Some(crate::Frame::Hello {
+                user_id: me.user_id.clone()
+            }),
+            "the legacy HELLO goes first and carries nothing but the user id"
+        );
+        assert_eq!(
+            crate::parse_frame(frames[1].clone()).ok(),
+            Some(crate::Frame::Hello2 {
+                user_id: me.user_id,
+                capabilities: crate::core_own_capabilities(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_fresh_link_owes_a_digest_and_then_goes_quiet_inside_the_window() {
+        let store = store();
+        let me = generate_identity();
+        let peer = generate_identity();
+        store
+            .upsert_contact(crate::Contact {
+                user_id: peer.user_id.clone(),
+                name: "Peer".to_string(),
+                sign_pk: peer.sign_pk.clone(),
+                agree_pk: peer.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .expect("upsert contact");
+
+        let router = router_for(&peer.user_id);
+        let spray = CoreSprayPolicy::new();
+        let gate = gate();
+
+        let first = store
+            .plan_mesh_meet(
+                &router,
+                &spray,
+                &gate,
+                request(me.user_id.clone(), peer.user_id.clone(), vec![], true),
+            )
+            .unwrap();
+        assert_eq!(first.work.digests_sent, 1, "a fresh link owes a digest");
+        assert!(
+            crate::parse_frame(first.digest_frames[0].clone())
+                .map(|frame| matches!(frame, crate::Frame::Digest { .. }))
+                .unwrap_or(false),
+            "the planned frame really is a DIGEST"
+        );
+        assert_eq!(
+            first.frames().next(),
+            first.digest_frames.first(),
+            "the digest is enqueued before any bulk lane"
+        );
+
+        // Same link a second later: the D8 window has not elapsed, so the
+        // encounter runs without putting a second digest on the radio.
+        let mut soon = request(me.user_id.clone(), peer.user_id.clone(), vec![], true);
+        soon.now_ms = NOW + 1_000;
+        soon.trigger = CoreSprayTrigger::Maintenance;
+        let second = store.plan_mesh_meet(&router, &spray, &gate, soon).unwrap();
+        assert_eq!(second.work.digests_sent, 0);
+
+        // Past the maximum re-digest interval it is due again.
+        let mut later = request(me.user_id, peer.user_id, vec![], true);
+        later.now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
+        later.trigger = CoreSprayTrigger::Maintenance;
+        let third = store.plan_mesh_meet(&router, &spray, &gate, later).unwrap();
+        assert_eq!(third.work.digests_sent, 1);
+    }
+
+    #[test]
+    fn answering_a_peer_digest_never_sends_one_back() {
+        // Two converged phones must not ping-pong digests for as long as they
+        // stay in range: the answer to a DIGEST is mail, not another DIGEST.
+        let store = store();
+        let me = generate_identity();
+        let peer = generate_identity();
+        store
+            .upsert_contact(crate::Contact {
+                user_id: peer.user_id.clone(),
+                name: "Peer".to_string(),
+                sign_pk: peer.sign_pk.clone(),
+                agree_pk: peer.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .expect("upsert contact");
+
+        let router = router_for(&peer.user_id);
+        let spray = CoreSprayPolicy::new();
+        let mut answer = request(me.user_id, peer.user_id, vec![], true);
+        answer.trigger = CoreSprayTrigger::PeerDigest;
+
+        let outcome = store
+            .plan_mesh_meet(&router, &spray, &gate(), answer)
+            .unwrap();
+        assert_eq!(outcome.work.digests_sent, 0);
+        assert!(outcome.digest_frames.is_empty());
+    }
+
+    #[test]
+    fn hello2_capabilities_from_the_encounter_reach_the_router() {
+        let store = store();
+        let me = generate_identity();
+        let peer = generate_identity();
+        let router = router_for(&peer.user_id);
+        let spray = CoreSprayPolicy::new();
+        assert!(!router.peer_acks_hidden_kinds(ADDRESS.to_string()));
+
+        let mut with_caps = request(me.user_id.clone(), peer.user_id.clone(), vec![], true);
+        with_caps.peer_capabilities = Some(crate::core_own_capabilities() | (1 << 31));
+        store
+            .plan_mesh_meet(&router, &spray, &gate(), with_caps)
+            .unwrap();
+        assert!(
+            router.peer_acks_hidden_kinds(ADDRESS.to_string()),
+            "an unknown future bit alongside the known ones is stored, not rejected"
+        );
+
+        // A later encounter that observed no HELLO2 must not forget them.
+        let mut without = request(me.user_id, peer.user_id, vec![], true);
+        without.now_ms = NOW + 1_000;
+        store
+            .plan_mesh_meet(&router, &spray, &gate(), without)
+            .unwrap();
+        assert!(router.peer_acks_hidden_kinds(ADDRESS.to_string()));
+    }
+
+    #[test]
+    fn a_multi_peer_fan_out_defers_the_third_peers_offer_without_dropping_it() {
+        // G3: a phone walking into a busy room brings up every link at once.
+        // At most two of them may walk the carry store per epoch; the rest
+        // wait, and nothing is removed for waiting.
+        let store = store();
+        let me = generate_identity();
+        let stranger = generate_identity();
+        let hint = compute_recipient_hint(stranger.user_id, NOW);
+        for index in 0..3_u8 {
+            let mut sealed = vec![0xAB; 64];
+            sealed[0] = index;
+            enqueue(
+                &store,
+                vec![0xD0 + index; 16],
+                hint.clone(),
+                sealed,
+                false,
+                NOW + i64::from(index),
+            );
+        }
+
+        let router = CoreMeshRouterState::new();
+        let spray = CoreSprayPolicy::new();
+        let gate = CoreCarriedOfferGate::new();
+        let mut deferred = 0;
+        let mut offered = 0;
+        for index in 0..3_u8 {
+            let peer = generate_identity();
+            let address = format!("ble:peer-{index}");
+            router.on_connected(address.clone(), CoreTransport::Central);
+            assert!(router.on_hello(address.clone(), peer.user_id.clone()));
+            let mut plan = request(me.user_id.clone(), peer.user_id, vec![], true);
+            plan.peer_address = address;
+            let outcome = store.plan_mesh_meet(&router, &spray, &gate, plan).unwrap();
+            if outcome.work.offer_deferred {
+                deferred += 1;
+            } else if outcome.work.sprayed > 0 {
+                offered += 1;
+            }
+        }
+        assert_eq!(offered, 2, "two peers get the epoch's offer slots");
+        assert_eq!(deferred, 1, "the third waits for the next epoch");
+        assert_eq!(
+            store.carried_len().unwrap(),
+            3,
+            "a deferred peer costs the queue nothing"
         );
     }
 
@@ -517,6 +891,7 @@ mod tests {
             .plan_mesh_meet(
                 &router,
                 &spray,
+                &gate(),
                 request(me.user_id, peer.user_id, vec![msg_id], false),
             )
             .unwrap();
