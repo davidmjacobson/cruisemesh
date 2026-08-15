@@ -34,6 +34,10 @@ from typing import NoReturn
 import jwt
 import requests
 
+# Import by explicit path so the script works from any working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from provenance import record  # noqa: E402
+
 KEY_PATH = sys.argv[1]
 KEY_ID = sys.argv[2]
 ISSUER_ID = sys.argv[3]
@@ -122,6 +126,7 @@ def main() -> None:
     if state != "VALID":
         die(f"processingState={state}, not VALID; nothing was distributed.")
     build_id = build["id"]
+    marketing_version = "(not checked)"
 
     # The build number alone can match a build App Store Connect assembled from
     # a different marketing version; check the train before handing it to
@@ -136,6 +141,7 @@ def main() -> None:
                 f"build {BUILD_NUMBER} reports marketing version {actual!r}, "
                 f"expected {EXPECT_MARKETING_VERSION!r}; refusing to distribute."
             )
+        marketing_version = actual
         print(f"marketing version {actual} matches the release.")
 
     apps = get_list(f"/v1/apps?filter[bundleId]={BUNDLE_ID}", "apps")
@@ -193,6 +199,22 @@ def main() -> None:
         )
     print(f"DONE: internal={detail.get('internalBuildState')} external={external}")
     print(f"Build {BUILD_NUMBER} is in '{GROUP_NAME}'.")
+
+    # The App Store Connect build id is the only stable handle on what shipped;
+    # it lives nowhere else in the run once the log ages out.
+    record(
+        "TestFlight distribution",
+        [
+            ("bundle_id", BUNDLE_ID),
+            ("build_number", BUILD_NUMBER),
+            ("marketing_version", marketing_version),
+            ("app_store_connect_build_id", build_id),
+            ("app_store_connect_app_id", app_id),
+            ("beta_group", GROUP_NAME),
+            ("internal_build_state", detail.get("internalBuildState")),
+            ("external_build_state", external),
+        ],
+    )
 
 
 if __name__ == "__main__":

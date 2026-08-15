@@ -55,6 +55,10 @@ jobs:
       # Change to `production` (or add a staged rollout step) after the gate
       # is met.
       PLAY_TRACK: alpha
+      # Plain-text record of what this run produced, uploaded as a run artifact
+      # at the end. tools/play_publish.py appends the Play identifiers it mints
+      # to the same file (it reads this variable itself).
+      CRUISEMESH_PROVENANCE_FILE: ${{ github.workspace }}/release-provenance.txt
     steps:
       - uses: actions/checkout@v4
 
@@ -111,6 +115,35 @@ jobs:
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
           echo "version_code=$version_code" >> "$GITHUB_OUTPUT"
 
+      # --- Release provenance ---------------------------------------------
+      # Records what this run shipped: tag, commit, version, artifact hashes and
+      # the store identifiers the publish scripts mint. Purely additive, and
+      # every provenance step carries continue-on-error so a release can never
+      # fail because a note about it could not be written. Never put
+      # continue-on-error on a step that actually gates the release.
+      - name: Start provenance record
+        continue-on-error: true
+        run: |
+          {
+            echo "# Release"
+            echo "workflow: ${{ github.workflow }}"
+            echo "tag: ${{ steps.version.outputs.tag }}"
+            echo "commit: ${{ github.sha }}"
+            echo "version_name: ${{ steps.version.outputs.version_name }}"
+            echo "version_code: ${{ steps.version.outputs.version_code }}"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "recorded_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "## Android release provenance"
+            echo
+            echo "- **tag**: \`${{ steps.version.outputs.tag }}\`"
+            echo "- **commit**: \`${{ github.sha }}\`"
+            echo "- **version**: \`${{ steps.version.outputs.version_name }} (${{ steps.version.outputs.version_code }})\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: gradlew assembleRelease (debug-signed APK for sideloading)
         working-directory: android
         run: |
@@ -129,6 +162,28 @@ jobs:
           dest="cruisemesh-${{ steps.version.outputs.tag }}.apk"
           cp "$src" "$dest"
           echo "path=$dest" >> "$GITHUB_OUTPUT"
+
+      - name: Record APK checksum
+        continue-on-error: true
+        run: |
+          path="${{ steps.apk.outputs.path }}"
+          sha="$(sha256sum "$path" | awk '{print $1}')"
+          bytes="$(wc -c < "$path" | tr -d ' ')"
+          {
+            echo "# Sideload APK"
+            echo "file: $(basename "$path")"
+            echo "bytes: $bytes"
+            echo "sha256: $sha"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "### Sideload APK"
+            echo
+            echo "- **file**: \`$(basename "$path")\`"
+            echo "- **bytes**: \`$bytes\`"
+            echo "- **sha256**: \`$sha\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release and attach APK
         env:
@@ -173,6 +228,29 @@ jobs:
         if: env.PLAY_ENABLED == 'true'
         run: python3 tools/check_android_elf_alignment.py android/app/build/outputs/bundle/release/app-release.aab
 
+      # Hash the AAB before the upload, so the record survives a failed publish.
+      - name: Record AAB checksum
+        if: env.PLAY_ENABLED == 'true'
+        continue-on-error: true
+        run: |
+          path="android/app/build/outputs/bundle/release/app-release.aab"
+          sha="$(sha256sum "$path" | awk '{print $1}')"
+          bytes="$(wc -c < "$path" | tr -d ' ')"
+          {
+            echo "# Play AAB"
+            echo "file: $(basename "$path")"
+            echo "bytes: $bytes"
+            echo "sha256: $sha"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "### Play AAB"
+            echo
+            echo "- **bytes**: \`$bytes\`"
+            echo "- **sha256**: \`$sha\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish AAB to Play (closed testing)
         if: env.PLAY_ENABLED == 'true'
         env:
@@ -191,3 +269,15 @@ jobs:
       - name: Clean up decoded keystore
         if: always() && env.PLAY_ENABLED == 'true'
         run: rm -f android/app/upload-keystore.jks
+
+      # if: always() so the partial record still lands when an earlier step
+      # failed -- that is exactly the run whose provenance is worth reading.
+      - name: Upload provenance artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-provenance-${{ github.ref_name }}
+          path: ${{ github.workspace }}/release-provenance.txt
+          if-no-files-found: ignore
+          retention-days: 90

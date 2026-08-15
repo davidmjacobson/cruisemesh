@@ -37,7 +37,7 @@ android/app/src/main/jniLibs/
 /tmp/
 
 # Icon source assets (rendered launcher icons live in android res/).
-# Exception: the hand-built vector master of the app icon is real source —
+# Exception: the hand-built vector master of the app icon is real source ï¿½
 # version it so the mark is never again something only Google has a copy of.
 /art/
 !/art/cruisemesh-icon.svg
@@ -48,3 +48,6 @@ android/app/src/main/jniLibs/
 # Codex remote-session attachments â€” not project documentation
 /.codex-remote-attachments/
 __pycache__/
+
+# Release provenance record the release workflows write into the workspace
+/release-provenance.txt
