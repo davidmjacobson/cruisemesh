@@ -4169,6 +4169,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearProtocolEvents() throws 
     
     /**
+     * Forget every fan-out marker, for the same reason
+     * [`MessageStore::clear_carried_relay_upload_markers`] exists: a changed
+     * endpoint makes every "already posted there" answer irrelevant.
+     */
+    func clearRelayFanoutMarkers() throws  -> UInt64
+    
+    /**
      * Forget every remembered frontier, so the next pass re-walks each
      * mailbox from the beginning.
      *
@@ -5070,6 +5077,12 @@ public protocol MessageStoreProtocol : AnyObject {
     func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
     
     /**
+     * Record that one member's fan-out row landed on `relay_url`. Returns
+     * whether this call was the one that recorded it.
+     */
+    func markRelayFanoutRowPosted(msgId: Data, memberUserId: Data, relayUrl: String, nowMs: Int64) throws  -> Bool
+    
+    /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
      */
@@ -5487,6 +5500,15 @@ public protocol MessageStoreProtocol : AnyObject {
     func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64) throws  -> UInt64
     
     /**
+     * Drop fan-out markers whose envelope is no longer an upload candidate --
+     * it was posted in full, expired, or was pruned. Housekeeping only: a
+     * stale marker could only ever suppress a re-post of a row whose envelope
+     * no longer exists, which costs nothing, but the table would otherwise
+     * grow without bound.
+     */
+    func pruneRelayFanoutMarkers() throws  -> UInt64
+    
+    /**
      * Queue one pairwise-sealed group invite for every non-self member while
      * storing the logical invite message exactly once.
      */
@@ -5713,6 +5735,24 @@ public protocol MessageStoreProtocol : AnyObject {
      * knows when to start offering "Don't ask again" (from the second one).
      */
     func recordSharedRequestDismissal(requesterUserId: Data) throws  -> UInt32
+    
+    /**
+     * Which members of a group-addressed envelope's per-member relay fan-out
+     * have already landed durably on `relay_url`.
+     *
+     * A group envelope becomes one row per member on the wire, and the
+     * envelope's own `relay_posted_at` may only be stamped once every one of
+     * them landed. Without a per-member record the only safe answer to a
+     * partial failure is to re-post the whole set next pass, which is what
+     * the legacy engine does and what makes a twelve-member group cost
+     * twelve posts every pass while one member's row keeps failing. These
+     * markers gate **re-posting** only; like the carried-row marker they
+     * never feed a removal or an ack decision.
+     *
+     * Scoped to a mailbox for the same reason the carried marker is:
+     * "already posted to the old relay" says nothing about a new one.
+     */
+    func relayFanoutPostedMembers(msgId: Data, relayUrl: String) throws  -> [Data]
     
     /**
      * Where the walk of one relay mailbox got to (see
@@ -6629,6 +6669,18 @@ open func clearProtocolEvents()throws  {try rustCallWithError(FfiConverterTypeCo
     uniffi_cruisemesh_core_fn_method_messagestore_clear_protocol_events(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+    /**
+     * Forget every fan-out marker, for the same reason
+     * [`MessageStore::clear_carried_relay_upload_markers`] exists: a changed
+     * endpoint makes every "already posted there" answer irrelevant.
+     */
+open func clearRelayFanoutMarkers()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_relay_fanout_markers(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -7983,6 +8035,21 @@ open func markOutgoingReceiptEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)
 }
     
     /**
+     * Record that one member's fan-out row landed on `relay_url`. Returns
+     * whether this call was the one that recorded it.
+     */
+open func markRelayFanoutRowPosted(msgId: Data, memberUserId: Data, relayUrl: String, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_mark_relay_fanout_row_posted(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),
+        FfiConverterData.lower(memberUserId),
+        FfiConverterString.lower(relayUrl),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
      */
@@ -8607,6 +8674,20 @@ open func pruneExpiredOutgoingReceiptEnvelopes(nowMs: Int64)throws  -> UInt64 {
 }
     
     /**
+     * Drop fan-out markers whose envelope is no longer an upload candidate --
+     * it was posted in full, expired, or was pruned. Housekeeping only: a
+     * stale marker could only ever suppress a re-post of a row whose envelope
+     * no longer exists, which costs nothing, but the table would otherwise
+     * grow without bound.
+     */
+open func pruneRelayFanoutMarkers()throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_prune_relay_fanout_markers(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Queue one pairwise-sealed group invite for every non-self member while
      * storing the logical invite message exactly once.
      */
@@ -8950,6 +9031,31 @@ open func recordSharedRequestDismissal(requesterUserId: Data)throws  -> UInt32 {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_record_shared_request_dismissal(self.uniffiClonePointer(),
         FfiConverterData.lower(requesterUserId),$0
+    )
+})
+}
+    
+    /**
+     * Which members of a group-addressed envelope's per-member relay fan-out
+     * have already landed durably on `relay_url`.
+     *
+     * A group envelope becomes one row per member on the wire, and the
+     * envelope's own `relay_posted_at` may only be stamped once every one of
+     * them landed. Without a per-member record the only safe answer to a
+     * partial failure is to re-post the whole set next pass, which is what
+     * the legacy engine does and what makes a twelve-member group cost
+     * twelve posts every pass while one member's row keeps failing. These
+     * markers gate **re-posting** only; like the carried-row marker they
+     * never feed a removal or an ack decision.
+     *
+     * Scoped to a mailbox for the same reason the carried marker is:
+     * "already posted to the old relay" says nothing about a new one.
+     */
+open func relayFanoutPostedMembers(msgId: Data, relayUrl: String)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_fanout_posted_members(self.uniffiClonePointer(),
+        FfiConverterData.lower(msgId),
+        FfiConverterString.lower(relayUrl),$0
     )
 })
 }
@@ -15074,28 +15180,77 @@ public func FfiConverterTypeCoreRelayBackoffVector_lower(_ value: CoreRelayBacko
  * resolution rules ([`resolved_contact_relay`], [`resolved_contact_poll_relay`])
  * are core policy, and handing the pass a pre-resolved endpoint would move
  * them back into whichever shell built the plan.
+ *
+ * # Two brakes, not one
+ *
+ * The two health flags are separate for the reason
+ * [`crate::GroupRelayMember`]'s are, and this config carried only the first
+ * one until the upload lanes needed both. An endpoint can be out of service
+ * in two ways that justify opposite answers:
+ *
+ * * **Rejection** — the endpoint answered, authoritatively, that it will not
+ * serve us. The card is wrong. Falling back to this device's own mailbox
+ * is right: a `401` proves nothing about our own relay, and when both
+ * sides have since moved to the same host it really delivers.
+ * * **Silence** — nothing answered at all. Falling back would put a
+ * cross-family contact's mail in a mailbox they never read, and
+ * `relay_posted_at` is terminal, so that is a permanent misroute rather
+ * than a retry. The right answer is to post nothing to that recipient this
+ * pass and keep waiting; the row stays queued for a later pass and for the
+ * mesh paths.
+ *
+ * Collapsed onto one flag, the silence case has to borrow the rejection
+ * answer, which is exactly the misroute. So both are here, and
+ * [`shadow_upload_endpoint_for`] treats them distinctly.
+ *
+ * `endpoint_answering` carries a default so a caller that has not yet been
+ * taught the difference keeps compiling and keeps its present behaviour
+ * (whatever it folded into `endpoint_usable`), rather than silently
+ * acquiring the fallback for a resting endpoint.
  */
 public struct CoreRelayContactConfig {
     public var userId: Data
     public var relayUrl: String?
     public var relayToken: String?
     /**
-     * False when this device has already written the endpoint off. Such a
-     * contact is not polled and cannot accrue more silence.
+     * False once this contact's card endpoint has been written off for
+     * authoritative *rejections*
+     * ([`crate::core_contact_relay_endpoint_usable`]). Such a contact is not
+     * polled and cannot accrue more silence, and an upload for them falls
+     * back to this device's own mailbox.
      */
     public var endpointUsable: Bool
+    /**
+     * False while this contact's card endpoint is resting because it stopped
+     * *answering*
+     * ([`crate::core_contact_relay_unreachable_endpoint_usable`]). Such a
+     * contact is not polled either, and an upload for them is declined
+     * outright this pass rather than redirected.
+     */
+    public var endpointAnswering: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(userId: Data, relayUrl: String?, relayToken: String?, 
         /**
-         * False when this device has already written the endpoint off. Such a
-         * contact is not polled and cannot accrue more silence.
-         */endpointUsable: Bool) {
+         * False once this contact's card endpoint has been written off for
+         * authoritative *rejections*
+         * ([`crate::core_contact_relay_endpoint_usable`]). Such a contact is not
+         * polled and cannot accrue more silence, and an upload for them falls
+         * back to this device's own mailbox.
+         */endpointUsable: Bool, 
+        /**
+         * False while this contact's card endpoint is resting because it stopped
+         * *answering*
+         * ([`crate::core_contact_relay_unreachable_endpoint_usable`]). Such a
+         * contact is not polled either, and an upload for them is declined
+         * outright this pass rather than redirected.
+         */endpointAnswering: Bool = true) {
         self.userId = userId
         self.relayUrl = relayUrl
         self.relayToken = relayToken
         self.endpointUsable = endpointUsable
+        self.endpointAnswering = endpointAnswering
     }
 }
 
@@ -15115,6 +15270,9 @@ extension CoreRelayContactConfig: Equatable, Hashable {
         if lhs.endpointUsable != rhs.endpointUsable {
             return false
         }
+        if lhs.endpointAnswering != rhs.endpointAnswering {
+            return false
+        }
         return true
     }
 
@@ -15123,6 +15281,7 @@ extension CoreRelayContactConfig: Equatable, Hashable {
         hasher.combine(relayUrl)
         hasher.combine(relayToken)
         hasher.combine(endpointUsable)
+        hasher.combine(endpointAnswering)
     }
 }
 
@@ -15137,7 +15296,8 @@ public struct FfiConverterTypeCoreRelayContactConfig: FfiConverterRustBuffer {
                 userId: FfiConverterData.read(from: &buf), 
                 relayUrl: FfiConverterOptionString.read(from: &buf), 
                 relayToken: FfiConverterOptionString.read(from: &buf), 
-                endpointUsable: FfiConverterBool.read(from: &buf)
+                endpointUsable: FfiConverterBool.read(from: &buf), 
+                endpointAnswering: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -15146,6 +15306,7 @@ public struct FfiConverterTypeCoreRelayContactConfig: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.relayUrl, into: &buf)
         FfiConverterOptionString.write(value.relayToken, into: &buf)
         FfiConverterBool.write(value.endpointUsable, into: &buf)
+        FfiConverterBool.write(value.endpointAnswering, into: &buf)
     }
 }
 
@@ -38520,6 +38681,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_protocol_events() != 39383) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fanout_markers() != 54484) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 48310) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -38718,6 +38882,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outgoing_receipt_envelope_relay_posted() != 16233) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_relay_fanout_row_posted() != 62196) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 44635) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -38805,6 +38972,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_expired_outgoing_receipt_envelopes() != 28322) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_prune_relay_fanout_markers() != 4321) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_queue_group_invites() != 18379) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -38848,6 +39018,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_shared_request_dismissal() != 11001) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fanout_posted_members() != 23882) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_cursor() != 29554) {

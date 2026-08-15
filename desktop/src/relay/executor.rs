@@ -85,6 +85,7 @@ pub fn build_relay_plan(
                 relay_url: contact.relay_url,
                 relay_token: contact.relay_token,
                 endpoint_usable: true,
+                endpoint_answering: true,
             })
             .collect(),
         own_user_id: identity.user_id.clone(),

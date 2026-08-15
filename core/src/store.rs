@@ -3505,6 +3505,89 @@ impl MessageStore {
         Ok(pruned as u64)
     }
 
+    /// Which members of a group-addressed envelope's per-member relay fan-out
+    /// have already landed durably on `relay_url`.
+    ///
+    /// A group envelope becomes one row per member on the wire, and the
+    /// envelope's own `relay_posted_at` may only be stamped once every one of
+    /// them landed. Without a per-member record the only safe answer to a
+    /// partial failure is to re-post the whole set next pass, which is what
+    /// the legacy engine does and what makes a twelve-member group cost
+    /// twelve posts every pass while one member's row keeps failing. These
+    /// markers gate **re-posting** only; like the carried-row marker they
+    /// never feed a removal or an ack decision.
+    ///
+    /// Scoped to a mailbox for the same reason the carried marker is:
+    /// "already posted to the old relay" says nothing about a new one.
+    pub fn relay_fanout_posted_members(
+        &self,
+        msg_id: Vec<u8>,
+        relay_url: String,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT member_user_id FROM outbound_fanout_posted
+                 WHERE msg_id = ?1 AND relay_url = ?2",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![msg_id, relay_url], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
+    /// Record that one member's fan-out row landed on `relay_url`. Returns
+    /// whether this call was the one that recorded it.
+    pub fn mark_relay_fanout_row_posted(
+        &self,
+        msg_id: Vec<u8>,
+        member_user_id: Vec<u8>,
+        relay_url: String,
+        now_ms: i64,
+    ) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let changed = conn
+            .execute(
+                "INSERT OR IGNORE INTO outbound_fanout_posted
+                     (msg_id, member_user_id, relay_url, posted_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![msg_id, member_user_id, relay_url, now_ms],
+            )
+            .map_err(store_err)?;
+        Ok(changed > 0)
+    }
+
+    /// Drop fan-out markers whose envelope is no longer an upload candidate --
+    /// it was posted in full, expired, or was pruned. Housekeeping only: a
+    /// stale marker could only ever suppress a re-post of a row whose envelope
+    /// no longer exists, which costs nothing, but the table would otherwise
+    /// grow without bound.
+    pub fn prune_relay_fanout_markers(&self) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let pruned = conn
+            .execute(
+                "DELETE FROM outbound_fanout_posted
+                 WHERE msg_id NOT IN (
+                     SELECT msg_id FROM outbound_envelopes WHERE relay_posted_at IS NULL
+                 )",
+                [],
+            )
+            .map_err(store_err)?;
+        Ok(pruned as u64)
+    }
+
+    /// Forget every fan-out marker, for the same reason
+    /// [`MessageStore::clear_carried_relay_upload_markers`] exists: a changed
+    /// endpoint makes every "already posted there" answer irrelevant.
+    pub fn clear_relay_fanout_markers(&self) -> Result<u64, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let cleared = conn
+            .execute("DELETE FROM outbound_fanout_posted", [])
+            .map_err(store_err)?;
+        Ok(cleared as u64)
+    }
+
     /// The latest relay-uploadable receipt envelope persisted for this
     /// cumulative outgoing receipt watermark, if any.
     pub fn outgoing_receipt_envelope(
@@ -8905,6 +8988,20 @@ CREATE INDEX IF NOT EXISTS idx_outbound_expiry ON outbound_envelopes(expiry);
 -- than beside the later migrations in `open`.
 CREATE INDEX IF NOT EXISTS idx_outbound_recipient_chat_lamport
     ON outbound_envelopes(recipient_user_id, chat_id, lamport);
+
+-- Per-member progress for a group-addressed envelope's relay fan-out. One
+-- group envelope is one row per member on the wire, and `relay_posted_at` may
+-- only be stamped once all of them land, so a partial failure needs somewhere
+-- durable to say which members are already done. Keyed by mailbox as well as
+-- by member: already posted there says nothing about a different relay.
+-- Gates re-posting only -- never removal, never an ack.
+CREATE TABLE IF NOT EXISTS outbound_fanout_posted (
+    msg_id         BLOB NOT NULL,
+    member_user_id BLOB NOT NULL,
+    relay_url      TEXT NOT NULL,
+    posted_at      INTEGER NOT NULL,
+    PRIMARY KEY(msg_id, member_user_id, relay_url)
+);
 
 CREATE TABLE IF NOT EXISTS carried_envelopes (
     msg_id         BLOB PRIMARY KEY,

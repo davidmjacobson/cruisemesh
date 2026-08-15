@@ -390,6 +390,7 @@ fn capture(steps: Vec<CoreRelayShadowStep>) -> CoreRelayShadowCapture {
             relay_url: None,
             relay_token: None,
             endpoint_usable: true,
+            endpoint_answering: true,
         }],
         steps,
         skipped_recipients: Vec::new(),

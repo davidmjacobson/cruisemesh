@@ -1,0 +1,13 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"group-fanout-partial","title":"A group fan-out half-posted, then re-posted whole on every later pass because no member's landing was remembered","origin":"synthetic","public_reference":"#140","pseudonyms":["mailbox-a"],"expect_invariants":["FANOUT-01","LIVE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":1,"authored_pending":1},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000200,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"group_members":6,"rows_planned":1},"outcome":"authored_upload_issued"}
+{"record":"event","seq":3,"at_ms":1700000000640,"code":"invariant_violation","pass":"p1","action":1,"actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"group_members":6,"rows_posted":1},"outcome":"group_row_not_decomposed"}
+{"record":"event","seq":4,"at_ms":1700000000700,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":1,"uploads":1},"outcome":"finished"}
+{"record":"event","seq":5,"at_ms":1700000060000,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"configs":1,"authored_pending":1},"outcome":"nudged"}
+{"record":"event","seq":6,"at_ms":1700000060200,"code":"action_emitted","pass":"p2","action":1,"actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"group_members":6,"rows_planned":6},"outcome":"authored_upload_issued"}
+{"record":"event","seq":7,"at_ms":1700000061400,"code":"action_result_accepted","pass":"p2","action":1,"actor":"mailbox-a","counts":{"status":200,"rows_landed":4},"outcome":"upload_accepted"}
+{"record":"event","seq":8,"at_ms":1700000061900,"code":"request_rejected","pass":"p2","action":5,"actor":"mailbox-a","counts":{"status":500,"rows_landed":4},"outcome":"relay_unavailable"}
+{"record":"event","seq":9,"at_ms":1700000062000,"code":"pass_finish","pass":"p2","actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"rows_landed":4,"members_owed":6,"envelope_marked":0},"outcome":"partial_fanout_not_marked"}
+{"record":"event","seq":10,"at_ms":1700000120000,"code":"pass_start","pass":"p3","actor":"mailbox-a","counts":{"configs":1,"authored_pending":1},"outcome":"nudged"}
+{"record":"event","seq":11,"at_ms":1700000120200,"code":"invariant_violation","pass":"p3","actor":"mailbox-a","invariants":["FANOUT-01","LIVE-01"],"counts":{"rows_planned":6,"rows_already_landed":4},"outcome":"whole_set_reposted"}
+{"record":"event","seq":12,"at_ms":1700000120900,"code":"pass_finish","pass":"p3","actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"rows_landed":6,"members_owed":6,"envelope_marked":1},"outcome":"fanout_complete"}

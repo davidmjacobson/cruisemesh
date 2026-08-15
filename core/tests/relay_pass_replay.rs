@@ -529,6 +529,7 @@ const EXECUTED: &[&str] = &[
     "ack-fail-after-consume",
     "carry-storm",
     "contact-silence-no-proof",
+    "group-fanout-partial",
     "oversize-shrink",
     "pending-rerun-during-backoff",
     "short-page",
@@ -590,6 +591,10 @@ fn executed_fixtures_name_their_scenario() {
         (
             "contact-silence-no-proof",
             "silence_is_committed_only_with_proof_another_relay_answered",
+        ),
+        (
+            "group-fanout-partial",
+            "a_partial_group_fan_out_resumes_with_the_members_that_did_not_land",
         ),
         (
             "oversize-shrink",
@@ -1059,6 +1064,7 @@ fn silence_is_committed_only_with_proof_another_relay_answered() {
         relay_url: Some(CONTACT_URL.to_string()),
         relay_token: Some(CONTACT_TOKEN.to_string()),
         endpoint_usable: true,
+        endpoint_answering: true,
     }];
 
     // Pass one: nothing answers. This device cannot tell a silent contact
@@ -1297,8 +1303,525 @@ fn a_msg_id_conflict_leaves_the_authored_row_queued_and_continues_the_lane() {
 }
 
 // ===========================================================================
+// Group fan-out: one row per member, and `relay_posted_at` only at the end
+// ===========================================================================
+
+#[test]
+fn a_group_envelope_becomes_one_row_per_member_and_is_marked_only_when_all_land() {
+    // The mail-losing shape. A group envelope carries
+    // `recipient_user_id = group_id`, which is nobody's contact entry, so a
+    // lane that posts one row to one resolved mailbox posts a single
+    // group-hinted row into this device's own mailbox — where no member ever
+    // looks, because members poll under their own daily hints. That is the
+    // shape #140 fixed on the shells.
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 3);
+    seed_group_authored(&store, &group, now);
+
+    let mut plan = base_plan(now);
+    plan.contacts = group_contacts(&group);
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    let posts = run.posts();
+    assert_eq!(
+        posts.len(),
+        3,
+        "one row per member, not one row for the group"
+    );
+    let bodies: std::collections::BTreeSet<Vec<u8>> =
+        posts.iter().map(|post| post.request.body.clone()).collect();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "each member's row is addressed to that member: distinct hints and distinct msg_ids"
+    );
+    assert_eq!(run.summary.authored_uploads, 3);
+
+    assert!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .is_empty(),
+        "every member's row landed, so the envelope is relay-posted"
+    );
+
+    // And a second pass re-posts nothing.
+    let second = CoreRelayPass::new(store.clone(), base_plan(now), "p2".to_string());
+    let run_two = drive(&second, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert_eq!(run_two.posts().len(), 0);
+
+    assert_no_secrets(&store, &run.summary);
+}
+
+#[test]
+fn a_partial_group_fan_out_resumes_with_the_members_that_did_not_land() {
+    // The property the per-member markers exist for. The legacy engine
+    // retries the whole set when one row fails, which costs every member a
+    // repeat post on every pass for as long as one row keeps failing. Here
+    // the landed rows are remembered durably, so the next pass posts only
+    // what is still owed — and the envelope stays queued until it is.
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 3);
+    seed_group_authored(&store, &group, now);
+    let mut plan = base_plan(now);
+    plan.contacts = group_contacts(&group);
+
+    let first = CoreRelayPass::new(store.clone(), plan.clone(), "p1".to_string());
+    let mut posts_seen = 0usize;
+    let mut failed_body: Option<Vec<u8>> = None;
+    let run_one = drive(&first, now, |request, _index| {
+        if request.is_fetch() {
+            return Reply::ok(empty_page());
+        }
+        if !request.is_post() {
+            return Reply::empty_ok();
+        }
+        posts_seen += 1;
+        if posts_seen == 2 {
+            failed_body = Some(request.request.body.clone());
+            // A mailbox-shaped fault: the lane stops spending on that relay
+            // for the rest of the pass, which is exactly the shape that
+            // leaves a fan-out half-posted.
+            return Reply::status(500, "server_error");
+        }
+        Reply::empty_ok()
+    });
+    assert_eq!(
+        run_one.posts().len(),
+        2,
+        "the first row landed and the second was refused, ending the lane for that mailbox"
+    );
+    let failed_body = failed_body.expect("one row was refused");
+
+    let still_queued = store
+        .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+        .expect("pending outbound");
+    assert_eq!(
+        still_queued.len(),
+        1,
+        "one member never received the message, so the envelope is not relay-posted"
+    );
+
+    // Pass two: only the member whose row was refused is posted again, and
+    // it is the same row — the deterministic fan-out msg_id and the same
+    // member hint, byte for byte.
+    let later = now + 60_000;
+    let second = CoreRelayPass::new(store.clone(), plan, "p2".to_string());
+    let run_two = drive(&second, later, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    let posts_two = run_two.posts();
+    assert_eq!(
+        posts_two.len(),
+        2,
+        "exactly the two members still owed a row, and not the one that landed"
+    );
+    assert!(
+        posts_two
+            .iter()
+            .any(|post| post.request.body == failed_body),
+        "the refused row is resumed byte for byte: the fan-out msg_id is deterministic"
+    );
+    assert!(
+        store
+            .pending_relay_outbound_envelopes(1_000, later, Vec::new())
+            .expect("pending outbound")
+            .is_empty(),
+        "the last member landed, so now the envelope is relay-posted"
+    );
+
+    assert_no_secrets(&store, &run_two.summary);
+}
+
+#[test]
+fn a_blocked_member_gets_no_fan_out_row_and_does_not_hold_the_envelope_open() {
+    // Every other outbound fan-out in this codebase drops blocked users
+    // before it sends, and a relay row is a send. The second half is the one
+    // that matters here: an excluded member is not *owed* a landing, so their
+    // absence must not keep the envelope queued forever, re-posting the rest
+    // of the group on every pass.
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 3);
+    seed_group_authored(&store, &group, now);
+    store
+        .block_user(group.member_user_ids[1].clone(), now)
+        .expect("block a member");
+
+    let mut plan = base_plan(now);
+    plan.contacts = group_contacts(&group);
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(
+        run.posts().len(),
+        2,
+        "a blocked member is excluded from the fan-out"
+    );
+    assert!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .is_empty(),
+        "the envelope is complete once every member it still owes has landed"
+    );
+}
+
+#[test]
+fn a_group_whose_only_endpoint_is_resting_posts_nothing_rather_than_misrouting() {
+    // `relay_posted_at` is terminal, so posting a cross-family group's rows
+    // into our own mailbox is not a retry — it is a permanent misroute. A
+    // member resting for silence contributes no fallback, and with no other
+    // member resolving, the answer is to post nothing this pass and leave the
+    // envelope for a later one and for the mesh paths.
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 1);
+    seed_group_authored(&store, &group, now);
+
+    let mut plan = base_plan(now);
+    plan.contacts = group_contacts(&group);
+    plan.contacts[0].endpoint_answering = false;
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+
+    assert_eq!(run.posts().len(), 0, "nowhere safe to post, so nothing did");
+    assert_eq!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .len(),
+        1,
+        "the envelope stays queued: a resting host that comes back still receives it"
+    );
+}
+
+// ===========================================================================
+// contact-silence-no-proof, upload half — rejection and silence diverge
+// ===========================================================================
+
+#[test]
+fn rejection_falls_back_to_our_own_mailbox_and_silence_declines_to_post() {
+    // The two brakes are different answers, and the one flag they used to
+    // share could only express the first. Rejection means the *card* is
+    // wrong: our own mailbox is a real alternative and the row should go
+    // there. Silence means nothing answered: falling back would put a
+    // cross-family contact's mail somewhere they never read, and because
+    // `relay_posted_at` is terminal that is a permanent misroute, not a
+    // retry.
+    let now = T0;
+
+    // Rejection: written off, but the endpoint answers. Fall back.
+    let rejected = new_store();
+    seed_contact(&rejected);
+    seed_authored(&rejected, 2, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: false,
+        endpoint_answering: true,
+    }];
+    let pass = CoreRelayPass::new(rejected.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    let posts = run.posts();
+    assert_eq!(posts.len(), 2, "a rejection has somewhere else to go");
+    assert!(
+        posts.iter().all(|post| post.request.base_url == OWN_URL),
+        "the fallback is our own mailbox"
+    );
+    assert!(
+        rejected
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .is_empty(),
+        "the fallback posts really happened, so the rows are marked"
+    );
+
+    // Silence: the card may be perfectly good, but nothing is answering.
+    // Post nothing, mark nothing.
+    let silent = new_store();
+    seed_contact(&silent);
+    seed_authored(&silent, 2, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: true,
+        endpoint_answering: false,
+    }];
+    let pass = CoreRelayPass::new(silent.clone(), plan, "p2".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert_eq!(
+        run.posts().len(),
+        0,
+        "silence declines to post rather than redirecting"
+    );
+    assert_eq!(
+        silent
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .len(),
+        2,
+        "no terminal marker was written: the rows are still deliverable, by relay or by mesh"
+    );
+    assert!(
+        run.requests
+            .iter()
+            .all(|request| request.request.base_url == OWN_URL),
+        "a resting endpoint is not polled either"
+    );
+
+    assert_no_violation_of(&silent, &["SILENCE-01"]);
+}
+
+// ===========================================================================
+// The skip list — one dead recipient cannot own the batch
+// ===========================================================================
+
+#[test]
+fn an_unpostable_recipient_does_not_spend_the_upload_batch() {
+    // The upload queries take an exclusion list precisely so a recipient this
+    // device cannot post to is never *selected*. Passing an empty list
+    // instead means their rows fill the bounded batch, get skipped one by
+    // one, and fill it again next pass — and the rows behind them that could
+    // actually move never do. The batch is bounded, so this is starvation,
+    // not merely waste.
+    let store = new_store();
+    let now = T0;
+    let budget = core_relay_pass_default_budgets().max_authored_uploads as usize;
+    let dead = vec![0xD0u8; 32];
+    let live = contact_user_id();
+    seed_contact(&store);
+    seed_authored_to(&store, &dead, 0x5000, 30, now);
+    seed_authored_to(&store, &live, 0x6000, 30, now);
+
+    let mut plan = base_plan(now);
+    plan.contacts = vec![
+        CoreRelayContactConfig {
+            user_id: dead.clone(),
+            relay_url: Some("https://gone.example".to_string()),
+            relay_token: Some("member-token-cccccccccccc".to_string()),
+            endpoint_usable: true,
+            // Resting for silence: nowhere to post, and no fallback.
+            endpoint_answering: false,
+        },
+        CoreRelayContactConfig {
+            user_id: live.clone(),
+            relay_url: Some(CONTACT_URL.to_string()),
+            relay_token: Some(CONTACT_TOKEN.to_string()),
+            endpoint_usable: true,
+            endpoint_answering: true,
+        },
+    ];
+
+    let mut posted = 0usize;
+    for (index, pass_id) in ["p1", "p2"].iter().enumerate() {
+        let pass = CoreRelayPass::new(store.clone(), plan.clone(), pass_id.to_string());
+        let run = drive(&pass, now + index as i64 * 60_000, |request, _index| {
+            if request.is_fetch() {
+                Reply::ok(empty_page())
+            } else {
+                Reply::empty_ok()
+            }
+        });
+        assert!(
+            run.posts()
+                .iter()
+                .all(|post| post.request.base_url == CONTACT_URL),
+            "every upload this pass spent must be one that could actually move"
+        );
+        posted += run.posts().len();
+    }
+    assert_eq!(
+        posted, 30,
+        "the live recipient's whole queue moved in two passes of {budget}; a dead recipient \
+         occupying the batch would have left rows waiting"
+    );
+
+    let remaining = store
+        .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+        .expect("pending outbound");
+    assert_eq!(
+        remaining.len(),
+        30,
+        "only the unpostable recipient's rows are still queued"
+    );
+    assert!(
+        remaining
+            .iter()
+            .all(|envelope| envelope.recipient_user_id == dead),
+        "the live recipient was not starved by the dead one"
+    );
+}
+
+// ===========================================================================
 // Seeding helpers
 // ===========================================================================
+
+/// `create_group` requires 16-byte member ids, so these are that length
+/// rather than the 32-byte stand-ins the rest of this file uses.
+fn member_user_id(index: usize) -> Vec<u8> {
+    vec![0xB0 + index as u8; 16]
+}
+
+/// A group of `members` contacts, each with their own card endpoint on the
+/// contact relay, persisted as contacts and as a group.
+fn seed_group(store: &MessageStore, members: usize) -> cruisemesh_core::Group {
+    let member_ids: Vec<Vec<u8>> = (0..members).map(member_user_id).collect();
+    for (index, user_id) in member_ids.iter().enumerate() {
+        store
+            .upsert_contact(Contact {
+                user_id: user_id.clone(),
+                name: format!("Member {index}"),
+                sign_pk: vec![1u8; 32],
+                agree_pk: vec![2u8; 32],
+                relay_url: Some(CONTACT_URL.to_string()),
+                relay_token: Some(CONTACT_TOKEN.to_string()),
+                nickname: None,
+            })
+            .expect("upsert member");
+    }
+    let group = cruisemesh_core::create_group("Cabin".to_string(), member_ids).expect("group");
+    store.upsert_group(group.clone()).expect("upsert group");
+    group
+}
+
+fn group_contacts(group: &cruisemesh_core::Group) -> Vec<CoreRelayContactConfig> {
+    group
+        .member_user_ids
+        .iter()
+        .map(|user_id| CoreRelayContactConfig {
+            user_id: user_id.clone(),
+            relay_url: Some(CONTACT_URL.to_string()),
+            relay_token: Some(CONTACT_TOKEN.to_string()),
+            endpoint_usable: true,
+            endpoint_answering: true,
+        })
+        .collect()
+}
+
+/// One authored group-addressed envelope: `recipient_user_id` is the group id,
+/// which is what makes it nobody's contact and everybody's message.
+fn seed_group_authored(store: &MessageStore, group: &cruisemesh_core::Group, now_ms: i64) {
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    let chat_id = group.id.clone();
+    store
+        .insert_outgoing_message(
+            StoredMessage {
+                chat_id: chat_id.clone(),
+                sender_user_id: own_user_id(),
+                lamport: 1,
+                timestamp: now_ms,
+                kind: KIND_TEXT,
+                payload: b"cabin at seven".to_vec(),
+            },
+            OutboundEnvelope {
+                msg_id: msg_id(0x4000),
+                recipient_user_id: group.id.clone(),
+                chat_id,
+                sender_user_id: own_user_id(),
+                kind: KIND_TEXT,
+                lamport: 1,
+                timestamp: now_ms,
+                hop_ttl: 3,
+                expiry,
+                recipient_hint: compute_recipient_hint(group.id.clone(), now_ms),
+                sealed: vec![0x55u8; 96],
+            },
+            now_ms,
+        )
+        .expect("queue group envelope");
+}
+
+/// `count` authored 1:1 envelopes addressed to `recipient`.
+fn seed_authored_to(
+    store: &MessageStore,
+    recipient: &[u8],
+    seed_base: u64,
+    count: usize,
+    now_ms: i64,
+) {
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    let chat_id = recipient.to_vec();
+    for index in 0..count {
+        let lamport = index as u64 + 1;
+        store
+            .insert_outgoing_message(
+                StoredMessage {
+                    chat_id: chat_id.clone(),
+                    sender_user_id: own_user_id(),
+                    lamport,
+                    timestamp: now_ms,
+                    kind: KIND_TEXT,
+                    payload: b"hello".to_vec(),
+                },
+                OutboundEnvelope {
+                    msg_id: msg_id(seed_base + index as u64),
+                    recipient_user_id: recipient.to_vec(),
+                    chat_id: chat_id.clone(),
+                    sender_user_id: own_user_id(),
+                    kind: KIND_TEXT,
+                    lamport,
+                    timestamp: now_ms,
+                    hop_ttl: 3,
+                    expiry,
+                    recipient_hint: compute_recipient_hint(recipient.to_vec(), now_ms),
+                    sealed: vec![0x33u8; 80],
+                },
+                now_ms,
+            )
+            .expect("queue authored");
+    }
+}
 
 fn seed_contact(store: &MessageStore) {
     store
@@ -2139,6 +2662,9 @@ fn a_written_off_contact_endpoint_is_neither_polled_nor_posted_to() {
         relay_url: Some(CONTACT_URL.to_string()),
         relay_token: Some(CONTACT_TOKEN.to_string()),
         endpoint_usable: false,
+        // Rejection, not silence: the endpoint answered, it just answered
+        // that it will not serve us.
+        endpoint_answering: true,
     }];
 
     let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
@@ -2458,6 +2984,7 @@ fn cancelling_a_pass_writes_no_contact_endpoint_off() {
         relay_url: Some(CONTACT_URL.to_string()),
         relay_token: Some(CONTACT_TOKEN.to_string()),
         endpoint_usable: true,
+        endpoint_answering: true,
     }];
 
     let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
@@ -2606,6 +3133,7 @@ fn two_mailboxes_on_one_host_are_both_walked() {
         relay_url: Some(OWN_URL.to_string()),
         relay_token: Some(CONTACT_TOKEN.to_string()),
         endpoint_usable: true,
+        endpoint_answering: true,
     }];
 
     let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
