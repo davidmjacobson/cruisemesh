@@ -3814,3 +3814,123 @@ fn a_same_family_contact_is_answered_by_its_own_config_not_a_second_request() {
         "a pollable endpoint is walked, and its presence rides that config"
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the pass hands the shell to project
+// ---------------------------------------------------------------------------
+
+/// The rows a shell must project are the rows the ingest transaction newly
+/// took, and only those.
+///
+/// This is the seam that closes "the message arrived and nobody knew" under
+/// the core engine: core cannot open a sealed body, so unless it says which
+/// rows it just persisted, the shell has nothing to open, deliver or raise a
+/// notification for. Handing over a row the store already had would be worse
+/// than handing over none — that is a second notification for one message.
+#[test]
+fn a_pass_reports_the_rows_it_newly_persisted_and_nothing_else() {
+    let store = new_store();
+    let now = T0;
+    let fresh = fresh_rows(1, 2, now);
+    let known = seed_consumed(&store, 50..51, now);
+    let mut page: Vec<Row> = Vec::new();
+    for row in &fresh {
+        page.push(Row {
+            id: row.id,
+            msg_id: row.msg_id.clone(),
+            hint: row.hint.clone(),
+            expiry_ms: row.expiry_ms,
+        });
+    }
+    page.push(Row {
+        id: 3,
+        msg_id: known[0].msg_id.clone(),
+        hint: known[0].hint.clone(),
+        expiry_ms: known[0].expiry_ms,
+    });
+
+    let pass = CoreRelayPass::new(store.clone(), base_plan(now), "p1".to_string());
+    let mut served = false;
+    drive(&pass, now, |request, _index| {
+        if request.is_fetch() && !served {
+            served = true;
+            return Reply::ok(page_body(&page));
+        }
+        if request.is_fetch() {
+            return Reply::ok(empty_page());
+        }
+        Reply::empty_ok()
+    });
+
+    let projection = pass.take_projection();
+    let reported: Vec<Vec<u8>> = projection
+        .ingested
+        .iter()
+        .map(|envelope| envelope.msg_id.clone())
+        .collect();
+    assert_eq!(
+        reported,
+        vec![fresh[0].msg_id.clone(), fresh[1].msg_id.clone()],
+        "only the rows this transaction persisted may be projected"
+    );
+    assert!(
+        projection.ingested.iter().all(|e| !e.sealed.is_empty()),
+        "a projected row must carry the sealed body the shell has to open"
+    );
+
+    // Drained, not accumulated: a driver that asks twice must not project the
+    // same page twice.
+    assert!(pass.take_projection().ingested.is_empty());
+}
+
+/// A mailbox's presence answer reaches the shell, which is the only way a
+/// contact's "last seen" moves while the core engine is driving.
+#[test]
+fn a_presence_answer_is_reported_as_an_age_rather_than_a_relay_timestamp() {
+    let store = new_store();
+    let now = T0;
+    let mut plan = base_plan(now);
+    let hint = compute_recipient_hint(contact_user_id(), now);
+    plan.presence_query = vec![hint.clone()];
+
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let body = format!(
+        "{{\"now_ms\":{},\"presence\":[{{\"hint\":\"{}\",\"last_seen_ms\":{}}}]}}",
+        // A relay whose clock runs an hour ahead of ours: the answer must
+        // still be reported as an age, so nothing downstream can adopt the
+        // relay's timestamp as a local one.
+        now + 3_600_000,
+        b64(&hint),
+        now + 3_600_000 - 5_000
+    );
+    drive(&pass, now, |request, _index| {
+        if request.request.operation == CoreRelayOperation::Presence {
+            return Reply::ok(body.clone().into_bytes());
+        }
+        if request.is_fetch() {
+            return Reply::ok(empty_page());
+        }
+        Reply::empty_ok()
+    });
+
+    let projection = pass.take_projection();
+    assert_eq!(
+        projection.presence.len(),
+        1,
+        "the answer must reach the shell"
+    );
+    let observation = &projection.presence[0];
+    assert_eq!(observation.hint, hint);
+    assert!(
+        observation.user_id.is_empty(),
+        "a mailbox answers about hints, not people"
+    );
+    assert_eq!(observation.age_ms, 5_000);
+    // This device's clock as the pass has it -- never the relay's, which is an
+    // hour ahead in this scenario.
+    assert!(
+        observation.observed_at_ms >= now && observation.observed_at_ms < now + 60_000,
+        "observed on this device's clock, got {}",
+        observation.observed_at_ms
+    );
+}

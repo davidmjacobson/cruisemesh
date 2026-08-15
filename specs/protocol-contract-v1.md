@@ -999,11 +999,12 @@ became the same exclusion Android already had. They stay in the table with
 their history, which is the point of the table.
 
 What closing them does not by itself do is make core the default engine. The
-presence-scope row below is still open, the canary still has to run clean over
-real passes, and the two adapter call sites still fold both brakes into one
-flag until they are taught the difference — until then a resting endpoint
-reaches core as a rejection, exactly as it did before, which is the behaviour
-those shells ship today rather than a regression.
+presence-scope row below is still open and the canary still has to run clean
+over real passes. The two adapter call sites have since been taught the
+difference: both shells now build `CoreRelayContactConfig` with
+`endpoint_usable` carrying rejection evidence and `endpoint_answering` carrying
+silence evidence, so a resting endpoint no longer reaches core as a rejection
+and no longer acquires the fallback.
 
 The presence-scope row is the one this table gained by being used: nobody
 recorded it as a difference, and it only surfaced because writing a single
@@ -1473,20 +1474,20 @@ Recorded so a reader does not have to diff two documents:
   disagreement per sample — because a per-row emitter would evict the
   operational evidence the ring exists to carry. It is removed with the legacy
   engine in C5.
-- Four things must close before the Android default may move, and they are
-  written down rather than discovered by flipping the switch. Two are the open
-  5.2 rows above — group fan-out, and a contact endpoint resting for silence.
-  The third is that a page `CoreRelayPass` ingests is persisted but never
-  handed to the shell's inbound processor, so nothing raises a notification for
-  it. The fourth is that the presence answer core decodes is never projected
-  back onto the connectivity surface, so contact "last seen" would stop moving.
-  The cross-family half of that answer is now cached in core — a recency bucket
-  per contact in `contact_presence` — so what remains owed there is the
-  projection onto the surface, not the data behind it.
-  Neither of the last two is a divergence between shells; both are simply the
-  work package C4 exists to do, and they are named here so "the core engine is
-  wired and tested" is not read as "the core engine is ready to be the
-  default".
+- Four things had to close before the Android default may move, and they were
+  written down rather than discovered by flipping the switch: the two open 5.2
+  rows above (group fan-out, and a contact endpoint resting for silence), a
+  page `CoreRelayPass` ingests being persisted but never handed to the shell's
+  inbound processor so nothing raised a notification for it, and the presence
+  answer never being projected back onto the connectivity surface so contact
+  "last seen" stopped moving. Three are now closed. The pass drains a typed
+  projection — the rows its ingest transaction newly took, and the presence it
+  was answered, as an age rather than as a relay timestamp — and each shell
+  hands those to the same inbound path and the same last-seen merge its legacy
+  pass uses, without re-deciding anything core already committed. Both shells
+  also now pass `endpoint_usable` and `endpoint_answering` distinctly, so the
+  silence brake engages rather than borrowing the rejection answer. Group
+  fan-out remains, and it is the one thing left on this list.
 - What is deliberately *not* on that list is anything the shell still owns on
   both paths. The prunes, the pre-upload receipt backfill, the contact-silence
   breaker's pass boundaries and the endpoint announcement all run on the core

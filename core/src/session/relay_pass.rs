@@ -183,7 +183,7 @@
 //! `SECRET-01` is tested against the live ring and against the summary rather
 //! than asserted here.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::protocol_event::{ProtocolEventCode, ProtocolEventDraft};
@@ -198,7 +198,8 @@ use crate::relay_wire::{
     relay_decode_presence_page, relay_encode_ack_request, relay_encode_post_envelope,
     relay_encode_presence_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
     relay_max_response_bytes, relay_validate_envelope_sizes, resolved_contact_delivery_relay,
-    resolved_contact_poll_relay, resolved_contact_relay, GroupRelayMember, RelayEndpoint,
+    resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchedEnvelope,
+    GroupRelayMember, RelayEndpoint,
 };
 use crate::session::relay_policy::{
     core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_relay_pass_health,
@@ -681,6 +682,76 @@ pub struct CoreRelayPassSummary {
     pub continuation: Option<CoreRelayContinuation>,
 }
 
+/// One thing a relay answered about a contact's freshness, for the shell to
+/// show.
+///
+/// Two answers reach this, and they are deliberately the same shape. A
+/// mailbox this device may poll answers a *precise* stamp for a hint it was
+/// asked about; another family's relay answers a coarse bucket about a
+/// contact, and `age_ms` is then the bucket's own freshest edge rather than
+/// anything the relay said, so a coarse answer cannot be laundered into a
+/// precise one by crossing this boundary (`PRESENCE-01`).
+///
+/// Nothing here decides anything. A shell reads it, resolves whom it is
+/// about, and merges a last-seen — exactly what the legacy pass does inline
+/// with its own presence response.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CoreRelayPresenceObservation {
+    /// Whom the answer is about, when the request named a contact: a
+    /// cross-family probe asks about one contact and nobody else. Empty for a
+    /// mailbox answer, which is keyed by hint instead.
+    pub user_id: Vec<u8>,
+    /// The hint the mailbox answered for. Empty for a cross-family probe.
+    /// The shell resolves it the same way it builds its own query.
+    pub hint: Vec<u8>,
+    /// How old the answer was when it was observed, in milliseconds, never
+    /// negative. The shell's last-seen is `observed_at_ms - age_ms`, which is
+    /// what keeps a relay's clock out of a local timestamp.
+    pub age_ms: i64,
+    /// This device's clock when the answer arrived.
+    pub observed_at_ms: i64,
+}
+
+/// What the pass has for the shell to *project* — the surfaces core cannot
+/// reach — drained by [`CoreRelayPass::take_projection`].
+///
+/// Deliberately not part of [`CoreRelayPassSummary`], and that separation is
+/// load-bearing twice over. A summary is a diagnostics artefact and carries
+/// no msg id and no payload (`SECRET-01`); these are envelopes and hints. And
+/// a summary exists once, at the end, while a shell must project a page as
+/// the page lands, exactly as the legacy engine does — so this drains as the
+/// pass runs rather than accumulating for the length of it.
+///
+/// Nothing in here is a decision. Every disposition, ack, cursor and marker
+/// was already decided and committed inside core's transactions; this is the
+/// evidence of what was committed, in the form the shell needs to raise a
+/// notification and move a "last seen".
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreRelayProjection {
+    /// Envelopes this pass durably persisted for the first time — the rows
+    /// the ingest transaction newly took, and only those. A row already known,
+    /// expired or refused is absent: the shell has nothing to project for one,
+    /// and handing it over would be asking the shell to re-decide something
+    /// core already decided.
+    pub ingested: Vec<CoreRelayFetchedEnvelope>,
+    pub presence: Vec<CoreRelayPresenceObservation>,
+}
+
+/// The freshest age still inside a recency bucket.
+///
+/// The inverse of [`relay_presence_recency`], and inexact on purpose: a
+/// bucket is all a cross-family answer ever carried, so this picks the one
+/// age that reproduces that bucket and no finer claim. "Active" reads as
+/// right now, which is precisely what the bucket means.
+fn relay_presence_recency_age_ms(recency: &str) -> i64 {
+    match recency {
+        RELAY_PRESENCE_RECENCY_ACTIVE => 0,
+        RELAY_PRESENCE_RECENCY_RECENT => crate::CONNECTION_PRESENCE_ONLINE_WINDOW_MS + 1,
+        RELAY_PRESENCE_RECENCY_DAY => RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS + 1,
+        _ => 24 * 60 * 60 * 1000 + 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal state
 // ---------------------------------------------------------------------------
@@ -901,6 +972,9 @@ struct PassState {
     /// while the pass is still walking its stages normally.
     stopped_at: Option<CoreRelayStage>,
     progress: Progress,
+    /// What the shell has not yet been handed. Drained, never accumulated for
+    /// the whole pass: see [`CoreRelayProjection`].
+    projection: CoreRelayProjection,
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1055,7 @@ impl CoreRelayPass {
                 cancelled: false,
                 stopped_at: None,
                 progress: Progress::default(),
+                projection: CoreRelayProjection::default(),
             }),
         }
     }
@@ -1157,6 +1232,18 @@ impl CoreRelayPass {
     /// running. For a driver that lost the action it was handed.
     pub fn summary(&self) -> Option<CoreRelayPassSummary> {
         self.lock().finished.clone()
+    }
+
+    /// Everything committed since the last call, handed over once.
+    ///
+    /// Drains, so a driver that asks after every result projects each page
+    /// while it is fresh and never projects one twice — which is both the
+    /// legacy engine's timing and the only bound on how much a deep mailbox
+    /// costs in memory. A driver that never asks changes nothing about the
+    /// pass; a driver that asks after the summary still gets the last page.
+    pub fn take_projection(&self) -> CoreRelayProjection {
+        let mut state = self.lock();
+        std::mem::take(&mut state.projection)
     }
 }
 
@@ -2011,7 +2098,17 @@ impl PassState {
         if let Some(recency) = recency {
             let _ = self
                 .store
-                .record_contact_presence(user_id, recency, self.now_ms);
+                .record_contact_presence(user_id.clone(), recency, self.now_ms);
+            // The same bucket the store keeps, offered to the shell so a
+            // contact reachable only through another family's relay keeps a
+            // "last seen" that moves. Coarsened here as well as there: the
+            // age is the bucket's, never the stamp the relay sent.
+            self.projection.presence.push(CoreRelayPresenceObservation {
+                user_id,
+                hint: Vec::new(),
+                age_ms: relay_presence_recency_age_ms(recency),
+                observed_at_ms: self.now_ms,
+            });
         }
         let mut draft = ProtocolEventDraft::new(
             ProtocolEventCode::ActionResultAccepted,
@@ -2498,6 +2595,23 @@ impl PassState {
             }
             ActionIntent::Presence { config } => {
                 self.mark_answered(config);
+                // A mailbox this device may poll answers precisely, about
+                // hints rather than about people, and the shell resolves whom
+                // each hint belongs to from the same query it supplied. A
+                // body that does not decode yields no observations and
+                // changes nothing else: presence is advisory, and a page this
+                // build cannot read must not cost the walk behind it.
+                if let Ok(page) = relay_decode_presence_page(result.body.clone()) {
+                    let observed_at_ms = self.now_ms;
+                    for row in page.presence {
+                        self.projection.presence.push(CoreRelayPresenceObservation {
+                            user_id: Vec::new(),
+                            hint: row.hint,
+                            age_ms: page.now_ms.saturating_sub(row.last_seen_ms).max(0),
+                            observed_at_ms,
+                        });
+                    }
+                }
                 self.note_for(
                     config,
                     ProtocolEventDraft::new(
@@ -2692,6 +2806,10 @@ impl PassState {
         // the `action_emitted` above it and the ack below it: TXN-01's first
         // transaction is the one point of a transcript that most needs to say
         // which pass consumed the page.
+        // Kept only across the ingest call, and only so the rows it newly
+        // took can be handed to the shell to project. Nothing is read back
+        // out of it for a decision.
+        let fetched = page.envelopes.clone();
         let ingest = match self.store.ingest_relay_page(
             page.envelopes,
             self.now_ms,
@@ -2722,6 +2840,29 @@ impl PassState {
         self.rows_ingested = self.rows_ingested.saturating_add(ingest.rows_ingested);
         if ingest.rows_ingested > 0 {
             self.progress.rows_ingested = true;
+        }
+        // The rows this transaction newly took, offered to the shell so it
+        // can run the projection core has no key for: opening what was
+        // addressed to this device, delivering it, and telling the person.
+        // Selected by disposition rather than by counting, because only
+        // `Carried` names a row that was persisted here for the first time —
+        // a row already known was projected by whichever arrival first
+        // persisted it, and one expired or refused was never persisted at
+        // all.
+        if ingest.rows_ingested > 0 {
+            let newly: HashSet<Vec<u8>> = ingest
+                .rows
+                .iter()
+                .filter(|row| row.disposition == crate::CoreInboundDisposition::Carried)
+                .map(|row| row.msg_id.clone())
+                .collect();
+            if !newly.is_empty() {
+                self.projection.ingested.extend(
+                    fetched
+                        .into_iter()
+                        .filter(|envelope| newly.contains(&envelope.msg_id)),
+                );
+            }
         }
         if let Some(walk) = self.configs.get_mut(config).and_then(|c| c.walk.as_mut()) {
             walk.swept_through = walk.swept_through.max(page.next_cursor);

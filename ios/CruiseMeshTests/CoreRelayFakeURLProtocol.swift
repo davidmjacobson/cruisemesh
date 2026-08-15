@@ -89,6 +89,11 @@ final class CoreRelayFakeRelay {
 
     /// The page a fetch answers with; an empty mailbox by default.
     var fetchBody = #"{"envelopes":[],"next_cursor":0}"#
+    /// Pages handed out in order, ahead of `fetchBody`. A fetch past the end of
+    /// the queue falls back to `fetchBody`, which is what ends a walk.
+    var fetchPages: [String] = []
+    /// The presence answer; nobody seen by default.
+    var presenceBody = #"{"now_ms":1700000000000,"presence":[]}"#
     /// When set, overrides `fetchBody` and every field of the fetch answer.
     var fetchResponse: (() -> (Int, [String: String], Data))?
     /// The post answer; a fresh id by default.
@@ -116,10 +121,13 @@ final class CoreRelayFakeRelay {
             if path.hasPrefix("/envelopes?"), method == "GET" {
                 self.fetchPaths.append(path)
                 if let fetchResponse = self.fetchResponse { return fetchResponse() }
+                if !self.fetchPages.isEmpty {
+                    return (200, [:], Data(self.fetchPages.removeFirst().utf8))
+                }
                 return (200, [:], Data(self.fetchBody.utf8))
             }
             if path == "/presence", method == "POST" {
-                return (200, [:], Data(#"{"now_ms":1700000000000,"presence":[]}"#.utf8))
+                return (200, [:], Data(self.presenceBody.utf8))
             }
             return (200, [:], Data("{}".utf8))
         }

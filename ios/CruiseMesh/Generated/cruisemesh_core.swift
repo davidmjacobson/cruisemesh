@@ -2853,6 +2853,17 @@ public protocol CoreRelayPassProtocol : AnyObject {
      */
     func summary()  -> CoreRelayPassSummary?
     
+    /**
+     * Everything committed since the last call, handed over once.
+     *
+     * Drains, so a driver that asks after every result projects each page
+     * while it is fresh and never projects one twice — which is both the
+     * legacy engine's timing and the only bound on how much a deep mailbox
+     * costs in memory. A driver that never asks changes nothing about the
+     * pass; a driver that asks after the summary still gets the last page.
+     */
+    func takeProjection()  -> CoreRelayProjection
+    
 }
 
 /**
@@ -3004,6 +3015,22 @@ open func start(nowMs: Int64) -> CoreRelayAction {
 open func summary() -> CoreRelayPassSummary? {
     return try!  FfiConverterOptionTypeCoreRelayPassSummary.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_method_corerelaypass_summary(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Everything committed since the last call, handed over once.
+     *
+     * Drains, so a driver that asks after every result projects each page
+     * while it is fresh and never projects one twice — which is both the
+     * legacy engine's timing and the only bound on how much a deep mailbox
+     * costs in memory. A driver that never asks changes nothing about the
+     * pass; a driver that asks after the summary still gets the last page.
+     */
+open func takeProjection() -> CoreRelayProjection {
+    return try!  FfiConverterTypeCoreRelayProjection.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corerelaypass_take_projection(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -17988,6 +18015,137 @@ public func FfiConverterTypeCoreRelayPresence_lower(_ value: CoreRelayPresence) 
 }
 
 
+/**
+ * One thing a relay answered about a contact's freshness, for the shell to
+ * show.
+ *
+ * Two answers reach this, and they are deliberately the same shape. A
+ * mailbox this device may poll answers a *precise* stamp for a hint it was
+ * asked about; another family's relay answers a coarse bucket about a
+ * contact, and `age_ms` is then the bucket's own freshest edge rather than
+ * anything the relay said, so a coarse answer cannot be laundered into a
+ * precise one by crossing this boundary (`PRESENCE-01`).
+ *
+ * Nothing here decides anything. A shell reads it, resolves whom it is
+ * about, and merges a last-seen — exactly what the legacy pass does inline
+ * with its own presence response.
+ */
+public struct CoreRelayPresenceObservation {
+    /**
+     * Whom the answer is about, when the request named a contact: a
+     * cross-family probe asks about one contact and nobody else. Empty for a
+     * mailbox answer, which is keyed by hint instead.
+     */
+    public var userId: Data
+    /**
+     * The hint the mailbox answered for. Empty for a cross-family probe.
+     * The shell resolves it the same way it builds its own query.
+     */
+    public var hint: Data
+    /**
+     * How old the answer was when it was observed, in milliseconds, never
+     * negative. The shell's last-seen is `observed_at_ms - age_ms`, which is
+     * what keeps a relay's clock out of a local timestamp.
+     */
+    public var ageMs: Int64
+    /**
+     * This device's clock when the answer arrived.
+     */
+    public var observedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Whom the answer is about, when the request named a contact: a
+         * cross-family probe asks about one contact and nobody else. Empty for a
+         * mailbox answer, which is keyed by hint instead.
+         */userId: Data, 
+        /**
+         * The hint the mailbox answered for. Empty for a cross-family probe.
+         * The shell resolves it the same way it builds its own query.
+         */hint: Data, 
+        /**
+         * How old the answer was when it was observed, in milliseconds, never
+         * negative. The shell's last-seen is `observed_at_ms - age_ms`, which is
+         * what keeps a relay's clock out of a local timestamp.
+         */ageMs: Int64, 
+        /**
+         * This device's clock when the answer arrived.
+         */observedAtMs: Int64) {
+        self.userId = userId
+        self.hint = hint
+        self.ageMs = ageMs
+        self.observedAtMs = observedAtMs
+    }
+}
+
+
+
+extension CoreRelayPresenceObservation: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayPresenceObservation, rhs: CoreRelayPresenceObservation) -> Bool {
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.hint != rhs.hint {
+            return false
+        }
+        if lhs.ageMs != rhs.ageMs {
+            return false
+        }
+        if lhs.observedAtMs != rhs.observedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(userId)
+        hasher.combine(hint)
+        hasher.combine(ageMs)
+        hasher.combine(observedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayPresenceObservation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayPresenceObservation {
+        return
+            try CoreRelayPresenceObservation(
+                userId: FfiConverterData.read(from: &buf), 
+                hint: FfiConverterData.read(from: &buf), 
+                ageMs: FfiConverterInt64.read(from: &buf), 
+                observedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayPresenceObservation, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.userId, into: &buf)
+        FfiConverterData.write(value.hint, into: &buf)
+        FfiConverterInt64.write(value.ageMs, into: &buf)
+        FfiConverterInt64.write(value.observedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresenceObservation_lift(_ buf: RustBuffer) throws -> CoreRelayPresenceObservation {
+    return try FfiConverterTypeCoreRelayPresenceObservation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayPresenceObservation_lower(_ value: CoreRelayPresenceObservation) -> RustBuffer {
+    return FfiConverterTypeCoreRelayPresenceObservation.lower(value)
+}
+
+
 public struct CoreRelayPresencePage {
     public var nowMs: Int64
     public var presence: [CoreRelayPresence]
@@ -18051,6 +18209,102 @@ public func FfiConverterTypeCoreRelayPresencePage_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeCoreRelayPresencePage_lower(_ value: CoreRelayPresencePage) -> RustBuffer {
     return FfiConverterTypeCoreRelayPresencePage.lower(value)
+}
+
+
+/**
+ * What the pass has for the shell to *project* — the surfaces core cannot
+ * reach — drained by [`CoreRelayPass::take_projection`].
+ *
+ * Deliberately not part of [`CoreRelayPassSummary`], and that separation is
+ * load-bearing twice over. A summary is a diagnostics artefact and carries
+ * no msg id and no payload (`SECRET-01`); these are envelopes and hints. And
+ * a summary exists once, at the end, while a shell must project a page as
+ * the page lands, exactly as the legacy engine does — so this drains as the
+ * pass runs rather than accumulating for the length of it.
+ *
+ * Nothing in here is a decision. Every disposition, ack, cursor and marker
+ * was already decided and committed inside core's transactions; this is the
+ * evidence of what was committed, in the form the shell needs to raise a
+ * notification and move a "last seen".
+ */
+public struct CoreRelayProjection {
+    /**
+     * Envelopes this pass durably persisted for the first time — the rows
+     * the ingest transaction newly took, and only those. A row already known,
+     * expired or refused is absent: the shell has nothing to project for one,
+     * and handing it over would be asking the shell to re-decide something
+     * core already decided.
+     */
+    public var ingested: [CoreRelayFetchedEnvelope]
+    public var presence: [CoreRelayPresenceObservation]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Envelopes this pass durably persisted for the first time — the rows
+         * the ingest transaction newly took, and only those. A row already known,
+         * expired or refused is absent: the shell has nothing to project for one,
+         * and handing it over would be asking the shell to re-decide something
+         * core already decided.
+         */ingested: [CoreRelayFetchedEnvelope], presence: [CoreRelayPresenceObservation]) {
+        self.ingested = ingested
+        self.presence = presence
+    }
+}
+
+
+
+extension CoreRelayProjection: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayProjection, rhs: CoreRelayProjection) -> Bool {
+        if lhs.ingested != rhs.ingested {
+            return false
+        }
+        if lhs.presence != rhs.presence {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ingested)
+        hasher.combine(presence)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayProjection: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayProjection {
+        return
+            try CoreRelayProjection(
+                ingested: FfiConverterSequenceTypeCoreRelayFetchedEnvelope.read(from: &buf), 
+                presence: FfiConverterSequenceTypeCoreRelayPresenceObservation.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayProjection, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCoreRelayFetchedEnvelope.write(value.ingested, into: &buf)
+        FfiConverterSequenceTypeCoreRelayPresenceObservation.write(value.presence, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayProjection_lift(_ buf: RustBuffer) throws -> CoreRelayProjection {
+    return try FfiConverterTypeCoreRelayProjection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayProjection_lower(_ value: CoreRelayProjection) -> RustBuffer {
+    return FfiConverterTypeCoreRelayProjection.lower(value)
 }
 
 
@@ -33578,6 +33832,31 @@ fileprivate struct FfiConverterSequenceTypeCoreRelayPresence: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRelayPresenceObservation: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRelayPresenceObservation]
+
+    public static func write(_ value: [CoreRelayPresenceObservation], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRelayPresenceObservation.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRelayPresenceObservation] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRelayPresenceObservation]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRelayPresenceObservation.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreRelayRerunVector: FfiConverterRustBuffer {
     typealias SwiftType = [CoreRelayRerunVector]
 
@@ -39095,6 +39374,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corerelaypass_summary() != 53381) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corerelaypass_take_projection() != 10778) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_admit_plan() != 64273) {

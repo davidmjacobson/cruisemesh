@@ -712,6 +712,11 @@ RustBuffer uniffi_cruisemesh_core_fn_method_corerelaypass_start(void*_Nonnull pt
 RustBuffer uniffi_cruisemesh_core_fn_method_corerelaypass_summary(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_CORERELAYPASS_TAKE_PROJECTION
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_METHOD_CORERELAYPASS_TAKE_PROJECTION
+RustBuffer uniffi_cruisemesh_core_fn_method_corerelaypass_take_projection(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_CLONE_CORESPRAYPOLICY
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_CLONE_CORESPRAYPOLICY
 void*_Nonnull uniffi_cruisemesh_core_fn_clone_corespraypolicy(void*_Nonnull ptr, RustCallStatus *_Nonnull out_status
@@ -5136,6 +5141,12 @@ uint16_t uniffi_cruisemesh_core_checksum_method_corerelaypass_start(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_CORERELAYPASS_SUMMARY
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_CORERELAYPASS_SUMMARY
 uint16_t uniffi_cruisemesh_core_checksum_method_corerelaypass_summary(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_CORERELAYPASS_TAKE_PROJECTION
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_METHOD_CORERELAYPASS_TAKE_PROJECTION
+uint16_t uniffi_cruisemesh_core_checksum_method_corerelaypass_take_projection(void
     
 );
 #endif
