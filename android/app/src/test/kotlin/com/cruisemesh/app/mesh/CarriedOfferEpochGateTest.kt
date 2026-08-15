@@ -6,7 +6,14 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
+import uniffi.cruisemesh_core.CoreCarriedOfferReservation
 
+/**
+ * The allowance rules themselves are core's, and are pinned by core's own unit
+ * tests. What is checked here is that this shell's wrapper reaches them intact
+ * across the binding boundary — including from the several receive threads that
+ * really do hit it at once on this platform.
+ */
 class CarriedOfferEpochGateTest {
     @Test
     fun concurrentDigestsAtomicallyReserveOnlyTwoOffers() {
@@ -15,7 +22,7 @@ class CarriedOfferEpochGateTest {
         val pool = Executors.newFixedThreadPool(16)
         try {
             val futures = (0 until 64).map {
-                pool.submit<CarriedOfferEpochGate.Reservation?> {
+                pool.submit<CoreCarriedOfferReservation?> {
                     start.await()
                     gate.tryReserve(nowMs = 1_000)
                 }
@@ -60,5 +67,10 @@ class CarriedOfferEpochGateTest {
         val empty = gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice")!!
         gate.release(empty)
         assertNotNull(gate.tryReserve(nowMs = 1_000, logicalPeerId = "alice"))
+    }
+
+    @Test
+    fun theEpochLengthComesFromTheCore() {
+        assertEquals(CarriedOfferEpochGate.defaultEpochMs, CarriedOfferEpochGate().epochMs)
     }
 }

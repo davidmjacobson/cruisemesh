@@ -166,6 +166,7 @@ impl MessageStore {
                 peer_hints.clone(),
                 now_ms,
                 CARRIED_SPRAY_BUDGET_BYTES,
+                crate::store::DEFAULT_CARRIED_PAGE_MAX_ROWS,
                 targeted_lane.after,
             )?;
             let mut offered_sealed = 0_u64;

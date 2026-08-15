@@ -737,6 +737,254 @@ public func FfiConverterTypeBleFrameReassembler_lower(_ value: BleFrameReassembl
 
 
 /**
+ * Atomically reserves the shared foreign-carry allowance for one short epoch.
+ *
+ * This is the concurrency gate in front of every lane that offers *third
+ * party* traffic: the HELLO drain and the digest spray. A busy desk can hold
+ * ten simultaneous links, and each of them independently deciding to walk the
+ * carry store is a self-DoS that queues live mail behind courier traffic on
+ * all of them at once. At most [`MAX_CONCURRENT_CARRIED_OFFERS`] peers may
+ * start such an offer per [`CARRIED_OFFER_EPOCH_MS`] window, and at most one
+ * offer per *logical peer* -- so a phone reachable at two Bluetooth addresses,
+ * or one that reconnects mid-epoch, cannot claim both slots for itself.
+ *
+ * Reservations are taken *before* a plan is built, because the point is to
+ * bound how many peers do the walk at all. A plan that comes out empty is
+ * [`Self::release`]d, which frees the slot and clears the logical-peer mark,
+ * since nothing was actually offered to that peer.
+ *
+ * This gates *offering* only. It never removes a carried row and never acks
+ * anything: a deferred peer simply gets its offer on a later round, and a
+ * carried copy is still retired only on digest-proof of receipt.
+ */
+public protocol CoreCarriedOfferGateProtocol : AnyObject {
+    
+    /**
+     * The offer went out. The slot stays spent for the rest of the epoch and
+     * the peer stays marked, so neither can be claimed again until it rolls.
+     */
+    func commit(reservation: CoreCarriedOfferReservation) 
+    
+    func epochMs()  -> Int64
+    
+    /**
+     * Nothing was offered after all, so return the slot to this epoch's pool
+     * and unmark the peer. A reservation from an epoch that has since rolled,
+     * or one already committed or released, is ignored -- crediting a slot
+     * back twice would let a third peer through.
+     */
+    func release(reservation: CoreCarriedOfferReservation) 
+    
+    /**
+     * Claims a slot, or `None` when this epoch's allowance is spent or this
+     * logical peer already had its offer. `logical_peer_id` is the peer's
+     * UserID hex, never a link address -- deduplicating on the address is what
+     * let one phone with two roles take both slots.
+     *
+     * A backwards clock jump starts a fresh epoch rather than parking the lane
+     * until the clock catches up.
+     */
+    func tryReserve(nowMs: Int64, logicalPeerId: String?)  -> CoreCarriedOfferReservation?
+    
+}
+
+/**
+ * Atomically reserves the shared foreign-carry allowance for one short epoch.
+ *
+ * This is the concurrency gate in front of every lane that offers *third
+ * party* traffic: the HELLO drain and the digest spray. A busy desk can hold
+ * ten simultaneous links, and each of them independently deciding to walk the
+ * carry store is a self-DoS that queues live mail behind courier traffic on
+ * all of them at once. At most [`MAX_CONCURRENT_CARRIED_OFFERS`] peers may
+ * start such an offer per [`CARRIED_OFFER_EPOCH_MS`] window, and at most one
+ * offer per *logical peer* -- so a phone reachable at two Bluetooth addresses,
+ * or one that reconnects mid-epoch, cannot claim both slots for itself.
+ *
+ * Reservations are taken *before* a plan is built, because the point is to
+ * bound how many peers do the walk at all. A plan that comes out empty is
+ * [`Self::release`]d, which frees the slot and clears the logical-peer mark,
+ * since nothing was actually offered to that peer.
+ *
+ * This gates *offering* only. It never removes a carried row and never acks
+ * anything: a deferred peer simply gets its offer on a later round, and a
+ * carried copy is still retired only on digest-proof of receipt.
+ */
+open class CoreCarriedOfferGate:
+    CoreCarriedOfferGateProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corecarriedoffergate(self.pointer, $0) }
+    }
+public convenience init() {
+    let pointer =
+        try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corecarriedoffergate_new($0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corecarriedoffergate(pointer, $0) }
+    }
+
+    
+    /**
+     * `epoch_ms` is clamped to at least 1ms: a zero-length epoch would roll on
+     * every call and defeat the cap entirely.
+     */
+public static func withEpochMs(epochMs: Int64) -> CoreCarriedOfferGate {
+    return try!  FfiConverterTypeCoreCarriedOfferGate.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_constructor_corecarriedoffergate_with_epoch_ms(
+        FfiConverterInt64.lower(epochMs),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * The offer went out. The slot stays spent for the rest of the epoch and
+     * the peer stays marked, so neither can be claimed again until it rolls.
+     */
+open func commit(reservation: CoreCarriedOfferReservation) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corecarriedoffergate_commit(self.uniffiClonePointer(),
+        FfiConverterTypeCoreCarriedOfferReservation.lower(reservation),$0
+    )
+}
+}
+    
+open func epochMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corecarriedoffergate_epoch_ms(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Nothing was offered after all, so return the slot to this epoch's pool
+     * and unmark the peer. A reservation from an epoch that has since rolled,
+     * or one already committed or released, is ignored -- crediting a slot
+     * back twice would let a third peer through.
+     */
+open func release(reservation: CoreCarriedOfferReservation) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corecarriedoffergate_release(self.uniffiClonePointer(),
+        FfiConverterTypeCoreCarriedOfferReservation.lower(reservation),$0
+    )
+}
+}
+    
+    /**
+     * Claims a slot, or `None` when this epoch's allowance is spent or this
+     * logical peer already had its offer. `logical_peer_id` is the peer's
+     * UserID hex, never a link address -- deduplicating on the address is what
+     * let one phone with two roles take both slots.
+     *
+     * A backwards clock jump starts a fresh epoch rather than parking the lane
+     * until the clock catches up.
+     */
+open func tryReserve(nowMs: Int64, logicalPeerId: String?) -> CoreCarriedOfferReservation? {
+    return try!  FfiConverterOptionTypeCoreCarriedOfferReservation.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corecarriedoffergate_try_reserve(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterOptionString.lower(logicalPeerId),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreCarriedOfferGate: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreCarriedOfferGate
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreCarriedOfferGate {
+        return CoreCarriedOfferGate(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreCarriedOfferGate) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedOfferGate {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreCarriedOfferGate, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedOfferGate_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreCarriedOfferGate {
+    return try FfiConverterTypeCoreCarriedOfferGate.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedOfferGate_lower(_ value: CoreCarriedOfferGate) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreCarriedOfferGate.lower(value)
+}
+
+
+
+
+/**
  * Leading-edge, per-logical-peer debounce for the failover resume fan-out
  * (Android `MeshService.resumeLogicalPeerSync`, iOS
  * `MeshController.resumeLogicalPeerSync`).
@@ -3518,10 +3766,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * Budgeted, cursor-resumable page of carried envelopes matching `hints`
      * (G2: HELLO `drainCarriedEnvelopesTo`). Same DTN rules as the unbudgeted
      * form: only *offers*; never removes. `budget_bytes == 0` is the off
-     * switch. Head-of-line oversized exception matches
-     * [`Self::carried_envelopes_for_peer_sync`].
+     * switch, and so is `max_rows == 0`. Head-of-line oversized exception and
+     * the row ceiling both match [`Self::carried_envelopes_for_peer_sync`];
+     * see [`DEFAULT_CARRIED_PAGE_MAX_ROWS`] for why a byte budget alone is not
+     * enough.
      */
-    func carriedEnvelopesForHintsPage(hints: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?) throws  -> CoreCarriedSyncPage
+    func carriedEnvelopesForHintsPage(hints: [Data], nowMs: Int64, budgetBytes: UInt64, maxRows: UInt32, after: CoreCarriedCursor?) throws  -> CoreCarriedSyncPage
     
     /**
      * Carried envelopes suitable to spray to a non-recipient mule on peer
@@ -3568,8 +3818,16 @@ public protocol MessageStoreProtocol : AnyObject {
      * queue is untouched, and D8's periodic re-digest re-offers whatever did
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
+     *
+     * `max_rows` is the same cut expressed in envelopes rather than bytes, and
+     * it exists because the byte budget alone does not bound a round's frame
+     * count: hundreds of receipt-sized envelopes clear a 256 KiB budget
+     * untouched while still queueing hundreds of separate writes into one
+     * link's FIFO ahead of live mail. Rows are taken oldest first until either
+     * cut binds, whichever comes first. Zero is an off switch exactly as a
+     * zero byte budget is. See [`DEFAULT_CARRIED_PAGE_MAX_ROWS`].
      */
-    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?) throws  -> CoreCarriedSyncPage
+    func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, maxRows: UInt32, after: CoreCarriedCursor?) throws  -> CoreCarriedSyncPage
     
     /**
      * Number of envelopes currently in the carry queue (diagnostics/tests).
@@ -5880,15 +6138,18 @@ open func carriedEnvelopesForHints(hints: [Data], nowMs: Int64)throws  -> [Carri
      * Budgeted, cursor-resumable page of carried envelopes matching `hints`
      * (G2: HELLO `drainCarriedEnvelopesTo`). Same DTN rules as the unbudgeted
      * form: only *offers*; never removes. `budget_bytes == 0` is the off
-     * switch. Head-of-line oversized exception matches
-     * [`Self::carried_envelopes_for_peer_sync`].
+     * switch, and so is `max_rows == 0`. Head-of-line oversized exception and
+     * the row ceiling both match [`Self::carried_envelopes_for_peer_sync`];
+     * see [`DEFAULT_CARRIED_PAGE_MAX_ROWS`] for why a byte budget alone is not
+     * enough.
      */
-open func carriedEnvelopesForHintsPage(hints: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?)throws  -> CoreCarriedSyncPage {
+open func carriedEnvelopesForHintsPage(hints: [Data], nowMs: Int64, budgetBytes: UInt64, maxRows: UInt32, after: CoreCarriedCursor?)throws  -> CoreCarriedSyncPage {
     return try  FfiConverterTypeCoreCarriedSyncPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_carried_envelopes_for_hints_page(self.uniffiClonePointer(),
         FfiConverterSequenceData.lower(hints),
         FfiConverterInt64.lower(nowMs),
         FfiConverterUInt64.lower(budgetBytes),
+        FfiConverterUInt32.lower(maxRows),
         FfiConverterOptionTypeCoreCarriedCursor.lower(after),$0
     )
 })
@@ -5939,14 +6200,23 @@ open func carriedEnvelopesForHintsPage(hints: [Data], nowMs: Int64, budgetBytes:
      * queue is untouched, and D8's periodic re-digest re-offers whatever did
      * not fit on the next round, so a big backlog is *paced* across rounds
      * instead of monopolizing a slow link's single FIFO in one burst.
+     *
+     * `max_rows` is the same cut expressed in envelopes rather than bytes, and
+     * it exists because the byte budget alone does not bound a round's frame
+     * count: hundreds of receipt-sized envelopes clear a 256 KiB budget
+     * untouched while still queueing hundreds of separate writes into one
+     * link's FIFO ahead of live mail. Rows are taken oldest first until either
+     * cut binds, whichever comes first. Zero is an off switch exactly as a
+     * zero byte budget is. See [`DEFAULT_CARRIED_PAGE_MAX_ROWS`].
      */
-open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, after: CoreCarriedCursor?)throws  -> CoreCarriedSyncPage {
+open func carriedEnvelopesForPeerSync(peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, budgetBytes: UInt64, maxRows: UInt32, after: CoreCarriedCursor?)throws  -> CoreCarriedSyncPage {
     return try  FfiConverterTypeCoreCarriedSyncPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_carried_envelopes_for_peer_sync(self.uniffiClonePointer(),
         FfiConverterSequenceData.lower(peerHints),
         FfiConverterSequenceData.lower(peerKnownMsgIds),
         FfiConverterInt64.lower(nowMs),
         FfiConverterUInt64.lower(budgetBytes),
+        FfiConverterUInt32.lower(maxRows),
         FfiConverterOptionTypeCoreCarriedCursor.lower(after),$0
     )
 })
@@ -10930,6 +11200,86 @@ public func FfiConverterTypeCoreCarriedLane_lower(_ value: CoreCarriedLane) -> R
 
 
 /**
+ * A claim on one of the epoch's [`MAX_CONCURRENT_CARRIED_OFFERS`] slots. Hand
+ * it back to [`CoreCarriedOfferGate::commit`] once the offer actually went
+ * out, or to [`CoreCarriedOfferGate::release`] when the plan came out empty,
+ * so the slot returns to the pool for another peer in the same epoch.
+ */
+public struct CoreCarriedOfferReservation {
+    public var id: Int64
+    public var epochStartMs: Int64
+    public var logicalPeerId: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: Int64, epochStartMs: Int64, logicalPeerId: String?) {
+        self.id = id
+        self.epochStartMs = epochStartMs
+        self.logicalPeerId = logicalPeerId
+    }
+}
+
+
+
+extension CoreCarriedOfferReservation: Equatable, Hashable {
+    public static func ==(lhs: CoreCarriedOfferReservation, rhs: CoreCarriedOfferReservation) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.epochStartMs != rhs.epochStartMs {
+            return false
+        }
+        if lhs.logicalPeerId != rhs.logicalPeerId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(epochStartMs)
+        hasher.combine(logicalPeerId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreCarriedOfferReservation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreCarriedOfferReservation {
+        return
+            try CoreCarriedOfferReservation(
+                id: FfiConverterInt64.read(from: &buf), 
+                epochStartMs: FfiConverterInt64.read(from: &buf), 
+                logicalPeerId: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreCarriedOfferReservation, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterInt64.write(value.epochStartMs, into: &buf)
+        FfiConverterOptionString.write(value.logicalPeerId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedOfferReservation_lift(_ buf: RustBuffer) throws -> CoreCarriedOfferReservation {
+    return try FfiConverterTypeCoreCarriedOfferReservation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreCarriedOfferReservation_lower(_ value: CoreCarriedOfferReservation) -> RustBuffer {
+    return FfiConverterTypeCoreCarriedOfferReservation.lower(value)
+}
+
+
+/**
  * One page of [`MessageStore::carried_envelopes_for_peer_sync`].
  */
 public struct CoreCarriedSyncPage {
@@ -10941,8 +11291,8 @@ public struct CoreCarriedSyncPage {
     public var next: CoreCarriedCursor?
     /**
      * Whether the scan reached the tail of the queue rather than stopping on
-     * the byte budget. `true` means the walk is complete: everything this
-     * peer is eligible to be offered has now been offered.
+     * the byte budget or the row ceiling. `true` means the walk is complete:
+     * everything this peer is eligible to be offered has now been offered.
      */
     public var exhausted: Bool
 
@@ -10955,8 +11305,8 @@ public struct CoreCarriedSyncPage {
          */next: CoreCarriedCursor?, 
         /**
          * Whether the scan reached the tail of the queue rather than stopping on
-         * the byte budget. `true` means the walk is complete: everything this
-         * peer is eligible to be offered has now been offered.
+         * the byte budget or the row ceiling. `true` means the walk is complete:
+         * everything this peer is eligible to be offered has now been offered.
          */exhausted: Bool) {
         self.rows = rows
         self.next = next
@@ -30275,6 +30625,30 @@ fileprivate struct FfiConverterOptionTypeCoreCarriedCursor: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreCarriedOfferReservation: FfiConverterRustBuffer {
+    typealias SwiftType = CoreCarriedOfferReservation?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreCarriedOfferReservation.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreCarriedOfferReservation.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreDeliveryLine: FfiConverterRustBuffer {
     typealias SwiftType = CoreDeliveryLine?
 
@@ -32478,6 +32852,28 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
         FfiConverterOptionString.lower(contactRelayToken),
         FfiConverterOptionString.lower(ownRelayUrl),
         FfiConverterOptionString.lower(ownRelayToken),$0
+    )
+})
+}
+/**
+ * The epoch length the shells construct [`CoreCarriedOfferGate`] with.
+ * Exported as a function because UniFFI has no constants: both shells read it
+ * from here so the window cannot drift between the platforms.
+ */
+public func coreCarriedOfferEpochMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_carried_offer_epoch_ms($0
+    )
+})
+}
+/**
+ * The row ceiling the shells pass to the carried paging calls. Exported as a
+ * function because UniFFI has no constants, so neither shell can drift from
+ * [`DEFAULT_CARRIED_PAGE_MAX_ROWS`].
+ */
+public func coreCarriedPageMaxRows() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_carried_page_max_rows($0
     )
 })
 }
@@ -36301,6 +36697,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_carried_offer_epoch_ms() != 47623) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_carried_page_max_rows() != 60597) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_classify_connection_health() != 10468) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -36976,6 +37378,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_bleframereassembler_accept() != 35445) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corecarriedoffergate_commit() != 33702) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corecarriedoffergate_epoch_ms() != 20624) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corecarriedoffergate_release() != 3711) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corecarriedoffergate_try_reserve() != 39638) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_corefailoverresumedebounce_cancel() != 27215) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -37222,10 +37636,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints_page() != 3327) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints_page() != 49586) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 48539) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_peer_sync() != 7892) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_len() != 13406) {
@@ -37700,6 +38114,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_bleframereassembler_new() != 1261) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corecarriedoffergate_new() != 49656) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corecarriedoffergate_with_epoch_ms() != 50346) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corefailoverresumedebounce_new() != 9684) {

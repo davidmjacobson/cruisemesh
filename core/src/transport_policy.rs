@@ -64,10 +64,10 @@ pub const REDIGEST_MIN_INTERVAL_MS: i64 = 3 * 60_000;
 pub const REDIGEST_MAX_INTERVAL_MS: i64 = 5 * 60_000;
 
 /// Max peers that may offer foreign-carry frames in one multi-peer spray pass
-/// (G3). A family desk can have 10+ simultaneous BLE links; walking the full
-/// carry store to every peer at once is a self-DoS. Shells count how many
-/// peers already received a non-skip carried offer this pass and consult
-/// [`may_start_carried_offer`] before starting another.
+/// (G3). A busy desk can have 10+ simultaneous BLE links; walking the full
+/// carry store to every peer at once is a self-DoS. [`CoreCarriedOfferGate`]
+/// enforces this for both shells; [`may_start_carried_offer`] is the bare
+/// predicate it is built on.
 pub const MAX_CONCURRENT_CARRIED_OFFERS: u32 = 2;
 
 /// Whether another peer may begin a foreign-carry offer given how many
@@ -75,6 +75,285 @@ pub const MAX_CONCURRENT_CARRIED_OFFERS: u32 = 2;
 #[uniffi::export]
 pub fn may_start_carried_offer(active_offers: u32) -> bool {
     active_offers < MAX_CONCURRENT_CARRIED_OFFERS
+}
+
+/// How long one shared foreign-carry allowance lasts (G3). Short enough that a
+/// peer denied its turn gets another chance within a single encounter, long
+/// enough that one connection burst -- several links coming up at once as a
+/// phone walks into range of a busy desk -- counts as one event rather than as
+/// N independent chances to walk the carry store.
+pub const CARRIED_OFFER_EPOCH_MS: i64 = 5_000;
+
+/// The epoch length the shells construct [`CoreCarriedOfferGate`] with.
+/// Exported as a function because UniFFI has no constants: both shells read it
+/// from here so the window cannot drift between the platforms.
+#[uniffi::export]
+pub fn core_carried_offer_epoch_ms() -> i64 {
+    CARRIED_OFFER_EPOCH_MS
+}
+
+/// A claim on one of the epoch's [`MAX_CONCURRENT_CARRIED_OFFERS`] slots. Hand
+/// it back to [`CoreCarriedOfferGate::commit`] once the offer actually went
+/// out, or to [`CoreCarriedOfferGate::release`] when the plan came out empty,
+/// so the slot returns to the pool for another peer in the same epoch.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreCarriedOfferReservation {
+    pub id: i64,
+    pub epoch_start_ms: i64,
+    pub logical_peer_id: Option<String>,
+}
+
+#[derive(Default)]
+struct CarriedOfferEpoch {
+    /// Distinguishes "no epoch yet" from "an epoch that started at 0", so a
+    /// caller whose clock legitimately reads 0 is not stuck resetting.
+    initialized: bool,
+    epoch_start_ms: i64,
+    offers_this_epoch: u32,
+    next_reservation_id: i64,
+    /// Reservation id -> the logical peer it was taken for, for the ones not
+    /// yet committed. Only those can be released.
+    uncommitted: HashMap<i64, Option<String>>,
+    offered_logical_peers: HashSet<String>,
+}
+
+/// Atomically reserves the shared foreign-carry allowance for one short epoch.
+///
+/// This is the concurrency gate in front of every lane that offers *third
+/// party* traffic: the HELLO drain and the digest spray. A busy desk can hold
+/// ten simultaneous links, and each of them independently deciding to walk the
+/// carry store is a self-DoS that queues live mail behind courier traffic on
+/// all of them at once. At most [`MAX_CONCURRENT_CARRIED_OFFERS`] peers may
+/// start such an offer per [`CARRIED_OFFER_EPOCH_MS`] window, and at most one
+/// offer per *logical peer* -- so a phone reachable at two Bluetooth addresses,
+/// or one that reconnects mid-epoch, cannot claim both slots for itself.
+///
+/// Reservations are taken *before* a plan is built, because the point is to
+/// bound how many peers do the walk at all. A plan that comes out empty is
+/// [`Self::release`]d, which frees the slot and clears the logical-peer mark,
+/// since nothing was actually offered to that peer.
+///
+/// This gates *offering* only. It never removes a carried row and never acks
+/// anything: a deferred peer simply gets its offer on a later round, and a
+/// carried copy is still retired only on digest-proof of receipt.
+#[derive(uniffi::Object)]
+pub struct CoreCarriedOfferGate {
+    epoch_ms: i64,
+    state: Mutex<CarriedOfferEpoch>,
+}
+
+#[uniffi::export]
+impl CoreCarriedOfferGate {
+    #[uniffi::constructor]
+    pub fn new() -> Self {
+        Self::with_epoch_ms(CARRIED_OFFER_EPOCH_MS)
+    }
+
+    /// `epoch_ms` is clamped to at least 1ms: a zero-length epoch would roll on
+    /// every call and defeat the cap entirely.
+    #[uniffi::constructor]
+    pub fn with_epoch_ms(epoch_ms: i64) -> Self {
+        Self {
+            epoch_ms: epoch_ms.max(1),
+            state: Mutex::new(CarriedOfferEpoch::default()),
+        }
+    }
+
+    pub fn epoch_ms(&self) -> i64 {
+        self.epoch_ms
+    }
+
+    /// Claims a slot, or `None` when this epoch's allowance is spent or this
+    /// logical peer already had its offer. `logical_peer_id` is the peer's
+    /// UserID hex, never a link address -- deduplicating on the address is what
+    /// let one phone with two roles take both slots.
+    ///
+    /// A backwards clock jump starts a fresh epoch rather than parking the lane
+    /// until the clock catches up.
+    pub fn try_reserve(
+        &self,
+        now_ms: i64,
+        logical_peer_id: Option<String>,
+    ) -> Option<CoreCarriedOfferReservation> {
+        let mut state = self.state.lock_recoverable();
+        self.roll_epoch_if_needed(&mut state, now_ms);
+        if !may_start_carried_offer(state.offers_this_epoch) {
+            return None;
+        }
+        if let Some(peer) = &logical_peer_id {
+            if state.offered_logical_peers.contains(peer) {
+                return None;
+            }
+        }
+        state.next_reservation_id = if state.next_reservation_id == i64::MAX {
+            0
+        } else {
+            state.next_reservation_id + 1
+        };
+        let id = state.next_reservation_id;
+        state.offers_this_epoch += 1;
+        state.uncommitted.insert(id, logical_peer_id.clone());
+        if let Some(peer) = &logical_peer_id {
+            state.offered_logical_peers.insert(peer.clone());
+        }
+        Some(CoreCarriedOfferReservation {
+            id,
+            epoch_start_ms: state.epoch_start_ms,
+            logical_peer_id,
+        })
+    }
+
+    /// The offer went out. The slot stays spent for the rest of the epoch and
+    /// the peer stays marked, so neither can be claimed again until it rolls.
+    pub fn commit(&self, reservation: CoreCarriedOfferReservation) {
+        let mut state = self.state.lock_recoverable();
+        if reservation.epoch_start_ms == state.epoch_start_ms {
+            state.uncommitted.remove(&reservation.id);
+        }
+    }
+
+    /// Nothing was offered after all, so return the slot to this epoch's pool
+    /// and unmark the peer. A reservation from an epoch that has since rolled,
+    /// or one already committed or released, is ignored -- crediting a slot
+    /// back twice would let a third peer through.
+    pub fn release(&self, reservation: CoreCarriedOfferReservation) {
+        let mut state = self.state.lock_recoverable();
+        if reservation.epoch_start_ms != state.epoch_start_ms
+            || state.uncommitted.remove(&reservation.id).is_none()
+        {
+            return;
+        }
+        state.offers_this_epoch = state.offers_this_epoch.saturating_sub(1);
+        if let Some(peer) = &reservation.logical_peer_id {
+            state.offered_logical_peers.remove(peer);
+        }
+    }
+}
+
+impl CoreCarriedOfferGate {
+    fn roll_epoch_if_needed(&self, state: &mut CarriedOfferEpoch, now_ms: i64) {
+        let rolled = !state.initialized
+            || now_ms < state.epoch_start_ms
+            || now_ms.saturating_sub(state.epoch_start_ms) >= self.epoch_ms;
+        if !rolled {
+            return;
+        }
+        state.initialized = true;
+        state.epoch_start_ms = now_ms;
+        state.offers_this_epoch = 0;
+        state.uncommitted.clear();
+        state.offered_logical_peers.clear();
+    }
+}
+
+impl Default for CoreCarriedOfferGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod carried_offer_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_digests_atomically_reserve_only_two_offers() {
+        // Ported from the Kotlin gate's test: Android's BLE, LAN and relay
+        // receive paths all reach this from different threads at once.
+        let gate = Arc::new(CoreCarriedOfferGate::with_epoch_ms(5_000));
+        let threads = 16;
+        let barrier = Arc::new(Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..4)
+                        .filter(|_| gate.try_reserve(1_000, None).is_some())
+                        .count()
+                })
+            })
+            .collect();
+        let granted: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(granted, MAX_CONCURRENT_CARRIED_OFFERS as usize);
+    }
+
+    #[test]
+    fn empty_plan_releases_but_committed_offer_counts_until_next_epoch() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(100);
+        let empty = gate.try_reserve(1_000, None).unwrap();
+        let sent = gate.try_reserve(1_000, None).unwrap();
+        assert!(gate.try_reserve(1_000, None).is_none());
+
+        gate.release(empty);
+        let replacement = gate.try_reserve(1_000, None);
+        assert!(replacement.is_some());
+        gate.commit(sent);
+        gate.commit(replacement.unwrap());
+        assert!(gate.try_reserve(1_099, None).is_none());
+        assert!(gate.try_reserve(1_100, None).is_some());
+    }
+
+    #[test]
+    fn duplicate_addresses_for_one_logical_peer_get_one_offer_per_epoch() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(100);
+        let first = gate.try_reserve(1_000, Some("alice".to_string())).unwrap();
+        gate.commit(first);
+        assert!(gate.try_reserve(1_000, Some("alice".to_string())).is_none());
+        assert!(gate.try_reserve(1_000, Some("bob".to_string())).is_some());
+        assert!(gate.try_reserve(1_100, Some("alice".to_string())).is_some());
+    }
+
+    #[test]
+    fn released_empty_offer_does_not_block_same_logical_peer() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(100);
+        let empty = gate.try_reserve(1_000, Some("alice".to_string())).unwrap();
+        gate.release(empty);
+        assert!(gate.try_reserve(1_000, Some("alice".to_string())).is_some());
+    }
+
+    #[test]
+    fn a_committed_reservation_cannot_be_released_for_a_second_slot() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(100);
+        let sent = gate.try_reserve(1_000, None).unwrap();
+        let other = gate.try_reserve(1_000, None).unwrap();
+        gate.commit(sent.clone());
+        // A double release (or a release after commit) must not credit the
+        // epoch a slot it never got back.
+        gate.release(sent.clone());
+        gate.release(sent);
+        assert!(gate.try_reserve(1_000, None).is_none());
+        gate.release(other);
+        assert!(gate.try_reserve(1_000, None).is_some());
+    }
+
+    #[test]
+    fn a_backwards_clock_jump_rolls_the_epoch_instead_of_parking_the_lane() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(5_000);
+        gate.commit(gate.try_reserve(100_000, None).unwrap());
+        gate.commit(gate.try_reserve(100_000, None).unwrap());
+        assert!(gate.try_reserve(100_000, None).is_none());
+        assert!(
+            gate.try_reserve(50_000, None).is_some(),
+            "a clock correction must not wedge foreign carry for the rest of \
+             the old epoch"
+        );
+    }
+
+    #[test]
+    fn a_stale_reservation_from_a_rolled_epoch_is_ignored() {
+        let gate = CoreCarriedOfferGate::with_epoch_ms(100);
+        let stale = gate.try_reserve(1_000, Some("alice".to_string())).unwrap();
+        // New epoch: two fresh slots, and the old reservation belongs to none
+        // of them.
+        assert!(gate.try_reserve(2_000, Some("bob".to_string())).is_some());
+        gate.release(stale);
+        assert!(gate.try_reserve(2_000, Some("carol".to_string())).is_some());
+        assert!(gate.try_reserve(2_000, Some("dave".to_string())).is_none());
+    }
 }
 
 #[cfg(test)]

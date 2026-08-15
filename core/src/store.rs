@@ -609,9 +609,41 @@ pub struct CoreCarriedSyncPage {
     /// if the page is empty (nothing to resume past).
     pub next: Option<CoreCarriedCursor>,
     /// Whether the scan reached the tail of the queue rather than stopping on
-    /// the byte budget. `true` means the walk is complete: everything this
-    /// peer is eligible to be offered has now been offered.
+    /// the byte budget or the row ceiling. `true` means the walk is complete:
+    /// everything this peer is eligible to be offered has now been offered.
     pub exhausted: bool,
+}
+
+/// Envelope-count ceiling for one round of carried paging, alongside the byte
+/// budget.
+///
+/// The byte budget alone bounds the *volume* of a round but not its *frame
+/// count*, and on the transports this traffic actually rides the frame count is
+/// what hurts. A typing indicator or a receipt seals to a few dozen bytes, so a
+/// courier holding hundreds of them clears a 256 KiB budget without ever
+/// approaching it, and every one of those envelopes is a separate fragmented
+/// write into a Bluetooth link's single FIFO. That queue is shared with live
+/// mail to real contacts, and the far side must process each frame on its
+/// receive path before the next one lands.
+///
+/// 64 is chosen to sit under the point where a round monopolizes a link:
+/// at BLE's practical throughput a 64-frame round drains in a couple of
+/// seconds, which fits comfortably inside the 3-5 minute re-digest interval
+/// that offers the next page. It is also well under the number of ids a peer
+/// can advertise back in one DIGEST, so a full page is still confirmable in a
+/// single exchange rather than trickling proof across several.
+///
+/// Like the byte budget, this bounds only what is OFFERED: the carry queue is
+/// untouched, the cursor advances past what was offered, and the next round
+/// resumes behind it, so a backlog is paced rather than dropped.
+pub const DEFAULT_CARRIED_PAGE_MAX_ROWS: u32 = 64;
+
+/// The row ceiling the shells pass to the carried paging calls. Exported as a
+/// function because UniFFI has no constants, so neither shell can drift from
+/// [`DEFAULT_CARRIED_PAGE_MAX_ROWS`].
+#[uniffi::export]
+pub fn core_carried_page_max_rows() -> u32 {
+    DEFAULT_CARRIED_PAGE_MAX_ROWS
 }
 
 /// Home chat-list preview for one chat (G1): last visible message, unread, and
@@ -6136,23 +6168,26 @@ impl MessageStore {
         // Unlimited page for callers that still want the full matching set
         // (tests, offline tooling). HELLO drain uses the budgeted page API.
         Ok(self
-            .carried_envelopes_for_hints_page(hints, now_ms, u64::MAX, None)?
+            .carried_envelopes_for_hints_page(hints, now_ms, u64::MAX, u32::MAX, None)?
             .rows)
     }
 
     /// Budgeted, cursor-resumable page of carried envelopes matching `hints`
     /// (G2: HELLO `drainCarriedEnvelopesTo`). Same DTN rules as the unbudgeted
     /// form: only *offers*; never removes. `budget_bytes == 0` is the off
-    /// switch. Head-of-line oversized exception matches
-    /// [`Self::carried_envelopes_for_peer_sync`].
+    /// switch, and so is `max_rows == 0`. Head-of-line oversized exception and
+    /// the row ceiling both match [`Self::carried_envelopes_for_peer_sync`];
+    /// see [`DEFAULT_CARRIED_PAGE_MAX_ROWS`] for why a byte budget alone is not
+    /// enough.
     pub fn carried_envelopes_for_hints_page(
         &self,
         hints: Vec<Vec<u8>>,
         now_ms: i64,
         budget_bytes: u64,
+        max_rows: u32,
         after: Option<CoreCarriedCursor>,
     ) -> Result<CoreCarriedSyncPage, CoreError> {
-        if hints.is_empty() || budget_bytes == 0 {
+        if hints.is_empty() || budget_bytes == 0 || max_rows == 0 {
             return Ok(CoreCarriedSyncPage {
                 rows: Vec::new(),
                 next: None,
@@ -6197,6 +6232,14 @@ impl MessageStore {
         let mut exhausted = true;
         for row in rows {
             let (envelope, received_at) = row.map_err(store_err)?;
+            if selected.len() as u64 >= u64::from(max_rows) {
+                // The row ceiling, checked before the byte budget: a page of
+                // tiny envelopes never comes near the budget, and the frame
+                // count is what floods the link. `exhausted` stays false, so
+                // the lane keeps its cursor and resumes here next round.
+                exhausted = false;
+                break;
+            }
             let size = envelope.sealed.len() as u64;
             if used > 0 && used.saturating_add(size) > budget_bytes {
                 exhausted = false;
@@ -6339,15 +6382,24 @@ impl MessageStore {
     /// queue is untouched, and D8's periodic re-digest re-offers whatever did
     /// not fit on the next round, so a big backlog is *paced* across rounds
     /// instead of monopolizing a slow link's single FIFO in one burst.
+    ///
+    /// `max_rows` is the same cut expressed in envelopes rather than bytes, and
+    /// it exists because the byte budget alone does not bound a round's frame
+    /// count: hundreds of receipt-sized envelopes clear a 256 KiB budget
+    /// untouched while still queueing hundreds of separate writes into one
+    /// link's FIFO ahead of live mail. Rows are taken oldest first until either
+    /// cut binds, whichever comes first. Zero is an off switch exactly as a
+    /// zero byte budget is. See [`DEFAULT_CARRIED_PAGE_MAX_ROWS`].
     pub fn carried_envelopes_for_peer_sync(
         &self,
         peer_hints: Vec<Vec<u8>>,
         peer_known_msg_ids: Vec<Vec<u8>>,
         now_ms: i64,
         budget_bytes: u64,
+        max_rows: u32,
         after: Option<CoreCarriedCursor>,
     ) -> Result<CoreCarriedSyncPage, CoreError> {
-        if budget_bytes == 0 {
+        if budget_bytes == 0 || max_rows == 0 {
             // The lane's off switch. Returning here rather than letting the
             // loop below break on its first row keeps the query -- and one
             // row's ciphertext decode -- off a link that is parked. Not
@@ -6410,6 +6462,17 @@ impl MessageStore {
             #[cfg(test)]
             self.sealed_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if selected.len() as u64 >= u64::from(max_rows) {
+                // The row ceiling. Checked ahead of the byte budget because a
+                // page of tiny envelopes never reaches the budget at all, and
+                // the frame count is what floods a slow link. No head-of-line
+                // exception is needed here: unlike an oversized envelope, a row
+                // stopped by the count is not stopped again next round -- the
+                // cursor has already advanced past everything that was taken,
+                // so this row is the head of the next page.
+                exhausted = false;
+                break;
+            }
             let size = envelope.sealed.len() as u64;
             let cursor = CoreCarriedCursor {
                 received_at,
@@ -10052,7 +10115,7 @@ mod tests {
         }
         // 250 bytes fits two 100-byte sealed bodies; third would exceed.
         let page = store
-            .carried_envelopes_for_hints_page(vec![hint.clone()], now, 250, None)
+            .carried_envelopes_for_hints_page(vec![hint.clone()], now, 250, u32::MAX, None)
             .unwrap();
         assert_eq!(page.rows.len(), 2);
         assert!(!page.exhausted);
@@ -10066,7 +10129,7 @@ mod tests {
             4
         );
         let page2 = store
-            .carried_envelopes_for_hints_page(vec![hint], now, 250, page.next)
+            .carried_envelopes_for_hints_page(vec![hint], now, 250, u32::MAX, page.next)
             .unwrap();
         assert_eq!(page2.rows.len(), 2);
         assert!(page2.exhausted);
@@ -17198,6 +17261,7 @@ mod tests {
                 vec![b"known".to_vec()],
                 5_000,
                 u64::MAX,
+                u32::MAX,
                 None,
             )
             .unwrap();
@@ -17222,7 +17286,7 @@ mod tests {
 
         let known_ids = vec![b"k1".to_vec(), b"k2".to_vec(), b"k3".to_vec()];
         let found = store
-            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000, u64::MAX, None)
+            .carried_envelopes_for_peer_sync(vec![], known_ids, 5_000, u64::MAX, u32::MAX, None)
             .unwrap();
 
         assert!(found.rows.is_empty());
@@ -17269,7 +17333,7 @@ mod tests {
         // park it at the head of every future round until it expired, and
         // nothing behind it would ever be offered, so it goes out by itself.
         let round_one = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, None)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, u32::MAX, None)
             .unwrap();
         let ids: Vec<Vec<u8>> = round_one.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"huge".to_vec()]);
@@ -17277,7 +17341,14 @@ mod tests {
         // Once the peer advertises it in a digest, the lane moves on and the
         // two small ones fit the same budget together.
         let round_two = store
-            .carried_envelopes_for_peer_sync(vec![], vec![b"huge".to_vec()], 5_000, 250, None)
+            .carried_envelopes_for_peer_sync(
+                vec![],
+                vec![b"huge".to_vec()],
+                5_000,
+                250,
+                u32::MAX,
+                None,
+            )
             .unwrap();
         let ids: Vec<Vec<u8>> = round_two.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"small-1".to_vec(), b"small-2".to_vec()]);
@@ -17301,7 +17372,7 @@ mod tests {
             .unwrap();
 
         let page = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 0, None)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 0, u32::MAX, None)
             .unwrap();
         assert!(page.rows.is_empty());
         assert!(page.next.is_none());
@@ -17335,7 +17406,7 @@ mod tests {
 
         // 250 bytes fits two 100-byte rows, not three.
         let page_one = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, None)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, u32::MAX, None)
             .unwrap();
         let ids: Vec<Vec<u8>> = page_one.rows.iter().map(|e| e.msg_id.clone()).collect();
         assert_eq!(ids, vec![b"e1".to_vec(), b"e2".to_vec()]);
@@ -17349,7 +17420,14 @@ mod tests {
         );
 
         let page_two = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, page_one.next.clone())
+            .carried_envelopes_for_peer_sync(
+                vec![],
+                vec![],
+                5_000,
+                250,
+                u32::MAX,
+                page_one.next.clone(),
+            )
             .unwrap();
         let ids: Vec<Vec<u8>> = page_two.rows.iter().map(|e| e.msg_id.clone()).collect();
         assert_eq!(
@@ -17363,7 +17441,7 @@ mod tests {
         );
 
         let page_three = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, page_two.next)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 250, u32::MAX, page_two.next)
             .unwrap();
         assert!(page_three.rows.is_empty());
         assert!(page_three.exhausted);
@@ -17385,7 +17463,7 @@ mod tests {
             .unwrap();
 
         let first = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, None)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, u32::MAX, None)
             .unwrap();
         assert_eq!(first.rows.len(), 1);
 
@@ -17399,7 +17477,7 @@ mod tests {
             .unwrap();
 
         let second = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, first.next)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 10, u32::MAX, first.next)
             .unwrap();
         let ids: Vec<Vec<u8>> = second.rows.into_iter().map(|e| e.msg_id).collect();
         assert_eq!(ids, vec![b"young".to_vec()]);
@@ -17432,7 +17510,7 @@ mod tests {
             msg_id: b"c3".to_vec(),
         });
         let page = store
-            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, after)
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, u32::MAX, after)
             .unwrap();
 
         let ids: Vec<Vec<u8>> = page.rows.into_iter().map(|e| e.msg_id).collect();
@@ -17443,6 +17521,205 @@ mod tests {
             "only the one row past the cursor may have its sealed ciphertext \
              decoded; the three behind it must never be read"
         );
+    }
+
+    // --- envelope-count ceiling --------------------------------------------
+
+    /// `count` tiny carried rows, one per millisecond from `first_received_at`,
+    /// named `n-0`, `n-1`, ... in queue order.
+    fn seed_tiny_carried(store: &MessageStore, count: usize, first_received_at: i64) {
+        for index in 0..count {
+            // Sealed bytes must differ per row: the queue dedupes on a digest
+            // of (hint, sealed), so a shared filler would silently collapse the
+            // page these tests are trying to fill.
+            let envelope = CarriedEnvelope {
+                msg_id: format!("n-{index}").into_bytes(),
+                hop_ttl: 7,
+                expiry: 9_000,
+                recipient_hint: b"hint".to_vec(),
+                sealed: (index as u64).to_be_bytes().to_vec(),
+            };
+            store
+                .enqueue_carried_envelope(
+                    envelope,
+                    false,
+                    first_received_at + index as i64,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn peer_sync_stops_at_the_row_ceiling_even_when_the_byte_budget_is_untouched() {
+        // 200 receipt-sized envelopes are ~1.6 KiB in total: the byte budget
+        // never binds, but 200 frames into one link's FIFO is exactly what the
+        // ceiling exists to prevent.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, 200, 1_000);
+
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, 64, None)
+            .unwrap();
+        assert_eq!(page.rows.len(), 64);
+        assert!(!page.exhausted, "163 rows are still behind the cursor");
+        assert_eq!(page.rows[0].msg_id, b"n-0".to_vec());
+        assert_eq!(page.rows[63].msg_id, b"n-63".to_vec());
+        assert_eq!(
+            page.next,
+            Some(CoreCarriedCursor {
+                received_at: 1_063,
+                msg_id: b"n-63".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_row_capped_page_resumes_where_it_stopped_and_reaches_the_tail() {
+        // The row ceiling must page the queue, not re-tread its head: three
+        // rounds of five over eleven rows, with no row offered twice and none
+        // skipped, and only the last round claiming the tail.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, 11, 1_000);
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = None;
+        let mut rounds = 0;
+        loop {
+            let page = store
+                .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, 5, cursor)
+                .unwrap();
+            rounds += 1;
+            seen.extend(page.rows.iter().map(|e| e.msg_id.clone()));
+            cursor = page.next;
+            if page.exhausted {
+                break;
+            }
+            assert!(rounds < 10, "the walk must terminate");
+        }
+        assert_eq!(rounds, 3);
+        let expected: Vec<Vec<u8>> = (0..11).map(|i| format!("n-{i}").into_bytes()).collect();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn the_byte_budget_still_binds_first_for_large_envelopes() {
+        // The ceiling is an addition, not a replacement: with rows this big the
+        // budget is still what stops the round well short of `max_rows`.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (index, id) in [b"b1" as &[u8], b"b2", b"b3", b"b4"].iter().enumerate() {
+            store
+                .enqueue_carried_envelope(
+                    carried(id, b"hint", 9_000, 4_096),
+                    false,
+                    1_000 + index as i64,
+                    BIG_BUDGET,
+                )
+                .unwrap();
+        }
+
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, 9_000, 64, None)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = page.rows.iter().map(|e| e.msg_id.clone()).collect();
+        assert_eq!(ids, vec![b"b1".to_vec(), b"b2".to_vec()]);
+        assert!(!page.exhausted);
+    }
+
+    #[test]
+    fn a_zero_row_ceiling_is_an_off_switch_like_a_zero_budget() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, 3, 1_000);
+
+        let page = store
+            .carried_envelopes_for_peer_sync(vec![], vec![], 5_000, u64::MAX, 0, None)
+            .unwrap();
+        assert!(page.rows.is_empty());
+        assert!(page.next.is_none());
+        assert!(
+            !page.exhausted,
+            "nothing was examined, so nothing was ruled out"
+        );
+        assert_eq!(store.test_sealed_reads(), 0);
+    }
+
+    #[test]
+    fn hints_page_stops_at_the_row_ceiling_and_resumes_across_pages() {
+        // The HELLO drain's lane gets the same ceiling, and the same
+        // offer-only guarantee: every row is still in the queue afterwards.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, 7, 1_000);
+        let hint = b"hint".to_vec();
+
+        let page_one = store
+            .carried_envelopes_for_hints_page(vec![hint.clone()], 5_000, u64::MAX, 3, None)
+            .unwrap();
+        let ids: Vec<Vec<u8>> = page_one.rows.iter().map(|e| e.msg_id.clone()).collect();
+        assert_eq!(ids, vec![b"n-0".to_vec(), b"n-1".to_vec(), b"n-2".to_vec()]);
+        assert!(!page_one.exhausted);
+
+        let page_two = store
+            .carried_envelopes_for_hints_page(
+                vec![hint.clone()],
+                5_000,
+                u64::MAX,
+                3,
+                page_one.next.clone(),
+            )
+            .unwrap();
+        let ids: Vec<Vec<u8>> = page_two.rows.iter().map(|e| e.msg_id.clone()).collect();
+        assert_eq!(ids, vec![b"n-3".to_vec(), b"n-4".to_vec(), b"n-5".to_vec()]);
+
+        // Nothing was removed by any of this: paging only ever offers.
+        assert_eq!(
+            store
+                .carried_envelopes_for_hints(vec![hint], 5_000)
+                .unwrap()
+                .len(),
+            7
+        );
+    }
+
+    #[test]
+    fn a_zero_row_ceiling_offers_nothing_from_the_hints_page() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, 3, 1_000);
+
+        let page = store
+            .carried_envelopes_for_hints_page(vec![b"hint".to_vec()], 5_000, u64::MAX, 0, None)
+            .unwrap();
+        assert!(page.rows.is_empty());
+        assert!(page.next.is_none());
+        assert!(!page.exhausted);
+    }
+
+    #[test]
+    fn the_digest_spray_plan_applies_the_default_row_ceiling() {
+        // The shells do not pass the ceiling to the plan; core applies its own.
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        seed_tiny_carried(&store, DEFAULT_CARRIED_PAGE_MAX_ROWS as usize + 40, 1_000);
+
+        let plan = store
+            .core_digest_spray_plan(
+                b"me".to_vec(),
+                b"peer".to_vec(),
+                vec![],
+                vec![],
+                5_000,
+                u64::MAX,
+                0,
+                0,
+                16,
+                true,
+                vec![],
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            plan.carried_frames.len(),
+            DEFAULT_CARRIED_PAGE_MAX_ROWS as usize
+        );
+        assert!(!plan.carried_exhausted);
     }
 
     #[test]
