@@ -57,6 +57,7 @@ of it: the gap is now countable.
 | `SILENCE-01` | Contact silence advances only with same-pass proof that another relay answered; authoritative rejection does not require that proof. | core | `core/src/contact_relay_health.rs` silence tests; index re-asserts the delta rule |
 | `UI-01` | Delivery and via-transport claims require persisted arrival or receipt evidence, never a current-link guess. | core | `core/src/connection_health.rs` delivery tests; index re-asserts the queue-honesty gate |
 | `LIVE-01` | Every pass terminates inside its declared request, envelope, byte, and time/yield budgets. | core | `core/src/session/relay_pass.rs` declares the budgets and carries them in every summary; `core/tests/relay_pass_replay.rs` drives a real pass against four hostile relays (endless mail, a cursor that never moves, silence, blanket rejection) and every incident fixture |
+| `PRESENCE-01` | A presence answer to a credential from outside the answering family is coarsened to a recency bucket and charged to a tight per-credential allowance of its own. It can never spend the queried family's request or byte budget, it never carries an announcement, and a suspended or lapsed family answers nobody. The asking client holds a staleness floor of its own, so the server's cap is a backstop rather than a schedule. | core | `relayd/src/lib.rs` gives the presence dimension its own token bucket keyed by the presented credential and coarsens every cross-family answer, with `relayd/tests/e2e_presence.rs` covering the cap, the `Retry-After`, a paired assertion that a presence flood leaves the family's own allowance untouched, the suspended refusal, and the coarse-vs-precise split; `core/src/session/relay_pass.rs` bounds the query to one per contact per pass inside the pass request budget, skips a resting endpoint, and caches the bucket behind a client floor, with `core/tests/relay_pass_replay.rs` driving it |
 | `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | core | `core/src/relay_cursor.rs` walk-budget yield plus `core/src/session/relay_pass.rs`, which can only emit a continuation carrying a `CoreRelayProgressReason`; `core/tests/relay_pass_replay.rs` gathers the continuations several passes produce and checks the rule across all of them |
 | `MARK-01` | A successfully relay-uploaded carried row is durably marked before the pass ends; the marker survives restart and suppresses repeat upload for its lifetime. | core | `core/src/store.rs` upload-marker tests; index re-asserts first-writer-wins |
 | `FANOUT-01` | A group-addressed authored row is posted as one row per member, to one mailbox chosen with both endpoint brakes. The envelope is marked relay-posted only once every member it owes has landed durably, and the members that landed are remembered per member, so a partial fan-out resumes with the remainder rather than re-posting the set. | core | `core/src/session/relay_pass.rs` upload planning + `core/src/store.rs` fan-out markers; `core/tests/relay_pass_replay.rs` drives full, partial, excluded-member and nowhere-to-post fan-outs against a real pass |
@@ -249,6 +250,54 @@ suite therefore holds passes to budgets small enough to bite — three
 requests against endless mail, ten envelopes at eight rows a page, a deadline
 shorter than one answer — and each of those scenarios fails if the gate is
 removed.
+
+#### `PRESENCE-01` — asking after someone must not cost them anything
+
+A phone can hold a friend card for someone in another family. That card names
+their family's relay and carries a post-only credential, which is the whole
+of `CP4`: the holder may leave mail there and may not read any. But "have they
+been around lately?" is not mail, and without an answer to it a contact
+reachable only that way has no last-seen at all — the relay pass has nothing
+to poll on their behalf, so their row in the list simply stops moving.
+
+Reinstating the question means a presence endpoint answers a credential that
+belongs to somebody else's family, and two things then have to be true.
+
+The first is that asking must not be a way to hurt the family being asked.
+Family-bucket starvation is a failure this codebase has already shipped and
+fixed once; a route that spends the answering family's request or byte
+allowance would hand a friend-card holder a lever on a mailbox they cannot
+otherwise touch — quietly, because the family would see their own traffic
+throttled and nothing to explain it. So the presence answer is charged to a
+dimension of its own: a small burst over a long window, keyed by the
+credential presented, drawn from neither of the buckets the family's own
+traffic rides on. Over the cap is `429` with a `Retry-After`, the same shape
+every other limit here uses. A suspended or lapsed family answers nothing, to
+anyone, because that check sits above the class boundary rather than beside
+it.
+
+The second is that the answer must be worth less than a log. A precise
+timestamp, asked for often enough, is a record of when someone's phone woke
+up, and nothing about wanting to show "seen recently" needs that. So a
+cross-family answer is a bucket — active, recent, today, older — reported as
+the oldest instant still inside it, and the bucket edges are the windows the
+apps already write their copy from, so nothing truthful is lost in the
+rounding. A same-family caller still gets the exact stamp: that family's own
+devices are the ones the row is about.
+
+The client carries the same rule from its side, because a limit is not a
+schedule. One query per contact per pass, inside the pass's ordinary request
+budget; a floor of fifteen minutes between two queries about the same person,
+stamped when the query is *sent* so a relay that times out is not punished
+with a retry storm; and an endpoint this device has already written off is
+asked nothing at all. Announcing stays where the earlier decision left it —
+a cross-family query tells the answering family nothing about who is asking,
+and the relay refuses an announcement carried on a credential from outside.
+
+Presence remains a hint under §3.6 throughout. Every part of this may fail,
+be refused, or be answered by a relay too old to know the route, and the only
+consequence is a contact whose last-seen stops moving — which is exactly where
+this started, and is why the whole mechanism is allowed to be this cheap.
 
 #### `PROGRESS-01` — a continuation must buy something
 
@@ -680,8 +729,8 @@ client contract purposes.
 
 | Class | Recognisable by | May do |
 |---|---|---|
-| Member token | no class prefix | post, fetch, ack, presence, WebSocket |
-| Deposit token | `cmdep1-` prefix | post only |
+| Member token | no class prefix | post, fetch, ack, presence (announce + query, precise answers), WebSocket |
+| Deposit token | `cmdep1-` prefix | post; presence query only — no announce, capped hints, coarse answers, own rate allowance (`PRESENCE-01`) |
 
 A deposit token is a one-way attenuation of its family's member token, so a
 device can stamp one onto a friend card entirely offline and the relay
@@ -690,6 +739,11 @@ class; the pass setup card carries the member class. Consequently a resolved
 poll endpoint that would carry a deposit credential is dropped rather than
 attempted — reading someone else's mailbox is prevented by the token class,
 not by client politeness.
+
+The one exception is `POST /presence`, and it is an exception to *what may be
+asked*, not to what may be read: a deposit credential may put a presence
+query, and gets back recency buckets rather than timestamps, on an allowance
+of its own. See `PRESENCE-01` for why that is safe and §3.4 for the numbers.
 
 ### 3.3 Stable response codes
 
@@ -705,6 +759,8 @@ combinations degrade to a generic outage rather than being guessed at.
 | 507 | `family_quota_exceeded` | Hosted storage full; posting fails while fetching still works | no |
 | 413 | `envelope_too_large` | This one envelope can never be posted | no |
 | 429 | `rate_limited` | Too fast, not broken; `Retry-After` present | yes |
+| 403 | `deposit_only` | This credential may post and query presence, nothing else | no |
+| 403 | `presence_query_only` | A deposit credential tried to announce presence | no |
 | other non-2xx | — | Generic outage | yes |
 
 When one pass observes several, a fixed rank decides which is shown:
@@ -724,7 +780,11 @@ rate limited > outage.
 | Server fetch page sealed-byte budget | 8 MiB |
 | Max fetch hints per request | 256 |
 | Max ack ids per request | 512 |
-| Max presence announce / query | 4 / 512 |
+| Max presence announce / query (member) | 4 / 512 |
+| Max presence query (cross-family, deposit) | 8, announce forbidden |
+| Cross-family presence allowance | 4 queries per credential per 15 min, own bucket |
+| Cross-family recency buckets | active ≤ 2.5 min, recent ≤ 15 min, day ≤ 24 h, older |
+| Client floor between two queries about one contact | 15 min |
 | Max WebSocket inbound message | 4 KiB |
 | Max envelope sealed bytes | 512 KiB |
 | Max server retention | 30 days |
@@ -842,6 +902,13 @@ them; the decisions and their reasons are in the table there.
    request that has already happened before anything can consume the budget.
    A presence failure is recorded against the config and does not skip the
    walk. See 5.2.
+
+   Once every config has been walked, the same stage issues the cross-family
+   presence queries: one per contact whose only endpoint is another family's
+   relay, query-only, budgeted and cadence-gated per `PRESENCE-01`. They come
+   last inside the stage because they are advisory — they spend what the mail
+   did not need, never the other way round — and a `429` on one ends the
+   remaining network work exactly as it would anywhere else.
 8. **Commit silence and rejection evidence and fold pass health.** Silence
    may only be committed now, because only now is it known whether this
    device's own mailbox answered (`SILENCE-01`).
@@ -877,7 +944,7 @@ finding another one is a finding, not a failure.
 | Order of presence and the mailbox walk within stage 7 | walk first, then presence, per config | presence first, then the walk, per config | **C0 — resolved toward iOS, which is also the order the plan pinned.** The walk is the budgeted, abortable stage; presence sits behind it under Android's order and is therefore never reached on a device whose walk exhausts its budget every pass, which is exactly the device whose presence matters. Presence is one fixed-cost request. Cost of the change: one extra round trip of latency before the first fetch on a shallow mailbox, paid only by devices for which the walk was never the constraint. C1/C2 migrate Android |
 | What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | **C0 — resolved toward iOS.** `SILENCE-01` needs same-pass evidence, and a swallowed failure destroys it: a config whose presence failed and whose walk then succeeded is *not* silent, and one where both failed is stronger evidence than the walk alone, but swallowing made the two indistinguishable. Recording never skips the walk on either reading. C1/C2 migrate Android |
 | When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | **C0 — resolved toward Android.** The window is a floor a later, shorter one cannot lower, which is what `RATE-01` says it is, and it exists from the refusal onward rather than from the end. `CoreRelayPassSummary::quiet_until_ms` is set the moment the refusal is seen, so a pass *cancelled* afterwards — an app backgrounded mid-pass — still reports it, where an accumulate-at-the-end pass reports nothing. Scope, stated plainly: this does **not** survive process death. Nothing in core persists the window; it lives in the pass object and in the summary, and Android's `rateLimitedUntilMs` is an in-memory field too, so neither shell has that property today. Making the floor durable is adapter work — a shell persisting the summary — and belongs to C1/C2 with the migration |
-| Where presence is announced and queried | per poll config: a contact on another family's relay has their hint queried on that relay | own mailbox only | **C0 — resolved toward iOS, and it costs something.** Announcing this device's hints into another family's mailbox tells that family we exist, which is a privacy cost with no visible benefit; the query half carries no such cost but is dropped with it, so a contact reachable only through another family's relay stops resolving a last-seen time once the shells migrate. Recorded here rather than left in a code comment because it was found while writing `relay_pass.rs` and was not in this table before. C3 decides whether to reinstate the query alone before it migrates the shells |
+| Where presence is announced and queried | per poll config: a contact on another family's relay has their hint queried on that relay | own mailbox only | **C0 — resolved toward iOS, and it costs something.** Announcing this device's hints into another family's mailbox tells that family we exist, which is a privacy cost with no visible benefit; the query half carries no such cost but is dropped with it, so a contact reachable only through another family's relay stops resolving a last-seen time once the shells migrate. Recorded here rather than left in a code comment because it was found while writing `relay_pass.rs` and was not in this table before. **C3 — resolved: the query alone is reinstated, hardened.** The announce half stays dropped, which is the privacy cost this row identified. The query half returns as a distinct stage-7 action: cross-family only, at most one per contact per pass inside the pass's ordinary request budget, never for an endpoint that is resting, behind a fifteen-minute client floor stamped at send. On the server it is an op of its own with its own token bucket, keyed by the presented credential, and a cross-family answer is a recency bucket rather than a timestamp. `PRESENCE-01` is the rule that came out of resolving it |
 | What a group-addressed authored row costs | one row per member: `RelaySyncEngine.kt` reads the group, builds the per-member fan-out rows with `coreGroupFanoutRows`, posts all of them, and marks the envelope relay-posted only when every row landed | the same fan-out in `MeshController.swift` | **C3 — resolved toward the shells, and one step past them.** `session/relay_pass.rs` now decomposes a group-addressed authored row into per-member rows at upload planning, picks the single destination mailbox with `core_group_fanout_relay_target` (so a member resting for silence still contributes no fallback), and stamps `relay_posted_at` only when every member the envelope owes has landed. It goes one step further than either shell: which members landed is recorded durably per member and per mailbox, so a partial fan-out resumes with the remainder instead of re-posting the whole set — the shells re-post all of it, which costs a twelve-member group twelve posts a pass for as long as one row keeps failing. Blocked members are excluded and are therefore not owed a row, matching every other outbound fan-out in the codebase. Pinned by `FANOUT-01` |
 | What a contact endpoint that has gone silent costs an upload | two separate brakes: a *rejection* streak (the card is wrong) falls back to this device's own mailbox, while *silence* (no answer at all) declines to post at all, because falling back would put a cross-family contact's mail in a mailbox they never read and `relay_posted_at` is terminal | the same two brakes in `RelaySweepSession.swift` | **C3 — resolved toward the shells.** `CoreRelayContactConfig` now carries both brakes as `endpoint_usable` (rejection) and `endpoint_answering` (silence), named and documented after `GroupRelayMember`'s pair, which already had to keep them apart for the same reason. The upload lanes answer them differently: a rejection resolves through `resolved_contact_delivery_relay` to our own mailbox, and silence resolves to nothing at all, which posts no row and writes no terminal marker, so the row stays deliverable by a later pass and by the mesh. `endpoint_answering` defaults to true, so a caller still folding `usable && answering` into the one flag keeps its present behaviour rather than silently acquiring the fallback for a resting endpoint; teaching the two adapter call sites the difference is the follow-up |
 | Whether an unpostable recipient's rows consume a batch slot | no: `unpostableRecipients` is passed into the store query, so those rows are never selected and the batch is spent on rows that can actually move | no such exclusion; the rows are selected and skipped | **C3 — resolved toward Android.** `session/relay_pass.rs` computes the same set — every contact for whom the two brakes resolve no destination — and passes it into both upload queries. The batch is bounded, so an empty skip list is not merely wasteful: one unreachable contact's rows refill it every pass while live rows behind them never move |
@@ -911,6 +978,15 @@ The presence-scope row is the one this table gained by being used: nobody
 recorded it as a difference, and it only surfaced because writing a single
 implementation forced someone to answer it. That is the argument for keeping
 the list append-only.
+
+It is also the one that came back. Resolving it toward iOS closed a real
+privacy cost and, in the same motion, dropped a capability nobody had noticed
+was carried alongside it — which is what "and it costs something" in the row
+was recording. Reinstating half of a resolved row is not a reversal: the half
+that was refused stays refused, the half that returns is narrower than what
+Android was doing, and it arrived with `PRESENCE-01` and a set of numbers
+attached, none of which existed when the difference was merely a difference.
+An append-only table is what made that possible to see.
 
 The first two were not known to be load-bearing when they were written down,
 and that was the point of writing them down: an undocumented difference cannot
@@ -1373,6 +1449,9 @@ Recorded so a reader does not have to diff two documents:
   handed to the shell's inbound processor, so nothing raises a notification for
   it. The fourth is that the presence answer core decodes is never projected
   back onto the connectivity surface, so contact "last seen" would stop moving.
+  The cross-family half of that answer is now cached in core — a recency bucket
+  per contact in `contact_presence` — so what remains owed there is the
+  projection onto the surface, not the data behind it.
   Neither of the last two is a divergence between shells; both are simply the
   work package C4 exists to do, and they are named here so "the core engine is
   wired and tested" is not read as "the core engine is ready to be the

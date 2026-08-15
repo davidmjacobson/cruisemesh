@@ -131,6 +131,8 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` | `60` | Requests per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` | `6291456` (6 MiB) | Uploaded `sealed` bytes per minute allowed for a single family **deposit** token (also the burst size). See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES` | `4` | Cross-family `POST /presence` queries allowed for a single family **deposit** token per window (also the burst size). Charged to its own bucket, never the family's request/byte allowance. See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS` | `900` | The window the above allowance is spread over. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_APNS_KEY_ID` | *(unset = APNs off)* | Apple push notification key ID. Set together with the next three fields; see §7.1. |
 | `CRUISEMESH_APNS_TEAM_ID` | *(unset = APNs off)* | Apple Developer Team ID. |
 | `CRUISEMESH_APNS_BUNDLE_ID` | *(unset = APNs off)* | App topic, currently `com.cruisemesh.app`. |
@@ -480,6 +482,15 @@ connection on a $4 VPS. Three token buckets close it:
 | Requests, per deposit token | 60/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_REQUESTS_PER_MIN` |
 | Uploaded `sealed` bytes, per deposit token | 6 MiB/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` |
 | Requests, all tokens combined | 6,000/min | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` |
+| Cross-family presence queries, per deposit token | 4 per 15 min | `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES`, `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS` |
+
+The last one is shaped the other way round from the rest — a small burst over
+a long window rather than a generous per-minute figure — and it is charged to
+a dimension of its own. A deposit credential may put a presence query (see
+`PRESENCE-01` in `specs/protocol-contract-v1.md`), and however hard it does
+so, it spends neither the request nor the byte allowance of the family whose
+relay answers. The client asks at most once per contact per fifteen minutes,
+so four in a window is a device asking on schedule with three spare.
 
 Buckets are keyed by the *presented* credential, so a family's deposit
 traffic (friend cards, i.e. what strangers can hold) exhausts its own

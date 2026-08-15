@@ -195,10 +195,10 @@ use crate::relay_cursor::{
 use crate::relay_status::{relay_classify_http_error, relay_retry_after_ms, CoreRelayFault};
 use crate::relay_wire::{
     core_group_fanout_relay_target, relay_build_fetch_path, relay_decode_fetch_page,
-    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
-    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
-    relay_validate_envelope_sizes, resolved_contact_delivery_relay, resolved_contact_poll_relay,
-    resolved_contact_relay, GroupRelayMember, RelayEndpoint,
+    relay_decode_presence_page, relay_encode_ack_request, relay_encode_post_envelope,
+    relay_encode_presence_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
+    relay_max_response_bytes, relay_validate_envelope_sizes, resolved_contact_delivery_relay,
+    resolved_contact_poll_relay, resolved_contact_relay, GroupRelayMember, RelayEndpoint,
 };
 use crate::session::relay_policy::{
     core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_relay_pass_health,
@@ -242,6 +242,65 @@ pub const RELAY_PASS_MAX_AUTHORED_UPLOADS: u32 = 24;
 /// queue is the deep one, and still bounded because #222 was what happens
 /// when it is not.
 pub const RELAY_PASS_MAX_CARRIED_UPLOADS: u32 = 48;
+
+/// Cross-family presence queries one pass may issue, across every contact.
+///
+/// Separate from, and smaller than, the number of contacts: this is a lane
+/// with no mail in it. Every query here spends a request asking another
+/// family's relay a question for this device's own benefit, so it is bounded
+/// by something that does not grow when an address book does. Eight is the
+/// same order as the configs the pass already walks, and each query is
+/// charged against [`CoreRelayPassBudgets::max_requests`] like every other
+/// request — this cap only stops presence from *being* the pass.
+pub const RELAY_PASS_MAX_PRESENCE_PROBES: u32 = 8;
+
+/// The shortest interval between two cross-family queries about the same
+/// contact, across passes.
+///
+/// The client half of `PRESENCE-01`. A relay's cap is not a schedule, and a
+/// client that asks as often as it is allowed to has turned the server's
+/// limit into its cadence; this is the cadence, and the server's cap is the
+/// backstop for a client that ignores it. Fifteen minutes is the window
+/// Android's `ContactReachability.RECENT_WINDOW_MS` already draws its
+/// "recently" copy from, and the answer is bucketed at least that coarsely,
+/// so asking faster could not change what anyone is shown.
+pub const RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS: i64 = 15 * 60 * 1000;
+
+/// Coarse recency buckets for a cross-family presence answer, by age in
+/// milliseconds.
+///
+/// Named here rather than read off the wire: a relay tells a cross-family
+/// caller which bucket a hint falls in by reporting the oldest instant still
+/// inside it, and this ladder maps that stamp back to the bucket. Deriving it
+/// rather than trusting a response field means a *precise* answer — from an
+/// older relayd, or from a mailbox this device is genuinely a member of — is
+/// coarsened here too, so nothing downstream can come to depend on a
+/// precision that is not contractually there.
+///
+/// The edges are [`crate::CONNECTION_PRESENCE_ONLINE_WINDOW_MS`] (the "seen
+/// online" window both shells already use) and
+/// [`RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS`] (their "recently"), then a
+/// day, then everything older.
+pub const RELAY_PRESENCE_RECENCY_ACTIVE: &str = "active";
+pub const RELAY_PRESENCE_RECENCY_RECENT: &str = "recent";
+pub const RELAY_PRESENCE_RECENCY_DAY: &str = "day";
+pub const RELAY_PRESENCE_RECENCY_OLDER: &str = "older";
+
+/// Which bucket an age falls in. A negative age (a stamp from the future,
+/// which is a clock artifact rather than evidence) reads as the freshest
+/// bucket the same way a zero age does; it cannot be used to invent a
+/// recency, because every bucket is advisory.
+pub(crate) fn relay_presence_recency(age_ms: i64) -> &'static str {
+    if age_ms <= crate::CONNECTION_PRESENCE_ONLINE_WINDOW_MS {
+        RELAY_PRESENCE_RECENCY_ACTIVE
+    } else if age_ms <= RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS {
+        RELAY_PRESENCE_RECENCY_RECENT
+    } else if age_ms <= 24 * 60 * 60 * 1000 {
+        RELAY_PRESENCE_RECENCY_DAY
+    } else {
+        RELAY_PRESENCE_RECENCY_OLDER
+    }
+}
 
 /// Wall-clock budget for one pass, measured from `start`.
 ///
@@ -707,11 +766,33 @@ struct WalkState {
     done: bool,
 }
 
+/// One contact this pass may ask another family's relay about.
+///
+/// Not a [`WalkConfig`]: there is no mailbox here to walk. A cross-family
+/// endpoint carries a deposit-class credential, which cannot fetch or ack, so
+/// this device has exactly one question it may put to it — whether the person
+/// whose card it came from has been around — and no cursor, no page, and no
+/// silence evidence attaches to the answer.
+struct PresenceProbe {
+    user_id: Vec<u8>,
+    endpoint: RelayEndpoint,
+    /// The archive-local pseudonym for the mailbox, so a transcript can
+    /// follow the query without naming a host (`SECRET-01`).
+    actor: Option<String>,
+}
+
 /// What the outstanding action was for, so its result can be applied.
 enum ActionIntent {
     Upload(PendingUpload),
     Presence {
         config: usize,
+    },
+    /// A cross-family presence query. Deliberately a separate intent from
+    /// `Presence`: that one is this device's own mailbox and its failure is
+    /// evidence about a config, while this one is advisory and its failure is
+    /// evidence about nothing (see `apply_error`).
+    PresenceProbe {
+        probe: usize,
     },
     Fetch {
         config: usize,
@@ -779,6 +860,9 @@ struct PassState {
     uploads: VecDeque<PendingUpload>,
     configs: Vec<WalkConfig>,
     config_index: usize,
+    probes: Vec<PresenceProbe>,
+    probe_index: usize,
+    presence_probes_issued: u32,
 
     requests_issued: u32,
     envelopes_processed: u32,
@@ -866,6 +950,9 @@ impl CoreRelayPass {
                 uploads: VecDeque::new(),
                 configs: Vec::new(),
                 config_index: 0,
+                probes: Vec::new(),
+                probe_index: 0,
+                presence_probes_issued: 0,
                 requests_issued: 0,
                 envelopes_processed: 0,
                 response_bytes_read: 0,
@@ -1204,11 +1291,21 @@ impl PassState {
                 CoreRelayStage::RewalkDecision => {
                     self.run_rewalk_decision();
                     self.build_walk_configs();
+                    self.build_presence_probes();
                     self.config_index = 0;
                     self.stage = CoreRelayStage::Presence;
                 }
                 CoreRelayStage::Presence => {
                     if self.config_index >= self.configs.len() {
+                        // Every mailbox has been walked. What is left are the
+                        // contacts this device holds a card for and no
+                        // mailbox: cross-family endpoints, asked about and
+                        // nothing else. Last inside the stage on purpose —
+                        // presence is advisory, so it spends what the mail
+                        // did not need, never the other way round.
+                        if let Some(action) = self.emit_presence_probe() {
+                            return action;
+                        }
                         self.stage = CoreRelayStage::CommitEvidence;
                         continue;
                     }
@@ -1751,6 +1848,182 @@ impl PassState {
     }
 
     // -----------------------------------------------------------------------
+    // Stage 7a': the cross-family presence query
+    // -----------------------------------------------------------------------
+
+    /// Contacts reachable only through another family's relay.
+    ///
+    /// The other half of the presence-scope decision, and the half that was
+    /// dropped with it. Announcing into another family's mailbox tells that
+    /// family this device exists, which is a privacy cost with nothing on the
+    /// other side of it, and that stays dropped: a probe announces nothing.
+    /// The *query* carries no such cost — it names hints the asker already
+    /// derives from a card they were given — and without it a contact whose
+    /// only endpoint is their own family's relay stops yielding a last-seen
+    /// at all, which is the regression this reinstates.
+    ///
+    /// Two contacts get no probe. One whose endpoint resolves to a mailbox
+    /// this device may *poll* is already answered by that config's own
+    /// presence call. One whose endpoint this device has written off
+    /// (`endpoint_usable == false`) is resting, and a resting endpoint is not
+    /// asked anything — including this.
+    fn build_presence_probes(&mut self) {
+        let own = self.plan.own.clone();
+        let mut probes: Vec<PresenceProbe> = Vec::new();
+        for contact in self.plan.contacts.clone() {
+            if !contact.endpoint_usable {
+                continue;
+            }
+            if resolved_contact_poll_relay(
+                contact.relay_url.clone(),
+                contact.relay_token.clone(),
+                own.as_ref().map(|o| o.url.clone()),
+                own.as_ref().map(|o| o.token.clone()),
+            )
+            .is_some()
+            {
+                continue;
+            }
+            // No fallback endpoint: a contact whose card names no mailbox has
+            // nowhere to be asked, and asking our own mailbox about them
+            // would be the announce-into-someone-else's-family mistake with
+            // the arrow reversed.
+            let Some(endpoint) =
+                resolved_contact_relay(contact.relay_url, contact.relay_token, None, None)
+            else {
+                continue;
+            };
+            if probes
+                .iter()
+                .any(|existing| existing.user_id == contact.user_id)
+            {
+                continue;
+            }
+            let cursor_key = relay_cursor_key(endpoint.url.clone(), endpoint.token.clone());
+            let actor = if cursor_key.is_empty() {
+                None
+            } else {
+                self.store
+                    .protocol_pseudonym("mailbox", cursor_key.as_bytes())
+            };
+            probes.push(PresenceProbe {
+                user_id: contact.user_id,
+                endpoint,
+                actor,
+            });
+        }
+        self.probes = probes;
+        self.probe_index = 0;
+    }
+
+    /// At most one query per contact per pass, and at most
+    /// [`RELAY_PASS_MAX_PRESENCE_PROBES`] per pass whatever the address book
+    /// looks like. `probe_index` only ever moves forward, so a contact
+    /// skipped for cadence is skipped for this pass rather than reconsidered.
+    fn emit_presence_probe(&mut self) -> Option<CoreRelayAction> {
+        while self.probe_index < self.probes.len() {
+            if self.presence_probes_issued >= RELAY_PASS_MAX_PRESENCE_PROBES {
+                return None;
+            }
+            let index = self.probe_index;
+            self.probe_index += 1;
+            let user_id = self.probes[index].user_id.clone();
+            let endpoint = self.probes[index].endpoint.clone();
+            let actor = self.probes[index].actor.clone();
+            // The client-side staleness floor. A cached answer that is still
+            // inside it is the answer, and no request is spent re-asking for
+            // a bucket that could not have changed.
+            if !self
+                .store
+                .contact_presence_probe_due(
+                    user_id.clone(),
+                    self.now_ms,
+                    RELAY_CROSS_FAMILY_PRESENCE_MIN_INTERVAL_MS,
+                )
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let query = crate::recent_presence_hints_for(user_id.clone(), self.now_ms);
+            if query.is_empty() {
+                continue;
+            }
+            let Some(request) = build_presence_request(&endpoint, Vec::new(), query) else {
+                continue;
+            };
+            // Stamped at emission, not at the answer: a relay that times out,
+            // or an older one that refuses the credential outright, must not
+            // be asked again next pass. Failure costs the same wait as
+            // success.
+            let _ = self
+                .store
+                .mark_contact_presence_probed(user_id, self.now_ms);
+            self.presence_probes_issued = self.presence_probes_issued.saturating_add(1);
+            let at_ms = self.now_ms;
+            let mut draft = ProtocolEventDraft::new(
+                ProtocolEventCode::ActionEmitted,
+                at_ms,
+                "cross_family_presence_issued",
+            )
+            .invariants(&["LIVE-01", "PRESENCE-01"]);
+            if let Some(actor) = actor {
+                draft = draft.actor(actor);
+            }
+            let stage = CoreRelayStage::Presence;
+            return Some(self.emit(
+                stage,
+                request,
+                ActionIntent::PresenceProbe { probe: index },
+                draft,
+            ));
+        }
+        None
+    }
+
+    /// Record what a cross-family relay answered: a bucket, never a stamp.
+    fn apply_presence_probe(&mut self, probe: usize, action_id: i64, result: CoreRelayHttpResult) {
+        // Our own internet demonstrably works — the same evidence a config's
+        // answer carries (`SILENCE-01`). It stops there: a probe answer is
+        // not evidence *about the contact's endpoint*, because a deposit
+        // credential could answer presence on a relay whose mailbox is
+        // failing, so it neither clears a rejection streak nor ends silence.
+        self.any_relay_succeeded = true;
+        let Some(user_id) = self.probes.get(probe).map(|p| p.user_id.clone()) else {
+            return;
+        };
+        let actor = self.probes.get(probe).and_then(|p| p.actor.clone());
+        let recency = match relay_decode_presence_page(result.body) {
+            Ok(page) => page
+                .presence
+                .first()
+                .map(|row| relay_presence_recency(page.now_ms.saturating_sub(row.last_seen_ms))),
+            Err(_) => None,
+        };
+        // An empty answer is a real answer: the relay has no presence row for
+        // any hint we asked about. Nothing is recorded, because "not seen" is
+        // the absence of evidence rather than evidence of absence, and the
+        // cached bucket from an earlier pass is not made worse by it.
+        if let Some(recency) = recency {
+            let _ = self
+                .store
+                .record_contact_presence(user_id, recency, self.now_ms);
+        }
+        let mut draft = ProtocolEventDraft::new(
+            ProtocolEventCode::ActionResultAccepted,
+            self.now_ms,
+            "cross_family_presence_accepted",
+        )
+        .action(action_id)
+        .invariants(&["PRESENCE-01"])
+        .count("status", i64::from(result.status))
+        .count("recorded", i64::from(recency.is_some()));
+        if let Some(actor) = actor {
+            draft = draft.actor(actor);
+        }
+        self.note(draft);
+    }
+
+    // -----------------------------------------------------------------------
     // Stage 7b: the mailbox walk
     // -----------------------------------------------------------------------
 
@@ -1957,6 +2230,17 @@ impl PassState {
                     self.uploads.retain(|queued| queued.endpoint.url != url);
                 }
             }
+            // A refused cross-family presence query is recorded (the event
+            // above) and costs nothing else. Deliberately: the credential a
+            // probe carries is post-only, so a relay that has never heard of
+            // this route answers `403 deposit_only` and an older one answers
+            // `404`, and neither says anything about the contact's card, the
+            // contact's mailbox, or the contact. Treating it as a rejection
+            // would let a relay upgrade schedule quietly write off every
+            // cross-family endpoint in an address book. The rate-limit branch
+            // ran before this one, so a `429` still ends the pass and still
+            // honours `Retry-After` (`RATE-01`).
+            ActionIntent::PresenceProbe { .. } => {}
             ActionIntent::Presence { config }
             | ActionIntent::Fetch { config, .. }
             | ActionIntent::Ack { config, .. } => {
@@ -2093,6 +2377,9 @@ impl PassState {
                 let url = upload.endpoint.url.clone();
                 self.uploads.retain(|queued| queued.endpoint.url != url);
             }
+            // See `apply_error`: a probe that did not answer is advisory work
+            // that did not happen, and nothing rests on it.
+            ActionIntent::PresenceProbe { .. } => {}
             ActionIntent::Presence { config }
             | ActionIntent::Fetch { config, .. }
             | ActionIntent::Ack { config, .. } => {
@@ -2216,6 +2503,9 @@ impl PassState {
                     .action(action_id)
                     .count("status", i64::from(result.status)),
                 );
+            }
+            ActionIntent::PresenceProbe { probe } => {
+                self.apply_presence_probe(probe, action_id, result);
             }
             ActionIntent::Fetch {
                 config,
@@ -2638,6 +2928,9 @@ impl PassState {
             config.presence_done = true;
         }
         self.config_index = self.configs.len();
+        // Advisory work does not outlive a refusal either: RATE-01 ends every
+        // remaining network stage, and the cross-family queries are in one.
+        self.probe_index = self.probes.len();
         self.stopped_at = Some(self.stage);
         self.stage = CoreRelayStage::CommitEvidence;
 
@@ -2857,6 +3150,9 @@ impl PassState {
     fn actor_of(&self, intent: &ActionIntent) -> Option<String> {
         match intent {
             ActionIntent::Upload(_) => None,
+            ActionIntent::PresenceProbe { probe } => {
+                self.probes.get(*probe).and_then(|p| p.actor.clone())
+            }
             ActionIntent::Presence { config }
             | ActionIntent::Fetch { config, .. }
             | ActionIntent::Ack { config, .. } => {

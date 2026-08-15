@@ -179,6 +179,19 @@ const CONTRACT: &[Invariant] = &[
         ),
     },
     Invariant {
+        id: "PRESENCE-01",
+        statement: "A cross-family presence query is answered coarsely and charged to its own \
+                    tight per-credential allowance; it can never spend the queried family's \
+                    request or byte budget, and a lapsed or suspended family answers nothing.",
+        owner: Owner::Core(
+            "relayd/src/lib.rs presence bucket and coarsening, with relayd/tests/e2e_presence.rs \
+             covering the per-credential cap, Retry-After, the paired budget-separation \
+             assertion, the suspended refusal and the coarse-vs-precise split; \
+             core/src/session/relay_pass.rs cross-family probe budget, cadence and rest, with \
+             core/tests/relay_pass_replay.rs driving them",
+        ),
+    },
+    Invariant {
         id: "PROGRESS-01",
         statement: "A continuation must strictly advance a cursor or strictly increase a future \
                     deadline; unchanged-state reschedule loops are forbidden.",
@@ -2547,7 +2560,12 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // and `relay_pass_replay.rs`), none of which is a JSONL replay fixture.
     // EVICT-01 is likewise a local admission invariant: its executable
     // incidents are small-budget SQLite tests in `store.rs`, not a relay-pass
-    // transcript.
+    // transcript. PRESENCE-01 is half a server rule and half a client cadence
+    // rule: the server half is enforced and tested in relayd
+    // (`relayd/tests/e2e_presence.rs`), which produces no transcript at all,
+    // and the client half is driven in `relay_pass_replay.rs` against a
+    // scripted relay. A JSONL incident would be a third statement of the
+    // cadence with no field trace behind it.
     const NO_FIXTURE_NEEDED: &[&str] = &[
         "ACK-01",
         "ACK-02",
@@ -2558,6 +2576,7 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         "UI-01",
         "DEDUP-01",
         "EVICT-01",
+        "PRESENCE-01",
     ];
 
     let mut covered: BTreeMap<String, Vec<&str>> = BTreeMap::new();

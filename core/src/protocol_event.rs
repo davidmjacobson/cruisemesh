@@ -273,6 +273,7 @@ pub const PROTOCOL_INVARIANT_IDS: &[&str] = &[
     "LIVE-01",
     "MARK-01",
     "PAGE-01",
+    "PRESENCE-01",
     "PROGRESS-01",
     "QUEUE-01",
     "RATE-01",
