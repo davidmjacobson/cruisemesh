@@ -59,6 +59,7 @@ of it: the gap is now countable.
 | `LIVE-01` | Every pass terminates inside its declared request, envelope, byte, and time/yield budgets. | core | `core/src/session/relay_pass.rs` declares the budgets and carries them in every summary; `core/tests/relay_pass_replay.rs` drives a real pass against four hostile relays (endless mail, a cursor that never moves, silence, blanket rejection) and every incident fixture |
 | `PROGRESS-01` | A continuation must strictly advance a frontier/work cursor or strictly increase a future deadline/backoff. Unchanged-state reschedule loops are forbidden. | core | `core/src/relay_cursor.rs` walk-budget yield plus `core/src/session/relay_pass.rs`, which can only emit a continuation carrying a `CoreRelayProgressReason`; `core/tests/relay_pass_replay.rs` gathers the continuations several passes produce and checks the rule across all of them |
 | `MARK-01` | A successfully relay-uploaded carried row is durably marked before the pass ends; the marker survives restart and suppresses repeat upload for its lifetime. | core | `core/src/store.rs` upload-marker tests; index re-asserts first-writer-wins |
+| `FANOUT-01` | A group-addressed authored row is posted as one row per member, to one mailbox chosen with both endpoint brakes. The envelope is marked relay-posted only once every member it owes has landed durably, and the members that landed are remembered per member, so a partial fan-out resumes with the remainder rather than re-posting the set. | core | `core/src/session/relay_pass.rs` upload planning + `core/src/store.rs` fan-out markers; `core/tests/relay_pass_replay.rs` drives full, partial, excluded-member and nowhere-to-post fan-outs against a real pass |
 | `WM-01` | Receipt repair has a reachable, bounded path from every supported stored state; a peer watermark of zero cannot permanently gate repair. | hoist-pending | shell repair planners |
 | `SPRAY-01` | Carried-first work toward one peer is bounded per encounter **in bytes as well as in rows**, and re-offers to the same peer are rate-gated, so a large carrier cannot starve receive work or trip an OS watchdog. | core | `core/src/spray_policy.rs` owns cadence, identical-set suppression, the three per-encounter byte budgets, a per-link burst allowance, and the receipt-quiet backoff (#280); both shells consult it and hold no spray constant of their own |
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
@@ -272,6 +273,35 @@ re-upload storm that put a real device at hundreds of posts per minute
 against its own family's rate bucket (#222). Markers are first-writer-wins,
 and they are cleared wholesale only when the destination mailbox itself
 changes.
+
+#### `FANOUT-01` — a group message is one row per member, or it is lost
+
+Group text is addressed to the group id, and nobody polls under a group's
+hint. A member finds their copy under their own daily recipient hint, the same
+one 1:1 mail uses, so a group envelope has to be decomposed into one row per
+member before it is posted — the fan-out
+(`specs/group-relay-durability.md` §4.2). A lane that posts the envelope
+whole posts one row nobody reads, which is the shape #140 fixed.
+
+Three parts, and the third is the one that is new here:
+
+- **One mailbox.** Every member's row goes to a single relay, chosen by
+  `core_group_fanout_relay_target`, which reads both endpoint brakes. A member
+  resting for silence contributes no fallback, and when nothing else resolves
+  the answer is to post nothing this pass rather than to put a cross-family
+  group's mail in our own mailbox.
+- **All or nothing for the terminal marker.** `relay_posted_at` is terminal
+  and it is one field for the whole envelope, so it may only be stamped once
+  every member the envelope owes has a row that landed. Blocked members are
+  excluded from the fan-out and are therefore not owed one — otherwise a
+  blocked member would hold the envelope open forever.
+- **Per-member resume.** Which members landed is recorded durably, keyed by
+  mailbox. A pass that posts four rows of six and then loses the relay leaves
+  the remaining two eligible next pass and the four already landed
+  ineligible. Without that record the only safe answer to a partial failure is
+  to re-post the whole set, so one member's failing row costs every other
+  member a repeat post on every pass, indefinitely. Like `MARK-01`'s marker,
+  this gates re-posting only: it never authorizes a removal or an ack.
 
 #### `WM-01` — repair must always have a way out
 
@@ -797,7 +827,8 @@ them; the decisions and their reasons are in the table there.
    it rides out in this same pass. Idempotent, so a periodic poll re-entering
    here costs nothing.
 3. **Upload receipts.**
-4. **Upload locally authored rows.**
+4. **Upload locally authored rows,** decomposing a group-addressed row into
+   one row per member first (`FANOUT-01`).
 5. **Upload carried rows,** writing the durable upload marker on success
    (`MARK-01`).
 6. **Decide hint-triggered rewalk.** If the hint source set changed, drop
@@ -847,20 +878,34 @@ finding another one is a finding, not a failure.
 | What a presence failure costs | swallowed and logged; only a family rate limit escapes, so presence never marks the config faulted | recorded against the config like any other fault, and the walk still runs afterwards | **C0 — resolved toward iOS.** `SILENCE-01` needs same-pass evidence, and a swallowed failure destroys it: a config whose presence failed and whose walk then succeeded is *not* silent, and one where both failed is stronger evidence than the walk alone, but swallowing made the two indistinguishable. Recording never skips the walk on either reading. C1/C2 migrate Android |
 | When the quiet window is committed after a 429 | committed inside the failing request, as `max(existing, now + delay)`, so an earlier longer window survives a later shorter one | accumulated as `max` across the pass and committed once at the end, overwriting whatever was there | **C0 — resolved toward Android.** The window is a floor a later, shorter one cannot lower, which is what `RATE-01` says it is, and it exists from the refusal onward rather than from the end. `CoreRelayPassSummary::quiet_until_ms` is set the moment the refusal is seen, so a pass *cancelled* afterwards — an app backgrounded mid-pass — still reports it, where an accumulate-at-the-end pass reports nothing. Scope, stated plainly: this does **not** survive process death. Nothing in core persists the window; it lives in the pass object and in the summary, and Android's `rateLimitedUntilMs` is an in-memory field too, so neither shell has that property today. Making the floor durable is adapter work — a shell persisting the summary — and belongs to C1/C2 with the migration |
 | Where presence is announced and queried | per poll config: a contact on another family's relay has their hint queried on that relay | own mailbox only | **C0 — resolved toward iOS, and it costs something.** Announcing this device's hints into another family's mailbox tells that family we exist, which is a privacy cost with no visible benefit; the query half carries no such cost but is dropped with it, so a contact reachable only through another family's relay stops resolving a last-seen time once the shells migrate. Recorded here rather than left in a code comment because it was found while writing `relay_pass.rs` and was not in this table before. C3 decides whether to reinstate the query alone before it migrates the shells |
-| What a group-addressed authored row costs | one row per member: `RelaySyncEngine.kt` reads the group, builds the per-member fan-out rows with `coreGroupFanoutRows`, posts all of them, and marks the envelope relay-posted only when every row landed | the same fan-out in `MeshController.swift` | **C3 — open, and it blocks defaulting the core engine.** `session/relay_pass.rs`'s upload lanes post one row to one resolved mailbox and do not decompose a group-addressed row at all, so a group envelope would go out as a single group-hinted row to this device's own mailbox — the shape #140 fixed, where the members never receive it. Found by C1 while wiring the driver. The whole-pass engine selection therefore defaults to legacy, and the migration canary counts every group-addressed row as *unshadowed* rather than comparing it, so a clean report is never read as a claim about groups |
-| What a contact endpoint that has gone silent costs an upload | two separate brakes: a *rejection* streak (the card is wrong) falls back to this device's own mailbox, while *silence* (no answer at all) declines to post at all, because falling back would put a cross-family contact's mail in a mailbox they never read and `relay_posted_at` is terminal | the same two brakes in `RelaySweepSession.swift` | **C3 — open.** `CoreRelayContactConfig` carries one `endpoint_usable` flag, so both brakes have to collapse onto it and the two answers cannot both be expressed: false means "ignore the card, use our own mailbox", which is the rejection answer applied to the silence case. C1 maps `usable && answering` onto the one flag and lets the canary report the difference as a destination or selection mismatch rather than hiding it; C3 owns the fix, and it is a second reason the core engine is not the default |
-| Whether an unpostable recipient's rows consume a batch slot | no: `unpostableRecipients` is passed into the store query, so those rows are never selected and the batch is spent on rows that can actually move | no such exclusion; the rows are selected and skipped | **C3 — open.** `session/relay_pass.rs` passes an empty skip list to both upload queries, so under the core engine one unreachable contact can refill the batch every pass — the starvation the Android exclusion exists to prevent. The canary reports it as `shadow_selection_skip_differs` |
+| What a group-addressed authored row costs | one row per member: `RelaySyncEngine.kt` reads the group, builds the per-member fan-out rows with `coreGroupFanoutRows`, posts all of them, and marks the envelope relay-posted only when every row landed | the same fan-out in `MeshController.swift` | **C3 — resolved toward the shells, and one step past them.** `session/relay_pass.rs` now decomposes a group-addressed authored row into per-member rows at upload planning, picks the single destination mailbox with `core_group_fanout_relay_target` (so a member resting for silence still contributes no fallback), and stamps `relay_posted_at` only when every member the envelope owes has landed. It goes one step further than either shell: which members landed is recorded durably per member and per mailbox, so a partial fan-out resumes with the remainder instead of re-posting the whole set — the shells re-post all of it, which costs a twelve-member group twelve posts a pass for as long as one row keeps failing. Blocked members are excluded and are therefore not owed a row, matching every other outbound fan-out in the codebase. Pinned by `FANOUT-01` |
+| What a contact endpoint that has gone silent costs an upload | two separate brakes: a *rejection* streak (the card is wrong) falls back to this device's own mailbox, while *silence* (no answer at all) declines to post at all, because falling back would put a cross-family contact's mail in a mailbox they never read and `relay_posted_at` is terminal | the same two brakes in `RelaySweepSession.swift` | **C3 — resolved toward the shells.** `CoreRelayContactConfig` now carries both brakes as `endpoint_usable` (rejection) and `endpoint_answering` (silence), named and documented after `GroupRelayMember`'s pair, which already had to keep them apart for the same reason. The upload lanes answer them differently: a rejection resolves through `resolved_contact_delivery_relay` to our own mailbox, and silence resolves to nothing at all, which posts no row and writes no terminal marker, so the row stays deliverable by a later pass and by the mesh. `endpoint_answering` defaults to true, so a caller still folding `usable && answering` into the one flag keeps its present behaviour rather than silently acquiring the fallback for a resting endpoint; teaching the two adapter call sites the difference is the follow-up |
+| Whether an unpostable recipient's rows consume a batch slot | no: `unpostableRecipients` is passed into the store query, so those rows are never selected and the batch is spent on rows that can actually move | no such exclusion; the rows are selected and skipped | **C3 — resolved toward Android.** `session/relay_pass.rs` computes the same set — every contact for whom the two brakes resolve no destination — and passes it into both upload queries. The batch is bounded, so an empty skip list is not merely wasteful: one unreachable contact's rows refill it every pass while live rows behind them never move |
 | Where the pending-rerun decision is made | explicit at the rerun point (`relayRerunAction`), which re-arms the coalesced retry timer for the remaining window | implicit: the pending nudge re-enters the front door, which drops it, and the retry armed when the 429 was recorded is what actually fires | B0 — resolved toward Android: both shells now call `core_relay_rerun_action` at the rerun point, so the deferral is a decision rather than a side effect of two gates agreeing |
 | What seeds the anti-lockstep jitter | `ByteArray.contentHashCode()` — `java.util.Arrays.hashCode`, a 31-multiply over the user id | a hand-written FNV-1a over the user id, added because Swift's `hashValue` is process-randomized | B0 — resolved: neither. Core derives it from the public user id under a BLAKE2b context, and no shell computes a hash for this any more |
 
-The three rows marked **C3 — open** are what package C1 gained by using this
-table the same way. Nobody had recorded any of them as a difference, and all
-three surfaced only because writing an adapter forced someone to answer what
-the core engine would actually do with a group-addressed row, an endpoint
-resting for silence, and a recipient this device cannot post to. Two of them
-would lose or misroute mail if the engine selection defaulted to core today,
-which is why it does not, and why the canary counts what it cannot speak for
-rather than staying quiet about it.
+Three rows are what package C1 gained by using this table the same way. Nobody
+had recorded any of them as a difference, and all three surfaced only because
+writing an adapter forced someone to answer what the core engine would
+actually do with a group-addressed row, an endpoint resting for silence, and a
+recipient this device cannot post to. Two of them would have lost or misrouted
+mail had the engine selection defaulted to core, which is why it did not, and
+why the canary counted what it could not speak for rather than staying quiet
+about it.
+
+All three are now closed in core, and the closing is where they earned their
+keep. The group row became `FANOUT-01`, with a per-member resume neither shell
+has. The silence row became a second field on `CoreRelayContactConfig` rather
+than a comment explaining why one flag had to mean two things. The skip list
+became the same exclusion Android already had. They stay in the table with
+their history, which is the point of the table.
+
+What closing them does not by itself do is make core the default engine. The
+presence-scope row below is still open, the canary still has to run clean over
+real passes, and the two adapter call sites still fold both brakes into one
+flag until they are taught the difference — until then a resting endpoint
+reaches core as a rejection, exactly as it did before, which is the behaviour
+those shells ship today rather than a regression.
 
 The presence-scope row is the one this table gained by being used: nobody
 recorded it as a difference, and it only surfaced because writing a single
@@ -993,6 +1038,7 @@ bytes.
 | `ack-fail-after-consume.jsonl` | durable consume, then a failed ack, then a restart | `TXN-01`, `CURSOR-01`, `IDEMP-01` | yes |
 | `oversize-shrink.jsonl` | a page over the response cap, retried smaller | `PAGE-01`, `LIVE-01` | yes |
 | `contact-silence-no-proof.jsonl` | a silent contact endpoint with no proof of own connectivity | `SILENCE-01` | yes |
+| `group-fanout-partial.jsonl` | a group message posted whole to one mailbox, then a fan-out re-posted in full every pass because no member's landing was remembered (#140) | `FANOUT-01`, `LIVE-01` | yes |
 | `pending-rerun-during-backoff.jsonl` | a pending nudge trying to start a pass inside the quiet window | `RATE-01`, `PROGRESS-01` | yes |
 | `zombie-outbound-queue.jsonl` | an outbound queue that never retires anything (#283) | `QUEUE-01`, `LIVE-01` | yes |
 
@@ -1064,7 +1110,7 @@ than left to be discovered.
 | `action_result_stale_ignored` | a duplicate, late or wrong-pass result changed nothing | `session/relay_pass.rs` (dark) | `IDEMP-01` |
 | `budget_yield` | a pass stopped inside a declared budget rather than at the end of its work | `session/relay_pass.rs` (dark) | `LIVE-01`, `PROGRESS-01` |
 | `carried_row_evicted` | low-trust foreign rows were removed to enforce carry byte budgets | `store.rs` carry admission and migration | `EVICT-01`, `CARRY-01` |
-| `carried_row_marked` | a relay-uploaded carried row was durably marked | `session/relay_pass.rs` (dark), for the announce-time wholesale clear; C3 adds the per-row record | `MARK-01`, `CARRY-01` |
+| `carried_row_marked` | a relay-uploaded carried row was durably marked | `session/relay_pass.rs` (dark), for the announce-time wholesale clear (which now also clears the fan-out markers, since those name a mailbox too) | `MARK-01`, `CARRY-01` |
 | `carry_admission_rejected` | a new carried row could not fit without deleting admitted family mail | `store.rs` carry admission | `EVICT-01`, `CARRY-01` |
 | `continuation_scheduled` | a pass scheduled more work, with its progress reason | `session/relay_pass.rs` (dark) | `PROGRESS-01` |
 | `endpoint_recovered` | a contact endpoint answered again and its streak cleared | `store.rs` `clear_contact_relay_unreachable` | `SILENCE-01` |

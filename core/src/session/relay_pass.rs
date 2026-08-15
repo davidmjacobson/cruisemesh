@@ -194,10 +194,11 @@ use crate::relay_cursor::{
 };
 use crate::relay_status::{relay_classify_http_error, relay_retry_after_ms, CoreRelayFault};
 use crate::relay_wire::{
-    relay_build_fetch_path, relay_decode_fetch_page, relay_encode_ack_request,
-    relay_encode_post_envelope, relay_encode_presence_request, relay_fetch_batch_limit,
-    relay_fetch_shrunk_limit, relay_max_response_bytes, relay_validate_envelope_sizes,
-    resolved_contact_poll_relay, resolved_contact_relay, RelayEndpoint,
+    core_group_fanout_relay_target, relay_build_fetch_path, relay_decode_fetch_page,
+    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
+    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
+    relay_validate_envelope_sizes, resolved_contact_delivery_relay, resolved_contact_poll_relay,
+    resolved_contact_relay, GroupRelayMember, RelayEndpoint,
 };
 use crate::session::relay_policy::{
     core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_relay_pass_health,
@@ -320,14 +321,51 @@ pub struct CoreRelayEndpointConfig {
 /// resolution rules ([`resolved_contact_relay`], [`resolved_contact_poll_relay`])
 /// are core policy, and handing the pass a pre-resolved endpoint would move
 /// them back into whichever shell built the plan.
+///
+/// # Two brakes, not one
+///
+/// The two health flags are separate for the reason
+/// [`crate::GroupRelayMember`]'s are, and this config carried only the first
+/// one until the upload lanes needed both. An endpoint can be out of service
+/// in two ways that justify opposite answers:
+///
+/// * **Rejection** — the endpoint answered, authoritatively, that it will not
+///   serve us. The card is wrong. Falling back to this device's own mailbox
+///   is right: a `401` proves nothing about our own relay, and when both
+///   sides have since moved to the same host it really delivers.
+/// * **Silence** — nothing answered at all. Falling back would put a
+///   cross-family contact's mail in a mailbox they never read, and
+///   `relay_posted_at` is terminal, so that is a permanent misroute rather
+///   than a retry. The right answer is to post nothing to that recipient this
+///   pass and keep waiting; the row stays queued for a later pass and for the
+///   mesh paths.
+///
+/// Collapsed onto one flag, the silence case has to borrow the rejection
+/// answer, which is exactly the misroute. So both are here, and
+/// [`shadow_upload_endpoint_for`] treats them distinctly.
+///
+/// `endpoint_answering` carries a default so a caller that has not yet been
+/// taught the difference keeps compiling and keeps its present behaviour
+/// (whatever it folded into `endpoint_usable`), rather than silently
+/// acquiring the fallback for a resting endpoint.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreRelayContactConfig {
     pub user_id: Vec<u8>,
     pub relay_url: Option<String>,
     pub relay_token: Option<String>,
-    /// False when this device has already written the endpoint off. Such a
-    /// contact is not polled and cannot accrue more silence.
+    /// False once this contact's card endpoint has been written off for
+    /// authoritative *rejections*
+    /// ([`crate::core_contact_relay_endpoint_usable`]). Such a contact is not
+    /// polled and cannot accrue more silence, and an upload for them falls
+    /// back to this device's own mailbox.
     pub endpoint_usable: bool,
+    /// False while this contact's card endpoint is resting because it stopped
+    /// *answering*
+    /// ([`crate::core_contact_relay_unreachable_endpoint_usable`]). Such a
+    /// contact is not polled either, and an upload for them is declined
+    /// outright this pass rather than redirected.
+    #[uniffi(default = true)]
+    pub endpoint_answering: bool,
 }
 
 /// Everything one pass needs that is not already in the store.
@@ -597,6 +635,26 @@ struct PendingUpload {
     sealed: Vec<u8>,
     expiry_ms: i64,
     endpoint: RelayEndpoint,
+    /// Set when this row is one member's copy of a group-addressed envelope's
+    /// fan-out. `None` for every 1:1, receipt and carried row.
+    fanout: Option<FanoutRow>,
+}
+
+/// What one member's fan-out row needs to know to record its own landing and
+/// to recognise the moment the whole envelope has landed.
+///
+/// `msg_id` on the [`PendingUpload`] is the *row's* deterministic fan-out id
+/// ([`crate::core_group_fanout_rows`]); the envelope's own id is here, because
+/// that is what `relay_posted_at` is keyed on and stamping it early would
+/// retire a send that most of the group never received.
+struct FanoutRow {
+    envelope_msg_id: Vec<u8>,
+    member_user_id: Vec<u8>,
+    /// How many members this envelope owes a landed row, after exclusions.
+    /// The envelope is marked posted when the durable marker set for this
+    /// mailbox reaches it — which is a count of *this and every earlier
+    /// pass's* successes, so a partial pass resumes rather than restarting.
+    members_owed: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1240,6 +1298,10 @@ impl PassState {
         let _ = self.store.prune_expired_outgoing_receipt_envelopes(now);
         let _ = self.store.prune_expired_carried(now);
         let _ = self.store.prune_expired_consumed_hidden_msg_ids(now);
+        // Fan-out markers outlive their envelope by nothing: once the envelope
+        // is posted in full, expired or pruned, the per-member record has no
+        // question left to answer.
+        let _ = self.store.prune_relay_fanout_markers();
     }
 
     fn run_announce(&mut self) {
@@ -1253,6 +1315,9 @@ impl PassState {
             .store
             .clear_carried_relay_upload_markers()
             .unwrap_or_default();
+        // The fan-out markers name a mailbox too, and for the same reason.
+        let cleared =
+            cleared.saturating_add(self.store.clear_relay_fanout_markers().unwrap_or_default());
         let at_ms = self.now_ms;
         self.note(
             ProtocolEventDraft::new(
@@ -1275,12 +1340,18 @@ impl PassState {
         shadow_upload_endpoint_for(&self.plan.contacts, self.plan.own.as_ref(), recipient)
     }
 
+    /// The recipients no upload query should spend a batch slot on this pass.
+    fn skip_recipients(&self) -> Vec<Vec<u8>> {
+        unpostable_recipients(&self.plan.contacts, self.plan.own.as_ref())
+    }
+
     fn load_receipt_uploads(&mut self) {
         let limit = u64::from(self.plan.budgets.max_receipt_uploads);
         let now = self.now_ms;
+        let skip = self.skip_recipients();
         let Ok(rows) = self
             .store
-            .pending_relay_outgoing_receipt_envelopes(limit, now, Vec::new())
+            .pending_relay_outgoing_receipt_envelopes(limit, now, skip)
         else {
             return;
         };
@@ -1296,20 +1367,40 @@ impl PassState {
                 sealed: row.sealed,
                 expiry_ms: row.expiry,
                 endpoint,
+                fanout: None,
             });
         }
     }
 
     fn load_authored_uploads(&mut self) {
+        let budget = self.plan.budgets.max_authored_uploads as usize;
         let limit = u64::from(self.plan.budgets.max_authored_uploads);
         let now = self.now_ms;
+        let skip = self.skip_recipients();
         let Ok(rows) = self
             .store
-            .pending_relay_outbound_envelopes(limit, now, Vec::new())
+            .pending_relay_outbound_envelopes(limit, now, skip)
         else {
             return;
         };
+        // Counted in *rows on the wire*, not in queue entries: a group
+        // envelope becomes one row per member, and a lane budget that counted
+        // envelopes would let one twelve-member group spend twelve posts
+        // while claiming to have spent one.
+        let mut queued = 0usize;
         for row in rows {
+            if queued >= budget {
+                break;
+            }
+            // A group-addressed row carries `recipient_user_id = group_id`,
+            // so it is nobody's contact entry. Decompose it; anything else is
+            // one row to one mailbox as before.
+            if !self.is_contact(&row.recipient_user_id) {
+                if let Ok(Some(group)) = self.store.get_group(row.recipient_user_id.clone()) {
+                    queued += self.load_group_fanout(&row, &group, budget - queued);
+                    continue;
+                }
+            }
             let Some(endpoint) = self.upload_endpoint_for(&row.recipient_user_id) else {
                 continue;
             };
@@ -1321,8 +1412,140 @@ impl PassState {
                 sealed: row.sealed,
                 expiry_ms: row.expiry,
                 endpoint,
+                fanout: None,
             });
+            queued += 1;
         }
+    }
+
+    fn is_contact(&self, user_id: &[u8]) -> bool {
+        self.plan
+            .contacts
+            .iter()
+            .any(|contact| contact.user_id == user_id)
+    }
+
+    /// Decompose one group-addressed envelope into its per-member rows, and
+    /// queue the ones that have not already landed. Returns how many rows were
+    /// queued.
+    ///
+    /// Three rules, all of them the legacy engine's:
+    ///
+    /// * **One mailbox.** Group text is addressed to a group, not to a person,
+    ///   so [`core_group_fanout_relay_target`] picks a single mailbox and
+    ///   every row goes there. A member resting for silence contributes no
+    ///   fallback, and if that leaves nowhere to post, nothing is posted this
+    ///   pass — the envelope stays queued and the mesh paths still carry it.
+    /// * **All or nothing for `relay_posted_at`.** The envelope is marked
+    ///   posted only once every member's row has landed. What is new here is
+    ///   that the *landed* ones are remembered durably, so a partial pass
+    ///   resumes with the remainder instead of re-posting the whole set.
+    /// * **Blocked members get no row.** Every other outbound fan-out in this
+    ///   codebase drops blocked users before it sends, and a relay row is a
+    ///   send. An excluded member is not owed a landing, so their absence
+    ///   cannot hold the envelope open forever.
+    fn load_group_fanout(
+        &mut self,
+        envelope: &crate::store::OutboundEnvelope,
+        group: &crate::Group,
+        room: usize,
+    ) -> usize {
+        let own = self.plan.own.clone();
+        let members: Vec<GroupRelayMember> = group
+            .member_user_ids
+            .iter()
+            .filter_map(|member_id| {
+                let contact = self
+                    .plan
+                    .contacts
+                    .iter()
+                    .find(|candidate| &candidate.user_id == member_id)?;
+                Some(GroupRelayMember {
+                    relay_url: contact.relay_url.clone(),
+                    relay_token: contact.relay_token.clone(),
+                    endpoint_usable: contact.endpoint_usable,
+                    endpoint_answering: contact.endpoint_answering,
+                })
+            })
+            .collect();
+        let Some(endpoint) = core_group_fanout_relay_target(
+            members,
+            own.as_ref().map(|o| o.url.clone()),
+            own.as_ref().map(|o| o.token.clone()),
+        ) else {
+            return 0;
+        };
+
+        let recipients: Vec<Vec<u8>> = group
+            .member_user_ids
+            .iter()
+            .filter(|member_id| {
+                !self
+                    .store
+                    .is_user_blocked((*member_id).clone())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if recipients.is_empty() {
+            return 0;
+        }
+        let members_owed = recipients.len();
+        let already = self
+            .store
+            .relay_fanout_posted_members(envelope.msg_id.clone(), endpoint.url.clone())
+            .unwrap_or_default();
+        // Every row was already accepted on an earlier pass but the envelope
+        // was never stamped — a pass that died between the last row and the
+        // mark. Stamp it now rather than re-posting anything.
+        if recipients
+            .iter()
+            .all(|member| already.iter().any(|posted| posted == member))
+        {
+            let now = self.now_ms;
+            if self
+                .store
+                .mark_outbound_envelope_relay_posted(envelope.msg_id.clone(), now)
+                .unwrap_or(false)
+            {
+                self.progress.uploads_marked = true;
+            }
+            return 0;
+        }
+
+        let rows = crate::core_group_fanout_rows(
+            envelope.msg_id.clone(),
+            recipients.clone(),
+            envelope.hop_ttl,
+            envelope.expiry,
+            envelope.sealed.clone(),
+            envelope.timestamp,
+        );
+        let mut queued = 0usize;
+        for (member_user_id, row) in recipients.into_iter().zip(rows) {
+            if queued >= room {
+                break;
+            }
+            if already.iter().any(|posted| posted == &member_user_id) {
+                continue;
+            }
+            self.uploads.push_back(PendingUpload {
+                lane: UploadLane::Authored,
+                msg_id: row.msg_id,
+                hop_ttl: row.hop_ttl,
+                recipient_hint: row.recipient_hint,
+                sealed: row.sealed,
+                expiry_ms: row.expiry,
+                endpoint: endpoint.clone(),
+                fanout: Some(FanoutRow {
+                    envelope_msg_id: envelope.msg_id.clone(),
+                    member_user_id,
+                    members_owed,
+                }),
+            });
+            queued += 1;
+        }
+        queued
     }
 
     fn load_carried_uploads(&mut self) {
@@ -1350,6 +1573,7 @@ impl PassState {
                     url: own.url.clone(),
                     token: own.token.clone(),
                 },
+                fanout: None,
             });
         }
     }
@@ -1421,7 +1645,12 @@ impl PassState {
         }
         let own = self.plan.own.clone();
         for contact in self.plan.contacts.clone() {
-            if !contact.endpoint_usable {
+            // Both brakes drop a contact out of the poll set, for the same
+            // reason: proxy-polling an endpoint that rejects us is pure
+            // waste, and polling one that is resting for silence both spends
+            // a request on a host that is not answering and would let the
+            // rest accrue more silence against itself.
+            if !contact.endpoint_usable || !contact.endpoint_answering {
                 continue;
             }
             // A deposit-class credential can post and nothing else, so an
@@ -1923,9 +2152,23 @@ impl PassState {
                     }
                     UploadLane::Authored => {
                         self.authored_uploads = self.authored_uploads.saturating_add(1);
-                        self.store
-                            .mark_outbound_envelope_relay_posted(upload.msg_id.clone(), self.now_ms)
-                            .unwrap_or(false)
+                        match &upload.fanout {
+                            // A group envelope's `relay_posted_at` is terminal
+                            // for every member at once, so it may only be
+                            // stamped when the last member's row has landed.
+                            // The per-member marker is written first and
+                            // durably, which is what lets the next pass resume
+                            // with the remainder instead of re-posting the
+                            // rows that already landed.
+                            Some(fanout) => self.mark_fanout_row(&upload.endpoint, fanout),
+                            None => self
+                                .store
+                                .mark_outbound_envelope_relay_posted(
+                                    upload.msg_id.clone(),
+                                    self.now_ms,
+                                )
+                                .unwrap_or(false),
+                        }
                     }
                     UploadLane::Carried => {
                         self.carried_uploads = self.carried_uploads.saturating_add(1);
@@ -2005,6 +2248,35 @@ impl PassState {
                 self.commit_page(config, page_next_cursor, true, rows);
             }
         }
+    }
+
+    /// Record one landed fan-out row, and stamp the envelope if that was the
+    /// last one owed. Returns whether anything durable changed.
+    fn mark_fanout_row(&mut self, endpoint: &RelayEndpoint, fanout: &FanoutRow) -> bool {
+        let now = self.now_ms;
+        let recorded = self
+            .store
+            .mark_relay_fanout_row_posted(
+                fanout.envelope_msg_id.clone(),
+                fanout.member_user_id.clone(),
+                endpoint.url.clone(),
+                now,
+            )
+            .unwrap_or(false);
+        let landed = self
+            .store
+            .relay_fanout_posted_members(fanout.envelope_msg_id.clone(), endpoint.url.clone())
+            .unwrap_or_default()
+            .len();
+        if landed < fanout.members_owed {
+            // Partial. Nothing terminal is written: the remaining members
+            // are still eligible next pass, and the ones counted here are not.
+            return recorded;
+        }
+        self.store
+            .mark_outbound_envelope_relay_posted(fanout.envelope_msg_id.clone(), now)
+            .unwrap_or(false)
+            || recorded
     }
 
     fn mark_answered(&mut self, config: usize) {
@@ -2645,28 +2917,67 @@ fn derive_pass_id(requested: &str) -> String {
 /// give rather than a second implementation's opinion of it. A live pass
 /// reaches it through [`PassState::upload_endpoint_for`].
 ///
-/// A card whose endpoint this device has already written off is worse than no
-/// card at all: [`resolved_contact_relay`] returns the contact endpoint
-/// unconditionally, so one dead field would beat a working alternative
-/// forever and the messages would never leave the queue. Skipping it falls
-/// through to our own, exactly as though the card had carried no relay fields
-/// — which is what `resolved_contact_delivery_relay` does, expressed here
-/// through the usability flag the plan already carries.
+/// A card whose endpoint this device has already written off for *rejections*
+/// is worse than no card at all: [`resolved_contact_relay`] returns the
+/// contact endpoint unconditionally, so one dead field would beat a working
+/// alternative forever and the messages would never leave the queue. Skipping
+/// it falls through to our own, exactly as though the card had carried no
+/// relay fields — which is what [`resolved_contact_delivery_relay`] does.
+///
+/// An endpoint resting for *silence* takes the other answer: `None`, meaning
+/// "post nothing to this recipient this pass". See
+/// [`CoreRelayContactConfig`] for why the two cannot share one answer. `None`
+/// writes no marker of any kind, so the row is queued exactly as it was and
+/// the mesh paths still carry it.
 pub(crate) fn shadow_upload_endpoint_for(
     contacts: &[CoreRelayContactConfig],
     own: Option<&CoreRelayEndpointConfig>,
     recipient: &[u8],
 ) -> Option<RelayEndpoint> {
-    let contact = contacts
+    let Some(contact) = contacts
         .iter()
         .find(|candidate| candidate.user_id == recipient)
-        .filter(|candidate| candidate.endpoint_usable);
-    resolved_contact_relay(
-        contact.and_then(|c| c.relay_url.clone()),
-        contact.and_then(|c| c.relay_token.clone()),
+    else {
+        // Not a contact of ours at all — a group id, or an invite recipient.
+        // Our own mailbox, as before.
+        return resolved_contact_relay(
+            None,
+            None,
+            own.map(|o| o.url.clone()),
+            own.map(|o| o.token.clone()),
+        );
+    };
+    if !contact.endpoint_answering {
+        return None;
+    }
+    resolved_contact_delivery_relay(
+        contact.relay_url.clone(),
+        contact.relay_token.clone(),
         own.map(|o| o.url.clone()),
         own.map(|o| o.token.clone()),
+        contact.endpoint_usable,
     )
+}
+
+/// Every recipient this pass cannot post to, so the upload queries never spend
+/// a batch slot on them.
+///
+/// Without this an unreachable contact's rows are selected, skipped, and
+/// selected again next pass: the batch is bounded, the query orders by
+/// recipient rank and then by age, and one contact with a deep queue and a
+/// dead endpoint can therefore refill it every pass while live rows behind
+/// them never move. The legacy Android engine's `unpostableRecipients`
+/// exclusion exists to prevent exactly that; this is the same set, computed
+/// from the same two brakes.
+pub(crate) fn unpostable_recipients(
+    contacts: &[CoreRelayContactConfig],
+    own: Option<&CoreRelayEndpointConfig>,
+) -> Vec<Vec<u8>> {
+    contacts
+        .iter()
+        .filter(|contact| shadow_upload_endpoint_for(contacts, own, &contact.user_id).is_none())
+        .map(|contact| contact.user_id.clone())
+        .collect()
 }
 
 /// The complete envelope-post request for one row, or `None` when the row

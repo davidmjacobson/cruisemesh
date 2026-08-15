@@ -195,6 +195,17 @@ const CONTRACT: &[Invariant] = &[
         owner: Owner::Core("core/src/store.rs carried-upload-marker tests"),
     },
     Invariant {
+        id: "FANOUT-01",
+        statement: "A group-addressed authored row is posted one row per member to one mailbox; \
+                    the envelope is marked relay-posted only when every member it owes has \
+                    landed, and landed members are remembered so a partial fan-out resumes.",
+        owner: Owner::Core(
+            "core/src/session/relay_pass.rs group fan-out upload planning + core/src/store.rs \
+             per-member fan-out markers; core/tests/relay_pass_replay.rs drives full, partial, \
+             excluded-member and nowhere-to-post fan-outs",
+        ),
+    },
+    Invariant {
         id: "WM-01",
         statement: "Receipt repair is reachable and bounded from every supported stored state; a \
                     zero peer watermark cannot permanently gate it.",
@@ -2144,6 +2155,7 @@ const FIXTURES: &[&str] = &[
     "ack-fail-after-consume",
     "carry-storm",
     "contact-silence-no-proof",
+    "group-fanout-partial",
     "oversize-shrink",
     "pending-rerun-during-backoff",
     "short-page",
