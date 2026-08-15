@@ -37,8 +37,60 @@ jobs:
     env:
       # Secrets can't be used in step `if:` directly; surface presence as a flag.
       IOS_ENABLED: ${{ secrets.IOS_DIST_CERT_P12_B64 != '' && secrets.ASC_API_KEY_P8 != '' }}
+      # Plain-text record of what this run produced, uploaded as a run artifact
+      # at the end. tools/testflight_distribute.py appends the App Store Connect
+      # identifiers it resolves to the same file (it reads this variable itself).
+      CRUISEMESH_PROVENANCE_FILE: ${{ github.workspace }}/release-provenance.txt
     steps:
       - uses: actions/checkout@v7
+
+      # --- Release provenance ---------------------------------------------
+      # Records what this run shipped: tag, commit, version, the checksum of the
+      # UniFFI Swift bindings that were compiled in, the IPA hash and the App
+      # Store Connect identifiers. Purely additive, and every provenance step
+      # carries continue-on-error so a release can never fail because a note
+      # about it could not be written. Never put continue-on-error on a step
+      # that actually gates the release.
+      - name: Start provenance record
+        continue-on-error: true
+        run: |
+          {
+            echo "# Release"
+            echo "workflow: ${{ github.workflow }}"
+            echo "tag: ${{ github.ref_name }}"
+            echo "commit: ${{ github.sha }}"
+            echo "run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "recorded_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "## iOS release provenance"
+            echo
+            echo "- **tag**: \`${{ github.ref_name }}\`"
+            echo "- **commit**: \`${{ github.sha }}\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Android proves its checked-in bindings match the native library it just
+      # built (core/build-android.sh stamps both, verifyNativeBindingsSync
+      # checks the stamp); iOS has no equivalent gate. Hashing the checked-in
+      # Swift bindings here, and again after core/build-ios.sh regenerates them,
+      # at least records exactly which bindings shipped -- and says out loud
+      # when the committed ones were stale.
+      - name: Hash checked-in iOS bindings
+        id: bindings
+        continue-on-error: true
+        run: |
+          gen="ios/CruiseMesh/Generated"
+          listing="$(cd "$gen" && find . -type f | LC_ALL=C sort | xargs shasum -a 256)"
+          combined="$(printf '%s\n' "$listing" | shasum -a 256 | awk '{print $1}')"
+          echo "checked_in=$combined" >> "$GITHUB_OUTPUT"
+          {
+            echo "# iOS bindings (checked in)"
+            echo "$listing"
+            echo "combined_sha256: $combined"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
 
       - name: Select latest stable Xcode
         uses: maxim-lobanov/setup-xcode@v1
@@ -56,6 +108,35 @@ jobs:
 
       - name: Build core + Swift bindings + xcframework
         run: bash core/build-ios.sh
+
+      - name: Hash rebuilt iOS bindings
+        continue-on-error: true
+        run: |
+          gen="ios/CruiseMesh/Generated"
+          listing="$(cd "$gen" && find . -type f | LC_ALL=C sort | xargs shasum -a 256)"
+          combined="$(printf '%s\n' "$listing" | shasum -a 256 | awk '{print $1}')"
+          checked_in="${{ steps.bindings.outputs.checked_in }}"
+          if [ -z "$checked_in" ]; then
+            verdict="checked-in bindings hash was not recorded, nothing to compare"
+          elif [ "$combined" = "$checked_in" ]; then
+            verdict="matches the checked-in bindings"
+          else
+            verdict="DIFFERS from the checked-in bindings ($checked_in): the committed Swift bindings were stale"
+          fi
+          {
+            echo "# iOS bindings (shipped)"
+            echo "$listing"
+            echo "combined_sha256: $combined"
+            echo "vs_checked_in: $verdict"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "### iOS Swift bindings"
+            echo
+            echo "- **combined sha256**: \`$combined\`"
+            echo "- $verdict"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Generate Xcode project
         working-directory: ios
@@ -80,6 +161,20 @@ jobs:
           echo "marketing=$marketing" >> "$GITHUB_OUTPUT"
           echo "build=$build" >> "$GITHUB_OUTPUT"
           echo "Version $marketing ($build)"
+
+      - name: Record version in provenance
+        continue-on-error: true
+        run: |
+          {
+            echo "# Version"
+            echo "marketing_version: ${{ steps.version.outputs.marketing }}"
+            echo "build_number: ${{ steps.version.outputs.build }}"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "- **version**: \`${{ steps.version.outputs.marketing }} (${{ steps.version.outputs.build }})\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Unsigned archive; the distribution signing is applied at export using the
       # imported cert + profile.
@@ -158,6 +253,32 @@ jobs:
             --apiIssuer "$ASC_API_ISSUER_ID"
           echo "Uploaded build ${{ steps.version.outputs.build }} (${{ steps.version.outputs.marketing }}) to TestFlight."
 
+      # The uploaded IPA is the thing testers install; hash the exact file that
+      # altool sent. Runs even if the upload step failed, so a failed run still
+      # says what it built.
+      - name: Record IPA checksum
+        if: always() && env.IOS_ENABLED == 'true'
+        continue-on-error: true
+        run: |
+          path="ios/build/export/CruiseMesh.ipa"
+          [ -f "$path" ] || exit 0
+          sha="$(shasum -a 256 "$path" | awk '{print $1}')"
+          bytes="$(wc -c < "$path" | tr -d ' ')"
+          {
+            echo "# IPA"
+            echo "file: CruiseMesh.ipa"
+            echo "bytes: $bytes"
+            echo "sha256: $sha"
+            echo
+          } >> "$CRUISEMESH_PROVENANCE_FILE"
+          {
+            echo "### IPA"
+            echo
+            echo "- **bytes**: \`$bytes\`"
+            echo "- **sha256**: \`$sha\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # Wait for processing, add to the beta group, submit for beta review.
       # continue-on-error so a slow queue never reds a landed release -- the
       # step writes its own verdict to the run summary instead. That only works
@@ -205,3 +326,15 @@ jobs:
         run: |
           rm -rf "$HOME/private_keys"
           rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/CruiseMesh-CI.mobileprovision" || true
+
+      # if: always() so the partial record still lands when an earlier step
+      # failed -- that is exactly the run whose provenance is worth reading.
+      - name: Upload provenance artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-provenance-${{ github.ref_name }}
+          path: ${{ github.workspace }}/release-provenance.txt
+          if-no-files-found: ignore
+          retention-days: 90

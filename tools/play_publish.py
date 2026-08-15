@@ -10,13 +10,19 @@ stack, which lags new Python releases). Never prints secrets. Exits non-zero
 with the API response body on any failure so the CI step fails loudly.
 """
 import base64
+import hashlib
 import json
+import os
 import sys
 import time
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+# Import by explicit path so the script works from any working directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from provenance import record  # noqa: E402
 
 KEY_PATH = sys.argv[1]
 AAB_PATH = sys.argv[2]
@@ -76,7 +82,8 @@ def main() -> None:
 
     with open(AAB_PATH, "rb") as fh:
         aab = fh.read()
-    print(f"Uploading AAB ({len(aab)} bytes)...")
+    aab_sha256 = hashlib.sha256(aab).hexdigest()
+    print(f"Uploading AAB ({len(aab)} bytes, sha256 {aab_sha256})...")
     resp = requests.post(
         f"{UPLOAD}/{PACKAGE}/edits/{edit_id}/bundles?uploadType=media",
         headers={**headers, "Content-Type": "application/octet-stream"},
@@ -114,6 +121,22 @@ def main() -> None:
     def commit() -> requests.Response:
         return requests.post(f"{BASE}/{PACKAGE}/edits/{edit_id}:commit", headers=headers, timeout=60)
 
+    def record_publish(release_status: str) -> None:
+        """Put the identifiers this run just minted somewhere durable."""
+        record(
+            "Play upload",
+            [
+                ("package", PACKAGE),
+                ("track", TRACK),
+                ("version_name", VERSION_NAME or "(unset)"),
+                ("version_code", version_code),
+                ("edit_id", edit_id),
+                ("release_status", release_status),
+                ("aab_bytes", len(aab)),
+                ("aab_sha256", aab_sha256),
+            ],
+        )
+
     assign_track("completed")
     resp = commit()
     if resp.status_code == 400 and "draft app" in resp.text:
@@ -135,10 +158,12 @@ def main() -> None:
             f"'{TRACK}' track. Roll it out in the Play Console to start the app's "
             "first review; subsequent releases will publish automatically."
         )
+        record_publish("draft")
         return
     if resp.status_code >= 300:
         die("commit", resp)
     print(f"COMMITTED edit {edit_id}: build {version_code} is live on the {TRACK} track.")
+    record_publish("completed")
 
 
 if __name__ == "__main__":
