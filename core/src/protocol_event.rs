@@ -265,6 +265,7 @@ pub const PROTOCOL_INVARIANT_IDS: &[&str] = &[
     "CARRY-02",
     "CURSOR-01",
     "DEDUP-01",
+    "DELIVER-01",
     "EVICT-01",
     "ENDPOINT-01",
     "FANOUT-01",

@@ -63,9 +63,17 @@
 use std::sync::Arc;
 
 use crate::{
-    core_inbound_gate, core_is_own_fanout_hint, decode_extended_message_body,
-    encode_envelope_frame, open_group_message, open_message, parse_frame, CarriedEnvelope,
-    CoreError, CoreInboundDisposition, CoreInboundGate, Frame, Identity, MessageStore, SeenIds,
+    core_inbound_gate, core_is_own_fanout_hint, core_pairwise_sender_authorized,
+    decode_extended_message_body, decode_group_invite_content, decode_lan_endpoint_content,
+    decode_profile_sync_content, decode_receipt_content, decode_relay_update_content,
+    encode_envelope_frame, friend_card_user_id, open_group_message, open_message, parse_frame,
+    parse_friend_request_content, verify_shared_friend_card, CarriedEnvelope, Contact,
+    ContactDiscoveryPolicy, CoreError, CoreInboundDisposition, CoreInboundGate,
+    ExtendedMessageBody, Frame, FriendCard, Identity, IncomingMessageInsertOutcome,
+    LanEndpointContent, MessageArrival, MessageStore, PendingSharedRequest, SeenIds,
+    SharedFriendCard, StoredMessage, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 /// The shared per-envelope foreign carry budget, byte-identical to the shells'
@@ -124,6 +132,11 @@ pub struct CoreInboundWork {
 pub struct CoreInboundCommit {
     /// The envelope id to mark seen once delivery succeeds.
     pub msg_id: Vec<u8>,
+    /// The group this envelope was opened for, when it was a group delivery,
+    /// and `None` for a pairwise one. It is both the pairwise discriminant the
+    /// delivery fold uses (never the sender-chosen `chat_id`) and the id a
+    /// group body's `chat_id` must equal under `DELIVER-01`.
+    pub group_id: Option<Vec<u8>>,
     /// The opened body's kind, when it decoded, so the commit can record the
     /// ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
     /// deliveries (recording hidden evidence is a pairwise-only licence) and
@@ -205,8 +218,188 @@ impl CoreInboundOutcome {
     }
 }
 
+/// The one piece of delivery input that is genuinely the shell's: this
+/// device's own friends-of-friends discovery switch, which lives in platform
+/// settings rather than the message store. Passed in explicitly so the fold
+/// below reads no ambient state (determinism, plan §3.1).
+#[derive(uniffi::Record, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoreDiscoveryPolicyState {
+    pub enabled: bool,
+    pub revision: u64,
+}
+
+/// What the delivery fold did with one opened body.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreDeliveryVerdict {
+    /// The body validated and every store effect it implies is committed.
+    Applied,
+    /// `DELIVER-01`: a pairwise body whose `chat_id` names a thread other than
+    /// its verified sender's own. Terminal — consumed, never applied.
+    DroppedForeignChat,
+    /// The verified pairwise sender is not authorized to dispatch this kind
+    /// ([`crate::core_pairwise_sender_authorized`]). Terminal, not a failure:
+    /// retrying cannot make an already-authored envelope more authorized.
+    DroppedUnauthorizedSender,
+    /// The body — or the per-kind content inside it — could not be decoded, or
+    /// failed a body-shape check the sender controls (a receipt that does not
+    /// acknowledge this device, a group invite whose membership omits its own
+    /// sender). Terminal, not a failure: the bytes are fixed and signed, so the
+    /// same decode fails identically forever. Delivering it again could only
+    /// re-fail, which is why it is consumed rather than left to refetch.
+    ///
+    /// This matches what the shipping Android delivery path already did with an
+    /// undecodable body: log it and report the envelope consumed. Only the
+    /// *hidden-kind ack evidence* is withheld when the top-level body would not
+    /// decode, and that falls out on its own — core fills
+    /// [`CoreInboundCommit::hidden_kind`] from a successful decode and leaves it
+    /// `None` otherwise, so an unreadable body can never vouch for a hidden kind.
+    DroppedMalformed,
+}
+
+/// How a failure inside the delivery fold should be reported.
+///
+/// The distinction is the whole point: a *deterministic* failure is a property
+/// of bytes that are already signed and will never change, so retrying it is a
+/// livelock — a relay copy that can never ack away refetches and re-fails
+/// forever. A *durability* failure is a property of this device right now (disk
+/// full, a quarantined stream conflict), so the envelope must stay
+/// re-presentable and unacked (DTN D4 / T4-06).
+enum DeliveryFailure {
+    /// Report as a terminal [`CoreDeliveryVerdict::DroppedMalformed`] on the
+    /// named kind (`None` when the body would not decode far enough to know).
+    Malformed(Option<u8>),
+    /// Report as `Err` — the caller must not commit.
+    Durability(CoreError),
+}
+
+/// Store and crypto errors reach the fold through `?` and are durability
+/// failures by default; a deterministic body failure is opted in explicitly
+/// with [`DeliveryFailure::Malformed`], never by accident.
+impl From<CoreError> for DeliveryFailure {
+    fn from(err: CoreError) -> Self {
+        DeliveryFailure::Durability(err)
+    }
+}
+
+/// Split a kind handler's error where the two classes are genuinely mixed:
+/// friend-request onboarding both parses sender-supplied bytes and writes a
+/// contact row. Everything that describes the *bytes* is terminal; only a store
+/// failure is worth retrying.
+fn classify_body_error(err: CoreError, kind: u8) -> DeliveryFailure {
+    match err {
+        CoreError::Store(_) => DeliveryFailure::Durability(err),
+        _ => DeliveryFailure::Malformed(Some(kind)),
+    }
+}
+
+/// The single delivery effect core cannot perform itself: recording a
+/// contact's advertised LAN endpoint in the shell's own endpoint cache (a
+/// file/preferences store outside SQLite). Present only for an applied kind-8
+/// hint, and it is *this contact's own* endpoint by construction — the
+/// `ENDPOINT-01` privacy rule is unchanged, because the fold hands back a hint
+/// keyed to its verified sender and nothing else.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreLanEndpointIntent {
+    pub peer_user_id: Vec<u8>,
+    pub endpoint: LanEndpointContent,
+    pub observed_at_ms: i64,
+}
+
+/// The bounded typed result of [`MessageStore::core_deliver_inbound`] — the
+/// per-kind delivery decisions folded into core, with only the driver work
+/// core cannot do handed back.
+///
+/// A driver executes what is in here and infers nothing: it must not re-read
+/// `kind` to decide on further store work, because every store effect for
+/// every kind has already been committed when this returns.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct CoreInboundDelivery {
+    pub verdict: CoreDeliveryVerdict,
+    /// The decoded body's kind, for the driver's presentation surface
+    /// (notification routing) — never for another policy branch.
+    pub kind: u8,
+    /// Whether a `messages` row was written, so a shell with a chat surface
+    /// knows there is something new to show. Hidden kinds and drops are false.
+    pub persisted: bool,
+    /// See [`CoreLanEndpointIntent`]. `None` for every other kind.
+    pub endpoint_hint: Option<CoreLanEndpointIntent>,
+}
+
+impl CoreInboundDelivery {
+    fn dropped(verdict: CoreDeliveryVerdict, kind: u8) -> Self {
+        CoreInboundDelivery {
+            verdict,
+            kind,
+            persisted: false,
+            endpoint_hint: None,
+        }
+    }
+}
+
 #[uniffi::export]
 impl MessageStore {
+    /// Apply one opened, verified inbound body — the per-kind half of the
+    /// inbound transaction, owned once, in core.
+    ///
+    /// [`Self::process_inbound_frame`] decides *whether* an envelope is ours;
+    /// this decides *what its body means*. Callers run them in that order and
+    /// then, only if this returned `Ok`, run
+    /// [`Self::core_commit_inbound_delivery`] with the same commit token —
+    /// the production `deliver → commit` order (DTN D4 / T4-06). An `Err` here
+    /// is a *durability* failure and only that: the caller drops the token
+    /// unused, leaves the `msg_id` re-presentable and reports
+    /// [`CoreInboundDisposition::Failed`], because a retry on a healthier disk
+    /// can genuinely succeed.
+    ///
+    /// A rejection the bytes themselves earn is not an error. It comes back as
+    /// a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
+    /// [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+    /// [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
+    /// any other consumption so the relay copy acks away instead of refetching
+    /// and re-failing forever. Retrying a signed body that will not decode
+    /// cannot make it decode.
+    ///
+    /// The two gates it applies before any kind runs:
+    ///
+    /// - `DELIVER-01` — a pairwise body is written only into its verified
+    ///   sender's own thread, and a group body only into the group whose key
+    ///   opened it. `chat_id` is attacker-chosen data inside a signed body;
+    ///   opening the seal proves *who* wrote it, never *where* they may
+    ///   write. Without this, any accepted contact or group member could
+    ///   author rows into a thread they are not part of.
+    /// - [`crate::core_pairwise_sender_authorized`] — the shared
+    ///   sender/kind predicate all three shells already call.
+    ///
+    /// Whether the body is pairwise is read from
+    /// [`CoreInboundCommit::group_id`], which core fills in only for a group
+    /// delivery. It is deliberately never inferred from `chat_id`, which the
+    /// sender controls.
+    pub fn core_deliver_inbound(
+        &self,
+        identity: Identity,
+        sender_user_id: Vec<u8>,
+        payload: Vec<u8>,
+        commit: CoreInboundCommit,
+        arrival: MessageArrival,
+        discovery: CoreDiscoveryPolicyState,
+    ) -> Result<CoreInboundDelivery, CoreError> {
+        match self.deliver_inbound_body(
+            identity,
+            sender_user_id,
+            payload,
+            commit,
+            arrival,
+            discovery,
+        ) {
+            Ok(delivery) => Ok(delivery),
+            Err(DeliveryFailure::Malformed(kind)) => Ok(CoreInboundDelivery::dropped(
+                CoreDeliveryVerdict::DroppedMalformed,
+                kind.unwrap_or(0),
+            )),
+            Err(DeliveryFailure::Durability(err)) => Err(err),
+        }
+    }
+
     /// Run one inbound `0x02` envelope through the production disposition and
     /// return the bounded work to execute. See the module docs for the ordered
     /// steps and the invariants preserved.
@@ -331,6 +524,7 @@ impl MessageStore {
                 dropped_blocked: false,
                 commit: Some(CoreInboundCommit {
                     msg_id,
+                    group_id: None,
                     hidden_kind,
                     recipient_hint,
                     expiry,
@@ -422,6 +616,7 @@ impl MessageStore {
                     dropped_blocked: false,
                     commit: Some(CoreInboundCommit {
                         msg_id: msg_id.clone(),
+                        group_id: Some(group.id.clone()),
                         hidden_kind: None,
                         recipient_hint: recipient_hint.clone(),
                         expiry,
@@ -523,6 +718,327 @@ impl MessageStore {
 /// gaining a raw `carry` method a shell could call to enqueue a carried row
 /// outside the single-authority disposition (A0 clean-surface discipline).
 impl MessageStore {
+    /// The delivery fold itself. See [`Self::core_deliver_inbound`] for the
+    /// contract; the only difference is the richer error type, which lets a
+    /// deterministic body failure be told apart from a durability one.
+    fn deliver_inbound_body(
+        &self,
+        identity: Identity,
+        sender_user_id: Vec<u8>,
+        payload: Vec<u8>,
+        commit: CoreInboundCommit,
+        arrival: MessageArrival,
+        discovery: CoreDiscoveryPolicyState,
+    ) -> Result<CoreInboundDelivery, DeliveryFailure> {
+        let body =
+            decode_extended_message_body(payload).map_err(|_| DeliveryFailure::Malformed(None))?;
+        let pairwise = commit.group_id.is_none();
+        let now_ms = arrival.received_at;
+
+        // DELIVER-01, both halves. A pairwise body may only be written into
+        // its verified sender's own thread; a group body may only be written
+        // into the group whose key actually opened it. Either way the wire
+        // `chat_id` is checked against something core established, never
+        // trusted as the destination it names.
+        match &commit.group_id {
+            Some(group_id) if &body.chat_id != group_id => {
+                return Ok(CoreInboundDelivery::dropped(
+                    CoreDeliveryVerdict::DroppedForeignChat,
+                    body.kind,
+                ));
+            }
+            _ => {}
+        }
+
+        if pairwise {
+            if body.chat_id != sender_user_id {
+                return Ok(CoreInboundDelivery::dropped(
+                    CoreDeliveryVerdict::DroppedForeignChat,
+                    body.kind,
+                ));
+            }
+            let sender_is_contact = self.get_contact(sender_user_id.clone())?.is_some();
+            if !core_pairwise_sender_authorized(
+                body.kind,
+                sender_is_contact,
+                sender_user_id == identity.user_id,
+            ) {
+                return Ok(CoreInboundDelivery::dropped(
+                    CoreDeliveryVerdict::DroppedUnauthorizedSender,
+                    body.kind,
+                ));
+            }
+        }
+
+        let mut delivery = CoreInboundDelivery {
+            verdict: CoreDeliveryVerdict::Applied,
+            kind: body.kind,
+            persisted: false,
+            endpoint_hint: None,
+        };
+
+        match body.kind {
+            KIND_FRIEND_REQUEST if pairwise => {
+                self.apply_friend_request(
+                    &identity,
+                    &sender_user_id,
+                    &body.content,
+                    discovery,
+                    now_ms,
+                )
+                .map_err(|err| classify_body_error(err, body.kind))?;
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+            }
+            KIND_RECEIPT if pairwise => {
+                let receipt = decode_receipt_content(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                if receipt.sender_user_id != identity.user_id {
+                    // A receipt for someone else's stream: sender-chosen data
+                    // that will never become ours. Terminal, not retryable.
+                    return Err(DeliveryFailure::Malformed(Some(body.kind)));
+                }
+                if let Some(group_id) = receipt.group_id {
+                    self.record_group_receipt(
+                        group_id,
+                        identity.user_id.clone(),
+                        sender_user_id.clone(),
+                        receipt.receipt_type,
+                        receipt.lamport,
+                        Some(arrival.transport),
+                    )?;
+                } else {
+                    self.record_receipt(
+                        sender_user_id.clone(),
+                        identity.user_id.clone(),
+                        receipt.receipt_type,
+                        receipt.lamport,
+                        Some(arrival.transport),
+                        Some(now_ms),
+                    )?;
+                }
+            }
+            KIND_LAN_ENDPOINT_HINT if pairwise => {
+                let endpoint = decode_lan_endpoint_content(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+                delivery.endpoint_hint = Some(CoreLanEndpointIntent {
+                    peer_user_id: sender_user_id.clone(),
+                    endpoint,
+                    observed_at_ms: now_ms,
+                });
+            }
+            KIND_RELAY_UPDATE if pairwise => {
+                let content = decode_relay_update_content(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+                // The hidden row stays durable even if the store rejects a
+                // mis-scoped or over-privileged credential update.
+                let _ = self.apply_contact_relay_update(sender_user_id.clone(), content);
+            }
+            KIND_PROFILE_SYNC if pairwise => {
+                let content = decode_profile_sync_content(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+                if let Some(mut contact) = self.get_contact(sender_user_id.clone())? {
+                    self.upsert_contact_discovery_policy(ContactDiscoveryPolicy {
+                        user_id: sender_user_id.clone(),
+                        protocol_version: content.friends_of_friends_version,
+                        enabled: content.friends_of_friends_enabled,
+                        revision: content.friends_of_friends_revision,
+                    })?;
+                    self.set_contact_avatar(
+                        sender_user_id.clone(),
+                        (!content.avatar.is_empty()).then_some(content.avatar),
+                        content.avatar_epoch,
+                    )?;
+                    if contact.name != content.name {
+                        contact.name = content.name;
+                        self.upsert_contact(contact)?;
+                    }
+                }
+            }
+            KIND_GROUP_INVITE if pairwise => {
+                let group = decode_group_invite_content(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                if !group.member_user_ids.contains(&sender_user_id)
+                    || !group.member_user_ids.contains(&identity.user_id)
+                {
+                    // Membership is fixed inside the signed body, so this
+                    // invite can never become valid. Terminal, not retryable.
+                    return Err(DeliveryFailure::Malformed(Some(body.kind)));
+                }
+                self.upsert_group(group.clone())?;
+                // The invite is filed under the group it creates, not under
+                // the 1:1 thread it travelled in. DELIVER-01 has already
+                // pinned the wire `chat_id` to the sender, so this rewrite is
+                // a core decision over verified data, never sender-chosen.
+                let mut stored = body.clone();
+                stored.chat_id = group.id;
+                self.persist_inbound(&sender_user_id, &stored, &commit, arrival)?;
+                delivery.persisted = true;
+            }
+            _ => {
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+            }
+        }
+
+        // Auto-receipt tail: acknowledge a contact's stream up to its highest
+        // contiguous point. A receipt never acknowledges a receipt.
+        if pairwise && body.kind != KIND_RECEIPT {
+            if let Some(contact) = self.get_contact(sender_user_id.clone())? {
+                let through = self
+                    .highest_contiguous_lamport(sender_user_id.clone(), sender_user_id.clone())?;
+                let _ = self.author_receipt(
+                    identity,
+                    contact,
+                    sender_user_id,
+                    RECEIPT_TYPE_DELIVERED,
+                    through,
+                    now_ms,
+                )?;
+            }
+        }
+
+        Ok(delivery)
+    }
+
+    /// Write the opened body as a `messages` row, mapping the store's insert
+    /// outcome onto the delivery contract: an insert or an idempotent
+    /// duplicate is success; a quarantined stream conflict is a durability
+    /// failure, so the caller must not commit and the envelope stays
+    /// re-presentable.
+    fn persist_inbound(
+        &self,
+        sender_user_id: &[u8],
+        body: &ExtendedMessageBody,
+        commit: &CoreInboundCommit,
+        arrival: MessageArrival,
+    ) -> Result<(), CoreError> {
+        let outcome = self.insert_incoming_message_with_arrival(
+            StoredMessage {
+                chat_id: body.chat_id.clone(),
+                sender_user_id: sender_user_id.to_vec(),
+                lamport: body.lamport,
+                timestamp: body.timestamp,
+                kind: body.kind,
+                payload: body.content.clone(),
+            },
+            commit.msg_id.clone(),
+            body.reply_to_msg_id.clone(),
+            arrival,
+        )?;
+        match outcome {
+            IncomingMessageInsertOutcome::Inserted | IncomingMessageInsertOutcome::Duplicate => {
+                Ok(())
+            }
+            IncomingMessageInsertOutcome::QuarantinedConflict => Err(CoreError::Store(
+                "message stream conflict was quarantined".into(),
+            )),
+        }
+    }
+
+    /// A kind-1 friend request: either a direct card, which onboards its
+    /// verified sender, or a friends-of-friends card, which may only ever
+    /// raise a prompt.
+    fn apply_friend_request(
+        &self,
+        identity: &Identity,
+        sender_user_id: &[u8],
+        content: &[u8],
+        discovery: CoreDiscoveryPolicyState,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        let json = std::str::from_utf8(content)
+            .map_err(|_| CoreError::Malformed("friend request is not UTF-8".into()))?;
+        let request = parse_friend_request_content(json.to_string())?;
+        if friend_card_user_id(request.card.clone()) != sender_user_id {
+            return Err(CoreError::InvalidFriendCard(
+                "friend request card does not match its verified sender".into(),
+            ));
+        }
+        if let Some(shared) = request.shared {
+            return self.hold_shared_friend_request(
+                identity,
+                sender_user_id,
+                request.card,
+                shared,
+                discovery,
+                now_ms,
+            );
+        }
+        self.upsert_imported_contact(Contact {
+            user_id: sender_user_id.to_vec(),
+            name: request.card.name,
+            sign_pk: request.card.sign_pk,
+            agree_pk: request.card.agree_pk,
+            relay_url: request.card.relay_url,
+            relay_token: request.card.relay_token,
+            nickname: None,
+        })?;
+        Ok(())
+    }
+
+    /// An introduced request never creates a contact. Every check that fails
+    /// here drops it silently and without a prompt, exactly as
+    /// [`crate::verify_shared_friend_card`]'s contract describes.
+    fn hold_shared_friend_request(
+        &self,
+        identity: &Identity,
+        sender_user_id: &[u8],
+        card: FriendCard,
+        shared: SharedFriendCard,
+        discovery: CoreDiscoveryPolicyState,
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        let Some(sharer) = self.get_contact(shared.sharer_user_id.clone())? else {
+            return Ok(());
+        };
+        if self.is_user_blocked(shared.sharer_user_id.clone())? {
+            return Ok(());
+        }
+        if friend_card_user_id(shared.card.clone()) != identity.user_id {
+            return Ok(());
+        }
+        if !discovery.enabled {
+            return Ok(());
+        }
+        if !verify_shared_friend_card(
+            shared.clone(),
+            sharer.sign_pk,
+            identity.user_id.clone(),
+            discovery.revision,
+            now_ms,
+        )? {
+            return Ok(());
+        }
+        if self
+            .get_shared_request_dismissal(sender_user_id.to_vec())?
+            .map(|row| row.suppressed)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        self.upsert_pending_shared_request(PendingSharedRequest {
+            requester_user_id: sender_user_id.to_vec(),
+            name: card.name,
+            sign_pk: card.sign_pk,
+            agree_pk: card.agree_pk,
+            relay_url: card.relay_url,
+            relay_token: card.relay_token,
+            sharer_user_id: shared.sharer_user_id,
+            expires_at_ms: shared.expires_at_ms,
+            first_seen_ms: now_ms,
+            last_prompted_ms: 0,
+        })?;
+        let _ = self.note_shared_request_prompt(sender_user_id.to_vec(), now_ms);
+        Ok(())
+    }
+
     /// Enqueue a foreign/group envelope into the carry queue for later delivery.
     ///
     /// The stored `hop_ttl` is one less than the header's: carrying is itself a
@@ -1023,5 +1539,652 @@ mod tests {
             "an uncommitted (failed) delivery must not poison the seen set"
         );
         assert_eq!(second.delivered_payloads.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod delivery_tests {
+    //! Executable owners for the per-kind delivery fold — the policy that used
+    //! to be a third copy in the desktop shell — driven end to end through the
+    //! one production pair (`process_inbound_frame` → `core_deliver_inbound`),
+    //! never by calling the fold with a hand-built commit token.
+    //!
+    //! `DELIVER-01` owns the two vectors at the top: a pairwise body may name
+    //! only its verified sender's thread, and a group body only the group whose
+    //! key opened it.
+
+    use std::sync::Arc;
+
+    use crate::{
+        compute_recipient_hint, encode_envelope_frame, encode_group_invite_content,
+        encode_lan_endpoint_content, encode_message_body, encode_profile_sync_content,
+        encode_receipt_content, encode_relay_update_content, generate_identity, generate_msg_id,
+        make_friend_card, seal_group_message, seal_message, Contact, CoreDeliveryVerdict,
+        CoreDiscoveryPolicyState, CoreInboundSource, Group, Identity, LanEndpointContent,
+        MessageArrival, MessageBody, MessageStore, ProfileSyncContent, ReceiptContent,
+        RelayUpdateContent, SeenIds, DEFAULT_HOP_TTL, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+        KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
+        MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    };
+
+    use super::CoreInboundDelivery;
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    fn store() -> MessageStore {
+        MessageStore::open(":memory:".to_string()).expect("open in-memory store")
+    }
+
+    fn contact(identity: &Identity, name: &str) -> Contact {
+        Contact {
+            user_id: identity.user_id.clone(),
+            name: name.into(),
+            sign_pk: identity.sign_pk.clone(),
+            agree_pk: identity.agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        }
+    }
+
+    fn arrival() -> MessageArrival {
+        MessageArrival {
+            transport: 3,
+            hops_taken: 0,
+            received_at: NOW,
+        }
+    }
+
+    fn discovery() -> CoreDiscoveryPolicyState {
+        CoreDiscoveryPolicyState {
+            enabled: true,
+            revision: 0,
+        }
+    }
+
+    fn body(kind: u8, chat_id: Vec<u8>, content: Vec<u8>) -> Vec<u8> {
+        encode_message_body(MessageBody {
+            kind,
+            chat_id,
+            lamport: 1,
+            timestamp: NOW,
+            content,
+        })
+        .expect("encode body")
+    }
+
+    /// Run the production pair for a pairwise envelope from `sender` to `me`.
+    fn deliver_pairwise(
+        store: &MessageStore,
+        me: &Identity,
+        sender: &Identity,
+        payload: Vec<u8>,
+    ) -> CoreInboundDelivery {
+        let sealed = seal_message(sender.clone(), me.agree_pk.clone(), payload).expect("seal");
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            sealed,
+        );
+        let seen = Arc::new(SeenIds::new());
+        let outcome = store
+            .process_inbound_frame(me.clone(), seen, CoreInboundSource::Mesh, frame, NOW)
+            .expect("inbound");
+        let payload = outcome
+            .delivered_payloads
+            .first()
+            .cloned()
+            .expect("a pairwise envelope for us is delivered");
+        store
+            .core_deliver_inbound(
+                me.clone(),
+                outcome.delivered_sender.expect("verified sender"),
+                payload,
+                outcome.commit.expect("commit token"),
+                arrival(),
+                discovery(),
+            )
+            .expect("delivery")
+    }
+
+    /// Run the production pair for a group envelope signed by `sender`.
+    fn deliver_group(
+        store: &MessageStore,
+        me: &Identity,
+        sender: &Identity,
+        group: &Group,
+        payload: Vec<u8>,
+    ) -> CoreInboundDelivery {
+        let sealed = seal_group_message(sender.clone(), group.clone(), payload).expect("seal");
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(group.id.clone(), NOW),
+            sealed,
+        );
+        let seen = Arc::new(SeenIds::new());
+        let outcome = store
+            .process_inbound_frame(me.clone(), seen, CoreInboundSource::Mesh, frame, NOW)
+            .expect("inbound");
+        let payload = outcome
+            .delivered_payloads
+            .first()
+            .cloned()
+            .expect("a group envelope for a member is delivered");
+        store
+            .core_deliver_inbound(
+                me.clone(),
+                outcome.delivered_sender.expect("verified sender"),
+                payload,
+                outcome.commit.expect("commit token"),
+                arrival(),
+                discovery(),
+            )
+            .expect("delivery")
+    }
+
+    fn group_of(me: &Identity, friend: &Identity) -> Group {
+        Group {
+            id: vec![0x33; 16],
+            name: "Deck 9".to_string(),
+            member_user_ids: vec![me.user_id.clone(), friend.user_id.clone()],
+            key: vec![0x44; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deliver_01_a_pairwise_body_may_only_name_its_verified_senders_thread() {
+        // The signed body's chat_id is sender-chosen. An accepted contact
+        // aiming it at a THIRD party's thread must write nothing at all --
+        // not a message row, not a receipt.
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let victim = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+        store.upsert_contact(contact(&victim, "Victim")).unwrap();
+
+        let forged = body(KIND_TEXT, victim.user_id.clone(), b"not from me".to_vec());
+        let delivery = deliver_pairwise(&store, &me, &sender, forged);
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedForeignChat);
+        assert!(!delivery.persisted);
+        assert!(
+            store
+                .messages_for_chat(victim.user_id.clone())
+                .unwrap()
+                .is_empty(),
+            "a body naming someone else's thread must not land in it"
+        );
+        assert!(store
+            .messages_for_chat(sender.user_id.clone())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    sender.user_id.clone(),
+                    sender.user_id,
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            0,
+            "a dropped body is never auto-receipted"
+        );
+    }
+
+    #[test]
+    fn deliver_01_a_group_body_may_only_name_the_group_that_opened_it() {
+        // Same rule on the group half: a member holding the group key must not
+        // be able to file a row into another chat by renaming it.
+        let store = store();
+        let me = generate_identity();
+        let friend = generate_identity();
+        let group = group_of(&me, &friend);
+        store.upsert_group(group.clone()).unwrap();
+
+        let forged = body(KIND_TEXT, me.user_id.clone(), b"wrong thread".to_vec());
+        let delivery = deliver_group(&store, &me, &friend, &group, forged);
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedForeignChat);
+        assert!(!delivery.persisted);
+        assert!(store
+            .messages_for_chat(me.user_id.clone())
+            .unwrap()
+            .is_empty());
+        assert!(store.messages_for_chat(group.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_group_body_from_a_member_lands_in_its_group() {
+        let store = store();
+        let me = generate_identity();
+        let friend = generate_identity();
+        let group = group_of(&me, &friend);
+        store.upsert_group(group.clone()).unwrap();
+
+        let delivery = deliver_group(
+            &store,
+            &me,
+            &friend,
+            &group,
+            body(KIND_TEXT, group.id.clone(), b"deck party".to_vec()),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert!(delivery.persisted);
+        assert!(delivery.endpoint_hint.is_none());
+        let rows = store.messages_for_chat(group.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload, b"deck party".to_vec());
+    }
+
+    #[test]
+    fn a_pairwise_text_from_a_contact_is_stored_and_auto_receipted() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_TEXT, sender.user_id.clone(), b"on deck 9".to_vec()),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(delivery.kind, KIND_TEXT);
+        assert!(delivery.persisted);
+        let rows = store.messages_for_chat(sender.user_id.clone()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    sender.user_id.clone(),
+                    sender.user_id,
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            1,
+            "delivery acknowledges the sender's stream up to its contiguous point"
+        );
+    }
+
+    #[test]
+    fn an_unauthorized_pairwise_sender_is_dropped_rather_than_failed() {
+        // Not yet a contact, and the kind is not an onboarding kind: a
+        // terminal policy verdict, so the envelope is consumed and its relay
+        // copy acks away instead of being refetched forever.
+        let store = store();
+        let me = generate_identity();
+        let stranger = generate_identity();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &stranger,
+            body(KIND_TEXT, stranger.user_id.clone(), b"hello?".to_vec()),
+        );
+
+        assert_eq!(
+            delivery.verdict,
+            CoreDeliveryVerdict::DroppedUnauthorizedSender
+        );
+        assert!(!delivery.persisted);
+        assert!(store
+            .messages_for_chat(stranger.user_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_direct_friend_request_onboards_its_verified_sender() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let card = make_friend_card("Emma".into(), sender.clone(), None, None).unwrap();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(
+                KIND_FRIEND_REQUEST,
+                sender.user_id.clone(),
+                card.into_bytes(),
+            ),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store.get_contact(sender.user_id).unwrap().unwrap().name,
+            "Emma"
+        );
+    }
+
+    #[test]
+    fn a_receipt_advances_a_watermark_and_never_answers_itself() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let content = encode_receipt_content(ReceiptContent {
+            chat_id: sender.user_id.clone(),
+            sender_user_id: me.user_id.clone(),
+            lamport: 7,
+            receipt_type: RECEIPT_TYPE_DELIVERED,
+            group_id: None,
+        })
+        .unwrap();
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_RECEIPT, sender.user_id.clone(), content),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert!(
+            !delivery.persisted,
+            "a receipt is a hidden kind: it leaves no chat row"
+        );
+        assert_eq!(
+            store
+                .receipt_through(
+                    sender.user_id.clone(),
+                    me.user_id.clone(),
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    sender.user_id.clone(),
+                    sender.user_id,
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            0,
+            "a receipt must never trigger an auto-receipt back"
+        );
+    }
+
+    #[test]
+    fn a_receipt_for_another_stream_is_dropped_not_silently_written() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let other = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let content = encode_receipt_content(ReceiptContent {
+            chat_id: sender.user_id.clone(),
+            sender_user_id: other.user_id.clone(),
+            lamport: 7,
+            receipt_type: RECEIPT_TYPE_DELIVERED,
+            group_id: None,
+        })
+        .unwrap();
+        let sealed = seal_message(
+            sender.clone(),
+            me.agree_pk.clone(),
+            body(KIND_RECEIPT, sender.user_id.clone(), content),
+        )
+        .unwrap();
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            sealed,
+        );
+        let outcome = store
+            .process_inbound_frame(
+                me.clone(),
+                Arc::new(SeenIds::new()),
+                CoreInboundSource::Mesh,
+                frame,
+                NOW,
+            )
+            .unwrap();
+        let result = store.core_deliver_inbound(
+            me.clone(),
+            outcome.delivered_sender.unwrap(),
+            outcome.delivered_payloads[0].clone(),
+            outcome.commit.unwrap(),
+            arrival(),
+            discovery(),
+        );
+        let delivery = result.expect("a body-shape rejection is a verdict, not an error");
+        assert_eq!(
+            delivery.verdict,
+            CoreDeliveryVerdict::DroppedMalformed,
+            "a receipt that does not acknowledge our own stream is dropped terminally"
+        );
+        assert!(!delivery.persisted);
+    }
+
+    /// The livelock this guards against: a permanently undecodable body from a
+    /// verified sender used to come back as `Err`, which every shell maps to
+    /// "delivery failed, do not ack". The relay copy is then refetched and
+    /// re-fails forever. Deterministic decode failures are terminal, and the
+    /// caller commits them like any other consumption.
+    #[test]
+    fn an_undecodable_body_is_a_terminal_drop_not_a_retryable_failure() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let sealed = seal_message(
+            sender.clone(),
+            me.agree_pk.clone(),
+            // Not a message body at all: this will never decode, on this
+            // attempt or any retry.
+            vec![0xff; 12],
+        )
+        .expect("seal");
+        let frame = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            sealed,
+        );
+        let outcome = store
+            .process_inbound_frame(
+                me.clone(),
+                Arc::new(SeenIds::new()),
+                CoreInboundSource::Mesh,
+                frame,
+                NOW,
+            )
+            .expect("inbound");
+        let commit = outcome.commit.expect("commit token");
+        assert!(
+            commit.hidden_kind.is_none(),
+            "an unreadable body must never vouch for a hidden kind's relay ack"
+        );
+
+        let delivery = store
+            .core_deliver_inbound(
+                me.clone(),
+                outcome.delivered_sender.expect("verified sender"),
+                outcome.delivered_payloads[0].clone(),
+                commit,
+                arrival(),
+                discovery(),
+            )
+            .expect("an undecodable body is consumed, never a retryable failure");
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedMalformed);
+        assert!(!delivery.persisted);
+        assert!(delivery.endpoint_hint.is_none());
+    }
+
+    /// The same rule one level in: the body decoded, the per-kind content did
+    /// not. Still fixed bytes, still terminal.
+    #[test]
+    fn undecodable_per_kind_content_is_a_terminal_drop() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(
+                KIND_LAN_ENDPOINT_HINT,
+                sender.user_id.clone(),
+                vec![0xff; 9],
+            ),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedMalformed);
+        assert_eq!(delivery.kind, KIND_LAN_ENDPOINT_HINT);
+        assert!(delivery.endpoint_hint.is_none());
+        assert!(!delivery.persisted);
+    }
+
+    #[test]
+    fn a_lan_endpoint_hint_returns_an_intent_keyed_to_its_sender() {
+        // The only effect the driver executes. ENDPOINT-01: the intent names
+        // the verified sender and that sender's own advertised endpoint --
+        // nothing discovered from a third party crosses this boundary.
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let endpoint = LanEndpointContent {
+            instance_token: vec![7; 8],
+            network_id: vec![9; 8],
+            host: "192.168.1.42".into(),
+            port: 41234,
+            expires_at_ms: NOW + 60_000,
+        };
+        let content = encode_lan_endpoint_content(endpoint.clone()).unwrap();
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_LAN_ENDPOINT_HINT, sender.user_id.clone(), content),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        let hint = delivery.endpoint_hint.expect("an endpoint intent");
+        assert_eq!(hint.peer_user_id, sender.user_id);
+        assert_eq!(hint.endpoint.host, endpoint.host);
+        assert_eq!(hint.observed_at_ms, NOW);
+    }
+
+    #[test]
+    fn a_profile_sync_updates_the_contact_it_came_from() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Old name")).unwrap();
+
+        let content = encode_profile_sync_content(ProfileSyncContent {
+            avatar_epoch: NOW,
+            name: "New name".into(),
+            avatar: Vec::new(),
+            friends_of_friends_version: 1,
+            friends_of_friends_enabled: true,
+            friends_of_friends_revision: 3,
+        })
+        .unwrap();
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_PROFILE_SYNC, sender.user_id.clone(), content),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store
+                .get_contact(sender.user_id.clone())
+                .unwrap()
+                .unwrap()
+                .name,
+            "New name"
+        );
+    }
+
+    #[test]
+    fn a_relay_update_never_moves_a_third_partys_endpoint() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        let other = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+        store.upsert_contact(contact(&other, "Other")).unwrap();
+
+        // A notice naming somebody else's endpoint is refused by the store
+        // rule; the hidden row still lands, and nothing else moves.
+        let content = encode_relay_update_content(RelayUpdateContent {
+            subject_user_id: other.user_id.clone(),
+            relay_url: "https://relay.example/".into(),
+            relay_token: "tok-aaaaaaaaaaaaaaaa".into(),
+            relay_epoch: NOW,
+        })
+        .unwrap();
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_RELAY_UPDATE, sender.user_id.clone(), content),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert!(store
+            .get_contact(other.user_id)
+            .unwrap()
+            .unwrap()
+            .relay_url
+            .is_none());
+    }
+
+    #[test]
+    fn a_group_invite_is_filed_under_the_group_it_creates() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let group = Group {
+            id: vec![0x55; 16],
+            name: "Muster".into(),
+            member_user_ids: vec![me.user_id.clone(), sender.user_id.clone()],
+            key: vec![0x66; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        };
+        let content = encode_group_invite_content(group.clone()).unwrap();
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body(KIND_GROUP_INVITE, sender.user_id.clone(), content),
+        );
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert!(store.get_group(group.id.clone()).unwrap().is_some());
+        assert_eq!(
+            store.messages_for_chat(group.id).unwrap().len(),
+            1,
+            "the invite row belongs to the group, not the 1:1 thread"
+        );
+        assert!(store.messages_for_chat(sender.user_id).unwrap().is_empty());
     }
 }

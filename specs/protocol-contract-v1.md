@@ -50,6 +50,7 @@ of it: the gap is now countable.
 | `CARRY-01` | Sending or relay-uploading a carried row does not remove it. Removal requires verified peer digest/receipt proof, expiry, or the low-trust pressure rule in `EVICT-01`. | core | `core/src/engine.rs` confirm-carried tests, `core/src/store.rs` carry tests; index re-asserts upload-then-survive |
 | `CARRY-02` | Durable removal of a carried row requires an authenticated peer identity. An unauthenticated confirm (a bare BLE HELLO/digest) may only suppress re-offering for the encounter, never remove or retire a row. | core | `core/src/engine.rs` confirm-carried authentication tests; index re-asserts the authenticated-only removal gate |
 | `EVICT-01` | Carry pressure may evict only low-trust foreign rows. An admitted family row is never pressure-evicted; an admission that cannot fit its applicable foreign or total byte budget is rejected without itself authorizing seen/ack state, and records redacted evidence when the diagnostics ring is writable. | core | `core/src/store.rs` carry-pressure admission, eviction, and event tests |
+| `DELIVER-01` | An opened pairwise body is applied only to its verified sender's own thread. The `chat_id` carried inside a signed body is sender-chosen data and never authorizes a write anywhere else. | core | `core/src/session/mesh_receive.rs` delivery tests; index re-asserts that a body naming a third party's thread is dropped and writes nothing |
 | `CURSOR-01` | A frontier advances only across a fully processed page whose required acks succeeded, and never moves backward on a normal pass. | core | `core/src/relay_cursor.rs` advance tests; index re-asserts `relay_cursor_advance` |
 | `PAGE-01` | Only an empty page is EOF. A short page continues. A non-empty non-advancing page terminates safely without unsafe advancement. | core | `core/src/relay_cursor.rs` walk-continuation tests; index re-asserts `relay_fetch_walk_continues` |
 | `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | core | `core/src/session/relay_policy.rs` owns request pacing, the exponential curve and its cap, the `Retry-After` floor, the stable identity jitter, the pending-rerun decision and the pass health fold; `relay_status.rs` owns the header clamp and the classification. Both shells delegate. The first clause — aborting the remaining stages — is completed by C0's pass |
@@ -147,6 +148,36 @@ decline to re-offer for that one encounter, which the digest spray plan
 already does by excluding the ids the peer named. This is the same
 "when in doubt, don't ack" direction as `ACK-01` and `CARRY-01`: churn is
 recoverable, deletion is not.
+
+#### `DELIVER-01` — opening a message proves who wrote it, not where it may go
+
+Opening a sealed 1:1 payload proves exactly one thing: which identity signed
+it. It says nothing about where that identity is allowed to write. The
+`chat_id` field sits *inside* the signed body, so its value is whatever the
+sender chose to put there — including another contact's user id, or a chat
+this device shares with someone else entirely.
+
+So a pairwise body is applied only when its `chat_id` equals its verified
+sender. Anything else is dropped before any handler runs: no message row, no
+receipt, no contact or group mutation. The drop is terminal rather than a
+failure — this device was the envelope's sole endpoint and deliberately
+discarded it, which is consumption, so its relay copy acks away instead of
+being refetched forever (the same shape as the blocked-sender drop).
+
+Without the rule, an accepted contact could file messages into a thread they
+are not part of: a chat that appears to be from someone else, receipts
+attributed to the wrong stream, or a stream-conflict quarantine in a
+conversation the sender never belonged to. This is why the rule must not be
+re-derived per platform. It is applied once, in
+`core/src/session/mesh_receive.rs`, before any per-kind handler; the shells
+keyed their handlers off the verified sender and so enforced it implicitly,
+which is a property that survives only as long as nobody refactors a handler
+to trust `chat_id`. Now they inherit it explicitly.
+
+The one legitimate rewrite of `chat_id` is core's own: a group invite arrives
+in a 1:1 envelope and is filed under the group it creates. That happens after
+this gate has already pinned the wire `chat_id` to the sender, and the group
+id comes from the invite's validated membership, not from a free field.
 
 #### `CURSOR-01` — the frontier only moves over ground you actually covered
 

@@ -43,20 +43,22 @@ use cruisemesh_core::{
     core_family_relay_jitter_ms, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
     core_own_capabilities, core_relay_ack_ids, core_relay_pass_default_budgets,
     core_relay_queue_reflects_delivery, core_relay_rerun_action, core_should_ack_inbound,
-    encode_hello, encode_hello2, generate_identity, may_start_carried_offer, parse_frame,
-    relay_classify_http_error, relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
-    relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
-    CarriedEnvelope, Contact, CoreFamilyRelayPacer, CoreInboundDisposition, CoreRelayActionKind,
-    CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
-    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayOperation,
-    CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan,
-    CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan,
-    CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageStore,
-    RelayMailboxWalkAction, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
+    encode_envelope_frame, encode_hello, encode_hello2, encode_message_body, generate_identity,
+    may_start_carried_offer, parse_frame, relay_classify_http_error, relay_cursor_advance,
+    relay_cursor_key, relay_fetch_walk_continues, relay_frontier_after_completed_sweep,
+    relay_mailbox_walk_action, relay_retry_after_ms, seal_message, CarriedEnvelope, Contact,
+    CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreFamilyRelayPacer, CoreInboundDisposition,
+    CoreInboundSource, CoreRelayActionKind, CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition,
+    CoreRelayFault, CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult,
+    CoreRelayOperation, CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome,
+    CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction,
+    CoreSprayLanePlan, CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame,
+    MessageArrival, MessageBody, MessageStore, RelayMailboxWalkAction, SeenIds,
+    CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES, DEFAULT_HOP_TTL,
     FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT,
     KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES,
-    MAX_SPRAY_INTERVAL_MS, OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES,
-    RECEIPT_TYPE_DELIVERED,
+    MAX_SPRAY_INTERVAL_MS, MS_PER_DAY, OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
+    OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
 // ---------------------------------------------------------------------------
@@ -124,6 +126,13 @@ const CONTRACT: &[Invariant] = &[
         statement: "Carry pressure may evict only low-trust foreign rows; admitted family rows \
                     survive, and rejected admissions remain retryable and observable.",
         owner: Owner::Core("core/src/store.rs carry-pressure admission and eviction tests"),
+    },
+    Invariant {
+        id: "DELIVER-01",
+        statement: "An opened body is applied only to the thread its verified sender owns (or, \
+                    for a group body, the group whose key opened it); a signed body's chat_id \
+                    never authorizes a write elsewhere.",
+        owner: Owner::Core("core/src/session/mesh_receive.rs delivery-fold tests"),
     },
     Invariant {
         id: "CURSOR-01",
@@ -712,6 +721,100 @@ fn ack_02_client_clock_expiry_never_authorizes_an_ack() {
         id,
         acked == vec![2],
         "only the consumed row may be acked; expiry alone deletes nothing, got {acked:?}"
+    );
+}
+
+#[test]
+fn deliver_01_a_signed_body_may_not_name_a_thread_its_sender_does_not_own() {
+    let id = lookup("DELIVER-01").id;
+    let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+    let now_ms = 1_700_000_000_000_i64;
+
+    let me = generate_identity();
+    let sender = generate_identity();
+    let victim = generate_identity();
+    for (identity, name) in [(&sender, "Sender"), (&victim, "Victim")] {
+        store
+            .upsert_contact(Contact {
+                user_id: identity.user_id.clone(),
+                name: name.to_string(),
+                sign_pk: identity.sign_pk.clone(),
+                agree_pk: identity.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .expect("contact");
+    }
+
+    // An accepted contact, correctly sealed to us, aiming its signed body at a
+    // THIRD contact's thread. Opening proved who wrote it; it never proved
+    // where they may write.
+    let payload = encode_message_body(MessageBody {
+        kind: KIND_TEXT,
+        chat_id: victim.user_id.clone(),
+        lamport: 1,
+        timestamp: now_ms,
+        content: b"not from the person this appears to be from".to_vec(),
+    })
+    .expect("body");
+    let sealed = seal_message(sender.clone(), me.agree_pk.clone(), payload).expect("seal");
+    let frame = encode_envelope_frame(
+        vec![0xD1; 16],
+        DEFAULT_HOP_TTL,
+        now_ms + 7 * MS_PER_DAY,
+        compute_recipient_hint(me.user_id.clone(), now_ms),
+        sealed,
+    );
+
+    let outcome = store
+        .process_inbound_frame(
+            me.clone(),
+            Arc::new(SeenIds::new()),
+            CoreInboundSource::Mesh,
+            frame,
+            now_ms,
+        )
+        .expect("inbound");
+    let delivery = store
+        .core_deliver_inbound(
+            me,
+            outcome.delivered_sender.expect("verified sender"),
+            outcome.delivered_payloads[0].clone(),
+            outcome.commit.expect("commit token"),
+            MessageArrival {
+                transport: 3,
+                hops_taken: 0,
+                received_at: now_ms,
+            },
+            CoreDiscoveryPolicyState {
+                enabled: true,
+                revision: 0,
+            },
+        )
+        .expect("a policy drop is a verdict, never an error");
+
+    contract_assert!(
+        id,
+        delivery.verdict == CoreDeliveryVerdict::DroppedForeignChat,
+        "a pairwise body naming another contact's thread must be dropped, got {:?}",
+        delivery.verdict
+    );
+    contract_assert!(
+        id,
+        store
+            .messages_for_chat(victim.user_id)
+            .expect("read")
+            .is_empty(),
+        "the dropped body must not have landed in the thread it named"
+    );
+    contract_assert!(
+        id,
+        store
+            .messages_for_chat(sender.user_id)
+            .expect("read")
+            .is_empty(),
+        "nor anywhere else"
     );
 }
 
@@ -2570,6 +2673,7 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         "ACK-01",
         "ACK-02",
         "CARRY-02",
+        "DELIVER-01",
         "SECRET-01",
         "HELLO-01",
         "ENDPOINT-01",

@@ -4322,6 +4322,46 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data], peerAuthenticated: Bool, nowMs: Int64) throws  -> UInt64
     
     /**
+     * Apply one opened, verified inbound body — the per-kind half of the
+     * inbound transaction, owned once, in core.
+     *
+     * [`Self::process_inbound_frame`] decides *whether* an envelope is ours;
+     * this decides *what its body means*. Callers run them in that order and
+     * then, only if this returned `Ok`, run
+     * [`Self::core_commit_inbound_delivery`] with the same commit token —
+     * the production `deliver → commit` order (DTN D4 / T4-06). An `Err` here
+     * is a *durability* failure and only that: the caller drops the token
+     * unused, leaves the `msg_id` re-presentable and reports
+     * [`CoreInboundDisposition::Failed`], because a retry on a healthier disk
+     * can genuinely succeed.
+     *
+     * A rejection the bytes themselves earn is not an error. It comes back as
+     * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
+     * any other consumption so the relay copy acks away instead of refetching
+     * and re-failing forever. Retrying a signed body that will not decode
+     * cannot make it decode.
+     *
+     * The two gates it applies before any kind runs:
+     *
+     * - `DELIVER-01` — a pairwise body is written only into its verified
+     * sender's own thread, and a group body only into the group whose key
+     * opened it. `chat_id` is attacker-chosen data inside a signed body;
+     * opening the seal proves *who* wrote it, never *where* they may
+     * write. Without this, any accepted contact or group member could
+     * author rows into a thread they are not part of.
+     * - [`crate::core_pairwise_sender_authorized`] — the shared
+     * sender/kind predicate all three shells already call.
+     *
+     * Whether the body is pairwise is read from
+     * [`CoreInboundCommit::group_id`], which core fills in only for a group
+     * delivery. It is deliberately never inferred from `chat_id`, which the
+     * sender controls.
+     */
+    func coreDeliverInbound(identity: Identity, senderUserId: Data, payload: Data, commit: CoreInboundCommit, arrival: MessageArrival, discovery: CoreDiscoveryPolicyState) throws  -> CoreInboundDelivery
+    
+    /**
      * Build the exact `recent_msg_id` list this device advertises in its
      * outgoing DIGEST (DESIGN.md §7.3; DTN_TODOS.md §3.2, D2
      * mule-drain-confirm): carried entries first, capped at
@@ -6892,6 +6932,57 @@ open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data]
         FfiConverterSequenceData.lower(peerKnownMsgIds),
         FfiConverterBool.lower(peerAuthenticated),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Apply one opened, verified inbound body — the per-kind half of the
+     * inbound transaction, owned once, in core.
+     *
+     * [`Self::process_inbound_frame`] decides *whether* an envelope is ours;
+     * this decides *what its body means*. Callers run them in that order and
+     * then, only if this returned `Ok`, run
+     * [`Self::core_commit_inbound_delivery`] with the same commit token —
+     * the production `deliver → commit` order (DTN D4 / T4-06). An `Err` here
+     * is a *durability* failure and only that: the caller drops the token
+     * unused, leaves the `msg_id` re-presentable and reports
+     * [`CoreInboundDisposition::Failed`], because a retry on a healthier disk
+     * can genuinely succeed.
+     *
+     * A rejection the bytes themselves earn is not an error. It comes back as
+     * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
+     * any other consumption so the relay copy acks away instead of refetching
+     * and re-failing forever. Retrying a signed body that will not decode
+     * cannot make it decode.
+     *
+     * The two gates it applies before any kind runs:
+     *
+     * - `DELIVER-01` — a pairwise body is written only into its verified
+     * sender's own thread, and a group body only into the group whose key
+     * opened it. `chat_id` is attacker-chosen data inside a signed body;
+     * opening the seal proves *who* wrote it, never *where* they may
+     * write. Without this, any accepted contact or group member could
+     * author rows into a thread they are not part of.
+     * - [`crate::core_pairwise_sender_authorized`] — the shared
+     * sender/kind predicate all three shells already call.
+     *
+     * Whether the body is pairwise is read from
+     * [`CoreInboundCommit::group_id`], which core fills in only for a group
+     * delivery. It is deliberately never inferred from `chat_id`, which the
+     * sender controls.
+     */
+open func coreDeliverInbound(identity: Identity, senderUserId: Data, payload: Data, commit: CoreInboundCommit, arrival: MessageArrival, discovery: CoreDiscoveryPolicyState)throws  -> CoreInboundDelivery {
+    return try  FfiConverterTypeCoreInboundDelivery.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_deliver_inbound(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterData.lower(payload),
+        FfiConverterTypeCoreInboundCommit.lower(commit),
+        FfiConverterTypeMessageArrival.lower(arrival),
+        FfiConverterTypeCoreDiscoveryPolicyState.lower(discovery),$0
     )
 })
 }
@@ -12838,6 +12929,78 @@ public func FfiConverterTypeCoreDigestSprayPlan_lower(_ value: CoreDigestSprayPl
 
 
 /**
+ * The one piece of delivery input that is genuinely the shell's: this
+ * device's own friends-of-friends discovery switch, which lives in platform
+ * settings rather than the message store. Passed in explicitly so the fold
+ * below reads no ambient state (determinism, plan §3.1).
+ */
+public struct CoreDiscoveryPolicyState {
+    public var enabled: Bool
+    public var revision: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, revision: UInt64) {
+        self.enabled = enabled
+        self.revision = revision
+    }
+}
+
+
+
+extension CoreDiscoveryPolicyState: Equatable, Hashable {
+    public static func ==(lhs: CoreDiscoveryPolicyState, rhs: CoreDiscoveryPolicyState) -> Bool {
+        if lhs.enabled != rhs.enabled {
+            return false
+        }
+        if lhs.revision != rhs.revision {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(enabled)
+        hasher.combine(revision)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDiscoveryPolicyState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDiscoveryPolicyState {
+        return
+            try CoreDiscoveryPolicyState(
+                enabled: FfiConverterBool.read(from: &buf), 
+                revision: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreDiscoveryPolicyState, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterUInt64.write(value.revision, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDiscoveryPolicyState_lift(_ buf: RustBuffer) throws -> CoreDiscoveryPolicyState {
+    return try FfiConverterTypeCoreDiscoveryPolicyState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDiscoveryPolicyState_lower(_ value: CoreDiscoveryPolicyState) -> RustBuffer {
+    return FfiConverterTypeCoreDiscoveryPolicyState.lower(value)
+}
+
+
+/**
  * The caller's half of an armed window: schedule the resume `delay_ms` out,
  * then hand `token` back to [`CoreFailoverResumeDebounce::fired`].
  */
@@ -13103,6 +13266,13 @@ public struct CoreInboundCommit {
      */
     public var msgId: Data
     /**
+     * The group this envelope was opened for, when it was a group delivery,
+     * and `None` for a pairwise one. It is both the pairwise discriminant the
+     * delivery fold uses (never the sender-chosen `chat_id`) and the id a
+     * group body's `chat_id` must equal under `DELIVER-01`.
+     */
+    public var groupId: Data?
+    /**
      * The opened body's kind, when it decoded, so the commit can record the
      * ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
      * deliveries (recording hidden evidence is a pairwise-only licence) and
@@ -13126,6 +13296,12 @@ public struct CoreInboundCommit {
          * The envelope id to mark seen once delivery succeeds.
          */msgId: Data, 
         /**
+         * The group this envelope was opened for, when it was a group delivery,
+         * and `None` for a pairwise one. It is both the pairwise discriminant the
+         * delivery fold uses (never the sender-chosen `chat_id`) and the id a
+         * group body's `chat_id` must equal under `DELIVER-01`.
+         */groupId: Data?, 
+        /**
          * The opened body's kind, when it decoded, so the commit can record the
          * ACK-01 consumed-hidden evidence for a hidden kind. `None` for group
          * deliveries (recording hidden evidence is a pairwise-only licence) and
@@ -13137,6 +13313,7 @@ public struct CoreInboundCommit {
          * stays a single call with no ambient state.
          */recipientHint: Data, expiry: Int64, ownUserId: Data, nowMs: Int64) {
         self.msgId = msgId
+        self.groupId = groupId
         self.hiddenKind = hiddenKind
         self.recipientHint = recipientHint
         self.expiry = expiry
@@ -13150,6 +13327,9 @@ public struct CoreInboundCommit {
 extension CoreInboundCommit: Equatable, Hashable {
     public static func ==(lhs: CoreInboundCommit, rhs: CoreInboundCommit) -> Bool {
         if lhs.msgId != rhs.msgId {
+            return false
+        }
+        if lhs.groupId != rhs.groupId {
             return false
         }
         if lhs.hiddenKind != rhs.hiddenKind {
@@ -13172,6 +13352,7 @@ extension CoreInboundCommit: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(msgId)
+        hasher.combine(groupId)
         hasher.combine(hiddenKind)
         hasher.combine(recipientHint)
         hasher.combine(expiry)
@@ -13189,6 +13370,7 @@ public struct FfiConverterTypeCoreInboundCommit: FfiConverterRustBuffer {
         return
             try CoreInboundCommit(
                 msgId: FfiConverterData.read(from: &buf), 
+                groupId: FfiConverterOptionData.read(from: &buf), 
                 hiddenKind: FfiConverterOptionUInt8.read(from: &buf), 
                 recipientHint: FfiConverterData.read(from: &buf), 
                 expiry: FfiConverterInt64.read(from: &buf), 
@@ -13199,6 +13381,7 @@ public struct FfiConverterTypeCoreInboundCommit: FfiConverterRustBuffer {
 
     public static func write(_ value: CoreInboundCommit, into buf: inout [UInt8]) {
         FfiConverterData.write(value.msgId, into: &buf)
+        FfiConverterOptionData.write(value.groupId, into: &buf)
         FfiConverterOptionUInt8.write(value.hiddenKind, into: &buf)
         FfiConverterData.write(value.recipientHint, into: &buf)
         FfiConverterInt64.write(value.expiry, into: &buf)
@@ -13220,6 +13403,119 @@ public func FfiConverterTypeCoreInboundCommit_lift(_ buf: RustBuffer) throws -> 
 #endif
 public func FfiConverterTypeCoreInboundCommit_lower(_ value: CoreInboundCommit) -> RustBuffer {
     return FfiConverterTypeCoreInboundCommit.lower(value)
+}
+
+
+/**
+ * The bounded typed result of [`MessageStore::core_deliver_inbound`] — the
+ * per-kind delivery decisions folded into core, with only the driver work
+ * core cannot do handed back.
+ *
+ * A driver executes what is in here and infers nothing: it must not re-read
+ * `kind` to decide on further store work, because every store effect for
+ * every kind has already been committed when this returns.
+ */
+public struct CoreInboundDelivery {
+    public var verdict: CoreDeliveryVerdict
+    /**
+     * The decoded body's kind, for the driver's presentation surface
+     * (notification routing) — never for another policy branch.
+     */
+    public var kind: UInt8
+    /**
+     * Whether a `messages` row was written, so a shell with a chat surface
+     * knows there is something new to show. Hidden kinds and drops are false.
+     */
+    public var persisted: Bool
+    /**
+     * See [`CoreLanEndpointIntent`]. `None` for every other kind.
+     */
+    public var endpointHint: CoreLanEndpointIntent?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(verdict: CoreDeliveryVerdict, 
+        /**
+         * The decoded body's kind, for the driver's presentation surface
+         * (notification routing) — never for another policy branch.
+         */kind: UInt8, 
+        /**
+         * Whether a `messages` row was written, so a shell with a chat surface
+         * knows there is something new to show. Hidden kinds and drops are false.
+         */persisted: Bool, 
+        /**
+         * See [`CoreLanEndpointIntent`]. `None` for every other kind.
+         */endpointHint: CoreLanEndpointIntent?) {
+        self.verdict = verdict
+        self.kind = kind
+        self.persisted = persisted
+        self.endpointHint = endpointHint
+    }
+}
+
+
+
+extension CoreInboundDelivery: Equatable, Hashable {
+    public static func ==(lhs: CoreInboundDelivery, rhs: CoreInboundDelivery) -> Bool {
+        if lhs.verdict != rhs.verdict {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.persisted != rhs.persisted {
+            return false
+        }
+        if lhs.endpointHint != rhs.endpointHint {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(verdict)
+        hasher.combine(kind)
+        hasher.combine(persisted)
+        hasher.combine(endpointHint)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreInboundDelivery: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreInboundDelivery {
+        return
+            try CoreInboundDelivery(
+                verdict: FfiConverterTypeCoreDeliveryVerdict.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                persisted: FfiConverterBool.read(from: &buf), 
+                endpointHint: FfiConverterOptionTypeCoreLanEndpointIntent.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreInboundDelivery, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreDeliveryVerdict.write(value.verdict, into: &buf)
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterBool.write(value.persisted, into: &buf)
+        FfiConverterOptionTypeCoreLanEndpointIntent.write(value.endpointHint, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundDelivery_lift(_ buf: RustBuffer) throws -> CoreInboundDelivery {
+    return try FfiConverterTypeCoreInboundDelivery.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreInboundDelivery_lower(_ value: CoreInboundDelivery) -> RustBuffer {
+    return FfiConverterTypeCoreInboundDelivery.lower(value)
 }
 
 
@@ -13641,6 +13937,88 @@ public func FfiConverterTypeCoreLanEndpoint_lift(_ buf: RustBuffer) throws -> Co
 #endif
 public func FfiConverterTypeCoreLanEndpoint_lower(_ value: CoreLanEndpoint) -> RustBuffer {
     return FfiConverterTypeCoreLanEndpoint.lower(value)
+}
+
+
+/**
+ * The single delivery effect core cannot perform itself: recording a
+ * contact's advertised LAN endpoint in the shell's own endpoint cache (a
+ * file/preferences store outside SQLite). Present only for an applied kind-8
+ * hint, and it is *this contact's own* endpoint by construction — the
+ * `ENDPOINT-01` privacy rule is unchanged, because the fold hands back a hint
+ * keyed to its verified sender and nothing else.
+ */
+public struct CoreLanEndpointIntent {
+    public var peerUserId: Data
+    public var endpoint: LanEndpointContent
+    public var observedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(peerUserId: Data, endpoint: LanEndpointContent, observedAtMs: Int64) {
+        self.peerUserId = peerUserId
+        self.endpoint = endpoint
+        self.observedAtMs = observedAtMs
+    }
+}
+
+
+
+extension CoreLanEndpointIntent: Equatable, Hashable {
+    public static func ==(lhs: CoreLanEndpointIntent, rhs: CoreLanEndpointIntent) -> Bool {
+        if lhs.peerUserId != rhs.peerUserId {
+            return false
+        }
+        if lhs.endpoint != rhs.endpoint {
+            return false
+        }
+        if lhs.observedAtMs != rhs.observedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(peerUserId)
+        hasher.combine(endpoint)
+        hasher.combine(observedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanEndpointIntent: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanEndpointIntent {
+        return
+            try CoreLanEndpointIntent(
+                peerUserId: FfiConverterData.read(from: &buf), 
+                endpoint: FfiConverterTypeLanEndpointContent.read(from: &buf), 
+                observedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLanEndpointIntent, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.peerUserId, into: &buf)
+        FfiConverterTypeLanEndpointContent.write(value.endpoint, into: &buf)
+        FfiConverterInt64.write(value.observedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanEndpointIntent_lift(_ buf: RustBuffer) throws -> CoreLanEndpointIntent {
+    return try FfiConverterTypeCoreLanEndpointIntent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanEndpointIntent_lower(_ value: CoreLanEndpointIntent) -> RustBuffer {
+    return FfiConverterTypeCoreLanEndpointIntent.lower(value)
 }
 
 
@@ -25057,6 +25435,114 @@ extension CoreDeliveryState: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What the delivery fold did with one opened body.
+ */
+
+public enum CoreDeliveryVerdict {
+    
+    /**
+     * The body validated and every store effect it implies is committed.
+     */
+    case applied
+    /**
+     * `DELIVER-01`: a pairwise body whose `chat_id` names a thread other than
+     * its verified sender's own. Terminal — consumed, never applied.
+     */
+    case droppedForeignChat
+    /**
+     * The verified pairwise sender is not authorized to dispatch this kind
+     * ([`crate::core_pairwise_sender_authorized`]). Terminal, not a failure:
+     * retrying cannot make an already-authored envelope more authorized.
+     */
+    case droppedUnauthorizedSender
+    /**
+     * The body — or the per-kind content inside it — could not be decoded, or
+     * failed a body-shape check the sender controls (a receipt that does not
+     * acknowledge this device, a group invite whose membership omits its own
+     * sender). Terminal, not a failure: the bytes are fixed and signed, so the
+     * same decode fails identically forever. Delivering it again could only
+     * re-fail, which is why it is consumed rather than left to refetch.
+     *
+     * This matches what the shipping Android delivery path already did with an
+     * undecodable body: log it and report the envelope consumed. Only the
+     * *hidden-kind ack evidence* is withheld when the top-level body would not
+     * decode, and that falls out on its own — core fills
+     * [`CoreInboundCommit::hidden_kind`] from a successful decode and leaves it
+     * `None` otherwise, so an unreadable body can never vouch for a hidden kind.
+     */
+    case droppedMalformed
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreDeliveryVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = CoreDeliveryVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreDeliveryVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .applied
+        
+        case 2: return .droppedForeignChat
+        
+        case 3: return .droppedUnauthorizedSender
+        
+        case 4: return .droppedMalformed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreDeliveryVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .applied:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .droppedForeignChat:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .droppedUnauthorizedSender:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .droppedMalformed:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryVerdict_lift(_ buf: RustBuffer) throws -> CoreDeliveryVerdict {
+    return try FfiConverterTypeCoreDeliveryVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreDeliveryVerdict_lower(_ value: CoreDeliveryVerdict) -> RustBuffer {
+    return FfiConverterTypeCoreDeliveryVerdict.lower(value)
+}
+
+
+
+extension CoreDeliveryVerdict: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which direct radio a live link to a person uses.
  */
 
@@ -31613,6 +32099,30 @@ fileprivate struct FfiConverterOptionTypeCoreLanEndpoint: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeCoreLanEndpoint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeCoreLanEndpointIntent: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanEndpointIntent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreLanEndpointIntent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreLanEndpointIntent.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -38765,6 +39275,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 19708) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_deliver_inbound() != 36853) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {

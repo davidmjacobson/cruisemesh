@@ -4,6 +4,19 @@ Build and bindgen recipes that don't fit in [README.md](README.md), including
 the faster paths and the ones with sharp edges. Human contributors are as much
 the audience as agents are.
 
+## Rust tests: run the whole workspace
+
+Run `cargo test` (equivalently `cargo test --workspace`) at the repo root.
+`default-members` is `core`, `relayd`, `desktop`, so a bare run covers all
+three. `cargo test -p cruisemesh-core` is a fast inner loop and nothing more:
+it skips the desktop crate, which depends on core as an ordinary Rust crate,
+so a change to a core export can break a desktop call site without a single
+local test turning red.
+
+CI does not close that gap for you either. The Linux job runs
+`cargo test --workspace --exclude cruisemesh-node`; the desktop crate is
+built and tested only by the separate Windows job in the same workflow.
+
 ## Android and iOS parity
 
 Treat Android and iOS as peer shells by default. For every user-visible feature,
