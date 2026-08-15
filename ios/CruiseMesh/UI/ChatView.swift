@@ -951,7 +951,7 @@ struct ComposerReachNotice: View {
         case .repliesCannotReachMe:
             return "Your messages will reach \(contactName), but their replies only arrive when you're near each other. Set up a Shore Pass to get replies anywhere."
         case .theyCannotBeReached:
-            return "\(contactName) hasn't set up a Shore Pass, so your messages only arrive when you're near each other. They need their own pass to be reached from further away."
+            return "Messages you send \(contactName) while you're apart wait in your family's Shore Pass mailbox until their phone picks them up. If their phone isn't set up with your pass, they'll wait until you're near each other."
         case .neitherDirectionWorks:
             return String(localized: "Neither phone has a Shore Pass, so messages only cross when you're near each other. Either of you can set one up.")
         }
