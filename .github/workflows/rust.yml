@@ -68,7 +68,7 @@ jobs:
       - name: Build dogfood helper
         run: cargo build --release -p cruisemesh-node
       - name: Upload Windows dogfood
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cruisemesh-windows-x64
           path: |
@@ -158,7 +158,7 @@ jobs:
         run: ./gradlew :app:validateDebugScreenshotTest
       - name: Upload screenshot differences
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: android-screenshot-differences
           path: android/app/build/reports/screenshotTest/

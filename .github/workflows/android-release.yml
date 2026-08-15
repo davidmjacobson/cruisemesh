@@ -275,7 +275,7 @@ jobs:
       - name: Upload provenance artifact
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-provenance-${{ github.ref_name }}
           path: ${{ github.workspace }}/release-provenance.txt
