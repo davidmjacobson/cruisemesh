@@ -1566,6 +1566,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         sealed: Data,
         identity: Identity
     ) -> CoreInboundDisposition {
+        // Whole-envelope engine selection, read once here and not consulted
+        // again while this frame is handled, so a flip cannot mix engines
+        // within one envelope. Default legacy: everything below this line is
+        // unchanged until the internal switch is turned on.
+        if InboundEngineSettings.pathEngine() == .core {
+            return processInboundEnvelopeViaCore(
+                sourceAddress: sourceAddress,
+                msgId: msgId,
+                hopTtl: hopTtl,
+                expiry: expiry,
+                recipientHint: recipientHint,
+                sealed: sealed,
+                identity: identity
+            )
+        }
         let sourceLabel = sourceAddress ?? "relay"
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         switch coreInboundGate(
@@ -1738,6 +1753,186 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         return .consumed
     }
 
+    /// The same envelope, dispositioned by core's one inbound transaction
+    /// (`MessageStore.processInboundFrame`) instead of by the function above.
+    ///
+    /// What moved: the dedupe/expiry/header gate, the pairwise and group opens,
+    /// the signer-is-a-member guard, the blocked-sender drop, the carry, the
+    /// hop decrement, the relay no-reinjection rule, and every `seen` record
+    /// -- all of it now decided once, in core, inside store transactions that
+    /// have committed before the call returns. What stayed: this class remains
+    /// the driver. It picks the links a re-flood goes out on, applies the
+    /// delivered payload through the same per-kind handlers as before, and
+    /// commits afterwards.
+    ///
+    /// The order is the production `deliver -> commit` order, and it is the
+    /// whole reason core hands a commit token back rather than recording the
+    /// bookkeeping itself: if the native delivery below throws, the token is
+    /// dropped, the `msgId` stays unrecorded and re-presentable, no
+    /// consumed-hidden evidence is written, and this reports `.failed` -- so
+    /// the relay copy is never acked away for a message that never landed
+    /// (T4-06 / DTN D4).
+    ///
+    /// Runs on `meshQueue` like its legacy twin -- the caller is unchanged --
+    /// so the FFI call below is off the main actor. That is load-bearing
+    /// rather than incidental: a receive pipeline doing core work on the main
+    /// actor is the shape of freeze this app has already shipped once.
+    private func processInboundEnvelopeViaCore(
+        sourceAddress: String?,
+        msgId: Data,
+        hopTtl: UInt8,
+        expiry: Int64,
+        recipientHint: Data,
+        sealed: Data,
+        identity: Identity
+    ) -> CoreInboundDisposition {
+        let sourceLabel = sourceAddress ?? "relay"
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        // Core takes the §6.4 frame, not the parsed fields, because the parse
+        // and the frame limits are part of the disposition it owns. Re-encoding
+        // what `parseFrame` just produced is byte-identical by construction.
+        let frame = encodeEnvelopeFrame(
+            msgId: msgId,
+            hopTtl: hopTtl,
+            expiry: expiry,
+            recipientHint: recipientHint,
+            sealed: sealed
+        )
+        let outcome: CoreInboundOutcome
+        do {
+            outcome = try store.processInboundFrame(
+                identity: identity,
+                seen: GossipState.seenIds,
+                source: InboundAdapter.source(forSourceAddress: sourceAddress),
+                frame: frame,
+                nowMs: now
+            )
+        } catch {
+            // A store failure inside the transaction. Core records nothing seen
+            // on that path, so this envelope stays re-presentable on its next
+            // copy and its relay row is never acked.
+            log.warning("Deferring envelope from \(sourceLabel, privacy: .public): inbound transaction failed")
+            return .failed
+        }
+        let plan = InboundAdapter.plan(from: outcome)
+
+        // Execution, in the order the legacy path used. Whether there is a
+        // frame to flood, and what its hop count is, was decided in core; this
+        // only chooses the links -- excluding the arriving one, which is the
+        // echo guard the legacy path has always had.
+        if let relayFrame = plan.relayFrame {
+            if let sourceAddress {
+                _ = MeshRouter.relayToAllExcept(sourceAddress, frame: relayFrame)
+            } else {
+                _ = MeshRouter.relayToAll(frame: relayFrame)
+            }
+        }
+        // A mesh-carried envelope addressed to someone this device knows is
+        // worth waking the relay pass for, exactly as `carryForeign` did. The
+        // family test is core's own `hintMatchesKnownTarget` -- the shell reads
+        // the answer, it does not decide what "family" means -- and the
+        // relay-source half of the condition is core's own carry rule, so a
+        // relay-fetched row never wakes a pass to re-upload itself. See
+        // `InboundExecutionPlan.wakesRelayPass`.
+        if plan.wakesRelayPass(
+            source: InboundAdapter.source(forSourceAddress: sourceAddress),
+            hintIsKnownTarget: (try? store.hintMatchesKnownTarget(hint: recipientHint, nowMs: now)) == true
+        ) {
+            RelaySyncEvents.requestSync()
+        }
+        if plan.droppedBlocked {
+            log.info("Dropping envelope from blocked sender on \(sourceLabel, privacy: .public)")
+        }
+
+        guard let delivery = plan.delivery else { return plan.disposition }
+        let consumed: PairwiseDeliveryResult?
+        do {
+            consumed = try applyCoreDeliveredPayload(
+                sourceLabel: sourceLabel,
+                sourceAddress: sourceAddress,
+                delivery: delivery,
+                identity: identity,
+                msgId: msgId,
+                hopTtl: hopTtl
+            )
+        } catch {
+            log.warning("Deferring envelope from \(sourceLabel, privacy: .public): durable delivery failed")
+            return .failed
+        }
+        // Delivery landed. Commit what core deferred: the ACK-01 hidden-kind
+        // evidence (best-effort, every safety condition re-checked in the
+        // store) and the DTN D4 `seen` record.
+        store.coreCommitInboundDelivery(seen: GossipState.seenIds, commit: delivery.commit)
+        if let consumed {
+            recordConsumedStreamLamport(consumed)
+        }
+        return plan.disposition
+    }
+
+    /// Applies one payload core decided this device should receive, through the
+    /// same handlers the legacy path calls.
+    ///
+    /// Core has already proved the envelope was ours to open, that a group
+    /// body's signer and this device are both current members, and that the
+    /// sender is not blocked; those checks are not repeated as policy here. The
+    /// handlers below re-derive what they need about the body itself -- the
+    /// 1:1 stream rule that `chatId` is the sender, the group rule that
+    /// `chatId` is the group -- because that is the body's own validity, which
+    /// is where each handler has always enforced it.
+    ///
+    /// Pairwise and group are told apart by `commit.hiddenKind`, which core
+    /// populates only on the pairwise-open path (recording hidden-kind ack
+    /// evidence is a pairwise-only licence) and leaves `nil` for a group
+    /// delivery or a body that did not decode. Using it here is deliberate and
+    /// worth stating, because the alternative -- routing on whether `chatId`
+    /// names a known group -- would let a 1:1-sealed body claiming a group's
+    /// id reach the group handlers, which the legacy path drops outright.
+    private func applyCoreDeliveredPayload(
+        sourceLabel: String,
+        sourceAddress: String?,
+        delivery: (payload: Data, senderUserId: Data, commit: CoreInboundCommit),
+        identity: Identity,
+        msgId: Data,
+        hopTtl: UInt8
+    ) throws -> PairwiseDeliveryResult? {
+        let opened = OpenedMessage(senderUserId: delivery.senderUserId, payload: delivery.payload)
+        let arrival = messageArrival(
+            sourceAddress: sourceAddress,
+            senderUserId: delivery.senderUserId,
+            receivedHopTtl: hopTtl
+        )
+        if delivery.commit.hiddenKind != nil {
+            return try deliverOpened(
+                sourceLabel: sourceLabel,
+                sourceAddress: sourceAddress,
+                opened: opened,
+                identity: identity,
+                msgId: msgId,
+                arrival: arrival
+            )
+        }
+        guard let extendedBody = try? decodeExtendedMessageBody(bytes: delivery.payload) else {
+            // Undecodable body from a verified sender: a deterministic reject,
+            // and a terminal handled state rather than a store failure.
+            return nil
+        }
+        guard let group = try? store.getGroup(groupId: extendedBody.chatId) else {
+            log.info("Dropping group envelope from \(sourceLabel, privacy: .public): no imported group for its chat id")
+            return nil
+        }
+        try deliverOpenedGroupEnvelope(
+            sourceLabel: sourceLabel,
+            group: group,
+            opened: opened,
+            identity: identity,
+            msgId: msgId,
+            arrival: arrival
+        )
+        // Group deliveries record no hidden-kind evidence and no 1:1 stream
+        // lamport; both are pairwise-only.
+        return nil
+    }
+
     /// Best-effort note that this device consumed this envelope as its sole
     /// true endpoint consumer, so a later relay copy of the same `msgId` can
     /// be acked away instead of sitting in the mailbox until expiry.
@@ -1769,6 +1964,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             ownUserId: identity.userId,
             nowMs: now
         )
+        recordConsumedStreamLamport(consumed)
+    }
+
+    /// Records an exact, validated pairwise lamport for gap rendering when the
+    /// handler left no message row. Core accepts that longer-lived evidence
+    /// only for an established contact and an actual 1:1 stream, so stranger
+    /// onboarding traffic cannot grow it indefinitely.
+    ///
+    /// Shared by both inbound engines: the core path's hidden-kind evidence is
+    /// written by `coreCommitInboundDelivery`, but this gap-rendering record is
+    /// not part of that commit, so it is called separately there.
+    private func recordConsumedStreamLamport(_ consumed: PairwiseDeliveryResult) {
         guard consumed.recordStreamLamport else { return }
         if (try? store.recordConsumedHiddenLamport(
             chatId: consumed.senderUserId,

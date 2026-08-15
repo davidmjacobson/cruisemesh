@@ -11,6 +11,7 @@ struct InternalToolsView: View {
     @State private var relayToken = ""
     @State private var useCoreRelayEngine = false
     @State private var relayShadowOn = true
+    @State private var useCoreInboundEngine = false
     @State private var lanAddress = ""
     @State private var lanError: String?
     @State private var showLanQR = false
@@ -23,6 +24,7 @@ struct InternalToolsView: View {
         // times out on that).
         Form {
             relaySection
+            receiveSection
             lanFieldToolsSection
             diagnosticsSection
         }
@@ -35,6 +37,7 @@ struct InternalToolsView: View {
             }
             useCoreRelayEngine = RelayEngineSettings.passEngine() == .core
             relayShadowOn = RelayEngineSettings.shadowEnabled()
+            useCoreInboundEngine = InboundEngineSettings.pathEngine() == .core
         }
         .task(id: relayUrl + "\u{0}" + relayToken) {
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -110,6 +113,25 @@ struct InternalToolsView: View {
                 }
             ))
             Text("On a few legacy passes a day, compares what the core engine would have done and records only where they differ. Sends and receives nothing extra.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var receiveSection: some View {
+        Section("Receiving") {
+            // The per-envelope rollback switch, read once as each frame
+            // arrives. Off by default; the legacy receive path is unchanged
+            // until this is turned on.
+            Toggle("Rebuilt message handling", isOn: Binding(
+                get: { useCoreInboundEngine },
+                set: {
+                    useCoreInboundEngine = $0
+                    InboundEngineSettings.setPathEngine($0 ? .core : .legacy)
+                }
+            ))
+            Text("Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
