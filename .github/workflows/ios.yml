@@ -23,6 +23,19 @@ on:
         options:
           - ui
           - all
+      # Two of the three simulator profiles only ever ran overnight, so a
+      # failure that needs a small screen, a large text size or an iPad could
+      # be reproduced no sooner than the next night — and a fix for one could
+      # not be confirmed at all before merging. Let anyone ask for the full
+      # set on a branch.
+      profiles:
+        description: Simulator profiles to run
+        required: true
+        default: standard
+        type: choice
+        options:
+          - standard
+          - nightly
   pull_request:
     paths:
       - "ios/**"
@@ -47,7 +60,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        profile: ${{ fromJSON(github.event_name == 'schedule' && '["standard","compact-accessibility","ipad-dark"]' || '["standard"]') }}
+        profile: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profiles == 'nightly')) && '["standard","compact-accessibility","ipad-dark"]' || '["standard"]') }}
     steps:
       - uses: actions/checkout@v7
 
@@ -128,7 +141,9 @@ jobs:
           echo "Using simulator $UDID"
 
       - name: Configure nightly appearance and content size
-        if: github.event_name == 'schedule' && matrix.profile != 'standard'
+        # The two extra profiles are only ever in the matrix as a set, so the
+        # profile name alone says whether this run wants the extra setup.
+        if: matrix.profile != 'standard'
         env:
           PROFILE: ${{ matrix.profile }}
           UDID: ${{ steps.sim.outputs.udid }}
@@ -197,7 +212,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ github.event_name == 'schedule' && format('ios-test-results-{0}', matrix.profile) || 'ios-test-results' }}
+          # Always profile-suffixed: a multi-profile run uploads one artifact
+          # per job, and two jobs sharing a name is an upload error.
+          name: ios-test-results-${{ matrix.profile }}
           path: |
             ios/build/TestResults.xcresult
             ios/build/xcodebuild.log

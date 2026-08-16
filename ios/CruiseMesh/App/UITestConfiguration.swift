@@ -116,7 +116,11 @@ enum UITestConfiguration {
         case .chatLateArrival:
             ProfileStore.saveDisplayName("UI Tester")
             let contact = seedContact(name: "Bob")
-            for index in 1...32 {
+            // Deep enough that the history overflows the tallest simulator
+            // screen. At 32 the whole thread fitted at once on an iPad, so a
+            // test could not scroll away from the newest message, and the
+            // "you are reading history" state it needed never happened.
+            for index in 1...lateArrivalHistoryCount {
                 insertMessage(
                     chatId: contact.userId,
                     senderUserId: index.isMultiple(of: 3) ? identity.userId : contact.userId,
@@ -126,6 +130,10 @@ enum UITestConfiguration {
             }
         }
     }
+
+    /// Messages the late-arrival fixture seeds. `CruiseMeshUITests` mirrors
+    /// this number, so change both together.
+    static let lateArrivalHistoryCount = 120
 
     static func injectIncomingMessage(contact: Contact, text: String) {
         guard scenario == .chatLateArrival else { return }
