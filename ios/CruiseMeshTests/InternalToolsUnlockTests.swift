@@ -66,6 +66,28 @@ final class InternalToolsUnlockTests: XCTestCase {
         XCTAssertEqual(counter.tap(at: 0.7), .quiet)
     }
 
+    func testTheVersionRowSaysWhatEachTapDid() {
+        XCTAssertEqual(internalToolsLabel(for: .quiet, unlockedAfterTap: false), .version)
+        XCTAssertEqual(
+            internalToolsLabel(for: .countdown(remaining: 3), unlockedAfterTap: false),
+            .countdown(remaining: 3)
+        )
+        XCTAssertEqual(internalToolsLabel(for: .reached, unlockedAfterTap: true), .unlocked)
+        XCTAssertEqual(internalToolsLabel(for: .reached, unlockedAfterTap: false), .hidden)
+    }
+
+    func testAnEarlyTapClearsFeedbackLeftOverFromAnAbandonedRun() {
+        // Taps one to three of a fresh run put the version string back, so a
+        // count from a run that was given up on cannot linger under a new one.
+        XCTAssertEqual(internalToolsLabel(for: .quiet, unlockedAfterTap: true), .version)
+    }
+
+    func testFeedbackClearsBeforeTheRunItBelongsToExpires() {
+        // The row goes quiet while a run may still be live, never the other way
+        // round: a count that outlived its own run would be a lie on screen.
+        XCTAssertLessThan(internalToolsLabelRevert, internalToolsTapWindow)
+    }
+
     /// A debug build shows the entry without any unlock; a release build shows
     /// it only once the flag is set. The warning is the other way round: it is
     /// for the release case only.

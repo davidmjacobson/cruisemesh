@@ -453,6 +453,28 @@
         }
       }
     },
+    "%lld more taps…": {
+      "localizations": {
+        "en": {
+          "variations": {
+            "plural": {
+              "one": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld more tap…"
+                }
+              },
+              "other": {
+                "stringUnit": {
+                  "state": "translated",
+                  "value": "%lld more taps…"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "A message is too large to send": {
       "localizations": {
         "en": {
@@ -1279,6 +1301,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "How to fix"
+          }
+        }
+      }
+    },
+    "Internal tools hidden.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internal tools hidden."
+          }
+        }
+      }
+    },
+    "Internal tools on. Reopen settings.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internal tools on. Reopen settings."
           }
         }
       }

@@ -414,15 +414,15 @@ fun InternalToolsScreen(onBack: () -> Unit) {
             // The way back out, for anyone who would rather not hunt for the
             // version line again. Only offered where it can do anything: a
             // debuggable build shows this screen regardless of the flag.
+            //
+            // No confirmation message: this navigates straight back to
+            // Settings, and a toast fired on the way would land on top of the
+            // version row there -- the one place in the app a stray tap
+            // matters. The entry being gone is the confirmation.
             if (internalToolsUnlockedOnRelease(context)) {
                 OutlinedButton(
                     onClick = {
                         InternalToolsUnlockStore.setUnlocked(context, false)
-                        Toast.makeText(
-                            context,
-                            R.string.ui_internal_tools_hidden,
-                            Toast.LENGTH_LONG,
-                        ).show()
                         saveAndBack()
                     },
                     modifier = Modifier.fillMaxWidth().padding(top = 24.dp),

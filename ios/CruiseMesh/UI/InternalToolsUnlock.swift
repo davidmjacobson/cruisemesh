@@ -11,6 +11,15 @@ private let internalToolsCountdownFrom = 4
 /// Taps further apart than this start the count over.
 let internalToolsTapWindow: TimeInterval = 3
 
+/// How long the version row keeps showing tap feedback after the last tap.
+///
+/// Every bit of feedback this flow gives is the row's own text swapped in
+/// place, so this is also how long the row stops reading as a version string.
+/// Shorter than `internalToolsTapWindow` on purpose: a run that is still live
+/// can go quiet, which is the harmless direction. The other way round would
+/// leave a stale count on screen after the run it belonged to had expired.
+let internalToolsLabelRevert: TimeInterval = 1.5
+
 /// What one tap on the version row means.
 enum InternalToolsTap: Equatable {
     /// Too early to say anything.
@@ -19,6 +28,39 @@ enum InternalToolsTap: Equatable {
     case countdown(remaining: Int)
     /// The full run landed. The caller flips the flag.
     case reached
+}
+
+/// What the version row reads right now.
+enum InternalToolsLabel: Equatable {
+    /// The version string itself: the row's ordinary, resting text.
+    case version
+    /// This many taps still to go.
+    case countdown(remaining: Int)
+    /// The run landed and internal tools are now on.
+    case unlocked
+    /// The run landed and internal tools are hidden again.
+    case hidden
+}
+
+/// What the version row should read after one tap.
+///
+/// The whole of this flow's feedback, as a pure function, because the shape of
+/// it is the point: nothing is drawn over the row and nothing below it moves.
+/// The row says what happened, in its own place, at its own size, and reverts
+/// `internalToolsLabelRevert` after the last tap.
+///
+/// `unlockedAfterTap` is the state the flag was left in, so the caller flips
+/// the flag and then asks what to say about it. Mirrors Android's
+/// `internalToolsLabelFor`.
+func internalToolsLabel(for tap: InternalToolsTap, unlockedAfterTap: Bool) -> InternalToolsLabel {
+    switch tap {
+    case .quiet:
+        return .version
+    case .countdown(let remaining):
+        return .countdown(remaining: remaining)
+    case .reached:
+        return unlockedAfterTap ? .unlocked : .hidden
+    }
 }
 
 /// The seven-tap run on the app-version row, as a plain counter.

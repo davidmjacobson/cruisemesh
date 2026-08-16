@@ -3,7 +3,6 @@ package com.cruisemesh.app.ui
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.selection.toggleable
@@ -32,7 +31,9 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -43,6 +44,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
@@ -58,6 +60,7 @@ import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayEngineSettings
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
 import com.cruisemesh.app.mesh.RelaySyncEvents
+import kotlinx.coroutines.delay
 
 const val SUPPORT_URL = "https://cruisemesh.app/support/"
 
@@ -89,9 +92,29 @@ fun SettingsScreen(
     // release build shows it once someone has done the seven-tap run on the
     // version line at the bottom of this screen -- the only way a closed-test
     // tester on a release-signed build can reach the engine switches.
-    var showInternalTools by remember { mutableStateOf(internalToolsVisible(context)) }
+    //
+    // Read once, and deliberately not updated when a run lands. Inserting a
+    // row above the version line would push the line out from under the finger
+    // still tapping it, and the seventh tap of a run is usually followed by an
+    // eighth on the way to stopping. The entry appears the next time this
+    // screen is opened, which the row's own text says out loud.
+    val showInternalTools = remember { internalToolsVisible(context) }
     val unlockTaps = remember { InternalToolsTapCounter() }
     val haptics = LocalHapticFeedback.current
+    // What the version row reads right now, plus a token that restarts the
+    // revert countdown on every tap. Keying the effect on the token means a
+    // run of taps cancels and replaces one pending revert rather than queueing
+    // several, so nothing keeps appearing after the tapping stops.
+    var versionRowLabel by remember {
+        mutableStateOf<InternalToolsLabel>(InternalToolsLabel.Version)
+    }
+    var versionRowLabelToken by remember { mutableIntStateOf(0) }
+    LaunchedEffect(versionRowLabelToken) {
+        if (versionRowLabel != InternalToolsLabel.Version) {
+            delay(INTERNAL_TOOLS_LABEL_REVERT_MS)
+            versionRowLabel = InternalToolsLabel.Version
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -227,8 +250,13 @@ fun SettingsScreen(
             // taps turn them on, seven more hide them again. Deliberately
             // undiscoverable -- a family member scrolling to the bottom of
             // Settings should never arrive here by accident.
+            //
+            // All of the feedback is this row's own text, swapped in place at
+            // the same size and reverted a moment after the last tap. Nothing
+            // is drawn over it and nothing below it moves, so the row stays
+            // exactly where the finger already is for the whole run.
             Text(
-                appVersionLabel(context),
+                versionRowText(versionRowLabel, appVersionLabel(context)),
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
@@ -243,36 +271,20 @@ fun SettingsScreen(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
                     ) {
-                        when (val tap = unlockTaps.tap(System.currentTimeMillis())) {
-                            InternalToolsTap.Quiet -> Unit
-                            is InternalToolsTap.Countdown -> {
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                Toast.makeText(
-                                    context,
-                                    context.resources.getQuantityString(
-                                        R.plurals.ui_internal_tools_taps_left,
-                                        tap.remaining,
-                                        tap.remaining,
-                                    ),
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
-                            InternalToolsTap.Reached -> {
-                                val unlocked = !InternalToolsUnlockStore.isUnlocked(context)
-                                InternalToolsUnlockStore.setUnlocked(context, unlocked)
-                                showInternalTools = internalToolsVisible(context)
-                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                                Toast.makeText(
-                                    context,
-                                    if (unlocked) {
-                                        R.string.ui_internal_tools_unlocked
-                                    } else {
-                                        R.string.ui_internal_tools_hidden
-                                    },
-                                    Toast.LENGTH_LONG,
-                                ).show()
-                            }
+                        val tap = unlockTaps.tap(System.currentTimeMillis())
+                        val unlocked = if (tap == InternalToolsTap.Reached) {
+                            !InternalToolsUnlockStore.isUnlocked(context)
+                        } else {
+                            InternalToolsUnlockStore.isUnlocked(context)
                         }
+                        if (tap == InternalToolsTap.Reached) {
+                            InternalToolsUnlockStore.setUnlocked(context, unlocked)
+                        }
+                        if (tap != InternalToolsTap.Quiet) {
+                            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                        }
+                        versionRowLabel = internalToolsLabelFor(tap, unlocked)
+                        versionRowLabelToken += 1
                     },
             )
             // The author's dedication, in the traditional place for one: the
@@ -301,6 +313,26 @@ fun SettingsScreen(
  * hardcoded "1.0.0" for any build not made from a release tag, so several
  * different builds can share it.
  */
+/**
+ * The version row's text: the version string at rest, tap feedback while a run
+ * is in progress.
+ *
+ * One row, one line of text, one hit target. The alternative -- a toast or a
+ * snackbar -- floats at the bottom of the screen, which is exactly where this
+ * row is, and every tap it swallows makes the run longer.
+ */
+@Composable
+private fun versionRowText(label: InternalToolsLabel, version: String): String = when (label) {
+    InternalToolsLabel.Version -> version
+    is InternalToolsLabel.Countdown -> pluralStringResource(
+        R.plurals.ui_internal_tools_taps_left,
+        label.remaining,
+        label.remaining,
+    )
+    InternalToolsLabel.Unlocked -> stringResource(R.string.ui_internal_tools_unlocked)
+    InternalToolsLabel.Hidden -> stringResource(R.string.ui_internal_tools_hidden)
+}
+
 @Composable
 private fun appVersionLabel(context: Context): String {
     val fallback = stringResource(R.string.app_name)
