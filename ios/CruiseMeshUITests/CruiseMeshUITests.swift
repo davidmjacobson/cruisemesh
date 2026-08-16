@@ -12,6 +12,17 @@ final class CruiseMeshUITests: XCTestCase {
     /// when the element does appear; a too-tight one reds the only gate iOS has.
     private static let uiTimeout: TimeInterval = 10
 
+    /// Mirrors the message count the late-arrival fixture seeds. Kept in step
+    /// with `UITestConfiguration`; the fixture is deep enough to overflow the
+    /// tallest simulator screen, which is what lets a test scroll away from
+    /// the bottom of the thread on every device shape.
+    private static let seededHistoryCount = 120
+
+    /// Shorter than the general timeout on purpose: the keyboard is only a
+    /// hint that focus landed, and a run that never gets one must not spend
+    /// the full wait twice per field.
+    private static let keyboardTimeout: TimeInterval = 5
+
     override func setUp() {
         super.setUp()
         continueAfterFailure = false
@@ -70,8 +81,7 @@ final class CruiseMeshUITests: XCTestCase {
 
         let name = app.textFields["Your name"]
         XCTAssertTrue(name.waitForExistence(timeout: 3))
-        name.tap()
-        name.typeText("UI Tester")
+        focusAndType(name, "UI Tester")
 
         let start = app.buttons["Start using CruiseMesh"]
         XCTAssertTrue(start.isEnabled)
@@ -139,10 +149,7 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.settings").waitForExistence(timeout: 5))
 
         let backup = app.staticTexts["Back up account"]
-        for _ in 0..<5 where !backup.isHittable {
-            app.swipeUp()
-        }
-        XCTAssertTrue(backup.isHittable)
+        XCTAssertTrue(scrollUntilHittable(backup), "Back up account never came into view")
         backup.tap()
 
         XCTAssertTrue(app.navigationBars["Back up account"].waitForExistence(timeout: 5))
@@ -171,12 +178,18 @@ final class CruiseMeshUITests: XCTestCase {
         // paste also hangs the app idle wait. Seed pasteText and FocusState
         // through the UI-test-only control that uses the same bindings as the
         // human path, then assert the keyboard accessory is hittable.
+        // The seed control sits in the fourth section, below the QR actions.
+        // A List builds its rows lazily, so on a small screen at a large
+        // accessibility text size that row is not merely off-screen: it is
+        // absent from the accessibility tree entirely until it is scrolled
+        // near. Waiting for existence *before* scrolling therefore always
+        // times out on those device shapes, which is exactly what the nightly
+        // compact profile has been reporting. Scroll and re-query together.
         let seed = element("friends.uitest-seed-card")
-        XCTAssertTrue(seed.waitForExistence(timeout: Self.uiTimeout), "UI-test seed control missing")
-        // Section sits under QR actions; scroll until the seed control is tappable.
-        for _ in 0..<6 where !seed.isHittable {
-            app.swipeUp()
-        }
+        XCTAssertTrue(
+            scrollUntilHittable(seed),
+            "UI-test seed control never came into view"
+        )
         seed.tap()
 
         let keyboardAction = element("friends.preview-keyboard")
@@ -198,11 +211,9 @@ final class CruiseMeshUITests: XCTestCase {
                 ? app.textFields.firstMatch
                 : app.textViews.firstMatch)
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
-        composer.tap()
-        composer.typeText("   ")
+        focusAndType(composer, "   ")
         XCTAssertFalse(element("chat.composer.send").exists)
-        composer.tap()
-        composer.typeText("Hello from UI test")
+        focusAndType(composer, "Hello from UI test")
 
         let send = app.buttons["chat.composer.send"].waitForExistence(timeout: 10)
             ? app.buttons["chat.composer.send"]
@@ -229,8 +240,7 @@ final class CruiseMeshUITests: XCTestCase {
                 ? app.textFields.firstMatch
                 : app.textViews.firstMatch)
         XCTAssertTrue(composer.waitForExistence(timeout: 10))
-        composer.tap()
-        composer.typeText("Checking the header")
+        focusAndType(composer, "Checking the header")
 
         let recipientHeader = element("chat.contact-details")
         XCTAssertTrue(recipientHeader.waitForExistence(timeout: 5))
@@ -268,27 +278,36 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
         openChat(named: "Bob")
 
-        element("chat.contact-details").tap()
-        XCTAssertTrue(element("screen.contact-details").waitForExistence(timeout: 5))
-        app.buttons["Verify contact"].tap()
+        let details = element("chat.contact-details")
+        XCTAssertTrue(details.waitForExistence(timeout: Self.uiTimeout))
+        details.tap()
+        XCTAssertTrue(element("screen.contact-details").waitForExistence(timeout: Self.uiTimeout))
+
+        let verify = app.buttons["Verify contact"]
+        XCTAssertTrue(verify.waitForExistence(timeout: Self.uiTimeout))
+        verify.tap()
         XCTAssertTrue(
-            app.staticTexts["Match these words with your friend's screen to confirm it's really them."].exists
+            app.staticTexts["Match these words with your friend's screen to confirm it's really them."]
+                .waitForExistence(timeout: Self.uiTimeout)
         )
 
         // Expanding verification pushes the destructive action below the
-        // sheet's viewport. Scroll before asking XCTest for hittability: on
-        // an off-screen SwiftUI button that query itself can fail the test.
-        for _ in 0..<4 {
-            app.swipeUp()
-        }
+        // sheet's viewport, and the sheet builds its rows lazily, so an
+        // unscrolled query can miss the button outright rather than merely
+        // find it unhittable. Scroll and re-query together.
         let delete = app.buttons["Delete contact"]
-        XCTAssertTrue(delete.waitForExistence(timeout: 3))
-        XCTAssertTrue(delete.isHittable)
+        XCTAssertTrue(
+            scrollUntilHittable(delete),
+            "The delete action never came into view on the contact sheet"
+        )
         delete.tap()
-        XCTAssertTrue(app.alerts["Delete contact?"].waitForExistence(timeout: 3))
-        app.alerts["Delete contact?"].buttons["Cancel"].tap()
-        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: 3))
-        XCTAssertFalse(app.alerts["Delete contact?"].exists)
+        let alert = app.alerts["Delete contact?"]
+        XCTAssertTrue(alert.waitForExistence(timeout: Self.uiTimeout))
+        let cancel = alert.buttons["Cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: Self.uiTimeout))
+        cancel.tap()
+        XCTAssertTrue(element("screen.chat").waitForExistence(timeout: Self.uiTimeout))
+        XCTAssertTrue(alert.waitForNonExistence(timeout: Self.uiTimeout))
     }
 
     func testChatListMarkReadAndDeleteRequireDeliberateActions() {
@@ -321,19 +340,37 @@ final class CruiseMeshUITests: XCTestCase {
         launch(scenario: "chat-late-arrival")
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
         openChat(named: "Bob")
-        XCTAssertTrue(app.staticTexts["History message 32"].waitForExistence(timeout: Self.uiTimeout))
+        let newest = app.staticTexts["History message \(Self.seededHistoryCount)"]
+        XCTAssertTrue(newest.waitForExistence(timeout: Self.uiTimeout))
 
-        for _ in 0..<4 { app.swipeDown() }
+        // Scrolling away from the newest message is this test's precondition,
+        // not scene-setting: the jump action only exists while the reader is
+        // somewhere above the bottom of the thread. A fixed number of swipes
+        // proved nothing — on a large screen the whole seeded history fits at
+        // once, so every swipe bounced, the thread stayed at the bottom, and
+        // the failure surfaced much later as "the jump action never appeared".
+        // Scroll until the newest message is genuinely out of reach, and say
+        // so here if it never is.
+        XCTAssertTrue(
+            scrollUntilOutOfView(newest),
+            "The newest message stayed on screen, so the thread never entered the reading-history state this test is about"
+        )
+
         let inject = element("chat.uitest-inject-incoming")
         XCTAssertTrue(inject.waitForExistence(timeout: Self.uiTimeout))
         inject.tap()
 
-        // Assert the control through the name VoiceOver users interact with.
-        // SwiftUI exposes this transient overlay as a labelled button on the
-        // current SDK, but does not propagate its view identifier into the
-        // accessibility snapshot.
-        let jump = app.buttons["New messages"].firstMatch
-        XCTAssertTrue(jump.waitForExistence(timeout: Self.uiTimeout))
+        // Assert the control through the name VoiceOver users interact with,
+        // and accept the view identifier too: SwiftUI does not always
+        // propagate an overlay's identifier into the accessibility snapshot,
+        // and which handle survives has changed between SDKs.
+        let labelled = app.buttons["New messages"].firstMatch
+        XCTAssertTrue(
+            labelled.waitForExistence(timeout: Self.uiTimeout)
+                || element("chat.new-messages").waitForExistence(timeout: Self.uiTimeout),
+            "No jump-to-new-messages action appeared after a message arrived"
+        )
+        let jump = labelled.exists ? labelled : element("chat.new-messages")
         XCTAssertTrue(jump.isHittable)
         attachScreenshot(named: "Chat-new-messages-action")
         jump.tap()
@@ -355,6 +392,59 @@ final class CruiseMeshUITests: XCTestCase {
 
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// Scrolls down until `target` is both present and tappable.
+    ///
+    /// Existence and visibility are the same question in a SwiftUI `List`,
+    /// which builds its rows lazily: a row far below the fold is absent from
+    /// the accessibility tree, so `waitForExistence` on it can only ever time
+    /// out no matter how generous the timeout. That is why the wait has to
+    /// happen *inside* the scroll rather than before it — and why the nightly
+    /// profiles, which shrink the screen or enlarge the text and so push more
+    /// rows below the fold, failed where the default phone passed.
+    private func scrollUntilHittable(_ target: XCUIElement, maxSwipes: Int = 8) -> Bool {
+        if target.waitForExistence(timeout: 2), target.isHittable { return true }
+        for _ in 0..<maxSwipes {
+            app.swipeUp()
+            // A short wait after each swipe lets the list build the rows the
+            // swipe just revealed before the next query asks about them.
+            if target.waitForExistence(timeout: 1), target.isHittable { return true }
+        }
+        return target.exists && target.isHittable
+    }
+
+    /// Scrolls up (back through history) until `target` is off screen.
+    ///
+    /// Returns false rather than swiping forever, so a caller can fail with a
+    /// reason instead of blaming whatever it checked next.
+    private func scrollUntilOutOfView(_ target: XCUIElement, maxSwipes: Int = 8) -> Bool {
+        for _ in 0..<maxSwipes {
+            if !target.exists || !target.isHittable { return true }
+            app.swipeDown()
+        }
+        return !target.exists || !target.isHittable
+    }
+
+    /// Taps a text entry and waits for the keyboard before typing into it.
+    ///
+    /// `typeText` straight after a tap fails outright with "neither element
+    /// nor any descendant has keyboard focus" when a loaded runner has not
+    /// finished raising the keyboard — a real failure seen on the nightly
+    /// suite. Waiting for the keyboard, and re-tapping once if it never came,
+    /// removes the race without hiding a genuinely unfocusable field.
+    ///
+    /// The keyboard is treated as a hint, not a verdict: a simulator with a
+    /// hardware keyboard attached can accept typing without ever showing one,
+    /// so a missing keyboard buys a second tap and then gets out of the way.
+    /// If the field really cannot take input, `typeText` still says so.
+    private func focusAndType(_ field: XCUIElement, _ text: String) {
+        field.tap()
+        if !app.keyboards.element.waitForExistence(timeout: Self.keyboardTimeout) {
+            field.tap()
+            _ = app.keyboards.element.waitForExistence(timeout: Self.keyboardTimeout)
+        }
+        field.typeText(text)
     }
 
     /// Taps a chat-list row and waits for the thread to actually be on screen.
@@ -438,11 +528,7 @@ final class CruiseMeshUITests: XCTestCase {
         line: UInt = #line
     ) {
         let reveal = element(identifier)
-        for _ in 0..<5 where !reveal.isHittable {
-            app.swipeUp()
-        }
-        XCTAssertTrue(reveal.waitForExistence(timeout: 5), file: file, line: line)
-        XCTAssertTrue(reveal.isHittable, file: file, line: line)
+        XCTAssertTrue(scrollUntilHittable(reveal), file: file, line: line)
         XCTAssertEqual(reveal.label, "Show passphrase", file: file, line: line)
         reveal.tap()
         XCTAssertEqual(reveal.label, "Hide passphrase", file: file, line: line)
