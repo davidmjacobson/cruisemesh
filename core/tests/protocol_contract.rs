@@ -2338,6 +2338,7 @@ const FIXTURES: &[&str] = &[
     "ack-fail-after-consume",
     "carry-storm",
     "contact-silence-no-proof",
+    "group-fanout-complete",
     "group-fanout-partial",
     "oversize-shrink",
     "pending-rerun-during-backoff",

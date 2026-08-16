@@ -1271,6 +1271,7 @@ bytes.
 | `oversize-shrink.jsonl` | a page over the response cap, retried smaller | `PAGE-01`, `LIVE-01` | yes |
 | `contact-silence-no-proof.jsonl` | a silent contact endpoint with no proof of own connectivity | `SILENCE-01` | yes |
 | `group-fanout-partial.jsonl` | a group message posted whole to one mailbox, then a fan-out re-posted in full every pass because no member's landing was remembered (#140) | `FANOUT-01`, `LIVE-01` | yes |
+| `group-fanout-complete.jsonl` | the healthy shape of the same lane: one row per member, every one accepted, and the envelope retired exactly once (#140) | `FANOUT-01`, `LIVE-01` | yes |
 | `pending-rerun-during-backoff.jsonl` | a pending nudge trying to start a pass inside the quiet window | `RATE-01`, `PROGRESS-01` | yes |
 | `zombie-outbound-queue.jsonl` | an outbound queue that never retires anything (#283) | `QUEUE-01`, `LIVE-01` | yes |
 
@@ -1288,7 +1289,10 @@ reproduce it, and that distinction is the whole point rather than a shortcut.
 Most of this corpus is a transcript of a *bug*: `carry-storm`,
 `sweep-livelock`, `watchdog-spray`, `watermark-lock` and
 `zombie-outbound-queue` all contain `invariant_violation` records. A session
-that reproduced them would be the incident happening again. So the fixture
+that reproduced them would be the incident happening again. `group-fanout-complete`
+is the exception that states the rule: it records the shape the same lane is
+supposed to have, so the pair reads as before and after rather than as one
+bug with no stated remedy. So the fixture
 stays the readable record of what went wrong and the index of which
 invariants the scenario is about; the scenario is the executable proof that it
 does not happen here. Outcome tokens and counts in a fixture are therefore not

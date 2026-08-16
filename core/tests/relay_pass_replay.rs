@@ -529,6 +529,7 @@ const EXECUTED: &[&str] = &[
     "ack-fail-after-consume",
     "carry-storm",
     "contact-silence-no-proof",
+    "group-fanout-complete",
     "group-fanout-partial",
     "oversize-shrink",
     "pending-rerun-during-backoff",
@@ -591,6 +592,10 @@ fn executed_fixtures_name_their_scenario() {
         (
             "contact-silence-no-proof",
             "silence_is_committed_only_with_proof_another_relay_answered",
+        ),
+        (
+            "group-fanout-complete",
+            "a_group_envelope_becomes_one_row_per_member_and_is_marked_only_when_all_land",
         ),
         (
             "group-fanout-partial",

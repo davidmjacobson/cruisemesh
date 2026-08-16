@@ -34,11 +34,11 @@ import XCTest
 ///
 /// # Scope
 ///
-/// The fixtures wired today are `carry-storm` and `contact-silence-no-proof`.
-/// Adding another is one arm in core's scenario table; this file iterates
-/// `coreRelayFixtureNames()` and needs no change. Fixtures whose transcripts
-/// turn on group fan-out wait for the core upload lanes to decompose a
-/// group-addressed row.
+/// The fixtures wired today are `carry-storm`, `contact-silence-no-proof`,
+/// `group-fanout-complete` and `group-fanout-partial`. Adding another is one
+/// arm in core's scenario table; this file iterates `coreRelayFixtureNames()`
+/// and needs no change — the two group-lane fixtures landed without a line
+/// changing here.
 final class RelayAdapterFixtureTranscriptTests: XCTestCase {
 
     /// Two distinct hosts because a contact's mailbox lives on its own relay,
