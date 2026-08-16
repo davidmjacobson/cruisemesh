@@ -11,11 +11,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
@@ -302,14 +304,22 @@ private fun ConversationScaffoldContent(
         Scaffold(
             topBar = topBar,
             snackbarHost = { SnackbarHost(snackbarHostState) },
+            // The app is edge-to-edge (enableEdgeToEdge in MainActivity), so the
+            // manifest's adjustResize declaration only forbids *panning* -- the
+            // system never resizes the window for the keyboard; it hands the IME
+            // to the app as an inset to consume. Union it into the content
+            // insets so the composer rises with the keyboard. A union (per-side
+            // max), not a sum: an open keyboard already covers the navigation
+            // bar, so stacking the two would double-pad.
+            contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.ime),
         ) { innerPadding ->
-            // MainActivity declares adjustResize (see AndroidManifest.xml), so the
-            // viewport already excludes the IME. Track its usable bottom edge
-            // rather than adding IME padding a second time; OverlayKeyboardFreeze
-            // pins that edge while the keyboard animates away and back. This read
-            // as a claim about the device until that declaration existed: with the
-            // mode unspecified the window panned instead, and the top bar left
-            // with it.
+            // innerPadding's bottom carries the IME (see contentWindowInsets
+            // above), so the usable content edge tracked here rises and falls
+            // with the keyboard; OverlayKeyboardFreeze pins that edge while the
+            // keyboard animates away and back under the focus overlay. Deriving
+            // it from Scaffold's own applied padding, never from a raw
+            // WindowInsets.ime reading, is what keeps the freeze's two numbers
+            // from diverging (see OverlayKeyboardFreeze's history note).
             val bottomInsetPx = with(density) { innerPadding.calculateBottomPadding().toPx() }
             val contentBottomPx = viewportHeightPx - bottomInsetPx
             val imeVisible = WindowInsets.ime.getBottom(density) > 0

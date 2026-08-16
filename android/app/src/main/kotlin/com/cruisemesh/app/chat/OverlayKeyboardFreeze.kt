@@ -19,12 +19,13 @@ import kotlinx.coroutines.withTimeoutOrNull
  * where it is while the background dims and the keyboard slides away.
  *
  * Opening the overlay hides the soft keyboard (the scrim owns the whole
- * screen). Android's adjust-resize behavior changes the Compose viewport as
- * the IME moves. Without intervention the list (bottom-pinned via
- * reverseLayout) and composer re-layout every frame of the hide animation
- * and chase the keyboard down the screen — clearly visible through the
- * half-transparent scrim, with the overlay's bright bubble copy detaching
- * from its dimmed original. Same flicker in reverse when the overlay closes.
+ * screen). The chat Scaffold's content insets union in the IME (see
+ * [ConversationScaffold]), so the usable viewport changes as the IME moves.
+ * Without intervention the list (bottom-pinned via reverseLayout) and
+ * composer re-layout every frame of the hide animation and chase the
+ * keyboard down the screen — clearly visible through the half-transparent
+ * scrim, with the overlay's bright bubble copy detaching from its dimmed
+ * original. Same flicker in reverse when the overlay closes.
  *
  * Two earlier versions of this tried to independently *recompute* what
  * Scaffold's bottom inset was doing (first by subtracting a live
@@ -37,11 +38,12 @@ import kotlinx.coroutines.withTimeoutOrNull
  * for the last ~48px of the close animation.
  *
  * [trackLiveContentBottom] is fed the viewport's usable bottom edge (viewport
- * height minus Scaffold's bottom system-bar padding). While frozen,
+ * height minus Scaffold's applied bottom padding, whose insets union the IME
+ * with the system bars). While frozen,
  * [extraBottomPx] adds back exactly the amount by which that edge has moved
  * down: `liveContentBottom - capturedContentBottom`. This keeps the content
  * at its keyboard-open position without applying an IME inset on top of an
- * already-resized viewport. IME visibility is tracked separately so the
+ * already-IME-padded viewport. IME visibility is tracked separately so the
  * navigation bar is not mistaken for an open keyboard.
  *
  * The freeze releases itself once the returning keyboard restores the
@@ -61,7 +63,8 @@ class OverlayKeyboardFreeze internal constructor(
 
     /**
      * Call every recomposition with the viewport's usable bottom edge in px:
-     * viewport height minus Scaffold's current bottom system-bar padding.
+     * viewport height minus Scaffold's current applied bottom padding (system
+     * bars unioned with the IME).
      */
     fun trackLiveContentBottom(px: Float, imeVisible: Boolean) {
         liveContentBottomPx = px

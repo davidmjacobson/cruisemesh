@@ -53,11 +53,13 @@
              unspecified the system is free to pan the whole window up when the
              keyboard opens, which carries the conversation's top bar (the
              contact's name and photo) off the top of the screen, so people
-             type without seeing who they are writing to. The chat layout is
-             written for a resized viewport throughout: ConversationScaffold
-             measures the usable bottom edge and OverlayKeyboardFreeze pins it
-             through the IME animation. This declaration is what that code
-             already assumes it has. -->
+             type without seeing who they are writing to. Note this stops the
+             pan but resizes nothing: the app is edge-to-edge
+             (enableEdgeToEdge), so the system hands the keyboard to the app
+             as an IME inset instead, and each screen with a bottom-anchored
+             input must consume it itself (ConversationScaffold unions it into
+             the chat Scaffold's content insets; the friending screens use
+             imePadding). -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
