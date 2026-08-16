@@ -210,14 +210,13 @@ pub use ship_wifi::{
     SHIP_WIFI_CONSENT_POLICY_VERSION, SHIP_WIFI_FORBIDDEN_KEYS, SHIP_WIFI_NONCE_BYTES,
     SHIP_WIFI_REPORT_FILE_NAME, SHIP_WIFI_REPORT_MAX_BYTES, SHIP_WIFI_REPORT_SCHEMA_VERSION,
 };
-// Package C0, driven from Android by package C1. Android reaches it only
-// behind a whole-pass engine selection that defaults to the legacy engine;
-// iOS does not reach it at all yet and compiles against this surface.
-// Plain Rust, deliberately not `#[uniffi::export]`: the shells still run
-// their own encounter loops. The sim is the first caller; a later package
-// can freeze a UniFFI surface once the planner is the only implementation.
+// Package C0, driven from both shells by package C1. Each shell reaches it
+// only behind a whole-encounter engine selection that defaults to the legacy
+// sequencer, so the exported surface below is built and testable on both
+// platforms while the field default is unchanged.
 pub use session::mesh_meet::{
-    plan_mesh_hello_frames, CoreMeetOutcome, CoreMeetRequest, CoreMeetWork,
+    core_plan_mesh_hello_frames, plan_mesh_hello_frames, CoreMeetOutcome, CoreMeetRequest,
+    CoreMeetWork,
 };
 pub use session::mesh_receive::{
     CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundCommit, CoreInboundDelivery,

@@ -1275,6 +1275,16 @@
         }
       }
     },
+    "Handles catching up with a nearby phone using the rebuilt shared engine. The old path stays the default; this is for testing only.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Handles catching up with a nearby phone using the rebuilt shared engine. The old path stays the default; this is for testing only."
+          }
+        }
+      }
+    },
     "Hide internal tools": {
       "localizations": {
         "en": {

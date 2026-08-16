@@ -78,6 +78,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var lanTransport: LanTransport?
     private let lanHealth = LanHealthTracker()
     private let store = AppStore.get()
+
+    /// The core encounter planner's driver, used only when
+    /// `MeetEngineSettings` selects `.core`. Built against the process-wide
+    /// route state, spray policy and carried-offer gate, because the planner
+    /// has to record its cadence windows and walk cursors on the very objects
+    /// the rest of this controller reads.
+    private lazy var coreMeet = MeetAdapter(
+        store: store,
+        router: MeshRouter.coreState,
+        spray: SprayPolicy.coreState,
+        offers: CarriedOfferEpochGate.coreState,
+        send: { address, frame in
+            _ = MeshRouter.sendToAddress(address: address, frame: frame)
+        }
+    )
     private let incomingAnnouncements = IncomingMessageAnnouncementGate(
         announcer: LocalNotificationAnnouncer()
     )
@@ -1040,6 +1055,29 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         sendLanEndpointHint(address: address)
         queueCurrentLanEndpoint(to: userId)
 
+        // One whole-encounter engine selection, read once here and not
+        // consulted again while this burst runs, so a flip mid-burst cannot
+        // split it between two sequencers.
+        //
+        // Under `.core` everything below — the cadence verdict, the DIGEST,
+        // the targeted carry drain, the mule spray and the offer slot the last
+        // two share — belongs to `MessageStore.corePlanMeshMeet`. What this
+        // shell still owns on that branch is the part that is genuinely
+        // transport: the LAN endpoint hints above (control frames, not
+        // encounter lanes) and the nearby-route refresh.
+        //
+        // The default is `.legacy`; every line below this branch is unchanged.
+        if MeetEngineSettings.meetEngine() == .core {
+            coreMeet.encounter(
+                address: address,
+                ownUserId: identity.userId,
+                peerUserId: userId,
+                trigger: .firstContact
+            )
+            refreshNearby()
+            return
+        }
+
         // Cadence gate (#280). This handler claims `.firstContact` because a
         // HELLO is what a fresh encounter looks like from here — two phones
         // meeting and beginning to sync must never be delayed. Core does not
@@ -1156,6 +1194,25 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private func resumeLogicalPeerSync(peerUserId: Data) {
         guard let identity,
               let route = MeshRouter.routeFor(userId: peerUserId) else { return }
+        // The encounter engine selection, same read as `handleHello`. Under
+        // `.core` the planner owns the cadence verdict, the digest, the drain
+        // and the spray; a peer digest this shell stashed while the gate was
+        // shut is handed to it as this encounter's known-id set rather than
+        // answered on a separate path, because it is the same encounter.
+        if MeetEngineSettings.meetEngine() == .core {
+            let gated = takeGatedDigest(peerUserId: peerUserId)
+            coreMeet.encounter(
+                address: route.1,
+                ownUserId: identity.userId,
+                peerUserId: peerUserId,
+                trigger: .reconnect,
+                peerKnownMsgIds: gated?.recentMsgIds ?? [],
+                // CARRY-02: replayed unchanged from arrival, never re-derived
+                // from the link we happen to answer on.
+                peerAuthenticated: gated?.peerAuthenticated ?? false
+            )
+            return
+        }
         // Cadence gate (#280). This is the reconnect-churn path: a link dying
         // and being re-elected several times a minute used to buy a full burst
         // each time. First contact is not this path — `handleHello` owns that
@@ -1522,6 +1579,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // admission sees a link allowance that already reflects what this
         // encounter has queued.
         SprayPolicy.noteBytesQueued(address: address, bytes: queuedBytes)
+        // The encounter engine selection. The lanes above — receipt repair,
+        // the per-missing-message re-send and the group catch-up — are the
+        // digest *answer* and stay with this shell on both branches; what the
+        // branch selects is who plans the offer half of the encounter: the
+        // core planner's digest-confirm, targeted drain and budgeted spray, or
+        // this shell's own spray path.
+        if MeetEngineSettings.meetEngine() == .core {
+            coreMeet.encounter(
+                address: address,
+                ownUserId: identity.userId,
+                peerUserId: peerUserId,
+                trigger: .peerDigest,
+                peerKnownMsgIds: recentMsgIds,
+                peerAuthenticated: peerAuthenticated
+            )
+            return
+        }
         sprayDigestPlanTo(
             address: address,
             peerUserId: peerUserId,

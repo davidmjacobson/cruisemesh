@@ -22,6 +22,12 @@ import Foundation
 enum CarriedOfferEpochGate {
     private static let core = CoreCarriedOfferGate.withEpochMs(epochMs: coreCarriedOfferEpochMs())
 
+    /// The shared Rust gate itself, for `MessageStore.corePlanMeshMeet`, which
+    /// reserves and commits or releases the epoch slot inside one planning
+    /// call. It has to be this object, or the planner's encounters would spend
+    /// an allowance nobody else could see.
+    static var coreState: CoreCarriedOfferGate { core }
+
     /// Claims one of the window's slots, or `nil` when the allowance is spent
     /// or this logical peer already had its offer. `logicalPeerId` is the
     /// peer's UserID hex, never a link address — keying it by address is what

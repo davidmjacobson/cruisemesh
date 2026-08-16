@@ -13,6 +13,15 @@ class MeshRouterState {
 
     private val core = CoreMeshRouterState()
 
+    /**
+     * The shared Rust route state itself, for the one caller that has to pass
+     * it rather than call it: `MessageStore.corePlanMeshMeet` records this
+     * link's re-digest window and both carry cursors as part of planning an
+     * encounter, and it has to record them on the *same* object the rest of
+     * this shell reads. Exposed rather than re-wrapped for that reason alone.
+     */
+    internal val coreState: CoreMeshRouterState get() = core
+
     fun setLocalUserId(userId: ByteArray) = core.setLocalUserId(userId)
     fun onConnected(address: String, transport: Transport) = core.onConnected(address, transport.toCore())
     fun onDisconnected(address: String) = core.onDisconnected(address)

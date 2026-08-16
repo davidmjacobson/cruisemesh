@@ -41,6 +41,14 @@ import uniffi.cruisemesh_core.coreSprayRetryArmMaxMs
 object SprayPolicy {
     private val core = CoreSprayPolicy()
 
+    /**
+     * The shared Rust policy itself, for `MessageStore.corePlanMeshMeet`,
+     * which takes the cadence verdict and charges the burst allowance inside
+     * one planning call. It has to be this object: a planner given a fresh
+     * policy would forget every window the moment it returned.
+     */
+    internal val coreState: CoreSprayPolicy get() = core
+
     /** Monotonic milliseconds; see the class KDoc. */
     fun nowMs(): Long = SystemClock.elapsedRealtime()
 

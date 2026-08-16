@@ -4439,6 +4439,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?) throws  -> CoreDigestSprayPlan
     
     /**
+     * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
+     *
+     * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
+     * targeted drain, then spray. The ordering is load-bearing (the peer's
+     * answering digest has to beat the exchange window), which is why the
+     * three lanes come back as separate lists rather than one blob a driver
+     * could reorder without noticing.
+     */
+    func corePlanMeshMeet(router: CoreMeshRouterState, spray: CoreSprayPolicy, offers: CoreCarriedOfferGate, request: CoreMeetRequest) throws  -> CoreMeetOutcome
+    
+    /**
      * Record that this device consumed `msg_id` as the envelope's SOLE true
      * endpoint consumer, for a kind that leaves no `messages` row to prove
      * it with -- the growth half of the relay-mailbox problem that
@@ -7112,6 +7123,26 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
         FfiConverterBool.lower(peerAcksHiddenKinds),
         FfiConverterSequenceData.lower(hiddenAlreadyOffered),
         FfiConverterOptionTypeCoreCarriedCursor.lower(carriedCursor),$0
+    )
+})
+}
+    
+    /**
+     * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
+     *
+     * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
+     * targeted drain, then spray. The ordering is load-bearing (the peer's
+     * answering digest has to beat the exchange window), which is why the
+     * three lanes come back as separate lists rather than one blob a driver
+     * could reorder without noticing.
+     */
+open func corePlanMeshMeet(router: CoreMeshRouterState, spray: CoreSprayPolicy, offers: CoreCarriedOfferGate, request: CoreMeetRequest)throws  -> CoreMeetOutcome {
+    return try  FfiConverterTypeCoreMeetOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_plan_mesh_meet(self.uniffiClonePointer(),
+        FfiConverterTypeCoreMeshRouterState.lower(router),
+        FfiConverterTypeCoreSprayPolicy.lower(spray),
+        FfiConverterTypeCoreCarriedOfferGate.lower(offers),
+        FfiConverterTypeCoreMeetRequest.lower(request),$0
     )
 })
 }
@@ -14173,6 +14204,514 @@ public func FfiConverterTypeCoreLanHealthDecision_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeCoreLanHealthDecision_lower(_ value: CoreLanHealthDecision) -> RustBuffer {
     return FfiConverterTypeCoreLanHealthDecision.lower(value)
+}
+
+
+/**
+ * The result of planning one encounter through [`MessageStore::plan_mesh_meet`].
+ *
+ * Every list here is the page this encounter is allowed to offer: the
+ * targeted drain is one budgeted walk page, the spray is one
+ * [`crate::CoreDigestSprayPlan`] after the spray-policy gate. Nothing
+ * unbounded crosses the boundary.
+ */
+public struct CoreMeetOutcome {
+    /**
+     * The DIGEST frames this link owes, if any. **Send these first**: the
+     * spray policy's exchange window is opened when the digest is enqueued,
+     * and at a BLE link's drain rate a carry drain queued ahead of it would
+     * hold it in the FIFO past the window, so the peer's answer would arrive
+     * to a shut gate. The ordering used to be a convention repeated at every
+     * shell call site; [`CoreMeetOutcome::frames`] is now what enforces it.
+     */
+    public var digestFrames: [Data]
+    /**
+     * Hint-matched carry frames for the true recipient (or a group member).
+     * Send these first: they are the HELLO drain, not the mule spray.
+     */
+    public var targetedFrames: [Data]
+    /**
+     * Foreign-carry (and any admitted own-outbound / own-receipt) frames
+     * for a non-recipient mule. Empty when the spray gate refuses or the
+     * plan selected nothing new.
+     */
+    public var sprayFrames: [Data]
+    public var work: CoreMeetWork
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The DIGEST frames this link owes, if any. **Send these first**: the
+         * spray policy's exchange window is opened when the digest is enqueued,
+         * and at a BLE link's drain rate a carry drain queued ahead of it would
+         * hold it in the FIFO past the window, so the peer's answer would arrive
+         * to a shut gate. The ordering used to be a convention repeated at every
+         * shell call site; [`CoreMeetOutcome::frames`] is now what enforces it.
+         */digestFrames: [Data], 
+        /**
+         * Hint-matched carry frames for the true recipient (or a group member).
+         * Send these first: they are the HELLO drain, not the mule spray.
+         */targetedFrames: [Data], 
+        /**
+         * Foreign-carry (and any admitted own-outbound / own-receipt) frames
+         * for a non-recipient mule. Empty when the spray gate refuses or the
+         * plan selected nothing new.
+         */sprayFrames: [Data], work: CoreMeetWork) {
+        self.digestFrames = digestFrames
+        self.targetedFrames = targetedFrames
+        self.sprayFrames = sprayFrames
+        self.work = work
+    }
+}
+
+
+
+extension CoreMeetOutcome: Equatable, Hashable {
+    public static func ==(lhs: CoreMeetOutcome, rhs: CoreMeetOutcome) -> Bool {
+        if lhs.digestFrames != rhs.digestFrames {
+            return false
+        }
+        if lhs.targetedFrames != rhs.targetedFrames {
+            return false
+        }
+        if lhs.sprayFrames != rhs.sprayFrames {
+            return false
+        }
+        if lhs.work != rhs.work {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(digestFrames)
+        hasher.combine(targetedFrames)
+        hasher.combine(sprayFrames)
+        hasher.combine(work)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMeetOutcome: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMeetOutcome {
+        return
+            try CoreMeetOutcome(
+                digestFrames: FfiConverterSequenceData.read(from: &buf), 
+                targetedFrames: FfiConverterSequenceData.read(from: &buf), 
+                sprayFrames: FfiConverterSequenceData.read(from: &buf), 
+                work: FfiConverterTypeCoreMeetWork.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMeetOutcome, into buf: inout [UInt8]) {
+        FfiConverterSequenceData.write(value.digestFrames, into: &buf)
+        FfiConverterSequenceData.write(value.targetedFrames, into: &buf)
+        FfiConverterSequenceData.write(value.sprayFrames, into: &buf)
+        FfiConverterTypeCoreMeetWork.write(value.work, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetOutcome_lift(_ buf: RustBuffer) throws -> CoreMeetOutcome {
+    return try FfiConverterTypeCoreMeetOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetOutcome_lower(_ value: CoreMeetOutcome) -> RustBuffer {
+    return FfiConverterTypeCoreMeetOutcome.lower(value)
+}
+
+
+/**
+ * Inputs for one encounter. Every clock is an explicit `now_ms`; every peer
+ * claim is an argument, never ambient process state.
+ */
+public struct CoreMeetRequest {
+    /**
+     * This device's user id, used to scope the spray plan's own-outbound
+     * lane (empty in the sim, which has no contacts).
+     */
+    public var ownUserId: Data
+    /**
+     * The authenticated-or-claimed peer identity the HELLO named.
+     */
+    public var peerUserId: Data
+    /**
+     * Transport address the router and spray policy key this link by.
+     */
+    public var peerAddress: String
+    /**
+     * `recent_msg_id`s off the peer's DIGEST (or the sim's stand-in:
+     * [`MessageStore::core_digest_advertised_msg_ids`]). Exclusion and
+     * confirm both read this set; neither invents a known-set of its own.
+     */
+    public var peerKnownMsgIds: [Data]
+    /**
+     * `true` only when `peer_user_id` / `peer_known_msg_ids` came from a
+     * cryptographically bound source (Noise-authenticated LAN, a signed
+     * receipt). `false` for a bare BLE HELLO/DIGEST. See `CARRY-02`.
+     */
+    public var peerAuthenticated: Bool
+    /**
+     * Capability bits off the peer's HELLO2 (0x06), if this encounter
+     * observed one. `None` leaves whatever the router already recorded for
+     * the link untouched — a HELLO2 arrives once per session and has to keep
+     * counting for the re-digests that follow it.
+     *
+     * Unknown bits are stored, never rejected: a future build advertising
+     * more than this one understands is a peer, not a parse failure.
+     */
+    public var peerCapabilities: UInt32?
+    /**
+     * What brought the two nodes together. Selects the cadence interval and
+     * decides whether this device owes a DIGEST — answering the peer's
+     * digest must never provoke one back, or two converged phones ping-pong
+     * for as long as they stay in range.
+     */
+    public var trigger: CoreSprayTrigger
+    /**
+     * Wall-clock milliseconds. Everything durable reads this one: the expiry
+     * prune, the carry pages, the delivery hints, the router's re-digest and
+     * re-walk windows.
+     */
+    public var nowMs: Int64
+    /**
+     * Monotonic milliseconds for [`CoreSprayPolicy`] alone.
+     *
+     * The two shells already run the cadence gate off a monotonic clock
+     * (`SystemClock.elapsedRealtime` / `mach_absolute_time`) while the store
+     * runs off the wall clock, and deliberately so: an NTP correction landing
+     * mid-session must never expire a spray window early and buy the burst
+     * the window exists to prevent. Folding both into one `now_ms` would have
+     * forced a driver to pick which of those two guarantees to break, so the
+     * planner takes both clocks and hands each to the state that measures
+     * with it. The sim passes the same value twice, which is exactly what a
+     * simulated clock is.
+     */
+    public var sprayNowMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * This device's user id, used to scope the spray plan's own-outbound
+         * lane (empty in the sim, which has no contacts).
+         */ownUserId: Data, 
+        /**
+         * The authenticated-or-claimed peer identity the HELLO named.
+         */peerUserId: Data, 
+        /**
+         * Transport address the router and spray policy key this link by.
+         */peerAddress: String, 
+        /**
+         * `recent_msg_id`s off the peer's DIGEST (or the sim's stand-in:
+         * [`MessageStore::core_digest_advertised_msg_ids`]). Exclusion and
+         * confirm both read this set; neither invents a known-set of its own.
+         */peerKnownMsgIds: [Data], 
+        /**
+         * `true` only when `peer_user_id` / `peer_known_msg_ids` came from a
+         * cryptographically bound source (Noise-authenticated LAN, a signed
+         * receipt). `false` for a bare BLE HELLO/DIGEST. See `CARRY-02`.
+         */peerAuthenticated: Bool, 
+        /**
+         * Capability bits off the peer's HELLO2 (0x06), if this encounter
+         * observed one. `None` leaves whatever the router already recorded for
+         * the link untouched — a HELLO2 arrives once per session and has to keep
+         * counting for the re-digests that follow it.
+         *
+         * Unknown bits are stored, never rejected: a future build advertising
+         * more than this one understands is a peer, not a parse failure.
+         */peerCapabilities: UInt32?, 
+        /**
+         * What brought the two nodes together. Selects the cadence interval and
+         * decides whether this device owes a DIGEST — answering the peer's
+         * digest must never provoke one back, or two converged phones ping-pong
+         * for as long as they stay in range.
+         */trigger: CoreSprayTrigger, 
+        /**
+         * Wall-clock milliseconds. Everything durable reads this one: the expiry
+         * prune, the carry pages, the delivery hints, the router's re-digest and
+         * re-walk windows.
+         */nowMs: Int64, 
+        /**
+         * Monotonic milliseconds for [`CoreSprayPolicy`] alone.
+         *
+         * The two shells already run the cadence gate off a monotonic clock
+         * (`SystemClock.elapsedRealtime` / `mach_absolute_time`) while the store
+         * runs off the wall clock, and deliberately so: an NTP correction landing
+         * mid-session must never expire a spray window early and buy the burst
+         * the window exists to prevent. Folding both into one `now_ms` would have
+         * forced a driver to pick which of those two guarantees to break, so the
+         * planner takes both clocks and hands each to the state that measures
+         * with it. The sim passes the same value twice, which is exactly what a
+         * simulated clock is.
+         */sprayNowMs: Int64) {
+        self.ownUserId = ownUserId
+        self.peerUserId = peerUserId
+        self.peerAddress = peerAddress
+        self.peerKnownMsgIds = peerKnownMsgIds
+        self.peerAuthenticated = peerAuthenticated
+        self.peerCapabilities = peerCapabilities
+        self.trigger = trigger
+        self.nowMs = nowMs
+        self.sprayNowMs = sprayNowMs
+    }
+}
+
+
+
+extension CoreMeetRequest: Equatable, Hashable {
+    public static func ==(lhs: CoreMeetRequest, rhs: CoreMeetRequest) -> Bool {
+        if lhs.ownUserId != rhs.ownUserId {
+            return false
+        }
+        if lhs.peerUserId != rhs.peerUserId {
+            return false
+        }
+        if lhs.peerAddress != rhs.peerAddress {
+            return false
+        }
+        if lhs.peerKnownMsgIds != rhs.peerKnownMsgIds {
+            return false
+        }
+        if lhs.peerAuthenticated != rhs.peerAuthenticated {
+            return false
+        }
+        if lhs.peerCapabilities != rhs.peerCapabilities {
+            return false
+        }
+        if lhs.trigger != rhs.trigger {
+            return false
+        }
+        if lhs.nowMs != rhs.nowMs {
+            return false
+        }
+        if lhs.sprayNowMs != rhs.sprayNowMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ownUserId)
+        hasher.combine(peerUserId)
+        hasher.combine(peerAddress)
+        hasher.combine(peerKnownMsgIds)
+        hasher.combine(peerAuthenticated)
+        hasher.combine(peerCapabilities)
+        hasher.combine(trigger)
+        hasher.combine(nowMs)
+        hasher.combine(sprayNowMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMeetRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMeetRequest {
+        return
+            try CoreMeetRequest(
+                ownUserId: FfiConverterData.read(from: &buf), 
+                peerUserId: FfiConverterData.read(from: &buf), 
+                peerAddress: FfiConverterString.read(from: &buf), 
+                peerKnownMsgIds: FfiConverterSequenceData.read(from: &buf), 
+                peerAuthenticated: FfiConverterBool.read(from: &buf), 
+                peerCapabilities: FfiConverterOptionUInt32.read(from: &buf), 
+                trigger: FfiConverterTypeCoreSprayTrigger.read(from: &buf), 
+                nowMs: FfiConverterInt64.read(from: &buf), 
+                sprayNowMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMeetRequest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.ownUserId, into: &buf)
+        FfiConverterData.write(value.peerUserId, into: &buf)
+        FfiConverterString.write(value.peerAddress, into: &buf)
+        FfiConverterSequenceData.write(value.peerKnownMsgIds, into: &buf)
+        FfiConverterBool.write(value.peerAuthenticated, into: &buf)
+        FfiConverterOptionUInt32.write(value.peerCapabilities, into: &buf)
+        FfiConverterTypeCoreSprayTrigger.write(value.trigger, into: &buf)
+        FfiConverterInt64.write(value.nowMs, into: &buf)
+        FfiConverterInt64.write(value.sprayNowMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetRequest_lift(_ buf: RustBuffer) throws -> CoreMeetRequest {
+    return try FfiConverterTypeCoreMeetRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetRequest_lower(_ value: CoreMeetRequest) -> RustBuffer {
+    return FfiConverterTypeCoreMeetRequest.lower(value)
+}
+
+
+/**
+ * Bounded work counts for one encounter, so a caller can fold progress into
+ * a protocol event without this path writing the ring itself.
+ */
+public struct CoreMeetWork {
+    /**
+     * Targeted-drain frames handed back to send.
+     */
+    public var targetedSent: UInt32
+    /**
+     * Spray frames (foreign carry, plus any own-outbound / own-receipt the
+     * plan admitted) handed back to send.
+     */
+    public var sprayed: UInt32
+    /**
+     * Carried 1:1 rows removed because the peer's digest proved they hold
+     * them. Zero when the peer is unauthenticated (`CARRY-02`) or advertised
+     * nothing we were holding for them.
+     */
+    public var confirmedRemoved: UInt32
+    /**
+     * Drain candidates skipped because the peer's digest already named them.
+     */
+    public var skippedKnown: UInt32
+    /**
+     * DIGEST frames this encounter owed and produced (the 1:1 one plus one
+     * per shared group). Zero when the link is inside its re-digest window,
+     * or when this encounter is itself the answer to the peer's digest.
+     */
+    public var digestsSent: UInt32
+    /**
+     * The two third-party-offering lanes sat this encounter out because the
+     * device's per-epoch offer allowance was already claimed by other peers.
+     * A deferral, never a drop: the next round gets a slot.
+     */
+    public var offerDeferred: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Targeted-drain frames handed back to send.
+         */targetedSent: UInt32, 
+        /**
+         * Spray frames (foreign carry, plus any own-outbound / own-receipt the
+         * plan admitted) handed back to send.
+         */sprayed: UInt32, 
+        /**
+         * Carried 1:1 rows removed because the peer's digest proved they hold
+         * them. Zero when the peer is unauthenticated (`CARRY-02`) or advertised
+         * nothing we were holding for them.
+         */confirmedRemoved: UInt32, 
+        /**
+         * Drain candidates skipped because the peer's digest already named them.
+         */skippedKnown: UInt32, 
+        /**
+         * DIGEST frames this encounter owed and produced (the 1:1 one plus one
+         * per shared group). Zero when the link is inside its re-digest window,
+         * or when this encounter is itself the answer to the peer's digest.
+         */digestsSent: UInt32, 
+        /**
+         * The two third-party-offering lanes sat this encounter out because the
+         * device's per-epoch offer allowance was already claimed by other peers.
+         * A deferral, never a drop: the next round gets a slot.
+         */offerDeferred: Bool) {
+        self.targetedSent = targetedSent
+        self.sprayed = sprayed
+        self.confirmedRemoved = confirmedRemoved
+        self.skippedKnown = skippedKnown
+        self.digestsSent = digestsSent
+        self.offerDeferred = offerDeferred
+    }
+}
+
+
+
+extension CoreMeetWork: Equatable, Hashable {
+    public static func ==(lhs: CoreMeetWork, rhs: CoreMeetWork) -> Bool {
+        if lhs.targetedSent != rhs.targetedSent {
+            return false
+        }
+        if lhs.sprayed != rhs.sprayed {
+            return false
+        }
+        if lhs.confirmedRemoved != rhs.confirmedRemoved {
+            return false
+        }
+        if lhs.skippedKnown != rhs.skippedKnown {
+            return false
+        }
+        if lhs.digestsSent != rhs.digestsSent {
+            return false
+        }
+        if lhs.offerDeferred != rhs.offerDeferred {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(targetedSent)
+        hasher.combine(sprayed)
+        hasher.combine(confirmedRemoved)
+        hasher.combine(skippedKnown)
+        hasher.combine(digestsSent)
+        hasher.combine(offerDeferred)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMeetWork: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMeetWork {
+        return
+            try CoreMeetWork(
+                targetedSent: FfiConverterUInt32.read(from: &buf), 
+                sprayed: FfiConverterUInt32.read(from: &buf), 
+                confirmedRemoved: FfiConverterUInt32.read(from: &buf), 
+                skippedKnown: FfiConverterUInt32.read(from: &buf), 
+                digestsSent: FfiConverterUInt32.read(from: &buf), 
+                offerDeferred: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMeetWork, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.targetedSent, into: &buf)
+        FfiConverterUInt32.write(value.sprayed, into: &buf)
+        FfiConverterUInt32.write(value.confirmedRemoved, into: &buf)
+        FfiConverterUInt32.write(value.skippedKnown, into: &buf)
+        FfiConverterUInt32.write(value.digestsSent, into: &buf)
+        FfiConverterBool.write(value.offerDeferred, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetWork_lift(_ buf: RustBuffer) throws -> CoreMeetWork {
+    return try FfiConverterTypeCoreMeetWork.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMeetWork_lower(_ value: CoreMeetWork) -> RustBuffer {
+    return FfiConverterTypeCoreMeetWork.lower(value)
 }
 
 
@@ -35640,6 +36179,17 @@ public func corePersonReach(directLink: CoreDirectLink?, presenceLastSeenMs: Int
     )
 })
 }
+/**
+ * The identity frames for a fresh link, in order. See
+ * [`plan_mesh_hello_frames`].
+ */
+public func corePlanMeshHelloFrames(ownUserId: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_plan_mesh_hello_frames(
+        FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
 public func coreReactionSummariesByTarget(messages: [StoredMessage], ownUserId: Data) -> [CoreReactionTargetSummary] {
     return try!  FfiConverterSequenceTypeCoreReactionTargetSummary.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_reaction_summaries_by_target(
@@ -38729,6 +39279,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_person_reach() != 15288) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_plan_mesh_hello_frames() != 39982) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -39627,6 +40180,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 15577) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_plan_mesh_meet() != 65521) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {

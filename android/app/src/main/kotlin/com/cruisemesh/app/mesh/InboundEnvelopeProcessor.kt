@@ -93,7 +93,7 @@ private const val FOREIGN_CARRY_BUDGET_BYTES: Long = 5L * 1024 * 1024
  * core (see `CoreCarriedOfferGate`). Shared by the HELLO drain and the digest
  * spray so the two lanes cannot each claim a full allowance for one peer.
  */
-private val carriedOfferGate = CarriedOfferEpochGate()
+internal val carriedOfferGate = CarriedOfferEpochGate()
 
 /**
  * Decoded pairwise-stream metadata carried out of the delivery switch only

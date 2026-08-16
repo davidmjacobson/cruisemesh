@@ -20,6 +20,7 @@ struct InternalToolsView: View {
     @State private var useCoreRelayEngine = false
     @State private var relayShadowOn = true
     @State private var useCoreInboundEngine = false
+    @State private var useCoreMeetEngine = false
     @State private var lanAddress = ""
     @State private var lanError: String?
     @State private var showLanQR = false
@@ -48,6 +49,7 @@ struct InternalToolsView: View {
             useCoreRelayEngine = RelayEngineSettings.passEngine() == .core
             relayShadowOn = RelayEngineSettings.shadowEnabled()
             useCoreInboundEngine = InboundEngineSettings.pathEngine() == .core
+            useCoreMeetEngine = MeetEngineSettings.meetEngine() == .core
         }
         .task(id: relayUrl + "\u{0}" + relayToken) {
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -175,6 +177,17 @@ struct InternalToolsView: View {
                 }
             ))
             Text("Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Toggle("Rebuilt nearby exchange", isOn: Binding(
+                get: { useCoreMeetEngine },
+                set: {
+                    useCoreMeetEngine = $0
+                    MeetEngineSettings.setMeetEngine($0 ? .core : .legacy)
+                }
+            ))
+            Text("Handles catching up with a nearby phone using the rebuilt shared engine. The old path stays the default; this is for testing only.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
