@@ -832,4 +832,38 @@
     <string name="ui_another_phone_is_using_your_backup">Another phone is using your CruiseMesh backup</string>
     <string name="ui_another_phone_is_using_your_backup_detail">Both phones will get out of sync. Use one phone until you can link them.</string>
     <string name="ui_this_is_my_only_phone">This is my only phone</string>
+    <!-- "Before you sail" checklist: the few things a family should finish
+         while they are still together. Every line is plain and literal — the
+         steps say what to do and promise nothing about what will get through. -->
+    <string name="ui_getting_ready">Getting ready</string>
+    <string name="ui_before_you_sail">Before you sail</string>
+    <string name="ui_before_you_sail_summary">Finish setting up before your trip.</string>
+    <string name="ui_before_you_sail_intro">Get set up while everyone\'s still together. Each step checks itself off as it\'s done.</string>
+    <string name="ui_before_you_sail_progress">%1$d of %2$d done</string>
+    <string name="ui_before_you_sail_card_progress">Before you sail: %1$d of %2$d done</string>
+    <string name="ui_before_you_sail_card_body">A few steps left before your trip.</string>
+    <string name="ui_before_you_sail_ready">You\'re set to sail.</string>
+    <string name="ui_sail_step_done">Done</string>
+    <string name="ui_sail_step_not_done">Not done yet</string>
+    <string name="ui_sail_step_optional">Optional</string>
+    <string name="ui_sail_shore_pass">Set up your Shore Pass</string>
+    <string name="ui_sail_shore_pass_detail">If you bought one, add it before you trade codes.</string>
+    <string name="ui_sail_add_family">Add your family</string>
+    <string name="ui_sail_add_family_detail">Scan each other\'s codes in person, before everyone scatters.</string>
+    <string name="ui_sail_permissions">Let it run in your pocket</string>
+    <string name="ui_sail_permissions_detail">Turn these on so messages can come and go while your phone is away.</string>
+    <string name="ui_sail_permission_bluetooth">Nearby devices</string>
+    <string name="ui_sail_permission_bluetooth_detail">Lets this phone find your family\'s phones close by.</string>
+    <string name="ui_sail_permission_notifications">Notifications</string>
+    <string name="ui_sail_permission_notifications_detail">Tells you when a message arrives.</string>
+    <string name="ui_sail_permission_battery">Battery use</string>
+    <string name="ui_sail_permission_battery_detail">Lets it keep going with the screen off.</string>
+    <string name="ui_sail_offline_test">Send a message with no internet</string>
+    <string name="ui_sail_offline_test_detail">Put two phones in airplane mode, turn Bluetooth back on, and send a message.</string>
+    <string name="ui_sail_backup">Back up your identity</string>
+    <string name="ui_sail_backup_detail">Keep a copy in case you lose your phone.</string>
+    <plurals name="ui_sail_family_added">
+        <item quantity="one">%1$d person added</item>
+        <item quantity="other">%1$d people added</item>
+    </plurals>
 </resources>

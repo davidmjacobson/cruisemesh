@@ -34,6 +34,7 @@ mod relay_cursor;
 mod relay_setup;
 mod relay_status;
 mod relay_wire;
+mod sail_checklist;
 mod semantic;
 mod session;
 mod ship_wifi;
@@ -188,6 +189,10 @@ pub use relay_wire::{
     resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
     CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, GroupRelayMember,
     RelayEndpoint,
+};
+pub use sail_checklist::{
+    core_sail_checklist, CoreSailChecklistInput, CoreSailChecklistItem, CoreSailChecklistItemId,
+    CoreSailChecklistReport, CoreSailPermission, CoreSailPermissionRow,
 };
 pub use semantic::{
     core_group_tick_status_for, core_is_visible_chat_kind, core_last_visible_message,

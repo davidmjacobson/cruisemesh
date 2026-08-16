@@ -19792,6 +19792,511 @@ public func FfiConverterTypeCoreReplyMetadata_lower(_ value: CoreReplyMetadata) 
 
 
 /**
+ * Every fact the checklist consumes, gathered by the shell.
+ *
+ * All of it is state the app already holds for other reasons -- this screen
+ * asks no questions, stores no sail date, and collects nothing new. Each
+ * field is a settled fact rather than a live radio state on purpose: a
+ * checklist item that unticks itself when Bluetooth blinks would train people
+ * to ignore it.
+ */
+public struct CoreSailChecklistInput {
+    /**
+     * Saved contacts on this device. Matches `BackupInventory.contact_count`.
+     */
+    public var contactCount: UInt64
+    /**
+     * A Shore Pass is saved on this device (the shell's own stored
+     * [`crate::RelaySetup`] exists). Whether the pass is *reachable* right
+     * now is deliberately not asked: a pass saved in a cabin with no internet
+     * is still set up.
+     */
+    public var shorePassConfigured: Bool
+    /**
+     * The platform's permission to use Bluetooth for nearby delivery.
+     * Android: the nearby-devices (`BLUETOOTH_CONNECT`/`BLUETOOTH_SCAN`)
+     * grant. iOS: Bluetooth authorization.
+     */
+    public var bluetoothPermission: Bool
+    /**
+     * Permission to post notifications, without which an arriving message is
+     * silent.
+     */
+    public var notificationsPermission: Bool
+    /**
+     * Android: this app is exempt from battery optimization, so it keeps
+     * carrying messages with the screen off. iOS: `None` -- the setting has
+     * no counterpart there, and an absent grant must never hold the
+     * permissions item open. `Some(false)` is a real, blocking "not granted".
+     */
+    public var batteryOptimizationExempt: Bool?
+    /**
+     * Any message has ever been delivered on this device over a nearby
+     * transport -- Bluetooth or local Wi-Fi. Internet delivery does not
+     * count: the whole point of the step is proving the phone works when the
+     * internet does not. "Ever", not "recently": a proof that has already
+     * been given is not withdrawn by a quiet afternoon.
+     */
+    public var offlineDeliverySeen: Bool
+    /**
+     * A local encrypted backup has been made at least once on this device.
+     */
+    public var backupCreated: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Saved contacts on this device. Matches `BackupInventory.contact_count`.
+         */contactCount: UInt64, 
+        /**
+         * A Shore Pass is saved on this device (the shell's own stored
+         * [`crate::RelaySetup`] exists). Whether the pass is *reachable* right
+         * now is deliberately not asked: a pass saved in a cabin with no internet
+         * is still set up.
+         */shorePassConfigured: Bool, 
+        /**
+         * The platform's permission to use Bluetooth for nearby delivery.
+         * Android: the nearby-devices (`BLUETOOTH_CONNECT`/`BLUETOOTH_SCAN`)
+         * grant. iOS: Bluetooth authorization.
+         */bluetoothPermission: Bool, 
+        /**
+         * Permission to post notifications, without which an arriving message is
+         * silent.
+         */notificationsPermission: Bool, 
+        /**
+         * Android: this app is exempt from battery optimization, so it keeps
+         * carrying messages with the screen off. iOS: `None` -- the setting has
+         * no counterpart there, and an absent grant must never hold the
+         * permissions item open. `Some(false)` is a real, blocking "not granted".
+         */batteryOptimizationExempt: Bool?, 
+        /**
+         * Any message has ever been delivered on this device over a nearby
+         * transport -- Bluetooth or local Wi-Fi. Internet delivery does not
+         * count: the whole point of the step is proving the phone works when the
+         * internet does not. "Ever", not "recently": a proof that has already
+         * been given is not withdrawn by a quiet afternoon.
+         */offlineDeliverySeen: Bool, 
+        /**
+         * A local encrypted backup has been made at least once on this device.
+         */backupCreated: Bool) {
+        self.contactCount = contactCount
+        self.shorePassConfigured = shorePassConfigured
+        self.bluetoothPermission = bluetoothPermission
+        self.notificationsPermission = notificationsPermission
+        self.batteryOptimizationExempt = batteryOptimizationExempt
+        self.offlineDeliverySeen = offlineDeliverySeen
+        self.backupCreated = backupCreated
+    }
+}
+
+
+
+extension CoreSailChecklistInput: Equatable, Hashable {
+    public static func ==(lhs: CoreSailChecklistInput, rhs: CoreSailChecklistInput) -> Bool {
+        if lhs.contactCount != rhs.contactCount {
+            return false
+        }
+        if lhs.shorePassConfigured != rhs.shorePassConfigured {
+            return false
+        }
+        if lhs.bluetoothPermission != rhs.bluetoothPermission {
+            return false
+        }
+        if lhs.notificationsPermission != rhs.notificationsPermission {
+            return false
+        }
+        if lhs.batteryOptimizationExempt != rhs.batteryOptimizationExempt {
+            return false
+        }
+        if lhs.offlineDeliverySeen != rhs.offlineDeliverySeen {
+            return false
+        }
+        if lhs.backupCreated != rhs.backupCreated {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contactCount)
+        hasher.combine(shorePassConfigured)
+        hasher.combine(bluetoothPermission)
+        hasher.combine(notificationsPermission)
+        hasher.combine(batteryOptimizationExempt)
+        hasher.combine(offlineDeliverySeen)
+        hasher.combine(backupCreated)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailChecklistInput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailChecklistInput {
+        return
+            try CoreSailChecklistInput(
+                contactCount: FfiConverterUInt64.read(from: &buf), 
+                shorePassConfigured: FfiConverterBool.read(from: &buf), 
+                bluetoothPermission: FfiConverterBool.read(from: &buf), 
+                notificationsPermission: FfiConverterBool.read(from: &buf), 
+                batteryOptimizationExempt: FfiConverterOptionBool.read(from: &buf), 
+                offlineDeliverySeen: FfiConverterBool.read(from: &buf), 
+                backupCreated: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSailChecklistInput, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.contactCount, into: &buf)
+        FfiConverterBool.write(value.shorePassConfigured, into: &buf)
+        FfiConverterBool.write(value.bluetoothPermission, into: &buf)
+        FfiConverterBool.write(value.notificationsPermission, into: &buf)
+        FfiConverterOptionBool.write(value.batteryOptimizationExempt, into: &buf)
+        FfiConverterBool.write(value.offlineDeliverySeen, into: &buf)
+        FfiConverterBool.write(value.backupCreated, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistInput_lift(_ buf: RustBuffer) throws -> CoreSailChecklistInput {
+    return try FfiConverterTypeCoreSailChecklistInput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistInput_lower(_ value: CoreSailChecklistInput) -> RustBuffer {
+    return FfiConverterTypeCoreSailChecklistInput.lower(value)
+}
+
+
+/**
+ * One checklist row.
+ */
+public struct CoreSailChecklistItem {
+    public var id: CoreSailChecklistItemId
+    /**
+     * Required items gate [`CoreSailChecklistReport::ready`]; optional ones
+     * never do.
+     */
+    public var required: Bool
+    public var done: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: CoreSailChecklistItemId, 
+        /**
+         * Required items gate [`CoreSailChecklistReport::ready`]; optional ones
+         * never do.
+         */required: Bool, done: Bool) {
+        self.id = id
+        self.required = required
+        self.done = done
+    }
+}
+
+
+
+extension CoreSailChecklistItem: Equatable, Hashable {
+    public static func ==(lhs: CoreSailChecklistItem, rhs: CoreSailChecklistItem) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.required != rhs.required {
+            return false
+        }
+        if lhs.done != rhs.done {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(required)
+        hasher.combine(done)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailChecklistItem: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailChecklistItem {
+        return
+            try CoreSailChecklistItem(
+                id: FfiConverterTypeCoreSailChecklistItemId.read(from: &buf), 
+                required: FfiConverterBool.read(from: &buf), 
+                done: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSailChecklistItem, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreSailChecklistItemId.write(value.id, into: &buf)
+        FfiConverterBool.write(value.required, into: &buf)
+        FfiConverterBool.write(value.done, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistItem_lift(_ buf: RustBuffer) throws -> CoreSailChecklistItem {
+    return try FfiConverterTypeCoreSailChecklistItem.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistItem_lower(_ value: CoreSailChecklistItem) -> RustBuffer {
+    return FfiConverterTypeCoreSailChecklistItem.lower(value)
+}
+
+
+/**
+ * The whole answer: the rows in order, the grants that apply here, and the
+ * counts the entry-point card reads.
+ */
+public struct CoreSailChecklistReport {
+    /**
+     * Every item, in display order. Always the full list -- an item is never
+     * dropped, only ticked.
+     */
+    public var items: [CoreSailChecklistItem]
+    /**
+     * The sub-rows of [`CoreSailChecklistItemId::Permissions`], in display
+     * order, filtered to the grants this platform has. Empty rows are never
+     * returned, so a shell can render this list without knowing which
+     * platform it is on.
+     */
+    public var permissions: [CoreSailPermissionRow]
+    /**
+     * Every required item is done. Optional items are not consulted.
+     */
+    public var ready: Bool
+    /**
+     * Items done, counting optional ones. With `total_count`, this is the
+     * "N of M done" the home-screen card shows; the card disappears at
+     * `ready`, so nobody is left staring at a total they never intend to
+     * finish.
+     */
+    public var doneCount: UInt32
+    /**
+     * Every item, counting optional ones.
+     */
+    public var totalCount: UInt32
+    /**
+     * Required items done -- the numerator of the progress that actually
+     * gates sailing.
+     */
+    public var requiredDoneCount: UInt32
+    /**
+     * Required items in total.
+     */
+    public var requiredTotalCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Every item, in display order. Always the full list -- an item is never
+         * dropped, only ticked.
+         */items: [CoreSailChecklistItem], 
+        /**
+         * The sub-rows of [`CoreSailChecklistItemId::Permissions`], in display
+         * order, filtered to the grants this platform has. Empty rows are never
+         * returned, so a shell can render this list without knowing which
+         * platform it is on.
+         */permissions: [CoreSailPermissionRow], 
+        /**
+         * Every required item is done. Optional items are not consulted.
+         */ready: Bool, 
+        /**
+         * Items done, counting optional ones. With `total_count`, this is the
+         * "N of M done" the home-screen card shows; the card disappears at
+         * `ready`, so nobody is left staring at a total they never intend to
+         * finish.
+         */doneCount: UInt32, 
+        /**
+         * Every item, counting optional ones.
+         */totalCount: UInt32, 
+        /**
+         * Required items done -- the numerator of the progress that actually
+         * gates sailing.
+         */requiredDoneCount: UInt32, 
+        /**
+         * Required items in total.
+         */requiredTotalCount: UInt32) {
+        self.items = items
+        self.permissions = permissions
+        self.ready = ready
+        self.doneCount = doneCount
+        self.totalCount = totalCount
+        self.requiredDoneCount = requiredDoneCount
+        self.requiredTotalCount = requiredTotalCount
+    }
+}
+
+
+
+extension CoreSailChecklistReport: Equatable, Hashable {
+    public static func ==(lhs: CoreSailChecklistReport, rhs: CoreSailChecklistReport) -> Bool {
+        if lhs.items != rhs.items {
+            return false
+        }
+        if lhs.permissions != rhs.permissions {
+            return false
+        }
+        if lhs.ready != rhs.ready {
+            return false
+        }
+        if lhs.doneCount != rhs.doneCount {
+            return false
+        }
+        if lhs.totalCount != rhs.totalCount {
+            return false
+        }
+        if lhs.requiredDoneCount != rhs.requiredDoneCount {
+            return false
+        }
+        if lhs.requiredTotalCount != rhs.requiredTotalCount {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(items)
+        hasher.combine(permissions)
+        hasher.combine(ready)
+        hasher.combine(doneCount)
+        hasher.combine(totalCount)
+        hasher.combine(requiredDoneCount)
+        hasher.combine(requiredTotalCount)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailChecklistReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailChecklistReport {
+        return
+            try CoreSailChecklistReport(
+                items: FfiConverterSequenceTypeCoreSailChecklistItem.read(from: &buf), 
+                permissions: FfiConverterSequenceTypeCoreSailPermissionRow.read(from: &buf), 
+                ready: FfiConverterBool.read(from: &buf), 
+                doneCount: FfiConverterUInt32.read(from: &buf), 
+                totalCount: FfiConverterUInt32.read(from: &buf), 
+                requiredDoneCount: FfiConverterUInt32.read(from: &buf), 
+                requiredTotalCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSailChecklistReport, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeCoreSailChecklistItem.write(value.items, into: &buf)
+        FfiConverterSequenceTypeCoreSailPermissionRow.write(value.permissions, into: &buf)
+        FfiConverterBool.write(value.ready, into: &buf)
+        FfiConverterUInt32.write(value.doneCount, into: &buf)
+        FfiConverterUInt32.write(value.totalCount, into: &buf)
+        FfiConverterUInt32.write(value.requiredDoneCount, into: &buf)
+        FfiConverterUInt32.write(value.requiredTotalCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistReport_lift(_ buf: RustBuffer) throws -> CoreSailChecklistReport {
+    return try FfiConverterTypeCoreSailChecklistReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistReport_lower(_ value: CoreSailChecklistReport) -> RustBuffer {
+    return FfiConverterTypeCoreSailChecklistReport.lower(value)
+}
+
+
+/**
+ * A grant this platform actually has, and whether it is held.
+ */
+public struct CoreSailPermissionRow {
+    public var permission: CoreSailPermission
+    public var granted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(permission: CoreSailPermission, granted: Bool) {
+        self.permission = permission
+        self.granted = granted
+    }
+}
+
+
+
+extension CoreSailPermissionRow: Equatable, Hashable {
+    public static func ==(lhs: CoreSailPermissionRow, rhs: CoreSailPermissionRow) -> Bool {
+        if lhs.permission != rhs.permission {
+            return false
+        }
+        if lhs.granted != rhs.granted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(permission)
+        hasher.combine(granted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailPermissionRow: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailPermissionRow {
+        return
+            try CoreSailPermissionRow(
+                permission: FfiConverterTypeCoreSailPermission.read(from: &buf), 
+                granted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSailPermissionRow, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreSailPermission.write(value.permission, into: &buf)
+        FfiConverterBool.write(value.granted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailPermissionRow_lift(_ buf: RustBuffer) throws -> CoreSailPermissionRow {
+    return try FfiConverterTypeCoreSailPermissionRow.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailPermissionRow_lower(_ value: CoreSailPermissionRow) -> RustBuffer {
+    return FfiConverterTypeCoreSailPermissionRow.lower(value)
+}
+
+
+/**
  * The answer to "this is what the plan came out as; does it go on the radio?".
  */
 public struct CoreSprayAdmission {
@@ -29331,6 +29836,203 @@ extension CoreRelayTransportError: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The checklist items, in the order they are shown.
+ *
+ * The enum order is the display order, and both are the order the spec fixes;
+ * see the module note for why the first two are where they are. Shells map
+ * each variant to its own title and subtitle resources.
+ */
+
+public enum CoreSailChecklistItemId {
+    
+    /**
+     * Set up your Shore Pass. Optional -- and first, because friend codes
+     * carry the pass's delivery details.
+     */
+    case shorePass
+    /**
+     * Add your family: scan each other's codes in person, while everyone is
+     * still together. A code swap needs proximity, never signal.
+     */
+    case addFamily
+    /**
+     * Let it run in your pocket: the delivery-critical grants.
+     */
+    case permissions
+    /**
+     * Send a message with no internet, proving nearby delivery works.
+     */
+    case offlineTest
+    /**
+     * Back up your identity. Optional.
+     */
+    case backup
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailChecklistItemId: FfiConverterRustBuffer {
+    typealias SwiftType = CoreSailChecklistItemId
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailChecklistItemId {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .shorePass
+        
+        case 2: return .addFamily
+        
+        case 3: return .permissions
+        
+        case 4: return .offlineTest
+        
+        case 5: return .backup
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreSailChecklistItemId, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .shorePass:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .addFamily:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .permissions:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .offlineTest:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .backup:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistItemId_lift(_ buf: RustBuffer) throws -> CoreSailChecklistItemId {
+    return try FfiConverterTypeCoreSailChecklistItemId.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailChecklistItemId_lower(_ value: CoreSailChecklistItemId) -> RustBuffer {
+    return FfiConverterTypeCoreSailChecklistItemId.lower(value)
+}
+
+
+
+extension CoreSailChecklistItemId: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * One delivery-critical grant, as its own row.
+ *
+ * Each is a separate row because each opens a different system screen, and a
+ * single lumped "permissions" button that reopens the same settings page four
+ * times is how people end up granting three of four and believing they are
+ * done.
+ */
+
+public enum CoreSailPermission {
+    
+    /**
+     * Android nearby devices, iOS Bluetooth authorization.
+     */
+    case bluetooth
+    /**
+     * Posting notifications.
+     */
+    case notifications
+    /**
+     * Android only: exemption from battery optimization.
+     */
+    case batteryOptimization
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSailPermission: FfiConverterRustBuffer {
+    typealias SwiftType = CoreSailPermission
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSailPermission {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .bluetooth
+        
+        case 2: return .notifications
+        
+        case 3: return .batteryOptimization
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreSailPermission, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .bluetooth:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .notifications:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .batteryOptimization:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailPermission_lift(_ buf: RustBuffer) throws -> CoreSailPermission {
+    return try FfiConverterTypeCoreSailPermission.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSailPermission_lower(_ value: CoreSailPermission) -> RustBuffer {
+    return FfiConverterTypeCoreSailPermission.lower(value)
+}
+
+
+
+extension CoreSailPermission: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Why a built plan was or was not admitted onto the radio.
  */
 
@@ -32649,6 +33351,30 @@ fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionBool: FfiConverterRustBuffer {
+    typealias SwiftType = Bool?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterBool.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterBool.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
     typealias SwiftType = String?
 
@@ -34549,6 +35275,56 @@ fileprivate struct FfiConverterSequenceTypeCoreReplyMetadata: FfiConverterRustBu
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCoreReplyMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreSailChecklistItem: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreSailChecklistItem]
+
+    public static func write(_ value: [CoreSailChecklistItem], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreSailChecklistItem.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreSailChecklistItem] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreSailChecklistItem]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreSailChecklistItem.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeCoreSailPermissionRow: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreSailPermissionRow]
+
+    public static func write(_ value: [CoreSailPermissionRow], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreSailPermissionRow.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreSailPermissionRow] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreSailPermissionRow]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreSailPermissionRow.read(from: &buf))
         }
         return seq
     }
@@ -36548,6 +37324,29 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
     uniffi_cruisemesh_core_fn_func_core_relay_shadow_sample(
         FfiConverterTypeCoreRelayShadowSampler.lower(state),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Turn the facts into the checklist.
+ *
+ * The rules, in full:
+ *
+ * 1. The five items are always all present, always in the order of
+ * [`CoreSailChecklistItemId`].
+ * 2. `ShorePass` is done when a pass is saved; `AddFamily` when at least one
+ * contact exists; `Permissions` when every grant *this platform has* is
+ * held; `OfflineTest` when a nearby delivery has ever happened; `Backup`
+ * when a local backup has ever been made.
+ * 3. `ShorePass` and `Backup` are optional. The other three are required.
+ * 4. `ready` is every required item done -- which is exactly `AddFamily`,
+ * `Permissions` and `OfflineTest`. No optional item can hold it back, and
+ * no optional item can grant it.
+ */
+public func coreSailChecklist(input: CoreSailChecklistInput) -> CoreSailChecklistReport {
+    return try!  FfiConverterTypeCoreSailChecklistReport.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sail_checklist(
+        FfiConverterTypeCoreSailChecklistInput.lower(input),$0
     )
 })
 }
@@ -39343,6 +40142,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sail_checklist() != 31707) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_build_report() != 57483) {

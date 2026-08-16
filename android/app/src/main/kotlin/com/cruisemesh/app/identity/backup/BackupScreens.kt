@@ -63,6 +63,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
+import com.cruisemesh.app.sail.SailChecklistEvidence
 import uniffi.cruisemesh_core.BackupContentOptions
 import uniffi.cruisemesh_core.BackupInventory
 
@@ -128,6 +129,11 @@ fun BackupExportScreen(onBack: () -> Unit) {
                     )
                 }
                 withContext(Dispatchers.IO) { BackupService.writeBytes(context, uri, bytes) }
+                // The file is on disk now, which is the fact the "back up your
+                // identity" step of the before-you-sail checklist is about.
+                // Nothing else on this phone remembers that a backup was ever
+                // made -- the file lives wherever the user chose to put it.
+                SailChecklistEvidence.markBackupCreated(context)
                 BackupUiState.Done
             } catch (e: Exception) {
                 BackupUiState.Error(backupFailureText(e, R.string.ui_couldn_t_save_the_backup))

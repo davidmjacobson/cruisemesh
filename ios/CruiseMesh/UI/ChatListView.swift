@@ -91,6 +91,12 @@ struct ChatListView: View {
     @State private var pendingDeleteSummary: ChatSummary?
     @State private var path = NavigationPath()
     @AppStorage("hideBluetoothAudioWarning") private var hideBluetoothAudioWarning = false
+    @StateObject private var sailChecklist = SailChecklistModel()
+    @State private var showSailChecklist = false
+    /// Read once when the view is built; the store is the durable answer and
+    /// this only has to keep the card gone for the rest of this launch.
+    @State private var sailCardDismissed = SailChecklistCardStore.isDismissed()
+    @Environment(\.scenePhase) private var scenePhase
 
     private var connectivityWarning: ConnectivityWarning? {
         if bluetooth.isAuthorizationBlocked {
@@ -304,6 +310,22 @@ struct ChatListView: View {
                             } : nil
                         )
                     }
+                    // hasLoaded keeps a cold launch from flashing the card
+                    // before the first real read (notification callback
+                    // included) has landed.
+                    if sailChecklist.hasLoaded, SailChecklistCard.isVisible(
+                        report: sailChecklist.report,
+                        dismissed: sailCardDismissed
+                    ) {
+                        SailChecklistCardView(
+                            report: sailChecklist.report,
+                            onOpen: { showSailChecklist = true },
+                            onDismiss: {
+                                SailChecklistCardStore.dismiss()
+                                sailCardDismissed = true
+                            }
+                        )
+                    }
                     MeshStatusPill {
                         if bluetooth.isAuthorizationBlocked || bluetooth.isRadioOff {
                             bluetooth.openSystemSettings()
@@ -357,9 +379,23 @@ struct ChatListView: View {
             .sheet(isPresented: $showHelp) {
                 HelpSupportView(appModel: appModel)
             }
+            .sheet(isPresented: $showSailChecklist, onDismiss: { sailChecklist.refresh() }) {
+                // The sheet supplies the stack and the Close button; the
+                // Settings push supplies neither (see SailChecklistView).
+                NavigationStack {
+                    SailChecklistView(appModel: appModel, isModal: true)
+                }
+            }
             .onAppear {
                 reload()
-                cancellable = ChatEvents.subject.sink { _ in reload() }
+                sailChecklist.refresh()
+                // The same events that reload the list recompute the card, so
+                // the offline-test step ticks the moment the airplane-mode
+                // message lands instead of on the next resume.
+                cancellable = ChatEvents.subject.sink { _ in
+                    reload()
+                    sailChecklist.refresh()
+                }
                 appModel.startMeshIfEnabled()
                 if AppStore.consumeRecoveryNotice() { showStoreRecoveryNotice = true }
                 if !UITestConfiguration.isEnabled && !publishedFriendDirectory {
@@ -379,6 +415,16 @@ struct ChatListView: View {
                 if connected { return }
                 bluetoothAudioWarningDismissed = false
             }
+            // Every step the card counts changes because somebody left the app
+            // and came back -- a permission alert, a trip to Settings, the
+            // first message that arrived over Bluetooth while the phone was
+            // locked. Coming back to the front is the one moment worth
+            // re-reading them all.
+            .onChange(of: scenePhase) { phase in
+                guard phase == .active else { return }
+                sailChecklist.refresh()
+            }
+            .onChange(of: hasContacts) { _ in sailChecklist.refresh() }
             .onChange(of: appModel.pendingFriendToken) { token in
                 if token != nil { showFriends = true }
             }

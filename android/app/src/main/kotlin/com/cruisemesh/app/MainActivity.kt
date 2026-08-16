@@ -70,10 +70,16 @@ import com.cruisemesh.app.friending.AddFriendScreen
 import com.cruisemesh.app.friending.ImportFriendResult
 import com.cruisemesh.app.friending.FriendAddedOutcome
 import com.cruisemesh.app.friending.FriendPreview
+import com.cruisemesh.app.sail.SailChecklistCardStore
+import com.cruisemesh.app.sail.SailChecklistEvidence
+import com.cruisemesh.app.sail.SailChecklistInputs
 import com.cruisemesh.app.ui.ConnectivityWarning
 import com.cruisemesh.app.ui.ConnectivityWarningSeverity
+import com.cruisemesh.app.ui.SailChecklistProgress
+import com.cruisemesh.app.ui.SailChecklistScreen
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import com.cruisemesh.app.friending.MyQrScreen
 import com.cruisemesh.app.friending.ProfileSyncSender
 import com.cruisemesh.app.friending.FriendDirectorySender
@@ -132,10 +138,13 @@ import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
 import com.cruisemesh.app.ui.DeveloperSettingsScreen
 import com.cruisemesh.app.ui.SettingsScreen
+import uniffi.cruisemesh_core.CoreSailChecklistReport
+import uniffi.cruisemesh_core.CoreSailPermission
 import uniffi.cruisemesh_core.DeepLinkRoute
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.coreSailChecklist
 import uniffi.cruisemesh_core.deepLinkRoute
 import uniffi.cruisemesh_core.fingerprintWords
 import uniffi.cruisemesh_core.friendCardMatch
@@ -311,6 +320,7 @@ fun CruiseMeshApp(
                 },
             )
         }
+        composable("sailChecklist") { SailChecklistRoute(navController) }
         composable("developerSettings") {
             DeveloperSettingsScreen(onBack = { navController.popOrExit(context) })
         }
@@ -922,6 +932,37 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
 
     var summaries by remember { mutableStateOf(emptyList<ChatSummary>()) }
     var ownCloneWarning by remember { mutableStateOf(false) }
+    // The before-you-sail card. Null unless there is genuinely something left
+    // to do: the card is the nudge, the Settings row is the permanent way in.
+    val sailCardDismissed by SailChecklistCardStore.dismissed.collectAsState()
+    var sailChecklistProgress by remember { mutableStateOf<SailChecklistProgress?>(null) }
+    // The evidence latches recompute the card the moment the airplane-mode
+    // test succeeds or a backup lands, not on the next resume.
+    val sailEvidenceVersion by SailChecklistEvidence.changes.collectAsState()
+    LaunchedEffect(Unit) { SailChecklistCardStore.refresh(context) }
+    LaunchedEffect(sailCardDismissed, permissionRefreshToken, summaries.size, sailEvidenceVersion) {
+        sailChecklistProgress = if (sailCardDismissed) {
+            null
+        } else {
+            withContext(Dispatchers.IO) {
+                val report = SailChecklistInputs.report(
+                    context,
+                    store,
+                    nearbyPermissionGranted = hasPermissions,
+                    notificationsPermissionGranted = notificationsDeliverable(context),
+                    batteryOptimizationExempt = isIgnoringBatteryOptimizations(context),
+                )
+                // Gone the moment the family is ready, without anyone having
+                // to dismiss it, and counted out of every step rather than
+                // only the required ones -- see the core's own note on why.
+                if (report.ready) {
+                    null
+                } else {
+                    SailChecklistProgress(report.doneCount.toInt(), report.totalCount.toInt())
+                }
+            }
+        }
+    }
     val summaryScope = rememberCoroutineScope()
     // G1: never load summaries on main. The coordinator debounces bursts,
     // guarantees a periodic refresh during a sustained storm, and never
@@ -1091,6 +1132,9 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
         onMeshStatusClick = { showMeshStatusLegend = true },
         meshStatusText = transientMeshStatus ?: pillStatus.text,
         meshStatusDotColor = if (transientMeshStatus != null) null else pillDotColor,
+        sailChecklistProgress = sailChecklistProgress,
+        onSailChecklistClick = { navController.navigate("sailChecklist") },
+        onDismissSailChecklist = { SailChecklistCardStore.dismiss(context) },
         ownCloneWarning = ownCloneWarning,
         onDismissOwnCloneWarning = {
             summaryScope.launch(Dispatchers.IO) {
@@ -1171,6 +1215,95 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     }
 }
 
+/**
+ * Gathers the before-you-sail checklist's inputs and keeps them current while
+ * the screen is open.
+ *
+ * Every grant row here opens a real system screen, and the answer only lands
+ * when the user comes back, so the whole report is recomputed on every resume
+ * as well as after each launcher returns. Anything less and a step someone
+ * just finished stays stubbornly unticked.
+ */
+@Composable
+private fun SailChecklistRoute(navController: NavHostController) {
+    val context = LocalContext.current
+    val store = remember { AppStore.get(context) }
+    val activity = context as? ComponentActivity
+    var refreshToken by remember { mutableStateOf(0) }
+    var report by remember { mutableStateOf<CoreSailChecklistReport?>(null) }
+    var contactCount by remember { mutableStateOf(0) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        refreshToken += 1
+        // A row that does nothing is worse than no row: once the system has
+        // stopped offering the dialog, send the user where the switch is.
+        val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
+            grants[perm] == false &&
+                !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+        }
+        if (permanentlyDenied) openAppPermissionSettings(context)
+    }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { refreshToken += 1 }
+    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { refreshToken += 1 }
+
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) refreshToken += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(refreshToken) {
+        val gathered = withContext(Dispatchers.IO) {
+            val state = SailChecklistInputs.deviceState(
+                context,
+                store,
+                nearbyPermissionGranted = hasMeshPermissions(context),
+                notificationsPermissionGranted = notificationsDeliverable(context),
+                batteryOptimizationExempt = isIgnoringBatteryOptimizations(context),
+            )
+            state.contactCount to coreSailChecklist(SailChecklistInputs.coreInput(state))
+        }
+        contactCount = gathered.first
+        report = gathered.second
+    }
+
+    report?.let { current ->
+        SailChecklistScreen(
+            report = current,
+            contactCount = contactCount,
+            onShorePass = { navController.navigate("shorePass") },
+            onAddFamily = { navController.navigate("addFriend") },
+            onGrantPermission = { permission ->
+                when (permission) {
+                    CoreSailPermission.BLUETOOTH ->
+                        permissionLauncher.launch(MeshService.requiredPermissions())
+                    CoreSailPermission.NOTIFICATIONS ->
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            // Older Android has no runtime prompt to raise;
+                            // the switch lives in the app's own settings.
+                            openAppPermissionSettings(context)
+                        }
+                    CoreSailPermission.BATTERY_OPTIMIZATION ->
+                        batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
+                }
+            },
+            onBackUp = { navController.navigate("backup") },
+            onBack = { navController.popOrExit(context) },
+        )
+    }
+}
+
 @Composable
 private fun SettingsRoute(identity: Identity, navController: NavHostController) {
     val context = LocalContext.current
@@ -1200,6 +1333,7 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
         meshStatus = runtimeStatus.label,
         relayHealth = relayHealth,
         onShorePass = { navController.navigate("shorePass") },
+        onSailChecklist = { navController.navigate("sailChecklist") },
         onConnectionDetails = { navController.navigate("connectionDetails") },
         onDeveloperSettings = { navController.navigate("developerSettings") },
         onBackUp = { navController.navigate("backup") },
@@ -1862,6 +1996,14 @@ private fun hasNotificationPermission(context: Context): Boolean =
     Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
         ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
         PackageManager.PERMISSION_GRANTED
+
+// The sail checklist asks "will an arriving message actually show?", which
+// the runtime permission alone cannot answer: below API 33 there is no
+// permission at all (the check above short-circuits to true), and on any
+// version the app-level notification toggle can be off while the permission
+// is granted. areNotificationsEnabled covers both.
+private fun notificationsDeliverable(context: Context): Boolean =
+    NotificationManagerCompat.from(context).areNotificationsEnabled()
 
 private fun openAppPermissionSettings(context: Context) {
     val intent = Intent(

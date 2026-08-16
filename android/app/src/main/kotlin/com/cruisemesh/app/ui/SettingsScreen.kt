@@ -71,6 +71,7 @@ fun SettingsScreen(
     meshStatus: String,
     relayHealth: RelayHealth,
     onShorePass: () -> Unit,
+    onSailChecklist: () -> Unit,
     onConnectionDetails: () -> Unit,
     onDeveloperSettings: () -> Unit,
     onBackUp: () -> Unit,
@@ -138,6 +139,18 @@ fun SettingsScreen(
                 .verticalScroll(rememberScrollState())
                 .padding(20.dp),
         ) {
+            // The checklist's permanent home. The home-screen card can be
+            // dismissed, and dismissing it must not be a way to lose the
+            // checklist -- there is always this row.
+            SettingsGroup(stringResource(R.string.ui_getting_ready)) {
+                SettingsLink(
+                    title = stringResource(R.string.ui_before_you_sail),
+                    detail = stringResource(R.string.ui_before_you_sail_summary),
+                    onClick = onSailChecklist,
+                )
+            }
+
+            SettingsGap()
             SettingsGroup(stringResource(R.string.ui_shore_pass)) {
                 SettingsLink(
                     title = relayTitle(relayHealth, relayConfigured),

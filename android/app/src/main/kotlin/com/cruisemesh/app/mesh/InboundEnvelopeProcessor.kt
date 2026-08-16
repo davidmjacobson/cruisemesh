@@ -21,6 +21,7 @@ import com.cruisemesh.app.notify.NotificationAnnouncer
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayFetchedEnvelope
 import com.cruisemesh.app.relay.RelayImport
+import com.cruisemesh.app.sail.SailChecklistEvidence
 import uniffi.cruisemesh_core.CarriedEnvelope
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.ContactDiscoveryPolicy
@@ -1287,6 +1288,10 @@ internal class InboundEnvelopeProcessor(
                 "sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
         )
         recordInboundChatArrival(senderUserId, body.kind, arrival)
+        // A group message that landed without the internet proves the same
+        // thing a 1:1 one does; see the matching line in
+        // [handleIncomingChatMessage].
+        SailChecklistEvidence.recordArrival(context, arrival.transport)
         ChatEvents.notifyChatChanged(group.id)
 
         // See [PeerStreamWatermark] for why this is a plain MAX.
@@ -1978,6 +1983,11 @@ internal class InboundEnvelopeProcessor(
         )
         MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(senderUserId), System.currentTimeMillis())
         ChatEvents.notifyChatChanged(senderUserId)
+        // The message is durably stored, so this arrival really happened:
+        // latch it if it came in without the internet. That is the proof the
+        // "send a message with no internet" checklist step waits for, and it
+        // is the only place on this phone where the fact is observed at all.
+        SailChecklistEvidence.recordArrival(context, arrival.transport)
 
         // See [PeerStreamWatermark] for why this is a plain MAX and not the
         // contiguous count.

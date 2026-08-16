@@ -88,6 +88,11 @@ struct BackupExportView: View {
             case .success:
                 error = nil
                 backupSaved = true
+                // Recorded here rather than where the bytes are built: a
+                // backup that was prepared and then cancelled is not one
+                // anybody could restore from, and the checklist step says a
+                // backup exists.
+                BackupCreatedStore.markCreated()
             case .failure(let failure):
                 error = backupFailureText(failure, fallback: .couldNotSave).text
             }

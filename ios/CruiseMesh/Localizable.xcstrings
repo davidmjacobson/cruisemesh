@@ -475,6 +475,46 @@
         }
       }
     },
+    "%lld of %lld done": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld of %lld done"
+          }
+        }
+      }
+    },
+    "%lld people added": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%lld people added"
+          }
+        }
+      }
+    },
+    "1 person added": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "1 person added"
+          }
+        }
+      }
+    },
+    "A message has already arrived here without the internet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A message has already arrived here without the internet."
+          }
+        }
+      }
+    },
     "A message is too large to send": {
       "localizations": {
         "en": {
@@ -615,12 +655,32 @@
         }
       }
     },
+    "Add your family": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add your family"
+          }
+        }
+      }
+    },
     "Advanced": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Advanced"
+          }
+        }
+      }
+    },
+    "Allowed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Allowed"
           }
         }
       }
@@ -685,6 +745,26 @@
         }
       }
     },
+    "Back up your identity": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Back up your identity"
+          }
+        }
+      }
+    },
+    "Background power": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Background power"
+          }
+        }
+      }
+    },
     "Backup": {
       "localizations": {
         "en": {
@@ -711,6 +791,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Backup saved"
+          }
+        }
+      }
+    },
+    "Before you sail": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Before you sail"
           }
         }
       }
@@ -781,6 +871,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Bluetooth and notifications are turned off for CruiseMesh. Turn them on in Settings to add those ways of reaching people."
+          }
+        }
+      }
+    },
+    "Bluetooth and notifications, so CruiseMesh can keep working with the screen off.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Bluetooth and notifications, so CruiseMesh can keep working with the screen off."
           }
         }
       }
@@ -1285,6 +1385,16 @@
         }
       }
     },
+    "Get set up while everyone's still together. Each step checks itself off as it's done.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Get set up while everyone's still together. Each step checks itself off as it's done."
+          }
+        }
+      }
+    },
     "Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only.": {
       "localizations": {
         "en": {
@@ -1381,6 +1491,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Last synced %@"
+          }
+        }
+      }
+    },
+    "Let it run in your pocket": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Let it run in your pocket"
           }
         }
       }
@@ -1497,6 +1617,26 @@
         }
       }
     },
+    "Not allowed yet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not allowed yet"
+          }
+        }
+      }
+    },
+    "Not done yet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Not done yet"
+          }
+        }
+      }
+    },
     "Not set up": {
       "localizations": {
         "en": {
@@ -1527,6 +1667,16 @@
         }
       }
     },
+    "Notifications": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Notifications"
+          }
+        }
+      }
+    },
     "Off": {
       "localizations": {
         "en": {
@@ -1543,6 +1693,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received."
+          }
+        }
+      }
+    },
+    "Optional. If you bought one, add it before trading codes.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional. If you bought one, add it before trading codes."
+          }
+        }
+      }
+    },
+    "Optional. Save an encrypted copy in case you lose your phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Optional. Save an encrypted copy in case you lose your phone."
           }
         }
       }
@@ -1615,6 +1785,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Play voice message"
+          }
+        }
+      }
+    },
+    "Put two phones in airplane mode, turn Bluetooth back on, and send a message.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Put two phones in airplane mode, turn Bluetooth back on, and send a message."
           }
         }
       }
@@ -1731,6 +1911,26 @@
         }
       }
     },
+    "Scan each other's codes in person, before everyone scatters.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scan each other's codes in person, before everyone scatters."
+          }
+        }
+      }
+    },
+    "Send a message with no internet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Send a message with no internet"
+          }
+        }
+      }
+    },
     "Sender ID": {
       "localizations": {
         "en": {
@@ -1809,6 +2009,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Setup rejected"
+          }
+        }
+      }
+    },
+    "Setup steps that check themselves off, for the days before a cruise.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Setup steps that check themselves off, for the days before a cruise."
           }
         }
       }
@@ -4395,6 +4605,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do."
+          }
+        }
+      }
+    },
+    "You're set to sail.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You're set to sail."
           }
         }
       }

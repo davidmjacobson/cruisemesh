@@ -127,6 +127,11 @@ fun ChatListScreen(
     onConnectivityWarningSecondaryClick: (() -> Unit)? = null,
     ownCloneWarning: Boolean = false,
     onDismissOwnCloneWarning: () -> Unit = {},
+    // Null once the checklist is finished or the card has been dismissed;
+    // whether it has earned a place is the caller's call, not this screen's.
+    sailChecklistProgress: SailChecklistProgress? = null,
+    onSailChecklistClick: () -> Unit = {},
+    onDismissSailChecklist: () -> Unit = {},
     summaries: List<ChatSummary>
 ) {
     var showHomeMenu by remember { mutableStateOf(false) }
@@ -272,6 +277,15 @@ fun ChatListScreen(
                 onClick = onMeshStatusClick,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
             )
+
+            sailChecklistProgress?.let { progress ->
+                SailChecklistCard(
+                    progress = progress,
+                    onClick = onSailChecklistClick,
+                    onDismiss = onDismissSailChecklist,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
+            }
 
             // T15 phase 3: after Wi‑Fi has repeatedly dropped out from under a
             // live mesh (see WifiDropPolicy), nudge the user to keep it on.
