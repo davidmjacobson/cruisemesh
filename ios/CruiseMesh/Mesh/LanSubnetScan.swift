@@ -1,7 +1,9 @@
 import Foundation
 
-/// Ceiling breadth for the user-initiated "Search local subnet" action --
-/// explicitly allowed to be big since the user asked for it.
+/// Ceiling breadth for a scan someone asked for by hand. No UI reaches this
+/// any more -- the manual local Wi-Fi controls were removed -- but the ceiling
+/// and its clamp stay so the distinction from the automatic sweep below is not
+/// quietly lost if a caller returns.
 let broadestLanScanPrefixLength = 16
 /// Ceiling breadth for the *automatic* full-subnet fallback sweep. A /16 is
 /// ~65k hosts, minutes of sustained radio at concurrency 64; a /20 is

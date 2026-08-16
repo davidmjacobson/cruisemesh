@@ -895,16 +895,6 @@
         }
       }
     },
-    "Checking this network…": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Checking this network…"
-          }
-        }
-      }
-    },
     "Checking your Shore Pass": {
       "localizations": {
         "en": {
@@ -1015,16 +1005,6 @@
         }
       }
     },
-    "Connect securely": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Connect securely"
-          }
-        }
-      }
-    },
     "Connected": {
       "localizations": {
         "en": {
@@ -1125,16 +1105,6 @@
         }
       }
     },
-    "Copy this phone's address": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Copy this phone's address"
-          }
-        }
-      }
-    },
     "Could not display photo": {
       "localizations": {
         "en": {
@@ -1205,6 +1175,46 @@
         }
       }
     },
+    "Delivery engines": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Delivery engines"
+          }
+        }
+      }
+    },
+    "Developer settings": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Developer settings"
+          }
+        }
+      }
+    },
+    "Developer settings hidden.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Developer settings hidden."
+          }
+        }
+      }
+    },
+    "Developer settings on. Reopen settings.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Developer settings on. Reopen settings."
+          }
+        }
+      }
+    },
     "Diagnostic logging": {
       "localizations": {
         "en": {
@@ -1255,6 +1265,16 @@
         }
       }
     },
+    "Engine rollout switches and diagnostic exports.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Engine rollout switches and diagnostic exports."
+          }
+        }
+      }
+    },
     "Friend": {
       "localizations": {
         "en": {
@@ -1285,12 +1305,12 @@
         }
       }
     },
-    "Hide internal tools": {
+    "Hide developer settings": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Hide internal tools"
+            "value": "Hide developer settings"
           }
         }
       }
@@ -1311,26 +1331,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "How to fix"
-          }
-        }
-      }
-    },
-    "Internal tools hidden.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internal tools hidden."
-          }
-        }
-      }
-    },
-    "Internal tools on. Reopen settings.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internal tools on. Reopen settings."
           }
         }
       }
@@ -1647,16 +1647,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Received your message %@"
-          }
-        }
-      }
-    },
-    "Receiving": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Receiving"
           }
         }
       }
@@ -2373,32 +2363,12 @@
         }
       }
     },
-    "Family token": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Family token"
-          }
-        }
-      }
-    },
     "For self-hosted relays and development.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "For self-hosted relays and development."
-          }
-        }
-      }
-    },
-    "Friend IP address": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Friend IP address"
           }
         }
       }
@@ -2593,42 +2563,12 @@
         }
       }
     },
-    "Internal field tools": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internal field tools"
-          }
-        }
-      }
-    },
-    "Internal tools": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Internal tools"
-          }
-        }
-      }
-    },
     "Internet delivery": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Internet delivery"
-          }
-        }
-      }
-    },
-    "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Keep Wi-Fi connected even when it has no internet — CruiseMesh uses it to reach phones near you."
           }
         }
       }
@@ -2649,16 +2589,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Keep the backup file and its passphrase somewhere safe."
-          }
-        }
-      }
-    },
-    "Last peer": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Last peer"
           }
         }
       }
@@ -2689,46 +2619,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Local Wi-Fi"
-          }
-        }
-      }
-    },
-    "Local Wi-Fi address": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Local Wi-Fi address"
-          }
-        }
-      }
-    },
-    "Local Wi-Fi field tools": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Local Wi-Fi field tools"
-          }
-        }
-      }
-    },
-    "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Local Wi-Fi probes were denied, likely by a VPN or OS policy; nearby delivery will use Bluetooth."
-          }
-        }
-      }
-    },
-    "Manual local-network probes, raw route counters, and diagnostic exports.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Manual local-network probes, raw route counters, and diagnostic exports."
           }
         }
       }
@@ -3333,16 +3223,6 @@
         }
       }
     },
-    "Relay URL must start with https:// This one was not saved.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Relay URL must start with https:// This one was not saved."
-          }
-        }
-      }
-    },
     "Relay token": {
       "localizations": {
         "en": {
@@ -3573,16 +3453,6 @@
         }
       }
     },
-    "Scan address QR": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Scan address QR"
-          }
-        }
-      }
-    },
     "Scan friend QR": {
       "localizations": {
         "en": {
@@ -3609,16 +3479,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Scan this with the other phone. It configures internet delivery; it does not add a contact."
-          }
-        }
-      }
-    },
-    "Search local subnet": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Search local subnet"
           }
         }
       }
@@ -3723,16 +3583,6 @@
         }
       }
     },
-    "Share address": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Share address"
-          }
-        }
-      }
-    },
     "Share card text": {
       "localizations": {
         "en": {
@@ -3821,16 +3671,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "Show address QR": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Show address QR"
           }
         }
       }
@@ -4035,16 +3875,6 @@
         }
       }
     },
-    "Test encrypted LAN link": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Test encrypted LAN link"
-          }
-        }
-      }
-    },
     "That backup couldn't be read. The file may be damaged.": {
       "localizations": {
         "en": {
@@ -4125,36 +3955,6 @@
         }
       }
     },
-    "The port is optional. An accepted friend and encrypted identity check are still required.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "The port is optional. An accepted friend and encrypted identity check are still required."
-          }
-        }
-      }
-    },
-    "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Shore Pass rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
-          }
-        }
-      }
-    },
-    "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "The relay rejected this family token. Messages will wait until the token is fixed — check it against another family phone."
-          }
-        }
-      }
-    },
     "The service on their card is not accepting messages for them, so yours are waiting. Ask them to check their Shore Pass is set up, then share their friend card again. Messages still deliver when you are near each other.": {
       "localizations": {
         "en": {
@@ -4201,16 +4001,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "They won't be able to message you, and they won't appear as a suggested friend. They won't be told. Scanning their card again unblocks them."
-          }
-        }
-      }
-    },
-    "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "This Wi-Fi appears to block phone-to-phone traffic; nearby delivery will use Bluetooth."
           }
         }
       }
@@ -4281,16 +4071,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "This only takes a moment."
-          }
-        }
-      }
-    },
-    "This phone": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "This phone"
           }
         }
       }
@@ -4569,16 +4349,6 @@
         }
       }
     },
-    "When any family phone has internet, queued messages flush through this mailbox.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "When any family phone has internet, queued messages flush through this mailbox."
-          }
-        }
-      }
-    },
     "Working normally": {
       "localizations": {
         "en": {
@@ -4685,16 +4455,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support."
-          }
-        }
-      }
-    },
-    "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Your friend must already be accepted. The QR only supplies a local network address; the encrypted identity check still applies."
           }
         }
       }

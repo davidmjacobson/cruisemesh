@@ -27,7 +27,7 @@ enum RelayPassEngine {
 /// forever. A handful of preference keys simply stop being read. Mirrors
 /// Android `RelayEngineSettings`.
 ///
-/// The engine switch is reachable from the internal tools screen, behind the
+/// The engine switch is reachable from the developer settings screen, behind the
 /// same door as the manual relay fields, because a closed-test build is
 /// release-signed and a canary whose flag could only be set by a unit test can
 /// never produce the evidence it exists to produce.

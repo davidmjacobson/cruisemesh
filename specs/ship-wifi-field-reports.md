@@ -933,7 +933,7 @@ evidence affects an automated compatibility headline.
   attachment.
 - Validate sample reports from permissive, client-isolated, no-peer, VPN-denied,
   and multicast-filtered test networks.
-- Keep the feature behind internal tools.
+- Keep the feature behind developer settings.
 
 ### Phase 1 — guided local report and share sheet
 

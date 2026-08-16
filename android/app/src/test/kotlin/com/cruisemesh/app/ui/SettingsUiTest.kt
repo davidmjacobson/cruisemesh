@@ -34,7 +34,7 @@ class SettingsUiTest {
                     relayHealth = RelayHealth.NoConfig,
                     onShorePass = {},
                     onConnectionDetails = {},
-                    onInternalTools = {},
+                    onDeveloperSettings = {},
                     onBackUp = {},
                     onMeshEnabledChange = {
                         enabled = it

@@ -695,7 +695,6 @@ class MeshService : Service() {
         WifiTipStore.refresh(this)
         refreshWifiHold()
         relaySync?.scheduleRelayPolling()
-        LanTransportDiagnostics.registerProbeRequester(::requestManualLanProbe)
         scheduleLanHealth()
         scheduleDigestMaintenance()
         scheduleRadioPowerChecks()
@@ -770,7 +769,6 @@ class MeshService : Service() {
         // being interrupted mid-write; this MeshService instance is done either
         // way, so there is nothing to await synchronously here.
         storeExecutor.shutdown()
-        LanTransportDiagnostics.unregisterProbeRequester()
         lanHealthTracker.clear()
         RelaySyncEvents.unregister()
         stopMeshRoles()
@@ -1575,27 +1573,6 @@ class MeshService : Service() {
                 address,
                 encodeTransportProbe(probe.nonce, response = true),
             )
-        }
-    }
-
-    private fun requestManualLanProbe(): String? {
-        val route = MeshRouter.identifiedRoutes()
-            .firstOrNull { it.transport == MeshRouterState.Transport.LAN }
-            ?: return "No secure local Wi-Fi link is active"
-        return when (val decision = nextLanHealthDecision(route.address)) {
-            is LanHealthTracker.Decision.Send -> {
-                LanTransportDiagnostics.probeStarted()
-                MeshRouter.sendToAddress(
-                    route.address,
-                    encodeTransportProbe(decision.nonce, response = false),
-                )
-                null
-            }
-            LanHealthTracker.Decision.Wait -> "A LAN connection test is already running"
-            LanHealthTracker.Decision.Close -> {
-                lanTransport?.closeLink(route.address)
-                "The stale LAN link was closed; CruiseMesh will reconnect"
-            }
         }
     }
 

@@ -21,7 +21,7 @@ import java.util.zip.ZipOutputStream
  * round trip to ask for the rest can cost a day at sea. So the tester-facing
  * surface has one button, and it sends them all.
  *
- * The granular per-file exports still exist on the internal tools screen, where
+ * The granular per-file exports still exist on the developer settings screen, where
  * the point is analysis rather than a support hand-off.
  */
 object DiagnosticsShare {

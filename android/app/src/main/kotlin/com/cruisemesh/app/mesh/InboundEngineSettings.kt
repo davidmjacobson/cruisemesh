@@ -29,7 +29,7 @@ enum class InboundEngine {
  * path is deleted, and a flag that had earned a column in the store's schema
  * would not be. A preference key simply stops being read.
  *
- * The switch is reachable from the internal tools screen. It has to be: a
+ * The switch is reachable from the developer settings screen. It has to be: a
  * closed-test build is release-signed, `run-as` is refused on it, and a rollout
  * switch that can only be set by a JVM test can never produce the field
  * evidence it exists to produce.

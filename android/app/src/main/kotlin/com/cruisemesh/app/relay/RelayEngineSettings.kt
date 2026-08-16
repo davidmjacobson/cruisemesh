@@ -33,7 +33,7 @@ enum class RelayPassEngine {
  * either a migration to drop nothing or a dead column kept forever. A handful
  * of preference keys simply stop being read.
  *
- * The engine switch is reachable from the internal tools screen, behind the
+ * The engine switch is reachable from the developer settings screen, behind the
  * same door as the manual relay fields. It has to be: a closed-test build is
  * release-signed, `run-as` is refused on it, and a canary whose flag can only
  * be set by a JVM test can never produce the evidence it exists to produce.

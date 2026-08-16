@@ -97,8 +97,8 @@ the usual cause).
 
 ## 4. Point phones at the relay
 
-On each phone, the saved relay config (Shore Pass screen / internal tools)
-should be:
+On each phone, the saved relay config (Shore Pass screen, under "Custom
+relay") should be:
 
 | Field | Value |
 |---|---|

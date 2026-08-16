@@ -1,27 +1,27 @@
 import Foundation
 
-/// Taps on the version row it takes to turn internal tools on, or off again.
-let internalToolsUnlockTaps = 7
+/// Taps on the version row it takes to turn developer settings on, or off again.
+let developerSettingsUnlockTaps = 7
 
 /// The tap after which the counter starts giving feedback. Nothing happens for
 /// the first three, so an accidental double-tap on the version line stays
 /// invisible.
-private let internalToolsCountdownFrom = 4
+private let developerSettingsCountdownFrom = 4
 
 /// Taps further apart than this start the count over.
-let internalToolsTapWindow: TimeInterval = 3
+let developerSettingsTapWindow: TimeInterval = 3
 
 /// How long the version row keeps showing tap feedback after the last tap.
 ///
 /// Every bit of feedback this flow gives is the row's own text swapped in
 /// place, so this is also how long the row stops reading as a version string.
-/// Shorter than `internalToolsTapWindow` on purpose: a run that is still live
+/// Shorter than `developerSettingsTapWindow` on purpose: a run that is still live
 /// can go quiet, which is the harmless direction. The other way round would
 /// leave a stale count on screen after the run it belonged to had expired.
-let internalToolsLabelRevert: TimeInterval = 1.5
+let developerSettingsLabelRevert: TimeInterval = 1.5
 
 /// What one tap on the version row means.
-enum InternalToolsTap: Equatable {
+enum DeveloperSettingsTap: Equatable {
     /// Too early to say anything.
     case quiet
     /// Far enough in to be deliberate: this many taps still to go.
@@ -31,14 +31,14 @@ enum InternalToolsTap: Equatable {
 }
 
 /// What the version row reads right now.
-enum InternalToolsLabel: Equatable {
+enum DeveloperSettingsLabel: Equatable {
     /// The version string itself: the row's ordinary, resting text.
     case version
     /// This many taps still to go.
     case countdown(remaining: Int)
-    /// The run landed and internal tools are now on.
+    /// The run landed and developer settings are now on.
     case unlocked
-    /// The run landed and internal tools are hidden again.
+    /// The run landed and developer settings are hidden again.
     case hidden
 }
 
@@ -47,12 +47,12 @@ enum InternalToolsLabel: Equatable {
 /// The whole of this flow's feedback, as a pure function, because the shape of
 /// it is the point: nothing is drawn over the row and nothing below it moves.
 /// The row says what happened, in its own place, at its own size, and reverts
-/// `internalToolsLabelRevert` after the last tap.
+/// `developerSettingsLabelRevert` after the last tap.
 ///
 /// `unlockedAfterTap` is the state the flag was left in, so the caller flips
 /// the flag and then asks what to say about it. Mirrors Android's
-/// `internalToolsLabelFor`.
-func internalToolsLabel(for tap: InternalToolsTap, unlockedAfterTap: Bool) -> InternalToolsLabel {
+/// `developerSettingsLabelFor`.
+func developerSettingsLabel(for tap: DeveloperSettingsTap, unlockedAfterTap: Bool) -> DeveloperSettingsLabel {
     switch tap {
     case .quiet:
         return .version
@@ -68,20 +68,20 @@ func internalToolsLabel(for tap: InternalToolsTap, unlockedAfterTap: Bool) -> In
 /// Pure on purpose: it holds no view and reads no clock of its own, so the whole
 /// rule -- how many taps, how far apart they may be, when the countdown starts
 /// -- is exercised by a test instead of by tapping a phone seven times. Mirrors
-/// Android's `InternalToolsTapCounter` exactly, including that a stalled run
+/// Android's `DeveloperSettingsTapCounter` exactly, including that a stalled run
 /// expires rather than resuming and that a clock jumping backwards starts over.
-final class InternalToolsTapCounter {
+final class DeveloperSettingsTapCounter {
     private let requiredTaps: Int
     private let window: TimeInterval
     private var taps = 0
     private var lastTap: TimeInterval?
 
-    init(requiredTaps: Int = internalToolsUnlockTaps, window: TimeInterval = internalToolsTapWindow) {
+    init(requiredTaps: Int = developerSettingsUnlockTaps, window: TimeInterval = developerSettingsTapWindow) {
         self.requiredTaps = requiredTaps
         self.window = window
     }
 
-    func tap(at now: TimeInterval) -> InternalToolsTap {
+    func tap(at now: TimeInterval) -> DeveloperSettingsTap {
         let continues = lastTap.map { now >= $0 && now - $0 <= window } ?? false
         taps = continues ? taps + 1 : 1
         lastTap = now
@@ -89,7 +89,7 @@ final class InternalToolsTapCounter {
             reset()
             return .reached
         }
-        if taps >= internalToolsCountdownFrom {
+        if taps >= developerSettingsCountdownFrom {
             return .countdown(remaining: requiredTaps - taps)
         }
         return .quiet
@@ -101,12 +101,15 @@ final class InternalToolsTapCounter {
     }
 }
 
-/// Whether this phone has had internal tools switched on by hand.
+/// Whether this phone has had developer settings switched on by hand.
 ///
 /// Persisted, because the reason it exists is a TestFlight tester on a release
 /// build who needs the engine switches to survive the app being killed between
 /// the two halves of a staged-rollout canary run.
-enum InternalToolsUnlockStore {
+enum DeveloperSettingsUnlockStore {
+    // The key predates the rename to "Developer settings" and is kept
+    // verbatim: it is what is already on testers' phones, and changing it
+    // would silently re-lock every phone mid-canary.
     private static let unlockedKey = "cruisemesh.ui.internalToolsUnlocked"
 
     static func isUnlocked() -> Bool {
@@ -122,7 +125,7 @@ enum InternalToolsUnlockStore {
 ///
 /// TestFlight and App Store builds are release builds, which is the whole
 /// reason the seven-tap run exists.
-var internalToolsDebugBuild: Bool {
+var developerSettingsDebugBuild: Bool {
 #if DEBUG
     return true
 #else
@@ -130,16 +133,16 @@ var internalToolsDebugBuild: Bool {
 #endif
 }
 
-/// Whether the Settings entry for internal tools is shown. Debug builds show it
+/// Whether the Settings entry for developer settings is shown. Debug builds show it
 /// outright, as they always have; a release build shows it once someone has done
 /// the seven-tap run.
-var internalToolsVisible: Bool {
-    internalToolsDebugBuild || InternalToolsUnlockStore.isUnlocked()
+var developerSettingsVisible: Bool {
+    developerSettingsDebugBuild || DeveloperSettingsUnlockStore.isUnlocked()
 }
 
 /// Whether to warn inside the screen: only on a release build that was unlocked
 /// by hand, where someone who is not a developer is looking at switches that
 /// change how their own messages are delivered.
-var internalToolsUnlockedOnRelease: Bool {
-    !internalToolsDebugBuild && InternalToolsUnlockStore.isUnlocked()
+var developerSettingsUnlockedOnRelease: Bool {
+    !developerSettingsDebugBuild && DeveloperSettingsUnlockStore.isUnlocked()
 }

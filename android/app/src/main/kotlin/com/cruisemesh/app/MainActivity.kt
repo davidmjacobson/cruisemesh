@@ -130,7 +130,7 @@ import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.ConnectionDetailsScreen
 import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
-import com.cruisemesh.app.ui.InternalToolsScreen
+import com.cruisemesh.app.ui.DeveloperSettingsScreen
 import com.cruisemesh.app.ui.SettingsScreen
 import uniffi.cruisemesh_core.DeepLinkRoute
 import uniffi.cruisemesh_core.Group
@@ -311,8 +311,8 @@ fun CruiseMeshApp(
                 },
             )
         }
-        composable("internalTools") {
-            InternalToolsScreen(onBack = { navController.popOrExit(context) })
+        composable("developerSettings") {
+            DeveloperSettingsScreen(onBack = { navController.popOrExit(context) })
         }
         composable("help") {
             HelpSupportScreen(
@@ -1201,7 +1201,7 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
         relayHealth = relayHealth,
         onShorePass = { navController.navigate("shorePass") },
         onConnectionDetails = { navController.navigate("connectionDetails") },
-        onInternalTools = { navController.navigate("internalTools") },
+        onDeveloperSettings = { navController.navigate("developerSettings") },
         onBackUp = { navController.navigate("backup") },
         onMeshEnabledChange = { enabled ->
             if (enabled) {

@@ -59,7 +59,8 @@ internal fun parseLanManualEndpoint(text: String, defaultPort: Int): LanManualEn
 }
 
 /**
- * Process-wide LAN observability and the small manual-connect control surface.
+ * Process-wide LAN observability, plus the one control that survives: a
+ * manual connect queued from a scanned or tapped LAN address link.
  *
  * The control only asks the running transport to open a socket. The transport
  * still requires the remote Noise static key to match an accepted contact.
@@ -71,31 +72,8 @@ object LanTransportDiagnostics {
     private val manualConnector =
         AtomicReference<((LanManualEndpoint) -> Unit)?>(null)
     private val pendingManualEndpoint = AtomicReference<LanManualEndpoint?>(null)
-    private val probeRequester = AtomicReference<(() -> String?)?>(null)
-    private val scanRequester = AtomicReference<(() -> String?)?>(null)
     private val activePeers = mutableMapOf<String, String>()
     private val sweepDisplayTracker = LanSweepDisplayTracker()
-
-    fun requestManualConnection(text: String, defaultPort: Int): String? {
-        val endpoint = parseLanManualEndpoint(text, defaultPort)
-            ?: return "Enter an IP address or host, optionally followed by :port"
-        val connector = manualConnector.get()
-            ?: return "Start the mesh before connecting over local Wi-Fi"
-        connector(endpoint)
-        return null
-    }
-
-    fun requestConnectionTest(): String? {
-        val requester = probeRequester.get()
-            ?: return "Start the mesh before testing local Wi-Fi"
-        return requester()
-    }
-
-    fun requestSubnetScan(): String? {
-        val requester = scanRequester.get()
-            ?: return "Start the mesh before searching the local subnet"
-        return requester()
-    }
 
     internal fun registerManualConnector(connector: (LanManualEndpoint) -> Unit) {
         manualConnector.set(connector)
@@ -113,22 +91,6 @@ object LanTransportDiagnostics {
         } else {
             pendingManualEndpoint.set(endpoint)
         }
-    }
-
-    internal fun registerProbeRequester(requester: () -> String?) {
-        probeRequester.set(requester)
-    }
-
-    internal fun unregisterProbeRequester() {
-        probeRequester.set(null)
-    }
-
-    internal fun registerScanRequester(requester: () -> String?) {
-        scanRequester.set(requester)
-    }
-
-    internal fun unregisterScanRequester() {
-        scanRequester.set(null)
     }
 
     internal fun waitingForWifi() {
@@ -221,15 +183,6 @@ object LanTransportDiagnostics {
                 state = if (names.isEmpty()) "Listening for CruiseMesh friends"
                 else "Secure local Wi-Fi link active",
                 activePeerNames = names,
-            )
-        }
-    }
-
-    internal fun probeStarted() {
-        mutableState.update {
-            it.copy(
-                probeStatus = "Testing encrypted LAN link…",
-                lastError = null,
             )
         }
     }

@@ -242,8 +242,6 @@ internal class LanTransport(
             LanTransportDiagnostics.registerManualConnector { endpoint ->
                 mainHandler.post { connectManually(endpoint) }
             }
-            // The manual diagnostics button always sweeps the full subnet.
-            LanTransportDiagnostics.registerScanRequester { startSubnetScan() }
         } catch (error: RuntimeException) {
             Log.w(TAG, "Unable to monitor Wi-Fi for LAN transport", error)
         }
@@ -254,7 +252,6 @@ internal class LanTransport(
         if (!started) return
         started = false
         LanTransportDiagnostics.unregisterManualConnector()
-        LanTransportDiagnostics.unregisterScanRequester()
         teardownNetworkSession()
         mainHandler.removeCallbacksAndMessages(null)
         if (networkCallbackRegistered) {
@@ -305,8 +302,8 @@ internal class LanTransport(
         connections[address]?.remoteStaticKey?.copyOf()
 
     fun startSubnetScan(
-        breadth: LanScanBreadth = LanScanBreadth.FULL_SUBNET,
-        automatic: Boolean = false,
+        breadth: LanScanBreadth,
+        automatic: Boolean,
     ): String? {
         if (!started) return "Start the mesh before searching the local subnet"
         val network = wifiNetwork ?: return "This phone is not connected to Wi-Fi"
