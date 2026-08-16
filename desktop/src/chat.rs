@@ -563,7 +563,9 @@ impl ChatService {
         let Conversation::Person(contact) = self.resolve(conversation_id)? else {
             bail!("only a person can be deleted this way");
         };
-        self.bootstrap.store().delete_contact(contact.user_id)?;
+        self.bootstrap
+            .store()
+            .delete_contact(contact.user_id, now_ms())?;
         Ok(())
     }
 
