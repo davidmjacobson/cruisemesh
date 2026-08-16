@@ -33,48 +33,14 @@ final class LanTransportDiagnostics: ObservableObject {
     private let lock = NSLock()
     private var manualConnector: ((LanManualEndpoint) -> Void)?
     private var pendingManualEndpoint: LanManualEndpoint?
-    private var probeRequester: (() -> String?)?
-    private var scanRequester: (() -> String?)?
     private var activePeers: [String: String] = [:]
     private let sweepDisplayTracker = LanSweepDisplayTracker()
 
     private init() {}
 
-    func requestManualConnection(_ text: String) -> String? {
-        guard let endpoint = parseLanManualEndpoint(text) else {
-            return "Enter an IP address or host, optionally followed by :port"
-        }
-        lock.lock()
-        let connector = manualConnector
-        lock.unlock()
-        guard let connector else { return "Start the mesh before connecting over local Wi-Fi" }
-        connector(endpoint)
-        return nil
-    }
-
-    func requestConnectionTest() -> String? {
-        lock.lock()
-        let requester = probeRequester
-        lock.unlock()
-        return requester?() ?? "Start the mesh before testing local Wi-Fi"
-    }
-
-    func requestSubnetScan() -> String? {
-        lock.lock()
-        let requester = scanRequester
-        lock.unlock()
-        return requester?() ?? "Start the mesh before searching the local subnet"
-    }
-
-    func register(
-        manualConnector: @escaping (LanManualEndpoint) -> Void,
-        probeRequester: @escaping () -> String?,
-        scanRequester: @escaping () -> String?
-    ) {
+    func register(manualConnector: @escaping (LanManualEndpoint) -> Void) {
         lock.lock()
         self.manualConnector = manualConnector
-        self.probeRequester = probeRequester
-        self.scanRequester = scanRequester
         let pending = pendingManualEndpoint
         pendingManualEndpoint = nil
         lock.unlock()
@@ -84,8 +50,6 @@ final class LanTransportDiagnostics: ObservableObject {
     func unregister() {
         lock.lock()
         manualConnector = nil
-        probeRequester = nil
-        scanRequester = nil
         lock.unlock()
     }
 
@@ -197,15 +161,6 @@ final class LanTransportDiagnostics: ObservableObject {
             var next = $0
             next.state = names.isEmpty ? "Listening for CruiseMesh friends" : "Secure local Wi-Fi link active"
             next.activePeerNames = names
-            return next
-        }
-    }
-
-    func probeStarted() {
-        publish {
-            var next = $0
-            next.probeStatus = "Testing encrypted LAN link…"
-            next.lastError = nil
             return next
         }
     }

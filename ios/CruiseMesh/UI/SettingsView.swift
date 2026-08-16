@@ -10,7 +10,7 @@ struct SettingsView: View {
 
     @State private var shareOnline = RelayConfigStore.shareOnline()
     @State private var friendsOfFriends = FriendsOfFriendsStore.isEnabled()
-    /// Debug builds show the internal-tools entry outright, as they always
+    /// Debug builds show the developer-settings entry outright, as they always
     /// have. A release build shows it once someone has done the seven-tap run
     /// on the version line at the bottom of this screen.
     ///
@@ -19,13 +19,13 @@ struct SettingsView: View {
     /// the finger still tapping it, and the seventh tap of a run is usually
     /// followed by an eighth on the way to stopping. The entry appears the next
     /// time Settings is opened, which the row's own text says out loud.
-    @State private var showInternalTools = internalToolsVisible
-    @State private var unlockTaps = InternalToolsTapCounter()
+    @State private var showDeveloperSettings = developerSettingsVisible
+    @State private var unlockTaps = DeveloperSettingsTapCounter()
     /// What the version row reads right now, and the pending revert back to the
     /// version string. One task, cancelled and replaced on every tap, so a run
     /// of taps cannot queue a series of messages that keep arriving after the
     /// tapping has stopped.
-    @State private var versionRowLabel: InternalToolsLabel = .version
+    @State private var versionRowLabel: DeveloperSettingsLabel = .version
     @State private var labelRevert: Task<Void, Never>?
 
     var body: some View {
@@ -73,19 +73,18 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    if showInternalTools {
+                    if showDeveloperSettings {
                         NavigationLink {
                             // Popping back does not re-run this view's state,
                             // so the screen tells us when it locked itself
                             // rather than us re-reading the flag on reappear.
-                            InternalToolsView(
-                                appModel: appModel,
-                                onLock: { showInternalTools = internalToolsVisible }
+                            DeveloperSettingsView(
+                                onLock: { showDeveloperSettings = developerSettingsVisible }
                             )
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text("Internal field tools")
-                                Text("Manual local-network probes, raw route counters, and diagnostic exports.")
+                                Text("Developer settings")
+                                Text("Engine rollout switches and diagnostic exports.")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -195,9 +194,9 @@ struct SettingsView: View {
         case .countdown(let remaining):
             return String(localized: "\(remaining) more taps…")
         case .unlocked:
-            return String(localized: "Internal tools on. Reopen settings.")
+            return String(localized: "Developer settings on. Reopen settings.")
         case .hidden:
-            return String(localized: "Internal tools hidden.")
+            return String(localized: "Developer settings hidden.")
         }
     }
 
@@ -207,7 +206,7 @@ struct SettingsView: View {
     /// Settings is next opened, so nothing moves under the finger.
     private func registerUnlockTap() {
         let tap = unlockTaps.tap(at: Date().timeIntervalSince1970)
-        var unlocked = InternalToolsUnlockStore.isUnlocked()
+        var unlocked = DeveloperSettingsUnlockStore.isUnlocked()
         switch tap {
         case .quiet:
             break
@@ -215,10 +214,10 @@ struct SettingsView: View {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
         case .reached:
             unlocked.toggle()
-            InternalToolsUnlockStore.setUnlocked(unlocked)
+            DeveloperSettingsUnlockStore.setUnlocked(unlocked)
             UINotificationFeedbackGenerator().notificationOccurred(.success)
         }
-        versionRowLabel = internalToolsLabel(for: tap, unlockedAfterTap: unlocked)
+        versionRowLabel = developerSettingsLabel(for: tap, unlockedAfterTap: unlocked)
         scheduleLabelRevert()
     }
 
@@ -229,7 +228,7 @@ struct SettingsView: View {
         labelRevert?.cancel()
         guard versionRowLabel != .version else { return }
         labelRevert = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(internalToolsLabelRevert * 1_000_000_000))
+            try? await Task.sleep(nanoseconds: UInt64(developerSettingsLabelRevert * 1_000_000_000))
             guard !Task.isCancelled else { return }
             versionRowLabel = .version
         }

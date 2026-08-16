@@ -18,7 +18,7 @@ import org.robolectric.RobolectricTestRunner
  * restart would give up on the run instead.
  */
 @RunWith(RobolectricTestRunner::class)
-class InternalToolsUnlockStoreTest {
+class DeveloperSettingsUnlockStoreTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val preferences =
         context.getSharedPreferences("cruisemesh_internal_tools", Context.MODE_PRIVATE)
@@ -35,20 +35,20 @@ class InternalToolsUnlockStoreTest {
 
     @Test
     fun `locked on a fresh install`() {
-        assertFalse(InternalToolsUnlockStore.isUnlocked(context))
+        assertFalse(DeveloperSettingsUnlockStore.isUnlocked(context))
     }
 
     @Test
     fun `unlocking persists`() {
-        InternalToolsUnlockStore.setUnlocked(context, true)
-        assertTrue(InternalToolsUnlockStore.isUnlocked(context))
+        DeveloperSettingsUnlockStore.setUnlocked(context, true)
+        assertTrue(DeveloperSettingsUnlockStore.isUnlocked(context))
     }
 
     @Test
     fun `locking again clears it`() {
-        InternalToolsUnlockStore.setUnlocked(context, true)
-        InternalToolsUnlockStore.setUnlocked(context, false)
-        assertFalse(InternalToolsUnlockStore.isUnlocked(context))
+        DeveloperSettingsUnlockStore.setUnlocked(context, true)
+        DeveloperSettingsUnlockStore.setUnlocked(context, false)
+        assertFalse(DeveloperSettingsUnlockStore.isUnlocked(context))
     }
 
     @Test
@@ -56,15 +56,15 @@ class InternalToolsUnlockStoreTest {
         val debuggable = DebugFileLog.isDebuggableBuild(context)
 
         // Locked: only a debuggable build shows the entry, and nothing warns.
-        assertEquals(debuggable, internalToolsVisible(context))
-        assertFalse(internalToolsUnlockedOnRelease(context))
+        assertEquals(debuggable, developerSettingsVisible(context))
+        assertFalse(developerSettingsUnlockedOnRelease(context))
 
-        InternalToolsUnlockStore.setUnlocked(context, true)
+        DeveloperSettingsUnlockStore.setUnlocked(context, true)
 
         // Unlocked: the entry is there on any build, and the warning appears
         // exactly where it is meant to -- on a release build, never on a
         // developer's own.
-        assertTrue(internalToolsVisible(context))
-        assertEquals(!debuggable, internalToolsUnlockedOnRelease(context))
+        assertTrue(developerSettingsVisible(context))
+        assertEquals(!debuggable, developerSettingsUnlockedOnRelease(context))
     }
 }

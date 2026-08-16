@@ -72,7 +72,7 @@ fun SettingsScreen(
     relayHealth: RelayHealth,
     onShorePass: () -> Unit,
     onConnectionDetails: () -> Unit,
-    onInternalTools: () -> Unit,
+    onDeveloperSettings: () -> Unit,
     onBackUp: () -> Unit,
     onMeshEnabledChange: (Boolean) -> Unit,
     onFriendsOfFriendsChanged: (Boolean) -> Unit,
@@ -98,21 +98,21 @@ fun SettingsScreen(
     // still tapping it, and the seventh tap of a run is usually followed by an
     // eighth on the way to stopping. The entry appears the next time this
     // screen is opened, which the row's own text says out loud.
-    val showInternalTools = remember { internalToolsVisible(context) }
-    val unlockTaps = remember { InternalToolsTapCounter() }
+    val showDeveloperSettings = remember { developerSettingsVisible(context) }
+    val unlockTaps = remember { DeveloperSettingsTapCounter() }
     val haptics = LocalHapticFeedback.current
     // What the version row reads right now, plus a token that restarts the
     // revert countdown on every tap. Keying the effect on the token means a
     // run of taps cancels and replaces one pending revert rather than queueing
     // several, so nothing keeps appearing after the tapping stops.
     var versionRowLabel by remember {
-        mutableStateOf<InternalToolsLabel>(InternalToolsLabel.Version)
+        mutableStateOf<DeveloperSettingsLabel>(DeveloperSettingsLabel.Version)
     }
     var versionRowLabelToken by remember { mutableIntStateOf(0) }
     LaunchedEffect(versionRowLabelToken) {
-        if (versionRowLabel != InternalToolsLabel.Version) {
-            delay(INTERNAL_TOOLS_LABEL_REVERT_MS)
-            versionRowLabel = InternalToolsLabel.Version
+        if (versionRowLabel != DeveloperSettingsLabel.Version) {
+            delay(DEVELOPER_SETTINGS_LABEL_REVERT_MS)
+            versionRowLabel = DeveloperSettingsLabel.Version
         }
     }
 
@@ -174,11 +174,11 @@ fun SettingsScreen(
                     detail = stringResource(R.string.ui_connection_details_summary),
                     onClick = onConnectionDetails,
                 )
-                if (showInternalTools) {
+                if (showDeveloperSettings) {
                     SettingsLink(
-                        title = stringResource(R.string.ui_internal_field_tools),
-                        detail = stringResource(R.string.ui_internal_field_tools_summary),
-                        onClick = onInternalTools,
+                        title = stringResource(R.string.ui_developer_settings_entry),
+                        detail = stringResource(R.string.ui_developer_settings_summary),
+                        onClick = onDeveloperSettings,
                     )
                 }
             }
@@ -246,7 +246,7 @@ fun SettingsScreen(
                 }
             }
 
-            // The version line doubles as the door to internal tools: seven
+            // The version line doubles as the door to developer settings: seven
             // taps turn them on, seven more hide them again. Deliberately
             // undiscoverable -- a family member scrolling to the bottom of
             // Settings should never arrive here by accident.
@@ -272,18 +272,18 @@ fun SettingsScreen(
                         indication = null,
                     ) {
                         val tap = unlockTaps.tap(System.currentTimeMillis())
-                        val unlocked = if (tap == InternalToolsTap.Reached) {
-                            !InternalToolsUnlockStore.isUnlocked(context)
+                        val unlocked = if (tap == DeveloperSettingsTap.Reached) {
+                            !DeveloperSettingsUnlockStore.isUnlocked(context)
                         } else {
-                            InternalToolsUnlockStore.isUnlocked(context)
+                            DeveloperSettingsUnlockStore.isUnlocked(context)
                         }
-                        if (tap == InternalToolsTap.Reached) {
-                            InternalToolsUnlockStore.setUnlocked(context, unlocked)
+                        if (tap == DeveloperSettingsTap.Reached) {
+                            DeveloperSettingsUnlockStore.setUnlocked(context, unlocked)
                         }
-                        if (tap != InternalToolsTap.Quiet) {
+                        if (tap != DeveloperSettingsTap.Quiet) {
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         }
-                        versionRowLabel = internalToolsLabelFor(tap, unlocked)
+                        versionRowLabel = developerSettingsLabelFor(tap, unlocked)
                         versionRowLabelToken += 1
                     },
             )
@@ -322,15 +322,15 @@ fun SettingsScreen(
  * row is, and every tap it swallows makes the run longer.
  */
 @Composable
-private fun versionRowText(label: InternalToolsLabel, version: String): String = when (label) {
-    InternalToolsLabel.Version -> version
-    is InternalToolsLabel.Countdown -> pluralStringResource(
-        R.plurals.ui_internal_tools_taps_left,
+private fun versionRowText(label: DeveloperSettingsLabel, version: String): String = when (label) {
+    DeveloperSettingsLabel.Version -> version
+    is DeveloperSettingsLabel.Countdown -> pluralStringResource(
+        R.plurals.ui_developer_settings_taps_left,
         label.remaining,
         label.remaining,
     )
-    InternalToolsLabel.Unlocked -> stringResource(R.string.ui_internal_tools_unlocked)
-    InternalToolsLabel.Hidden -> stringResource(R.string.ui_internal_tools_hidden)
+    DeveloperSettingsLabel.Unlocked -> stringResource(R.string.ui_developer_settings_unlocked)
+    DeveloperSettingsLabel.Hidden -> stringResource(R.string.ui_developer_settings_hidden)
 }
 
 @Composable

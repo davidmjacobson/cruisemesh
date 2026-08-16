@@ -235,18 +235,6 @@ final class LanTransport {
         queue.sync { connections[address]?.remoteStaticKey }
     }
 
-    func startSubnetScan() -> String? {
-        guard let network = localWifiIPv4Network() else {
-            return "Connect this phone to Wi-Fi before searching the local subnet"
-        }
-        return queue.sync {
-            guard started else { return "Start the mesh before searching the local subnet" }
-            guard foregroundActive else { return "Return to CruiseMesh before searching the local subnet" }
-            guard runningScan == nil else { return "A local subnet search is already running" }
-            return startSubnetScan(.fullSubnet, network: network, automatic: false)
-        }
-    }
-
     private func startListener(preferDefaultPort: Bool) {
         guard started else { return }
         do {
@@ -820,10 +808,11 @@ final class LanTransport {
         let prefixLength = breadth == .fullSubnet
             ? network.prefixLength
             : max(network.prefixLength, defaultLanScanPrefixLength)
-        // The automatic full-subnet sweep is capped at /20 (~4,094 hosts);
-        // the user-initiated "Search local subnet" action (automatic ==
-        // false) keeps the wider /16 (~65k hosts) ceiling since the user
-        // explicitly asked for it.
+        // The automatic full-subnet sweep is capped at /20 (~4,094 hosts).
+        // A by-hand scan (automatic == false) keeps the wider /16 (~65k
+        // hosts) ceiling; nothing calls that way now that the manual local
+        // Wi-Fi controls are gone, so in practice every sweep is the
+        // narrower one.
         let effectivePrefix = automatic
             ? effectiveAutomaticLanScanPrefixLength(prefixLength)
             : effectiveLanScanPrefixLength(prefixLength)

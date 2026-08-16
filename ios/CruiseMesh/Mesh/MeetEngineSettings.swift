@@ -28,7 +28,7 @@ enum MeetEngine {
 /// in the store's forward-only schema would not be. A preference key simply
 /// stops being read.
 ///
-/// The switch is reachable from the internal tools screen, behind the same
+/// The switch is reachable from the developer settings screen, behind the same
 /// door as the relay and receive engine switches, because a closed-test build
 /// is release-signed and a migration whose flag could only be set by a unit
 /// test can never produce the field evidence it exists to produce.

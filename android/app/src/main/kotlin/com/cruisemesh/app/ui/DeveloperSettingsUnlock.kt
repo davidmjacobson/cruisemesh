@@ -3,8 +3,8 @@ package com.cruisemesh.app.ui
 import android.content.Context
 import com.cruisemesh.app.debug.DebugFileLog
 
-/** Taps on the version row it takes to turn internal tools on, or off again. */
-const val INTERNAL_TOOLS_UNLOCK_TAPS = 7
+/** Taps on the version row it takes to turn developer settings on, or off again. */
+const val DEVELOPER_SETTINGS_UNLOCK_TAPS = 7
 
 /**
  * The tap after which the counter starts saying how many are left.
@@ -12,32 +12,32 @@ const val INTERNAL_TOOLS_UNLOCK_TAPS = 7
  * Nothing is said for the first three, so an accidental double-tap on the
  * version line stays invisible.
  */
-private const val INTERNAL_TOOLS_COUNTDOWN_FROM = 4
+private const val DEVELOPER_SETTINGS_COUNTDOWN_FROM = 4
 
 /** Taps further apart than this start the count over. */
-const val INTERNAL_TOOLS_TAP_WINDOW_MS = 3_000L
+const val DEVELOPER_SETTINGS_TAP_WINDOW_MS = 3_000L
 
 /**
  * How long the version row keeps showing tap feedback after the last tap.
  *
  * Every bit of feedback this flow gives is the row's own text swapped in place,
  * so this is also how long the row stops reading as a version string. Shorter
- * than [INTERNAL_TOOLS_TAP_WINDOW_MS] on purpose: a run that is still live can
+ * than [DEVELOPER_SETTINGS_TAP_WINDOW_MS] on purpose: a run that is still live can
  * go quiet, which is the harmless direction. The other way round would leave a
  * stale count on screen after the run it belonged to had already expired.
  */
-const val INTERNAL_TOOLS_LABEL_REVERT_MS = 1_500L
+const val DEVELOPER_SETTINGS_LABEL_REVERT_MS = 1_500L
 
 /** What one tap on the version row means. */
-sealed class InternalToolsTap {
+sealed class DeveloperSettingsTap {
     /** Too early to say anything. */
-    object Quiet : InternalToolsTap()
+    object Quiet : DeveloperSettingsTap()
 
     /** Far enough in to be deliberate: [remaining] taps still to go. */
-    data class Countdown(val remaining: Int) : InternalToolsTap()
+    data class Countdown(val remaining: Int) : DeveloperSettingsTap()
 
     /** The full run landed. The caller flips the flag. */
-    object Reached : InternalToolsTap()
+    object Reached : DeveloperSettingsTap()
 }
 
 /**
@@ -53,28 +53,28 @@ sealed class InternalToolsTap {
  * an afternoon of stray touches. A clock that jumps backwards also starts over,
  * which is the safe direction -- the worst it costs is one more deliberate run.
  */
-class InternalToolsTapCounter(
-    private val requiredTaps: Int = INTERNAL_TOOLS_UNLOCK_TAPS,
-    private val windowMs: Long = INTERNAL_TOOLS_TAP_WINDOW_MS,
+class DeveloperSettingsTapCounter(
+    private val requiredTaps: Int = DEVELOPER_SETTINGS_UNLOCK_TAPS,
+    private val windowMs: Long = DEVELOPER_SETTINGS_TAP_WINDOW_MS,
 ) {
     private var taps = 0
     private var lastTapMs = 0L
     private var started = false
 
-    fun tap(nowMs: Long): InternalToolsTap {
+    fun tap(nowMs: Long): DeveloperSettingsTap {
         val continues = started && nowMs >= lastTapMs && nowMs - lastTapMs <= windowMs
         taps = if (continues) taps + 1 else 1
         lastTapMs = nowMs
         started = true
         if (taps >= requiredTaps) {
             reset()
-            return InternalToolsTap.Reached
+            return DeveloperSettingsTap.Reached
         }
         val remaining = requiredTaps - taps
-        return if (taps >= INTERNAL_TOOLS_COUNTDOWN_FROM) {
-            InternalToolsTap.Countdown(remaining)
+        return if (taps >= DEVELOPER_SETTINGS_COUNTDOWN_FROM) {
+            DeveloperSettingsTap.Countdown(remaining)
         } else {
-            InternalToolsTap.Quiet
+            DeveloperSettingsTap.Quiet
         }
     }
 
@@ -86,18 +86,18 @@ class InternalToolsTapCounter(
 }
 
 /** What the version row reads right now. */
-sealed class InternalToolsLabel {
+sealed class DeveloperSettingsLabel {
     /** The version string itself: the row's ordinary, resting text. */
-    object Version : InternalToolsLabel()
+    object Version : DeveloperSettingsLabel()
 
     /** [remaining] taps still to go. */
-    data class Countdown(val remaining: Int) : InternalToolsLabel()
+    data class Countdown(val remaining: Int) : DeveloperSettingsLabel()
 
-    /** The run landed and internal tools are now on. */
-    object Unlocked : InternalToolsLabel()
+    /** The run landed and developer settings are now on. */
+    object Unlocked : DeveloperSettingsLabel()
 
-    /** The run landed and internal tools are hidden again. */
-    object Hidden : InternalToolsLabel()
+    /** The run landed and developer settings are hidden again. */
+    object Hidden : DeveloperSettingsLabel()
 }
 
 /**
@@ -106,23 +106,23 @@ sealed class InternalToolsLabel {
  * The whole of this flow's feedback, as a pure function, because the shape of
  * it is the fix: nothing is drawn over the row and nothing is queued. The row
  * says what happened, in its own place, at its own size, and reverts
- * [INTERNAL_TOOLS_LABEL_REVERT_MS] after the last tap. Anything floating above
+ * [DEVELOPER_SETTINGS_LABEL_REVERT_MS] after the last tap. Anything floating above
  * the bottom of the screen -- a toast, a snackbar -- lands exactly on top of
  * the row being tapped and swallows the next tap.
  *
  * [unlockedAfterTap] is the state the flag was left in, so the caller flips the
  * flag and then asks what to say about it.
  */
-fun internalToolsLabelFor(tap: InternalToolsTap, unlockedAfterTap: Boolean): InternalToolsLabel =
+fun developerSettingsLabelFor(tap: DeveloperSettingsTap, unlockedAfterTap: Boolean): DeveloperSettingsLabel =
     when (tap) {
-        InternalToolsTap.Quiet -> InternalToolsLabel.Version
-        is InternalToolsTap.Countdown -> InternalToolsLabel.Countdown(tap.remaining)
-        InternalToolsTap.Reached ->
-            if (unlockedAfterTap) InternalToolsLabel.Unlocked else InternalToolsLabel.Hidden
+        DeveloperSettingsTap.Quiet -> DeveloperSettingsLabel.Version
+        is DeveloperSettingsTap.Countdown -> DeveloperSettingsLabel.Countdown(tap.remaining)
+        DeveloperSettingsTap.Reached ->
+            if (unlockedAfterTap) DeveloperSettingsLabel.Unlocked else DeveloperSettingsLabel.Hidden
     }
 
 /**
- * Whether this phone has had internal tools switched on by hand.
+ * Whether this phone has had developer settings switched on by hand.
  *
  * Persisted, because the reason it exists is a closed-test tester on a
  * release-signed build who needs the engine switches to survive the app being
@@ -130,7 +130,10 @@ fun internalToolsLabelFor(tap: InternalToolsTap, unlockedAfterTap: Boolean): Int
  * preferences file, holding one boolean, so deleting the whole mechanism later
  * is deleting a file nothing else reads.
  */
-object InternalToolsUnlockStore {
+object DeveloperSettingsUnlockStore {
+    // Both names predate the rename to "Developer settings" and are kept
+    // verbatim: they are what is already on testers' phones, and changing
+    // either would silently re-lock every phone mid-canary.
     private const val PREFS_NAME = "cruisemesh_internal_tools"
     private const val PREF_UNLOCKED = "unlocked"
 
@@ -146,13 +149,13 @@ object InternalToolsUnlockStore {
 }
 
 /**
- * Whether the Settings entry for internal tools is shown.
+ * Whether the Settings entry for developer settings is shown.
  *
  * Debuggable builds show it unconditionally, exactly as before; a release build
  * shows it once someone has done the seven-tap run.
  */
-fun internalToolsVisible(context: Context): Boolean =
-    DebugFileLog.isDebuggableBuild(context) || InternalToolsUnlockStore.isUnlocked(context)
+fun developerSettingsVisible(context: Context): Boolean =
+    DebugFileLog.isDebuggableBuild(context) || DeveloperSettingsUnlockStore.isUnlocked(context)
 
 /**
  * Whether to warn inside the screen.
@@ -161,5 +164,5 @@ fun internalToolsVisible(context: Context): Boolean =
  * someone who is not a developer is looking at switches that change how their
  * own messages are delivered.
  */
-fun internalToolsUnlockedOnRelease(context: Context): Boolean =
-    !DebugFileLog.isDebuggableBuild(context) && InternalToolsUnlockStore.isUnlocked(context)
+fun developerSettingsUnlockedOnRelease(context: Context): Boolean =
+    !DebugFileLog.isDebuggableBuild(context) && DeveloperSettingsUnlockStore.isUnlocked(context)

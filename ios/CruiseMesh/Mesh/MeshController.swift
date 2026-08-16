@@ -351,17 +351,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             }
         )
         lanTransport = lan
-        LanTransportDiagnostics.shared.register(
-            manualConnector: { [weak lan] endpoint in
-                lan?.connect(endpoint, manual: true)
-            },
-            probeRequester: { [weak self] in
-                self?.requestLanProbe()
-            },
-            scanRequester: { [weak lan] in
-                lan?.startSubnetScan() ?? "Start the mesh before searching the local subnet"
-            }
-        )
+        LanTransportDiagnostics.shared.register { [weak lan] endpoint in
+            lan?.connect(endpoint, manual: true)
+        }
         MeshRouter.registerLan { [weak lan] address, frame in
             lan?.sendFrame(address: address, frame: frame)
         }
@@ -923,35 +915,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lanHealthTimer?.cancel()
         lanHealthTimer = nil
         guard appForeground else { return }
-        probeLanLinks(manual: false)
+        probeLanLinks()
         lanHealthTimer = meshTimer(intervalSeconds: 30, repeats: true) { [weak self] in
             self?.refreshLanCapableContacts()
-            self?.probeLanLinks(manual: false)
+            self?.probeLanLinks()
         }
     }
 
-    /// The Advanced screen's "test the local Wi-Fi link" button, called
-    /// straight from the UI thread and answering synchronously.
-    ///
-    /// Deliberately does NOT hop onto `meshQueue` and wait: that would put the
-    /// main thread behind whatever inbound work the queue is doing, which is
-    /// the freeze this whole change exists to remove. The one thing it needs
-    /// to answer -- is there a LAN link at all -- comes from `MeshRouter`,
-    /// which is lock-protected and readable from any thread; the probe itself
-    /// is fire-and-forget and reports through `LanTransportDiagnostics` as it
-    /// always did.
-    private func requestLanProbe() -> String? {
-        guard MeshRouter.identifiedRoutes().contains(where: { $0.transport == .lan }) else {
-            return "No secure local Wi-Fi link is active yet"
-        }
-        meshQueue.async { self.probeLanLinks(manual: true) }
-        return nil
-    }
-
-    private func probeLanLinks(manual: Bool) {
+    private func probeLanLinks() {
         let routes = MeshRouter.identifiedRoutes().filter { $0.transport == .lan }
         guard !routes.isEmpty else { return }
-        if manual { LanTransportDiagnostics.shared.probeStarted() }
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         for route in routes {
             switch lanHealth.next(
