@@ -1,9 +1,10 @@
 # Multi-device support v1
 
-Status: **draft 2026-08-11, pending the three decisions in §14**. Everything
-outside §14 is settled design, ready to implement in the work-package order
-of §13. Derived from the 2026-08-11 design review (working notes in
-`specs/multi-device.md`).
+Status: **accepted 2026-08-16 — the three §14 decisions are resolved (David,
+2026-08-16 interview); ready to implement in the work-package order of §13.**
+Ship gate: WPT–WP6 (phones complete) gate production-store promotion; WP7
+(Windows) lands after production. Derived from the 2026-08-11 design review
+(working notes in `specs/multi-device.md`).
 
 Scenario: one person, several devices. Alice has a Windows desktop and an
 Android phone; Bob has an iPad and an iPhone. Alice messages "Bob" — one
@@ -85,13 +86,16 @@ one of:
 
 - the **approving-device key**: exactly one linked device holds the
   roster-signing role at a time (by default, the first/oldest device);
-- the **recovery code**: an offline secret shown once at identity
-  creation or upgrade (extends the existing `.cmbak` passphrase habit).
-  Material derived from it can sign a roster at a **higher recovery
-  epoch**, which always supersedes anything the approving device signed —
-  this is how a stolen approving device is dethroned.
+- the **recovery material**: per the §14.2 decision, this is the person
+  root secret kept only inside the passphrase-encrypted `.cmbak` backup —
+  there is no separate memorized code. Restoring/opening the backup can
+  sign a roster at a **higher recovery epoch**, which always supersedes
+  anything the approving device signed — this is how a stolen approving
+  device is dethroned. Consequence: the identity-upgrade flow must nudge
+  backup creation (no backup = no override path; the fallback is new
+  identity + re-friend, per §2 non-goals).
 
-The person root secret is kept only inside the recovery material after
+The person root secret is kept only inside the encrypted backup after
 migration; it is **never** copied to every device. (Root-on-every-device
 is rejected: a thief holding any phone could revoke the real devices and
 hijack the person.)
@@ -200,7 +204,7 @@ Mirror the group fan-out machinery, per recipient device:
 - `device_fanout_msg_id(original_msg_id, device_id)` — deterministic,
   16 bytes, same construction discipline as the existing group
   `fanout_msg_id(original_msg_id, member_user_id)`
-  (`core/src/protocol.rs:1353`, spec'd in
+  (`core/src/protocol.rs:1400`, spec'd in
   `specs/group-relay-durability.md` §4.1).
 - One relay row per recipient device, each with that device's daily
   recipient hint (per-device hint namespace derived from
@@ -208,7 +212,10 @@ Mirror the group fan-out machinery, per recipient device:
   too, so relay-reachable siblings converge without a separate channel.
 - Each row has exactly **one true consumer**, so the existing consumed-ack
   rule generalizes cleanly through `core_should_ack_inbound`
-  (`core/src/engine.rs:350`).
+  (`core/src/engine.rs:378`) and the hint-aware ack planner
+  `core_relay_ack_ids_with_consumed` (`core/src/engine.rs:985`), which is
+  what every production caller uses and where legacy shared-hint
+  withholding already lives.
 
 Ack rules (cite as ACK-MD-n; these extend, never replace, the DTN
 ack-safety invariant — when in doubt, don't ack):
@@ -319,8 +326,10 @@ exists.
 
 - **Legacy HELLO is never touched** (no trailing fields, ever).
   `CAP_MULTI_DEVICE = 1 << 2` rides HELLO2 frame 0x06 via
-  `core_own_capabilities()` (`core/src/protocol.rs:336`, next free bit
-  after `CAP_ACKS_HIDDEN_KINDS = 1`, `CAP_RELAY_UPDATE = 1 << 1`).
+  `core_own_capabilities()` (`core/src/protocol.rs:355`; the constant is
+  already reserved at `core/src/protocol.rs:350`, next free bit after
+  `CAP_ACKS_HIDDEN_KINDS = 1`, `CAP_RELAY_UPDATE = 1 << 1` — WPT shipped
+  the reservation, WP1 flips the advertisement).
 - Envelope public header unchanged; new fields sealed-body only (§5).
 - **Friend card v4 (`CMFRIEND4`)** adds the roster head (or its hash) so
   new friendships start multi-device-aware. Rollout copies the proven v3
@@ -429,16 +438,24 @@ WP0 → WP1 → WP2 → {WP3, WP4} → WP5 → WP6 → WP7; WP8 last. WP3 and WP
 can proceed in parallel worktrees after WP2. Nothing after WPT blocks
 the wide-release cut.
 
-## 14. Open decisions (David) — gate before the marked WP
+## 14. Decisions — resolved by David, 2026-08-16
 
-1. **Sealing scope (§6) — gates WP2.** Accept the person-scoped inbox key
-   on BLE/carry (one copy + self-sync) as specified? The alternative —
-   strict per-device sealing everywhere — keeps the plan structure but
-   changes §6, §7 costs, and the hint/duty-cycle budgets.
-2. **Recovery-code UX (§3, §9) — gates WP3 ship.** The recovery code at
-   identity-upgrade time is the one new user-facing burden. Needs a
-   family-grade flow (wording, where it's shown, re-display policy)
-   before linking ships.
-3. **Device cap (§6, §7) — gates WP2.** Proposed soft 8 / hard 16 per
-   person, sized by the hint budget (~28 routing identities under
-   `MAX_FETCH_HINTS`) and relay fan-out width. Confirm or adjust.
+1. **Sealing scope (§6): RESOLVED — person-scoped inbox key on BLE/carry,
+   as specified.** Strict per-device sealing everywhere stays the
+   documented escalation if the threat model hardens. WP2 unblocked.
+2. **Recovery UX (§3, §9): RESOLVED — recovery lives in the backup.** No
+   separate memorized code: the person-root secret exists only inside the
+   passphrase-encrypted `.cmbak`; the recovery flow is "open your
+   backup." The upgrade flow nudges backup creation, and the Before-you-
+   sail checklist's backup item doubles as the standing nudge. No backup
+   ever made = no override path (new identity + re-friend fallback).
+   WP3 unblocked.
+3. **Device cap (§6, §7): RESOLVED — soft 8 / hard 16 per person**, as
+   proposed. Boundary semantics (pinned by the WP0 vectors): a person may
+   hold up to 16 devices; adding a device that would make the count exceed
+   8 succeeds with a warning (the 9th device warns, the 8th does not); an
+   add that would exceed 16 is refused (the 17th device). WP2 unblocked.
+
+Ship-gate decision (same interview): **WPT–WP6 gate production-store
+promotion; WP7 (Windows as linked device) does not** — it lands after
+production on its own timeline. WP8 unchanged (deferred tail).
