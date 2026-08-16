@@ -50,14 +50,25 @@
 //! [`reply_for`], and the name in [`core_relay_fixture_names`]. Nothing in the
 //! shells changes: both suites iterate `core_relay_fixture_names()`.
 //!
+//! # The shape of a scripted failure
+//!
+//! [`reply_for`] is keyed on the pass and on `(operation, endpoint)` — never on
+//! "the third request of this pass". That is deliberate, and it constrains what
+//! a scenario can express: each shell answers every request from this script
+//! independently, so a script that turned on a request ordinal would be asking
+//! two runtimes to agree on a count they keep separately, and any difference in
+//! how a lane interleaves would read as a driver bug rather than as what it is.
+//! A scenario that needs *part* of a lane refused therefore stages it across
+//! passes rather than inside one — see `group-fanout-partial` below.
+//!
 //! # What is deliberately not here yet
 //!
-//! Fixtures whose transcripts turn on group fan-out. The upload lanes do not
-//! decompose a group-addressed row yet, so a group-lane transcript would pin
-//! present behaviour rather than intended behaviour and would have to be
-//! rewritten the moment that lands. The two fixtures wired here —
-//! `carry-storm` and `contact-silence-no-proof` — are 1:1 and carry-shaped and
-//! do not touch it.
+//! Nothing relay-shaped. The group-lane fixtures arrived once the upload lanes
+//! learned to decompose a group-addressed row into one row per member with
+//! durable per-member markers; before that, a group transcript would have
+//! pinned present behaviour rather than intended behaviour. The two mesh-shaped
+//! fixtures in the corpus stay out for the reason `relay_pass_replay.rs` gives:
+//! a relay pass has no encounter and no peer link to drive them with.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -67,8 +78,8 @@ use crate::session::relay_pass::{
     CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayOperation, CoreRelayPass,
     CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayTransportError,
 };
-use crate::store::{CarriedEnvelope, Contact, MessageStore};
-use crate::{compute_recipient_hint, core_relay_pass_default_budgets, relay_cursor_key};
+use crate::store::{CarriedEnvelope, Contact, MessageStore, OutboundEnvelope, StoredMessage};
+use crate::{compute_recipient_hint, core_relay_pass_default_budgets, relay_cursor_key, KIND_TEXT};
 
 // ---------------------------------------------------------------------------
 // The identities and endpoints a fixture scenario runs on
@@ -208,6 +219,8 @@ pub fn core_relay_fixture_names() -> Vec<String> {
     vec![
         "carry-storm".to_string(),
         "contact-silence-no-proof".to_string(),
+        "group-fanout-complete".to_string(),
+        "group-fanout-partial".to_string(),
     ]
 }
 
@@ -266,6 +279,59 @@ fn scenario_of(name: &str) -> CoreRelayFixtureScenario {
             ],
             uses_contact_endpoint: true,
         },
+        // One group-addressed authored row, three members, everything
+        // accepted. FANOUT-01's first half: the row leaves as one row per
+        // member rather than as one group-hinted row into a mailbox no member
+        // reads, and the envelope is retired exactly once — the second pass
+        // offers nothing.
+        "group-fanout-complete" => CoreRelayFixtureScenario {
+            name: name.to_string(),
+            declared_invariants: vec!["FANOUT-01".to_string(), "LIVE-01".to_string()],
+            passes: vec![
+                CoreRelayFixturePassSpec {
+                    label: "p1".to_string(),
+                    now_ms: T0,
+                },
+                CoreRelayFixturePassSpec {
+                    label: "p2".to_string(),
+                    now_ms: T0 + 60_000,
+                },
+            ],
+            uses_contact_endpoint: true,
+        },
+        // The same group, half-posted and then resumed. Three passes, because
+        // the script cannot refuse the second request of a pass while
+        // accepting the first (see the module docs), and the incident needs
+        // one member landed and the rest owed:
+        //
+        // * p1 runs under a one-row authored budget, so exactly one member's
+        //   row goes out and is accepted. The envelope stays queued: two
+        //   members never received it.
+        // * p2 has the mailbox refuse, which is the fault shape that leaves a
+        //   fan-out stuck. Nothing lands, and nothing is un-landed either.
+        // * p3 lets it through, and FANOUT-01's second half is what the
+        //   transcript shows: two posts, not three. The member whose row
+        //   landed in p1 is not asked to receive it twice, and only now is the
+        //   envelope retired.
+        "group-fanout-partial" => CoreRelayFixtureScenario {
+            name: name.to_string(),
+            declared_invariants: vec!["FANOUT-01".to_string(), "LIVE-01".to_string()],
+            passes: vec![
+                CoreRelayFixturePassSpec {
+                    label: "p1".to_string(),
+                    now_ms: T0,
+                },
+                CoreRelayFixturePassSpec {
+                    label: "p2".to_string(),
+                    now_ms: T0 + 60_000,
+                },
+                CoreRelayFixturePassSpec {
+                    label: "p3".to_string(),
+                    now_ms: T0 + 120_000,
+                },
+            ],
+            uses_contact_endpoint: true,
+        },
         other => panic!("no relay fixture scenario is wired for {other}"),
     }
 }
@@ -286,6 +352,7 @@ fn seed_for(name: &str, store: &MessageStore, now_ms: i64) {
     match name {
         "carry-storm" => seed_carried(store, 5, now_ms),
         "contact-silence-no-proof" => seed_contact(store),
+        "group-fanout-complete" | "group-fanout-partial" => seed_group_authored(store, now_ms),
         other => panic!("no relay fixture seeding is wired for {other}"),
     }
 }
@@ -307,8 +374,22 @@ pub fn core_relay_fixture_plan(
         .get(pass_index as usize)
         .unwrap_or_else(|| panic!("{name} has no pass {pass_index}"));
 
-    let contacts = if scenario.uses_contact_endpoint {
-        vec![CoreRelayContactConfig {
+    let contacts = match name.as_str() {
+        // Every member's card names the same mailbox, which is what a family
+        // on one relay looks like, and is why the fan-out lane resolves a
+        // single target for the whole group.
+        "group-fanout-complete" | "group-fanout-partial" => fixture_group()
+            .member_user_ids
+            .into_iter()
+            .map(|user_id| CoreRelayContactConfig {
+                user_id,
+                relay_url: Some(contact_url.clone()),
+                relay_token: Some(contact_token.clone()),
+                endpoint_usable: true,
+                endpoint_answering: true,
+            })
+            .collect(),
+        _ if scenario.uses_contact_endpoint => vec![CoreRelayContactConfig {
             user_id: contact_user_id(),
             relay_url: Some(contact_url),
             relay_token: Some(contact_token),
@@ -317,10 +398,18 @@ pub fn core_relay_fixture_plan(
             // endpoint was told apart from a written-off one, so their contact
             // endpoint is answering by construction.
             endpoint_answering: true,
-        }]
-    } else {
-        Vec::new()
+        }],
+        _ => Vec::new(),
     };
+
+    let mut budgets = core_relay_pass_default_budgets();
+    // The one-row budget that makes `group-fanout-partial` partial. It is the
+    // deployed budget everywhere else, including in that fixture's later
+    // passes, so what the resume posts is decided by the per-member markers
+    // rather than by a budget still being narrow.
+    if name == "group-fanout-partial" && pass_index == 0 {
+        budgets.max_authored_uploads = 1;
+    }
 
     CoreRelayPassPlan {
         own: Some(CoreRelayEndpointConfig {
@@ -338,7 +427,7 @@ pub fn core_relay_fixture_plan(
         swept_this_session: true,
         consecutive_rate_limits: 0,
         quiet_until_ms: 0,
-        budgets: core_relay_pass_default_budgets(),
+        budgets,
     }
 }
 
@@ -390,6 +479,28 @@ fn reply_for(
                 _ => CoreRelayFixtureReply::ok(b"{}".to_vec()),
             }
         }
+        // Everything is accepted. What the transcript is about is how many
+        // posts there were and where they went: three rows to the members'
+        // mailbox in the first pass, none at all in the second.
+        "group-fanout-complete" => match operation {
+            CoreRelayOperation::FetchPage => CoreRelayFixtureReply::ok(empty_page()),
+            _ => CoreRelayFixtureReply::ok(b"{}".to_vec()),
+        },
+        // Pass 2 is a mailbox that answers but will not take a row — a server
+        // fault rather than a rejection of this particular message, so nothing
+        // about the envelope is retired and nothing already landed is
+        // forgotten. Reads keep working throughout, so the refusal cannot be
+        // mistaken for the endpoint going quiet.
+        "group-fanout-partial" => match (operation, pass_index) {
+            (CoreRelayOperation::FetchPage, _) => CoreRelayFixtureReply::ok(empty_page()),
+            (CoreRelayOperation::PostEnvelope, 1) => CoreRelayFixtureReply {
+                status: 500,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+                transport_failure: false,
+            },
+            _ => CoreRelayFixtureReply::ok(b"{}".to_vec()),
+        },
         other => panic!("no relay fixture reply script is wired for {other}"),
     }
 }
@@ -814,6 +925,84 @@ fn seed_contact(store: &MessageStore) {
             nickname: None,
         })
         .expect("upsert contact");
+}
+
+// --- the group the fan-out fixtures run on -------------------------------
+
+/// Members are 16-byte user ids because that is what a group accepts, and they
+/// are in ascending order because a group canonicalises its membership — the
+/// plan below has to name the same members in the same order as the stored
+/// group without reading the store, since a shell asks for a plan and a store
+/// seeding independently.
+const GROUP_MEMBERS: usize = 3;
+
+fn group_member_user_id(index: usize) -> Vec<u8> {
+    vec![0xB0 + index as u8; 16]
+}
+
+/// A fixed group id, not a generated one: `create_group` draws its id from the
+/// OS random source, and a transcript whose recipient hint changed per run
+/// would fail the determinism check the shells depend on.
+fn fixture_group() -> crate::Group {
+    crate::Group {
+        id: vec![0x77u8; 16],
+        name: "Cabin".to_string(),
+        member_user_ids: (0..GROUP_MEMBERS).map(group_member_user_id).collect(),
+        key: vec![0x33u8; 32],
+        metadata_revision: 0,
+        metadata_changed_by: Vec::new(),
+    }
+}
+
+/// The group, its members as contacts, and one authored group-addressed
+/// envelope waiting to go out.
+///
+/// The envelope's `recipient_user_id` is the group id, which is nobody's
+/// contact entry — that is the whole shape the fan-out lane exists to handle.
+fn seed_group_authored(store: &MessageStore, now_ms: i64) {
+    let group = fixture_group();
+    for (index, user_id) in group.member_user_ids.iter().enumerate() {
+        store
+            .upsert_contact(Contact {
+                user_id: user_id.clone(),
+                name: format!("Member {index}"),
+                sign_pk: vec![1u8; 32],
+                agree_pk: vec![2u8; 32],
+                relay_url: Some(REFERENCE_CONTACT_URL.to_string()),
+                relay_token: Some(REFERENCE_CONTACT_TOKEN.to_string()),
+                nickname: None,
+            })
+            .expect("upsert member");
+    }
+    store.upsert_group(group.clone()).expect("upsert group");
+
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    store
+        .insert_outgoing_message(
+            StoredMessage {
+                chat_id: group.id.clone(),
+                sender_user_id: own_user_id(),
+                lamport: 1,
+                timestamp: now_ms,
+                kind: KIND_TEXT,
+                payload: b"cabin at seven".to_vec(),
+            },
+            OutboundEnvelope {
+                msg_id: msg_id(0x4000),
+                recipient_user_id: group.id.clone(),
+                chat_id: group.id.clone(),
+                sender_user_id: own_user_id(),
+                kind: KIND_TEXT,
+                lamport: 1,
+                timestamp: now_ms,
+                hop_ttl: 3,
+                expiry,
+                recipient_hint: compute_recipient_hint(group.id.clone(), now_ms),
+                sealed: vec![0x55u8; 96],
+            },
+            now_ms,
+        )
+        .expect("queue the group envelope");
 }
 
 fn seed_carried(store: &MessageStore, count: usize, now_ms: i64) {

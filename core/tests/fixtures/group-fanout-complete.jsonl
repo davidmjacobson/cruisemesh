@@ -1,0 +1,10 @@
+{"schema":"cruisemesh.protocol-event/v1","record":"header","fixture":"group-fanout-complete","title":"A group message decomposed into one row per member, all of them accepted, and the envelope retired exactly once","origin":"synthetic","public_reference":"#140","pseudonyms":["mailbox-a"],"expect_invariants":["FANOUT-01","LIVE-01"]}
+{"record":"event","seq":1,"at_ms":1700000000000,"code":"pass_start","pass":"p1","actor":"mailbox-a","counts":{"configs":1,"authored_pending":1},"outcome":"nudged"}
+{"record":"event","seq":2,"at_ms":1700000000200,"code":"action_emitted","pass":"p1","action":1,"actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"group_members":3,"rows_planned":3},"outcome":"authored_upload_issued"}
+{"record":"event","seq":3,"at_ms":1700000000600,"code":"action_result_accepted","pass":"p1","action":1,"actor":"mailbox-a","counts":{"status":200,"rows_landed":1},"outcome":"upload_accepted"}
+{"record":"event","seq":4,"at_ms":1700000000900,"code":"action_result_accepted","pass":"p1","action":2,"actor":"mailbox-a","counts":{"status":200,"rows_landed":2},"outcome":"upload_accepted"}
+{"record":"event","seq":5,"at_ms":1700000001200,"code":"action_result_accepted","pass":"p1","action":3,"actor":"mailbox-a","counts":{"status":200,"rows_landed":3},"outcome":"upload_accepted"}
+{"record":"event","seq":6,"at_ms":1700000001300,"code":"outbound_row_retired","pass":"p1","actor":"mailbox-a","invariants":["FANOUT-01"],"counts":{"rows_landed":3,"members_owed":3,"envelope_marked":1},"outcome":"fanout_complete"}
+{"record":"event","seq":7,"at_ms":1700000001400,"code":"pass_finish","pass":"p1","actor":"mailbox-a","counts":{"requests":4,"uploads":3},"outcome":"finished"}
+{"record":"event","seq":8,"at_ms":1700000060000,"code":"pass_start","pass":"p2","actor":"mailbox-a","counts":{"configs":1,"authored_pending":0},"outcome":"nudged"}
+{"record":"event","seq":9,"at_ms":1700000060500,"code":"pass_finish","pass":"p2","actor":"mailbox-a","invariants":["FANOUT-01","LIVE-01"],"counts":{"rows_planned":0,"uploads":0},"outcome":"nothing_reoffered"}
