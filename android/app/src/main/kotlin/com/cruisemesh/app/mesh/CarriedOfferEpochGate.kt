@@ -24,6 +24,14 @@ internal class CarriedOfferEpochGate(
 
     private val core = CoreCarriedOfferGate.withEpochMs(epochMs)
 
+    /**
+     * The shared Rust gate itself, for `MessageStore.corePlanMeshMeet`, which
+     * reserves and commits or releases the epoch slot inside one planning
+     * call. It has to be this object, or the planner's encounters would spend
+     * an allowance nobody else could see.
+     */
+    internal val coreState: CoreCarriedOfferGate get() = core
+
     val epochMs: Long get() = core.epochMs()
 
     /**

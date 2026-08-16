@@ -95,7 +95,7 @@ pub fn plan_mesh_hello_frames(own_user_id: Vec<u8>) -> Result<Vec<Vec<u8>>, Core
 
 /// Inputs for one encounter. Every clock is an explicit `now_ms`; every peer
 /// claim is an argument, never ambient process state.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreMeetRequest {
     /// This device's user id, used to scope the spray plan's own-outbound
     /// lane (empty in the sim, which has no contacts).
@@ -125,12 +125,27 @@ pub struct CoreMeetRequest {
     /// digest must never provoke one back, or two converged phones ping-pong
     /// for as long as they stay in range.
     pub trigger: CoreSprayTrigger,
+    /// Wall-clock milliseconds. Everything durable reads this one: the expiry
+    /// prune, the carry pages, the delivery hints, the router's re-digest and
+    /// re-walk windows.
     pub now_ms: i64,
+    /// Monotonic milliseconds for [`CoreSprayPolicy`] alone.
+    ///
+    /// The two shells already run the cadence gate off a monotonic clock
+    /// (`SystemClock.elapsedRealtime` / `mach_absolute_time`) while the store
+    /// runs off the wall clock, and deliberately so: an NTP correction landing
+    /// mid-session must never expire a spray window early and buy the burst
+    /// the window exists to prevent. Folding both into one `now_ms` would have
+    /// forced a driver to pick which of those two guarantees to break, so the
+    /// planner takes both clocks and hands each to the state that measures
+    /// with it. The sim passes the same value twice, which is exactly what a
+    /// simulated clock is.
+    pub spray_now_ms: i64,
 }
 
 /// Bounded work counts for one encounter, so a caller can fold progress into
 /// a protocol event without this path writing the ring itself.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(uniffi::Record, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreMeetWork {
     /// Targeted-drain frames handed back to send.
     pub targeted_sent: u32,
@@ -159,7 +174,7 @@ pub struct CoreMeetWork {
 /// targeted drain is one budgeted walk page, the spray is one
 /// [`crate::CoreDigestSprayPlan`] after the spray-policy gate. Nothing
 /// unbounded crosses the boundary.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CoreMeetOutcome {
     /// The DIGEST frames this link owes, if any. **Send these first**: the
     /// spray policy's exchange window is opened when the digest is enqueued,
@@ -212,6 +227,7 @@ impl MessageStore {
             peer_capabilities,
             trigger,
             now_ms,
+            spray_now_ms,
         } = request;
 
         // 0. HELLO2. Recording the bits here rather than on a separate shell
@@ -236,7 +252,7 @@ impl MessageStore {
         )?;
         let peer_key = peer_key(&peer_user_id);
         if confirmed_removed > 0 {
-            spray.note_receipt_progress(peer_key.clone(), now_ms);
+            spray.note_receipt_progress(peer_key.clone(), spray_now_ms);
         }
 
         let peer_hints = self.delivery_hints_for_peer(peer_user_id.clone(), now_ms)?;
@@ -246,7 +262,12 @@ impl MessageStore {
         // by the spray: consulting it twice inside one encounter would let the
         // digest arm a window that then admits the very spray the same verdict
         // had refused.
-        let gate = spray.may_spray(peer_key.clone(), peer_address.clone(), trigger, now_ms);
+        let gate = spray.may_spray(
+            peer_key.clone(),
+            peer_address.clone(),
+            trigger,
+            spray_now_ms,
+        );
 
         // 2. The DIGEST exchange. Owed on a link that has never run one and
         // then on the jittered D8 window; never owed back to a peer whose own
@@ -276,9 +297,13 @@ impl MessageStore {
             if !digest_frames.is_empty() {
                 router.record_digest_sent(&peer_address, now_ms);
                 if gate.allow {
-                    spray.note_digest_sent(peer_key.clone(), peer_address.clone(), now_ms);
+                    spray.note_digest_sent(peer_key.clone(), peer_address.clone(), spray_now_ms);
                 } else {
-                    spray.note_digest_only_sent(peer_key.clone(), peer_address.clone(), now_ms);
+                    spray.note_digest_only_sent(
+                        peer_key.clone(),
+                        peer_address.clone(),
+                        spray_now_ms,
+                    );
                 }
             }
         }
@@ -332,7 +357,7 @@ impl MessageStore {
                 page.exhausted,
                 now_ms,
             );
-            spray.note_bytes_queued(peer_address.clone(), offered_sealed, now_ms);
+            spray.note_bytes_queued(peer_address.clone(), offered_sealed, spray_now_ms);
         }
 
         // 4. Budgeted spray-on-connect to a non-recipient mule. Cadence,
@@ -359,7 +384,8 @@ impl MessageStore {
                 router.hidden_offered_for(peer_address.clone()),
                 lane.after,
             )?;
-            let admission = spray.admit_plan(peer_key, peer_address.clone(), plan.lanes, now_ms);
+            let admission =
+                spray.admit_plan(peer_key, peer_address.clone(), plan.lanes, spray_now_ms);
             if admission.send_carried {
                 spray_frames.extend(plan.carried_frames);
                 if !lane.skip {
@@ -445,6 +471,47 @@ impl MessageStore {
     }
 }
 
+/// The FFI face of the planner, for the two shells' meet adapters.
+///
+/// Deliberately a thin delegation rather than a second implementation: the
+/// exported name is what a shell may call, and the plain-Rust
+/// [`MessageStore::plan_mesh_meet`] above stays the one body the simulator and
+/// the shells both run. A driver that reached past this for the store
+/// primitives the planner composes would be re-deriving the encounter order in
+/// Kotlin or Swift again, which is the whole thing this file exists to stop.
+///
+/// The three state objects are passed in rather than owned here because both
+/// shells already hold exactly one of each, process-wide, and the walk cursors
+/// and cadence windows recorded during a plan have to be the *same* ones the
+/// rest of the shell reads. A planner that built its own would forget every
+/// encounter the moment it returned.
+#[uniffi::export]
+impl MessageStore {
+    /// Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
+    ///
+    /// Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
+    /// targeted drain, then spray. The ordering is load-bearing (the peer's
+    /// answering digest has to beat the exchange window), which is why the
+    /// three lanes come back as separate lists rather than one blob a driver
+    /// could reorder without noticing.
+    pub fn core_plan_mesh_meet(
+        &self,
+        router: std::sync::Arc<CoreMeshRouterState>,
+        spray: std::sync::Arc<CoreSprayPolicy>,
+        offers: std::sync::Arc<CoreCarriedOfferGate>,
+        request: CoreMeetRequest,
+    ) -> Result<CoreMeetOutcome, CoreError> {
+        self.plan_mesh_meet(&router, &spray, &offers, request)
+    }
+}
+
+/// The identity frames for a fresh link, in order. See
+/// [`plan_mesh_hello_frames`].
+#[uniffi::export]
+pub fn core_plan_mesh_hello_frames(own_user_id: Vec<u8>) -> Result<Vec<Vec<u8>>, CoreError> {
+    plan_mesh_hello_frames(own_user_id)
+}
+
 /// Desktop's digest-response receipt query bound, used here so the own-receipt
 /// spray lane agrees with the production caller.
 const RECEIPT_QUERY_LIMIT: u64 = 256;
@@ -502,6 +569,7 @@ mod tests {
             peer_capabilities: None,
             trigger: CoreSprayTrigger::FirstContact,
             now_ms: NOW,
+            spray_now_ms: NOW,
         }
     }
 
@@ -772,6 +840,7 @@ mod tests {
         // encounter runs without putting a second digest on the radio.
         let mut soon = request(me.user_id.clone(), peer.user_id.clone(), vec![], true);
         soon.now_ms = NOW + 1_000;
+        soon.spray_now_ms = NOW + 1_000;
         soon.trigger = CoreSprayTrigger::Maintenance;
         let second = store.plan_mesh_meet(&router, &spray, &gate, soon).unwrap();
         assert_eq!(second.work.digests_sent, 0);
@@ -779,6 +848,7 @@ mod tests {
         // Past the maximum re-digest interval it is due again.
         let mut later = request(me.user_id, peer.user_id, vec![], true);
         later.now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
+        later.spray_now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
         later.trigger = CoreSprayTrigger::Maintenance;
         let third = store.plan_mesh_meet(&router, &spray, &gate, later).unwrap();
         assert_eq!(third.work.digests_sent, 1);
@@ -885,6 +955,7 @@ mod tests {
         // a digest is what could end the quiet.
         let mut later = request(me.user_id, peer.user_id, vec![], true);
         later.now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
+        later.spray_now_ms = NOW + crate::transport_policy::REDIGEST_MAX_INTERVAL_MS + 1;
         later.trigger = CoreSprayTrigger::Maintenance;
         assert!(
             !spray
@@ -948,6 +1019,7 @@ mod tests {
         // A later encounter that observed no HELLO2 must not forget them.
         let mut without = request(me.user_id, peer.user_id, vec![], true);
         without.now_ms = NOW + 1_000;
+        without.spray_now_ms = NOW + 1_000;
         store
             .plan_mesh_meet(&router, &spray, &gate(), without)
             .unwrap();

@@ -29,6 +29,12 @@ import Foundation
 enum SprayPolicy {
     private static let core = CoreSprayPolicy()
 
+    /// The shared Rust policy itself, for `MessageStore.corePlanMeshMeet`,
+    /// which takes the cadence verdict and charges the burst allowance inside
+    /// one planning call. It has to be this object: a planner given a fresh
+    /// policy would forget every window the moment it returned.
+    static var coreState: CoreSprayPolicy { core }
+
     /// Monotonic milliseconds; see the type doc.
     static var nowMs: Int64 { FailoverResumeDebounce.monotonicNowMs }
 

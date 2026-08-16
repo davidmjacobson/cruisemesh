@@ -142,6 +142,27 @@ class MeshService : Service() {
     private var relaySync: RelaySyncEngine? = null
 
     /**
+     * The core encounter planner's driver, used only when
+     * [MeetEngineSettings] selects [MeetEngine.CORE]. Built lazily against the
+     * process-wide route state, spray policy and carried-offer gate, because
+     * the planner has to record its cadence windows and walk cursors on the
+     * very objects the rest of this service reads.
+     */
+    private val coreMeet: CoreMeetAdapter by lazy {
+        CoreMeetAdapter(
+            store = store,
+            router = MeshRouter.coreState,
+            spray = SprayPolicy.coreState,
+            offers = carriedOfferGate.coreState,
+            links = object : CoreMeetAdapter.Links {
+                override fun send(address: String, frame: ByteArray) {
+                    MeshRouter.sendToAddress(address, frame)
+                }
+            },
+        )
+    }
+
+    /**
      * Group digests answered on each live link. The 1:1 fallback still
      * resends any shared group this link has not answered for. Record only
      * after the spray gate allows — a gated first digest must not suppress
@@ -1320,6 +1341,25 @@ class MeshService : Service() {
             scheduleDeferredSpray(peerUserId, deferralMs)
             return
         }
+        // The encounter engine selection, same read as [handleHello]. Under
+        // CORE the planner owns the cadence verdict, the digest, the drain and
+        // the spray; a peer digest this shell stashed while the cooldown was
+        // up is handed to it as this encounter's known-id set rather than
+        // answered on a separate path, because it is the same encounter.
+        if (MeetEngineSettings.meetEngine(this) == MeetEngine.CORE) {
+            val gated = takeGatedDigest(peerUserId)
+            coreMeet.encounter(
+                address,
+                identity.userId,
+                peerUserId,
+                CoreSprayTrigger.RECONNECT,
+                peerKnownMsgIds = gated?.recentMsgIds ?: emptyList(),
+                // CARRY-02: replayed unchanged from arrival, never re-derived
+                // from the link we happen to answer on.
+                peerAuthenticated = gated?.peerAuthenticated ?: false,
+            )
+            return
+        }
         // Cadence gate (#280). This is the reconnect-churn path: a link dying
         // and being re-elected 5 times a minute used to buy 5 full bursts.
         // First contact is not this path -- [handleHello] owns that -- so a
@@ -1748,6 +1788,38 @@ class MeshService : Service() {
                 TAG,
                 "HELLO route $address retained for control/failover; bulk sync uses the elected logical-peer route",
             )
+            return
+        }
+
+        // One whole-encounter engine selection, read once here and not
+        // consulted again while this burst runs, so a flip mid-burst cannot
+        // split it between two sequencers.
+        //
+        // Under CORE everything below -- the cadence verdict, the DIGEST, the
+        // targeted carry drain, the mule spray and the offer slot the last two
+        // share -- belongs to `MessageStore.corePlanMeshMeet`. What this shell
+        // still owns on that branch is the part that is genuinely transport:
+        // the LAN endpoint hint (a control frame, not an encounter lane, and
+        // the fastest way off this radio entirely) and the post-notify-reject
+        // cooldown, which is a property of a BLE peripheral link and of
+        // nothing core can see.
+        //
+        // The default is LEGACY; every line below this branch is unchanged.
+        if (MeetEngineSettings.meetEngine(this) == MeetEngine.CORE) {
+            if (store.getContact(userId) != null) {
+                sendLanEndpointHintTo(address)
+            }
+            val coreDeferralMs = peripheralSyncSprayDeferralMs(address)
+            if (coreDeferralMs > 0L) {
+                Log.i(
+                    TAG,
+                    "Holding the HELLO encounter for $address for ${coreDeferralMs}ms " +
+                        "after a notify-reject teardown on this address",
+                )
+                scheduleDeferredSpray(userId, coreDeferralMs)
+                return
+            }
+            coreMeet.encounter(address, identity.userId, userId, CoreSprayTrigger.FIRST_CONTACT)
             return
         }
 
@@ -2196,7 +2268,24 @@ class MeshService : Service() {
         // admission sees a link allowance that already reflects what this
         // encounter has queued.
         SprayPolicy.noteBytesQueued(address, queuedBytes)
-        envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate, peerAuthenticated)
+        // The encounter engine selection. The lanes above -- receipt repair,
+        // the per-missing-message re-send and the group catch-up -- are the
+        // digest *answer* and stay with this shell on both branches; what the
+        // branch selects is who plans the offer half of the encounter: the
+        // core planner's digest-confirm, targeted drain and budgeted spray, or
+        // the shell's own spray path.
+        if (MeetEngineSettings.meetEngine(this) == MeetEngine.CORE) {
+            coreMeet.encounter(
+                address,
+                identity.userId,
+                resolvedPeerUserId,
+                CoreSprayTrigger.PEER_DIGEST,
+                peerKnownMsgIds = recentMsgIds,
+                peerAuthenticated = peerAuthenticated,
+            )
+        } else {
+            envelopeProcessor?.sprayDigestPlanTo(address, resolvedPeerUserId, recentMsgIds, identity, gate, peerAuthenticated)
+        }
         if (contact == null) {
             Log.i(TAG, "DIGEST from unrecognized userId=${UserIdHex.encode(resolvedPeerUserId)}; sprayed carry queue only")
         }

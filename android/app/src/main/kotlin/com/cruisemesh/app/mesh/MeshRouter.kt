@@ -28,6 +28,13 @@ private const val TAG = "MeshRouter"
 object MeshRouter {
     private val state = MeshRouterState()
 
+    /**
+     * The shared Rust route state, for `MessageStore.corePlanMeshMeet` alone
+     * (see [MeshRouterState.coreState]). Everything else goes through the
+     * named delegations below.
+     */
+    internal val coreState get() = state.coreState
+
     @Volatile private var centralSend: ((String, ByteArray) -> Unit)? = null
     @Volatile private var peripheralSend: ((String, ByteArray) -> Unit)? = null
     @Volatile private var lanSend: ((String, ByteArray) -> Unit)? = null

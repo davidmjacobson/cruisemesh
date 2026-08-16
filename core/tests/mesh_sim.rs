@@ -230,6 +230,9 @@ impl SimNode {
                     peer_capabilities: Some(core_own_capabilities()),
                     trigger,
                     now_ms: now,
+                    // One simulated clock: the sim has no NTP and no
+                    // monotonic/wall split to preserve.
+                    spray_now_ms: now,
                 },
             )
             .expect("plan encounter")

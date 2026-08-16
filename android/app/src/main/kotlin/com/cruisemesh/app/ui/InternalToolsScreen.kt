@@ -57,6 +57,8 @@ import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.mesh.InboundEngine
 import com.cruisemesh.app.mesh.InboundEngineSettings
+import com.cruisemesh.app.mesh.MeetEngine
+import com.cruisemesh.app.mesh.MeetEngineSettings
 import com.cruisemesh.app.relay.RelayEngineSettings
 import com.cruisemesh.app.relay.RelayPassEngine
 import uniffi.cruisemesh_core.lanDefaultTcpPort
@@ -377,6 +379,37 @@ fun InternalToolsScreen(onBack: () -> Unit) {
                 )
             }
             Text(stringResource(R.string.ui_rebuilt_message_handling_desc),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+
+            // The nearby-exchange engine switch, alongside the two above and
+            // for the same reason: a rollout switch whose evidence can only be
+            // gathered on a release-signed device has to be reachable on one.
+            var rebuiltMeet by remember {
+                mutableStateOf(MeetEngineSettings.meetEngine(context) == MeetEngine.CORE)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+            ) {
+                Text(
+                    stringResource(R.string.ui_rebuilt_nearby_exchange),
+                    modifier = Modifier.weight(1f),
+                )
+                Switch(
+                    checked = rebuiltMeet,
+                    onCheckedChange = {
+                        rebuiltMeet = it
+                        MeetEngineSettings.setMeetEngine(
+                            context,
+                            if (it) MeetEngine.CORE else MeetEngine.LEGACY,
+                        )
+                    },
+                )
+            }
+            Text(stringResource(R.string.ui_rebuilt_nearby_exchange_desc),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 4.dp),

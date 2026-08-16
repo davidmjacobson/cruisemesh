@@ -16,6 +16,13 @@ final class MeshRouterState {
 
     private let core = CoreMeshRouterState()
 
+    /// The shared Rust route state itself, for the one caller that has to pass
+    /// it rather than call it: `MessageStore.corePlanMeshMeet` records this
+    /// link's re-digest window and both carry cursors while planning an
+    /// encounter, and it has to record them on the *same* object the rest of
+    /// this shell reads. Exposed for that reason alone.
+    var coreState: CoreMeshRouterState { core }
+
     func setLocalUserId(_ userId: Data) { core.setLocalUserId(userId: userId) }
 
     func onConnected(address: String, transport: Transport) {

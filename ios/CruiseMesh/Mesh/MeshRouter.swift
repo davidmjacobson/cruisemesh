@@ -4,6 +4,11 @@ import os.log
 /// Process-wide send router (Android `MeshRouter` parity).
 enum MeshRouter {
     private static let state = MeshRouterState()
+
+    /// The shared Rust route state, for `MessageStore.corePlanMeshMeet` alone
+    /// (see `MeshRouterState.coreState`). Everything else goes through the
+    /// named delegations below.
+    static var coreState: CoreMeshRouterState { state.coreState }
     private static let log = Logger(subsystem: "com.cruisemesh", category: "MeshRouter")
     private static var centralSend: ((String, Data) -> Void)?
     private static var peripheralSend: ((String, Data) -> Void)?
