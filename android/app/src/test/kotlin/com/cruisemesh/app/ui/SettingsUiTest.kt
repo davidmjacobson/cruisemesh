@@ -9,6 +9,7 @@ import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import com.cruisemesh.app.mesh.RelayHealth
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
@@ -33,6 +34,7 @@ class SettingsUiTest {
                     meshStatus = "Mesh running",
                     relayHealth = RelayHealth.NoConfig,
                     onShorePass = {},
+                    onSailChecklist = {},
                     onConnectionDetails = {},
                     onDeveloperSettings = {},
                     onBackUp = {},
@@ -46,8 +48,10 @@ class SettingsUiTest {
             }
         }
 
+        // Scrolled to first: Settings is a long scrolling screen, so where the
+        // row happens to sit is not what this test is about.
         val meshToggle = compose.onNode(hasText("Mesh running") and isToggleable())
-        meshToggle.assertIsOn().performClick()
+        meshToggle.performScrollTo().assertIsOn().performClick()
         meshToggle.assertIsOff()
         assertEquals(1, changes)
     }

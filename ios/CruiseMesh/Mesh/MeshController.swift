@@ -5466,6 +5466,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     ) {
         guard isVisibleChatKind(kind), let arrival else { return }
         guard (try? store.getContact(userId: senderUserId)) != nil else { return }
+        // The message is already durably stored, so this arrival really
+        // happened: latch it if it came in without the internet. That is the
+        // proof the checklist's "send a message with no internet" step waits
+        // for, and this is the only place on the phone where the fact is
+        // observed at all. Written once and never withdrawn.
+        OfflineDeliverySeenStore.noteArrival(transport: arrival.transport)
         try? store.recordPeerConnectionEvent(
             userId: senderUserId,
             transport: corePeerTransportForArrival(transport: arrival.transport),

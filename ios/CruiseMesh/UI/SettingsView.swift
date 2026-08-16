@@ -31,6 +31,21 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                // First, and permanent: the home-screen card can be dismissed,
+                // and this is where somebody who dismissed it goes looking.
+                Section {
+                    NavigationLink {
+                        SailChecklistView(appModel: appModel)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Before you sail")
+                            Text("Setup steps that check themselves off, for the days before a cruise.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 Section("Shore Pass") {
                     NavigationLink {
                         ShorePassView(initialCard: nil, appModel: appModel)
