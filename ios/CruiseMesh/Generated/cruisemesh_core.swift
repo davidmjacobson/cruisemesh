@@ -4598,10 +4598,40 @@ public protocol MessageStoreProtocol : AnyObject {
      * counter does outlive a delete; that is the deliberate cost of not
      * erasing someone else's chat from their phone.
      *
+     * **Deleting an introduced contact also writes a block tombstone.**
+     * specs/friends-of-friends.md: "Deleting an introduced contact should
+     * also create a local dismissal/block tombstone so a delayed duplicate
+     * request cannot immediately recreate the contact." Without it the
+     * delete is undone by the network: an introduced friend request is
+     * accepted automatically while friends-of-friends is on, so a duplicate
+     * still in flight through a mule -- or a fresh snapshot from any third
+     * party still connected to both of you -- silently puts the person
+     * back, and the user cannot tell their delete from a phone that ignored
+     * it.
+     *
+     * Only `source = 1` (introduced) is tombstoned. A direct QR/link
+     * contact (`source = 0`) is deleted plainly: the spec's sentence is
+     * about introductions, and nobody else can re-add a direct contact
+     * without the user scanning again. A contact added from a shared card
+     * (`source = 2`) also stays plain -- that path never auto-accepts, it
+     * raises a prompt, and specs/share-contact.md gives it its own
+     * "Don't ask again" tombstone -- so the silent-recreation problem this
+     * guards against does not arise there.
+     *
+     * The tombstone is cleared like any other block: a deliberate direct
+     * import of that person's card
+     * ([`MessageStore::upsert_imported_contact`]), which is exactly the
+     * spec's "A deliberate direct QR/link confirmation may clear that
+     * tombstone" escape hatch. Note this leaves an identity in
+     * `list_blocked_users()` with no contact row; both shells build their
+     * blocked projections from contacts, so a deleted person never surfaces
+     * as "Blocked" anywhere -- the tombstone stays invisible, which is what
+     * a delete should look like.
+     *
      * Atomic (single transaction) and idempotent: deleting an unknown
      * contact is a no-op. Returns `true` if a contact row was removed.
      */
-    func deleteContact(userId: Data) throws  -> Bool
+    func deleteContact(userId: Data, nowMs: Int64) throws  -> Bool
     
     /**
      * Delete a group definition, its membership rows, and every row of
@@ -7265,13 +7295,44 @@ open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], own
      * counter does outlive a delete; that is the deliberate cost of not
      * erasing someone else's chat from their phone.
      *
+     * **Deleting an introduced contact also writes a block tombstone.**
+     * specs/friends-of-friends.md: "Deleting an introduced contact should
+     * also create a local dismissal/block tombstone so a delayed duplicate
+     * request cannot immediately recreate the contact." Without it the
+     * delete is undone by the network: an introduced friend request is
+     * accepted automatically while friends-of-friends is on, so a duplicate
+     * still in flight through a mule -- or a fresh snapshot from any third
+     * party still connected to both of you -- silently puts the person
+     * back, and the user cannot tell their delete from a phone that ignored
+     * it.
+     *
+     * Only `source = 1` (introduced) is tombstoned. A direct QR/link
+     * contact (`source = 0`) is deleted plainly: the spec's sentence is
+     * about introductions, and nobody else can re-add a direct contact
+     * without the user scanning again. A contact added from a shared card
+     * (`source = 2`) also stays plain -- that path never auto-accepts, it
+     * raises a prompt, and specs/share-contact.md gives it its own
+     * "Don't ask again" tombstone -- so the silent-recreation problem this
+     * guards against does not arise there.
+     *
+     * The tombstone is cleared like any other block: a deliberate direct
+     * import of that person's card
+     * ([`MessageStore::upsert_imported_contact`]), which is exactly the
+     * spec's "A deliberate direct QR/link confirmation may clear that
+     * tombstone" escape hatch. Note this leaves an identity in
+     * `list_blocked_users()` with no contact row; both shells build their
+     * blocked projections from contacts, so a deleted person never surfaces
+     * as "Blocked" anywhere -- the tombstone stays invisible, which is what
+     * a delete should look like.
+     *
      * Atomic (single transaction) and idempotent: deleting an unknown
      * contact is a no-op. Returns `true` if a contact row was removed.
      */
-open func deleteContact(userId: Data)throws  -> Bool {
+open func deleteContact(userId: Data, nowMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_delete_contact(self.uniffiClonePointer(),
-        FfiConverterData.lower(userId),$0
+        FfiConverterData.lower(userId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -39574,7 +39635,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 44389) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 9888) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 60649) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_group() != 30648) {

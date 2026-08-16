@@ -1057,7 +1057,7 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
                 if (summary.isGroup) {
                     store.deleteGroup(summary.chatId)
                 } else {
-                    store.deleteContact(summary.chatId)
+                    store.deleteContact(summary.chatId, System.currentTimeMillis())
                     FriendDirectorySender.queueToAllContacts(context, store, identity)
                 }
                 scheduleSummaryReload(immediate = true)
@@ -1547,7 +1547,7 @@ private fun ContactsRoute(identity: Identity, navController: NavHostController) 
         outgoingSharedByUserId = outgoingShared,
         onContactClick = { contact -> navController.navigate("chat/${UserIdHex.encode(contact.userId)}") },
         onContactDelete = { contact ->
-            store.deleteContact(contact.userId)
+            store.deleteContact(contact.userId, System.currentTimeMillis())
             FriendDirectorySender.queueToAllContacts(context, store, identity)
             reloadContacts()
         },
@@ -1715,7 +1715,7 @@ private fun ChatRoute(identity: Identity, userIdHex: String, navController: NavH
             store = store,
             onBack = { navController.popOrExit(context) },
             onDeleteContact = {
-                store.deleteContact(contact.userId)
+                store.deleteContact(contact.userId, System.currentTimeMillis())
                 FriendDirectorySender.queueToAllContacts(context, store, identity)
                 navController.popOrExit(context)
             },

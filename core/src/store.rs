@@ -474,6 +474,11 @@ pub struct FriendSuggestion {
     pub state: u8,
 }
 
+/// [`ContactProvenance::source`] for a contact who arrived through another
+/// accepted contact's introduction rather than a card the user handled
+/// themselves. The one value [`MessageStore::delete_contact`] tombstones.
+const PROVENANCE_SOURCE_INTRODUCED: i64 = 1;
+
 /// How an accepted contact first entered the local trust graph.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct ContactProvenance {
@@ -5448,14 +5453,63 @@ impl MessageStore {
     /// counter does outlive a delete; that is the deliberate cost of not
     /// erasing someone else's chat from their phone.
     ///
+    /// **Deleting an introduced contact also writes a block tombstone.**
+    /// specs/friends-of-friends.md: "Deleting an introduced contact should
+    /// also create a local dismissal/block tombstone so a delayed duplicate
+    /// request cannot immediately recreate the contact." Without it the
+    /// delete is undone by the network: an introduced friend request is
+    /// accepted automatically while friends-of-friends is on, so a duplicate
+    /// still in flight through a mule -- or a fresh snapshot from any third
+    /// party still connected to both of you -- silently puts the person
+    /// back, and the user cannot tell their delete from a phone that ignored
+    /// it.
+    ///
+    /// Only `source = 1` (introduced) is tombstoned. A direct QR/link
+    /// contact (`source = 0`) is deleted plainly: the spec's sentence is
+    /// about introductions, and nobody else can re-add a direct contact
+    /// without the user scanning again. A contact added from a shared card
+    /// (`source = 2`) also stays plain -- that path never auto-accepts, it
+    /// raises a prompt, and specs/share-contact.md gives it its own
+    /// "Don't ask again" tombstone -- so the silent-recreation problem this
+    /// guards against does not arise there.
+    ///
+    /// The tombstone is cleared like any other block: a deliberate direct
+    /// import of that person's card
+    /// ([`MessageStore::upsert_imported_contact`]), which is exactly the
+    /// spec's "A deliberate direct QR/link confirmation may clear that
+    /// tombstone" escape hatch. Note this leaves an identity in
+    /// `list_blocked_users()` with no contact row; both shells build their
+    /// blocked projections from contacts, so a deleted person never surfaces
+    /// as "Blocked" anywhere -- the tombstone stays invisible, which is what
+    /// a delete should look like.
+    ///
     /// Atomic (single transaction) and idempotent: deleting an unknown
     /// contact is a no-op. Returns `true` if a contact row was removed.
-    pub fn delete_contact(&self, user_id: Vec<u8>) -> Result<bool, CoreError> {
+    pub fn delete_contact(&self, user_id: Vec<u8>, now_ms: i64) -> Result<bool, CoreError> {
         let mut conn = lock_conn(&self.conn);
         let tx = conn.transaction().map_err(store_err)?;
         let removed = tx
             .execute("DELETE FROM contacts WHERE user_id = ?1", params![user_id])
             .map_err(store_err)?;
+        // Read provenance before the delete further down drops the row.
+        let introduced = removed > 0
+            && tx
+                .query_row(
+                    "SELECT source FROM contact_provenance WHERE user_id = ?1",
+                    params![user_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(store_err)?
+                == Some(PROVENANCE_SOURCE_INTRODUCED);
+        if introduced {
+            tx.execute(
+                "INSERT INTO blocked_identities (user_id, blocked_at_ms) VALUES (?1, ?2)
+                 ON CONFLICT(user_id) DO NOTHING",
+                params![user_id, now_ms],
+            )
+            .map_err(store_err)?;
+        }
         tx.execute("DELETE FROM messages WHERE chat_id = ?1", params![user_id])
             .map_err(store_err)?;
         tx.execute(
@@ -10984,7 +11038,7 @@ mod tests {
         );
 
         alice_phone.upsert_contact(contact(alice, "Alice")).unwrap();
-        assert!(alice_phone.delete_contact(alice.to_vec()).unwrap());
+        assert!(alice_phone.delete_contact(alice.to_vec(), 1).unwrap());
         assert!(
             !alice_phone
                 .has_identity_clone_warning(alice.to_vec())
@@ -11542,7 +11596,7 @@ mod tests {
         }
         assert_eq!(last, 3);
 
-        assert!(store.delete_contact(contact.user_id.clone()).unwrap());
+        assert!(store.delete_contact(contact.user_id.clone(), 1).unwrap());
         assert!(store
             .messages_for_chat(contact.user_id.clone())
             .unwrap()
@@ -12784,6 +12838,179 @@ mod tests {
             })
             .unwrap();
         assert!(!store.is_user_blocked(carol.user_id).unwrap());
+    }
+
+    /// specs/friends-of-friends.md: "Deleting an introduced contact should
+    /// also create a local dismissal/block tombstone so a delayed duplicate
+    /// request cannot immediately recreate the contact."
+    #[test]
+    fn deleting_an_introduced_contact_tombstones_them_against_re_introduction() {
+        let alice = generate_identity();
+        let bob = generate_identity();
+        let carol = generate_identity();
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        // Alice is the introducer and stays a contact throughout.
+        store
+            .upsert_contact(identity_contact(&alice, "Alice"))
+            .unwrap();
+        // Carol arrived through Alice's introduction and is now deleted.
+        store
+            .upsert_contact(identity_contact(&carol, "Carol"))
+            .unwrap();
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: carol.user_id.clone(),
+                source: 1,
+                introducer_user_id: Some(alice.user_id.clone()),
+                introduced_at_ms: 1_000,
+                added_nearby: false,
+            })
+            .unwrap();
+        assert!(store.delete_contact(carol.user_id.clone(), 2_000).unwrap());
+        assert!(store.is_user_blocked(carol.user_id.clone()).unwrap());
+
+        // A third party re-offering Carol cannot put her back in the list.
+        introduce(&store, &alice, &bob, &carol, 3_000);
+        assert!(store.list_friend_suggestions(3_000).unwrap().is_empty());
+
+        // ...and the deliberate direct import the spec names as the escape
+        // hatch clears the tombstone, suggestions included.
+        store
+            .upsert_imported_contact(identity_contact(&carol, "Carol"))
+            .unwrap();
+        assert!(!store.is_user_blocked(carol.user_id.clone()).unwrap());
+        store.delete_contact(carol.user_id.clone(), 4_000).unwrap();
+        // Deleted again, but the provenance row went with the first delete and
+        // the re-import was direct, so this time there is no tombstone.
+        assert!(!store.is_user_blocked(carol.user_id.clone()).unwrap());
+        introduce(&store, &alice, &bob, &carol, 5_000);
+        assert_eq!(store.list_friend_suggestions(5_000).unwrap().len(), 1);
+    }
+
+    /// The spec's sentence is about introductions only. A contact the user
+    /// added themselves, or one from a shared card (which is never
+    /// auto-accepted -- specs/share-contact.md raises a prompt and carries its
+    /// own "Don't ask again" tombstone), is deleted plainly.
+    #[test]
+    fn deleting_a_direct_or_shared_or_unknown_contact_writes_no_tombstone() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        for (id, source) in [
+            (b"direct-id".as_slice(), Some(0u8)),
+            (b"shared-id".as_slice(), Some(2)),
+            (b"no-prov-id".as_slice(), None),
+        ] {
+            store.upsert_contact(contact(id, "Someone")).unwrap();
+            if let Some(source) = source {
+                store
+                    .upsert_contact_provenance(ContactProvenance {
+                        user_id: id.to_vec(),
+                        source,
+                        introducer_user_id: None,
+                        introduced_at_ms: 1_000,
+                        added_nearby: false,
+                    })
+                    .unwrap();
+            }
+            assert!(store.delete_contact(id.to_vec(), 2_000).unwrap());
+            assert!(!store.is_user_blocked(id.to_vec()).unwrap());
+        }
+        // Deleting somebody who was never a contact blocks nobody, even if a
+        // stray provenance row outlived them.
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: b"ghost-id".to_vec(),
+                source: 1,
+                introducer_user_id: None,
+                introduced_at_ms: 1_000,
+                added_nearby: false,
+            })
+            .unwrap();
+        assert!(!store.delete_contact(b"ghost-id".to_vec(), 2_000).unwrap());
+        assert!(!store.is_user_blocked(b"ghost-id".to_vec()).unwrap());
+        assert!(store.list_blocked_users().unwrap().is_empty());
+    }
+
+    /// A delete tombstone must not read as a block anywhere the user looks:
+    /// nothing survives the delete that a "Blocked" projection built from
+    /// contacts could attach to.
+    #[test]
+    fn a_delete_tombstone_leaves_no_contact_row_behind() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"carol-id", "Carol")).unwrap();
+        store
+            .upsert_contact_provenance(ContactProvenance {
+                user_id: b"carol-id".to_vec(),
+                source: 1,
+                introducer_user_id: Some(b"alice-id".to_vec()),
+                introduced_at_ms: 1_000,
+                added_nearby: false,
+            })
+            .unwrap();
+        store.delete_contact(b"carol-id".to_vec(), 2_000).unwrap();
+        assert!(store.list_contacts().unwrap().is_empty());
+        assert_eq!(store.get_contact(b"carol-id".to_vec()).unwrap(), None);
+        assert_eq!(
+            store.get_contact_provenance(b"carol-id".to_vec()).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.list_blocked_users().unwrap(),
+            vec![b"carol-id".to_vec()]
+        );
+    }
+
+    fn identity_contact(identity: &crate::Identity, name: &str) -> Contact {
+        Contact {
+            user_id: identity.user_id.clone(),
+            name: name.to_string(),
+            sign_pk: identity.sign_pk.clone(),
+            agree_pk: identity.agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        }
+    }
+
+    /// `introducer` offers `candidate` to `invitee` in a fresh directory
+    /// snapshot, the way a third party's phone would after a delete.
+    fn introduce(
+        store: &MessageStore,
+        introducer: &crate::Identity,
+        invitee: &crate::Identity,
+        candidate: &crate::Identity,
+        now_ms: i64,
+    ) {
+        let ticket = create_introduction_ticket(
+            introducer.clone(),
+            candidate.user_id.clone(),
+            invitee.user_id.clone(),
+            3,
+            now_ms,
+            100_000,
+            vec![9; 16],
+        )
+        .unwrap();
+        store
+            .apply_friend_directory(
+                introducer.user_id.clone(),
+                invitee.user_id.clone(),
+                FriendDirectoryContent {
+                    version: 1,
+                    revision: now_ms as u64,
+                    entries: vec![FriendDirectoryEntry {
+                        candidate: SuggestedFriendCard {
+                            name: "Carol".to_string(),
+                            user_id: candidate.user_id.clone(),
+                            sign_pk: candidate.sign_pk.clone(),
+                            agree_pk: candidate.agree_pk.clone(),
+                        },
+                        candidate_policy_revision: 3,
+                        ticket,
+                    }],
+                },
+                now_ms,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -15271,7 +15498,7 @@ mod tests {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
 
-        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
         assert_eq!(store.get_contact(b"alice-id".to_vec()).unwrap(), None);
         assert!(store.list_contacts().unwrap().is_empty());
     }
@@ -15279,11 +15506,11 @@ mod tests {
     #[test]
     fn delete_contact_is_a_noop_for_unknown_contact() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
-        assert!(!store.delete_contact(b"nobody".to_vec()).unwrap());
+        assert!(!store.delete_contact(b"nobody".to_vec(), 1).unwrap());
         // Deleting twice is idempotent, not an error.
         store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
-        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
-        assert!(!store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
+        assert!(!store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
     }
 
     #[test]
@@ -15324,7 +15551,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
 
         assert!(store
             .messages_for_chat(b"alice-id".to_vec())
@@ -15373,7 +15600,7 @@ mod tests {
             .insert_message(msg(b"group-1", b"alice-id", 1, "group msg"))
             .unwrap();
 
-        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
 
         assert_eq!(store.list_contacts().unwrap().len(), 1);
         assert_eq!(
@@ -15490,7 +15717,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(store.delete_contact(b"alice-id".to_vec()).unwrap());
+        assert!(store.delete_contact(b"alice-id".to_vec(), 1).unwrap());
 
         // All five per-chat tables are empty for alice's chat_id.
         assert!(store

@@ -412,7 +412,7 @@ struct ChatListView: View {
         if summary.isGroup {
             _ = try? AppStore.get().deleteGroup(groupId: summary.chatId)
         } else {
-            try? AppStore.get().deleteContact(userId: summary.chatId)
+            try? AppStore.get().deleteContact(userId: summary.chatId, nowMs: Int64(Date().timeIntervalSince1970 * 1000))
             FriendDirectorySender.queueToAllContacts(store: AppStore.get(), identity: identity)
             MeshController.shared.contactListChanged()
         }

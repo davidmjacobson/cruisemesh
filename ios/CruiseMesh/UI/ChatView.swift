@@ -419,7 +419,7 @@ struct ChatView: View {
         }
         .alert("Delete contact?", isPresented: $confirmDelete) {
             Button("Delete", role: .destructive) {
-                try? store.deleteContact(userId: contact.userId)
+                try? store.deleteContact(userId: contact.userId, nowMs: Int64(Date().timeIntervalSince1970 * 1000))
                 FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
                 MeshController.shared.contactListChanged()
                 dismiss()
