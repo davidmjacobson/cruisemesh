@@ -23,6 +23,11 @@
 //!   sync record at a contact even by mistake: there is no parameter that
 //!   accepts a bare public key, and a contact's public key is not one this
 //!   device holds the secret for. That is the structural half of the boundary.
+//!   [`core_seal_sync_handoff`] — §10.1's rotation announcement, the one record
+//!   that cannot be addressed to any inbox generation — keeps the same property
+//!   by a different route: it takes a device *id* and looks the agreement key up
+//!   in the person's own roster, so its reachable addresses are exactly this
+//!   person's active devices and nothing else.
 //! * **Opening is roster-gated.** [`core_open_sync_record`] needs the inbox
 //!   secret to decrypt at all, then re-checks three independent facts against
 //!   the *own* roster: the record names this person, it was sealed under the
@@ -240,8 +245,10 @@ pub fn core_sync_kind_is_stream(kind: SyncRecordKind) -> bool {
 /// persists; the shell keeps it in platform-protected storage.
 ///
 /// `generation` is the counter [`Roster::inbox_key_generation`] carries. §10
-/// bumps it and rotates the key on every revocation; WP5 owns that ceremony,
-/// and [`core_rotate_inbox_key`] is the primitive it will reach for.
+/// bumps it and rotates the key on every revocation, through
+/// [`core_rotate_inbox_key`]; `revocation.rs` is the ceremony that reaches for
+/// it, and [`core_seal_sync_handoff`] is how the result gets to a sibling that
+/// does not have it yet.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct InboxKey {
     /// Matches [`Roster::inbox_key_generation`] for the roster this key belongs
@@ -600,6 +607,13 @@ pub enum SyncRecordRejection {
     UnknownAuthorDevice,
     /// The device signature does not verify in the sync-record domain.
     SignatureInvalid,
+    /// §10.1's rotation handoff carries one kind and one kind only
+    /// ([`SyncRecordKind::OwnRoster`]). The handoff channel is sealed to a
+    /// sibling's *device* key rather than to the inbox key, so it is the one
+    /// channel that survives a rotation — and therefore the one channel that
+    /// must never become a general-purpose way to bypass
+    /// [`SyncRecordRejection::StaleInboxKey`].
+    NotARotationHandoff,
 }
 
 /// The SYNC-3 gate on an opened record, against this person's own roster.
@@ -618,11 +632,54 @@ pub fn core_sync_record_admit(
     inbox_key_generation: u64,
     own_roster: Roster,
 ) -> Option<SyncRecordRejection> {
+    admit(record, Some(inbox_key_generation), own_roster)
+}
+
+/// The SYNC-3 gate for §10.1's **rotation handoff**: the same checks as
+/// [`core_sync_record_admit`] with exactly two differences, and both are forced
+/// by what the handoff is for.
+///
+/// * The [`SyncRecordRejection::StaleInboxKey`] check is dropped. A handoff is
+///   sealed to a sibling's device key, not to an inbox key, precisely because
+///   the generation it announces is one the receiver does not hold yet —
+///   refusing it for naming a generation the receiver has not got would refuse
+///   every rotation there will ever be.
+/// * The kind is pinned to [`SyncRecordKind::OwnRoster`]. Dropping the
+///   generation check is a real weakening, so it is confined to the one payload
+///   that carries a roster and its new key. History, watermarks, contacts,
+///   groups and settings keep the strict gate; there is no way to smuggle them
+///   through this door.
+///
+/// Everything else is unchanged and load-bearing: the record must name this
+/// person, its author must be an active — not tombstoned (DL-4, §10.3) —
+/// device of the roster the receiver holds *now*, and its device signature must
+/// verify. So a revoked device cannot announce a rotation of its own.
+#[uniffi::export]
+pub fn core_sync_handoff_admit(
+    record: SyncRecord,
+    own_roster: Roster,
+) -> Option<SyncRecordRejection> {
+    if record.kind != SyncRecordKind::OwnRoster {
+        return Some(SyncRecordRejection::NotARotationHandoff);
+    }
+    admit(record, None, own_roster)
+}
+
+/// The shared body of the two gates above. `inbox_key_generation` is `None` on
+/// the §10.1 handoff path and `Some` everywhere else; nothing else differs, so
+/// the two can never drift on the checks they do share.
+fn admit(
+    record: SyncRecord,
+    inbox_key_generation: Option<u64>,
+    own_roster: Roster,
+) -> Option<SyncRecordRejection> {
     if record.person_id != own_roster.person_id {
         return Some(SyncRecordRejection::ForeignPerson);
     }
-    if record.inbox_key_generation != inbox_key_generation {
-        return Some(SyncRecordRejection::StaleInboxKey);
+    if let Some(generation) = inbox_key_generation {
+        if record.inbox_key_generation != generation {
+            return Some(SyncRecordRejection::StaleInboxKey);
+        }
     }
     if record.author_device_id.len() != DEVICE_ID_LEN
         || record.author_device_id[..] == LEGACY_DEVICE_ID[..]
@@ -741,6 +798,210 @@ fn sync_rejection_error(rejection: SyncRecordRejection) -> CoreError {
         SyncRecordRejection::UnknownAuthorDevice => {
             CoreError::Crypto("sync record is authored by an unknown device".to_string())
         }
+        SyncRecordRejection::NotARotationHandoff => CoreError::Crypto(
+            "only an own-roster record may ride the rotation handoff channel".to_string(),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §10.1's rotation handoff
+// ---------------------------------------------------------------------------
+
+/// **Seal §10.1's rotation announcement to ONE sibling device.**
+///
+/// Every other sync record is sealed to the person's [`InboxKey`], and a
+/// revocation is precisely the moment that key stops being a safe address. The
+/// record that *announces* the rotation cannot use either generation of it:
+///
+/// * sealed under the **old** generation it hands the device being buried the
+///   very secret the rotation exists to take away — §10's threat model assumes
+///   the revoked device is hostile and keeps everything it ever saw, so this is
+///   not a small window, it is the whole revocation undone; and
+/// * sealed under the **new** generation it cannot be opened by the surviving
+///   siblings, who do not have that key yet. That is the announcement's job.
+///
+/// So the announcement — and, by [`core_sync_handoff_admit`]'s kind check, only
+/// the announcement — is sealed once per surviving sibling to that sibling's
+/// `device_agree_pk`. A revoked device holds no sibling's device secret, which
+/// is what makes this the one channel the thief cannot read. It costs one copy
+/// per surviving device, bounded by §14.3's hard cap of 16, once per revocation.
+///
+/// # The address is a roster lookup, never a key the caller supplies
+///
+/// This module's boundary rests on [`core_seal_sync_record`] having no parameter
+/// that accepts a bare public key, so a sync record cannot be addressed at a
+/// contact even by mistake. That property is preserved here rather than spent:
+/// the caller names a `recipient_device_id`, and the agreement key is read out
+/// of the certificate `own_roster` carries for it (§4). The only reachable
+/// addresses are therefore this person's own active devices — a contact's key is
+/// unreachable because no certificate in this person's roster holds one, and,
+/// which is the point of the whole exercise, **a device this roster has
+/// tombstoned is unreachable too** (DL-4, §10.3). The announcement cannot be
+/// addressed to the phone whose removal it announces.
+///
+/// Pass the roster the revocation *produced*, not the one it superseded: the
+/// surviving devices are the ones the new document lists, and that is exactly
+/// the set to be told.
+///
+/// Note what is *not* relaxed. The record still carries its ordinary device
+/// signature, the outer envelope is still [`crate::seal_message`]'s, and the
+/// receiver still runs the full roster gate. This changes the address, not the
+/// authority.
+#[uniffi::export]
+pub fn core_seal_sync_handoff(
+    record: SyncRecord,
+    author: Identity,
+    own_roster: Roster,
+    recipient_device_id: Vec<u8>,
+) -> Result<SealedSyncRecord, CoreError> {
+    if record.kind != SyncRecordKind::OwnRoster {
+        return Err(sync_rejection_error(
+            SyncRecordRejection::NotARotationHandoff,
+        ));
+    }
+    if record.person_id != author.user_id && record.author_device_id != author.user_id {
+        return Err(CoreError::Crypto(
+            "a rotation handoff is sealed either by the person it names or by the device that \
+             authored it, and this key is neither"
+                .to_string(),
+        ));
+    }
+    if record.signature.len() != SIGNATURE_LEN {
+        return Err(CoreError::SignatureInvalid);
+    }
+    if record.person_id != own_roster.person_id {
+        return Err(CoreError::Crypto(
+            "a rotation handoff is addressed inside one person's device set, and this roster is \
+             somebody else's"
+                .to_string(),
+        ));
+    }
+    if own_roster
+        .tombstones
+        .iter()
+        .any(|tombstone| tombstone.device_id == recipient_device_id)
+    {
+        return Err(CoreError::Crypto(
+            "a rotation handoff is never addressed to a device this roster has revoked".to_string(),
+        ));
+    }
+    let recipient = own_roster
+        .devices
+        .iter()
+        .find(|cert| cert.device_id() == recipient_device_id)
+        .ok_or_else(|| {
+            CoreError::Crypto(
+                "a rotation handoff is addressed to a device this roster lists, and it lists no \
+                 such device"
+                    .to_string(),
+            )
+        })?;
+    let sealed_for = record.roster_version;
+    let inbox_key_generation = record.inbox_key_generation;
+    let sealed = seal_message(
+        author,
+        recipient.device_agree_pk.clone(),
+        core_encode_sync_record(record)?,
+    )?;
+    Ok(SealedSyncRecord {
+        sealed,
+        sealed_for,
+        inbox_key_generation,
+    })
+}
+
+/// Open §10.1's rotation announcement with this device's own X25519 secret.
+///
+/// `own_roster` is the roster this device holds **now** — the pre-rotation one,
+/// because the whole point of the record inside is to replace it. It is what
+/// answers "is the device that sealed this one of mine, and is it still allowed
+/// to speak" (DL-4, §10.3): a device this roster has already buried cannot
+/// announce anything, inner signature or outer.
+///
+/// Deciding whether the roster *inside* supersedes what is stored is not this
+/// function's business and deliberately so — that is DL-1's ordering, owned by
+/// the monotone writers
+/// ([`crate::MessageStore::adopt_own_roster`],
+/// [`crate::MessageStore::core_set_own_sync_context`]) that refuse to go
+/// backwards. This function answers only "may I believe these bytes came from a
+/// device of mine".
+///
+/// # The recovery path's handoff is signed by a device this roster never listed
+///
+/// The rule above — the signer must be an active device of the roster held
+/// **now** — is exactly right for the ordinary revocation and exactly wrong for
+/// §14.2's. A recovery happens on a *new* phone: the person opens the
+/// passphrase-encrypted `.cmbak`, and the roster the root signs at the next
+/// epoch introduces a device nobody has ever seen. Its rotation announcement is
+/// therefore signed by a device no surviving sibling holds a certificate for,
+/// so a strict held-roster gate refuses it as
+/// [`SyncRecordRejection::UnknownAuthorDevice`] — and the recovery reaches
+/// nobody. The one ceremony that exists to rescue a fleet from a stolen phone
+/// would be the one ceremony the fleet could not hear.
+///
+/// So the gate has a second acceptable answer, and every part of it is
+/// load-bearing. The signer may instead be an active device of the roster
+/// carried **inside** the record, provided that roster:
+///
+/// * validates to `person_root_sign_pk` — the root the receiver *already*
+///   holds, never a key the document supplies, which is what stops a stranger
+///   from bootstrapping their own fleet into this person's boundary; and
+/// * is accepted over the held one by [`crate::core_roster_accept`], so DL-1's
+///   ordering, DL-4's tombstones and §14.2's "only the root raises the epoch"
+///   all apply before a single new signer is trusted. A stolen device cannot
+///   take this door: it cannot sign a higher epoch, and within its own epoch it
+///   is already listed, so it gains nothing it did not have.
+///
+/// The quarantine bit is deliberately not consulted here — `false` is passed —
+/// because this function answers "may I believe these bytes", and a quarantined
+/// person's document is believable and merely not adoptable.
+/// [`crate::MessageStore::adopt_revocation_handoff`] runs the same acceptance
+/// again with the stored quarantine state, and that is the call that decides.
+#[uniffi::export]
+pub fn core_open_sync_handoff(
+    sealed: Vec<u8>,
+    own_device_agree_sk: Vec<u8>,
+    own_roster: Roster,
+    person_root_sign_pk: Vec<u8>,
+) -> Result<SyncRecord, CoreError> {
+    let opened = open_sealed_with_agree_sk(&own_device_agree_sk, &sealed)?;
+    let record = core_decode_sync_record(opened.payload)?;
+    if outer_signer_is_own(&opened.sender_user_id, &own_roster)
+        && core_sync_handoff_admit(record.clone(), own_roster.clone()).is_none()
+    {
+        return Ok(record);
+    }
+    // The recovery door. Anything that fails it reports the ORDINARY gate's
+    // rejection, because that is the one a caller can act on: "this came from
+    // a device I do not know" is the truth about a forgery, and burying it
+    // under a recovery-specific error would make every ordinary failure read
+    // like a recovery that went wrong.
+    let ordinary = || match core_sync_handoff_admit(record.clone(), own_roster.clone()) {
+        Some(rejection) => sync_rejection_error(rejection),
+        None => CoreError::Crypto(
+            "rotation handoff was not sealed by this person's own device set".to_string(),
+        ),
+    };
+    let Ok(payload) = crate::core_decode_sync_own_roster(record.payload.clone()) else {
+        return Err(ordinary());
+    };
+    let carried = payload.roster;
+    let decision = crate::core_roster_accept(
+        Some(own_roster.clone()),
+        false,
+        carried.clone(),
+        person_root_sign_pk,
+    );
+    if decision.outcome != crate::RosterUpdateOutcome::Accepted {
+        return Err(ordinary());
+    }
+    if !outer_signer_is_own(&opened.sender_user_id, &carried) {
+        return Err(ordinary());
+    }
+    match core_sync_handoff_admit(record.clone(), carried) {
+        None => Ok(record),
+        Some(_) => Err(ordinary()),
     }
 }
 

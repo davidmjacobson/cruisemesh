@@ -510,7 +510,9 @@ pub struct Roster {
     pub tombstones: Vec<DeviceTombstone>,
     /// The device currently holding the roster-signing role (§3).
     pub approving_device_id: Vec<u8>,
-    /// §6; bumped on every revocation. WP5 rotates the key itself.
+    /// §6; bumped on every revocation, and never alone: `revocation.rs` mints
+    /// new key material in the same update, because a generation that climbed
+    /// over the same key is a number a revoked device can ignore.
     pub inbox_key_generation: u64,
     /// The key that signed this document: the approving device, or the person
     /// root (genesis and recovery).
@@ -1089,7 +1091,35 @@ pub enum RosterUpdateReason {
     /// A roster's `inbox_key_generation` never goes backwards within one
     /// recovery epoch (§6).
     InboxGenerationRegressed,
+    /// DL-1's ceiling: the incoming roster's `(recovery_epoch, seq)` climbs
+    /// further above the stored one than any honest sequence of ceremonies
+    /// could ([`ROSTER_MAX_VERSION_JUMP`]).
+    VersionJumpTooLarge,
 }
+
+/// How far above the stored version a single incoming roster may claim to be
+/// (DL-1).
+///
+/// DL-1 says higher wins, and a document is free to claim any number. That is
+/// fine for ordering and catastrophic for headroom: a roster at
+/// `seq = u64::MAX` is accepted by a pure "is it higher" rule and then pins the
+/// person shut forever, because the honest approving device's next revocation
+/// can only be at `seq + 1` and there is no `+ 1` left. The person's own
+/// remedies stop working — this is the same denial of service the epoch clamp
+/// closes on the relay side, aimed at the roster instead.
+///
+/// A million is the bound, and the two directions it has to survive are very
+/// different sizes. Upward, a person would have to link and revoke devices a
+/// million times to reach it — decades of it, and the §14.3 hard cap of 16
+/// devices means every one of those is a deliberate ceremony. Downward, a
+/// device that has been dark for years and comes back to a fleet that moved on
+/// must still be able to catch up in one document, and a million is enormously
+/// more than the few hundred a real family accumulates.
+///
+/// It bounds the jump rather than the value, so nothing here caps how far a
+/// person's roster may travel over a lifetime; it only refuses to travel that
+/// far in one step, from a document that arrived over gossip.
+pub const ROSTER_MAX_VERSION_JUMP: u64 = 1_000_000;
 
 /// The verdict, plus the quarantine bit the caller must persist.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Record)]
@@ -1190,6 +1220,56 @@ pub(crate) fn non_surfacing_device_count_outcome(outcome: DeviceAddOutcome) -> D
     }
 }
 
+/// DL-2's one refinement: **the person root itself, at a strictly higher
+/// recovery epoch, is heard through a quarantine.**
+///
+/// DL-2 says never auto-resolve a fork, and the rule it is protecting is that
+/// two documents at one version mean somebody signed twice and no *arithmetic*
+/// can tell which one the person meant. Every device key in the fleet is a
+/// candidate author of both branches, so nothing a device signs is evidence.
+///
+/// The person root is the exception, and it is the only one. §14.2 keeps it
+/// inside the passphrase-encrypted `.cmbak` and off every linked device, so a
+/// thief holding a stolen phone provably cannot produce this signature — it is
+/// the single artefact in the system whose existence *is* the person speaking.
+/// A quarantine that ignored it would mean a fork the attacker caused could
+/// never be cleared by the owner at all: the recovery ceremony is the remedy,
+/// and refusing the remedy because the attack succeeded is the wrong end of
+/// the rule. This is not a fork auto-resolving; it is the person resolving it,
+/// with the one credential a person has and an attacker does not.
+///
+/// Three conditions, all required:
+///
+/// * a roster is **stored** — with no baseline there is no epoch to be
+///   strictly higher than, and a first roster arriving into a quarantine is
+///   still refused;
+/// * `recovery_epoch` is **strictly** higher than the stored one, so a root
+///   re-signing within the forked epoch changes nothing; and
+/// * the signer is the person root itself, byte for byte.
+///
+/// Everything else stays quarantined, and the document still has to survive
+/// [`validate`], DL-4's tombstones, and §6's generation rule afterwards —
+/// piercing the quarantine buys a hearing, not an acceptance. Once one is
+/// accepted the sticky bit clears with it, because the branch that caused the
+/// fork now sits below an epoch nothing can extend.
+///
+/// The other half of the resolution seam is
+/// [`crate::MessageStore::clear_roster_quarantine`], for the case where there
+/// is no recovery to be had and a person clears the state by hand after
+/// verifying out of band.
+fn pierces_quarantine(
+    stored: &Option<Roster>,
+    incoming: &Roster,
+    person_root_sign_pk: &[u8],
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    stored.person_id == incoming.person_id
+        && incoming.recovery_epoch > stored.recovery_epoch
+        && incoming.signer_sign_pk == person_root_sign_pk
+}
+
 /// Everything [`core_roster_accept`] decides *except* §14.3: DL-1 ordering,
 /// DL-2 quarantine, DL-4 tombstones, and the [`validate`] gate.
 fn ordering_verdict(
@@ -1198,9 +1278,10 @@ fn ordering_verdict(
     incoming: Roster,
     person_root_sign_pk: Vec<u8>,
 ) -> RosterUpdateDecision {
-    // DL-2: quarantine is sticky and is checked before anything else, so no
-    // amount of later well-formed traffic can lift it.
-    if stored_quarantined {
+    // DL-2: quarantine is sticky and is checked before almost everything else,
+    // so no amount of later well-formed traffic can lift it. The single
+    // exception below is not "later well-formed traffic".
+    if stored_quarantined && !pierces_quarantine(&stored, &incoming, &person_root_sign_pk) {
         return decision(
             RosterUpdateOutcome::ForkQuarantined,
             RosterUpdateReason::PersonQuarantined,
@@ -1252,6 +1333,25 @@ fn ordering_verdict(
             };
         }
         std::cmp::Ordering::Greater => {}
+    }
+
+    // DL-1's ceiling. Refused before the authority rules below rather than
+    // after, because an absurd climb is not a document worth reasoning about:
+    // whichever half of the version it inflated, accepting it would leave this
+    // person unable to be revoked from ever again. See
+    // [`ROSTER_MAX_VERSION_JUMP`].
+    if incoming
+        .recovery_epoch
+        .saturating_sub(stored.recovery_epoch)
+        > ROSTER_MAX_VERSION_JUMP
+        || (incoming.recovery_epoch == stored.recovery_epoch
+            && incoming.seq.saturating_sub(stored.seq) > ROSTER_MAX_VERSION_JUMP)
+    {
+        return decision(
+            RosterUpdateOutcome::Ignored,
+            RosterUpdateReason::VersionJumpTooLarge,
+            false,
+        );
     }
 
     // §14.2: only the recovery material may raise the epoch. The approving
@@ -2589,6 +2689,95 @@ mod tests {
         assert!(
             decision.quarantined,
             "DL-2 quarantine is never auto-resolved"
+        );
+    }
+
+    /// DL-2's one refinement (MD-ROSTER-FORK-ROOT-PIERCE): the person root, at
+    /// a strictly higher recovery epoch, is heard through the quarantine.
+    ///
+    /// It is the only signature a thief provably cannot produce, so honouring
+    /// it is the person resolving the fork rather than arithmetic resolving
+    /// it — and refusing it would mean a fork an attacker caused could never
+    /// be cleared by the owner at all.
+    #[test]
+    fn dl2_quarantine_yields_only_to_the_person_root_at_a_higher_epoch() {
+        let stored = core_sign_roster(
+            unsigned_roster(2, 0, vec![approving_cert()], Vec::new()),
+            ROOT_SK.to_vec(),
+        )
+        .expect("signs");
+
+        // The recovery ceremony's document: root-signed, next epoch, seq 0.
+        let recovery = core_sign_roster(
+            unsigned_roster(3, 0, vec![approving_cert()], Vec::new()),
+            ROOT_SK.to_vec(),
+        )
+        .expect("signs");
+        let decision = accept(Some(stored.clone()), true, recovery.clone());
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Accepted);
+        assert_eq!(decision.reason, RosterUpdateReason::Superseded);
+        assert!(
+            !decision.quarantined,
+            "the branch that forked now sits below an epoch nothing can extend"
+        );
+
+        // A stolen approving device cannot take this door: it cannot sign the
+        // epoch at all (§14.2), and within its own epoch it gains nothing it
+        // did not already have.
+        let thief_at_a_higher_epoch = core_sign_roster(
+            unsigned_roster(3, 0, vec![approving_cert()], Vec::new()),
+            DEVICE_A_SK.to_vec(),
+        )
+        .expect("signs");
+        assert_eq!(
+            accept(Some(stored.clone()), true, thief_at_a_higher_epoch).reason,
+            RosterUpdateReason::PersonQuarantined
+        );
+        // Nor does the root re-signing WITHIN the forked epoch: the same epoch
+        // is not a resolution, it is another document in the argument.
+        let root_same_epoch = core_sign_roster(
+            unsigned_roster(2, 1, vec![approving_cert()], Vec::new()),
+            ROOT_SK.to_vec(),
+        )
+        .expect("signs");
+        assert_eq!(
+            accept(Some(stored), true, root_same_epoch).reason,
+            RosterUpdateReason::PersonQuarantined
+        );
+        // And with no stored roster there is no epoch to be strictly higher
+        // than, so a quarantine with nothing behind it stays shut.
+        assert_eq!(
+            accept(None, true, recovery).reason,
+            RosterUpdateReason::PersonQuarantined
+        );
+    }
+
+    /// DL-1's ceiling. A roster at `u64::MAX` is "higher" and would pin the
+    /// person shut forever: the honest approving device's next revocation can
+    /// only be at `seq + 1`, and there is no `+ 1` left.
+    #[test]
+    fn an_absurd_version_climb_is_refused_rather_than_accepted_as_higher() {
+        let stored = roster_at(2, 1);
+        assert_eq!(
+            accept(Some(stored.clone()), false, roster_at(2, u64::MAX)).reason,
+            RosterUpdateReason::VersionJumpTooLarge
+        );
+        assert_eq!(
+            accept(Some(stored.clone()), false, roster_at(u64::MAX, 1)).reason,
+            RosterUpdateReason::VersionJumpTooLarge,
+            "and the epoch half is bounded before §14.2's authority rule runs"
+        );
+        // The bound is on the JUMP, not on the value, and it sits far above
+        // anything a real fleet accumulates -- a device dark for years still
+        // catches up in one document.
+        assert_eq!(
+            accept(
+                Some(stored),
+                false,
+                roster_at(2, 1 + ROSTER_MAX_VERSION_JUMP)
+            )
+            .outcome,
+            RosterUpdateOutcome::Accepted
         );
     }
 

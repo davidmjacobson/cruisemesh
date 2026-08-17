@@ -69,6 +69,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
+use ed25519_dalek::{Signature, VerifyingKey};
+use rand_core::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -387,6 +389,34 @@ pub const DEFAULT_DEPOSIT_PRESENCE_QUERIES: u32 = 4;
 /// seconds. Matches the client's own re-ask floor.
 pub const DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS: u64 = 900;
 
+/// `POST /family/rotate` allowance, per family per
+/// [`DEFAULT_ROTATION_WINDOW_SECS`], charged against a bucket of its own.
+///
+/// It cannot share the family's request bucket, and the reason is the whole
+/// point of the route: rotation is the *remedy* for a family whose credential
+/// is in hostile hands, and the device holding that credential can burn the
+/// family's shared request allowance at will. Charging the remedy to the
+/// bucket the attacker controls would let the attacker make the remedy
+/// unreachable — the family would be rate-limited out of locking its own
+/// thief out.
+///
+/// Small on purpose in the other direction too: a rotation is a rare ceremony
+/// (a device revocation, not a sync), each one rewrites every row the family
+/// owns, and a client that loses a response retries with the *same* token,
+/// which converges rather than rotating again.
+///
+/// The bucket is charged per *attempt*, before the request shape is even
+/// validated, which is deliberate — a caller must not be able to hammer the
+/// route for free by sending garbage — and it is what sets the number. Ten
+/// per hour leaves a real ceremony (one rotation, a couple of retries through
+/// a bad connection) room to spare even if the client also fumbles the
+/// request shape several times on the way, and leaves nothing else room at
+/// all.
+pub const DEFAULT_ROTATION_REQUESTS: u32 = 10;
+
+/// The window [`DEFAULT_ROTATION_REQUESTS`] is spread over, in seconds.
+pub const DEFAULT_ROTATION_WINDOW_SECS: u64 = 3600;
+
 /// CP4: class prefix that marks a deposit token. Mirrors
 /// `core/src/relay_wire.rs::RELAY_DEPOSIT_TOKEN_PREFIX` — golden vectors in
 /// both crates pin the two implementations together. Member tokens are
@@ -427,6 +457,125 @@ pub fn deposit_token_for(member_token: &str) -> String {
 /// it can gate validation before any lookup.
 pub fn is_deposit_token(token: &str) -> bool {
     token.trim().starts_with(DEPOSIT_TOKEN_PREFIX)
+}
+
+/// Whether a string is shaped like a stable family id rather than a token.
+/// Provisioning and rotation both refuse tokens that answer `true` here, which
+/// is what keeps `/admin/families/{id}` unambiguous (`resolve_family_on`).
+pub fn is_family_id(value: &str) -> bool {
+    value.trim().starts_with(FAMILY_ID_PREFIX)
+}
+
+/// Mint a fresh stable family id. Called once per family, at provisioning.
+fn mint_family_id() -> String {
+    let mut bytes = [0u8; FAMILY_ID_RANDOM_BYTES];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    format!("{FAMILY_ID_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// The exact bytes a rotation authority signs (`ROTATION_SIGNING_DOMAIN`).
+///
+/// Both tokens are length-prefixed with a big-endian `u16`, which
+/// `MAX_FAMILY_TOKEN_LEN` (1024) guarantees fits. That framing is what makes
+/// the message injective in the pair: without it, a signature over
+/// (`ab`, `c`) would also read as a signature over (`a`, `bc`), and a
+/// signature captured from one rotation could authorize a different one.
+///
+/// On an idempotent retry the caller presents the new token as its bearer
+/// credential, so `current_token` and `new_token` are the same string and the
+/// signed message binds (new, new). That is a *different* message from the
+/// original (current, new), which is deliberate: the retry is a separate
+/// assertion and has to be signed as one.
+fn rotation_signed_bytes(current_token: &str, new_token: &str) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        ROTATION_SIGNING_DOMAIN.len() + 4 + current_token.len() + new_token.len(),
+    );
+    message.extend_from_slice(ROTATION_SIGNING_DOMAIN);
+    for token in [current_token, new_token] {
+        message.extend_from_slice(&(token.len() as u16).to_be_bytes());
+        message.extend_from_slice(token.as_bytes());
+    }
+    message
+}
+
+/// The Ed25519 keypair half a rotation presents, already length-checked by
+/// the handler. Raw bytes rather than a parsed `VerifyingKey` because a
+/// malformed key is an authorization failure to be answered with a 403, not a
+/// parse error to be handled at the HTTP boundary — `verify_rotation_signature`
+/// makes that decision in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RotationAuthority {
+    pub public_key: [u8; ROTATION_PK_LEN],
+    pub signature: [u8; ROTATION_SIG_LEN],
+}
+
+/// Verify a rotation signature, returning `false` for every failure mode
+/// rather than distinguishing them.
+///
+/// A key that is not a canonical Ed25519 point, a low-order key, a signature
+/// that does not verify — all of them mean the same thing to the caller: this
+/// request does not carry the family's rotation authority. Nothing here can
+/// panic on attacker-chosen bytes; `VerifyingKey::from_bytes` rejects
+/// non-canonical encodings and `verify_strict` rejects the low-order-key
+/// malleability cases the plain `verify` accepts.
+fn verify_rotation_signature(
+    public_key: &[u8; ROTATION_PK_LEN],
+    message: &[u8],
+    signature: &[u8; ROTATION_SIG_LEN],
+) -> bool {
+    let Ok(verifying_key) = VerifyingKey::from_bytes(public_key) else {
+        return false;
+    };
+    verifying_key
+        .verify_strict(message, &Signature::from_bytes(signature))
+        .is_ok()
+}
+
+/// What checking a presented rotation authority against the stored one
+/// concluded. `Register` is the trust-on-first-rotation case and is the only
+/// one that writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RotationAuthorityCheck {
+    /// The signature verified against the key already on the row.
+    Accepted,
+    /// The row carried no key; the signature verified against the presented
+    /// one, which is therefore this family's rotation key from now on.
+    Register,
+    /// No authority. Everything else lands here.
+    Refused,
+}
+
+/// Decide whether a presented rotation authority may re-key this family.
+///
+/// The stored key wins absolutely once it exists: a presented key that
+/// differs from it is refused without the signature even being examined, so
+/// holding the member token buys nothing. Only when the row carries no key at
+/// all does the presented key get to prove itself — and then it is registered,
+/// which is what closes the door behind it.
+fn check_rotation_authority(
+    stored_pk: Option<&[u8]>,
+    message: &[u8],
+    authority: &RotationAuthority,
+) -> RotationAuthorityCheck {
+    match stored_pk {
+        Some(stored) => {
+            if stored != authority.public_key.as_slice() {
+                return RotationAuthorityCheck::Refused;
+            }
+            if verify_rotation_signature(&authority.public_key, message, &authority.signature) {
+                RotationAuthorityCheck::Accepted
+            } else {
+                RotationAuthorityCheck::Refused
+            }
+        }
+        None => {
+            if verify_rotation_signature(&authority.public_key, message, &authority.signature) {
+                RotationAuthorityCheck::Register
+            } else {
+                RotationAuthorityCheck::Refused
+            }
+        }
+    }
 }
 
 /// CP4: which capability class a presented bearer token resolved to.
@@ -476,6 +625,61 @@ pub const FAMILY_EXPIRY_GRACE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// friend-card `relay_token` validation cap (`core/src/identity.rs`), so any
 /// token the admin API accepts is guaranteed to fit in a friend card.
 pub const MAX_FAMILY_TOKEN_LEN: usize = 1024;
+
+/// Shortest credential `POST /family/rotate` accepts as a family's next member
+/// token (`specs/multi-device-v1.md` §10 step 2).
+///
+/// The rotating client picks its own replacement (see `rotate_family`), which
+/// is what makes the ceremony crash-safe: it writes the candidate down before
+/// the call, so a lost response is recoverable by retrying rather than being a
+/// family locked out of its own mailbox. The cost of letting the client choose
+/// is that the server can no longer vouch for the entropy, so it enforces the
+/// one property it can check from outside: length.
+/// `core_mint_relay_member_token` emits 32 random bytes base64url-encoded
+/// behind a class prefix, comfortably above this floor.
+///
+/// Operator provisioning (`POST /admin/families`) is deliberately not held to
+/// this — that is a different trust relationship, and tokens already in the
+/// field predate the rule.
+pub const MIN_ROTATION_TOKEN_LEN: usize = 24;
+
+/// Ed25519 domain separator for the `POST /family/rotate` authority
+/// signature. Shape matches every other signing context in this project
+/// (`core/src/device_roster.rs`): a human-readable sentence, versioned,
+/// terminated by a NUL so no context can ever be a prefix of another.
+///
+/// The signed bytes are this, then each token length-prefixed as a big-endian
+/// `u16` followed by its UTF-8 bytes — `current_token` first, `new_token`
+/// second (`rotation_signed_bytes`). Length prefixes rather than a separator
+/// because a separator byte can appear inside a token: two different
+/// (current, new) pairs must never produce the same message, or a signature
+/// captured for one rotation would authorize a different one.
+const ROTATION_SIGNING_DOMAIN: &[u8] = b"CruiseMesh family token rotation v1\0";
+
+/// An Ed25519 public key is 32 bytes and a signature is 64. Both arrive
+/// base64url without padding, and a wrong length is a malformed request (400)
+/// rather than a failed authorization (403): the caller's remedy is to fix its
+/// encoder, not to find a different key.
+const ROTATION_PK_LEN: usize = 32;
+const ROTATION_SIG_LEN: usize = 64;
+
+/// Class prefix on `families.family_id`, the stable handle a family keeps
+/// across rotations.
+///
+/// It is deliberately its own prefix, distinct from `cmfam1-` (member tokens)
+/// and `DEPOSIT_TOKEN_PREFIX` (`cmdep1-`), because
+/// `GET/PATCH/DELETE /admin/families/{id}` resolves its path segment as
+/// *either* a family id or a current token. Two namespaces sharing one path
+/// segment are only unambiguous if no string can plausibly be in both, so
+/// provisioning and rotation both refuse a token wearing this prefix — the
+/// same discipline CP4 already applies to the deposit prefix.
+pub const FAMILY_ID_PREFIX: &str = "cmfid1-";
+
+/// Random bytes behind `FAMILY_ID_PREFIX`. Nine bytes is twelve base64url
+/// characters — short enough for an operator to read off a dashboard and type
+/// into a curl, and 72 bits is far past what a relay holding a few thousand
+/// families could collide by accident.
+const FAMILY_ID_RANDOM_BYTES: usize = 9;
 
 /// Page size for `GET /admin/families` when the caller doesn't ask for one.
 pub const DEFAULT_FAMILY_LIST_LIMIT: usize = 100;
@@ -539,6 +743,12 @@ pub struct RateLimitConfig {
     /// family's allowance (`PRESENCE-01`).
     pub deposit_presence_queries: u32,
     pub deposit_presence_window_secs: u64,
+    /// `POST /family/rotate`: rotations allowed per family per
+    /// `rotation_window_secs`. Its own dimension for the reason spelled out
+    /// on [`DEFAULT_ROTATION_REQUESTS`] — the remedy must not be charged to
+    /// the bucket the device being revoked can exhaust.
+    pub rotation_requests: u32,
+    pub rotation_window_secs: u64,
 }
 
 impl Default for RateLimitConfig {
@@ -551,6 +761,8 @@ impl Default for RateLimitConfig {
             global_requests_per_min: DEFAULT_RATE_GLOBAL_REQUESTS_PER_MIN,
             deposit_presence_queries: DEFAULT_DEPOSIT_PRESENCE_QUERIES,
             deposit_presence_window_secs: DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS,
+            rotation_requests: DEFAULT_ROTATION_REQUESTS,
+            rotation_window_secs: DEFAULT_ROTATION_WINDOW_SECS,
         }
     }
 }
@@ -671,14 +883,28 @@ struct FamilyBuckets {
     /// (`PRESENCE-01`). Member-class presence is an ordinary read and still
     /// charges `requests`.
     presence: TokenBucket,
+    /// `POST /family/rotate`. A fourth dimension for the same reason presence
+    /// is a third one, but pointing the other way: presence is separate so a
+    /// stranger's flood cannot starve the family, and rotation is separate so
+    /// the family's own exhausted (or maliciously exhausted) request
+    /// allowance cannot deny it the one call that evicts the thief. Charged
+    /// by `AppState::check_rotation_rate_limit` and by nothing else.
+    rotation: TokenBucket,
 }
 
 impl FamilyBuckets {
     /// CP4: capacities are passed per credential class
     /// (`RateLimitConfig::allowances_for`) — one bucket map holds member and
     /// deposit entries side by side, keyed by the presented credential.
-    fn new(requests_per_min: u32, bytes_per_min: u64, presence: (u32, u64), now: Instant) -> Self {
+    fn new(
+        requests_per_min: u32,
+        bytes_per_min: u64,
+        presence: (u32, u64),
+        rotation: (u32, u64),
+        now: Instant,
+    ) -> Self {
         let (presence_queries, presence_window_secs) = presence;
+        let (rotation_requests, rotation_window_secs) = rotation;
         Self {
             requests: TokenBucket::per_minute(f64::from(requests_per_min), now),
             bytes: TokenBucket::per_minute(bytes_per_min as f64, now),
@@ -687,6 +913,24 @@ impl FamilyBuckets {
                 presence_window_secs as f64,
                 now,
             ),
+            rotation: TokenBucket::per_window(
+                f64::from(rotation_requests),
+                rotation_window_secs as f64,
+                now,
+            ),
+        }
+    }
+
+    /// Charge one rotation attempt. Touches neither `requests` nor `bytes`;
+    /// see the field comment for why that separation is load-bearing.
+    fn try_take_rotation(&mut self, now: Instant) -> Result<(), (RateLimitScope, u64)> {
+        if self.rotation.try_take(1.0, now) {
+            Ok(())
+        } else {
+            Err((
+                RateLimitScope::RotationRequests,
+                self.rotation.retry_after_secs(1.0),
+            ))
         }
     }
 
@@ -744,6 +988,7 @@ enum RateLimitScope {
     FamilyBytes,
     GlobalRequests,
     PresenceQueries,
+    RotationRequests,
 }
 
 impl RateLimitScope {
@@ -754,6 +999,7 @@ impl RateLimitScope {
             Self::FamilyBytes => "family_bytes",
             Self::GlobalRequests => "global_requests",
             Self::PresenceQueries => "presence_queries",
+            Self::RotationRequests => "rotation_requests",
         }
     }
 
@@ -765,6 +1011,7 @@ impl RateLimitScope {
             Self::FamilyBytes => "family upload byte rate limit",
             Self::GlobalRequests => "server-wide request rate limit",
             Self::PresenceQueries => "cross-family presence query rate limit",
+            Self::RotationRequests => "family token rotation rate limit",
         }
     }
 }
@@ -782,6 +1029,14 @@ impl RateLimitScope {
 /// which, past an idle window several times the one-minute capacity, it
 /// always is. Dropping a full bucket is equivalent to keeping it: a
 /// re-created one also starts full.
+///
+/// *Every* dimension has to answer that question, not just the two
+/// per-minute ones. The presence and rotation buckets refill across windows
+/// (fifteen minutes, an hour) far longer than the idle threshold, so a caller
+/// that spent them and then went quiet for five minutes would have its entry
+/// dropped and re-created full — turning eviction into a way to buy back an
+/// allowance that had not actually refilled. Asking all four means an entry
+/// is only ever dropped when re-creating it hands back nothing.
 fn evict_idle_rate_buckets(buckets: &mut HashMap<String, FamilyBuckets>, now: Instant) {
     buckets.retain(|_, family| {
         let idle_for = now.saturating_duration_since(family.requests.last_refill);
@@ -790,7 +1045,12 @@ fn evict_idle_rate_buckets(buckets: &mut HashMap<String, FamilyBuckets>, now: In
         }
         family.requests.refill(now);
         family.bytes.refill(now);
-        !(family.requests.is_full() && family.bytes.is_full())
+        family.presence.refill(now);
+        family.rotation.refill(now);
+        !(family.requests.is_full()
+            && family.bytes.is_full()
+            && family.presence.is_full()
+            && family.rotation.is_full())
     });
 }
 
@@ -1019,10 +1279,10 @@ impl AppState {
     /// prevent. Authorization first means an attacker can only ever occupy
     /// entries for tokens they already hold.
     ///
-    /// CP4: buckets are keyed by `access.rate_key` — the presented member
-    /// *or* deposit token — with per-class capacities, so friend-card
-    /// (deposit) traffic exhausts its own tighter allowance and never eats
-    /// into the family's member-class buckets.
+    /// CP4: buckets are keyed by `access.rate_key` — the family's stable key
+    /// namespaced by the presented credential's class — with per-class
+    /// capacities, so friend-card (deposit) traffic exhausts its own tighter
+    /// allowance and never eats into the family's member-class buckets.
     fn check_rate_limit(
         &self,
         access: &FamilyAccess,
@@ -1034,11 +1294,7 @@ impl AppState {
             buckets.try_take(requests, bytes, now)
         });
         if let Err((scope, retry_after_secs)) = family {
-            return Err(reject_rate_limited(
-                &access.rate_key,
-                scope,
-                retry_after_secs,
-            ));
+            return Err(reject_rate_limited(&access.token, scope, retry_after_secs));
         }
         // Global backstop, requests only: bytes are already bounded per
         // family, and a request cap bounds how many uploads can arrive at
@@ -1054,7 +1310,7 @@ impl AppState {
         };
         if let Some(retry_after_secs) = global_retry_after {
             return Err(reject_rate_limited(
-                &access.rate_key,
+                &access.token,
                 RateLimitScope::GlobalRequests,
                 retry_after_secs,
             ));
@@ -1065,12 +1321,12 @@ impl AppState {
     /// Look this credential's buckets up (creating them at its class's
     /// capacities) and charge them with `charge`.
     ///
-    /// Extracted so the presence dimension cannot accidentally be added to a
-    /// second bucket map, or keyed by anything but `access.rate_key` — the
-    /// presented credential, never the family it resolves to. Keying by the
-    /// family would put a friend-card holder's traffic and the family's own
-    /// traffic in one bucket, which is precisely the starvation this exists
-    /// to prevent.
+    /// Extracted so a new dimension cannot accidentally be added to a second
+    /// bucket map, or keyed by anything but `access.rate_key`. That key is
+    /// class-namespaced for a reason worth restating: dropping the class and
+    /// keying on the family alone would put a friend-card holder's traffic
+    /// and the family's own traffic in one bucket, which is precisely the
+    /// starvation this exists to prevent.
     fn charge_family_buckets<T>(
         &self,
         access: &FamilyAccess,
@@ -1082,15 +1338,60 @@ impl AppState {
             self.rate_limits.deposit_presence_queries,
             self.rate_limits.deposit_presence_window_secs,
         );
+        let rotation = (
+            self.rate_limits.rotation_requests,
+            self.rate_limits.rotation_window_secs,
+        );
         let mut buckets = self.rate_buckets.lock().unwrap_or_else(|e| e.into_inner());
         if buckets.len() >= RATE_BUCKET_EVICT_THRESHOLD {
             evict_idle_rate_buckets(&mut buckets, now);
         }
-        charge(
-            buckets.entry(access.rate_key.clone()).or_insert_with(|| {
-                FamilyBuckets::new(requests_per_min, bytes_per_min, presence, now)
-            }),
-        )
+        charge(buckets.entry(access.rate_key.clone()).or_insert_with(|| {
+            FamilyBuckets::new(requests_per_min, bytes_per_min, presence, rotation, now)
+        }))
+    }
+
+    /// Charge one `POST /family/rotate` attempt against the rotation bucket
+    /// and the global backstop, and nothing else.
+    ///
+    /// The family's request and byte buckets are deliberately untouched. A
+    /// rotation is what a family does *because* a device it no longer trusts
+    /// holds its member token, and that device can spend the shared request
+    /// allowance as fast as the network lets it. If the remedy were charged
+    /// to the bucket the attacker controls, the attacker could hold the
+    /// family's own eviction call at 429 indefinitely — the rate limiter
+    /// would be enforcing the lockout.
+    ///
+    /// The global backstop is still charged, for the server's sake rather
+    /// than the family's: at four per hour per family a rotation flood cannot
+    /// make a dent in it, but nothing authenticated should be entirely
+    /// invisible to the server-wide cap.
+    ///
+    /// Only ever call this after the caller's token has authorized, for the
+    /// reason spelled out on `check_rate_limit`.
+    fn check_rotation_rate_limit(&self, access: &FamilyAccess) -> Result<(), ApiError> {
+        let now = Instant::now();
+        let charged =
+            self.charge_family_buckets(access, now, |buckets| buckets.try_take_rotation(now));
+        if let Err((scope, retry_after_secs)) = charged {
+            return Err(reject_rate_limited(&access.token, scope, retry_after_secs));
+        }
+        let global_retry_after = {
+            let mut global = self.rate_global.lock().unwrap_or_else(|e| e.into_inner());
+            if global.try_take(1.0, now) {
+                None
+            } else {
+                Some(global.retry_after_secs(1.0))
+            }
+        };
+        if let Some(retry_after_secs) = global_retry_after {
+            return Err(reject_rate_limited(
+                &access.token,
+                RateLimitScope::GlobalRequests,
+                retry_after_secs,
+            ));
+        }
+        Ok(())
     }
 
     /// Charge one *cross-family* presence query: the presence bucket, and
@@ -1110,11 +1411,7 @@ impl AppState {
         let charged =
             self.charge_family_buckets(access, now, |buckets| buckets.try_take_presence(now));
         if let Err((scope, retry_after_secs)) = charged {
-            return Err(reject_rate_limited(
-                &access.rate_key,
-                scope,
-                retry_after_secs,
-            ));
+            return Err(reject_rate_limited(&access.token, scope, retry_after_secs));
         }
         let global_retry_after = {
             let mut global = self.rate_global.lock().unwrap_or_else(|e| e.into_inner());
@@ -1126,7 +1423,7 @@ impl AppState {
         };
         if let Some(retry_after_secs) = global_retry_after {
             return Err(reject_rate_limited(
-                &access.rate_key,
+                &access.token,
                 RateLimitScope::GlobalRequests,
                 retry_after_secs,
             ));
@@ -1254,6 +1551,13 @@ impl InsertOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FamilyRow {
     pub token: String,
+    /// Opaque, stable handle for this family, minted at provisioning and
+    /// never changed afterwards (`FAMILY_ID_PREFIX`). The token is not a
+    /// stable identity — `POST /family/rotate` replaces it — so anything that
+    /// must survive a rotation keys on this instead: the rate-limit buckets,
+    /// the per-family WebSocket semaphore, and operator addressing of
+    /// `/admin/families/{id}`.
+    pub family_id: String,
     /// `active` or `suspended`. Revoked families are deleted outright.
     pub status: String,
     pub plan: Option<String>,
@@ -1267,6 +1571,11 @@ pub struct FamilyRow {
     /// provisioning (or by the startup migration for pre-CP4 rows). Rides
     /// friend cards; rejected for everything except `POST /envelopes`.
     pub deposit_token: String,
+    /// WP5 rotation authority: the Ed25519 public key, 32 raw bytes, that is
+    /// allowed to sign this family's token rotations. `None` until the first
+    /// rotation registers one (trust on first rotation) — see
+    /// `rotate_family_token` for what that costs and where it is bounded.
+    pub rotation_pk: Option<Vec<u8>>,
 }
 
 /// A family plus its stored-usage figures, as returned by `list_families`.
@@ -1283,6 +1592,38 @@ pub struct FamilyUsage {
 pub struct FamilyPage {
     pub families: Vec<FamilyUsage>,
     pub total: u64,
+}
+
+/// What `RelayStore::rotate_family_token` did (`specs/multi-device-v1.md`
+/// §10 step 2).
+#[derive(Clone, Debug, PartialEq)]
+pub enum FamilyRotation {
+    /// The family and every row it owned now answer to the new token.
+    Rotated {
+        family: FamilyRow,
+        /// Envelopes carried across — the rotate-then-drain figure. Nothing a
+        /// sibling had not fetched was dropped to make the rotation happen,
+        /// and this is the count that says so out loud.
+        envelopes_moved: u64,
+    },
+    /// The new token is already this family's, so a previous call succeeded
+    /// and its answer was lost. Reported as success: a client retrying after a
+    /// dropped response must converge, not be told it is too late.
+    AlreadyRotated { family: FamilyRow },
+    /// Neither credential names a provisioned family. Reached when a
+    /// static-allowlist deployment tries to rotate (there is no row to
+    /// re-key), or when a rotation is attempted twice from a stale token.
+    UnknownFamily,
+    /// Somebody else already holds the proposed token, as their member or
+    /// their deposit credential.
+    TokenTaken,
+    /// The request did not carry this family's rotation authority: either the
+    /// family already registered a key and this is not it (or not a valid
+    /// signature by it), or no key is registered yet and the presented
+    /// signature does not verify under the presented key. Holding the member
+    /// token is not enough, which is the entire point — the revoked device
+    /// holds it too.
+    Unauthorized,
 }
 
 impl RelayStore {
@@ -1319,6 +1660,10 @@ impl RelayStore {
         // all existing tokens become member class with zero behavior change
         // and their deposit counterparts exist the moment the process is up.
         migrate_families_deposit_token(&conn)?;
+        // WP5: rotation authority + the stable family id. Additive columns
+        // plus a backfill of the id, so an already-deployed database gains
+        // both on the next restart with no operator step and no downtime.
+        migrate_families_rotation_authority(&conn)?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
@@ -1972,10 +2317,17 @@ impl RelayStore {
         // CP4: both credentials are minted together — the deposit token is
         // the deterministic attenuation of the member token, so re-provision
         // (webhook retry, renewal) converges on the same pair.
+        // `family_id` and `rotation_pk` are deliberately absent from the
+        // conflict clause. Re-provisioning is a webhook retry or a renewal of
+        // a family that already exists, and neither may disturb its identity:
+        // a fresh id would orphan the rate buckets and the operator's saved
+        // handle, and clearing the rotation key would hand a revoked device a
+        // second shot at trust-on-first-rotation.
         conn.execute(
             "INSERT INTO families
-                (token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token)
-             VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7)
+                (token, status, plan, quota_bytes, created_ms, expires_ms, note,
+                 deposit_token, family_id)
+             VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(token) DO UPDATE SET
                 status = 'active',
                 plan = excluded.plan,
@@ -1991,6 +2343,7 @@ impl RelayStore {
                 expires_ms,
                 note,
                 deposit_token_for(token),
+                mint_family_id(),
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -2000,6 +2353,14 @@ impl RelayStore {
     pub fn get_family(&self, token: &str) -> Result<Option<FamilyRow>, String> {
         let conn = self.conn.lock().expect("relay store mutex poisoned");
         get_family_on(&conn, token)
+    }
+
+    /// Resolve an operator-supplied handle — stable `family_id` or current
+    /// member token — to its family row. See `resolve_family_on` for the
+    /// resolution order and why both spellings are supported.
+    pub fn resolve_family(&self, id_or_token: &str) -> Result<Option<FamilyRow>, String> {
+        let conn = self.conn.lock().expect("relay store mutex poisoned");
+        resolve_family_on(&conn, id_or_token)
     }
 
     /// CP4: resolve a presented bearer credential (member or deposit) to its
@@ -2040,24 +2401,23 @@ impl RelayStore {
             )
             .map_err(|e| e.to_string())?;
         let mut stmt = conn
-            .prepare(
-                "SELECT f.token, f.status, f.plan, f.quota_bytes, f.created_ms,
-                        f.expires_ms, f.note, f.deposit_token,
+            .prepare(&format!(
+                "SELECT {FAMILY_COLUMNS},
                         COALESCE(SUM(LENGTH(e.sealed)), 0), COUNT(e.id)
                  FROM families f
                  LEFT JOIN envelopes e ON e.family_token = f.token
                  WHERE (?1 IS NULL OR f.status = ?1)
                  GROUP BY f.token
                  ORDER BY f.created_ms ASC, f.token ASC
-                 LIMIT ?2 OFFSET ?3",
-            )
+                 LIMIT ?2 OFFSET ?3"
+            ))
             .map_err(|e| e.to_string())?;
         let families = stmt
             .query_map(params![status_filter, limit as i64, offset as i64], |row| {
                 Ok(FamilyUsage {
                     family: family_row_from(row)?,
-                    usage_bytes: row.get::<_, i64>(8)? as u64,
-                    envelope_count: row.get::<_, i64>(9)? as u64,
+                    usage_bytes: row.get::<_, i64>(10)? as u64,
+                    envelope_count: row.get::<_, i64>(11)? as u64,
                 })
             })
             .map_err(|e| e.to_string())?
@@ -2135,6 +2495,184 @@ impl RelayStore {
         Ok(deleted > 0)
     }
 
+    /// **Re-key a family in place** (`specs/multi-device-v1.md` §10 step 2).
+    ///
+    /// Every table in this schema is scoped by `family_token`, which is
+    /// exactly the hole §10.2 names: a revoked device holding the old token
+    /// can fetch — and ack, which deletes — its siblings' rows indefinitely,
+    /// because the token is the whole of the authorization. Rotating the token
+    /// is what withdraws that, and it is why this is the one family credential
+    /// operation a *client* may perform on itself rather than an operator.
+    ///
+    /// **Rotate, then drain.** Every row moves with the family in one
+    /// transaction: envelopes keep their `id`, their `recipient_hint` and their
+    /// place in the fetch order, so a sibling that was offline for the whole
+    /// ceremony fetches exactly what it would have fetched, from exactly the
+    /// cursor it held, the moment it learns the new token. A rotation that
+    /// dropped un-fetched mail to cut off the thief would be the rotation
+    /// losing mail, which is the one thing it may not do — so nothing here
+    /// deletes.
+    ///
+    /// The old credentials — member *and* its derived deposit token — stop
+    /// resolving the instant this commits. That strands, until the rotation
+    /// gossips to them, every contact still holding a friend card minted from
+    /// the old member token. That cost is accepted deliberately and is not
+    /// widened here: §10 says the propagation window is bounded and the
+    /// old-card repair path is the fallback, and a grace window that kept the
+    /// old credential alive as deposit-class would hand the revoked device a
+    /// capability §10 does not grant it.
+    ///
+    /// **Authority is a signature, not the bearer token.** Possession of the
+    /// member token cannot be what authorizes a rotation, because the device
+    /// this ceremony exists to evict is holding that exact token — authorizing
+    /// on possession would let the thief re-key the family out from under its
+    /// owner, and do it first. So the caller must also sign
+    /// `rotation_signed_bytes(current_token, new_token)` under the family's
+    /// registered rotation key, and that check happens *here*, inside the
+    /// transaction: reading the stored key and writing the re-keyed row in one
+    /// atomic step is what stops two concurrent rotations from both passing a
+    /// check made against a row that then changed underneath them.
+    ///
+    /// Registration is trust on first rotation. A family with no key yet
+    /// registers whichever key signs its first rotation validly; from then on
+    /// that key is the only authority, and a presented key that differs is
+    /// refused without its signature being examined. The consequences of that
+    /// are honest and documented on the `rotate_family` handler.
+    ///
+    /// Idempotent by construction, because a client that loses the response
+    /// must be able to ask again: presenting the *new* token (which is what a
+    /// retry after a lost response can do, and all it can do) reports
+    /// [`FamilyRotation::AlreadyRotated`] rather than re-rotating or failing.
+    /// That path is gated by the same signature check — a retry that anyone
+    /// could make by replaying the new token would be a way to learn a
+    /// rotated family's current credentials from the outside.
+    ///
+    /// **Push registrations are purged rather than carried.** A push
+    /// registration is a per-device wake channel: carrying one across would
+    /// leave the revoked device's APNs token still being woken for the
+    /// rotated family's mail, which is a small but real leak of the family's
+    /// activity to a device that was just cut off — and the relay cannot tell
+    /// the revoked device's registration from a sibling's. Siblings re-register
+    /// on their next round, so the cost is one round of notification latency.
+    /// Envelopes and presence still *move*: rotate-then-drain may not lose
+    /// un-fetched mail, and presence is the family's own announcement about
+    /// itself, not a per-device channel.
+    ///
+    /// A WebSocket the revoked device already had open is not torn down, and
+    /// does not need to be: every query that socket makes is scoped by the
+    /// token it authorized under, which now names zero rows, and every
+    /// broadcast is published under the new token. It goes inert rather than
+    /// being disconnected — the same outcome, without a second mechanism to
+    /// keep correct.
+    pub fn rotate_family_token(
+        &self,
+        current_token: &str,
+        new_token: &str,
+        authority: &RotationAuthority,
+    ) -> Result<FamilyRotation, String> {
+        let mut conn = self.conn.lock().expect("relay store mutex poisoned");
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // Which row this call is about, and whether the work is already done.
+        // A caller presenting the new token is either retrying a rotation
+        // whose answer it lost or asking to rotate a token to itself; both are
+        // the same "already there" answer.
+        let (row, already_rotated) = match get_family_on(&tx, current_token)? {
+            Some(row) if current_token != new_token => (row, false),
+            Some(row) => (row, true),
+            // Not the current token, so either the caller already rotated and
+            // lost the answer, or this family is not in the table at all (a
+            // static env-allowlist deployment). The handler tells those two
+            // apart for the caller. No row means no authority to check
+            // against and nothing to leak by saying so.
+            None => match get_family_on(&tx, new_token)? {
+                Some(row) => (row, true),
+                None => return Ok(FamilyRotation::UnknownFamily),
+            },
+        };
+
+        // Authorization before validation: a caller without the family's
+        // rotation authority learns nothing about whether its proposed token
+        // was available, only that it may not rotate.
+        let message = rotation_signed_bytes(current_token, new_token);
+        match check_rotation_authority(row.rotation_pk.as_deref(), &message, authority) {
+            RotationAuthorityCheck::Refused => return Ok(FamilyRotation::Unauthorized),
+            RotationAuthorityCheck::Accepted => {}
+            RotationAuthorityCheck::Register => {
+                // Trust on first rotation. Written inside the transaction, so
+                // it lands only if this call goes on to commit — a rotation
+                // refused below for a taken token leaves the family exactly as
+                // unregistered as it was, rather than burning its one
+                // first-rotation slot on an attempt that did nothing.
+                tx.execute(
+                    "UPDATE families SET rotation_pk = ?2 WHERE token = ?1",
+                    params![row.token, authority.public_key.as_slice()],
+                )
+                .map_err(|e| e.to_string())?;
+                info!(
+                    family = %token_prefix(&row.token),
+                    "rotation authority registered on first rotation"
+                );
+            }
+        }
+
+        if already_rotated {
+            let family = get_family_on(&tx, &row.token)?
+                .ok_or_else(|| "family vanished during rotation".to_string())?;
+            // Committed rather than rolled back because a first-rotation
+            // registration on this path is a real write that must stick.
+            tx.commit().map_err(|e| e.to_string())?;
+            return Ok(FamilyRotation::AlreadyRotated { family });
+        }
+
+        let new_deposit = deposit_token_for(new_token);
+        // Both halves of the pair must be free. A member token that collided
+        // with another family's deposit token — or vice versa — would make the
+        // `WHERE token = ? OR deposit_token = ?` auth lookup ambiguous, which
+        // is the one thing CP4's class discipline may never become.
+        if get_family_by_credential_on(&tx, new_token)?.is_some()
+            || get_family_by_credential_on(&tx, &new_deposit)?.is_some()
+        {
+            return Ok(FamilyRotation::TokenTaken);
+        }
+        let envelopes_moved = tx
+            .execute(
+                "UPDATE envelopes SET family_token = ?2 WHERE family_token = ?1",
+                params![current_token, new_token],
+            )
+            .map_err(|e| e.to_string())? as u64;
+        // Presence moves: it is the family's own announcement about itself,
+        // and a sibling that slept through the ceremony should not look
+        // offline to its contacts afterwards.
+        tx.execute(
+            "UPDATE presence SET family_token = ?2 WHERE family_token = ?1",
+            params![current_token, new_token],
+        )
+        .map_err(|e| e.to_string())?;
+        // Push registrations do not. See the "purged rather than carried"
+        // paragraph above: each row is one device's wake channel, the revoked
+        // device's is indistinguishable from a sibling's, and a sibling
+        // re-registers on its next round.
+        for table in ["push_registration_hints", "push_registrations"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE family_token = ?1"),
+                params![current_token],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "UPDATE families SET token = ?2, deposit_token = ?3 WHERE token = ?1",
+            params![current_token, new_token, new_deposit],
+        )
+        .map_err(|e| e.to_string())?;
+        let family = get_family_on(&tx, new_token)?
+            .ok_or_else(|| "family vanished during rotation".to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(FamilyRotation::Rotated {
+            family,
+            envelopes_moved,
+        })
+    }
+
     /// `EXPLAIN QUERY PLAN` for the fetch path. Used by tests to ensure the
     /// family+hint+id index is used instead of a table scan. Mirrors
     /// `fetch_envelopes`'s real query (including the FR7 `expiry_ms`
@@ -2199,8 +2737,15 @@ fn family_row_from(row: &rusqlite::Row<'_>) -> Result<FamilyRow, rusqlite::Error
     let deposit_token = row
         .get::<_, Option<String>>(7)?
         .unwrap_or_else(|| deposit_token_for(&token));
+    // Also backfilled at startup (`migrate_families_rotation_authority`).
+    // Unlike the deposit token this one cannot be re-derived — it is random —
+    // so a torn mid-migration read yields an empty id, and every consumer
+    // treats empty as "no stable id yet" and falls back to the token. That is
+    // exactly the static-allowlist behavior, which is already correct.
+    let family_id = row.get::<_, Option<String>>(8)?.unwrap_or_default();
     Ok(FamilyRow {
         token,
+        family_id,
         status: row.get(1)?,
         plan: row.get(2)?,
         quota_bytes: row.get::<_, Option<i64>>(3)?.map(|q| q as u64),
@@ -2208,18 +2753,57 @@ fn family_row_from(row: &rusqlite::Row<'_>) -> Result<FamilyRow, rusqlite::Error
         expires_ms: row.get(5)?,
         note: row.get(6)?,
         deposit_token,
+        rotation_pk: row.get::<_, Option<Vec<u8>>>(9)?,
     })
 }
 
+/// The column list every `families` read shares, in the exact order
+/// `family_row_from` indexes. One constant so a new column can never be added
+/// to one query and forgotten in another, which would silently shift every
+/// index after it.
+const FAMILY_COLUMNS: &str = "token, status, plan, quota_bytes, created_ms, expires_ms, note, \
+                              deposit_token, family_id, rotation_pk";
+
 fn get_family_on(conn: &Connection, token: &str) -> Result<Option<FamilyRow>, String> {
     conn.query_row(
-        "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token
-         FROM families WHERE token = ?1",
+        &format!("SELECT {FAMILY_COLUMNS} FROM families WHERE token = ?1"),
         params![token],
         family_row_from,
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+/// Resolve an `/admin/families/{id}` path segment, which may be *either* the
+/// family's stable `family_id` or its current member token.
+///
+/// **Resolution order is family id first, then token.** Both namespaces are
+/// prefixed (`FAMILY_ID_PREFIX` vs `cmfam1-` / `DEPOSIT_TOKEN_PREFIX`) and
+/// provisioning refuses a token wearing the family-id prefix, so no string can
+/// legitimately be both and the order is a tie-break that never fires. It is
+/// still written down rather than left to chance: if a pre-prefix legacy token
+/// somehow matched an id, the id wins, because the id is the identifier this
+/// server minted and the token is one a caller chose.
+///
+/// Both spellings are supported because both have a real caller. The
+/// pass-issuing web flow stored a token when it provisioned, and that token is
+/// still how it addresses the family, so `{token}` may not break. But a token
+/// stops resolving the moment the family rotates, and an operator who has to
+/// find that family afterwards has nothing else to go on — which is what the
+/// stable id is for.
+fn resolve_family_on(conn: &Connection, id_or_token: &str) -> Result<Option<FamilyRow>, String> {
+    let by_id = conn
+        .query_row(
+            &format!("SELECT {FAMILY_COLUMNS} FROM families WHERE family_id = ?1"),
+            params![id_or_token],
+            family_row_from,
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    match by_id {
+        Some(row) => Ok(Some(row)),
+        None => get_family_on(conn, id_or_token),
+    }
 }
 
 /// CP4: resolve a presented bearer credential to its family row and class —
@@ -2232,9 +2816,10 @@ fn get_family_by_credential_on(
 ) -> Result<Option<(FamilyRow, TokenClass)>, String> {
     let family = conn
         .query_row(
-            "SELECT token, status, plan, quota_bytes, created_ms, expires_ms, note, deposit_token
-             FROM families WHERE token = ?1 OR deposit_token = ?1
-             ORDER BY (token = ?1) DESC LIMIT 1",
+            &format!(
+                "SELECT {FAMILY_COLUMNS} FROM families WHERE token = ?1 OR deposit_token = ?1
+                 ORDER BY (token = ?1) DESC LIMIT 1"
+            ),
             params![credential],
             family_row_from,
         )
@@ -2311,15 +2896,7 @@ fn ensure_incremental_auto_vacuum(conn: &Connection) -> Result<(), String> {
 ///    `SCHEMA` because on a pre-CP4 database `SCHEMA` runs before the column
 ///    exists.
 fn migrate_families_deposit_token(conn: &Connection) -> Result<(), String> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(families)")
-        .map_err(|e| e.to_string())?;
-    let has_column = stmt
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .any(|name| name == "deposit_token");
-    drop(stmt);
+    let has_column = families_has_column(conn, "deposit_token")?;
     if !has_column {
         conn.execute("ALTER TABLE families ADD COLUMN deposit_token TEXT", [])
             .map_err(|e| e.to_string())?;
@@ -2350,6 +2927,82 @@ fn migrate_families_deposit_token(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_families_deposit_token
              ON families(deposit_token);",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Whether the `families` table already has a given column. Pulled out
+/// because every additive migration here starts with the same question, and
+/// `PRAGMA table_info` returning the name in column 1 is exactly the kind of
+/// detail that gets copied wrong the third time.
+fn families_has_column(conn: &Connection, column: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(families)")
+        .map_err(|e| e.to_string())?;
+    let present = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    Ok(present)
+}
+
+/// WP5 startup migration, following `migrate_families_deposit_token`'s
+/// pattern exactly (idempotent, self-applying, safe on a deployed database,
+/// no operator step):
+///
+/// 1. `ALTER TABLE families ADD COLUMN family_id` / `rotation_pk` when
+///    missing. `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` is a no-op on an
+///    existing database and cannot add columns, so this is the only path by
+///    which a live relay grows them.
+/// 2. Backfill `family_id` for every row that has none, one freshly minted id
+///    per family. Existing families therefore gain a stable handle
+///    immediately, which is what lets the rate limiter and the WS semaphore
+///    key on it for *all* families rather than only ones provisioned from
+///    here on.
+/// 3. A UNIQUE index on `family_id`, created here rather than in `SCHEMA`
+///    because on a pre-WP5 database `SCHEMA` runs before the column exists.
+///
+/// `rotation_pk` is deliberately **not** backfilled: NULL is its meaningful
+/// value, and it means "no rotation authority registered yet". Every family
+/// that predates this change is in that state, and the first rotation each
+/// one performs is what registers its key.
+fn migrate_families_rotation_authority(conn: &Connection) -> Result<(), String> {
+    if !families_has_column(conn, "family_id")? {
+        conn.execute("ALTER TABLE families ADD COLUMN family_id TEXT", [])
+            .map_err(|e| e.to_string())?;
+    }
+    if !families_has_column(conn, "rotation_pk")? {
+        conn.execute("ALTER TABLE families ADD COLUMN rotation_pk BLOB", [])
+            .map_err(|e| e.to_string())?;
+    }
+    let missing: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT token FROM families WHERE family_id IS NULL OR family_id = ''")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for token in &missing {
+        conn.execute(
+            "UPDATE families SET family_id = ?2 WHERE token = ?1",
+            params![token, mint_family_id()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if !missing.is_empty() {
+        info!(
+            families = missing.len(),
+            "WP5 migration: minted stable family ids for existing families"
+        );
+    }
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_families_family_id
+             ON families(family_id);",
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -2438,6 +3091,10 @@ pub fn app(state: AppState) -> Router {
         .route("/envelopes/ack", post(ack_envelopes))
         .route("/presence", post(sync_presence))
         .route("/push/registrations", put(put_push_registration))
+        // §10 step 2. Under `/family/` rather than `/admin/families/` on
+        // purpose: this is the family acting on itself with its own
+        // credential, not an operator acting on a family with theirs.
+        .route("/family/rotate", post(rotate_family))
         .route(
             "/admin/families",
             post(admin_provision_family).get(admin_list_families),
@@ -3072,6 +3729,11 @@ struct PatchFamilyRequest {
 #[derive(Serialize)]
 struct FamilyResponse {
     token: String,
+    /// The family's stable handle. Unlike `token` it never changes, so it is
+    /// what an operator should record: `GET /admin/families/{family_id}`
+    /// still finds this family after a `POST /family/rotate` has replaced
+    /// every credential in this response.
+    family_id: String,
     /// CP4: the family's post-only credential, minted alongside `token` at
     /// provisioning. The purchase flow puts `token` on the Shore Pass setup
     /// card; `deposit_token` is what friend cards carry (phones derive the
@@ -3103,6 +3765,7 @@ fn family_response_with_usage(
     FamilyResponse {
         effective_quota_bytes: row.quota_bytes.unwrap_or(state.family_quota_bytes),
         token: row.token,
+        family_id: row.family_id,
         deposit_token: row.deposit_token,
         status: row.status,
         plan: row.plan,
@@ -3171,6 +3834,14 @@ async fn admin_provision_family(
     if is_deposit_token(token) {
         return Err(ApiError::bad_request(format!(
             "token must not start with the deposit-token prefix {DEPOSIT_TOKEN_PREFIX:?}"
+        )));
+    }
+    // Same discipline for the family-id namespace: `/admin/families/{id}`
+    // resolves one path segment as either an id or a token, and that is only
+    // unambiguous while no token can wear the id prefix.
+    if is_family_id(token) {
+        return Err(ApiError::bad_request(format!(
+            "token must not start with the family-id prefix {FAMILY_ID_PREFIX:?}"
         )));
     }
     validate_quota_bytes(request.quota_bytes)?;
@@ -3269,15 +3940,17 @@ async fn admin_list_families(
     }))
 }
 
+/// The `{id}` path segment of every by-family admin route is a family id
+/// *or* a current member token (`resolve_family_on`).
 async fn admin_get_family(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(token): Path<String>,
+    Path(id_or_token): Path<String>,
 ) -> Result<Json<FamilyResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
     let row = state
         .store
-        .get_family(&token)
+        .resolve_family(&id_or_token)
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(family_response(&state, row)?))
@@ -3286,7 +3959,7 @@ async fn admin_get_family(
 async fn admin_patch_family(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(token): Path<String>,
+    Path(id_or_token): Path<String>,
     Json(request): Json<PatchFamilyRequest>,
 ) -> Result<Json<FamilyResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
@@ -3298,6 +3971,14 @@ async fn admin_patch_family(
         }
     }
     validate_quota_bytes(request.quota_bytes)?;
+    // Resolve the handle to the family's *current* token first; the update
+    // itself still keys on the token, which is the `families` primary key.
+    let token = state
+        .store
+        .resolve_family(&id_or_token)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?
+        .token;
     let row = state
         .store
         .patch_family(
@@ -3327,9 +4008,15 @@ struct DeleteFamilyResponse {
 async fn admin_delete_family(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(token): Path<String>,
+    Path(id_or_token): Path<String>,
 ) -> Result<Json<DeleteFamilyResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
+    let token = state
+        .store
+        .resolve_family(&id_or_token)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?
+        .token;
     let deleted = state
         .store
         .delete_family(&token)
@@ -3339,6 +4026,191 @@ async fn admin_delete_family(
     }
     info!(family = %token_prefix(&token), "family revoked and purged");
     Ok(Json(DeleteFamilyResponse { deleted: true }))
+}
+
+/// Both signature fields are `Option` and checked by hand rather than being
+/// required by the deserializer. A missing field would otherwise be axum's
+/// 422 with a serde message, and this is a 400 with an error a client can act
+/// on — the same reason `ListFamiliesQuery` parses its bounds by hand.
+#[derive(Deserialize)]
+struct RotateFamilyRequest {
+    new_token: String,
+    /// Ed25519 public key of the rotation authority, 32 bytes, base64url
+    /// without padding.
+    rotation_pk: Option<String>,
+    /// Ed25519 signature over `rotation_signed_bytes(current, new)`, 64
+    /// bytes, base64url without padding.
+    rotation_sig: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RotateFamilyResponse {
+    /// The family's member token from here on. Echoed rather than assumed so a
+    /// client that lost a previous response learns the truth from the server.
+    family_token: String,
+    /// Its CP4 attenuation, the credential friend cards carry. Derivable
+    /// offline by the client; returned so the two sides can be compared.
+    deposit_token: String,
+    /// Rows carried across (`RelayStore::rotate_family_token`). Zero on a
+    /// retry that found the work already done.
+    envelopes_moved: u64,
+    /// `false` when this call found the rotation already committed.
+    rotated: bool,
+}
+
+/// **`POST /family/rotate` — a family re-keys itself**
+/// (`specs/multi-device-v1.md` §10 step 2).
+///
+/// The only route where a family credential authorizes changing that
+/// credential, and it exists because §10.2's hole cannot be closed anywhere
+/// else: relayd scopes fetch and ack by `family_token` alone, so a device that
+/// has been revoked from a person's roster keeps full read/delete access to
+/// the family mailbox until the token itself changes. Waiting for an operator
+/// to re-provision would make "remove this stolen phone" a support ticket.
+///
+/// Authorization is the current **member** token *and a signature*. A deposit
+/// credential is refused by `FamilyOp::Rotate`'s class rule before this body
+/// runs — friend cards carry deposit tokens, so a rotatable deposit credential
+/// would let anyone a family ever waved a QR code at lock them out of their
+/// own mailbox. But the member token alone is not enough either, and that is
+/// the point of the second factor: the revoked device *holds* the member
+/// token. If possession authorized rotation, the device this ceremony exists
+/// to evict could run the ceremony first and lock the owner out.
+///
+/// So the caller also sends `rotation_pk` (32-byte Ed25519 public key) and
+/// `rotation_sig` (64-byte signature), both base64url without padding, over
+/// `rotation_signed_bytes(current_token, new_token)` — the presented bearer
+/// token and the trimmed replacement, each length-prefixed behind a versioned
+/// domain separator. `RelayStore::rotate_family_token` checks it inside the
+/// same transaction that performs the re-key.
+///
+/// **Two consequences, stated plainly rather than buried.**
+///
+/// *After the first rotation, exactly one key can ever rotate this family.*
+/// The relay registers the first key that signs a valid rotation and refuses
+/// every other key from then on; there is no recovery path here for a family
+/// that loses it, short of an operator re-provisioning. On a **shared Shore
+/// Pass** that means only the organizer's person root can rotate, because
+/// only one person holds that key — which matches the organizer reality
+/// (they bought the pass, they hand out the cards, they are who a household
+/// asks when a phone is stolen) rather than fighting it.
+///
+/// *A thief can race trust-on-first-rotation, once.* On the very first
+/// rotation a family ever performs, `rotation_pk` is still NULL and there is
+/// nothing to check the presented key against, so a revoked device holding
+/// the member token could register a key of its own before the owner does and
+/// take the authority permanently. That window is real and is accepted
+/// deliberately, bounded three ways: it exists only for families provisioned
+/// before this shipped, only until their first rotation, and it requires the
+/// hostile device to already hold a live member token. Families provisioned
+/// from here on will register on their first rotation from a device that was
+/// never revoked. The alternative — refusing every legacy family's first
+/// rotation — would leave exactly the families most likely to need a
+/// revocation unable to perform one.
+///
+/// The replacement is chosen by the client, which is what makes the ceremony
+/// survivable. A server-minted token would exist only in the response, so a
+/// dropped response would strand the family on a credential that no longer
+/// authorizes anything — permanent brickage from a network blip. Instead the
+/// client writes its candidate down first (`MessageStore::begin_relay_rotation`)
+/// and can always ask again; presenting the new token reports `rotated: false`
+/// and the same values, so a retry converges. `MIN_ROTATION_TOKEN_LEN` is the
+/// entropy floor that letting the client choose costs.
+async fn rotate_family(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RotateFamilyRequest>,
+) -> Result<Json<RotateFamilyResponse>, ApiError> {
+    let presented = raw_bearer_token(&headers)?;
+    let access = authorize_family(&state, &presented, FamilyOp::Rotate, now_ms()).await?;
+    // Its own small bucket, never the family's shared request allowance —
+    // see `AppState::check_rotation_rate_limit`.
+    state.check_rotation_rate_limit(&access)?;
+
+    let new_token = request.new_token.trim().to_string();
+    if new_token.len() < MIN_ROTATION_TOKEN_LEN || new_token.len() > MAX_FAMILY_TOKEN_LEN {
+        return Err(ApiError::bad_request(format!(
+            "new_token must be {MIN_ROTATION_TOKEN_LEN}..={MAX_FAMILY_TOKEN_LEN} characters"
+        )));
+    }
+    if new_token
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(ApiError::bad_request(
+            "new_token must not contain whitespace or control characters".to_string(),
+        ));
+    }
+    // CP4's class prefix is what makes a presented credential's class
+    // unambiguous; a member token wearing it would break the auth lookup.
+    if is_deposit_token(&new_token) {
+        return Err(ApiError::bad_request(format!(
+            "new_token must not start with the deposit-token prefix {DEPOSIT_TOKEN_PREFIX:?}"
+        )));
+    }
+    // And not the family-id prefix either, for the reason `resolve_family_on`
+    // spells out: `/admin/families/{id}` reads one path segment as either
+    // namespace, so a token that could pass for an id would make operator
+    // addressing ambiguous.
+    if is_family_id(&new_token) {
+        return Err(ApiError::bad_request(format!(
+            "new_token must not start with the family-id prefix {FAMILY_ID_PREFIX:?}"
+        )));
+    }
+    // The same overlap `admin_provision_family` forbids: a family token that
+    // shadowed an operator or static credential would cross a trust boundary.
+    if state.admin_token.as_deref() == Some(new_token.as_str())
+        || state.auth_tokens.contains(&new_token)
+        || state.static_deposit_tokens.contains_key(&new_token)
+    {
+        return Err(ApiError::rotation_token_taken());
+    }
+
+    let authority = RotationAuthority {
+        public_key: decode_fixed_base64_field(request.rotation_pk.as_ref(), "rotation_pk")?,
+        signature: decode_fixed_base64_field(request.rotation_sig.as_ref(), "rotation_sig")?,
+    };
+
+    // The signed message binds the credential as *presented and trimmed*
+    // (`access.token` is the canonical member token the bearer resolved to,
+    // which for `FamilyOp::Rotate` is the bearer itself — deposit credentials
+    // never reach here), so a signature captured for one family's rotation
+    // cannot be replayed for another's.
+    let current = access.token.clone();
+    let requested = new_token.clone();
+    let outcome = state
+        .store
+        .run_blocking(move |store| store.rotate_family_token(&current, &requested, &authority))
+        .await
+        .map_err(ApiError::internal)?;
+    match outcome {
+        FamilyRotation::Rotated {
+            family,
+            envelopes_moved,
+        } => {
+            info!(
+                family = %token_prefix(&family.token),
+                superseded = %token_prefix(&access.token),
+                envelopes_moved,
+                "family token rotated"
+            );
+            Ok(Json(RotateFamilyResponse {
+                family_token: family.token,
+                deposit_token: family.deposit_token,
+                envelopes_moved,
+                rotated: true,
+            }))
+        }
+        FamilyRotation::AlreadyRotated { family } => Ok(Json(RotateFamilyResponse {
+            family_token: family.token,
+            deposit_token: family.deposit_token,
+            envelopes_moved: 0,
+            rotated: false,
+        })),
+        FamilyRotation::UnknownFamily => Err(ApiError::rotation_unsupported(&access.token)),
+        FamilyRotation::TokenTaken => Err(ApiError::rotation_token_taken()),
+        FamilyRotation::Unauthorized => Err(ApiError::rotation_unauthorized(&access.token)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3385,6 +4257,7 @@ async fn ws_handler(
     // paths above resolved it (see `check_rate_limit`).
     state.check_rate_limit(&access, 1.0, 0.0)?;
     let token = access.token;
+    let family_key = access.family_key;
     let (hints, hints_base64) = decode_fetch_hints(&query.hints)?;
     let after = query.after.unwrap_or(0);
     if after < 0 {
@@ -3413,10 +4286,17 @@ async fn ws_handler(
     // `authorize_family` via the `families` table, not the static
     // allowlist), so their semaphore is created lazily on first upgrade
     // rather than looked up from a construction-time map.
+    //
+    // Keyed by the family's stable key, not by its token: a rotation replaces
+    // the token, and a token-keyed map would strand the old entry — its
+    // permits still held by whatever sockets are open under it — while the
+    // family silently got a second, full set of connection slots under the
+    // new name. The cap is meant to bound one family's live sockets, and only
+    // a key that survives the rotation can do that.
     let per_token_semaphore = {
         let mut per_token = state.ws_per_token.lock().unwrap_or_else(|e| e.into_inner());
         per_token
-            .entry(token.clone())
+            .entry(family_key)
             .or_insert_with(|| Arc::new(Semaphore::new(state.ws_per_token_max_connections)))
             .clone()
     };
@@ -3693,6 +4573,22 @@ fn encode_base64_field(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// A required base64url field that must decode to exactly `N` bytes.
+///
+/// Absence, bad base64 and a wrong length are all 400s rather than
+/// authorization failures: each one means the caller's encoder is wrong, and
+/// a 403 would send it looking for a different key instead.
+fn decode_fixed_base64_field<const N: usize>(
+    value: Option<&String>,
+    field: &str,
+) -> Result<[u8; N], ApiError> {
+    let value = value.ok_or_else(|| ApiError::bad_request(format!("{field} is required")))?;
+    let bytes = decode_base64_field(value, field)?;
+    bytes
+        .try_into()
+        .map_err(|_| ApiError::bad_request(format!("{field} must decode to exactly {N} bytes")))
+}
+
 /// Short, non-secret prefix of a family token for correlating log lines
 /// without printing the full bearer token (semi-public via QR friend cards,
 /// but still a credential -- FR2 asks for correlation, not disclosure).
@@ -3726,6 +4622,12 @@ enum FamilyOp {
     /// narrowed in `sync_presence` — announce refused, query capped, answer
     /// coarsened, own rate bucket.
     Presence,
+    /// `POST /family/rotate` (`specs/multi-device-v1.md` §10 step 2). Its own
+    /// op because it is the only route where holding the family's member
+    /// credential authorizes changing that credential: a deposit token — which
+    /// rides friend cards, i.e. is held by people outside the family — must
+    /// never be able to lock a family out of its own mailbox.
+    Rotate,
 }
 
 impl FamilyOp {
@@ -3744,10 +4646,52 @@ struct FamilyAccess {
     token: String,
     /// CP4: which capability class the presented credential carried.
     class: TokenClass,
-    /// CP4: the credential as presented — the rate-limit bucket key, so
-    /// member and deposit traffic charge separate per-class buckets.
+    /// The rate-limit bucket key: the family's stable id, prefixed by the
+    /// presented credential's class.
+    ///
+    /// It used to be the presented credential itself, which was wrong in one
+    /// specific way that only WP5 made reachable: `POST /family/rotate`
+    /// replaces the token, so a family that rotated arrived at a bucket key
+    /// nobody had ever used and got a full fresh allowance — the rate limiter
+    /// silently reset by a call any member device can make. Keying on the
+    /// stable id fixes that while keeping CP4's separation, because the class
+    /// prefix still puts member and deposit traffic in different buckets, so
+    /// a friend-card flood cannot eat the family's own allowance.
     rate_key: String,
+    /// The per-family key for anything that must survive a rotation but is
+    /// *not* per-class — today, the WebSocket connection semaphore. The
+    /// stable family id where one exists; see `family_limit_key` for the
+    /// static-allowlist fallback.
+    family_key: String,
     quota_bytes: u64,
+}
+
+/// The stable per-family key the rate buckets and the WS semaphore use.
+///
+/// Provisioned families have a `family_id` that outlives their token, and
+/// that is the whole reason this exists. Static env-allowlist families
+/// (`CRUISEMESH_RELAY_TOKENS`) have no `families` row at all, so there is no
+/// id to use — they fall back to the token string, which is correct for them
+/// rather than merely tolerable: an operator-configured token only changes
+/// when the operator edits the config and restarts, so there is nothing for a
+/// stable id to protect against. The same fallback covers the torn
+/// mid-migration read `family_row_from` describes.
+fn family_limit_key(family_id: &str, token: &str) -> String {
+    if family_id.is_empty() {
+        token.to_string()
+    } else {
+        family_id.to_string()
+    }
+}
+
+/// The rate-limit bucket key: the stable family key, namespaced by credential
+/// class so member and deposit traffic never share a bucket (CP4).
+fn family_rate_key(class: TokenClass, family_key: &str) -> String {
+    let class_prefix = match class {
+        TokenClass::Member => "member",
+        TokenClass::Deposit => "deposit",
+    };
+    format!("{class_prefix}:{family_key}")
 }
 
 /// Resolve a family credential against the static env allowlist first
@@ -3778,7 +4722,8 @@ async fn authorize_family(
         return Ok(FamilyAccess {
             token: token.to_string(),
             class: TokenClass::Member,
-            rate_key: token.to_string(),
+            rate_key: family_rate_key(TokenClass::Member, token),
+            family_key: token.to_string(),
             quota_bytes: state.family_quota_bytes,
         });
     }
@@ -3787,9 +4732,10 @@ async fn authorize_family(
             return Err(ApiError::deposit_only(token));
         }
         return Ok(FamilyAccess {
+            rate_key: family_rate_key(TokenClass::Deposit, member),
+            family_key: member.clone(),
             token: member.clone(),
             class: TokenClass::Deposit,
-            rate_key: token.to_string(),
             quota_bytes: state.family_quota_bytes,
         });
     }
@@ -3821,11 +4767,13 @@ async fn authorize_family(
             return Err(ApiError::family_expired(&family.token, true));
         }
     }
+    let family_key = family_limit_key(&family.family_id, &family.token);
     Ok(FamilyAccess {
         quota_bytes: family.quota_bytes.unwrap_or(state.family_quota_bytes),
         token: family.token,
         class,
-        rate_key: token.to_string(),
+        rate_key: family_rate_key(class, &family_key),
+        family_key,
     })
 }
 
@@ -4027,6 +4975,66 @@ impl ApiError {
         }
     }
 
+    /// `specs/multi-device-v1.md` §10 step 2: this deployment has no family
+    /// row to re-key, because the credential comes from the static
+    /// `CRUISEMESH_RELAY_TOKENS` allowlist. 409 (not 404): the family is real
+    /// and authorized — its token simply lives in the operator's config, and
+    /// only the operator can change it. The stable `rotation_unsupported` code
+    /// is what lets a revoking device say "your relay was set up by hand, so
+    /// finish the rotation with a new setup card" instead of retrying forever.
+    fn rotation_unsupported(token: &str) -> Self {
+        warn!(
+            family = %token_prefix(token),
+            "family reject: token rotation on a statically configured family (409 rotation_unsupported)"
+        );
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "this family's token is configured on the server and cannot be \
+                      rotated from a device; provision a new token instead"
+                .to_string(),
+            code: Some("rotation_unsupported"),
+            retry_after_secs: None,
+        }
+    }
+
+    /// §10 step 2: the proposed replacement credential already belongs to
+    /// somebody. 409 Conflict, and the caller's remedy is to mint another and
+    /// try again — which is why this is a distinct code from a malformed
+    /// token, whose remedy is to stop sending that shape.
+    fn rotation_token_taken() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: "the proposed family token is already in use".to_string(),
+            code: Some("rotation_token_taken"),
+            retry_after_secs: None,
+        }
+    }
+
+    /// §10 step 2: the request carried the family's member token but not its
+    /// rotation authority. 403 rather than 401, and the distinction matters:
+    /// the credential authenticated fine — this is a real member token — and
+    /// what failed is the separate signature that says *this* holder may
+    /// re-key the family. Telling those apart is what stops a client from
+    /// "fixing" the failure by re-fetching its token.
+    ///
+    /// Logged, like every other family rejection, because a legitimate
+    /// rotation refused here means a family cannot evict a device it no
+    /// longer trusts, and that is something an operator should be able to see
+    /// from the server side rather than only from a support ticket.
+    fn rotation_unauthorized(token: &str) -> Self {
+        warn!(
+            family = %token_prefix(token),
+            "family reject: rotation not signed by the family's rotation key (403 rotation_unauthorized)"
+        );
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: "this rotation is not signed by the family's registered rotation key"
+                .to_string(),
+            code: Some("rotation_unauthorized"),
+            retry_after_secs: None,
+        }
+    }
+
     /// Family administratively suspended (payment dispute, abuse, …).
     fn family_suspended(token: &str) -> Self {
         warn!(
@@ -4163,7 +5171,9 @@ CREATE TABLE IF NOT EXISTS families (
     created_ms    INTEGER NOT NULL,
     expires_ms    INTEGER,
     note          TEXT,
-    deposit_token TEXT
+    deposit_token TEXT,
+    family_id     TEXT,
+    rotation_pk   BLOB
 );
 ";
 
@@ -4835,6 +5845,56 @@ mod tests {
         );
     }
 
+    /// WP5's additive migration on a database that predates it: the family
+    /// gains a stable id it did not have, keeps everything it did have, and
+    /// stays *unregistered* for rotation — NULL is the meaningful value of
+    /// `rotation_pk`, and backfilling it would mean inventing an authority
+    /// nobody holds.
+    #[test]
+    fn migration_mints_stable_family_ids_and_leaves_rotation_unregistered() {
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        {
+            // A database exactly as a pre-WP5 (post-CP4) relayd left it.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE families (
+                    token         TEXT PRIMARY KEY,
+                    status        TEXT NOT NULL DEFAULT 'active',
+                    plan          TEXT,
+                    quota_bytes   INTEGER,
+                    created_ms    INTEGER NOT NULL,
+                    expires_ms    INTEGER,
+                    note          TEXT,
+                    deposit_token TEXT
+                );
+                INSERT INTO families (token, status, created_ms, deposit_token)
+                    VALUES ('fam-legacy', 'active', 123, 'cmdep1-legacy');",
+            )
+            .unwrap();
+        }
+
+        let store = RelayStore::open(&path).unwrap();
+        let row = store.get_family("fam-legacy").unwrap().unwrap();
+        assert!(row.family_id.starts_with(FAMILY_ID_PREFIX));
+        assert_eq!(row.deposit_token, "cmdep1-legacy");
+        assert_eq!(row.rotation_pk, None);
+
+        // The id addresses the family, and it is stable across restarts —
+        // re-minting it on every open would orphan whatever an operator
+        // wrote down.
+        assert_eq!(
+            store.resolve_family(&row.family_id).unwrap().unwrap().token,
+            "fam-legacy"
+        );
+        drop(store);
+        let store = RelayStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_family("fam-legacy").unwrap().unwrap().family_id,
+            row.family_id
+        );
+    }
+
     #[tokio::test]
     async fn admin_returns_both_tokens_and_rejects_deposit_prefixed_member_tokens() {
         let app = admin_app();
@@ -4890,6 +5950,773 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "provisioning {token}");
+    }
+
+    // -----------------------------------------------------------------------
+    // §10 step 2: a family re-keys itself
+    // -----------------------------------------------------------------------
+
+    /// A member token of the shape `core_mint_relay_member_token` produces:
+    /// class-prefixed, and long past `MIN_ROTATION_TOKEN_LEN`.
+    fn minted_token(tag: &str) -> String {
+        format!("cmfam1-{tag}{}", "0".repeat(32))
+    }
+
+    /// The rotation authority the §10 tests sign with. A fixed seed rather
+    /// than a fresh keypair per call because trust-on-first-rotation is
+    /// stateful: a test that rotates and then retries has to present the same
+    /// key both times, exactly as a real client does.
+    fn test_rotation_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[7u8; ROTATION_PK_LEN])
+    }
+
+    /// A second, unrelated keypair — the revoked device's, in the tests that
+    /// model one.
+    fn other_rotation_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[9u8; ROTATION_PK_LEN])
+    }
+
+    fn rotation_authority(
+        key: &ed25519_dalek::SigningKey,
+        current_token: &str,
+        new_token: &str,
+    ) -> RotationAuthority {
+        use ed25519_dalek::Signer;
+        RotationAuthority {
+            public_key: key.verifying_key().to_bytes(),
+            signature: key
+                .sign(&rotation_signed_bytes(current_token, new_token))
+                .to_bytes(),
+        }
+    }
+
+    /// A well-formed rotation, signed by `key` over the pair the server will
+    /// reconstruct: the presented bearer token and the *trimmed* replacement.
+    fn rotate_request_signed_by(
+        bearer: &str,
+        new_token: &str,
+        key: &ed25519_dalek::SigningKey,
+    ) -> Request<Body> {
+        let authority = rotation_authority(key, bearer, new_token.trim());
+        rotate_request_with(
+            bearer,
+            serde_json::json!({
+                "new_token": new_token,
+                "rotation_pk": encode_base64_field(&authority.public_key),
+                "rotation_sig": encode_base64_field(&authority.signature),
+            }),
+        )
+    }
+
+    /// A rotation with a hand-built body, for the malformed and unsigned
+    /// cases that cannot be expressed as "signed by some key".
+    fn rotate_request_with(bearer: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/family/rotate")
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn rotate_request(bearer: &str, new_token: &str) -> Request<Body> {
+        rotate_request_signed_by(bearer, new_token, &test_rotation_key())
+    }
+
+    /// The gate in one test (`specs/multi-device-v1.md` §13, WP5): **a revoked
+    /// device demonstrably loses relay fetch after rotation**, and **rotate,
+    /// then drain** — no sibling loses an un-fetched row to make that happen.
+    ///
+    /// The revoked device here is modelled exactly as the threat model
+    /// demands: it kept the old member token and everything derived from it,
+    /// and it replays them.
+    #[tokio::test]
+    async fn rotation_cuts_the_old_credential_off_without_losing_a_single_row() {
+        let app = admin_app();
+        let old = "fam-before-the-revocation-token";
+        let new = minted_token("after");
+        provision(&app, old, serde_json::json!({})).await;
+
+        // Two envelopes a sibling has not fetched yet.
+        for byte in [1u8, 2u8] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(envelope_request(old, byte, 48))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        }
+        // And presence the family announced under the old token.
+        assert_eq!(
+            app.clone()
+                .oneshot(presence_request(old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let response = app
+            .clone()
+            .oneshot(rotate_request(old, &new))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rotated = body_json(response).await;
+        assert_eq!(rotated["family_token"], new);
+        assert_eq!(rotated["deposit_token"], deposit_token_for(&new));
+        assert_eq!(rotated["envelopes_moved"], 2);
+        assert_eq!(rotated["rotated"], true);
+
+        // The revoked device replays every credential it ever held. Fetch and
+        // ack are the two §10.2 names, and ack is the dangerous one -- it
+        // DELETES a sibling's row.
+        for (request, what) in [
+            (fetch_request(old), "fetch"),
+            (ack_request(old, &[1, 2]), "ack"),
+            (presence_request(old), "presence"),
+            (envelope_request(old, 3, 48), "post"),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED,
+                "the retired member token must not authorize {what}"
+            );
+        }
+        // Including the deposit attenuation of the retired token, which is
+        // what its friend cards carry.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&deposit_token_for(old), 4, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "the retired deposit token must not authorize a post either"
+        );
+
+        // Rotate, then drain: the sibling that slept through all of this
+        // fetches both rows, with their ids and hints untouched.
+        let response = app.clone().oneshot(fetch_request(&new)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        let envelopes = page["envelopes"].as_array().unwrap();
+        assert_eq!(envelopes.len(), 2, "no un-fetched row was dropped");
+        assert_eq!(envelopes[0]["id"], 1);
+        assert_eq!(envelopes[1]["id"], 2);
+        assert_eq!(
+            envelopes[0]["recipient_hint"],
+            encode_base64_field(&sample_hint(1))
+        );
+
+        // And the new deposit token deposits, so a contact who received the
+        // kind-9 notice reaches the family again.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&deposit_token_for(&new), 5, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// What moves across a rotation and what does not.
+    ///
+    /// Presence moves: it is the family's own announcement about itself, and
+    /// a sibling that slept through the ceremony must not look offline
+    /// afterwards. Push registrations are *purged*, because each one is a
+    /// single device's wake channel and the relay cannot tell the revoked
+    /// device's from a sibling's — carrying them would leave the evicted
+    /// device still being woken for the family's mail. Siblings re-register
+    /// on their next round, which is the cost this deliberately accepts.
+    #[test]
+    fn rotation_carries_presence_but_purges_push_registrations() {
+        let (_db, store) = test_store();
+        let old = "fam-before";
+        let new = minted_token("after");
+        store.upsert_family(old, None, None, None, None, 1).unwrap();
+        store
+            .sync_presence(old, &[sample_hint(1)], &[sample_hint(1)], 1_000)
+            .unwrap();
+        store
+            .replace_push_registration(old, "apns-device", &[sample_hint(1)], 1_000)
+            .unwrap();
+
+        let authority = rotation_authority(&test_rotation_key(), old, &new);
+        match store.rotate_family_token(old, &new, &authority).unwrap() {
+            FamilyRotation::Rotated { family, .. } => {
+                assert_eq!(family.token, new);
+                assert_eq!(family.deposit_token, deposit_token_for(&new));
+            }
+            other => panic!("expected a rotation, got {other:?}"),
+        }
+        assert!(
+            store
+                .push_device_tokens_for_hint(&new, &sample_hint(1), 0)
+                .unwrap()
+                .is_empty(),
+            "the revoked device's wake channel must not follow the family"
+        );
+        assert!(store
+            .push_device_tokens_for_hint(old, &sample_hint(1), 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .sync_presence(&new, &[], &[sample_hint(1)], 2_000)
+                .unwrap()
+                .len(),
+            1,
+            "the family's announced presence survived the rotation"
+        );
+    }
+
+    /// The crash-safety contract the client depends on: a rotation whose
+    /// response was lost is discoverable by asking again with the credential
+    /// the client wrote down first.
+    #[tokio::test]
+    async fn a_rotation_whose_answer_was_lost_is_recovered_by_retrying() {
+        let app = admin_app();
+        let old = "fam-before-the-revocation-token";
+        let new = minted_token("after");
+        provision(&app, old, serde_json::json!({})).await;
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(old, &new))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // The client never saw that answer. It retries with the token it
+        // minted -- the only credential it can still present.
+        let response = app
+            .clone()
+            .oneshot(rotate_request(&new, &new))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let retried = body_json(response).await;
+        assert_eq!(retried["family_token"], new);
+        assert_eq!(retried["rotated"], false);
+        assert_eq!(retried["envelopes_moved"], 0);
+
+        // Retrying with the retired credential is an ordinary auth failure --
+        // there is nothing to tell a stranger holding a dead token.
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(old, &minted_token("third")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_member_credential_of_a_provisioned_family_may_rotate() {
+        let app = admin_app();
+        let old = "fam-before-the-revocation-token";
+        provision(&app, old, serde_json::json!({})).await;
+
+        // A deposit credential rides friend cards, so anyone the family ever
+        // waved a QR code at holds one. It must never be able to lock them
+        // out of their own mailbox.
+        let response = app
+            .clone()
+            .oneshot(rotate_request(
+                &deposit_token_for(old),
+                &minted_token("byadeposit"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "deposit_only");
+
+        // A statically configured family has no row to re-key, and says so
+        // with a code a client can act on rather than retry against.
+        let response = app
+            .clone()
+            .oneshot(rotate_request("family-a", &minted_token("static")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["code"], "rotation_unsupported");
+    }
+
+    #[tokio::test]
+    async fn rotation_refuses_a_replacement_that_is_weak_malformed_or_taken() {
+        let app = admin_app();
+        let mine = "fam-mine-before-the-revocation";
+        let theirs = "fam-someone-elses-token-entirely";
+        provision(&app, mine, serde_json::json!({})).await;
+        provision(&app, theirs, serde_json::json!({})).await;
+
+        for (candidate, status, why) in [
+            ("short", StatusCode::BAD_REQUEST, "below the entropy floor"),
+            (
+                "cmdep1-aaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                StatusCode::BAD_REQUEST,
+                "wears the deposit class prefix",
+            ),
+            (
+                "has a space in it and is long enough",
+                StatusCode::BAD_REQUEST,
+                "whitespace",
+            ),
+            (
+                theirs,
+                StatusCode::CONFLICT,
+                "another family's member token",
+            ),
+            (
+                ADMIN_TOKEN,
+                StatusCode::BAD_REQUEST,
+                "an operator credential, refused by the length floor before \
+                 the collision check even runs",
+            ),
+            (
+                &deposit_token_for(theirs),
+                StatusCode::BAD_REQUEST,
+                "another family's deposit token, refused by class rather than \
+                 by collision -- an ambiguous `token OR deposit_token` lookup \
+                 is the one thing CP4's discipline may never become",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(rotate_request(mine, candidate))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{why}");
+        }
+
+        // The store refuses the deposit collision on its own too, which is
+        // what keeps the class prefix from being the only thing standing
+        // between two families and an ambiguous credential.
+        let (_db, store) = test_store();
+        store
+            .upsert_family("fam-one", None, None, None, None, 1)
+            .unwrap();
+        store
+            .upsert_family("fam-two", None, None, None, None, 1)
+            .unwrap();
+        let key = test_rotation_key();
+        let taken_deposit = deposit_token_for("fam-two");
+        assert_eq!(
+            store
+                .rotate_family_token(
+                    "fam-one",
+                    &taken_deposit,
+                    &rotation_authority(&key, "fam-one", &taken_deposit)
+                )
+                .unwrap(),
+            FamilyRotation::TokenTaken
+        );
+        assert_eq!(
+            store
+                .rotate_family_token(
+                    "fam-one",
+                    "fam-two",
+                    &rotation_authority(&key, "fam-one", "fam-two")
+                )
+                .unwrap(),
+            FamilyRotation::TokenTaken
+        );
+        // A refused rotation leaves the family as unregistered as it found
+        // it: trust-on-first-rotation is spent by a rotation that commits,
+        // not by one that was turned away.
+        assert_eq!(
+            store.get_family("fam-one").unwrap().unwrap().rotation_pk,
+            None
+        );
+        // A family that is not in the table has nothing to re-key.
+        let nope = minted_token("nope");
+        assert_eq!(
+            store
+                .rotate_family_token(
+                    "fam-static",
+                    &nope,
+                    &rotation_authority(&key, "fam-static", &nope)
+                )
+                .unwrap(),
+            FamilyRotation::UnknownFamily
+        );
+
+        // And the family still works on the credential it started with.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(mine, 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// Read one family through the admin API by whichever handle is given.
+    async fn admin_family(app: &Router, id_or_token: &str) -> Response {
+        app.clone()
+            .oneshot(admin_bare("GET", &format!("/admin/families/{id_or_token}")))
+            .await
+            .unwrap()
+    }
+
+    /// Trust on first rotation, the registering half: a family that has never
+    /// rotated has no key to check against, so the first valid signature both
+    /// authorizes the rotation and becomes the family's rotation authority
+    /// from then on.
+    #[tokio::test]
+    async fn a_first_rotation_registers_the_key_that_signed_it() {
+        let (_db, store) = test_store();
+        let old = "fam-never-rotated-before";
+        let new = minted_token("first");
+        store.upsert_family(old, None, None, None, None, 1).unwrap();
+        assert_eq!(
+            store.get_family(old).unwrap().unwrap().rotation_pk,
+            None,
+            "a freshly provisioned family carries no rotation authority yet"
+        );
+
+        let key = test_rotation_key();
+        match store
+            .rotate_family_token(old, &new, &rotation_authority(&key, old, &new))
+            .unwrap()
+        {
+            FamilyRotation::Rotated { family, .. } => assert_eq!(family.token, new),
+            other => panic!("expected a rotation, got {other:?}"),
+        }
+        assert_eq!(
+            store.get_family(&new).unwrap().unwrap().rotation_pk,
+            Some(key.verifying_key().to_bytes().to_vec()),
+            "the row now names the key that signed, and only that key"
+        );
+    }
+
+    /// **The two halves of the contract, joined.**
+    ///
+    /// Every other rotation test here signs with this file's own
+    /// `rotation_signed_bytes`, which proves the server is self-consistent and
+    /// nothing more. The client is a different crate with its own copy of the
+    /// domain string, the field names, the base64 alphabet and the framing, so
+    /// "both sides agree" is exactly the claim those tests cannot make — and it
+    /// is the claim that decides whether a real phone can rotate at all. A
+    /// silent disagreement does not fail loudly in development; it ships, and
+    /// then every revocation in the field ends in a 403 that looks like an
+    /// attack.
+    ///
+    /// So this drives the real client encoder,
+    /// `cruisemesh_core::relay_encode_rotate_request`, straight into the real
+    /// route. Nothing is reconstructed by hand on either side.
+    #[tokio::test]
+    async fn the_core_clients_own_encoder_produces_a_request_this_route_accepts() {
+        let app = admin_app();
+        let old = "fam-before-the-core-client-rotates";
+        let new = cruisemesh_core::core_mint_relay_member_token();
+        provision(&app, old, serde_json::json!({})).await;
+
+        // The person root, which is what §14.2 makes the rotation authority:
+        // stable across every change of approving device, and the one key a
+        // stolen phone never holds.
+        let person = cruisemesh_core::generate_identity();
+        let rotate = |bearer: String, current: String, next: String, sign_sk: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri("/family/rotate")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    cruisemesh_core::relay_encode_rotate_request(current, next, sign_sk)
+                        .expect("the core client encodes a rotation"),
+                ))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(rotate(
+                old.to_string(),
+                old.to_string(),
+                new.clone(),
+                person.sign_sk.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The client's own decoder accepts what came back, so the round trip
+        // is pinned end to end rather than only on the way in.
+        let parsed = cruisemesh_core::relay_decode_rotate_response(
+            serde_json::to_vec(&body_json(response).await).unwrap(),
+            new.clone(),
+        )
+        .expect("the core client decodes the answer");
+        assert_eq!(parsed.family_token, new);
+        assert!(parsed.rotated);
+
+        // The key the client presented is the one that got registered, proved
+        // the only way that matters: a stranger's root is refused, and this
+        // person's root still works.
+        let stranger = cruisemesh_core::generate_identity();
+        let response = app
+            .clone()
+            .oneshot(rotate(
+                new.clone(),
+                new.clone(),
+                cruisemesh_core::core_mint_relay_member_token(),
+                stranger.sign_sk,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "rotation_unauthorized");
+
+        let third = cruisemesh_core::core_mint_relay_member_token();
+        assert_eq!(
+            app.oneshot(rotate(new.clone(), new, third, person.sign_sk.clone()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "the person who registered the authority keeps it"
+        );
+    }
+
+    /// Trust on first rotation, the closing half: once a key is registered a
+    /// different one is refused outright, and the refusal changes nothing —
+    /// the family still answers to the token it had.
+    #[tokio::test]
+    async fn a_registered_family_refuses_a_rotation_signed_by_another_key() {
+        let app = admin_app();
+        let first = "fam-that-has-rotated-once-already";
+        let second = minted_token("second");
+        provision(&app, first, serde_json::json!({})).await;
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(first, &second))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // A second key, signing a perfectly well-formed rotation. This is the
+        // revoked device: it holds the family's current member token, so
+        // every check that rests on possession alone would pass.
+        let response = app
+            .clone()
+            .oneshot(rotate_request_signed_by(
+                second.as_str(),
+                &minted_token("stolen"),
+                &other_rotation_key(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "rotation_unauthorized");
+
+        // Nothing moved: the family is still reachable on the credential it
+        // held before the attempt, and the thief's candidate names nobody.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&second, 1, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+            "the refused rotation left the family on its current token"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(fetch_request(&minted_token("stolen")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// The threat model in one test: the revoked device replays the member
+    /// token it kept, with no rotation authority to offer. Every shape that
+    /// replay can take is refused, and the family is untouched afterwards.
+    #[tokio::test]
+    async fn replaying_the_member_token_without_a_signature_cannot_rotate() {
+        let app = admin_app();
+        let held = "fam-the-revoked-device-still-holds";
+        provision(&app, held, serde_json::json!({})).await;
+        // Register an authority first, so the device is up against a real
+        // stored key rather than an empty column.
+        let current = minted_token("rotatedonce");
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(held, &current))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let candidate = minted_token("bythethief");
+        let garbage_pk = encode_base64_field(&[0xAAu8; ROTATION_PK_LEN]);
+        let garbage_sig = encode_base64_field(&[0x5Au8; ROTATION_SIG_LEN]);
+        for (body, status, why) in [
+            (
+                serde_json::json!({ "new_token": candidate }),
+                StatusCode::BAD_REQUEST,
+                "no signature fields at all — a malformed request, not a \
+                 failed authorization, so the client is told to fix its \
+                 encoder rather than to go find a key",
+            ),
+            (
+                serde_json::json!({
+                    "new_token": candidate,
+                    "rotation_pk": "not base64!!",
+                    "rotation_sig": garbage_sig,
+                }),
+                StatusCode::BAD_REQUEST,
+                "unparseable base64",
+            ),
+            (
+                serde_json::json!({
+                    "new_token": candidate,
+                    "rotation_pk": encode_base64_field(&[0xAAu8; 16]),
+                    "rotation_sig": garbage_sig,
+                }),
+                StatusCode::BAD_REQUEST,
+                "a key of the wrong length",
+            ),
+            (
+                serde_json::json!({
+                    "new_token": candidate,
+                    "rotation_pk": garbage_pk,
+                    "rotation_sig": garbage_sig,
+                }),
+                StatusCode::FORBIDDEN,
+                "well-formed bytes that are not this family's key and not a \
+                 signature at all — the one case that is an authorization \
+                 failure",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(rotate_request_with(&current, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{why}");
+        }
+
+        // And the family is exactly where it was.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&current, 2, 48))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    /// The operator's side of a rotation. A family's token is not a stable
+    /// name for it — the whole point of §10 step 2 is that the token changes
+    /// — so the admin API answers to a stable id as well, and an operator who
+    /// recorded that id can still find the family afterwards. Recording only
+    /// the token, which is what the pass-issuing flow does today, keeps
+    /// working for as long as that token is current.
+    #[tokio::test]
+    async fn a_rotated_family_is_still_reachable_by_its_stable_id() {
+        let app = admin_app();
+        let old = "fam-before-the-operator-looks";
+        let new = minted_token("afterward");
+        provision(&app, old, serde_json::json!({})).await;
+
+        let provisioned = body_json(admin_family(&app, old).await).await;
+        let family_id = provisioned["family_id"].as_str().unwrap().to_string();
+        assert!(
+            family_id.starts_with(FAMILY_ID_PREFIX),
+            "the stable id is prefixed so it can never be mistaken for a token"
+        );
+
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(old, &new))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // The id survived the rotation and still names this family.
+        let response = admin_family(&app, &family_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let by_id = body_json(response).await;
+        assert_eq!(by_id["token"], new);
+        assert_eq!(by_id["family_id"], family_id);
+
+        // So does the current token, which is what the pass-issuing flow
+        // holds.
+        let response = admin_family(&app, &new).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["family_id"], family_id);
+
+        // The retired token names nobody, which is the point of rotating it.
+        assert_eq!(
+            admin_family(&app, old).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// The rotation bucket is not the family's request bucket, and that
+    /// separation is what keeps the remedy reachable: the device being
+    /// revoked can spend the family's shared request allowance at will, so a
+    /// rotation charged to that bucket would be a rotation the thief can
+    /// block.
+    #[tokio::test]
+    async fn a_family_out_of_request_allowance_can_still_rotate() {
+        let store = RelayStore::open(":memory:").unwrap();
+        let app = app(AppState::with_rate_limits(
+            store,
+            HashSet::new(),
+            RateLimitConfig {
+                // One request a minute, spent below by a single fetch.
+                requests_per_min: 1,
+                ..RateLimitConfig::default()
+            },
+        )
+        .with_admin_token(Some(ADMIN_TOKEN.to_string())));
+        let old = "fam-whose-allowance-is-gone";
+        let new = minted_token("despiteit");
+        provision(&app, old, serde_json::json!({})).await;
+
+        assert_eq!(
+            app.clone()
+                .oneshot(fetch_request(old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(fetch_request(old))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the family's shared request allowance is exhausted"
+        );
+
+        // The rotation goes through anyway.
+        let response = app
+            .clone()
+            .oneshot(rotate_request(old, &new))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["rotated"], true);
     }
 
     async fn list_families(app: &Router, query: &str) -> serde_json::Value {
@@ -6641,7 +8468,7 @@ mod tests {
         let mut buckets = HashMap::new();
         // Both families spend everything at t=0, so both look empty.
         for token in ["idle-family", "busy-family"] {
-            let mut family = FamilyBuckets::new(60, 60, (4, 900), start);
+            let mut family = FamilyBuckets::new(60, 60, (4, 900), (4, 3600), start);
             assert!(family.try_take(60.0, 60.0, start).is_ok());
             buckets.insert(token.to_string(), family);
         }

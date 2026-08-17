@@ -26,7 +26,7 @@
 //!   there is no end-to-end path to drive. WP4/WP5 own that carrier.
 //! * MD-SEAL-STALE-ROSTER needs §6's inbox key generations. WP2 came and
 //!   went without minting them -- it generalized addressing and acks, not
-//!   sealing -- so this one is WP5's alone now.
+//!   sealing -- so this one is WP5's alone now. **WP5 closed it**, see below.
 //! * MD-ROSTER-FIRST-CONTACT-ANCHOR needs a second source of truth about a
 //!   person's recovery epoch (WP5's recovery flow).
 //! * MD-RECOVERY-ROOT-CUSTODY needs the person root minted and stored apart
@@ -59,6 +59,67 @@
 //! * `MD-SYNC-OUTBOUND-DEDUP` for SYNC-2, driven through the shipped claim on a
 //!   store holding a sibling's authored row.
 //!
+//! WP5's revocation slice moved exactly one vector, and moved nothing else:
+//!
+//! * `MD-SEAL-STALE-ROSTER` left the data-only list because §10.1's rotation
+//!   exists. Its driver performs a real revocation through
+//!   `core_revoke_devices_roster` and then asserts both ends of §6's accepted
+//!   window: a months-offline contact sealing to the roster it still holds
+//!   reaches the surviving devices, the row it addressed to the buried device is
+//!   a different row that starves nobody, the revocation supersedes the stale
+//!   roster the moment it arrives, and a replayed pre-revocation generation
+//!   cannot pull sealing back (`InboxGenerationRegressed`).
+//! * `MD-ROSTER-GOSSIP-TO-CONTACTS` did NOT move, and the reason is narrower
+//!   than it was. §10.1's own-device leg is executed — the rotation announcement
+//!   is a real signed record, sealed once per surviving sibling — and the
+//!   contact leg now produces the exact document and the exact recipient list
+//!   (`RevocationCommit::roster_document` / `contact_user_ids`). What is still
+//!   missing is the same thing WP3 named: no envelope kind carries a roster
+//!   document to a contact. A plan is not a delivery, so the vector stays
+//!   data-only until the carrier lands.
+//!
+//! WP5's relay-token slice (§10 step 2) moved no vector at all, which is worth
+//! saying out loud rather than leaving to inference. There has never been a
+//! contract vector for the family relay credential — the ledger's subject is
+//! rosters, streams and acks, and `family_token` is none of those — so the
+//! rotation is pinned where its behaviour actually lives:
+//! `core/src/relay_rotation.rs` for the ceremony and its accepted windows, and
+//! `relayd/src/lib.rs` for the two halves of §13's WP5 gate that only the
+//! server can prove (a revoked device demonstrably losing fetch *and ack*
+//! after rotation; every un-fetched row carried across with its id, so no
+//! sibling is starved to cut the thief off).
+//!
+//! One thing it did change under this file's nose, and it is a *widening* of
+//! the mixed-fleet story rather than a narrowing: `MD-SEAL-STALE-ROSTER`'s
+//! months-offline contact now has a second way to be stranded — their friend
+//! card's relay credential dies with the rotation, not only their roster going
+//! stale. Both windows close the same way, by propagation with a human repair
+//! path behind it, and the relay half is driven end to end in
+//! `relay_rotation.rs` through the shipped `CAP_RELAY_UPDATE` notice rather
+//! than described here.
+//!
+//! WP5's third slice — §10 steps 3 and 4 — added two ids and moved none:
+//!
+//! * `MD-REVOKE-REFUSE-NEW-EVENTS` for §10.3, driven through the production
+//!   inbound pair (`process_inbound_frame` → `core_deliver_inbound`) rather
+//!   than by asking a policy function. The asymmetry is the whole vector:
+//!   events the buried device authored while it was vouched for are still
+//!   there afterwards, and events it signs after the burial land nowhere.
+//!   History is never rewritten by a later revocation — a rule that deleted it
+//!   would let a thief erase a conversation by getting himself revoked.
+//! * `MD-REVOKE-CONTACT-NOTIFIED` for §10.4, driven through
+//!   `apply_contact_roster`, which is the single funnel both DL-3 gossip and a
+//!   sibling's self-sync reach. Its shape is decided as much by §2 goal 1 as by
+//!   §10: a revocation raises a fact, an ordinary link raises nothing, because
+//!   a person's device count is nobody else's business and a warning on every
+//!   link is how a real warning gets swiped away unread.
+//!
+//! Neither is a *surface*: WP6 owns the copy, and the reason codes here name
+//! what changed without saying a word of it. And `MD-ROSTER-GOSSIP-TO-CONTACTS`
+//! still did not move — §10.4 tells a contact what a roster they RECEIVED
+//! means, which is a different problem from getting the roster to them, and
+//! that carrier is still missing.
+//!
 //! **What "implemented and pinned" does NOT mean here.** The ack vectors below
 //! run the production planner against a fleet of two devices — and the fleet
 //! record itself still has no production writer. `set_own_device_fleet`'s only
@@ -79,15 +140,17 @@ use cruisemesh_core::{
     core_open_sync_record, core_own_capabilities, core_plan_sync_backfill, core_relay_ack_ids,
     core_roster_validate, core_seal_sync_record, core_should_ack_inbound, core_sign_device_cert,
     core_sign_roster, core_sign_sync_record, core_sync_digest_gaps, decode_extended_message_body,
-    device_fanout_msg_id, encode_message_body, encode_message_body_extended,
+    device_fanout_msg_id, encode_envelope_frame, encode_message_body, encode_message_body_extended,
     generate_device_keypair, generate_identity, open_message, seal_message, CarriedEnvelope,
-    Contact, ContactDeviceState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
+    Contact, ContactDeviceState, ContactSafetyReason, CoreDeliveryVerdict,
+    CoreDiscoveryPolicyState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
     DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceTombstone, ExtendedMessageBody, Identity,
-    InboxKey, IncomingMessageInsertOutcome, MessageBody, MessageStore, OutboundAuthorDecision,
-    OwnDeviceFleet, Roster, RosterRejection, RosterUpdateOutcome, RosterUpdateReason,
-    StoredMessage, SyncBackfillAction, SyncRecord, SyncRecordKind, CAP_MULTI_DEVICE,
-    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_TEXT,
-    LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID, SYNC_OUTBOUND_DEDUP_WINDOW_MS,
+    InboxKey, IncomingMessageInsertOutcome, MessageArrival, MessageBody, MessageStore,
+    OutboundAuthorDecision, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateOutcome,
+    RosterUpdateReason, StoredMessage, SyncBackfillAction, SyncRecord, SyncRecordKind,
+    CAP_MULTI_DEVICE, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN,
+    DEVICE_SOFT_CAP, KIND_TEXT, LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
+    SYNC_OUTBOUND_DEDUP_WINDOW_MS,
 };
 use ed25519_dalek::SigningKey;
 
@@ -153,6 +216,17 @@ enum Scenario {
         incoming: RosterVersion,
         incoming_is_strictly_higher: bool,
         auto_resolves: bool,
+    },
+    /// DL-2's one refinement: a document signed by the **person root** at a
+    /// strictly higher `recovery_epoch` is heard through the quarantine and
+    /// clears it. Not an auto-resolution -- it is the person resolving the
+    /// fork with the one credential a thief provably cannot hold (§14.2 keeps
+    /// the root inside the encrypted backup), and refusing it would leave a
+    /// fork an attacker caused permanently unrecoverable.
+    RosterForkPiercedByRoot {
+        quarantined_at: RosterVersion,
+        incoming: RosterVersion,
+        signed_by_person_root: bool,
     },
     RosterTombstonedDeviceReturns {
         version: RosterVersion,
@@ -238,6 +312,22 @@ enum Scenario {
         sealed_with_inbox_key_generation: u64,
         current_inbox_key_generation: u64,
         surviving_devices_still_receive: bool,
+    },
+    /// §10.3: a device is buried, and then keeps signing. Events it authored
+    /// while it was still vouched for stay exactly where they are; events it
+    /// signs afterwards are refused. The two counts are what the driver sends,
+    /// not what it hopes for.
+    RevokedDeviceKeepsSigning {
+        events_before_revocation: u8,
+        events_after_revocation: u8,
+        stored_history_survives: bool,
+    },
+    /// §10.4: what a contact is told. Only the changes that mean something was
+    /// taken away raise a fact — §2 goal 1 keeps a person's device COUNT
+    /// invisible, so an ordinary link raises nothing.
+    ContactNotifiedOfRevocation {
+        device_added_raises_a_fact: bool,
+        device_revoked_raises_a_fact: bool,
     },
     /// §8, WP4: a day in which mail reaches one device of a fleet over BLE
     /// only. The devices must converge afterwards by self-sync — no relay row
@@ -328,6 +418,13 @@ enum Outcome {
     PersonDigestProofOnly,
     DigestProofOnly,
     SurvivingDevicesDeliver,
+    /// §10.3, WP5: an event newly signed by a buried device is refused, and
+    /// the stream that device wrote seals at its last pre-revocation point —
+    /// nothing already stored is rewritten.
+    RevokedSignatureRefused,
+    /// §10.4, WP5: the contact holds a changed-safety-state fact naming the
+    /// revocation, in core reason codes. What a family member reads is WP6's.
+    ContactSafetyStateRaised,
     Advertised,
     DeviceAdded,
     DeviceAddedWithWarning,
@@ -477,6 +574,27 @@ const VECTORS: &[Vector] = &[
             auto_resolves: false,
         },
         target_outcome: Outcome::ForkQuarantined,
+        implemented: true,
+    },
+    // DL-2's refinement: the person root, at a strictly higher recovery epoch,
+    // is the one document a quarantine yields to. `-QUARANTINE-PERSISTS` above
+    // keeps its full meaning for every non-root document; this is the narrow
+    // hole deliberately left in it, and it is narrow because the root is the
+    // one signature §14.2 keeps off every device a thief could steal.
+    Vector {
+        id: "MD-ROSTER-FORK-ROOT-PIERCE",
+        scenario: Scenario::RosterForkPiercedByRoot {
+            quarantined_at: RosterVersion {
+                recovery_epoch: 2,
+                seq: 0,
+            },
+            incoming: RosterVersion {
+                recovery_epoch: 3,
+                seq: 0,
+            },
+            signed_by_person_root: true,
+        },
+        target_outcome: Outcome::Accepted,
         implemented: true,
     },
     // DL-4: the tombstoned device_id itself can never return.
@@ -719,6 +837,11 @@ const VECTORS: &[Vector] = &[
     // A months-offline contact seals to the roster it knows -- which still
     // lists the revoked device and still uses the pre-revocation inbox key
     // generation -- and the surviving devices must still receive that mail.
+    //
+    // Driven since WP5: the rotation the vector's two generations describe is
+    // performed by the shipped `core_revoke_devices_roster`, and the driver
+    // asserts both ends of the window -- the stale roster still delivers to the
+    // survivors, and the revocation supersedes it the moment it arrives.
     Vector {
         id: "MD-SEAL-STALE-ROSTER",
         scenario: Scenario::StaleRosterSealing {
@@ -728,7 +851,33 @@ const VECTORS: &[Vector] = &[
             surviving_devices_still_receive: true,
         },
         target_outcome: Outcome::SurvivingDevicesDeliver,
-        implemented: false,
+        implemented: true,
+    },
+    // §10.3: a buried device keeps its key and keeps signing. Everything it
+    // wrote while it was trusted stays; nothing it signs afterwards lands. The
+    // asymmetry is the rule — deleting stored history on a later revocation
+    // would let a thief erase a conversation by getting himself revoked.
+    Vector {
+        id: "MD-REVOKE-REFUSE-NEW-EVENTS",
+        scenario: Scenario::RevokedDeviceKeepsSigning {
+            events_before_revocation: 2,
+            events_after_revocation: 1,
+            stored_history_survives: true,
+        },
+        target_outcome: Outcome::RevokedSignatureRefused,
+        implemented: true,
+    },
+    // §10.4: the contact's changed-safety-state treatment, as core facts with
+    // reason codes. Its shape is decided by §2 goal 1 as much as by §10: a
+    // revocation is news, an ordinary link is nobody else's business.
+    Vector {
+        id: "MD-REVOKE-CONTACT-NOTIFIED",
+        scenario: Scenario::ContactNotifiedOfRevocation {
+            device_added_raises_a_fact: false,
+            device_revoked_raises_a_fact: true,
+        },
+        target_outcome: Outcome::ContactSafetyStateRaised,
+        implemented: true,
     },
     // §12: WP1 advertises the reserved capability through HELLO2.
     Vector {
@@ -798,6 +947,7 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
         "MD-ROSTER-FORK-QUARANTINE-PERSISTS",
         Outcome::ForkQuarantined,
     ),
+    ("MD-ROSTER-FORK-ROOT-PIERCE", Outcome::Accepted),
     ("MD-ROSTER-TOMBSTONE", Outcome::TombstonePermanent),
     ("MD-ROSTER-RELINK-FRESH-KEY", Outcome::FreshKeyAccepted),
     (
@@ -851,6 +1001,14 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
         Outcome::ContactsLearnTheRoster,
     ),
     ("MD-SEAL-STALE-ROSTER", Outcome::SurvivingDevicesDeliver),
+    (
+        "MD-REVOKE-REFUSE-NEW-EVENTS",
+        Outcome::RevokedSignatureRefused,
+    ),
+    (
+        "MD-REVOKE-CONTACT-NOTIFIED",
+        Outcome::ContactSafetyStateRaised,
+    ),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
     ("MD-DEVICE-CAP-7", Outcome::DeviceAdded),
     ("MD-DEVICE-CAP-8", Outcome::DeviceAdded),
@@ -894,6 +1052,15 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
 /// field is not activated, so every previously pinned result is still the
 /// result. `MD-STREAM-AUTHOR-UNLINKED` exists precisely to make that stay true
 /// by accident-proof rather than by inspection.
+///
+/// WP5 added `MD-SEAL-STALE-ROSTER` (§6's window, once rotation existed) and
+/// then `MD-REVOKE-REFUSE-NEW-EVENTS` / `MD-REVOKE-CONTACT-NOTIFIED` (§10
+/// steps 3 and 4). Again nothing already here moved, and again that is the
+/// claim rather than the coincidence: §10.3 refuses what a roster BURIED, and
+/// no roster in the field has buried anything, so every peer on today's build
+/// — which stamps no device id at all — delivers exactly as it did before.
+/// `MD-STREAM-AUTHOR-UNLINKED` and `MD-STREAM-LEGACY-ID` are what keep that
+/// honest rather than hopeful.
 const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ROSTER-GREATER", Outcome::Accepted),
     ("MD-ROSTER-LOWER", Outcome::Ignored),
@@ -906,6 +1073,7 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
         "MD-ROSTER-FORK-QUARANTINE-PERSISTS",
         Outcome::ForkQuarantined,
     ),
+    ("MD-ROSTER-FORK-ROOT-PIERCE", Outcome::Accepted),
     ("MD-ROSTER-TOMBSTONE", Outcome::TombstonePermanent),
     ("MD-ROSTER-RELINK-FRESH-KEY", Outcome::FreshKeyAccepted),
     ("MD-ROSTER-KEYS-NOT-ENDPOINTS", Outcome::KeysOnlyNoEndpoints),
@@ -939,6 +1107,15 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
         Outcome::SiblingsConvergeBySelfSync,
     ),
     ("MD-SYNC-OUTBOUND-DEDUP", Outcome::DeferredToSiblingAuthor),
+    ("MD-SEAL-STALE-ROSTER", Outcome::SurvivingDevicesDeliver),
+    (
+        "MD-REVOKE-REFUSE-NEW-EVENTS",
+        Outcome::RevokedSignatureRefused,
+    ),
+    (
+        "MD-REVOKE-CONTACT-NOTIFIED",
+        Outcome::ContactSafetyStateRaised,
+    ),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
     ("MD-DEVICE-CAP-7", Outcome::DeviceAdded),
     ("MD-DEVICE-CAP-8", Outcome::DeviceAdded),
@@ -1312,6 +1489,112 @@ fn round_trip_body(
     decode_extended_message_body(opened.payload).expect("decodes")
 }
 
+/// §10's cast, built through the shipped ceremonies: a person, the device that
+/// survives, the device that gets buried, and the rosters either side of the
+/// revocation.
+///
+/// A freshly generated person rather than this file's pinned label fixtures,
+/// because §10.3's driver has to actually SEAL an envelope, and that needs
+/// X25519 secrets the label fixtures deliberately do not carry.
+fn revoking_person() -> (Identity, DeviceKeypair, DeviceKeypair, Roster, Roster) {
+    let person = generate_identity();
+    let kept = generate_device_keypair();
+    let buried = generate_device_keypair();
+    // `kept` holds the roster-signing role, because §10.1's ordinary path is
+    // the approving device burying somebody else — an approving device may not
+    // bury itself, and dethroning one takes §14.2's recovery material.
+    let genesis = cruisemesh_core::core_link_genesis_roster(
+        person.sign_sk.clone(),
+        kept.sign_pk.clone(),
+        kept.agree_pk.clone(),
+    )
+    .expect("genesis");
+    let before = cruisemesh_core::core_link_sign_new_device_roster(
+        genesis,
+        person.sign_pk.clone(),
+        kept.sign_sk.clone(),
+        buried.sign_pk.clone(),
+        buried.agree_pk.clone(),
+    )
+    .expect("link")
+    .roster;
+    let after = cruisemesh_core::core_revoke_devices_roster(
+        before.clone(),
+        person.sign_pk.clone(),
+        kept.sign_sk.clone(),
+        vec![buried.device_id.clone()],
+        cruisemesh_core::core_mint_inbox_key(before.inbox_key_generation),
+    )
+    .expect("the approving device revokes")
+    .roster;
+    (person, kept, buried, before, after)
+}
+
+/// Deliver one ordinary 1:1 message from `device` through the production
+/// inbound pair — `process_inbound_frame` then `core_deliver_inbound`, which is
+/// the pair every shell runs — and hand back the verdict.
+fn deliver_from_device(
+    store: &MessageStore,
+    me: &Identity,
+    sender: &Identity,
+    device: &DeviceKeypair,
+    lamport: u64,
+) -> CoreDeliveryVerdict {
+    let payload = encode_message_body_extended(
+        MessageBody {
+            kind: KIND_TEXT,
+            chat_id: sender.user_id.clone(),
+            lamport,
+            timestamp: NOW_MS,
+            content: b"an ordinary, correctly signed message".to_vec(),
+        },
+        None,
+        Some(device.device_id.clone()),
+        None,
+    )
+    .expect("body encodes");
+    let sealed = seal_message(sender.clone(), me.agree_pk.clone(), payload).expect("seals");
+    let frame = encode_envelope_frame(
+        cruisemesh_core::generate_msg_id(),
+        cruisemesh_core::DEFAULT_HOP_TTL,
+        NOW_MS + 7 * cruisemesh_core::MS_PER_DAY,
+        compute_recipient_hint(me.user_id.clone(), NOW_MS),
+        sealed,
+    );
+    let outcome = store
+        .process_inbound_frame(
+            me.clone(),
+            std::sync::Arc::new(cruisemesh_core::SeenIds::new()),
+            cruisemesh_core::CoreInboundSource::Mesh,
+            frame,
+            NOW_MS,
+        )
+        .expect("inbound");
+    let payload = outcome
+        .delivered_payloads
+        .first()
+        .cloned()
+        .expect("an envelope addressed to us opens");
+    store
+        .core_deliver_inbound(
+            me.clone(),
+            outcome.delivered_sender.expect("verified sender"),
+            payload,
+            outcome.commit.expect("commit token"),
+            MessageArrival {
+                transport: 3,
+                hops_taken: 0,
+                received_at: NOW_MS,
+            },
+            CoreDiscoveryPolicyState {
+                enabled: true,
+                revision: 0,
+            },
+        )
+        .expect("delivery")
+        .verdict
+}
+
 fn relay_item(
     relay_id: i64,
     disposition: CoreInboundDisposition,
@@ -1565,6 +1848,72 @@ fn drive(vector: &Vector) -> Option<Outcome> {
                     .as_ref()
                     == Some(&stored_doc),
                 "the pre-fork roster is what this device keeps holding"
+            );
+            roster_outcome(decision.outcome)
+        }
+        // DL-2's refinement: the person root at a higher epoch is heard.
+        Scenario::RosterForkPiercedByRoot {
+            quarantined_at,
+            incoming,
+            signed_by_person_root,
+        } => {
+            contract_assert!(
+                vector.id,
+                signed_by_person_root,
+                "the whole point of this vector is who signed it"
+            );
+            let store = roster_store();
+            store
+                .apply_contact_roster(roster_at(quarantined_at, &[b"approved-device-a"], &[], 0))
+                .expect("the stored roster applies");
+            let fork = store
+                .apply_contact_roster(roster_at(quarantined_at, &[b"approved-device-b"], &[], 0))
+                .expect("the forked roster applies");
+            contract_assert!(
+                vector.id,
+                fork.outcome == RosterUpdateOutcome::ForkQuarantined,
+                "the fork must quarantine before the pierce is meaningful"
+            );
+
+            // A device key at the same higher epoch is refused first, so what
+            // this vector proves is the SIGNER and not the epoch.
+            let by_a_device = roster_signed_by(
+                incoming,
+                &[b"approved-device-a"],
+                &[],
+                0,
+                Some(device(b"approved-device-a").sign_sk),
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .apply_contact_roster(by_a_device)
+                    .expect("applies")
+                    .outcome
+                    == RosterUpdateOutcome::ForkQuarantined,
+                "a device key cannot pierce a quarantine at any epoch"
+            );
+
+            let rescue = roster_signed_by(incoming, &[b"approved-device-a"], &[], 0, Some(ROOT_SK));
+            contract_assert!(
+                vector.id,
+                core_roster_validate(rescue.clone(), person_root_sign_pk()).is_none()
+                    && rescue.signer_sign_pk == person_root_sign_pk(),
+                "the rescue document must be valid AND root-signed on its own terms"
+            );
+            let decision = store
+                .apply_contact_roster(rescue.clone())
+                .expect("the rescue roster applies");
+            let state = store
+                .contact_roster_state(person_id())
+                .expect("stored roster state");
+            contract_assert!(
+                vector.id,
+                decision.outcome == RosterUpdateOutcome::Accepted
+                    && !decision.quarantined
+                    && !state.quarantined
+                    && state.roster.as_ref() == Some(&rescue),
+                "the root's recovery is adopted and the fork is resolved, got {decision:?}"
             );
             roster_outcome(decision.outcome)
         }
@@ -2723,17 +3072,295 @@ fn drive(vector: &Vector) -> Option<Outcome> {
             );
             Outcome::SiblingsConvergeBySelfSync
         }
+        Scenario::StaleRosterSealing {
+            sealed_with_inbox_key_generation,
+            current_inbox_key_generation,
+            ..
+        } => {
+            // §6's accepted residual, driven end to end now that §10.1's
+            // revocation exists. The window is bounded by propagation and must
+            // never become a delivery brick, so this arm asserts BOTH halves:
+            // the stale roster keeps working, and the fresh one supersedes it.
+            let stale_version = RosterVersion {
+                recovery_epoch: 2,
+                seq: 6,
+            };
+            let stale = roster_at(
+                stale_version,
+                &[OWN_DEVICE_ID, SIBLING_DEVICE_ID, b"revoked-phone-key"],
+                &[],
+                sealed_with_inbox_key_generation,
+            );
+            // The person revokes a device through the shipped §10.1 path. The
+            // generation the fixture names is not restated here -- it is what
+            // the rotation produces from the stale one, checked below.
+            let update = cruisemesh_core::core_revoke_devices_roster(
+                stale.clone(),
+                person_root_sign_pk(),
+                device(OWN_DEVICE_ID).sign_sk.to_vec(),
+                vec![device(b"revoked-phone-key").device_id],
+                cruisemesh_core::core_mint_inbox_key(sealed_with_inbox_key_generation),
+            )
+            .expect("the approving device revokes");
+            contract_assert!(
+                vector.id,
+                update.roster.inbox_key_generation == current_inbox_key_generation,
+                "a revocation must land on the generation this vector pins, got {}",
+                update.roster.inbox_key_generation
+            );
+
+            // The months-offline contact still holds the pre-revocation roster,
+            // which still vouches for the device that has since been buried.
+            let store = roster_store();
+            contract_assert!(
+                vector.id,
+                store
+                    .apply_contact_roster(stale)
+                    .expect("stale roster")
+                    .outcome
+                    == RosterUpdateOutcome::Accepted,
+                "the contact's stored roster is the stale one"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_device_state(person_id(), device(b"revoked-phone-key").device_id)
+                    .expect("device state")
+                    == ContactDeviceState::Active,
+                "a stale roster still lists the revoked device -- that is the exposure"
+            );
+
+            // Sealing to that stale roster still reaches the survivors: each row
+            // of the fan-out is addressed to its own device namespace, and the
+            // surviving device acks its own and nobody else's (ACK-MD-1).
+            let surviving_row = fanout_item(71, CoreInboundDisposition::Consumed, OWN_DEVICE_ID);
+            contract_assert!(
+                vector.id,
+                plan_acks(surviving_row.clone()) == vec![71],
+                "a surviving device must still receive and consume its own row"
+            );
+            // The row the stale contact addressed to the buried device is a
+            // different row in a different namespace, so it is not the row a
+            // survivor consumes and cannot starve one. It has no consumer left,
+            // and it expires on the relay's existing 7-day clock -- the bounded
+            // cost §6 accepts.
+            let buried_row =
+                fanout_item(72, CoreInboundDisposition::Consumed, b"revoked-phone-key");
+            contract_assert!(
+                vector.id,
+                buried_row.recipient_hint != surviving_row.recipient_hint
+                    && buried_row.msg_id != surviving_row.msg_id,
+                "a per-device fan-out gives the buried device its own row, not the survivor's"
+            );
+
+            // And the window closes the moment the revocation propagates.
+            contract_assert!(
+                vector.id,
+                store
+                    .apply_contact_roster(update.roster.clone())
+                    .expect("revocation gossip")
+                    .outcome
+                    == RosterUpdateOutcome::Accepted,
+                "the revocation supersedes the stale roster when it arrives"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_device_state(person_id(), device(b"revoked-phone-key").device_id)
+                    .expect("device state")
+                    == ContactDeviceState::Revoked,
+                "once told, the contact stops vouching for the buried device"
+            );
+            // No wider than §6's window: a replay of the stale generation cannot
+            // pull sealing back to the key the buried device still holds.
+            contract_assert!(
+                vector.id,
+                store
+                    .apply_contact_roster(roster_at(
+                        RosterVersion {
+                            recovery_epoch: stale_version.recovery_epoch,
+                            seq: update.roster.seq + 1,
+                        },
+                        &[OWN_DEVICE_ID, SIBLING_DEVICE_ID],
+                        &[b"revoked-phone-key"],
+                        sealed_with_inbox_key_generation,
+                    ))
+                    .expect("regression attempt")
+                    .reason
+                    == RosterUpdateReason::InboxGenerationRegressed,
+                "an inbox generation never goes backwards inside one recovery epoch"
+            );
+            Outcome::SurvivingDevicesDeliver
+        }
+        // §10.3, driven through the production inbound pair. Nothing here is
+        // revocation-aware on the send side: every envelope is an ordinary
+        // sealed 1:1 message, correctly signed, and the only thing that changes
+        // between the accepted ones and the refused one is whether the roster
+        // in the receiver's store has buried its author.
+        Scenario::RevokedDeviceKeepsSigning {
+            events_before_revocation,
+            events_after_revocation,
+            ..
+        } => {
+            let (person, kept, buried, before, after) = revoking_person();
+            let me = generate_identity();
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            store
+                .upsert_contact(Contact {
+                    user_id: person.user_id.clone(),
+                    name: "Alice".to_string(),
+                    sign_pk: person.sign_pk.clone(),
+                    agree_pk: person.agree_pk.clone(),
+                    relay_url: None,
+                    relay_token: None,
+                    nickname: None,
+                })
+                .expect("the revoking person is a contact");
+            store
+                .apply_contact_roster(before)
+                .expect("the pre-revocation roster applies");
+
+            for lamport in 1..=u64::from(events_before_revocation) {
+                contract_assert!(
+                    vector.id,
+                    deliver_from_device(&store, &me, &person, &buried, lamport)
+                        == CoreDeliveryVerdict::Applied,
+                    "a device still vouched for must deliver"
+                );
+            }
+            let sealed_at = store
+                .messages_for_chat(person.user_id.clone())
+                .expect("chat")
+                .len();
+            contract_assert!(
+                vector.id,
+                sealed_at == usize::from(events_before_revocation),
+                "the pre-revocation history must be what was sent, got {sealed_at}"
+            );
+
+            store
+                .apply_contact_roster(after)
+                .expect("the revocation gossips");
+            for lamport in 1..=u64::from(events_after_revocation) {
+                contract_assert!(
+                    vector.id,
+                    deliver_from_device(
+                        &store,
+                        &me,
+                        &person,
+                        &buried,
+                        lamport + u64::from(events_before_revocation),
+                    ) == CoreDeliveryVerdict::DroppedRevokedDevice,
+                    "an event newly signed by a buried device must be refused"
+                );
+            }
+            contract_assert!(
+                vector.id,
+                store
+                    .messages_for_chat(person.user_id.clone())
+                    .expect("chat")
+                    .len()
+                    == sealed_at,
+                "the stream seals at its last pre-revocation point; history is never rewritten"
+            );
+            // The person is not cut off — only the device is. A surviving
+            // device of the same contact delivers as it always did.
+            contract_assert!(
+                vector.id,
+                deliver_from_device(&store, &me, &person, &kept, 90)
+                    == CoreDeliveryVerdict::Applied,
+                "a revocation cuts off a device, never a person"
+            );
+            Outcome::RevokedSignatureRefused
+        }
+        // §10.4, driven through the same `apply_contact_roster` every gossip
+        // and self-sync path funnels into. The facts are read back from the
+        // store rather than from the classifier, because a fact a surface
+        // cannot read is not a surface treatment.
+        Scenario::ContactNotifiedOfRevocation {
+            device_added_raises_a_fact,
+            device_revoked_raises_a_fact,
+        } => {
+            let (person, kept, buried, before, after) = revoking_person();
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            store
+                .upsert_contact(Contact {
+                    user_id: person.user_id.clone(),
+                    name: "Alice".to_string(),
+                    sign_pk: person.sign_pk.clone(),
+                    agree_pk: person.agree_pk.clone(),
+                    relay_url: None,
+                    relay_token: None,
+                    nickname: None,
+                })
+                .expect("the revoking person is a contact");
+
+            // Learning a contact's fleet, and then watching it grow, is not a
+            // safety change: §2 goal 1 keeps a person's device count invisible
+            // to everyone else, and a warning on every ordinary link is how a
+            // real warning gets swiped away unread.
+            let genesis = cruisemesh_core::core_link_genesis_roster(
+                person.sign_sk.clone(),
+                kept.sign_pk.clone(),
+                kept.agree_pk.clone(),
+            )
+            .expect("genesis");
+            store.apply_contact_roster(genesis).expect("first roster");
+            store
+                .apply_contact_roster(before)
+                .expect("a second device is linked");
+            let after_add = store.contact_safety_facts(true).expect("facts");
+            contract_assert!(
+                vector.id,
+                after_add.len() == usize::from(device_added_raises_a_fact),
+                "an added device must raise {} fact(s), got {}",
+                usize::from(device_added_raises_a_fact),
+                after_add.len()
+            );
+
+            store.apply_contact_roster(after).expect("the revocation");
+            let facts = store.contact_safety_facts(false).expect("facts");
+            contract_assert!(
+                vector.id,
+                (facts.len() == 1) == device_revoked_raises_a_fact,
+                "a revocation must raise exactly one unacknowledged fact, got {}",
+                facts.len()
+            );
+            contract_assert!(
+                vector.id,
+                facts[0].reason == ContactSafetyReason::DeviceRevoked
+                    && facts[0].person_user_id == person.user_id
+                    && facts[0].device_ids == vec![buried.device_id.clone()],
+                "the fact must name the revocation and the device it buried, got {:?}",
+                facts[0]
+            );
+            // Acknowledgement clears the notification and nothing else: DL-4's
+            // tombstone stands, and §10.3's refusal is unaffected.
+            contract_assert!(
+                vector.id,
+                store
+                    .acknowledge_contact_safety_facts(person.user_id.clone(), facts[0].observed_seq)
+                    .expect("acknowledge")
+                    == 1
+                    && store.contact_safety_facts(false).expect("facts").is_empty()
+                    && store
+                        .contact_device_state(person.user_id.clone(), buried.device_id.clone())
+                        .expect("device state")
+                        == ContactDeviceState::Revoked,
+                "acknowledging a warning must not un-bury a device"
+            );
+            Outcome::ContactSafetyStateRaised
+        }
         // Still data-only, and each for a mechanism reason rather than a
-        // shrug: DL-3's roster gossip is contact-FACING distribution, which
-        // WP4's own-device self-sync deliberately does not touch (WP4/WP5);
-        // §6's inbox key generations do not rotate yet (WP5); first-contact
-        // anchoring has no second source of truth to check an adopted epoch
-        // against (WP5's recovery flow); and root-secret custody is WP3's,
-        // since nothing yet mints or stores a person root separately from the
-        // identity key. There is nothing real to execute.
+        // shrug: DL-3's roster gossip is contact-FACING distribution, and WP5
+        // slice 1 produces the document and the recipient list but there is
+        // still no envelope kind that carries a roster to a contact; and
+        // first-contact anchoring has no second source of truth to check an
+        // adopted epoch against. Root-secret custody is WP3's, since nothing
+        // yet mints or stores a person root separately from the identity key.
+        // There is nothing real to execute.
         Scenario::RosterPairwiseGossipNoDirectory { .. }
         | Scenario::RosterGossipToContacts { .. }
-        | Scenario::StaleRosterSealing { .. }
         | Scenario::RosterFirstContactAnchor { .. }
         | Scenario::RecoveryRootCustody { .. } => {
             unreachable!("unimplemented vector ran")
@@ -2847,6 +3474,17 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                     && !auto_resolves,
                 "DL-2 quarantine must survive a legitimately higher roster"
             ),
+            Scenario::RosterForkPiercedByRoot {
+                quarantined_at,
+                incoming,
+                signed_by_person_root,
+            } => contract_assert!(
+                vector.id,
+                (quarantined_at.recovery_epoch, quarantined_at.seq) == (2, 0)
+                    && incoming.recovery_epoch > quarantined_at.recovery_epoch
+                    && signed_by_person_root,
+                "the pierce vector is a ROOT-signed document at a strictly higher epoch"
+            ),
             Scenario::RosterTombstonedDeviceReturns {
                 version,
                 tombstoned_device_id,
@@ -2940,6 +3578,25 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                     && sealed_with_inbox_key_generation < current_inbox_key_generation
                     && surviving_devices_still_receive,
                 "§6 stale-roster sealing is a bounded exposure, never a delivery brick"
+            ),
+            Scenario::RevokedDeviceKeepsSigning {
+                events_before_revocation,
+                events_after_revocation,
+                stored_history_survives,
+            } => contract_assert!(
+                vector.id,
+                events_before_revocation > 0
+                    && events_after_revocation > 0
+                    && stored_history_survives,
+                "§10.3's vector must send on BOTH sides of the burial and keep what came first"
+            ),
+            Scenario::ContactNotifiedOfRevocation {
+                device_added_raises_a_fact,
+                device_revoked_raises_a_fact,
+            } => contract_assert!(
+                vector.id,
+                !device_added_raises_a_fact && device_revoked_raises_a_fact,
+                "§10.4 tells a contact what was taken away, never how many devices somebody has"
             ),
             Scenario::RosterGossipToContacts {
                 fleet_size_after_link,
@@ -3048,19 +3705,23 @@ fn unimplemented_vector_ledger_is_deliberate() {
     // claiming coverage this work package does not have (see this file's
     // header for what the gap costs while it stands).
     //
-    // The rest each wait on a mechanism rather than on effort: §6's
-    // stale-roster sealing needs inbox key *rotation* (WP5); first-contact
-    // anchoring needs a second source of truth about a person's epoch, which is
-    // WP5's recovery flow; root-secret custody needs the person root minted and
-    // stored separately from the identity key, which is WP3's. Driving any of
-    // them today would mean writing a test-only stand-in and calling it core,
-    // which is the one thing this ledger exists to prevent.
+    // The rest each wait on a mechanism rather than on effort: first-contact
+    // anchoring needs a second source of truth about a person's epoch, which
+    // WP5's recovery flow does not supply -- the override proves who may climb
+    // an epoch, not where a stranger's epoch had already got to; root-secret
+    // custody needs the person root minted and stored separately from the
+    // identity key, which is WP3's. Driving either today would mean writing a
+    // test-only stand-in and calling it core, which is the one thing this
+    // ledger exists to prevent.
+    //
+    // §6's stale-roster sealing left this list with WP5: inbox key rotation is
+    // real now (`core_revoke_devices_roster`), so MD-SEAL-STALE-ROSTER is
+    // driven rather than described.
     let expected = [
         "MD-ROSTER-PAIRWISE-GOSSIP",
         "MD-ROSTER-FIRST-CONTACT-ANCHOR",
         "MD-RECOVERY-ROOT-CUSTODY",
         "MD-ROSTER-GOSSIP-TO-CONTACTS",
-        "MD-SEAL-STALE-ROSTER",
     ];
     assert_eq!(
         actual, expected,

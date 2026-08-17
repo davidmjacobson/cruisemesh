@@ -4429,6 +4429,41 @@ public protocol MessageStoreProtocol : AnyObject {
     func abandonLinkActivation(nowMs: Int64) throws  -> CoreLinkActivation
     
     /**
+     * Give up on a revocation whose key never reached storage, leaving this
+     * device exactly where it was. Returns whether anything was pending.
+     */
+    func abandonOwnRevocation() throws  -> Bool
+    
+    /**
+     * Give up on a rotation that cannot be completed, leaving this device on
+     * the credential it already has.
+     *
+     * Safe precisely because the server side is idempotent and all-or-nothing:
+     * either the rotation landed — in which case the old token stops
+     * authorizing and the shell learns that from the next 401, not from this
+     * row — or it did not, and the old token is still the family's. Returns
+     * whether anything was pending.
+     */
+    func abandonRelayRotation() throws  -> Bool
+    
+    /**
+     * Mark one contact's facts acknowledged through
+     * [`ContactSafetyFact::observed_seq`], returning how many moved.
+     *
+     * "Through a watermark" rather than "by id" so that acknowledging what a
+     * person actually saw cannot silently clear a fact that arrived while the
+     * screen was open: a fact observed after the watermark the surface was
+     * showing stays unacknowledged, and comes back.
+     *
+     * Acknowledgement is not resolution. A quarantined fork stays quarantined
+     * (DL-2: only a person resolves a fork, and clearing this row is not that
+     * act), a tombstone stays forever (DL-4), and §10.3's refusal of a buried
+     * device's new events is unaffected. This clears a *notification*, and
+     * nothing else.
+     */
+    func acknowledgeContactSafetyFacts(personUserId: Data, throughObservedSeq: UInt64) throws  -> UInt32
+    
+    /**
      * Adopt a roster of this person's own devices: store the document and
      * project the fleet routing and acks read from it.
      *
@@ -4439,6 +4474,56 @@ public protocol MessageStoreProtocol : AnyObject {
      * which are the same two writes with §9.4's ordering enforced around them.
      */
     func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Data) throws 
+    
+    /**
+     * **Adopt a sibling's rotation announcement** (§10.1, receiving side).
+     *
+     * `sealed` is one [`RevocationHandoff::sealed`] copy, opened with this
+     * device's own X25519 secret because both inbox generations are the wrong
+     * address for it. The roster inside is adopted through the same monotone
+     * writers an activation uses, so DL-1 ordering is enforced by the writers
+     * rather than restated here.
+     *
+     * A device that finds *itself* tombstoned adopts nothing and is told so.
+     * That is not a refusal to obey: the roster is the person's decision and it
+     * stands. It is that a revoked device is not a member of the fleet the
+     * document describes, so it has no fleet projection to write and no sync
+     * context to keep — and [`Self::adopt_own_roster`] would refuse the
+     * document anyway, for the same reason, with a less useful error. What the
+     * shell does with the answer (WP6: stop, say so, offer to re-link with a
+     * fresh key per DL-4) is above this line.
+     *
+     * # The real acceptance rules run here, not a version comparison
+     *
+     * This used to decide with `incoming.version() <= held.version()`, which
+     * is DL-1 and only DL-1. Every other rule in
+     * [`core_roster_accept`] — DL-2's sticky fork quarantine, DL-4's
+     * "tombstones are forever", §6's inbox-generation floor, §14.2's "only
+     * the root raises the epoch" — was simply not consulted on this path.
+     * That is a hole shaped exactly like the threat model. A revoked device
+     * holds no sibling's device secret and so cannot mint a handoff — but it
+     * holds every byte it ever saw, and a *sibling's* genuine handoff
+     * replayed against a later state, or a document that quietly drops a
+     * burial the fleet has since made, is precisely what those rules exist to
+     * refuse. A stricter gate on the contact path than on this device's own
+     * fleet is the wrong way round.
+     *
+     * So the decision is [`core_roster_accept`]'s, run with the quarantine
+     * state this device has stored for its own person, and only
+     * [`RosterUpdateOutcome::Accepted`] adopts. Everything else comes back
+     * with the reason it was refused, and a fork records the sticky bit
+     * before returning.
+     *
+     * `superseded_inbox_key` is the key this device holds *now*, and passing
+     * it is what lets the adopting sibling re-seal its own retained backlog
+     * into the new generation — the same work the revoking device did for its
+     * own. Without it a sibling adopts the rotation and then answers every
+     * backfill request out of rows sealed under a key the rotation retired,
+     * which reads stale to [`crate::core_sync_seal_is_current`] and quietly
+     * stops flowing. `None` is honest when the device never held the key;
+     * nothing is touched then.
+     */
+    func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?) throws  -> RevocationAdoption
     
     /**
      * Persist the frontier after one fetch page, and return what is now
@@ -4505,12 +4590,24 @@ public protocol MessageStoreProtocol : AnyObject {
      * freely over DTN and replays cheaply off a relay, so a notice that
      * is not strictly newer than what is stored must never regress an
      * endpoint that already got repaired.
+     * 4. **A bounded epoch** (`crate::RELAY_EPOCH_MAX_SKEW_MS`). Rules 3 and
+     * 4 are two halves of one idea: "newest wins" only works while the
+     * numbers being compared are wall-clock times. A notice stamped at
+     * `i64::MAX` wins forever, which does not merely misdirect one send —
+     * it **pins the contact's endpoint shut**, because no honest notice
+     * the contact can ever author afterwards is strictly newer. The
+     * revoked device holds the old member token and every notice it ever
+     * saw, so it is in a position to send exactly this, and the poison
+     * would survive the rotation that was supposed to remove it. An epoch
+     * further ahead than a few days of clock skew is refused as
+     * `false`, like any other notice that does not apply.
      *
      * Returns whether the contact's endpoint actually moved. `false` covers
-     * both "not a contact" and "we already hold this or newer" — neither is
-     * an error, both are ordinary outcomes of a spray/replay.
+     * "not a contact", "we already hold this or newer", and "that epoch is
+     * not a time" — none is an error, all are ordinary outcomes of a
+     * spray/replay.
      */
-    func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent) throws  -> Bool
+    func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent, nowMs: Int64) throws  -> Bool
     
     /**
      * Apply a contact's gossiped device roster (§4), storing the result.
@@ -4726,6 +4823,35 @@ public protocol MessageStoreProtocol : AnyObject {
      * ceremony rather than merely arriving on it.
      */
     func beginLinkActivation(channelBinding: Data, nowMs: Int64) throws  -> CoreLinkActivation
+    
+    /**
+     * **Write the revocation down and hand over its key** (§10.1, crash
+     * safety).
+     *
+     * The first half of the two-call ceremony
+     * [`Self::commit_own_revocation`] documents. It validates the update,
+     * records the journal row, and returns the rotated
+     * [`InboxKey`] — which the caller must put in platform-protected storage
+     * **before** calling the commit. Nothing observable has changed yet: no
+     * row has been re-sealed, the roster has not been adopted, and abandoning
+     * here leaves the device exactly where it was.
+     *
+     * A second `begin` replaces a first that never committed, for the same
+     * reason [`Self::begin_relay_rotation`] does: a rotation that was never
+     * performed is worth nothing, and neither is the key it proposed.
+     */
+    func beginOwnRevocation(update: RevocationUpdate, personRootSignPk: Data, ownDevice: DeviceKeypair, nowMs: Int64) throws  -> InboxKey
+    
+    /**
+     * **Write the rotation down before performing it** (§10.2, crash safety).
+     *
+     * Must be called before `POST /family/rotate`, and the ordering is the
+     * whole point: the only way a device can recover from a lost response is
+     * to already know which credential to try. A second `begin` replaces a
+     * pending first — a proposal that never reached the server is worth
+     * nothing, and neither is the token it named.
+     */
+    func beginRelayRotation(plan: RelayRotationPlan, nowMs: Int64) throws 
     
     /**
      * Block an identity (specs/friends-of-friends.md "dismissal-block
@@ -4992,10 +5118,148 @@ public protocol MessageStoreProtocol : AnyObject {
     func clearRelayFetchCursors() throws 
     
     /**
+     * **DL-2's person-driven resolution: clear a roster fork quarantine.**
+     *
+     * DL-2 forbids resolving a fork by arithmetic, and the code keeps that
+     * promise absolutely — nothing in `core_roster_accept` lifts the bit
+     * except a person-root document at a higher recovery epoch, which is the
+     * person speaking rather than the system guessing. But "a fork is
+     * resolved by a person" needs a way for a person to actually do it, and
+     * without one a contact whose devices forked once is quarantined for the
+     * life of the install with no route back.
+     *
+     * **Only after out-of-band re-verification.** The honest precondition is
+     * the same one a changed safety number carries: the two people compare
+     * fingerprints over a channel the attacker does not control, and only
+     * then is this called. It is deliberately a bare seam and not a
+     * convenience — it takes a person id and nothing else, so nothing in the
+     * core can call it as part of a flow.
+     *
+     * The surface that asks the question, explains what it means, and
+     * requires the comparison is WP6's; this is the store operation it will
+     * call. Returns whether anything was quarantined.
+     */
+    func clearRosterQuarantine(personUserId: Data) throws  -> Bool
+    
+    /**
      * Directly scanning the person's own QR code is the escape hatch that
      * clears both a suppression and any dismissal history.
      */
     func clearSharedRequestDismissal(requesterUserId: Data) throws 
+    
+    /**
+     * **Commit §10.1 on the device that signed it.**
+     *
+     * Order is load-bearing and is the "rotate, then drain" rule made concrete:
+     *
+     * 1. **Re-seal the backlog first**, from `superseded_inbox_key` to the
+     * rotated one, in place. A retained record's stream slot — and therefore
+     * its [`crate::core_sync_record_id`] — never moves, so a sibling that
+     * has been dark for a fortnight is still answered out of storage and no
+     * un-fetched record is dropped to make the rotation happen. Doing it
+     * before the roster is adopted means a crash halfway leaves rows sealed
+     * for a roster this device has not adopted yet: they read stale to
+     * [`crate::core_sync_seal_is_current`], nothing sends them, and running
+     * the same `update` again finishes the job.
+     * 2. Adopt the roster and project the fleet
+     * ([`Self::adopt_own_roster`]).
+     * 3. Point the inbound sync gate at the new roster and generation
+     * ([`Self::core_set_own_sync_context`]), which is what makes
+     * [`crate::core_sync_record_admit`] start refusing the revoked device
+     * (§10.3) and everything sealed under the old key
+     * ([`crate::SyncRecordRejection::StaleInboxKey`]).
+     * 4. Author, sign and seal the announcement.
+     *
+     * Records this device cannot re-seal — sealed under a generation older than
+     * `superseded_inbox_key`, or of a kind this build cannot name — are counted
+     * and left exactly where they are. Deleting a record because a rotation
+     * could not re-address it would be the rotation losing mail, which is the
+     * one thing it may not do.
+     *
+     * `superseded_inbox_key` is `None` on a recovery from a phone that never
+     * held the old key; there is then no backlog it could open, and none is
+     * touched.
+     *
+     * # Hard precondition: the rotated key must already be durable
+     *
+     * [`Self::begin_own_revocation`] must have run for exactly this update,
+     * and this refuses to proceed until it has. The ordering is not
+     * bookkeeping — it is the difference between a recoverable crash and a
+     * fleet that has locked itself out of its own backlog.
+     *
+     * Step (1) re-seals every retained record *to the rotated key*. If the
+     * process dies after that and the shell never wrote the key to platform
+     * storage, the rows are addressed to a secret that no longer exists
+     * anywhere: the superseded key opens none of them, the rotated key is
+     * gone, and every one of them is unreadable forever. That is the rotation
+     * losing mail by another route, and it is the one thing §10 may not do.
+     *
+     * So the ceremony is two calls with a durable step between them, exactly
+     * like [`Self::begin_relay_rotation`] / [`Self::commit_relay_rotation`]:
+     * `begin_own_revocation` writes the journal row and hands the shell the
+     * key, the shell puts it in platform-protected storage, and only then
+     * does this run. A device that crashes between the two wakes to
+     * [`Self::pending_own_revocation`] and asks its own key store the one
+     * question that settles it — do I hold this generation? Yes means re-run
+     * this and finish; no means nothing was re-sealed, nothing was adopted,
+     * and the revocation can be planned again from the roster it still holds.
+     */
+    func commitOwnRevocation(update: RevocationUpdate, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?, nowMs: Int64) throws  -> RevocationCommit
+    
+    /**
+     * **Commit §10.2 once the relay has confirmed the rotation.**
+     *
+     * Order, and why each step is where it is:
+     *
+     * 1. **Refuse to publish under a superseded inbox generation.** §10.1
+     * rotates the inbox key; the Settings stream is sealed to it. Running
+     * this before that landed would seal the family's new fetch credential
+     * under the generation the revoked device still holds — handing the
+     * thief its replacement in the same breath as taking the old one away.
+     * The check is against this device's own sync context, which
+     * `commit_own_revocation` moves as its third step.
+     * 2. **Publish to siblings**, into [`SYNC_RELAY_CREDENTIAL_SETTING_KEY`]
+     * at the rotation's epoch. WP4's carrier takes it from there over any
+     * of the four transports — which matters, because a sibling that
+     * missed the rotation cannot reach the relay to be told over the relay.
+     * 3. **Mark the journal committed**, so a relaunch does not re-run a
+     * rotation that has already happened.
+     *
+     * The contact leg is returned rather than performed: the notices are
+     * ordinary kind-9 traffic on the shipped `CAP_RELAY_UPDATE` path, and
+     * this returns the epoch to stamp them with and the list to send them to.
+     *
+     * # A rotation always wins its own publish
+     *
+     * The sibling leg used to write at the plan's epoch and report a lost
+     * merge as an ordinary outcome. That was wrong in exactly the case this
+     * module exists for. The Settings merge is "highest `(epoch,
+     * author_device_id, value)` wins", the revoked device held the inbox key
+     * up to the moment §10.1 rotated it, and it could therefore have authored
+     * a `relay.credential` entry at any epoch it liked before being cut off.
+     * A rotation that shrugged at losing to that entry would leave the whole
+     * fleet converged on a credential the thief chose, announced under the
+     * person's own name, with nothing in the system ever able to displace it.
+     *
+     * So this publishes at `max(plan.relay_epoch, stored_epoch + 1)` — a
+     * stamp that is by construction strictly above whatever is there — and a
+     * write that still does not take is an **error**, not a result. There is
+     * no useful state to return from a rotation whose replacement credential
+     * no sibling will ever learn; the caller's remedy is to retry, and the
+     * journal row [`Self::begin_relay_rotation`] wrote is what lets it.
+     *
+     * The epoch that entry can climb to is bounded on the way *in*, by
+     * [`RELAY_EPOCH_MAX_SKEW_MS`] in the settings apply, which is what keeps
+     * `stored_epoch + 1` a number an honest clock can still stamp.
+     *
+     * Two of the person's own devices revoking at once are the case this
+     * deliberately no longer treats as a loss: both rotate, both publish, the
+     * later wall clock wins, and the loser's own relay call has already been
+     * superseded on the server too — its token no longer authorizes, so it
+     * discovers the winner's credential by the same route a months-asleep
+     * sibling does.
+     */
+    func commitRelayRotation(plan: RelayRotationPlan, nowMs: Int64) throws  -> RelayRotationCommit
     
     /**
      * **§9.4(b), and the moment the device becomes visible.**
@@ -5104,6 +5368,16 @@ public protocol MessageStoreProtocol : AnyObject {
     func contactRosterState(personUserId: Data) throws  -> ContactRosterState
     
     /**
+     * The §10.4 facts this device holds, newest first, at most
+     * [`CONTACT_SAFETY_FACT_PAGE`] of them.
+     *
+     * `include_acknowledged` is what separates the badge from the history: a
+     * surface asking "is there anything to tell this person" passes `false`,
+     * and a safety screen listing what has happened passes `true`.
+     */
+    func contactSafetyFacts(includeAcknowledged: Bool) throws  -> [ContactSafetyFact]
+    
+    /**
      * Apply one admitted sync record (SYNC-1). Idempotent per stream slot and
      * safe to call with records in any order — see the module docs for why
      * both hold, and for why the caller must have opened the record through
@@ -5206,14 +5480,19 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * A rejection the bytes themselves earn is not an error. It comes back as
      * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
-     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`],
+     * [`CoreDeliveryVerdict::DroppedRevokedDevice`] or
      * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
      * any other consumption so the relay copy acks away instead of refetching
      * and re-failing forever. Retrying a signed body that will not decode
      * cannot make it decode.
      *
-     * The two gates it applies before any kind runs:
+     * The three gates it applies before any kind runs:
      *
+     * - §10.3 — an event newly signed by a device its person's roster has
+     * buried is refused outright ([`Self::signer_device_revoked`]). It runs
+     * first because a tombstone answers whether the signature counts at
+     * all, which precedes any question about where the body wanted to write.
      * - `DELIVER-01` — a pairwise body is written only into its verified
      * sender's own thread, and a group body only into the group whose key
      * opened it. `chat_id` is attacker-chosen data inside a signed body;
@@ -6831,6 +7110,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func peerConnectionSummaries() throws  -> [PeerConnectionSummary]
     
     /**
+     * The revocation this device began and has not committed, if any.
+     *
+     * A shell finding one on launch asks its own key store whether it holds
+     * [`PendingRevocation::inbox_key_generation`]. Holding it means the key
+     * survived and [`Self::commit_own_revocation`] can be re-run with the
+     * same update to finish; not holding it means nothing was re-sealed to a
+     * secret that no longer exists, and the ceremony can be planned again.
+     */
+    func pendingOwnRevocation() throws  -> PendingRevocation?
+    
+    /**
      * How many unposted, unexpired relay-upload candidates are queued per
      * recipient as of `now_ms`, largest backlog first. Diagnostics only: a
      * stranded outbound queue was previously invisible in a support export,
@@ -6884,6 +7174,17 @@ public protocol MessageStoreProtocol : AnyObject {
      * from anyone generates one and they are re-queued until they post.
      */
     func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skipRecipientUserIds: [Data]) throws  -> [OutgoingReceiptEnvelope]
+    
+    /**
+     * The rotation this device started and has not committed, if any.
+     *
+     * A shell finding one on launch should try the plan's `new_token` against
+     * the relay: if it authorizes, the server rotated and only the answer was
+     * lost, so [`Self::commit_relay_rotation`] finishes the job. If the *old*
+     * token still authorizes, the call never landed and the rotation can be
+     * retried unchanged.
+     */
+    func pendingRelayRotation() throws  -> RelayRotationPlan?
     
     /**
      * Run one inbound `0x02` envelope through the production disposition and
@@ -7184,6 +7485,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func recordSharedRequestDismissal(requesterUserId: Data) throws  -> UInt32
     
     /**
+     * The family relay credential a sibling published (§10.2's own-device
+     * leg, receiving side).
+     *
+     * A device that adopted a rotation announcement reads its new
+     * configuration here and writes it to platform storage. `None` means no
+     * sibling has ever published one, which is every fleet that has not
+     * rotated — the shell keeps whatever it was configured with.
+     */
+    func relayCredentialSetting() throws  -> RelayEndpoint?
+    
+    /**
      * Which members of a group-addressed envelope's per-member relay fan-out
      * have already landed durably on `relay_url`.
      *
@@ -7336,6 +7648,40 @@ public protocol MessageStoreProtocol : AnyObject {
      * happening.
      */
     func resetRelaySweepProgress(configKey: String, nowMs: Int64) throws 
+    
+    /**
+     * **Re-issue §10.1's rotation announcement to one sibling.**
+     *
+     * The ceremony hands out [`RevocationCommit::handoffs`] once, at the
+     * moment the person taps "Remove device", to whichever siblings a
+     * transport can reach right then. In a family that is roughly nobody: the
+     * other phone is in a bag, the tablet is at home, and the *normal* case
+     * is a sibling that was not present for the ceremony at all. Without a
+     * way to re-issue, that sibling never learns the rotation — it cannot
+     * read the retained copy (sealed to a generation it does not have), it
+     * cannot read the Settings stream carrying the new relay credential for
+     * the same reason, and it is stranded until somebody re-links it.
+     *
+     * So the journal keeps the announcement's stream slot, and this re-seals
+     * a fresh handoff copy from the retained record whenever a sibling turns
+     * up. It is not a cached blob: re-sealing means the copy is addressed
+     * against the roster this device holds **now**, so a sibling that has
+     * since been revoked itself gets nothing (`core_seal_sync_handoff`
+     * refuses a tombstoned address, and this returns an empty list rather
+     * than an error), and a fleet that rotated twice hands out the latest
+     * announcement rather than a stale one.
+     *
+     * `inbox_key` is the current key, and it has to be passed in for the
+     * reason the whole module turns on: the core mints inbox key material and
+     * never persists it, so the retained record — sealed to that key — can
+     * only be reopened by a caller that holds it. Handing it in is the same
+     * contract [`DeviceKeypair`] already has.
+     *
+     * An empty list is the honest answer to "nothing has been revoked here",
+     * "this device did not sign that revocation", and "that device is not a
+     * sibling of mine" alike; none of them is an error.
+     */
+    func revocationHandoffsFor(siblingDeviceId: Data, ownDevice: DeviceKeypair, inboxKey: InboxKey) throws  -> [RevocationHandoff]
     
     /**
      * Unread visible messages across every non-self sender stream in a chat,
@@ -7548,6 +7894,58 @@ open func abandonLinkActivation(nowMs: Int64)throws  -> CoreLinkActivation {
 }
     
     /**
+     * Give up on a revocation whose key never reached storage, leaving this
+     * device exactly where it was. Returns whether anything was pending.
+     */
+open func abandonOwnRevocation()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_abandon_own_revocation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Give up on a rotation that cannot be completed, leaving this device on
+     * the credential it already has.
+     *
+     * Safe precisely because the server side is idempotent and all-or-nothing:
+     * either the rotation landed — in which case the old token stops
+     * authorizing and the shell learns that from the next 401, not from this
+     * row — or it did not, and the old token is still the family's. Returns
+     * whether anything was pending.
+     */
+open func abandonRelayRotation()throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_abandon_relay_rotation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Mark one contact's facts acknowledged through
+     * [`ContactSafetyFact::observed_seq`], returning how many moved.
+     *
+     * "Through a watermark" rather than "by id" so that acknowledging what a
+     * person actually saw cannot silently clear a fact that arrived while the
+     * screen was open: a fact observed after the watermark the surface was
+     * showing stays unacknowledged, and comes back.
+     *
+     * Acknowledgement is not resolution. A quarantined fork stays quarantined
+     * (DL-2: only a person resolves a fork, and clearing this row is not that
+     * act), a tombstone stays forever (DL-4), and §10.3's refusal of a buried
+     * device's new events is unaffected. This clears a *notification*, and
+     * nothing else.
+     */
+open func acknowledgeContactSafetyFacts(personUserId: Data, throughObservedSeq: UInt64)throws  -> UInt32 {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_acknowledge_contact_safety_facts(self.uniffiClonePointer(),
+        FfiConverterData.lower(personUserId),
+        FfiConverterUInt64.lower(throughObservedSeq),$0
+    )
+})
+}
+    
+    /**
      * Adopt a roster of this person's own devices: store the document and
      * project the fleet routing and acks read from it.
      *
@@ -7564,6 +7962,65 @@ open func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Da
         FfiConverterData.lower(ownDeviceId),$0
     )
 }
+}
+    
+    /**
+     * **Adopt a sibling's rotation announcement** (§10.1, receiving side).
+     *
+     * `sealed` is one [`RevocationHandoff::sealed`] copy, opened with this
+     * device's own X25519 secret because both inbox generations are the wrong
+     * address for it. The roster inside is adopted through the same monotone
+     * writers an activation uses, so DL-1 ordering is enforced by the writers
+     * rather than restated here.
+     *
+     * A device that finds *itself* tombstoned adopts nothing and is told so.
+     * That is not a refusal to obey: the roster is the person's decision and it
+     * stands. It is that a revoked device is not a member of the fleet the
+     * document describes, so it has no fleet projection to write and no sync
+     * context to keep — and [`Self::adopt_own_roster`] would refuse the
+     * document anyway, for the same reason, with a less useful error. What the
+     * shell does with the answer (WP6: stop, say so, offer to re-link with a
+     * fresh key per DL-4) is above this line.
+     *
+     * # The real acceptance rules run here, not a version comparison
+     *
+     * This used to decide with `incoming.version() <= held.version()`, which
+     * is DL-1 and only DL-1. Every other rule in
+     * [`core_roster_accept`] — DL-2's sticky fork quarantine, DL-4's
+     * "tombstones are forever", §6's inbox-generation floor, §14.2's "only
+     * the root raises the epoch" — was simply not consulted on this path.
+     * That is a hole shaped exactly like the threat model. A revoked device
+     * holds no sibling's device secret and so cannot mint a handoff — but it
+     * holds every byte it ever saw, and a *sibling's* genuine handoff
+     * replayed against a later state, or a document that quietly drops a
+     * burial the fleet has since made, is precisely what those rules exist to
+     * refuse. A stricter gate on the contact path than on this device's own
+     * fleet is the wrong way round.
+     *
+     * So the decision is [`core_roster_accept`]'s, run with the quarantine
+     * state this device has stored for its own person, and only
+     * [`RosterUpdateOutcome::Accepted`] adopts. Everything else comes back
+     * with the reason it was refused, and a fork records the sticky bit
+     * before returning.
+     *
+     * `superseded_inbox_key` is the key this device holds *now*, and passing
+     * it is what lets the adopting sibling re-seal its own retained backlog
+     * into the new generation — the same work the revoking device did for its
+     * own. Without it a sibling adopts the rotation and then answers every
+     * backfill request out of rows sealed under a key the rotation retired,
+     * which reads stale to [`crate::core_sync_seal_is_current`] and quietly
+     * stops flowing. `None` is honest when the device never held the key;
+     * nothing is touched then.
+     */
+open func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?)throws  -> RevocationAdoption {
+    return try  FfiConverterTypeRevocationAdoption.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_adopt_revocation_handoff(self.uniffiClonePointer(),
+        FfiConverterData.lower(sealed),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterTypeDeviceKeypair.lower(ownDevice),
+        FfiConverterOptionTypeInboxKey.lower(supersededInboxKey),$0
+    )
+})
 }
     
     /**
@@ -7648,16 +8105,29 @@ open func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, page
      * freely over DTN and replays cheaply off a relay, so a notice that
      * is not strictly newer than what is stored must never regress an
      * endpoint that already got repaired.
+     * 4. **A bounded epoch** (`crate::RELAY_EPOCH_MAX_SKEW_MS`). Rules 3 and
+     * 4 are two halves of one idea: "newest wins" only works while the
+     * numbers being compared are wall-clock times. A notice stamped at
+     * `i64::MAX` wins forever, which does not merely misdirect one send —
+     * it **pins the contact's endpoint shut**, because no honest notice
+     * the contact can ever author afterwards is strictly newer. The
+     * revoked device holds the old member token and every notice it ever
+     * saw, so it is in a position to send exactly this, and the poison
+     * would survive the rotation that was supposed to remove it. An epoch
+     * further ahead than a few days of clock skew is refused as
+     * `false`, like any other notice that does not apply.
      *
      * Returns whether the contact's endpoint actually moved. `false` covers
-     * both "not a contact" and "we already hold this or newer" — neither is
-     * an error, both are ordinary outcomes of a spray/replay.
+     * "not a contact", "we already hold this or newer", and "that epoch is
+     * not a time" — none is an error, all are ordinary outcomes of a
+     * spray/replay.
      */
-open func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent)throws  -> Bool {
+open func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent, nowMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_apply_contact_relay_update(self.uniffiClonePointer(),
         FfiConverterData.lower(senderUserId),
-        FfiConverterTypeRelayUpdateContent.lower(content),$0
+        FfiConverterTypeRelayUpdateContent.lower(content),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -7992,6 +8462,50 @@ open func beginLinkActivation(channelBinding: Data, nowMs: Int64)throws  -> Core
         FfiConverterInt64.lower(nowMs),$0
     )
 })
+}
+    
+    /**
+     * **Write the revocation down and hand over its key** (§10.1, crash
+     * safety).
+     *
+     * The first half of the two-call ceremony
+     * [`Self::commit_own_revocation`] documents. It validates the update,
+     * records the journal row, and returns the rotated
+     * [`InboxKey`] — which the caller must put in platform-protected storage
+     * **before** calling the commit. Nothing observable has changed yet: no
+     * row has been re-sealed, the roster has not been adopted, and abandoning
+     * here leaves the device exactly where it was.
+     *
+     * A second `begin` replaces a first that never committed, for the same
+     * reason [`Self::begin_relay_rotation`] does: a rotation that was never
+     * performed is worth nothing, and neither is the key it proposed.
+     */
+open func beginOwnRevocation(update: RevocationUpdate, personRootSignPk: Data, ownDevice: DeviceKeypair, nowMs: Int64)throws  -> InboxKey {
+    return try  FfiConverterTypeInboxKey.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_begin_own_revocation(self.uniffiClonePointer(),
+        FfiConverterTypeRevocationUpdate.lower(update),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterTypeDeviceKeypair.lower(ownDevice),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * **Write the rotation down before performing it** (§10.2, crash safety).
+     *
+     * Must be called before `POST /family/rotate`, and the ordering is the
+     * whole point: the only way a device can recover from a lost response is
+     * to already know which credential to try. A second `begin` replaces a
+     * pending first — a proposal that never reached the server is worth
+     * nothing, and neither is the token it named.
+     */
+open func beginRelayRotation(plan: RelayRotationPlan, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_begin_relay_rotation(self.uniffiClonePointer(),
+        FfiConverterTypeRelayRotationPlan.lower(plan),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
 }
     
     /**
@@ -8384,6 +8898,36 @@ open func clearRelayFetchCursors()throws  {try rustCallWithError(FfiConverterTyp
 }
     
     /**
+     * **DL-2's person-driven resolution: clear a roster fork quarantine.**
+     *
+     * DL-2 forbids resolving a fork by arithmetic, and the code keeps that
+     * promise absolutely — nothing in `core_roster_accept` lifts the bit
+     * except a person-root document at a higher recovery epoch, which is the
+     * person speaking rather than the system guessing. But "a fork is
+     * resolved by a person" needs a way for a person to actually do it, and
+     * without one a contact whose devices forked once is quarantined for the
+     * life of the install with no route back.
+     *
+     * **Only after out-of-band re-verification.** The honest precondition is
+     * the same one a changed safety number carries: the two people compare
+     * fingerprints over a channel the attacker does not control, and only
+     * then is this called. It is deliberately a bare seam and not a
+     * convenience — it takes a person id and nothing else, so nothing in the
+     * core can call it as part of a flow.
+     *
+     * The surface that asks the question, explains what it means, and
+     * requires the comparison is WP6's; this is the store operation it will
+     * call. Returns whether anything was quarantined.
+     */
+open func clearRosterQuarantine(personUserId: Data)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_clear_roster_quarantine(self.uniffiClonePointer(),
+        FfiConverterData.lower(personUserId),$0
+    )
+})
+}
+    
+    /**
      * Directly scanning the person's own QR code is the escape hatch that
      * clears both a suppression and any dismissal history.
      */
@@ -8392,6 +8936,137 @@ open func clearSharedRequestDismissal(requesterUserId: Data)throws  {try rustCal
         FfiConverterData.lower(requesterUserId),$0
     )
 }
+}
+    
+    /**
+     * **Commit §10.1 on the device that signed it.**
+     *
+     * Order is load-bearing and is the "rotate, then drain" rule made concrete:
+     *
+     * 1. **Re-seal the backlog first**, from `superseded_inbox_key` to the
+     * rotated one, in place. A retained record's stream slot — and therefore
+     * its [`crate::core_sync_record_id`] — never moves, so a sibling that
+     * has been dark for a fortnight is still answered out of storage and no
+     * un-fetched record is dropped to make the rotation happen. Doing it
+     * before the roster is adopted means a crash halfway leaves rows sealed
+     * for a roster this device has not adopted yet: they read stale to
+     * [`crate::core_sync_seal_is_current`], nothing sends them, and running
+     * the same `update` again finishes the job.
+     * 2. Adopt the roster and project the fleet
+     * ([`Self::adopt_own_roster`]).
+     * 3. Point the inbound sync gate at the new roster and generation
+     * ([`Self::core_set_own_sync_context`]), which is what makes
+     * [`crate::core_sync_record_admit`] start refusing the revoked device
+     * (§10.3) and everything sealed under the old key
+     * ([`crate::SyncRecordRejection::StaleInboxKey`]).
+     * 4. Author, sign and seal the announcement.
+     *
+     * Records this device cannot re-seal — sealed under a generation older than
+     * `superseded_inbox_key`, or of a kind this build cannot name — are counted
+     * and left exactly where they are. Deleting a record because a rotation
+     * could not re-address it would be the rotation losing mail, which is the
+     * one thing it may not do.
+     *
+     * `superseded_inbox_key` is `None` on a recovery from a phone that never
+     * held the old key; there is then no backlog it could open, and none is
+     * touched.
+     *
+     * # Hard precondition: the rotated key must already be durable
+     *
+     * [`Self::begin_own_revocation`] must have run for exactly this update,
+     * and this refuses to proceed until it has. The ordering is not
+     * bookkeeping — it is the difference between a recoverable crash and a
+     * fleet that has locked itself out of its own backlog.
+     *
+     * Step (1) re-seals every retained record *to the rotated key*. If the
+     * process dies after that and the shell never wrote the key to platform
+     * storage, the rows are addressed to a secret that no longer exists
+     * anywhere: the superseded key opens none of them, the rotated key is
+     * gone, and every one of them is unreadable forever. That is the rotation
+     * losing mail by another route, and it is the one thing §10 may not do.
+     *
+     * So the ceremony is two calls with a durable step between them, exactly
+     * like [`Self::begin_relay_rotation`] / [`Self::commit_relay_rotation`]:
+     * `begin_own_revocation` writes the journal row and hands the shell the
+     * key, the shell puts it in platform-protected storage, and only then
+     * does this run. A device that crashes between the two wakes to
+     * [`Self::pending_own_revocation`] and asks its own key store the one
+     * question that settles it — do I hold this generation? Yes means re-run
+     * this and finish; no means nothing was re-sealed, nothing was adopted,
+     * and the revocation can be planned again from the roster it still holds.
+     */
+open func commitOwnRevocation(update: RevocationUpdate, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?, nowMs: Int64)throws  -> RevocationCommit {
+    return try  FfiConverterTypeRevocationCommit.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_commit_own_revocation(self.uniffiClonePointer(),
+        FfiConverterTypeRevocationUpdate.lower(update),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterTypeDeviceKeypair.lower(ownDevice),
+        FfiConverterOptionTypeInboxKey.lower(supersededInboxKey),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * **Commit §10.2 once the relay has confirmed the rotation.**
+     *
+     * Order, and why each step is where it is:
+     *
+     * 1. **Refuse to publish under a superseded inbox generation.** §10.1
+     * rotates the inbox key; the Settings stream is sealed to it. Running
+     * this before that landed would seal the family's new fetch credential
+     * under the generation the revoked device still holds — handing the
+     * thief its replacement in the same breath as taking the old one away.
+     * The check is against this device's own sync context, which
+     * `commit_own_revocation` moves as its third step.
+     * 2. **Publish to siblings**, into [`SYNC_RELAY_CREDENTIAL_SETTING_KEY`]
+     * at the rotation's epoch. WP4's carrier takes it from there over any
+     * of the four transports — which matters, because a sibling that
+     * missed the rotation cannot reach the relay to be told over the relay.
+     * 3. **Mark the journal committed**, so a relaunch does not re-run a
+     * rotation that has already happened.
+     *
+     * The contact leg is returned rather than performed: the notices are
+     * ordinary kind-9 traffic on the shipped `CAP_RELAY_UPDATE` path, and
+     * this returns the epoch to stamp them with and the list to send them to.
+     *
+     * # A rotation always wins its own publish
+     *
+     * The sibling leg used to write at the plan's epoch and report a lost
+     * merge as an ordinary outcome. That was wrong in exactly the case this
+     * module exists for. The Settings merge is "highest `(epoch,
+     * author_device_id, value)` wins", the revoked device held the inbox key
+     * up to the moment §10.1 rotated it, and it could therefore have authored
+     * a `relay.credential` entry at any epoch it liked before being cut off.
+     * A rotation that shrugged at losing to that entry would leave the whole
+     * fleet converged on a credential the thief chose, announced under the
+     * person's own name, with nothing in the system ever able to displace it.
+     *
+     * So this publishes at `max(plan.relay_epoch, stored_epoch + 1)` — a
+     * stamp that is by construction strictly above whatever is there — and a
+     * write that still does not take is an **error**, not a result. There is
+     * no useful state to return from a rotation whose replacement credential
+     * no sibling will ever learn; the caller's remedy is to retry, and the
+     * journal row [`Self::begin_relay_rotation`] wrote is what lets it.
+     *
+     * The epoch that entry can climb to is bounded on the way *in*, by
+     * [`RELAY_EPOCH_MAX_SKEW_MS`] in the settings apply, which is what keeps
+     * `stored_epoch + 1` a number an honest clock can still stamp.
+     *
+     * Two of the person's own devices revoking at once are the case this
+     * deliberately no longer treats as a loss: both rotate, both publish, the
+     * later wall clock wins, and the loser's own relay call has already been
+     * superseded on the server too — its token no longer authorizes, so it
+     * discovers the winner's credential by the same route a months-asleep
+     * sibling does.
+     */
+open func commitRelayRotation(plan: RelayRotationPlan, nowMs: Int64)throws  -> RelayRotationCommit {
+    return try  FfiConverterTypeRelayRotationCommit.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_commit_relay_rotation(self.uniffiClonePointer(),
+        FfiConverterTypeRelayRotationPlan.lower(plan),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
     
     /**
@@ -8570,6 +9245,22 @@ open func contactRosterState(personUserId: Data)throws  -> ContactRosterState {
 }
     
     /**
+     * The §10.4 facts this device holds, newest first, at most
+     * [`CONTACT_SAFETY_FACT_PAGE`] of them.
+     *
+     * `include_acknowledged` is what separates the badge from the history: a
+     * surface asking "is there anything to tell this person" passes `false`,
+     * and a safety screen listing what has happened passes `true`.
+     */
+open func contactSafetyFacts(includeAcknowledged: Bool)throws  -> [ContactSafetyFact] {
+    return try  FfiConverterSequenceTypeContactSafetyFact.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_safety_facts(self.uniffiClonePointer(),
+        FfiConverterBool.lower(includeAcknowledged),$0
+    )
+})
+}
+    
+    /**
      * Apply one admitted sync record (SYNC-1). Idempotent per stream slot and
      * safe to call with records in any order — see the module docs for why
      * both hold, and for why the caller must have opened the record through
@@ -8694,14 +9385,19 @@ open func coreConfirmCarriedDeliveries(peerUserId: Data, peerKnownMsgIds: [Data]
      *
      * A rejection the bytes themselves earn is not an error. It comes back as
      * a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
-     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+     * [`CoreDeliveryVerdict::DroppedUnauthorizedSender`],
+     * [`CoreDeliveryVerdict::DroppedRevokedDevice`] or
      * [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
      * any other consumption so the relay copy acks away instead of refetching
      * and re-failing forever. Retrying a signed body that will not decode
      * cannot make it decode.
      *
-     * The two gates it applies before any kind runs:
+     * The three gates it applies before any kind runs:
      *
+     * - §10.3 — an event newly signed by a device its person's roster has
+     * buried is refused outright ([`Self::signer_device_revoked`]). It runs
+     * first because a tombstone answers whether the signature counts at
+     * all, which precedes any question about where the body wanted to write.
      * - `DELIVER-01` — a pairwise body is written only into its verified
      * sender's own thread, and a group body only into the group whose key
      * opened it. `chat_id` is attacker-chosen data inside a signed body;
@@ -11089,6 +11785,22 @@ open func peerConnectionSummaries()throws  -> [PeerConnectionSummary] {
 }
     
     /**
+     * The revocation this device began and has not committed, if any.
+     *
+     * A shell finding one on launch asks its own key store whether it holds
+     * [`PendingRevocation::inbox_key_generation`]. Holding it means the key
+     * survived and [`Self::commit_own_revocation`] can be re-run with the
+     * same update to finish; not holding it means nothing was re-sealed to a
+     * secret that no longer exists, and the ceremony can be planned again.
+     */
+open func pendingOwnRevocation()throws  -> PendingRevocation? {
+    return try  FfiConverterOptionTypePendingRevocation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_pending_own_revocation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * How many unposted, unexpired relay-upload candidates are queued per
      * recipient as of `now_ms`, largest backlog first. Diagnostics only: a
      * stranded outbound queue was previously invisible in a support export,
@@ -11161,6 +11873,22 @@ open func pendingRelayOutgoingReceiptEnvelopes(limit: UInt64, nowMs: Int64, skip
         FfiConverterUInt64.lower(limit),
         FfiConverterInt64.lower(nowMs),
         FfiConverterSequenceData.lower(skipRecipientUserIds),$0
+    )
+})
+}
+    
+    /**
+     * The rotation this device started and has not committed, if any.
+     *
+     * A shell finding one on launch should try the plan's `new_token` against
+     * the relay: if it authorizes, the server rotated and only the answer was
+     * lost, so [`Self::commit_relay_rotation`] finishes the job. If the *old*
+     * token still authorizes, the call never landed and the rotation can be
+     * retried unchanged.
+     */
+open func pendingRelayRotation()throws  -> RelayRotationPlan? {
+    return try  FfiConverterOptionTypeRelayRotationPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_pending_relay_rotation(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -11623,6 +12351,22 @@ open func recordSharedRequestDismissal(requesterUserId: Data)throws  -> UInt32 {
 }
     
     /**
+     * The family relay credential a sibling published (§10.2's own-device
+     * leg, receiving side).
+     *
+     * A device that adopted a rotation announcement reads its new
+     * configuration here and writes it to platform storage. `None` means no
+     * sibling has ever published one, which is every fleet that has not
+     * rotated — the shell keeps whatever it was configured with.
+     */
+open func relayCredentialSetting()throws  -> RelayEndpoint? {
+    return try  FfiConverterOptionTypeRelayEndpoint.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_relay_credential_setting(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Which members of a group-addressed envelope's per-member relay fan-out
      * have already landed durably on `relay_url`.
      *
@@ -11845,6 +12589,48 @@ open func resetRelaySweepProgress(configKey: String, nowMs: Int64)throws  {try r
         FfiConverterInt64.lower(nowMs),$0
     )
 }
+}
+    
+    /**
+     * **Re-issue §10.1's rotation announcement to one sibling.**
+     *
+     * The ceremony hands out [`RevocationCommit::handoffs`] once, at the
+     * moment the person taps "Remove device", to whichever siblings a
+     * transport can reach right then. In a family that is roughly nobody: the
+     * other phone is in a bag, the tablet is at home, and the *normal* case
+     * is a sibling that was not present for the ceremony at all. Without a
+     * way to re-issue, that sibling never learns the rotation — it cannot
+     * read the retained copy (sealed to a generation it does not have), it
+     * cannot read the Settings stream carrying the new relay credential for
+     * the same reason, and it is stranded until somebody re-links it.
+     *
+     * So the journal keeps the announcement's stream slot, and this re-seals
+     * a fresh handoff copy from the retained record whenever a sibling turns
+     * up. It is not a cached blob: re-sealing means the copy is addressed
+     * against the roster this device holds **now**, so a sibling that has
+     * since been revoked itself gets nothing (`core_seal_sync_handoff`
+     * refuses a tombstoned address, and this returns an empty list rather
+     * than an error), and a fleet that rotated twice hands out the latest
+     * announcement rather than a stale one.
+     *
+     * `inbox_key` is the current key, and it has to be passed in for the
+     * reason the whole module turns on: the core mints inbox key material and
+     * never persists it, so the retained record — sealed to that key — can
+     * only be reopened by a caller that holds it. Handing it in is the same
+     * contract [`DeviceKeypair`] already has.
+     *
+     * An empty list is the honest answer to "nothing has been revoked here",
+     * "this device did not sign that revocation", and "that device is not a
+     * sibling of mine" alike; none of them is an error.
+     */
+open func revocationHandoffsFor(siblingDeviceId: Data, ownDevice: DeviceKeypair, inboxKey: InboxKey)throws  -> [RevocationHandoff] {
+    return try  FfiConverterSequenceTypeRevocationHandoff.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_revocation_handoffs_for(self.uniffiClonePointer(),
+        FfiConverterData.lower(siblingDeviceId),
+        FfiConverterTypeDeviceKeypair.lower(ownDevice),
+        FfiConverterTypeInboxKey.lower(inboxKey),$0
+    )
+})
 }
     
     /**
@@ -13852,6 +14638,234 @@ public func FfiConverterTypeContactRosterState_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeContactRosterState_lower(_ value: ContactRosterState) -> RustBuffer {
     return FfiConverterTypeContactRosterState.lower(value)
+}
+
+
+/**
+ * One changed-safety-state fact, before it is written down.
+ */
+public struct ContactSafetyChange {
+    public var reason: ContactSafetyReason
+    /**
+     * The device ids the change names — the newly buried ones for
+     * [`ContactSafetyReason::DeviceRevoked`], empty for every other reason.
+     */
+    public var deviceIds: [Data]
+    /**
+     * The roster version this fact is about.
+     */
+    public var recoveryEpoch: UInt64
+    public var seq: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(reason: ContactSafetyReason, 
+        /**
+         * The device ids the change names — the newly buried ones for
+         * [`ContactSafetyReason::DeviceRevoked`], empty for every other reason.
+         */deviceIds: [Data], 
+        /**
+         * The roster version this fact is about.
+         */recoveryEpoch: UInt64, seq: UInt64) {
+        self.reason = reason
+        self.deviceIds = deviceIds
+        self.recoveryEpoch = recoveryEpoch
+        self.seq = seq
+    }
+}
+
+
+
+extension ContactSafetyChange: Equatable, Hashable {
+    public static func ==(lhs: ContactSafetyChange, rhs: ContactSafetyChange) -> Bool {
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.deviceIds != rhs.deviceIds {
+            return false
+        }
+        if lhs.recoveryEpoch != rhs.recoveryEpoch {
+            return false
+        }
+        if lhs.seq != rhs.seq {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(reason)
+        hasher.combine(deviceIds)
+        hasher.combine(recoveryEpoch)
+        hasher.combine(seq)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactSafetyChange: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactSafetyChange {
+        return
+            try ContactSafetyChange(
+                reason: FfiConverterTypeContactSafetyReason.read(from: &buf), 
+                deviceIds: FfiConverterSequenceData.read(from: &buf), 
+                recoveryEpoch: FfiConverterUInt64.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactSafetyChange, into buf: inout [UInt8]) {
+        FfiConverterTypeContactSafetyReason.write(value.reason, into: &buf)
+        FfiConverterSequenceData.write(value.deviceIds, into: &buf)
+        FfiConverterUInt64.write(value.recoveryEpoch, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyChange_lift(_ buf: RustBuffer) throws -> ContactSafetyChange {
+    return try FfiConverterTypeContactSafetyChange.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyChange_lower(_ value: ContactSafetyChange) -> RustBuffer {
+    return FfiConverterTypeContactSafetyChange.lower(value)
+}
+
+
+/**
+ * A stored fact, as a surface reads it back.
+ */
+public struct ContactSafetyFact {
+    public var personUserId: Data
+    public var reason: ContactSafetyReason
+    public var deviceIds: [Data]
+    public var recoveryEpoch: UInt64
+    public var seq: UInt64
+    /**
+     * Observation order across every contact, monotone and never reused.
+     *
+     * It is deliberately not a wall clock. Nothing on the write path has one:
+     * [`MessageStore::apply_contact_roster`] is reached from pairwise gossip
+     * (DL-3) and from a sibling's self-sync alike, and neither carries a
+     * trustworthy time for when the *change* happened — the roster document
+     * has no timestamp at all, by design (§4). An order this device can vouch
+     * for beats a time it would have to invent.
+     */
+    public var observedSeq: UInt64
+    public var acknowledged: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personUserId: Data, reason: ContactSafetyReason, deviceIds: [Data], recoveryEpoch: UInt64, seq: UInt64, 
+        /**
+         * Observation order across every contact, monotone and never reused.
+         *
+         * It is deliberately not a wall clock. Nothing on the write path has one:
+         * [`MessageStore::apply_contact_roster`] is reached from pairwise gossip
+         * (DL-3) and from a sibling's self-sync alike, and neither carries a
+         * trustworthy time for when the *change* happened — the roster document
+         * has no timestamp at all, by design (§4). An order this device can vouch
+         * for beats a time it would have to invent.
+         */observedSeq: UInt64, acknowledged: Bool) {
+        self.personUserId = personUserId
+        self.reason = reason
+        self.deviceIds = deviceIds
+        self.recoveryEpoch = recoveryEpoch
+        self.seq = seq
+        self.observedSeq = observedSeq
+        self.acknowledged = acknowledged
+    }
+}
+
+
+
+extension ContactSafetyFact: Equatable, Hashable {
+    public static func ==(lhs: ContactSafetyFact, rhs: ContactSafetyFact) -> Bool {
+        if lhs.personUserId != rhs.personUserId {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.deviceIds != rhs.deviceIds {
+            return false
+        }
+        if lhs.recoveryEpoch != rhs.recoveryEpoch {
+            return false
+        }
+        if lhs.seq != rhs.seq {
+            return false
+        }
+        if lhs.observedSeq != rhs.observedSeq {
+            return false
+        }
+        if lhs.acknowledged != rhs.acknowledged {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personUserId)
+        hasher.combine(reason)
+        hasher.combine(deviceIds)
+        hasher.combine(recoveryEpoch)
+        hasher.combine(seq)
+        hasher.combine(observedSeq)
+        hasher.combine(acknowledged)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactSafetyFact: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactSafetyFact {
+        return
+            try ContactSafetyFact(
+                personUserId: FfiConverterData.read(from: &buf), 
+                reason: FfiConverterTypeContactSafetyReason.read(from: &buf), 
+                deviceIds: FfiConverterSequenceData.read(from: &buf), 
+                recoveryEpoch: FfiConverterUInt64.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf), 
+                observedSeq: FfiConverterUInt64.read(from: &buf), 
+                acknowledged: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactSafetyFact, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personUserId, into: &buf)
+        FfiConverterTypeContactSafetyReason.write(value.reason, into: &buf)
+        FfiConverterSequenceData.write(value.deviceIds, into: &buf)
+        FfiConverterUInt64.write(value.recoveryEpoch, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterUInt64.write(value.observedSeq, into: &buf)
+        FfiConverterBool.write(value.acknowledged, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyFact_lift(_ buf: RustBuffer) throws -> ContactSafetyFact {
+    return try FfiConverterTypeContactSafetyFact.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyFact_lower(_ value: ContactSafetyFact) -> RustBuffer {
+    return FfiConverterTypeContactSafetyFact.lower(value)
 }
 
 
@@ -22318,6 +23332,130 @@ public func FfiConverterTypeCoreRelayRerunVector_lower(_ value: CoreRelayRerunVe
 
 
 /**
+ * What relayd reported about a rotation (`specs/multi-device-v1.md` §10 step
+ * 2, [`relay_decode_rotate_response`]).
+ */
+public struct CoreRelayRotation {
+    /**
+     * The family's member token from here on — read back from the server
+     * rather than assumed, so a device that lost an earlier response learns
+     * which credential actually won.
+     */
+    public var familyToken: String
+    /**
+     * Its deposit attenuation, the credential friend cards carry. A device
+     * can derive this offline with [`relay_deposit_token_for`]; comparing the
+     * two is how it notices a server that answered about a different family.
+     */
+    public var depositToken: String
+    /**
+     * Rows the server carried across. "Rotate, then drain": no sibling loses
+     * un-fetched mail to make a rotation happen, and this is the figure that
+     * says so.
+     */
+    public var envelopesMoved: UInt64
+    /**
+     * `false` when the server found the rotation already committed — the
+     * answer to a retry after a lost response, and a success, not a failure.
+     */
+    public var rotated: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The family's member token from here on — read back from the server
+         * rather than assumed, so a device that lost an earlier response learns
+         * which credential actually won.
+         */familyToken: String, 
+        /**
+         * Its deposit attenuation, the credential friend cards carry. A device
+         * can derive this offline with [`relay_deposit_token_for`]; comparing the
+         * two is how it notices a server that answered about a different family.
+         */depositToken: String, 
+        /**
+         * Rows the server carried across. "Rotate, then drain": no sibling loses
+         * un-fetched mail to make a rotation happen, and this is the figure that
+         * says so.
+         */envelopesMoved: UInt64, 
+        /**
+         * `false` when the server found the rotation already committed — the
+         * answer to a retry after a lost response, and a success, not a failure.
+         */rotated: Bool) {
+        self.familyToken = familyToken
+        self.depositToken = depositToken
+        self.envelopesMoved = envelopesMoved
+        self.rotated = rotated
+    }
+}
+
+
+
+extension CoreRelayRotation: Equatable, Hashable {
+    public static func ==(lhs: CoreRelayRotation, rhs: CoreRelayRotation) -> Bool {
+        if lhs.familyToken != rhs.familyToken {
+            return false
+        }
+        if lhs.depositToken != rhs.depositToken {
+            return false
+        }
+        if lhs.envelopesMoved != rhs.envelopesMoved {
+            return false
+        }
+        if lhs.rotated != rhs.rotated {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(familyToken)
+        hasher.combine(depositToken)
+        hasher.combine(envelopesMoved)
+        hasher.combine(rotated)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRelayRotation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRelayRotation {
+        return
+            try CoreRelayRotation(
+                familyToken: FfiConverterString.read(from: &buf), 
+                depositToken: FfiConverterString.read(from: &buf), 
+                envelopesMoved: FfiConverterUInt64.read(from: &buf), 
+                rotated: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRelayRotation, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.familyToken, into: &buf)
+        FfiConverterString.write(value.depositToken, into: &buf)
+        FfiConverterUInt64.write(value.envelopesMoved, into: &buf)
+        FfiConverterBool.write(value.rotated, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRotation_lift(_ buf: RustBuffer) throws -> CoreRelayRotation {
+    return try FfiConverterTypeCoreRelayRotation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRelayRotation_lower(_ value: CoreRelayRotation) -> RustBuffer {
+    return FfiConverterTypeCoreRelayRotation.lower(value)
+}
+
+
+/**
  * Everything one sampled legacy pass is asked to remember.
  *
  * Both lists are clamped by [`core_relay_shadow_compare`] before anything is
@@ -26203,8 +27341,10 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> RustBuffer {
  * persists; the shell keeps it in platform-protected storage.
  *
  * `generation` is the counter [`Roster::inbox_key_generation`] carries. §10
- * bumps it and rotates the key on every revocation; WP5 owns that ceremony,
- * and [`core_rotate_inbox_key`] is the primitive it will reach for.
+ * bumps it and rotates the key on every revocation, through
+ * [`core_rotate_inbox_key`]; `revocation.rs` is the ceremony that reaches for
+ * it, and [`core_seal_sync_handoff`] is how the result gets to a sibling that
+ * does not have it yet.
  */
 public struct InboxKey {
     /**
@@ -29087,6 +30227,108 @@ public func FfiConverterTypePeerConnectionSummary_lower(_ value: PeerConnectionS
 
 
 /**
+ * A revocation that has been written down but whose key may not be stored yet
+ * (§10.1, crash safety).
+ */
+public struct PendingRevocation {
+    /**
+     * [`crate::core_roster_head_hash`] of the roster the revocation produced.
+     * The identity of the ceremony, and what
+     * [`MessageStore::commit_own_revocation`] matches its argument against.
+     */
+    public var rosterHead: Data
+    /**
+     * The generation the rotated key belongs to. A device that finds a
+     * pending row asks its platform storage for this generation: holding it
+     * means the key survived and the commit can be re-run, and not holding it
+     * means nothing was ever rotated and the ceremony can be replanned from
+     * scratch.
+     */
+    public var inboxKeyGeneration: UInt64
+    public var revokedDeviceIds: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * [`crate::core_roster_head_hash`] of the roster the revocation produced.
+         * The identity of the ceremony, and what
+         * [`MessageStore::commit_own_revocation`] matches its argument against.
+         */rosterHead: Data, 
+        /**
+         * The generation the rotated key belongs to. A device that finds a
+         * pending row asks its platform storage for this generation: holding it
+         * means the key survived and the commit can be re-run, and not holding it
+         * means nothing was ever rotated and the ceremony can be replanned from
+         * scratch.
+         */inboxKeyGeneration: UInt64, revokedDeviceIds: [Data]) {
+        self.rosterHead = rosterHead
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.revokedDeviceIds = revokedDeviceIds
+    }
+}
+
+
+
+extension PendingRevocation: Equatable, Hashable {
+    public static func ==(lhs: PendingRevocation, rhs: PendingRevocation) -> Bool {
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.revokedDeviceIds != rhs.revokedDeviceIds {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rosterHead)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(revokedDeviceIds)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePendingRevocation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PendingRevocation {
+        return
+            try PendingRevocation(
+                rosterHead: FfiConverterData.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                revokedDeviceIds: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PendingRevocation, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterSequenceData.write(value.revokedDeviceIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingRevocation_lift(_ buf: RustBuffer) throws -> PendingRevocation {
+    return try FfiConverterTypePendingRevocation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePendingRevocation_lower(_ value: PendingRevocation) -> RustBuffer {
+    return FfiConverterTypePendingRevocation.lower(value)
+}
+
+
+/**
  * An inbound friend request that originated from a shared contact card and
  * is waiting for this user's explicit decision (specs/share-contact.md).
  * Everything needed to build the Contact on accept, held outside `contacts`
@@ -29750,6 +30992,317 @@ public func FfiConverterTypeRelayQueueDepth_lower(_ value: RelayQueueDepth) -> R
 }
 
 
+/**
+ * What a committed rotation left behind, and what still has to go out.
+ */
+public struct RelayRotationCommit {
+    /**
+     * This device's relay configuration from here on: the shell writes it to
+     * platform storage, exactly as it would after scanning a setup card.
+     */
+    public var endpoint: RelayEndpoint
+    /**
+     * The deposit attenuation kind-9 will carry.
+     */
+    public var depositToken: String
+    /**
+     * The epoch to stamp those notices with.
+     */
+    public var relayEpoch: Int64
+    /**
+     * The credential that just died. Useful for a shell that wants to stop
+     * retrying it, and for the operator reading a support report.
+     */
+    public var supersededToken: String
+    /**
+     * Every contact that must be told (§10.2's contact leg). The notices
+     * themselves ride the shipped `CAP_RELAY_UPDATE` path.
+     */
+    public var contactUserIds: [Data]
+    /**
+     * The epoch the sibling leg actually published at. Usually
+     * [`Self::relay_epoch`], and strictly above it when a stored entry had
+     * already claimed that stamp — see
+     * [`MessageStore::commit_relay_rotation`].
+     */
+    public var publishedEpoch: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * This device's relay configuration from here on: the shell writes it to
+         * platform storage, exactly as it would after scanning a setup card.
+         */endpoint: RelayEndpoint, 
+        /**
+         * The deposit attenuation kind-9 will carry.
+         */depositToken: String, 
+        /**
+         * The epoch to stamp those notices with.
+         */relayEpoch: Int64, 
+        /**
+         * The credential that just died. Useful for a shell that wants to stop
+         * retrying it, and for the operator reading a support report.
+         */supersededToken: String, 
+        /**
+         * Every contact that must be told (§10.2's contact leg). The notices
+         * themselves ride the shipped `CAP_RELAY_UPDATE` path.
+         */contactUserIds: [Data], 
+        /**
+         * The epoch the sibling leg actually published at. Usually
+         * [`Self::relay_epoch`], and strictly above it when a stored entry had
+         * already claimed that stamp — see
+         * [`MessageStore::commit_relay_rotation`].
+         */publishedEpoch: UInt64) {
+        self.endpoint = endpoint
+        self.depositToken = depositToken
+        self.relayEpoch = relayEpoch
+        self.supersededToken = supersededToken
+        self.contactUserIds = contactUserIds
+        self.publishedEpoch = publishedEpoch
+    }
+}
+
+
+
+extension RelayRotationCommit: Equatable, Hashable {
+    public static func ==(lhs: RelayRotationCommit, rhs: RelayRotationCommit) -> Bool {
+        if lhs.endpoint != rhs.endpoint {
+            return false
+        }
+        if lhs.depositToken != rhs.depositToken {
+            return false
+        }
+        if lhs.relayEpoch != rhs.relayEpoch {
+            return false
+        }
+        if lhs.supersededToken != rhs.supersededToken {
+            return false
+        }
+        if lhs.contactUserIds != rhs.contactUserIds {
+            return false
+        }
+        if lhs.publishedEpoch != rhs.publishedEpoch {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(endpoint)
+        hasher.combine(depositToken)
+        hasher.combine(relayEpoch)
+        hasher.combine(supersededToken)
+        hasher.combine(contactUserIds)
+        hasher.combine(publishedEpoch)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayRotationCommit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayRotationCommit {
+        return
+            try RelayRotationCommit(
+                endpoint: FfiConverterTypeRelayEndpoint.read(from: &buf), 
+                depositToken: FfiConverterString.read(from: &buf), 
+                relayEpoch: FfiConverterInt64.read(from: &buf), 
+                supersededToken: FfiConverterString.read(from: &buf), 
+                contactUserIds: FfiConverterSequenceData.read(from: &buf), 
+                publishedEpoch: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayRotationCommit, into buf: inout [UInt8]) {
+        FfiConverterTypeRelayEndpoint.write(value.endpoint, into: &buf)
+        FfiConverterString.write(value.depositToken, into: &buf)
+        FfiConverterInt64.write(value.relayEpoch, into: &buf)
+        FfiConverterString.write(value.supersededToken, into: &buf)
+        FfiConverterSequenceData.write(value.contactUserIds, into: &buf)
+        FfiConverterUInt64.write(value.publishedEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationCommit_lift(_ buf: RustBuffer) throws -> RelayRotationCommit {
+    return try FfiConverterTypeRelayRotationCommit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationCommit_lower(_ value: RelayRotationCommit) -> RustBuffer {
+    return FfiConverterTypeRelayRotationCommit.lower(value)
+}
+
+
+/**
+ * One planned relay rotation: the credential to move to, and the two epochs
+ * that decide whether it is safe to announce.
+ */
+public struct RelayRotationPlan {
+    public var relayUrl: String
+    /**
+     * The credential being retired. Kept so a device recovering a
+     * half-finished rotation knows which of the two tokens it was holding.
+     */
+    public var supersededToken: String
+    /**
+     * The credential to move to. Already minted, and durable before the call
+     * (see [`MessageStore::begin_relay_rotation`]).
+     */
+    public var newToken: String
+    /**
+     * [`crate::relay_deposit_token_for`] of `new_token`: what kind-9 notices
+     * and friend cards will carry. Derived here so both legs agree.
+     */
+    public var newDepositToken: String
+    /**
+     * The T23 epoch the contact leg announces at — strictly above whatever
+     * this device announced last, so a replayed older notice cannot pull a
+     * contact back to the retired credential.
+     */
+    public var relayEpoch: Int64
+    /**
+     * The inbox key generation §10.1 rotated to. The sibling leg refuses to
+     * publish until this device is actually there, because the Settings
+     * stream is sealed to it.
+     */
+    public var inboxKeyGeneration: UInt64
+    /**
+     * What made this rotation necessary — §10.1's buried devices, carried
+     * through so the shell can say why the relay credential changed.
+     */
+    public var revokedDeviceIds: [Data]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(relayUrl: String, 
+        /**
+         * The credential being retired. Kept so a device recovering a
+         * half-finished rotation knows which of the two tokens it was holding.
+         */supersededToken: String, 
+        /**
+         * The credential to move to. Already minted, and durable before the call
+         * (see [`MessageStore::begin_relay_rotation`]).
+         */newToken: String, 
+        /**
+         * [`crate::relay_deposit_token_for`] of `new_token`: what kind-9 notices
+         * and friend cards will carry. Derived here so both legs agree.
+         */newDepositToken: String, 
+        /**
+         * The T23 epoch the contact leg announces at — strictly above whatever
+         * this device announced last, so a replayed older notice cannot pull a
+         * contact back to the retired credential.
+         */relayEpoch: Int64, 
+        /**
+         * The inbox key generation §10.1 rotated to. The sibling leg refuses to
+         * publish until this device is actually there, because the Settings
+         * stream is sealed to it.
+         */inboxKeyGeneration: UInt64, 
+        /**
+         * What made this rotation necessary — §10.1's buried devices, carried
+         * through so the shell can say why the relay credential changed.
+         */revokedDeviceIds: [Data]) {
+        self.relayUrl = relayUrl
+        self.supersededToken = supersededToken
+        self.newToken = newToken
+        self.newDepositToken = newDepositToken
+        self.relayEpoch = relayEpoch
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.revokedDeviceIds = revokedDeviceIds
+    }
+}
+
+
+
+extension RelayRotationPlan: Equatable, Hashable {
+    public static func ==(lhs: RelayRotationPlan, rhs: RelayRotationPlan) -> Bool {
+        if lhs.relayUrl != rhs.relayUrl {
+            return false
+        }
+        if lhs.supersededToken != rhs.supersededToken {
+            return false
+        }
+        if lhs.newToken != rhs.newToken {
+            return false
+        }
+        if lhs.newDepositToken != rhs.newDepositToken {
+            return false
+        }
+        if lhs.relayEpoch != rhs.relayEpoch {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.revokedDeviceIds != rhs.revokedDeviceIds {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(relayUrl)
+        hasher.combine(supersededToken)
+        hasher.combine(newToken)
+        hasher.combine(newDepositToken)
+        hasher.combine(relayEpoch)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(revokedDeviceIds)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayRotationPlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayRotationPlan {
+        return
+            try RelayRotationPlan(
+                relayUrl: FfiConverterString.read(from: &buf), 
+                supersededToken: FfiConverterString.read(from: &buf), 
+                newToken: FfiConverterString.read(from: &buf), 
+                newDepositToken: FfiConverterString.read(from: &buf), 
+                relayEpoch: FfiConverterInt64.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                revokedDeviceIds: FfiConverterSequenceData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RelayRotationPlan, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.relayUrl, into: &buf)
+        FfiConverterString.write(value.supersededToken, into: &buf)
+        FfiConverterString.write(value.newToken, into: &buf)
+        FfiConverterString.write(value.newDepositToken, into: &buf)
+        FfiConverterInt64.write(value.relayEpoch, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterSequenceData.write(value.revokedDeviceIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationPlan_lift(_ buf: RustBuffer) throws -> RelayRotationPlan {
+    return try FfiConverterTypeRelayRotationPlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationPlan_lower(_ value: RelayRotationPlan) -> RustBuffer {
+    return FfiConverterTypeRelayRotationPlan.lower(value)
+}
+
+
 public struct RelaySetup {
     public var relayUrl: String
     public var relayToken: String
@@ -29916,6 +31469,578 @@ public func FfiConverterTypeRelayUpdateContent_lower(_ value: RelayUpdateContent
 
 
 /**
+ * The result of adopting a sibling's rotation announcement.
+ */
+public struct RevocationAdoption {
+    public var outcome: RevocationAdoptionOutcome
+    /**
+     * Why, in [`core_roster_accept`]'s own vocabulary. Carried out rather
+     * than collapsed into the outcome because a shell has to be able to tell
+     * "this arrived twice" from "somebody is replaying a roster that tries to
+     * exhume a device you buried" — the first is silence, the second is a
+     * safety surface.
+     */
+    public var reason: RosterUpdateReason
+    /**
+     * The ids this document buried that were not buried before — §10.4's fact,
+     * seen from a sibling.
+     */
+    public var revokedDeviceIds: [Data]
+    /**
+     * The rotated key the announcement carried, for the shell to persist in
+     * platform-protected storage. `None` when nothing was adopted.
+     */
+    public var inboxKey: InboxKey?
+    /**
+     * Retained records re-sealed from the superseded generation to the
+     * adopted one, when the caller supplied the superseded key.
+     */
+    public var resealedRecords: UInt32
+    /**
+     * Retained records left sealed under a generation this device can no
+     * longer open. Never deleted — see
+     * [`MessageStore::commit_own_revocation`].
+     */
+    public var unresealableRecords: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: RevocationAdoptionOutcome, 
+        /**
+         * Why, in [`core_roster_accept`]'s own vocabulary. Carried out rather
+         * than collapsed into the outcome because a shell has to be able to tell
+         * "this arrived twice" from "somebody is replaying a roster that tries to
+         * exhume a device you buried" — the first is silence, the second is a
+         * safety surface.
+         */reason: RosterUpdateReason, 
+        /**
+         * The ids this document buried that were not buried before — §10.4's fact,
+         * seen from a sibling.
+         */revokedDeviceIds: [Data], 
+        /**
+         * The rotated key the announcement carried, for the shell to persist in
+         * platform-protected storage. `None` when nothing was adopted.
+         */inboxKey: InboxKey?, 
+        /**
+         * Retained records re-sealed from the superseded generation to the
+         * adopted one, when the caller supplied the superseded key.
+         */resealedRecords: UInt32, 
+        /**
+         * Retained records left sealed under a generation this device can no
+         * longer open. Never deleted — see
+         * [`MessageStore::commit_own_revocation`].
+         */unresealableRecords: UInt32) {
+        self.outcome = outcome
+        self.reason = reason
+        self.revokedDeviceIds = revokedDeviceIds
+        self.inboxKey = inboxKey
+        self.resealedRecords = resealedRecords
+        self.unresealableRecords = unresealableRecords
+    }
+}
+
+
+
+extension RevocationAdoption: Equatable, Hashable {
+    public static func ==(lhs: RevocationAdoption, rhs: RevocationAdoption) -> Bool {
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.revokedDeviceIds != rhs.revokedDeviceIds {
+            return false
+        }
+        if lhs.inboxKey != rhs.inboxKey {
+            return false
+        }
+        if lhs.resealedRecords != rhs.resealedRecords {
+            return false
+        }
+        if lhs.unresealableRecords != rhs.unresealableRecords {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outcome)
+        hasher.combine(reason)
+        hasher.combine(revokedDeviceIds)
+        hasher.combine(inboxKey)
+        hasher.combine(resealedRecords)
+        hasher.combine(unresealableRecords)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationAdoption: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationAdoption {
+        return
+            try RevocationAdoption(
+                outcome: FfiConverterTypeRevocationAdoptionOutcome.read(from: &buf), 
+                reason: FfiConverterTypeRosterUpdateReason.read(from: &buf), 
+                revokedDeviceIds: FfiConverterSequenceData.read(from: &buf), 
+                inboxKey: FfiConverterOptionTypeInboxKey.read(from: &buf), 
+                resealedRecords: FfiConverterUInt32.read(from: &buf), 
+                unresealableRecords: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RevocationAdoption, into buf: inout [UInt8]) {
+        FfiConverterTypeRevocationAdoptionOutcome.write(value.outcome, into: &buf)
+        FfiConverterTypeRosterUpdateReason.write(value.reason, into: &buf)
+        FfiConverterSequenceData.write(value.revokedDeviceIds, into: &buf)
+        FfiConverterOptionTypeInboxKey.write(value.inboxKey, into: &buf)
+        FfiConverterUInt32.write(value.resealedRecords, into: &buf)
+        FfiConverterUInt32.write(value.unresealableRecords, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationAdoption_lift(_ buf: RustBuffer) throws -> RevocationAdoption {
+    return try FfiConverterTypeRevocationAdoption.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationAdoption_lower(_ value: RevocationAdoption) -> RustBuffer {
+    return FfiConverterTypeRevocationAdoption.lower(value)
+}
+
+
+/**
+ * What a committed revocation left behind, and what still has to go out.
+ *
+ * The two gossip legs are deliberately different in kind, because §10.1's two
+ * audiences are:
+ *
+ * * **Own devices** get `handoffs` — a real signed [`SyncRecord`], sealed once
+ * per surviving sibling, ready for any of the four transports. WP4's carrier
+ * already exists, so this leg is executed rather than described.
+ * * **Contacts** get `roster_document` sealed pairwise per contact (DL-3), and
+ * `contact_user_ids` is exactly who must be told. The bytes and the recipient
+ * list are produced here; putting them on a wire is the caller's, and the
+ * envelope kind that carries a roster document to a contact is owed by the
+ * notification slice. Until it lands this leg is a plan, and saying so in the
+ * type is better than a comment nobody reads.
+ */
+public struct RevocationCommit {
+    public var roster: Roster
+    public var rosterHead: Data
+    public var inboxKeyGeneration: UInt64
+    /**
+     * What changed, for §10.4's surface: the ids this update buried.
+     */
+    public var revokedDeviceIds: [Data]
+    /**
+     * The stream slot the announcement was authored at, on this device's
+     * [`SyncRecordKind::OwnRoster`] stream.
+     */
+    public var streamSeq: UInt64
+    public var handoffs: [RevocationHandoff]
+    public var contactUserIds: [Data]
+    /**
+     * [`crate::core_encode_roster`] of the new roster: the DL-3 document.
+     */
+    public var rosterDocument: Data
+    /**
+     * Retained records re-sealed from the superseded generation to the new one.
+     */
+    public var resealedRecords: UInt32
+    /**
+     * Retained records left sealed under a generation this device can no longer
+     * open. Never deleted — see [`MessageStore::commit_own_revocation`].
+     */
+    public var unresealableRecords: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(roster: Roster, rosterHead: Data, inboxKeyGeneration: UInt64, 
+        /**
+         * What changed, for §10.4's surface: the ids this update buried.
+         */revokedDeviceIds: [Data], 
+        /**
+         * The stream slot the announcement was authored at, on this device's
+         * [`SyncRecordKind::OwnRoster`] stream.
+         */streamSeq: UInt64, handoffs: [RevocationHandoff], contactUserIds: [Data], 
+        /**
+         * [`crate::core_encode_roster`] of the new roster: the DL-3 document.
+         */rosterDocument: Data, 
+        /**
+         * Retained records re-sealed from the superseded generation to the new one.
+         */resealedRecords: UInt32, 
+        /**
+         * Retained records left sealed under a generation this device can no longer
+         * open. Never deleted — see [`MessageStore::commit_own_revocation`].
+         */unresealableRecords: UInt32) {
+        self.roster = roster
+        self.rosterHead = rosterHead
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.revokedDeviceIds = revokedDeviceIds
+        self.streamSeq = streamSeq
+        self.handoffs = handoffs
+        self.contactUserIds = contactUserIds
+        self.rosterDocument = rosterDocument
+        self.resealedRecords = resealedRecords
+        self.unresealableRecords = unresealableRecords
+    }
+}
+
+
+
+extension RevocationCommit: Equatable, Hashable {
+    public static func ==(lhs: RevocationCommit, rhs: RevocationCommit) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.revokedDeviceIds != rhs.revokedDeviceIds {
+            return false
+        }
+        if lhs.streamSeq != rhs.streamSeq {
+            return false
+        }
+        if lhs.handoffs != rhs.handoffs {
+            return false
+        }
+        if lhs.contactUserIds != rhs.contactUserIds {
+            return false
+        }
+        if lhs.rosterDocument != rhs.rosterDocument {
+            return false
+        }
+        if lhs.resealedRecords != rhs.resealedRecords {
+            return false
+        }
+        if lhs.unresealableRecords != rhs.unresealableRecords {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(rosterHead)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(revokedDeviceIds)
+        hasher.combine(streamSeq)
+        hasher.combine(handoffs)
+        hasher.combine(contactUserIds)
+        hasher.combine(rosterDocument)
+        hasher.combine(resealedRecords)
+        hasher.combine(unresealableRecords)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationCommit: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationCommit {
+        return
+            try RevocationCommit(
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                rosterHead: FfiConverterData.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                revokedDeviceIds: FfiConverterSequenceData.read(from: &buf), 
+                streamSeq: FfiConverterUInt64.read(from: &buf), 
+                handoffs: FfiConverterSequenceTypeRevocationHandoff.read(from: &buf), 
+                contactUserIds: FfiConverterSequenceData.read(from: &buf), 
+                rosterDocument: FfiConverterData.read(from: &buf), 
+                resealedRecords: FfiConverterUInt32.read(from: &buf), 
+                unresealableRecords: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RevocationCommit, into buf: inout [UInt8]) {
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterSequenceData.write(value.revokedDeviceIds, into: &buf)
+        FfiConverterUInt64.write(value.streamSeq, into: &buf)
+        FfiConverterSequenceTypeRevocationHandoff.write(value.handoffs, into: &buf)
+        FfiConverterSequenceData.write(value.contactUserIds, into: &buf)
+        FfiConverterData.write(value.rosterDocument, into: &buf)
+        FfiConverterUInt32.write(value.resealedRecords, into: &buf)
+        FfiConverterUInt32.write(value.unresealableRecords, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationCommit_lift(_ buf: RustBuffer) throws -> RevocationCommit {
+    return try FfiConverterTypeRevocationCommit.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationCommit_lower(_ value: RevocationCommit) -> RustBuffer {
+    return FfiConverterTypeRevocationCommit.lower(value)
+}
+
+
+/**
+ * One sealed copy of the rotation announcement, addressed to one surviving
+ * sibling (§10.1, [`core_seal_sync_handoff`]).
+ */
+public struct RevocationHandoff {
+    public var deviceId: Data
+    public var sealed: SealedSyncRecord
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceId: Data, sealed: SealedSyncRecord) {
+        self.deviceId = deviceId
+        self.sealed = sealed
+    }
+}
+
+
+
+extension RevocationHandoff: Equatable, Hashable {
+    public static func ==(lhs: RevocationHandoff, rhs: RevocationHandoff) -> Bool {
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceId)
+        hasher.combine(sealed)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationHandoff: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationHandoff {
+        return
+            try RevocationHandoff(
+                deviceId: FfiConverterData.read(from: &buf), 
+                sealed: FfiConverterTypeSealedSyncRecord.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RevocationHandoff, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceId, into: &buf)
+        FfiConverterTypeSealedSyncRecord.write(value.sealed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationHandoff_lift(_ buf: RustBuffer) throws -> RevocationHandoff {
+    return try FfiConverterTypeRevocationHandoff.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationHandoff_lower(_ value: RevocationHandoff) -> RustBuffer {
+    return FfiConverterTypeRevocationHandoff.lower(value)
+}
+
+
+/**
+ * One revocation, ready to be committed locally and gossiped (§10.1).
+ *
+ * It carries secret material — `inbox_key`'s secret half — under exactly the
+ * contract [`crate::Identity`] and [`DeviceKeypair`] already keep: the core
+ * mints and never persists, the shell puts it in platform-protected storage.
+ */
+public struct RevocationUpdate {
+    /**
+     * The signed post-revocation roster.
+     */
+    public var roster: Roster
+    /**
+     * [`crate::core_roster_head_hash`] of `roster`.
+     */
+    public var rosterHead: Data
+    /**
+     * The device ids this update buries, in the order they were named. Already
+     * present tombstones are not repeated here — this is what *changed*, which
+     * is the fact a shell surfaces and a sibling reacts to.
+     */
+    public var revokedDeviceIds: [Data]
+    /**
+     * §6's rotated key: brand-new material at
+     * `roster.inbox_key_generation`. Nothing of the superseded key survives
+     * into it.
+     *
+     * # What this rotates, and what it leaves exactly where it was
+     *
+     * The inbox key is the key **own devices** seal each other's sync records
+     * to, and rotating it is what stops a revoked sibling reading the fleet's
+     * self-sync traffic from the moment the rotation lands.
+     *
+     * It is not the key contacts seal mail to. Generation 0 *is* the deployed
+     * person agreement key — [`crate::Identity`]'s `agree_pk`, the one on
+     * every friend card and QR code already in the field — which is the whole
+     * reason §3 can promise nobody has to re-friend anybody. A revocation
+     * therefore does **not** rotate the key a contact uses to write to this
+     * person, and cannot: doing so would invalidate every card ever shared
+     * and turn "remove this phone" into "re-friend everyone you know".
+     *
+     * Said plainly, because a reader deserves it in one sentence: a revoked
+     * device that keeps the person's identity secret can still open new
+     * contact mail addressed to that person, and what this rotation takes
+     * away is the fleet's own sync channel, the retained backlog, and — with
+     * §10.2 — the relay mailbox. Cutting the contact channel too is a
+     * re-friending ceremony, which §2 lists as a non-goal for v1 and which
+     * §14.2's recovery path is the eventual answer to.
+     */
+    public var inboxKey: InboxKey
+    public var path: RevocationPath
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The signed post-revocation roster.
+         */roster: Roster, 
+        /**
+         * [`crate::core_roster_head_hash`] of `roster`.
+         */rosterHead: Data, 
+        /**
+         * The device ids this update buries, in the order they were named. Already
+         * present tombstones are not repeated here — this is what *changed*, which
+         * is the fact a shell surfaces and a sibling reacts to.
+         */revokedDeviceIds: [Data], 
+        /**
+         * §6's rotated key: brand-new material at
+         * `roster.inbox_key_generation`. Nothing of the superseded key survives
+         * into it.
+         *
+         * # What this rotates, and what it leaves exactly where it was
+         *
+         * The inbox key is the key **own devices** seal each other's sync records
+         * to, and rotating it is what stops a revoked sibling reading the fleet's
+         * self-sync traffic from the moment the rotation lands.
+         *
+         * It is not the key contacts seal mail to. Generation 0 *is* the deployed
+         * person agreement key — [`crate::Identity`]'s `agree_pk`, the one on
+         * every friend card and QR code already in the field — which is the whole
+         * reason §3 can promise nobody has to re-friend anybody. A revocation
+         * therefore does **not** rotate the key a contact uses to write to this
+         * person, and cannot: doing so would invalidate every card ever shared
+         * and turn "remove this phone" into "re-friend everyone you know".
+         *
+         * Said plainly, because a reader deserves it in one sentence: a revoked
+         * device that keeps the person's identity secret can still open new
+         * contact mail addressed to that person, and what this rotation takes
+         * away is the fleet's own sync channel, the retained backlog, and — with
+         * §10.2 — the relay mailbox. Cutting the contact channel too is a
+         * re-friending ceremony, which §2 lists as a non-goal for v1 and which
+         * §14.2's recovery path is the eventual answer to.
+         */inboxKey: InboxKey, path: RevocationPath) {
+        self.roster = roster
+        self.rosterHead = rosterHead
+        self.revokedDeviceIds = revokedDeviceIds
+        self.inboxKey = inboxKey
+        self.path = path
+    }
+}
+
+
+
+extension RevocationUpdate: Equatable, Hashable {
+    public static func ==(lhs: RevocationUpdate, rhs: RevocationUpdate) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.revokedDeviceIds != rhs.revokedDeviceIds {
+            return false
+        }
+        if lhs.inboxKey != rhs.inboxKey {
+            return false
+        }
+        if lhs.path != rhs.path {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(rosterHead)
+        hasher.combine(revokedDeviceIds)
+        hasher.combine(inboxKey)
+        hasher.combine(path)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationUpdate {
+        return
+            try RevocationUpdate(
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                rosterHead: FfiConverterData.read(from: &buf), 
+                revokedDeviceIds: FfiConverterSequenceData.read(from: &buf), 
+                inboxKey: FfiConverterTypeInboxKey.read(from: &buf), 
+                path: FfiConverterTypeRevocationPath.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RevocationUpdate, into buf: inout [UInt8]) {
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterSequenceData.write(value.revokedDeviceIds, into: &buf)
+        FfiConverterTypeInboxKey.write(value.inboxKey, into: &buf)
+        FfiConverterTypeRevocationPath.write(value.path, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationUpdate_lift(_ buf: RustBuffer) throws -> RevocationUpdate {
+    return try FfiConverterTypeRevocationUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationUpdate_lower(_ value: RevocationUpdate) -> RustBuffer {
+    return FfiConverterTypeRevocationUpdate.lower(value)
+}
+
+
+/**
  * The person-signed, versioned device document of §4.
  *
  * DL-5: keys, ids, counters, one signature. An endpoint has nowhere to live.
@@ -29946,7 +32071,9 @@ public struct Roster {
      */
     public var approvingDeviceId: Data
     /**
-     * §6; bumped on every revocation. WP5 rotates the key itself.
+     * §6; bumped on every revocation, and never alone: `revocation.rs` mints
+     * new key material in the same update, because a generation that climbed
+     * over the same key is a number a revoked device can ignore.
      */
     public var inboxKeyGeneration: UInt64
     /**
@@ -29981,7 +32108,9 @@ public struct Roster {
          * The device currently holding the roster-signing role (§3).
          */approvingDeviceId: Data, 
         /**
-         * §6; bumped on every revocation. WP5 rotates the key itself.
+         * §6; bumped on every revocation, and never alone: `revocation.rs` mints
+         * new key material in the same update, because a generation that climbed
+         * over the same key is a number a revoked device can ignore.
          */inboxKeyGeneration: UInt64, 
         /**
          * The key that signed this document: the approving device, or the person
@@ -31905,6 +34034,23 @@ public struct SyncApplyResult {
      * backfilled — it is true for exactly as long as it takes to act on.
      */
     public var peerDigest: SyncDigest?
+    /**
+     * The family relay credential a sibling published, for
+     * [`SyncRecordKind::Settings`] records that carried a *winning* write to
+     * [`crate::SYNC_RELAY_CREDENTIAL_SETTING_KEY`] (§10 step 2).
+     *
+     * Surfaced for the same reason `own_roster` is, and with the same
+     * division of labour: the setting itself is merged here, because it is
+     * ordinary newest-wins shared state, but *acting* on it means writing a
+     * bearer credential into platform-protected storage, which is a shell's
+     * job and nobody else's. A device that had to poll
+     * [`crate::MessageStore::relay_credential_setting`] after every round to
+     * notice a rotation would keep hammering a dead token in between.
+     *
+     * `None` on every other record, and on a Settings record whose credential
+     * entry lost the merge — a losing write is not news.
+     */
+    public var relayCredential: RelayEndpoint?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -31934,12 +34080,29 @@ public struct SyncApplyResult {
          * what it owes with [`crate::core_sync_digest_gaps`], and answers. Handed
          * back rather than stored for the same reason a watermark is not
          * backfilled — it is true for exactly as long as it takes to act on.
-         */peerDigest: SyncDigest?) {
+         */peerDigest: SyncDigest?, 
+        /**
+         * The family relay credential a sibling published, for
+         * [`SyncRecordKind::Settings`] records that carried a *winning* write to
+         * [`crate::SYNC_RELAY_CREDENTIAL_SETTING_KEY`] (§10 step 2).
+         *
+         * Surfaced for the same reason `own_roster` is, and with the same
+         * division of labour: the setting itself is merged here, because it is
+         * ordinary newest-wins shared state, but *acting* on it means writing a
+         * bearer credential into platform-protected storage, which is a shell's
+         * job and nobody else's. A device that had to poll
+         * [`crate::MessageStore::relay_credential_setting`] after every round to
+         * notice a rotation would keep hammering a dead token in between.
+         *
+         * `None` on every other record, and on a Settings record whose credential
+         * entry lost the merge — a losing write is not news.
+         */relayCredential: RelayEndpoint?) {
         self.outcome = outcome
         self.appliedEntries = appliedEntries
         self.throughSeq = throughSeq
         self.ownRoster = ownRoster
         self.peerDigest = peerDigest
+        self.relayCredential = relayCredential
     }
 }
 
@@ -31962,6 +34125,9 @@ extension SyncApplyResult: Equatable, Hashable {
         if lhs.peerDigest != rhs.peerDigest {
             return false
         }
+        if lhs.relayCredential != rhs.relayCredential {
+            return false
+        }
         return true
     }
 
@@ -31971,6 +34137,7 @@ extension SyncApplyResult: Equatable, Hashable {
         hasher.combine(throughSeq)
         hasher.combine(ownRoster)
         hasher.combine(peerDigest)
+        hasher.combine(relayCredential)
     }
 }
 
@@ -31986,7 +34153,8 @@ public struct FfiConverterTypeSyncApplyResult: FfiConverterRustBuffer {
                 appliedEntries: FfiConverterUInt32.read(from: &buf), 
                 throughSeq: FfiConverterUInt64.read(from: &buf), 
                 ownRoster: FfiConverterOptionTypeSyncOwnRosterPayload.read(from: &buf), 
-                peerDigest: FfiConverterOptionTypeSyncDigest.read(from: &buf)
+                peerDigest: FfiConverterOptionTypeSyncDigest.read(from: &buf), 
+                relayCredential: FfiConverterOptionTypeRelayEndpoint.read(from: &buf)
         )
     }
 
@@ -31996,6 +34164,7 @@ public struct FfiConverterTypeSyncApplyResult: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.throughSeq, into: &buf)
         FfiConverterOptionTypeSyncOwnRosterPayload.write(value.ownRoster, into: &buf)
         FfiConverterOptionTypeSyncDigest.write(value.peerDigest, into: &buf)
+        FfiConverterOptionTypeRelayEndpoint.write(value.relayCredential, into: &buf)
     }
 }
 
@@ -34126,6 +36295,102 @@ extension ContactDeviceState: Equatable, Hashable {}
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a contact's safety state changed (§10.4). Reason codes only — the copy
+ * that goes with each one is WP6's, and lives in `strings.xml` /
+ * `Localizable.xcstrings` like every other user-facing string.
+ */
+
+public enum ContactSafetyReason {
+    
+    /**
+     * §10.1 / DL-4: this contact buried one or more of their devices, and
+     * [`ContactSafetyFact::device_ids`] names which. Mail authored from here
+     * on is sealed to a new inbox generation (§6), and events newly signed by
+     * a buried device are refused (§10.3).
+     */
+    case deviceRevoked
+    /**
+     * §14.2 seen from outside: this contact's roster climbed to a higher
+     * `recovery_epoch`, and only the person root inside their
+     * passphrase-encrypted `.cmbak` can sign that. Somebody opened that
+     * backup — the owner recovering, or, if the owner did not, the single
+     * most important thing this surface can say.
+     */
+    case identityRecovered
+    /**
+     * DL-2: two verified rosters at the same `(recovery_epoch, seq)` with
+     * different content. The stored one is kept, this person's roster updates
+     * are quarantined from here on, and the spec asks for the same treatment
+     * as a changed fingerprint. Never auto-resolved — this fact is raised
+     * once per stored version and cleared only by a person.
+     */
+    case rosterForked
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactSafetyReason: FfiConverterRustBuffer {
+    typealias SwiftType = ContactSafetyReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactSafetyReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .deviceRevoked
+        
+        case 2: return .identityRecovered
+        
+        case 3: return .rosterForked
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ContactSafetyReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .deviceRevoked:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .identityRecovered:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .rosterForked:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyReason_lift(_ buf: RustBuffer) throws -> ContactSafetyReason {
+    return try FfiConverterTypeContactSafetyReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactSafetyReason_lower(_ value: ContactSafetyReason) -> RustBuffer {
+    return FfiConverterTypeContactSafetyReason.lower(value)
+}
+
+
+
+extension ContactSafetyReason: Equatable, Hashable {}
+
+
+
 
 public enum CoreBackupError {
 
@@ -34564,6 +36829,31 @@ public enum CoreDeliveryVerdict {
      */
     case droppedUnauthorizedSender
     /**
+     * §10.3: the sealed body names a device its person's roster has buried
+     * (DL-4), so this is a **newly received** event signed by a revoked
+     * device. Terminal in the strongest sense available — a tombstone is
+     * forever, so no later state can make these bytes acceptable, and the
+     * stream they would have landed on stays sealed at its last
+     * pre-revocation point.
+     *
+     * Nothing already stored is touched. §10.3 seals the future of that
+     * stream, it does not rewrite its past: history a device wrote while it
+     * was still trusted was legitimately received, and deleting it on a later
+     * revocation would hand a thief the power to erase a conversation by
+     * getting themselves revoked.
+     *
+     * **Bodies written before the revocation and delivered after it are
+     * dropped too**, and that is a deliberate cost rather than an oversight.
+     * A DTN carry or a relay row can sit for days, so a message the revoked
+     * phone sent in good faith an hour before it was lost arrives to this
+     * verdict and is discarded. The alternative — believing a timestamp the
+     * sender chose — would let the thief backdate everything it writes and
+     * walk straight through §10.3. There is no authenticated "when" to check
+     * against, so the rule is the arrival, not the claim.
+     * `pre_revocation_carry_arriving_after_the_tombstone_is_dropped` pins it.
+     */
+    case droppedRevokedDevice
+    /**
      * The body — or the per-kind content inside it — could not be decoded, or
      * failed a body-shape check the sender controls (a receipt that does not
      * acknowledge this device, a group invite whose membership omits its own
@@ -34598,7 +36888,9 @@ public struct FfiConverterTypeCoreDeliveryVerdict: FfiConverterRustBuffer {
         
         case 3: return .droppedUnauthorizedSender
         
-        case 4: return .droppedMalformed
+        case 4: return .droppedRevokedDevice
+        
+        case 5: return .droppedMalformed
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -34620,8 +36912,12 @@ public struct FfiConverterTypeCoreDeliveryVerdict: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
         
         
-        case .droppedMalformed:
+        case .droppedRevokedDevice:
             writeInt(&buf, Int32(4))
+        
+        
+        case .droppedMalformed:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -40488,6 +42784,193 @@ extension RelayMailboxWalkAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What adopting somebody else's revocation did to this device.
+ */
+
+public enum RevocationAdoptionOutcome {
+    
+    /**
+     * The roster superseded what was held and is now this device's own.
+     */
+    case adopted
+    /**
+     * DL-1: the document does not supersede what is stored. Idempotent gossip,
+     * or a replay.
+     */
+    case notSuperseding
+    /**
+     * This device is the one being buried. Nothing is adopted: a tombstoned
+     * device is not a member of the fleet it is being removed from, and
+     * [`MessageStore::adopt_own_roster`] would refuse the document anyway.
+     */
+    case revokedSelf
+    /**
+     * The acceptance rules refused the document — DL-2's fork quarantine,
+     * DL-4's tombstones, §6's generation rule, §14.2's epoch authority.
+     * [`RevocationAdoption::reason`] says which.
+     */
+    case refused
+    /**
+     * DL-2: this document forks the roster this device holds, and from here
+     * on this person's roster updates are quarantined until a person resolves
+     * it ([`MessageStore::clear_roster_quarantine`]).
+     */
+    case forkQuarantined
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationAdoptionOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = RevocationAdoptionOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationAdoptionOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .adopted
+        
+        case 2: return .notSuperseding
+        
+        case 3: return .revokedSelf
+        
+        case 4: return .refused
+        
+        case 5: return .forkQuarantined
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RevocationAdoptionOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .adopted:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .notSuperseding:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .revokedSelf:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .refused:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .forkQuarantined:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationAdoptionOutcome_lift(_ buf: RustBuffer) throws -> RevocationAdoptionOutcome {
+    return try FfiConverterTypeRevocationAdoptionOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationAdoptionOutcome_lower(_ value: RevocationAdoptionOutcome) -> RustBuffer {
+    return FfiConverterTypeRevocationAdoptionOutcome.lower(value)
+}
+
+
+
+extension RevocationAdoptionOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which of §3's two authorities signed a revocation.
+ */
+
+public enum RevocationPath {
+    
+    /**
+     * "Remove device" on the device that holds the roster-signing role. Bumps
+     * `seq` within the current `recovery_epoch`.
+     */
+    case approvingDevice
+    /**
+     * §14.2's override: a roster signed with the person root secret opened out
+     * of the encrypted backup, at the next `recovery_epoch`. This is the only
+     * path that can dethrone a stolen approving device, and the only path a
+     * device key alone can never take.
+     */
+    case recoveryEpoch
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRevocationPath: FfiConverterRustBuffer {
+    typealias SwiftType = RevocationPath
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RevocationPath {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .approvingDevice
+        
+        case 2: return .recoveryEpoch
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RevocationPath, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .approvingDevice:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .recoveryEpoch:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationPath_lift(_ buf: RustBuffer) throws -> RevocationPath {
+    return try FfiConverterTypeRevocationPath.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRevocationPath_lower(_ value: RevocationPath) -> RustBuffer {
+    return FfiConverterTypeRevocationPath.lower(value)
+}
+
+
+
+extension RevocationPath: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Why a roster is not acceptable on its own terms. `None` from
  * [`core_roster_validate`] means the document is well-formed and every
  * signature in it verifies to a person-authorized key.
@@ -40838,6 +43321,12 @@ public enum RosterUpdateReason {
      * recovery epoch (§6).
      */
     case inboxGenerationRegressed
+    /**
+     * DL-1's ceiling: the incoming roster's `(recovery_epoch, seq)` climbs
+     * further above the stored one than any honest sequence of ceremonies
+     * could ([`ROSTER_MAX_VERSION_JUMP`]).
+     */
+    case versionJumpTooLarge
 }
 
 
@@ -40870,6 +43359,8 @@ public struct FfiConverterTypeRosterUpdateReason: FfiConverterRustBuffer {
         case 9: return .tombstoneResurrected
         
         case 10: return .inboxGenerationRegressed
+        
+        case 11: return .versionJumpTooLarge
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -40917,6 +43408,10 @@ public struct FfiConverterTypeRosterUpdateReason: FfiConverterRustBuffer {
         
         case .inboxGenerationRegressed:
             writeInt(&buf, Int32(10))
+        
+        
+        case .versionJumpTooLarge:
+            writeInt(&buf, Int32(11))
         
         }
     }
@@ -43020,6 +45515,15 @@ public enum SyncRecordRejection {
      * The device signature does not verify in the sync-record domain.
      */
     case signatureInvalid
+    /**
+     * §10.1's rotation handoff carries one kind and one kind only
+     * ([`SyncRecordKind::OwnRoster`]). The handoff channel is sealed to a
+     * sibling's *device* key rather than to the inbox key, so it is the one
+     * channel that survives a rotation — and therefore the one channel that
+     * must never become a general-purpose way to bypass
+     * [`SyncRecordRejection::StaleInboxKey`].
+     */
+    case notARotationHandoff
 }
 
 
@@ -43044,6 +45548,8 @@ public struct FfiConverterTypeSyncRecordRejection: FfiConverterRustBuffer {
         case 5: return .unknownAuthorDevice
         
         case 6: return .signatureInvalid
+        
+        case 7: return .notARotationHandoff
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -43075,6 +45581,10 @@ public struct FfiConverterTypeSyncRecordRejection: FfiConverterRustBuffer {
         
         case .signatureInvalid:
             writeInt(&buf, Int32(6))
+        
+        
+        case .notARotationHandoff:
+            writeInt(&buf, Int32(7))
         
         }
     }
@@ -43914,6 +46424,30 @@ fileprivate struct FfiConverterOptionTypeGroup: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeInboxKey: FfiConverterRustBuffer {
+    typealias SwiftType = InboxKey?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeInboxKey.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeInboxKey.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeLanEndpointCacheEntry: FfiConverterRustBuffer {
     typealias SwiftType = LanEndpointCacheEntry?
 
@@ -44082,6 +46616,30 @@ fileprivate struct FfiConverterOptionTypeOwnSyncContext: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypePendingRevocation: FfiConverterRustBuffer {
+    typealias SwiftType = PendingRevocation?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypePendingRevocation.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypePendingRevocation.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePendingSharedRequest: FfiConverterRustBuffer {
     typealias SwiftType = PendingSharedRequest?
 
@@ -44122,6 +46680,30 @@ fileprivate struct FfiConverterOptionTypeRelayEndpoint: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeRelayEndpoint.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeRelayRotationPlan: FfiConverterRustBuffer {
+    typealias SwiftType = RelayRotationPlan?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRelayRotationPlan.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRelayRotationPlan.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -44925,6 +47507,56 @@ fileprivate struct FfiConverterSequenceTypeContactRelayUnreachable: FfiConverter
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeContactRelayUnreachable.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeContactSafetyChange: FfiConverterRustBuffer {
+    typealias SwiftType = [ContactSafetyChange]
+
+    public static func write(_ value: [ContactSafetyChange], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeContactSafetyChange.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ContactSafetyChange] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ContactSafetyChange]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeContactSafetyChange.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeContactSafetyFact: FfiConverterRustBuffer {
+    typealias SwiftType = [ContactSafetyFact]
+
+    public static func write(_ value: [ContactSafetyFact], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeContactSafetyFact.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ContactSafetyFact] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ContactSafetyFact]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeContactSafetyFact.read(from: &buf))
         }
         return seq
     }
@@ -46150,6 +48782,31 @@ fileprivate struct FfiConverterSequenceTypeRelayQueueDepth: FfiConverterRustBuff
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeRelayQueueDepth.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeRevocationHandoff: FfiConverterRustBuffer {
+    typealias SwiftType = [RevocationHandoff]
+
+    public static func write(_ value: [RevocationHandoff], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeRevocationHandoff.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [RevocationHandoff] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [RevocationHandoff]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeRevocationHandoff.read(from: &buf))
         }
         return seq
     }
@@ -48209,9 +50866,12 @@ public func coreLinkQrUrl(qrText: String) -> String {
  *
  * It starts the epoch with this device alone. Note what it deliberately does
  * NOT do: it does not tombstone the devices it drops. Burying a device is
- * §10's revocation and WP5's work package, with the relay-token rotation that
- * has to come with it; dropping one here simply means the new epoch does not
- * vouch for it. Tombstones already recorded are carried forward untouched,
+ * §10's revocation — [`crate::core_recovery_revoke_roster`] is the same epoch
+ * climb that *does* bury, and names which devices it is burying — while
+ * dropping one here simply means the new epoch does not vouch for it. The
+ * distinction is the product difference between "I lost my phone" and "I am
+ * setting up a replacement": the second must not silently unlink the tablet.
+ * Tombstones already recorded are carried forward untouched either way,
  * because DL-4 is forever.
  *
  * **The inbox key generation moves, the key material does not.** §14.2 is
@@ -48219,10 +50879,13 @@ public func coreLinkQrUrl(qrText: String) -> String {
  * to stop sealing to what that device could open — and §6 says the way a
  * person says that is by advancing `inbox_key_generation`. So this bumps it.
  * What it does not do is mint the new keypair: rotating the actual inbox key,
- * and re-sealing to it, is WP5's, and until WP5 lands the generation this
- * roster announces runs ahead of the material behind it. That is a deliberate,
- * stated gap — a generation that never moved would be worse, because contacts
- * would have no signal at all that anything had changed.
+ * and re-sealing to it, belongs to §10's revocation
+ * ([`crate::core_recovery_revoke_roster`], which does both), so on THIS path
+ * the generation this roster announces runs ahead of the material behind it.
+ * That is a deliberate, stated gap — a generation that never moved would be
+ * worse, because contacts would have no signal at all that anything had
+ * changed — and a caller that means "cut that phone off" should be reaching for
+ * the revocation instead.
  *
  * The `.cmbak` restore path (`ReplaceThisDevice`) does not come through here
  * and must not: nothing was recovered, so nothing is announced.
@@ -48326,6 +50989,79 @@ public func coreMintInboxKey(generation: UInt64) -> InboxKey {
     return try!  FfiConverterTypeInboxKey.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_mint_inbox_key(
         FfiConverterUInt64.lower(generation),$0
+    )
+})
+}
+/**
+ * Mint a fresh member-class relay credential (§10.2).
+ *
+ * Minted locally rather than issued by the server on purpose: the client has
+ * to be able to name the credential it is asking for, or a lost response
+ * leaves it holding a token that no longer authorizes anything and no way to
+ * discover the one that does. See this module's crash-safety note.
+ */
+public func coreMintRelayMemberToken() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_mint_relay_member_token($0
+    )
+})
+}
+/**
+ * Open §10.1's rotation announcement with this device's own X25519 secret.
+ *
+ * `own_roster` is the roster this device holds **now** — the pre-rotation one,
+ * because the whole point of the record inside is to replace it. It is what
+ * answers "is the device that sealed this one of mine, and is it still allowed
+ * to speak" (DL-4, §10.3): a device this roster has already buried cannot
+ * announce anything, inner signature or outer.
+ *
+ * Deciding whether the roster *inside* supersedes what is stored is not this
+ * function's business and deliberately so — that is DL-1's ordering, owned by
+ * the monotone writers
+ * ([`crate::MessageStore::adopt_own_roster`],
+ * [`crate::MessageStore::core_set_own_sync_context`]) that refuse to go
+ * backwards. This function answers only "may I believe these bytes came from a
+ * device of mine".
+ *
+ * # The recovery path's handoff is signed by a device this roster never listed
+ *
+ * The rule above — the signer must be an active device of the roster held
+ * **now** — is exactly right for the ordinary revocation and exactly wrong for
+ * §14.2's. A recovery happens on a *new* phone: the person opens the
+ * passphrase-encrypted `.cmbak`, and the roster the root signs at the next
+ * epoch introduces a device nobody has ever seen. Its rotation announcement is
+ * therefore signed by a device no surviving sibling holds a certificate for,
+ * so a strict held-roster gate refuses it as
+ * [`SyncRecordRejection::UnknownAuthorDevice`] — and the recovery reaches
+ * nobody. The one ceremony that exists to rescue a fleet from a stolen phone
+ * would be the one ceremony the fleet could not hear.
+ *
+ * So the gate has a second acceptable answer, and every part of it is
+ * load-bearing. The signer may instead be an active device of the roster
+ * carried **inside** the record, provided that roster:
+ *
+ * * validates to `person_root_sign_pk` — the root the receiver *already*
+ * holds, never a key the document supplies, which is what stops a stranger
+ * from bootstrapping their own fleet into this person's boundary; and
+ * * is accepted over the held one by [`crate::core_roster_accept`], so DL-1's
+ * ordering, DL-4's tombstones and §14.2's "only the root raises the epoch"
+ * all apply before a single new signer is trusted. A stolen device cannot
+ * take this door: it cannot sign a higher epoch, and within its own epoch it
+ * is already listed, so it gains nothing it did not have.
+ *
+ * The quarantine bit is deliberately not consulted here — `false` is passed —
+ * because this function answers "may I believe these bytes", and a quarantined
+ * person's document is believable and merely not adoptable.
+ * [`crate::MessageStore::adopt_revocation_handoff`] runs the same acceptance
+ * again with the stored quarantine state, and that is the call that decides.
+ */
+public func coreOpenSyncHandoff(sealed: Data, ownDeviceAgreeSk: Data, ownRoster: Roster, personRootSignPk: Data)throws  -> SyncRecord {
+    return try  FfiConverterTypeSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_open_sync_handoff(
+        FfiConverterData.lower(sealed),
+        FfiConverterData.lower(ownDeviceAgreeSk),
+        FfiConverterTypeRoster.lower(ownRoster),
+        FfiConverterData.lower(personRootSignPk),$0
     )
 })
 }
@@ -48575,6 +51311,34 @@ public func corePlanMeshHelloFrames(ownUserId: Data)throws  -> [Data] {
 })
 }
 /**
+ * **Plan §10.2, from §10.1's result.**
+ *
+ * Takes the [`RevocationCommit`] rather than a bare device list because the
+ * trigger is structural: a relay rotation is something a revocation causes,
+ * and a caller that has not committed a revocation has nothing to rotate
+ * *for*. It also carries the two facts the legs need — which devices were
+ * buried, and which inbox generation the announcement must be sealed under.
+ *
+ * `None` means there is nothing to rotate: a person with no Shore Pass has no
+ * family token, and their revocation is complete without this step.
+ *
+ * A deposit-class credential is an error rather than a `None`. A device whose
+ * own relay config holds a deposit token cannot fetch its own mail either, so
+ * it is misconfigured; rotating is not the repair and silently skipping would
+ * hide it.
+ */
+public func corePlanRelayRotation(revocation: RevocationCommit, relayUrl: String, currentToken: String, previousRelayEpoch: Int64, nowMs: Int64)throws  -> RelayRotationPlan? {
+    return try  FfiConverterOptionTypeRelayRotationPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_plan_relay_rotation(
+        FfiConverterTypeRevocationCommit.lower(revocation),
+        FfiConverterString.lower(relayUrl),
+        FfiConverterString.lower(currentToken),
+        FfiConverterInt64.lower(previousRelayEpoch),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * Plan one round of gap-fill (SYNC-1).
  *
  * `gaps` is what the peer is missing — [`core_sync_digest_gaps`] called with
@@ -48640,6 +51404,73 @@ public func coreReactorsForReaction(messages: [StoredMessage], target: CoreMessa
         FfiConverterSequenceTypeStoredMessage.lower(messages),
         FfiConverterTypeCoreMessageTarget.lower(target),
         FfiConverterString.lower(emoji),$0
+    )
+})
+}
+/**
+ * **The override: a revocation signed with the person root out of the backup.**
+ *
+ * This is how §3's "a stolen approving device is dethroned" actually happens.
+ * The thief holds a device key and can sign rosters at `seq + 1` all day; it
+ * cannot sign one at a higher `recovery_epoch`, because §14.2 keeps the person
+ * root secret only inside the passphrase-encrypted `.cmbak`. A contact holding
+ * the thief's latest roster accepts this one on DL-1's ordering and refuses
+ * every later document the thief signs as a
+ * [`crate::RosterUpdateReason::Rollback`].
+ *
+ * It differs from [`crate::core_link_recovery_roster`] — which starts a new
+ * epoch with the recovering device *alone* and buries nothing — in the one way
+ * §10 cares about: it names the devices to bury and buries them, forever
+ * (DL-4). Devices not named survive into the new epoch. That distinction is the
+ * whole product difference between "I lost my phone" and "I am setting up a
+ * replacement": the second must not silently unlink the tablet.
+ *
+ * Every surviving certificate is re-signed under the root, not merely carried
+ * over. Whoever signed them before may be the device this update is burying —
+ * in the case that matters, it *is* — and a certificate signed by a tombstoned
+ * device is an orphan [`core_roster_validate`] rejects. Signing them all from
+ * the root is one rule instead of a conditional, and the root is in hand by
+ * construction on this path.
+ *
+ * `current_inbox_key` is `None` when recovery happens on a phone that never
+ * held the key — opening a backup on a fresh install is the ordinary case — and
+ * the new material is minted one generation above what the stored roster
+ * announced. Passing the key when it *is* held changes nothing about the
+ * result's safety; it only keeps the generation arithmetic in one place.
+ *
+ * # `stored` must be the NEWEST roster in hand, not the backup's snapshot
+ *
+ * DL-4 is absolute and does not bend for the root: `core_roster_accept` refuses
+ * an incoming roster that drops a tombstone the receiver already holds, at
+ * **any** epoch. So a recovery built from a roster older than a burial a
+ * contact has already seen is ignored by that contact, and a higher epoch does
+ * not rescue it.
+ *
+ * That matters because the stolen device can plant burials. A thief holding the
+ * approving device may tombstone the owner's other phones before the owner ever
+ * opens the backup, and a recovery built from the `.cmbak`'s own snapshot would
+ * not carry those tombstones forward. The remedy is the input: pass the most
+ * recent roster this device holds for the person — from a sibling, from a
+ * contact's gossip, from whatever arrived last — and every tombstone travels
+ * with it. The burials themselves are not undoable and are not meant to be:
+ * DL-4's own remedy is that the buried hardware re-links with a fresh key,
+ * which the new epoch's approving device can authorize immediately.
+ *
+ * The residual, stated plainly: a person whose only copy of their roster is an
+ * old backup, whose contacts have since seen a thief's burials, recovers for
+ * the contacts that had not seen them and has to re-share a card with the rest.
+ * Propagation-bounded, never permanent brickage — the same shape as the
+ * stale-endpoint repair path this codebase already runs.
+ */
+public func coreRecoveryRevokeRoster(stored: Roster, personRootSignSk: Data, recoveringDeviceSignPk: Data, recoveringDeviceAgreePk: Data, revokedDeviceIds: [Data], currentInboxKey: InboxKey?)throws  -> RevocationUpdate {
+    return try  FfiConverterTypeRevocationUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_recovery_revoke_roster(
+        FfiConverterTypeRoster.lower(stored),
+        FfiConverterData.lower(personRootSignSk),
+        FfiConverterData.lower(recoveringDeviceSignPk),
+        FfiConverterData.lower(recoveringDeviceAgreePk),
+        FfiConverterSequenceData.lower(revokedDeviceIds),
+        FfiConverterOptionTypeInboxKey.lower(currentInboxKey),$0
     )
 })
 }
@@ -48980,6 +51811,46 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
 })
 }
 /**
+ * **"Remove device", signed by the device that holds the roster-signing role.**
+ *
+ * The mirror image of [`crate::core_link_sign_new_device_roster`], and
+ * deliberately so: same authority check, same `seq + 1`, same re-validation of
+ * what it just produced. What it adds is everything §10.1 asks for beyond the
+ * membership change — the tombstone (DL-4), the inbox generation bump (§6), the
+ * rotated key material, and the re-signing of whatever the buried device had
+ * vouched for.
+ *
+ * `current_inbox_key` must be the key `current.inbox_key_generation` names.
+ * Requiring the whole key rather than a counter is what makes the rotation real:
+ * a caller that does not hold the current key cannot pretend to have rotated it,
+ * and [`core_rotate_inbox_key`] mints material that shares nothing with its
+ * input.
+ *
+ * Two refusals worth naming, because each is a different failure with the same
+ * shape:
+ *
+ * * **The approving device may not bury itself.** A roster whose
+ * `approving_device_id` names no active device is rejected by
+ * [`core_roster_validate`], and handing the role to another device on the way
+ * out would let a stolen phone nominate its successor. Removing the approving
+ * device is §14.2's job — [`core_recovery_revoke_roster`] — where the person
+ * root is what says who approves next.
+ * * **The last device may not be buried.** A person with no devices has no way
+ * back except the recovery path, and producing that state from a device key
+ * would be a self-inflicted lockout one tap deep.
+ */
+public func coreRevokeDevicesRoster(current: Roster, personRootSignPk: Data, approvingDeviceSignSk: Data, revokedDeviceIds: [Data], currentInboxKey: InboxKey)throws  -> RevocationUpdate {
+    return try  FfiConverterTypeRevocationUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_revoke_devices_roster(
+        FfiConverterTypeRoster.lower(current),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterData.lower(approvingDeviceSignSk),
+        FfiConverterSequenceData.lower(revokedDeviceIds),
+        FfiConverterTypeInboxKey.lower(currentInboxKey),$0
+    )
+})
+}
+/**
  * Decide what to do with an incoming roster (DL-1, DL-2, DL-4).
  *
  * Pure: `stored` and `stored_quarantined` are what the caller has persisted
@@ -49021,6 +51892,50 @@ public func coreRosterHeadHash(roster: Roster) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_roster_head_hash(
         FfiConverterTypeRoster.lower(roster),$0
+    )
+})
+}
+/**
+ * The device ids `current` buries that `previous` had not (§10.4's fact,
+ * without §10.4's surface).
+ *
+ * Nothing in the core diffed tombstone sets before this: DL-4 kept them and
+ * DL-1 refused to lose them, but no path asked *which ones are new*. A contact
+ * learning that a person just revoked a device is a changed-safety-state fact,
+ * and a fact is what this returns — the reason code and the copy that go with
+ * it belong to the notification slice and to WP6.
+ *
+ * `previous` is `None` for a first roster, where every tombstone is news.
+ */
+public func coreRosterNewlyRevoked(previous: Roster?, current: Roster) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_newly_revoked(
+        FfiConverterOptionTypeRoster.lower(previous),
+        FfiConverterTypeRoster.lower(current),$0
+    )
+})
+}
+/**
+ * Classify what an applied roster decision changed about a contact's safety
+ * state (§10.4). Pure: no store, no clock, no transport.
+ *
+ * `previous` is what was stored before the decision ran, and `decision` is
+ * what [`crate::core_roster_accept`] said about `incoming`. The returned facts
+ * are in a fixed order — fork, recovery, revocation — so a caller that writes
+ * them down gets the same observation order on every device.
+ *
+ * Two changes genuinely can arrive together: §14.2's recovery-revocation
+ * signs a new epoch *and* buries the stolen approving device in one document,
+ * and both halves are worth saying. They come back as two facts rather than
+ * one blended reason, because a person acknowledging "yes, I recovered my
+ * account" has not thereby acknowledged which device was cut off.
+ */
+public func coreRosterSafetyChanges(previous: Roster?, incoming: Roster, decision: RosterUpdateDecision) -> [ContactSafetyChange] {
+    return try!  FfiConverterSequenceTypeContactSafetyChange.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_safety_changes(
+        FfiConverterOptionTypeRoster.lower(previous),
+        FfiConverterTypeRoster.lower(incoming),
+        FfiConverterTypeRosterUpdateDecision.lower(decision),$0
     )
 })
 }
@@ -49095,6 +52010,58 @@ public func coreSailChecklist(input: CoreSailChecklistInput) -> CoreSailChecklis
     return try!  FfiConverterTypeCoreSailChecklistReport.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_sail_checklist(
         FfiConverterTypeCoreSailChecklistInput.lower(input),$0
+    )
+})
+}
+/**
+ * **Seal §10.1's rotation announcement to ONE sibling device.**
+ *
+ * Every other sync record is sealed to the person's [`InboxKey`], and a
+ * revocation is precisely the moment that key stops being a safe address. The
+ * record that *announces* the rotation cannot use either generation of it:
+ *
+ * * sealed under the **old** generation it hands the device being buried the
+ * very secret the rotation exists to take away — §10's threat model assumes
+ * the revoked device is hostile and keeps everything it ever saw, so this is
+ * not a small window, it is the whole revocation undone; and
+ * * sealed under the **new** generation it cannot be opened by the surviving
+ * siblings, who do not have that key yet. That is the announcement's job.
+ *
+ * So the announcement — and, by [`core_sync_handoff_admit`]'s kind check, only
+ * the announcement — is sealed once per surviving sibling to that sibling's
+ * `device_agree_pk`. A revoked device holds no sibling's device secret, which
+ * is what makes this the one channel the thief cannot read. It costs one copy
+ * per surviving device, bounded by §14.3's hard cap of 16, once per revocation.
+ *
+ * # The address is a roster lookup, never a key the caller supplies
+ *
+ * This module's boundary rests on [`core_seal_sync_record`] having no parameter
+ * that accepts a bare public key, so a sync record cannot be addressed at a
+ * contact even by mistake. That property is preserved here rather than spent:
+ * the caller names a `recipient_device_id`, and the agreement key is read out
+ * of the certificate `own_roster` carries for it (§4). The only reachable
+ * addresses are therefore this person's own active devices — a contact's key is
+ * unreachable because no certificate in this person's roster holds one, and,
+ * which is the point of the whole exercise, **a device this roster has
+ * tombstoned is unreachable too** (DL-4, §10.3). The announcement cannot be
+ * addressed to the phone whose removal it announces.
+ *
+ * Pass the roster the revocation *produced*, not the one it superseded: the
+ * surviving devices are the ones the new document lists, and that is exactly
+ * the set to be told.
+ *
+ * Note what is *not* relaxed. The record still carries its ordinary device
+ * signature, the outer envelope is still [`crate::seal_message`]'s, and the
+ * receiver still runs the full roster gate. This changes the address, not the
+ * authority.
+ */
+public func coreSealSyncHandoff(record: SyncRecord, author: Identity, ownRoster: Roster, recipientDeviceId: Data)throws  -> SealedSyncRecord {
+    return try  FfiConverterTypeSealedSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_seal_sync_handoff(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterTypeIdentity.lower(author),
+        FfiConverterTypeRoster.lower(ownRoster),
+        FfiConverterData.lower(recipientDeviceId),$0
     )
 })
 }
@@ -49413,6 +52380,35 @@ public func coreSyncDraftKey(chatId: Data) -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_sync_draft_key(
         FfiConverterData.lower(chatId),$0
+    )
+})
+}
+/**
+ * The SYNC-3 gate for §10.1's **rotation handoff**: the same checks as
+ * [`core_sync_record_admit`] with exactly two differences, and both are forced
+ * by what the handoff is for.
+ *
+ * * The [`SyncRecordRejection::StaleInboxKey`] check is dropped. A handoff is
+ * sealed to a sibling's device key, not to an inbox key, precisely because
+ * the generation it announces is one the receiver does not hold yet —
+ * refusing it for naming a generation the receiver has not got would refuse
+ * every rotation there will ever be.
+ * * The kind is pinned to [`SyncRecordKind::OwnRoster`]. Dropping the
+ * generation check is a real weakening, so it is confined to the one payload
+ * that carries a roster and its new key. History, watermarks, contacts,
+ * groups and settings keep the strict gate; there is no way to smuggle them
+ * through this door.
+ *
+ * Everything else is unchanged and load-bearing: the record must name this
+ * person, its author must be an active — not tombstoned (DL-4, §10.3) —
+ * device of the roster the receiver holds *now*, and its device signature must
+ * verify. So a revoked device cannot announce a rotation of its own.
+ */
+public func coreSyncHandoffAdmit(record: SyncRecord, ownRoster: Roster) -> SyncRecordRejection? {
+    return try!  FfiConverterOptionTypeSyncRecordRejection.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_handoff_admit(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterTypeRoster.lower(ownRoster),$0
     )
 })
 }
@@ -50949,6 +53945,27 @@ public func relayDecodePresencePage(body: Data)throws  -> CoreRelayPresencePage 
 })
 }
 /**
+ * Decode relayd's answer, refusing one that does not describe the rotation
+ * that was asked for.
+ *
+ * The `expected_token` check is the point of decoding this at all. A rotation
+ * is the one call whose *result* the device then commits to platform storage
+ * and gossips to its whole contact list, so an answer naming a different
+ * credential — a proxy replaying an older family's response, a server that
+ * resolved the bearer to something else — must not be adopted quietly. And
+ * the deposit half is re-derived rather than trusted: it is what friend cards
+ * will carry, so a server-supplied value that did not attenuate from the
+ * member token would put an unrelated credential on every card.
+ */
+public func relayDecodeRotateResponse(body: Data, expectedToken: String)throws  -> CoreRelayRotation {
+    return try  FfiConverterTypeCoreRelayRotation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_rotate_response(
+        FfiConverterData.lower(body),
+        FfiConverterString.lower(expectedToken),$0
+    )
+})
+}
+/**
  * CP4: attenuate a member relay token into its deposit-class counterpart —
  * `cmdep1-` ‖ base64url(BLAKE2b-256(context ‖ member_token)).
  *
@@ -50995,6 +54012,50 @@ public func relayEncodePresenceRequest(announce: [Data], query: [Data])throws  -
     uniffi_cruisemesh_core_fn_func_relay_encode_presence_request(
         FfiConverterSequenceData.lower(announce),
         FfiConverterSequenceData.lower(query),$0
+    )
+})
+}
+/**
+ * Body for §10.2's rotation call.
+ *
+ * # Why the bearer token is not the authority
+ *
+ * The obvious design — the family's current member token authorizes changing
+ * that token — is the one thing §10's threat model forbids, because **the
+ * revoked device holds that token**. A rotation authorized by possession
+ * alone is a rotation the thief can perform first, re-keying the family to a
+ * credential only it knows and locking the owner out of their own mailbox
+ * with the owner's own remedy. So the bearer token still says *which* family
+ * this is, and a signature says *who may re-key it*.
+ *
+ * The signing key is the **person root** public key, and that choice is the
+ * load-bearing one. It is stable across every change of approving device —
+ * §14.2 keeps it inside the passphrase-encrypted `.cmbak` and off every
+ * linked device, so a stolen phone never holds it, and the recovery path
+ * always can sign with it. A roster-signing device key would have had to be
+ * re-registered on the server every time the role moved, and the recovery
+ * path — the one that matters most, because it is the path a *stolen
+ * approving device* is dethroned by — could not have signed at all.
+ *
+ * relayd registers the key on first use (trust on first rotation) and pins it
+ * thereafter; see its `rotate_family` handler for the server half, including
+ * the two consequences that follow (a shared pass becomes rotatable by one
+ * person only, and the bounded first-rotation-on-a-legacy-family window).
+ *
+ * `new_token` is minted locally by [`crate::core_mint_relay_member_token`]
+ * and must already be written down durably before this is sent — see
+ * [`crate::MessageStore::begin_relay_rotation`]. The client choosing the
+ * replacement is what makes a lost response recoverable instead of terminal;
+ * a retry after a lost response presents the new token as both halves, so it
+ * re-signs over `(new_token, new_token)`, which this function produces
+ * naturally when the caller passes the new token as `current_token`.
+ */
+public func relayEncodeRotateRequest(currentToken: String, newToken: String, personRootSignSk: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_encode_rotate_request(
+        FfiConverterString.lower(currentToken),
+        FfiConverterString.lower(newToken),
+        FfiConverterData.lower(personRootSignSk),$0
     )
 })
 }
@@ -51375,6 +54436,19 @@ public func relayRetryAfterMs(retryAfterHeader: String?) -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_retry_after_ms(
         FfiConverterOptionString.lower(retryAfterHeader),$0
+    )
+})
+}
+/**
+ * The path [`relay_encode_rotate_request`] posts to.
+ *
+ * A function rather than a constant so both shells route identically and
+ * neither hand-writes the string, exactly as [`relay_build_fetch_path`]
+ * exists so neither hand-writes the fetch query.
+ */
+public func relayRotatePath() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_rotate_path($0
     )
 })
 }
@@ -52318,7 +55392,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_link_qr_url() != 9866) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_link_recovery_roster() != 55416) {
+    if (uniffi_cruisemesh_core_checksum_func_core_link_recovery_roster() != 51356) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_link_rendezvous_id() != 54978) {
@@ -52337,6 +55411,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_mint_inbox_key() != 38877) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_mint_relay_member_token() != 6229) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_open_sync_handoff() != 33206) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_open_sync_record() != 6040) {
@@ -52381,6 +55461,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_plan_mesh_hello_frames() != 39982) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_plan_relay_rotation() != 39416) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_plan_sync_backfill() != 60379) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -52388,6 +55471,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_reactors_for_reaction() != 63484) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_recovery_revoke_roster() != 32799) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
@@ -52447,6 +55533,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_revoke_devices_roster() != 47609) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_accept() != 33112) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -52456,6 +55545,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_roster_head_hash() != 1927) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_newly_revoked() != 31535) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_safety_changes() != 36307) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_validate() != 10) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -52463,6 +55558,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_sail_checklist() != 31707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_seal_sync_handoff() != 15579) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_seal_sync_record() != 31661) {
@@ -52520,6 +55618,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_sync_draft_key() != 47882) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_handoff_admit() != 33770) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_sync_kind_is_stream() != 60552) {
@@ -52840,6 +55941,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_presence_page() != 6708) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_rotate_response() != 63630) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_deposit_token_for() != 59157) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -52850,6 +55954,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_presence_request() != 64701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_encode_rotate_request() != 32464) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24532) {
@@ -52892,6 +55999,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_retry_after_ms() != 10198) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_rotate_path() != 31771) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_setup_is_official() != 11572) {
@@ -53299,7 +56409,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_abandon_link_activation() != 54731) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_abandon_own_revocation() != 16674) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_abandon_relay_rotation() != 6094) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_acknowledge_contact_safety_facts() != 34121) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_own_roster() != 39473) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_revocation_handoff() != 38529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
@@ -53308,7 +56430,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_sweep_cursor() != 33864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 59804) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 29083) {
@@ -53351,6 +56473,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_begin_link_activation() != 2143) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_begin_own_revocation() != 6076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_begin_relay_rotation() != 1389) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
@@ -53416,7 +56544,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_relay_fetch_cursors() != 48310) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_roster_quarantine() != 28677) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_commit_own_revocation() != 48614) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_commit_relay_rotation() != 43704) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_complete_link_activation() != 14897) {
@@ -53452,6 +56589,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_roster_state() != 8489) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_safety_facts() != 19720) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_apply_sync_record() != 64327) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -53461,7 +56601,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_confirm_carried_deliveries() != 19708) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_deliver_inbound() != 36853) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_deliver_inbound() != 30192) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
@@ -53788,6 +56928,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_peer_connection_summaries() != 62253) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_own_revocation() != 52848) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outbound_depth_by_recipient() != 58936) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -53795,6 +56938,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_outgoing_receipt_envelopes() != 13280) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_rotation() != 50828) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 43681) {
@@ -53860,6 +57006,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_shared_request_dismissal() != 11001) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_credential_setting() != 56457) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fanout_posted_members() != 23882) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -53891,6 +57040,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_reset_relay_sweep_progress() != 31015) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_revocation_handoffs_for() != 37109) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_semantic_unread_count() != 2210) {

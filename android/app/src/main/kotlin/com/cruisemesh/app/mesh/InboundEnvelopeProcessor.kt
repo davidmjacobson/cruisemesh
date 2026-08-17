@@ -1713,7 +1713,10 @@ internal class InboundEnvelopeProcessor(
         if (!inserted) return
 
         val applied = try {
-            store.applyContactRelayUpdate(senderUserId, content)
+            // The clock is passed so core can refuse an epoch further ahead
+            // than believable skew -- a notice stamped past the end of time would
+            // otherwise pin this contact's endpoint shut forever.
+            store.applyContactRelayUpdate(senderUserId, content, System.currentTimeMillis())
         } catch (e: CoreException) {
             // Mis-scoped subject or a non-deposit credential: a deterministic
             // reject, not a store failure. The message row above still stands

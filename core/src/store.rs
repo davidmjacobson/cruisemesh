@@ -1160,6 +1160,10 @@ impl MessageStore {
             .map_err(store_err)?;
         conn.execute_batch(crate::roster_store::CONTACT_ROSTER_SCHEMA_SQL)
             .map_err(store_err)?;
+        // §10 step 4's changed-safety-state facts, beside the rosters that
+        // raise them.
+        conn.execute_batch(crate::contact_safety::CONTACT_SAFETY_SCHEMA_SQL)
+            .map_err(store_err)?;
         conn.execute_batch(crate::device_link::activation::DEVICE_LINK_SCHEMA_SQL)
             .map_err(store_err)?;
         // The ceremony a pre-activation window belongs to. Added after the
@@ -1171,8 +1175,17 @@ impl MessageStore {
         // records, and the shared settings a sibling may write.
         conn.execute_batch(crate::sync_store::SYNC_STREAM_SCHEMA_SQL)
             .map_err(store_err)?;
-        // A roster describes a contact, so it has no business outliving one.
+        // §10 step 2's crash-safety journal for a relay credential rotation.
+        conn.execute_batch(crate::relay_rotation::RELAY_ROTATION_SCHEMA_SQL)
+            .map_err(store_err)?;
+        // §10.1's own journal: the durable-key precondition and the record
+        // that makes a rotation handoff re-issuable.
+        conn.execute_batch(crate::revocation::REVOCATION_SCHEMA_SQL)
+            .map_err(store_err)?;
+        // A roster describes a contact, so it has no business outliving one,
+        // and neither does a safety warning about them.
         crate::roster_store::sweep_orphaned_persons(&conn)?;
+        crate::contact_safety::sweep_orphaned_persons(&conn)?;
         migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
@@ -2040,6 +2053,21 @@ fn sanitize_restore_contents(
         [],
     )
     .map_err(store_err)?;
+    // Same reasoning one layer up (`specs/multi-device-v1.md` §10 step 2): a
+    // half-finished relay-credential rotation describes a ceremony the backup's
+    // phone was in the middle of, not this one. Restoring it would have the new
+    // install try to finish somebody else's rotation with a token it never
+    // minted. The credential a restore should use is the one in the backup
+    // payload, which is where it has always come from.
+    tx.execute("DELETE FROM relay_rotation", [])
+        .map_err(store_err)?;
+    // And §10.1's journal for the same reason: it names a roster head and an
+    // inbox key generation that belong to the phone the backup came from. A
+    // restored install holding it would refuse to commit its own revocations
+    // and would offer a handoff re-issue pointing at a stream slot it does not
+    // have.
+    tx.execute("DELETE FROM own_revocation", [])
+        .map_err(store_err)?;
 
     if options.include_message_history {
         report.removed_expired_delivery_count += tx
@@ -4799,19 +4827,35 @@ impl MessageStore {
     ///    freely over DTN and replays cheaply off a relay, so a notice that
     ///    is not strictly newer than what is stored must never regress an
     ///    endpoint that already got repaired.
+    /// 4. **A bounded epoch** (`crate::RELAY_EPOCH_MAX_SKEW_MS`). Rules 3 and
+    ///    4 are two halves of one idea: "newest wins" only works while the
+    ///    numbers being compared are wall-clock times. A notice stamped at
+    ///    `i64::MAX` wins forever, which does not merely misdirect one send —
+    ///    it **pins the contact's endpoint shut**, because no honest notice
+    ///    the contact can ever author afterwards is strictly newer. The
+    ///    revoked device holds the old member token and every notice it ever
+    ///    saw, so it is in a position to send exactly this, and the poison
+    ///    would survive the rotation that was supposed to remove it. An epoch
+    ///    further ahead than a few days of clock skew is refused as
+    ///    `false`, like any other notice that does not apply.
     ///
     /// Returns whether the contact's endpoint actually moved. `false` covers
-    /// both "not a contact" and "we already hold this or newer" — neither is
-    /// an error, both are ordinary outcomes of a spray/replay.
+    /// "not a contact", "we already hold this or newer", and "that epoch is
+    /// not a time" — none is an error, all are ordinary outcomes of a
+    /// spray/replay.
     pub fn apply_contact_relay_update(
         &self,
         sender_user_id: Vec<u8>,
         content: RelayUpdateContent,
+        now_ms: i64,
     ) -> Result<bool, CoreError> {
         if content.subject_user_id != sender_user_id {
             return Err(CoreError::Malformed(
                 "relay update may only change the sending contact's own endpoint".into(),
             ));
+        }
+        if content.relay_epoch > now_ms.saturating_add(crate::RELAY_EPOCH_MAX_SKEW_MS) {
+            return Ok(false);
         }
         crate::protocol::validate_relay_update_credential(
             &content.relay_url,
@@ -5883,6 +5927,7 @@ impl MessageStore {
         // do. DL-4's "tombstones are forever" is a rule about a roster's own
         // history, not a reason to keep a deleted person's device list.
         crate::roster_store::delete_person(&tx, &user_id)?;
+        crate::contact_safety::delete_person(&tx, &user_id)?;
         tx.commit().map_err(store_err)?;
         Ok(removed > 0)
     }
@@ -5940,6 +5985,7 @@ impl MessageStore {
             });
         };
         let state = crate::roster_store::load_state(&tx, &incoming.person_id)?;
+        let previous = state.roster.clone();
         let decision = crate::core_roster_accept(
             state.roster,
             state.quarantined,
@@ -5952,9 +5998,42 @@ impl MessageStore {
             ),
             ..decision
         };
+        // §10 step 4. Recorded inside this transaction so a fact and the roster
+        // that produced it land together: a surface can never announce a
+        // revocation the store did not accept, and a rolled-back write leaves
+        // no orphan warning behind.
+        crate::contact_safety::record_changes(
+            &tx,
+            &incoming.person_id,
+            &crate::core_roster_safety_changes(previous.clone(), incoming.clone(), decision),
+        )?;
         match decision.outcome {
             RosterUpdateOutcome::Accepted => {
                 crate::roster_store::save_roster(&tx, &incoming, decision.quarantined)?;
+                // §14.2 reaches the relay endpoint too. A new recovery epoch
+                // means the person's *authority* changed hands — a stolen
+                // device was dethroned, or a lost one replaced — and the T23
+                // epoch we hold for them was very possibly set by whoever was
+                // holding that device. Refusing the recovered person's next
+                // relay notice because a thief had already claimed a higher
+                // stamp would leave the repaired contact permanently
+                // unreachable, with a monotonicity rule as the reason.
+                //
+                // Only the epoch is reset, never the endpoint: what is stored
+                // stays until a notice actually moves it, so this widens what
+                // may be believed rather than believing anything new. And only
+                // on a strictly higher recovery epoch, which is the one climb
+                // no device key can mint.
+                if previous
+                    .as_ref()
+                    .is_some_and(|held| incoming.recovery_epoch > held.recovery_epoch)
+                {
+                    tx.execute(
+                        "UPDATE contacts SET relay_epoch = 0 WHERE user_id = ?1",
+                        params![incoming.person_id],
+                    )
+                    .map_err(store_err)?;
+                }
             }
             // DL-2: keep the stored roster exactly as it is and record the
             // quarantine, which from here on refuses this person's updates
@@ -5966,6 +6045,35 @@ impl MessageStore {
         }
         tx.commit().map_err(store_err)?;
         Ok(decision)
+    }
+
+    /// **DL-2's person-driven resolution: clear a roster fork quarantine.**
+    ///
+    /// DL-2 forbids resolving a fork by arithmetic, and the code keeps that
+    /// promise absolutely — nothing in `core_roster_accept` lifts the bit
+    /// except a person-root document at a higher recovery epoch, which is the
+    /// person speaking rather than the system guessing. But "a fork is
+    /// resolved by a person" needs a way for a person to actually do it, and
+    /// without one a contact whose devices forked once is quarantined for the
+    /// life of the install with no route back.
+    ///
+    /// **Only after out-of-band re-verification.** The honest precondition is
+    /// the same one a changed safety number carries: the two people compare
+    /// fingerprints over a channel the attacker does not control, and only
+    /// then is this called. It is deliberately a bare seam and not a
+    /// convenience — it takes a person id and nothing else, so nothing in the
+    /// core can call it as part of a flow.
+    ///
+    /// The surface that asks the question, explains what it means, and
+    /// requires the comparison is WP6's; this is the store operation it will
+    /// call. Returns whether anything was quarantined.
+    pub fn clear_roster_quarantine(&self, person_user_id: Vec<u8>) -> Result<bool, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let was = crate::roster_store::load_state(&conn, &person_user_id)?.quarantined;
+        if was {
+            crate::roster_store::set_quarantined(&conn, &person_user_id, false)?;
+        }
+        Ok(was)
     }
 
     /// What this device holds about one contact's devices (§4). A contact who
@@ -15030,6 +15138,12 @@ mod tests {
 
     // -- T23 relay-change propagation -----------------------------------
 
+    /// A wall clock far above every fixture epoch below, so the
+    /// `RELAY_EPOCH_MAX_SKEW_MS` ceiling is satisfied and the rules under test
+    /// are the ordering ones. `relay_epoch_beyond_believable_skew_is_refused`
+    /// is where the ceiling itself is exercised.
+    const RELAY_NOTICE_NOW: i64 = 1_755_000_000_000;
+
     fn relay_notice(subject: &[u8], epoch: i64, url: &str) -> RelayUpdateContent {
         RelayUpdateContent {
             subject_user_id: subject.to_vec(),
@@ -15050,7 +15164,7 @@ mod tests {
 
         let notice = relay_notice(b"alice-id", 100, "https://new.relay.example");
         assert!(store
-            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone())
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone(), RELAY_NOTICE_NOW)
             .unwrap());
 
         let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
@@ -15076,7 +15190,8 @@ mod tests {
         assert!(store
             .apply_contact_relay_update(
                 b"alice-id".to_vec(),
-                relay_notice(b"alice-id", 200, "https://current.relay.example")
+                relay_notice(b"alice-id", 200, "https://current.relay.example"),
+                RELAY_NOTICE_NOW,
             )
             .unwrap());
 
@@ -15085,7 +15200,8 @@ mod tests {
                 !store
                     .apply_contact_relay_update(
                         b"alice-id".to_vec(),
-                        relay_notice(b"alice-id", stale_epoch, "https://retired.relay.example")
+                        relay_notice(b"alice-id", stale_epoch, "https://retired.relay.example"),
+                        RELAY_NOTICE_NOW,
                     )
                     .unwrap(),
                 "epoch {stale_epoch} was applied over 200"
@@ -15105,9 +15221,84 @@ mod tests {
         assert!(store
             .apply_contact_relay_update(
                 b"alice-id".to_vec(),
-                relay_notice(b"alice-id", 201, "https://newer.relay.example")
+                relay_notice(b"alice-id", 201, "https://newer.relay.example"),
+                RELAY_NOTICE_NOW,
             )
             .unwrap());
+    }
+
+    /// The other half of "newest wins": the number being compared has to be a
+    /// time. A notice at `i64::MAX` does not merely misdirect one send -- it
+    /// PINS the contact's endpoint shut, because nothing they can honestly
+    /// author afterwards is strictly newer. The revoked device holds the old
+    /// credential and every notice it ever saw, so it is exactly in a position
+    /// to send this, and the poison would outlive the rotation meant to remove
+    /// it (`specs/multi-device-v1.md` §10 step 2).
+    #[test]
+    fn a_relay_epoch_beyond_believable_skew_is_refused_and_the_repair_lands() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store.upsert_contact(contact(b"alice-id", "Alice")).unwrap();
+        store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(
+                    b"alice-id",
+                    RELAY_NOTICE_NOW,
+                    "https://current.relay.example",
+                ),
+                RELAY_NOTICE_NOW,
+            )
+            .unwrap();
+
+        for poison in [
+            i64::MAX,
+            RELAY_NOTICE_NOW + crate::RELAY_EPOCH_MAX_SKEW_MS + 1,
+        ] {
+            assert!(
+                !store
+                    .apply_contact_relay_update(
+                        b"alice-id".to_vec(),
+                        relay_notice(b"alice-id", poison, "https://poison.relay.example"),
+                        RELAY_NOTICE_NOW,
+                    )
+                    .unwrap(),
+                "epoch {poison} is not a time"
+            );
+        }
+        // A phone whose clock is merely wrong is still believed: the bound
+        // refuses poison, not imprecision.
+        assert!(store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(
+                    b"alice-id",
+                    RELAY_NOTICE_NOW + crate::RELAY_EPOCH_MAX_SKEW_MS - 1,
+                    "https://skewed.relay.example",
+                ),
+                RELAY_NOTICE_NOW,
+            )
+            .unwrap());
+        // And the post-rotation notice, at an ordinary wall clock, lands.
+        assert!(store
+            .apply_contact_relay_update(
+                b"alice-id".to_vec(),
+                relay_notice(
+                    b"alice-id",
+                    RELAY_NOTICE_NOW + crate::RELAY_EPOCH_MAX_SKEW_MS + 5_000,
+                    "https://rotated.relay.example",
+                ),
+                RELAY_NOTICE_NOW + crate::RELAY_EPOCH_MAX_SKEW_MS + 5_000,
+            )
+            .unwrap());
+        assert_eq!(
+            store
+                .get_contact(b"alice-id".to_vec())
+                .unwrap()
+                .unwrap()
+                .relay_url
+                .as_deref(),
+            Some("https://rotated.relay.example")
+        );
     }
 
     /// Endpoint privacy (CLAUDE.md): a device never accepts a *third party's*
@@ -15128,6 +15319,7 @@ mod tests {
             .apply_contact_relay_update(
                 b"alice-id".to_vec(),
                 relay_notice(b"bob-id", 500, "https://attacker.relay.example"),
+                RELAY_NOTICE_NOW,
             )
             .unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
@@ -15151,7 +15343,7 @@ mod tests {
         let mut notice = relay_notice(b"alice-id", 10, "https://new.relay.example");
         notice.relay_token = "their-member-token".to_string();
         assert!(store
-            .apply_contact_relay_update(b"alice-id".to_vec(), notice)
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice, RELAY_NOTICE_NOW)
             .is_err());
 
         // A half-configured endpoint is refused for the same reason: it is
@@ -15159,7 +15351,7 @@ mod tests {
         let mut partial = relay_notice(b"alice-id", 10, "https://new.relay.example");
         partial.relay_token = String::new();
         assert!(store
-            .apply_contact_relay_update(b"alice-id".to_vec(), partial)
+            .apply_contact_relay_update(b"alice-id".to_vec(), partial, RELAY_NOTICE_NOW)
             .is_err());
     }
 
@@ -15180,7 +15372,7 @@ mod tests {
             relay_token: String::new(),
         };
         assert!(store
-            .apply_contact_relay_update(b"alice-id".to_vec(), cleared)
+            .apply_contact_relay_update(b"alice-id".to_vec(), cleared, RELAY_NOTICE_NOW)
             .unwrap());
         let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
         assert_eq!(stored.relay_url, None);
@@ -15191,7 +15383,8 @@ mod tests {
         assert!(!store
             .apply_contact_relay_update(
                 b"stranger-id".to_vec(),
-                relay_notice(b"stranger-id", 9, "https://stranger.relay.example")
+                relay_notice(b"stranger-id", 9, "https://stranger.relay.example"),
+                RELAY_NOTICE_NOW,
             )
             .unwrap());
         assert_eq!(
@@ -16742,7 +16935,8 @@ mod tests {
         assert!(store
             .apply_contact_relay_update(
                 b"alice-id".to_vec(),
-                relay_notice(b"alice-id", 5, "https://live.example")
+                relay_notice(b"alice-id", 5, "https://live.example"),
+                RELAY_NOTICE_NOW,
             )
             .unwrap());
         assert!(store.list_contact_relay_rejections().unwrap().is_empty());
@@ -17368,6 +17562,93 @@ mod tests {
                 .roster,
             None,
         );
+    }
+
+    /// §14.2 reaches the relay endpoint too: a new recovery epoch means the
+    /// person's authority changed hands, and the T23 epoch we hold for them
+    /// was very possibly stamped by whoever was holding the device that got
+    /// dethroned. Refusing the recovered person's next relay notice on
+    /// monotonicity grounds would leave them permanently unreachable.
+    #[test]
+    fn a_recovery_epoch_resets_the_relay_epoch_we_hold_for_that_person() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+
+        // The thief, holding the approving device, claims a high relay epoch.
+        let thief_epoch = RELAY_NOTICE_NOW;
+        assert!(store
+            .apply_contact_relay_update(
+                fixture.root.user_id.clone(),
+                relay_notice(
+                    &fixture.root.user_id,
+                    thief_epoch,
+                    "https://relay.thief.example",
+                ),
+                RELAY_NOTICE_NOW,
+            )
+            .unwrap());
+
+        // The owner recovers: a root-signed roster at the next epoch.
+        let recovered = fixture.sign(
+            Roster {
+                person_id: fixture.root.user_id.clone(),
+                recovery_epoch: 1,
+                seq: 0,
+                devices: vec![fixture.cert(
+                    &fixture.second,
+                    DEVICE_CERT_FLAG_ROSTER_SIGNING,
+                    &fixture.root.sign_sk,
+                )],
+                tombstones: vec![DeviceTombstone {
+                    device_id: fixture.approving.device_id.clone(),
+                    revoked_at_seq: 0,
+                }],
+                approving_device_id: fixture.second.device_id.clone(),
+                inbox_key_generation: 1,
+                signer_sign_pk: Vec::new(),
+                signature: Vec::new(),
+            },
+            &fixture.root.sign_sk,
+        );
+        assert_eq!(
+            store.apply_contact_roster(recovered).unwrap().outcome,
+            RosterUpdateOutcome::Accepted
+        );
+        assert_eq!(
+            store
+                .contact_relay_epoch(fixture.root.user_id.clone())
+                .unwrap(),
+            0,
+            "the thief's claim on the epoch does not survive the dethroning"
+        );
+
+        // Only the epoch was reset. The stored endpoint is untouched until a
+        // notice actually moves it, so this widens what may be believed rather
+        // than believing anything new.
+        assert_eq!(
+            store
+                .get_contact(fixture.root.user_id.clone())
+                .unwrap()
+                .unwrap()
+                .relay_url
+                .as_deref(),
+            Some("https://relay.thief.example")
+        );
+        // And now a notice BELOW the thief's epoch repairs the contact, which
+        // is the whole point.
+        assert!(store
+            .apply_contact_relay_update(
+                fixture.root.user_id.clone(),
+                relay_notice(
+                    &fixture.root.user_id,
+                    thief_epoch - 1,
+                    "https://relay.recovered.example",
+                ),
+                RELAY_NOTICE_NOW,
+            )
+            .unwrap());
     }
 
     /// A roster signed by a key this contact's person root never vouched for
@@ -21073,7 +21354,7 @@ mod tests {
 
         let notice = relay_notice(b"alice-id", 100, "https://new.relay.example");
         assert!(store
-            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone())
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone(), RELAY_NOTICE_NOW)
             .unwrap());
         assert_eq!(
             store.family_carried_envelopes(10, 2_000, vec![]).unwrap(),
@@ -21089,7 +21370,7 @@ mod tests {
             )
             .unwrap());
         assert!(!store
-            .apply_contact_relay_update(b"alice-id".to_vec(), notice)
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice, RELAY_NOTICE_NOW)
             .unwrap());
         assert!(store
             .family_carried_envelopes(10, 2_000, vec![])
