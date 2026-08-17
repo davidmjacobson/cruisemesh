@@ -76,6 +76,9 @@ import uniffi.cruisemesh_core.makeRelaySetupCard
 import uniffi.cruisemesh_core.parseRelaySetupText
 import uniffi.cruisemesh_core.relaySetupIsOfficial
 
+/** Where a first Shore Pass comes from; the app never sells one itself. */
+private const val SHORE_PASS_SITE_URL = "https://cruisemesh.app/pass/"
+
 private sealed class PassSetupState {
     object Idle : PassSetupState()
     object Testing : PassSetupState()
@@ -329,6 +332,25 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                         stringResource(R.string.ui_paste_your_setup_card_well_test_it),
                         modifier = Modifier.padding(top = 8.dp),
                     )
+                    // Where a pass comes from, for the person who arrived here
+                    // without one: the family share first (one pass covers
+                    // everyone), the site second. The paste flow above stays
+                    // the primary action for anyone already holding a card.
+                    Text(
+                        stringResource(R.string.ui_shore_pass_family_note),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                    TextButton(
+                        onClick = {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse(SHORE_PASS_SITE_URL)),
+                            )
+                        },
+                    ) {
+                        Text(stringResource(R.string.ui_get_a_shore_pass_at_cruisemesh_app))
+                    }
                     // Who bills for what, before anyone commits to a pass. Kept
                     // in the secondary style the rest of this screen uses for
                     // supporting text: it is an answer, not a warning.

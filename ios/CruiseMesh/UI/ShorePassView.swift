@@ -110,6 +110,19 @@ struct ShorePassView: View {
                         Text("Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        // Where a pass comes from, for the person who arrived
+                        // here without one: the family share first (one pass
+                        // covers everyone), the site second. The paste flow
+                        // above stays the primary action for anyone already
+                        // holding a card.
+                        Text("One Shore Pass covers your whole family. If someone in your family already has one, ask them to share their setup card instead of buying another.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Link(
+                            "Get a Shore Pass at cruisemesh.app",
+                            destination: URL(string: "https://cruisemesh.app/pass/")!
+                        )
+                        .font(.subheadline)
                         // Who bills for what, before anyone commits to a pass.
                         // Same secondary style as the line above: it is an
                         // answer, not a warning.

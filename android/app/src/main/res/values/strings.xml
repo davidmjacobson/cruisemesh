@@ -213,6 +213,11 @@
     <string name="ui_onboarding_delivery_body">Nearby, CruiseMesh talks phone-to-phone over Bluetooth and local Wi-Fi. Farther away, your message hops between other phones running CruiseMesh until it reaches your friend — and, with a Shore Pass or your own server, over the internet whenever any of those phones has a connection.</string>
     <string name="ui_onboarding_private_title">Private by default</string>
     <string name="ui_onboarding_private_detail">Every message is encrypted end to end, so the phones and networks that help carry it can never read it.</string>
+    <string name="ui_onboarding_shore_pass_eyebrow">When you\'re far apart</string>
+    <string name="ui_onboarding_shore_pass_title">Shore Pass carries messages over the internet</string>
+    <string name="ui_onboarding_shore_pass_body">Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family\'s messages over the internet when you\'re spread out or someone\'s back home.</string>
+    <string name="ui_onboarding_shore_pass_family_title">One pass covers your whole family</string>
+    <string name="ui_onboarding_shore_pass_family_detail">Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card.</string>
     <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
     <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
     <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
@@ -400,6 +405,11 @@
     <string name="ui_setup_card">Setup card</string>
     <string name="ui_cmrelay1">CMRELAY1:…</string>
     <string name="ui_paste_your_setup_card_well_test_it">Paste the setup card from your purchase email. CruiseMesh will test and save it automatically.</string>
+    <!-- The empty state's answer to "what pass?": the family share is the
+         common path (one pass covers everyone), the site is where a first
+         pass comes from. -->
+    <string name="ui_shore_pass_family_note">One Shore Pass covers your whole family. If someone in your family already has one, ask them to share their setup card instead of buying another.</string>
+    <string name="ui_get_a_shore_pass_at_cruisemesh_app">Get a Shore Pass at cruisemesh.app</string>
     <!-- Shore Pass is the only part of CruiseMesh that uses the internet, so
          this is the only screen where a data charge can surprise anyone. Say
          who bills for what before a pass is set up, not after. -->

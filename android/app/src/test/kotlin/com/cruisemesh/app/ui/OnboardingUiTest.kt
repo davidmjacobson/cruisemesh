@@ -55,7 +55,9 @@ class OnboardingUiTest {
             }
         }
 
-        repeat(4) {
+        // One Next per page before the profile slide: welcome, delivery,
+        // Shore Pass, permissions, Wi-Fi.
+        repeat(5) {
             compose.onNodeWithText(next).performClick()
             compose.waitForIdle()
         }
