@@ -6,6 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 class MessageInteractionsTest {
     private val ownUserId = byteArrayOf(0x01)
@@ -76,7 +77,7 @@ class MessageInteractionsTest {
     }
 
     private fun text(sender: ByteArray, lamport: ULong, body: String): StoredMessage =
-        StoredMessage(chatId, sender, lamport, lamport.toLong(), KIND_TEXT, body.toByteArray())
+        StoredMessage(chatId, sender, lamport, lamport.toLong(), KIND_TEXT, body.toByteArray(), coreLegacyDeviceId())
 
     private fun reaction(
         sender: ByteArray,
@@ -84,7 +85,7 @@ class MessageInteractionsTest {
         target: MessageTarget,
         emoji: String,
     ): StoredMessage =
-        StoredMessage(chatId, sender, lamport, lamport.toLong(), KIND_REACTION, ReactionPayload(target, emoji).encode())
+        StoredMessage(chatId, sender, lamport, lamport.toLong(), KIND_REACTION, ReactionPayload(target, emoji).encode(), coreLegacyDeviceId())
 
     private companion object {
         val KIND_TEXT: UByte = 1u

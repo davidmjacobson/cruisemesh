@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 class ReplyPresentationTest {
     @Test
@@ -33,6 +34,7 @@ class ReplyPresentationTest {
             timestamp = 1L,
             kind = KIND_ATTACHMENT_MANIFEST,
             payload = photo.encode(),
+            senderDeviceId = coreLegacyDeviceId(),
         )
 
         assertEquals("📷 pool deck", quotedMessageText(message))

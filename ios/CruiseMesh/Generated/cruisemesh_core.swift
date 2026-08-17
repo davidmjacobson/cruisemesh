@@ -3833,6 +3833,24 @@ public protocol MessageStoreProtocol : AnyObject {
     func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateContent) throws  -> Bool
     
     /**
+     * Apply a contact's gossiped device roster (§4), storing the result.
+     *
+     * The decision itself is `core_roster_accept`'s (DL-1 ordering, DL-2 fork
+     * quarantine, DL-4 tombstone persistence); this method supplies the two
+     * things that decision needs from durable state and writes back what it
+     * says. The person root it verifies against is the contact's existing
+     * `sign_pk` — §3's whole premise is that the deployed Ed25519 identity key
+     * *becomes* the person root, so a roster is checked against the same key
+     * that already authenticates that contact's messages, with no new trust
+     * anchor and no re-friending.
+     *
+     * A roster for someone who is not a contact is ignored rather than
+     * refused: rosters gossip as ordinary sealed traffic (DL-3), and a
+     * document about a stranger is simply not this device's business.
+     */
+    func applyContactRoster(incoming: Roster) throws  -> RosterUpdateDecision
+    
+    /**
      * Atomically replace all suggestions supplied by one introducer. The
      * directory's tickets are checked here so both mobile shells share the
      * same fail-closed behavior.
@@ -4246,6 +4264,11 @@ public protocol MessageStoreProtocol : AnyObject {
     func consumedHiddenMsgIdRecorded(msgId: Data, nowMs: Int64) throws  -> Bool
     
     /**
+     * A contact's active device ids in roster order.
+     */
+    func contactActiveDeviceIds(personUserId: Data) throws  -> [Data]
+    
+    /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
     func contactAvatar(userId: Data) throws  -> Data?
@@ -4254,6 +4277,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * The newest avatar/display-name profile-sync epoch applied for a contact.
      */
     func contactAvatarEpoch(userId: Data) throws  -> Int64
+    
+    /**
+     * Whether a contact's roster vouches for one of their devices, or has
+     * buried it (DL-4).
+     */
+    func contactDeviceState(personUserId: Data, deviceId: Data) throws  -> ContactDeviceState
     
     /**
      * The contact whose recent-day hints include `hint`; failing that, for a
@@ -4268,6 +4297,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * friend card carried.
      */
     func contactRelayEpoch(userId: Data) throws  -> Int64
+    
+    /**
+     * What this device holds about one contact's devices (§4). A contact who
+     * has never gossiped a roster reads as no roster and no quarantine, which
+     * is the synthetic one-device person of §5.
+     */
+    func contactRosterState(personUserId: Data) throws  -> ContactRosterState
     
     /**
      * Commit the DTN D4 bookkeeping for a payload the caller has now durably
@@ -4916,6 +4952,14 @@ public protocol MessageStoreProtocol : AnyObject {
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
      * waiting"). Returns 0 if message 1 itself hasn't arrived yet.
+     *
+     * Still per person rather than per device stream, which is deliberate for
+     * now: a digest is what this device tells a peer it already has, and the
+     * per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
+     * Until then the person's device streams are merged into one run of
+     * lamport values, and the merge is over DISTINCT values -- two of that
+     * person's devices sharing a lamport is a normal §5 outcome, not a gap,
+     * and counting it twice would truncate the watermark there forever.
      */
     func highestContiguousLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
     
@@ -5053,6 +5097,18 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertIncomingMessageClassified(message: StoredMessage, msgId: Data, replyToMsgId: Data?) throws  -> IncomingMessageInsertOutcome
     
     /**
+     * The device-aware incoming insert (§5): the same conflict and quarantine
+     * rules as [`Self::insert_incoming_message_with_arrival`], discriminated
+     * per *device* stream rather than per person. This is what the open path
+     * calls once it has a sealed-body device field to pass; the older methods
+     * remain exactly themselves and land on the legacy stream.
+     *
+     * `sender_device_id` is mapped by [`crate::core_device_stream_id`] —
+     * absent or wrong-width means [`LEGACY_DEVICE_ID`], never an error.
+     */
+    func insertIncomingMessageFromDevice(message: StoredMessage, senderDeviceId: Data?, msgId: Data, replyToMsgId: Data?, arrival: MessageArrival?) throws  -> IncomingMessageInsertOutcome
+    
+    /**
      * Insert an opened incoming message and atomically retain first-arrival
      * transport evidence. If the stream position conflicts, the existing
      * visible branch wins and the incoming branch plus its source is placed
@@ -5065,8 +5121,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * true duplicate while failing closed when two different authenticated
      * messages claim the same stream position.
      *
-     * A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
-     * own: it could be a digest resend or relay copy of a message we already
+     * This entry point puts the message on the sender's legacy device stream
+     * (§5); [`Self::insert_message_from_device`] is the same insert for an
+     * envelope that named its authoring device.
+     *
+     * A conflict on `(chat_id, sender_user_id, sender_device_id, lamport)` is
+     * ambiguous on its own: it could be a digest resend or relay copy of a
+     * message we already
      * have (same sealed content, arriving twice -- expected under DTN and
      * harmless to ignore), or it could be a sender who reset their stream
      * (e.g. deleted the chat and re-added the contact, per DESIGN.md §7.1's
@@ -5092,12 +5153,26 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertMessage(message: StoredMessage) throws  -> Bool
     
     /**
+     * [`Self::insert_message`] for an envelope whose sealed body named the
+     * authoring device (§5).
+     *
+     * `sender_device_id` follows the §5 mapping exactly, through
+     * [`crate::core_device_stream_id`]: absent — a legacy envelope, or a kind
+     * that carries no device field — means the reserved all-zero
+     * [`LEGACY_DEVICE_ID`] stream, and so does an id of the wrong width. It is
+     * never an error, because a legacy peer must stay indistinguishable from
+     * today.
+     */
+    func insertMessageFromDevice(message: StoredMessage, senderDeviceId: Data?) throws  -> Bool
+    
+    /**
      * Atomically persist one locally authored message and the exact sealed
      * envelope that should be retried for it over BLE and relay. The message
-     * row stays idempotent on `(chat_id, sender_user_id, lamport)`; the
-     * outbound queue uses the same logical identity as its dedupe key, so
-     * re-queuing the same authored message is a no-op instead of creating a
-     * second `msg_id`.
+     * row stays idempotent on `(chat_id, sender_user_id, lamport)` within
+     * this device's own stream -- which is the legacy one until linking mints
+     * a device identity (§5); the outbound queue uses the same logical
+     * identity as its dedupe key, so re-queuing the same authored message is
+     * a no-op instead of creating a second `msg_id`.
      */
     func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelope, queuedAtMs: Int64) throws  -> Bool
     
@@ -5193,6 +5268,11 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
+     *
+     * Person-level, like [`Self::message_reference`]: when the person has
+     * several device streams at one lamport it answers with the lowest device
+     * id — §5's display tie-break, which puts the legacy stream first — rather
+     * than whichever row SQLite happened to reach.
      */
     func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageArrival?
     
@@ -5240,8 +5320,28 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Stable id and optional reply target for one stored message. Returns
      * `None` for legacy rows whose inbound envelope id was never recorded.
+     *
+     * Person-level: it names a position in a *person's* stream, so when that
+     * person has several device streams at one lamport it answers with the
+     * lowest device id — §5's display tie-break, which puts the legacy stream
+     * first. [`Self::message_reference_from_device`] asks about one stream.
      */
     func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> MessageReference?
+    
+    /**
+     * [`Self::message_reference`] for one device's stream (§5). `None` for
+     * `sender_device_id` asks about the legacy stream, which is where every
+     * migrated row and every legacy peer's traffic lives.
+     */
+    func messageReferenceFromDevice(chatId: Data, senderUserId: Data, senderDeviceId: Data?, lamport: UInt64) throws  -> MessageReference?
+    
+    /**
+     * The device streams one person actually has history on in a chat (§5),
+     * lowest device id first. A one-device person — every legacy peer, and
+     * every peer at all until linking ships — answers with exactly the
+     * reserved legacy id.
+     */
+    func messageStreamDeviceIds(chatId: Data, senderUserId: Data) throws  -> [Data]
     
     /**
      * Messages from `sender_user_id` in `chat_id` with `lamport >
@@ -5476,6 +5576,9 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Expiry of a locally-authored message's durable outbound envelope.
      * This remains available after the retry queue prunes expired ciphertext.
+     *
+     * Person-level, with §5's lowest-device-id tie-break: this device's own
+     * authored rows are on the legacy stream, which that ordering names first.
      */
     func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64) throws  -> Int64?
     
@@ -5753,6 +5856,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
+     *
+     * §5: this entry point carries no device field, so it stamps the sender's
+     * legacy stream — the one every legacy peer and every migrated row is on.
+     * The WHERE says so explicitly rather than matching every device the
+     * person has at that lamport, which would attribute one envelope's route
+     * to a sibling device's separate message.
      */
     func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival) throws  -> Bool
     
@@ -6212,6 +6321,30 @@ open func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateConten
     uniffi_cruisemesh_core_fn_method_messagestore_apply_contact_relay_update(self.uniffiClonePointer(),
         FfiConverterData.lower(senderUserId),
         FfiConverterTypeRelayUpdateContent.lower(content),$0
+    )
+})
+}
+    
+    /**
+     * Apply a contact's gossiped device roster (§4), storing the result.
+     *
+     * The decision itself is `core_roster_accept`'s (DL-1 ordering, DL-2 fork
+     * quarantine, DL-4 tombstone persistence); this method supplies the two
+     * things that decision needs from durable state and writes back what it
+     * says. The person root it verifies against is the contact's existing
+     * `sign_pk` — §3's whole premise is that the deployed Ed25519 identity key
+     * *becomes* the person root, so a roster is checked against the same key
+     * that already authenticates that contact's messages, with no new trust
+     * anchor and no re-friending.
+     *
+     * A roster for someone who is not a contact is ignored rather than
+     * refused: rosters gossip as ordinary sealed traffic (DL-3), and a
+     * document about a stranger is simply not this device's business.
+     */
+open func applyContactRoster(incoming: Roster)throws  -> RosterUpdateDecision {
+    return try  FfiConverterTypeRosterUpdateDecision.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_apply_contact_roster(self.uniffiClonePointer(),
+        FfiConverterTypeRoster.lower(incoming),$0
     )
 })
 }
@@ -6862,6 +6995,17 @@ open func consumedHiddenMsgIdRecorded(msgId: Data, nowMs: Int64)throws  -> Bool 
 }
     
     /**
+     * A contact's active device ids in roster order.
+     */
+open func contactActiveDeviceIds(personUserId: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_active_device_ids(self.uniffiClonePointer(),
+        FfiConverterData.lower(personUserId),$0
+    )
+})
+}
+    
+    /**
      * The canonical JPEG avatar bytes for a contact, if one has been synced.
      */
 open func contactAvatar(userId: Data)throws  -> Data? {
@@ -6879,6 +7023,19 @@ open func contactAvatarEpoch(userId: Data)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_avatar_epoch(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * Whether a contact's roster vouches for one of their devices, or has
+     * buried it (DL-4).
+     */
+open func contactDeviceState(personUserId: Data, deviceId: Data)throws  -> ContactDeviceState {
+    return try  FfiConverterTypeContactDeviceState.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_device_state(self.uniffiClonePointer(),
+        FfiConverterData.lower(personUserId),
+        FfiConverterData.lower(deviceId),$0
     )
 })
 }
@@ -6906,6 +7063,19 @@ open func contactRelayEpoch(userId: Data)throws  -> Int64 {
     return try  FfiConverterInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_contact_relay_epoch(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * What this device holds about one contact's devices (§4). A contact who
+     * has never gossiped a roster reads as no roster and no quarantine, which
+     * is the synthetic one-device person of §5.
+     */
+open func contactRosterState(personUserId: Data)throws  -> ContactRosterState {
+    return try  FfiConverterTypeContactRosterState.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_contact_roster_state(self.uniffiClonePointer(),
+        FfiConverterData.lower(personUserId),$0
     )
 })
 }
@@ -7829,6 +7999,14 @@ open func hasProtocolEvents()throws  -> Bool {
      * sender in this chat is present -- the point up to which there's no
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
      * waiting"). Returns 0 if message 1 itself hasn't arrived yet.
+     *
+     * Still per person rather than per device stream, which is deliberate for
+     * now: a digest is what this device tells a peer it already has, and the
+     * per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
+     * Until then the person's device streams are merged into one run of
+     * lamport values, and the merge is over DISTINCT values -- two of that
+     * person's devices sharing a lamport is a normal §5 outcome, not a gap,
+     * and counting it twice would truncate the watermark there forever.
      */
 open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8012,6 +8190,28 @@ open func insertIncomingMessageClassified(message: StoredMessage, msgId: Data, r
 }
     
     /**
+     * The device-aware incoming insert (§5): the same conflict and quarantine
+     * rules as [`Self::insert_incoming_message_with_arrival`], discriminated
+     * per *device* stream rather than per person. This is what the open path
+     * calls once it has a sealed-body device field to pass; the older methods
+     * remain exactly themselves and land on the legacy stream.
+     *
+     * `sender_device_id` is mapped by [`crate::core_device_stream_id`] —
+     * absent or wrong-width means [`LEGACY_DEVICE_ID`], never an error.
+     */
+open func insertIncomingMessageFromDevice(message: StoredMessage, senderDeviceId: Data?, msgId: Data, replyToMsgId: Data?, arrival: MessageArrival?)throws  -> IncomingMessageInsertOutcome {
+    return try  FfiConverterTypeIncomingMessageInsertOutcome.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_incoming_message_from_device(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterOptionData.lower(senderDeviceId),
+        FfiConverterData.lower(msgId),
+        FfiConverterOptionData.lower(replyToMsgId),
+        FfiConverterOptionTypeMessageArrival.lower(arrival),$0
+    )
+})
+}
+    
+    /**
      * Insert an opened incoming message and atomically retain first-arrival
      * transport evidence. If the stream position conflicts, the existing
      * visible branch wins and the incoming branch plus its source is placed
@@ -8033,8 +8233,13 @@ open func insertIncomingMessageWithArrival(message: StoredMessage, msgId: Data, 
      * true duplicate while failing closed when two different authenticated
      * messages claim the same stream position.
      *
-     * A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
-     * own: it could be a digest resend or relay copy of a message we already
+     * This entry point puts the message on the sender's legacy device stream
+     * (§5); [`Self::insert_message_from_device`] is the same insert for an
+     * envelope that named its authoring device.
+     *
+     * A conflict on `(chat_id, sender_user_id, sender_device_id, lamport)` is
+     * ambiguous on its own: it could be a digest resend or relay copy of a
+     * message we already
      * have (same sealed content, arriving twice -- expected under DTN and
      * harmless to ignore), or it could be a sender who reset their stream
      * (e.g. deleted the chat and re-added the contact, per DESIGN.md §7.1's
@@ -8066,12 +8271,33 @@ open func insertMessage(message: StoredMessage)throws  -> Bool {
 }
     
     /**
+     * [`Self::insert_message`] for an envelope whose sealed body named the
+     * authoring device (§5).
+     *
+     * `sender_device_id` follows the §5 mapping exactly, through
+     * [`crate::core_device_stream_id`]: absent — a legacy envelope, or a kind
+     * that carries no device field — means the reserved all-zero
+     * [`LEGACY_DEVICE_ID`] stream, and so does an id of the wrong width. It is
+     * never an error, because a legacy peer must stay indistinguishable from
+     * today.
+     */
+open func insertMessageFromDevice(message: StoredMessage, senderDeviceId: Data?)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_insert_message_from_device(self.uniffiClonePointer(),
+        FfiConverterTypeStoredMessage.lower(message),
+        FfiConverterOptionData.lower(senderDeviceId),$0
+    )
+})
+}
+    
+    /**
      * Atomically persist one locally authored message and the exact sealed
      * envelope that should be retried for it over BLE and relay. The message
-     * row stays idempotent on `(chat_id, sender_user_id, lamport)`; the
-     * outbound queue uses the same logical identity as its dedupe key, so
-     * re-queuing the same authored message is a no-op instead of creating a
-     * second `msg_id`.
+     * row stays idempotent on `(chat_id, sender_user_id, lamport)` within
+     * this device's own stream -- which is the legacy one until linking mints
+     * a device identity (§5); the outbound queue uses the same logical
+     * identity as its dedupe key, so re-queuing the same authored message is
+     * a no-op instead of creating a second `msg_id`.
      */
 open func insertOutgoingMessage(message: StoredMessage, envelope: OutboundEnvelope, queuedAtMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8262,6 +8488,11 @@ open func markRelayFanoutRowPosted(msgId: Data, memberUserId: Data, relayUrl: St
     /**
      * First-arrival diagnostics for one message, or `None` for locally
      * authored/legacy rows that predate diagnostics.
+     *
+     * Person-level, like [`Self::message_reference`]: when the person has
+     * several device streams at one lamport it answers with the lowest device
+     * id — §5's display tie-break, which puts the legacy stream first — rather
+     * than whichever row SQLite happened to reach.
      */
 open func messageArrival(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageArrival? {
     return try  FfiConverterOptionTypeMessageArrival.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8336,6 +8567,11 @@ open func messageOriginByMsgId(msgId: Data)throws  -> MessageOrigin? {
     /**
      * Stable id and optional reply target for one stored message. Returns
      * `None` for legacy rows whose inbound envelope id was never recorded.
+     *
+     * Person-level: it names a position in a *person's* stream, so when that
+     * person has several device streams at one lamport it answers with the
+     * lowest device id — §5's display tie-break, which puts the legacy stream
+     * first. [`Self::message_reference_from_device`] asks about one stream.
      */
 open func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> MessageReference? {
     return try  FfiConverterOptionTypeMessageReference.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8343,6 +8579,37 @@ open func messageReference(chatId: Data, senderUserId: Data, lamport: UInt64)thr
         FfiConverterData.lower(chatId),
         FfiConverterData.lower(senderUserId),
         FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+    
+    /**
+     * [`Self::message_reference`] for one device's stream (§5). `None` for
+     * `sender_device_id` asks about the legacy stream, which is where every
+     * migrated row and every legacy peer's traffic lives.
+     */
+open func messageReferenceFromDevice(chatId: Data, senderUserId: Data, senderDeviceId: Data?, lamport: UInt64)throws  -> MessageReference? {
+    return try  FfiConverterOptionTypeMessageReference.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_reference_from_device(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),
+        FfiConverterOptionData.lower(senderDeviceId),
+        FfiConverterUInt64.lower(lamport),$0
+    )
+})
+}
+    
+    /**
+     * The device streams one person actually has history on in a chat (§5),
+     * lowest device id first. A one-device person — every legacy peer, and
+     * every peer at all until linking ships — answers with exactly the
+     * reserved legacy id.
+     */
+open func messageStreamDeviceIds(chatId: Data, senderUserId: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_message_stream_device_ids(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderUserId),$0
     )
 })
 }
@@ -8660,6 +8927,9 @@ open func outboundEnvelopesAfter(chatId: Data, senderUserId: Data, afterLamport:
     /**
      * Expiry of a locally-authored message's durable outbound envelope.
      * This remains available after the retry queue prunes expired ciphertext.
+     *
+     * Person-level, with §5's lowest-device-id tie-break: this device's own
+     * authored rows are on the legacy stream, which that ordering names first.
      */
 open func outboundMessageExpiry(chatId: Data, senderUserId: Data, lamport: UInt64)throws  -> Int64? {
     return try  FfiConverterOptionInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -9106,6 +9376,12 @@ open func recordIdentityCloneWarning(userId: Data, nowMs: Int64)throws  {try rus
      * Attach first-arrival diagnostics to an already inserted incoming
      * message. A redundant mesh/relay copy never overwrites the original
      * route, hop count, or receive time.
+     *
+     * §5: this entry point carries no device field, so it stamps the sender's
+     * legacy stream — the one every legacy peer and every migrated row is on.
+     * The WHERE says so explicitly rather than matching every device the
+     * person has at that lamport, which would attribute one envelope's route
+     * to a sibling device's separate message.
      */
 open func recordMessageArrival(chatId: Data, senderUserId: Data, lamport: UInt64, arrival: MessageArrival)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11327,6 +11603,93 @@ public func FfiConverterTypeContactRelayUnreachable_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeContactRelayUnreachable_lower(_ value: ContactRelayUnreachable) -> RustBuffer {
     return FfiConverterTypeContactRelayUnreachable.lower(value)
+}
+
+
+/**
+ * What this device holds about one contact's roster.
+ */
+public struct ContactRosterState {
+    /**
+     * The last accepted roster, or `None` for a contact who has never
+     * gossiped one — which is every v1 peer, and is exactly the synthetic
+     * one-device person of §5.
+     */
+    public var roster: Roster?
+    /**
+     * DL-2: this person's roster updates are quarantined. Sticky, and never
+     * resolved by arithmetic.
+     */
+    public var quarantined: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The last accepted roster, or `None` for a contact who has never
+         * gossiped one — which is every v1 peer, and is exactly the synthetic
+         * one-device person of §5.
+         */roster: Roster?, 
+        /**
+         * DL-2: this person's roster updates are quarantined. Sticky, and never
+         * resolved by arithmetic.
+         */quarantined: Bool) {
+        self.roster = roster
+        self.quarantined = quarantined
+    }
+}
+
+
+
+extension ContactRosterState: Equatable, Hashable {
+    public static func ==(lhs: ContactRosterState, rhs: ContactRosterState) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.quarantined != rhs.quarantined {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(quarantined)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactRosterState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactRosterState {
+        return
+            try ContactRosterState(
+                roster: FfiConverterOptionTypeRoster.read(from: &buf), 
+                quarantined: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ContactRosterState, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeRoster.write(value.roster, into: &buf)
+        FfiConverterBool.write(value.quarantined, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRosterState_lift(_ buf: RustBuffer) throws -> ContactRosterState {
+    return try FfiConverterTypeContactRosterState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactRosterState_lower(_ value: ContactRosterState) -> RustBuffer {
+    return FfiConverterTypeContactRosterState.lower(value)
 }
 
 
@@ -21132,6 +21495,355 @@ public func FfiConverterTypeCoreVoiceCaptureStep_lower(_ value: CoreVoiceCapture
 
 
 /**
+ * A person-authorized certificate binding one device to one person (§3).
+ *
+ * `signer_sign_pk` records who authorized it: the person root (genesis and
+ * recovery) or a device whose own certificate is still listed in the same
+ * roster and itself chains back to the root. A revoked signer does not keep
+ * vouching: its certificate leaves `devices` when it is tombstoned, so any
+ * certificate it signed is orphaned and must be re-signed (see
+ * [`core_roster_validate`]).
+ *
+ * Note what is not here: no endpoint, no relay URL, no name. DL-5 keeps a
+ * certificate to keys, ids, and integers.
+ */
+public struct DeviceCert {
+    /**
+     * The person this device belongs to: 16 bytes, the wire `user_id`.
+     */
+    public var personId: Data
+    /**
+     * The device's Ed25519 signing public key (32 bytes).
+     */
+    public var deviceSignPk: Data
+    /**
+     * The device's X25519 DH public key (32 bytes) — what siblings and
+     * contacts seal to.
+     */
+    public var deviceAgreePk: Data
+    /**
+     * The person's `recovery_epoch` when this device was added.
+     */
+    public var addedEpoch: UInt64
+    /**
+     * [`DEVICE_CERT_FLAG_ROSTER_SIGNING`] and bits reserved for later work
+     * packages, preserved verbatim.
+     */
+    public var flags: UInt32
+    /**
+     * The key that authorized this certificate.
+     */
+    public var signerSignPk: Data
+    /**
+     * Raw 64-byte Ed25519 signature over [`device_cert_signed_bytes`].
+     */
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The person this device belongs to: 16 bytes, the wire `user_id`.
+         */personId: Data, 
+        /**
+         * The device's Ed25519 signing public key (32 bytes).
+         */deviceSignPk: Data, 
+        /**
+         * The device's X25519 DH public key (32 bytes) — what siblings and
+         * contacts seal to.
+         */deviceAgreePk: Data, 
+        /**
+         * The person's `recovery_epoch` when this device was added.
+         */addedEpoch: UInt64, 
+        /**
+         * [`DEVICE_CERT_FLAG_ROSTER_SIGNING`] and bits reserved for later work
+         * packages, preserved verbatim.
+         */flags: UInt32, 
+        /**
+         * The key that authorized this certificate.
+         */signerSignPk: Data, 
+        /**
+         * Raw 64-byte Ed25519 signature over [`device_cert_signed_bytes`].
+         */signature: Data) {
+        self.personId = personId
+        self.deviceSignPk = deviceSignPk
+        self.deviceAgreePk = deviceAgreePk
+        self.addedEpoch = addedEpoch
+        self.flags = flags
+        self.signerSignPk = signerSignPk
+        self.signature = signature
+    }
+}
+
+
+
+extension DeviceCert: Equatable, Hashable {
+    public static func ==(lhs: DeviceCert, rhs: DeviceCert) -> Bool {
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.deviceSignPk != rhs.deviceSignPk {
+            return false
+        }
+        if lhs.deviceAgreePk != rhs.deviceAgreePk {
+            return false
+        }
+        if lhs.addedEpoch != rhs.addedEpoch {
+            return false
+        }
+        if lhs.flags != rhs.flags {
+            return false
+        }
+        if lhs.signerSignPk != rhs.signerSignPk {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personId)
+        hasher.combine(deviceSignPk)
+        hasher.combine(deviceAgreePk)
+        hasher.combine(addedEpoch)
+        hasher.combine(flags)
+        hasher.combine(signerSignPk)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceCert: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceCert {
+        return
+            try DeviceCert(
+                personId: FfiConverterData.read(from: &buf), 
+                deviceSignPk: FfiConverterData.read(from: &buf), 
+                deviceAgreePk: FfiConverterData.read(from: &buf), 
+                addedEpoch: FfiConverterUInt64.read(from: &buf), 
+                flags: FfiConverterUInt32.read(from: &buf), 
+                signerSignPk: FfiConverterData.read(from: &buf), 
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeviceCert, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterData.write(value.deviceSignPk, into: &buf)
+        FfiConverterData.write(value.deviceAgreePk, into: &buf)
+        FfiConverterUInt64.write(value.addedEpoch, into: &buf)
+        FfiConverterUInt32.write(value.flags, into: &buf)
+        FfiConverterData.write(value.signerSignPk, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceCert_lift(_ buf: RustBuffer) throws -> DeviceCert {
+    return try FfiConverterTypeDeviceCert.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceCert_lower(_ value: DeviceCert) -> RustBuffer {
+    return FfiConverterTypeDeviceCert.lower(value)
+}
+
+
+/**
+ * A device's own keypairs, private material included.
+ *
+ * Same contract as [`crate::Identity`]: the core generates and never persists;
+ * the shell stores the secrets in platform-protected storage. The person root
+ * secret is NOT here and never is — after migration it lives only inside the
+ * passphrase-encrypted `.cmbak` backup (§3, §14.2), which is what keeps a
+ * stolen phone from revoking the person's real devices.
+ */
+public struct DeviceKeypair {
+    /**
+     * 16 bytes, derived from `sign_pk`. This is the id that joins the message
+     * stream key `(chat_id, sender_person_id, sender_device_id, lamport)`.
+     */
+    public var deviceId: Data
+    public var signPk: Data
+    public var signSk: Data
+    public var agreePk: Data
+    public var agreeSk: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 16 bytes, derived from `sign_pk`. This is the id that joins the message
+         * stream key `(chat_id, sender_person_id, sender_device_id, lamport)`.
+         */deviceId: Data, signPk: Data, signSk: Data, agreePk: Data, agreeSk: Data) {
+        self.deviceId = deviceId
+        self.signPk = signPk
+        self.signSk = signSk
+        self.agreePk = agreePk
+        self.agreeSk = agreeSk
+    }
+}
+
+
+
+extension DeviceKeypair: Equatable, Hashable {
+    public static func ==(lhs: DeviceKeypair, rhs: DeviceKeypair) -> Bool {
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.signPk != rhs.signPk {
+            return false
+        }
+        if lhs.signSk != rhs.signSk {
+            return false
+        }
+        if lhs.agreePk != rhs.agreePk {
+            return false
+        }
+        if lhs.agreeSk != rhs.agreeSk {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceId)
+        hasher.combine(signPk)
+        hasher.combine(signSk)
+        hasher.combine(agreePk)
+        hasher.combine(agreeSk)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceKeypair: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceKeypair {
+        return
+            try DeviceKeypair(
+                deviceId: FfiConverterData.read(from: &buf), 
+                signPk: FfiConverterData.read(from: &buf), 
+                signSk: FfiConverterData.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                agreeSk: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeviceKeypair, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceId, into: &buf)
+        FfiConverterData.write(value.signPk, into: &buf)
+        FfiConverterData.write(value.signSk, into: &buf)
+        FfiConverterData.write(value.agreePk, into: &buf)
+        FfiConverterData.write(value.agreeSk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceKeypair_lift(_ buf: RustBuffer) throws -> DeviceKeypair {
+    return try FfiConverterTypeDeviceKeypair.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceKeypair_lower(_ value: DeviceKeypair) -> RustBuffer {
+    return FfiConverterTypeDeviceKeypair.lower(value)
+}
+
+
+/**
+ * A revoked device, kept forever (DL-4).
+ */
+public struct DeviceTombstone {
+    /**
+     * 16-byte device id. The key itself is deliberately not retained — a
+     * tombstone only has to name what may never come back.
+     */
+    public var deviceId: Data
+    public var revokedAtSeq: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 16-byte device id. The key itself is deliberately not retained — a
+         * tombstone only has to name what may never come back.
+         */deviceId: Data, revokedAtSeq: UInt64) {
+        self.deviceId = deviceId
+        self.revokedAtSeq = revokedAtSeq
+    }
+}
+
+
+
+extension DeviceTombstone: Equatable, Hashable {
+    public static func ==(lhs: DeviceTombstone, rhs: DeviceTombstone) -> Bool {
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.revokedAtSeq != rhs.revokedAtSeq {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceId)
+        hasher.combine(revokedAtSeq)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceTombstone: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceTombstone {
+        return
+            try DeviceTombstone(
+                deviceId: FfiConverterData.read(from: &buf), 
+                revokedAtSeq: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeviceTombstone, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceId, into: &buf)
+        FfiConverterUInt64.write(value.revokedAtSeq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceTombstone_lift(_ buf: RustBuffer) throws -> DeviceTombstone {
+    return try FfiConverterTypeDeviceTombstone.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceTombstone_lower(_ value: DeviceTombstone) -> RustBuffer {
+    return FfiConverterTypeDeviceTombstone.lower(value)
+}
+
+
+/**
  * One entry of a per-chat sync digest (DESIGN.md §7.3): "I have `sender_user_id`'s
  * messages in this chat contiguously through `through_lamport`."
  */
@@ -21212,16 +21924,40 @@ public struct ExtendedMessageBody {
     public var timestamp: Int64
     public var content: Data
     public var replyToMsgId: Data?
+    /**
+     * §5: the authoring device, or `None` for every legacy sender. `None` is
+     * the permanent, expected case for a v1 peer — map it with
+     * [`crate::core_device_stream_id`] rather than treating it as missing
+     * data.
+     */
+    public var senderDeviceId: Data?
+    /**
+     * §12: the sender's roster head at authoring time, or `None`. Purely
+     * informational to WP1: nothing here fetches a roster yet.
+     */
+    public var senderRosterHead: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(kind: UInt8, chatId: Data, lamport: UInt64, timestamp: Int64, content: Data, replyToMsgId: Data?) {
+    public init(kind: UInt8, chatId: Data, lamport: UInt64, timestamp: Int64, content: Data, replyToMsgId: Data?, 
+        /**
+         * §5: the authoring device, or `None` for every legacy sender. `None` is
+         * the permanent, expected case for a v1 peer — map it with
+         * [`crate::core_device_stream_id`] rather than treating it as missing
+         * data.
+         */senderDeviceId: Data?, 
+        /**
+         * §12: the sender's roster head at authoring time, or `None`. Purely
+         * informational to WP1: nothing here fetches a roster yet.
+         */senderRosterHead: Data?) {
         self.kind = kind
         self.chatId = chatId
         self.lamport = lamport
         self.timestamp = timestamp
         self.content = content
         self.replyToMsgId = replyToMsgId
+        self.senderDeviceId = senderDeviceId
+        self.senderRosterHead = senderRosterHead
     }
 }
 
@@ -21247,6 +21983,12 @@ extension ExtendedMessageBody: Equatable, Hashable {
         if lhs.replyToMsgId != rhs.replyToMsgId {
             return false
         }
+        if lhs.senderDeviceId != rhs.senderDeviceId {
+            return false
+        }
+        if lhs.senderRosterHead != rhs.senderRosterHead {
+            return false
+        }
         return true
     }
 
@@ -21257,6 +21999,8 @@ extension ExtendedMessageBody: Equatable, Hashable {
         hasher.combine(timestamp)
         hasher.combine(content)
         hasher.combine(replyToMsgId)
+        hasher.combine(senderDeviceId)
+        hasher.combine(senderRosterHead)
     }
 }
 
@@ -21273,7 +22017,9 @@ public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
                 lamport: FfiConverterUInt64.read(from: &buf), 
                 timestamp: FfiConverterInt64.read(from: &buf), 
                 content: FfiConverterData.read(from: &buf), 
-                replyToMsgId: FfiConverterOptionData.read(from: &buf)
+                replyToMsgId: FfiConverterOptionData.read(from: &buf), 
+                senderDeviceId: FfiConverterOptionData.read(from: &buf), 
+                senderRosterHead: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -21284,6 +22030,8 @@ public struct FfiConverterTypeExtendedMessageBody: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.timestamp, into: &buf)
         FfiConverterData.write(value.content, into: &buf)
         FfiConverterOptionData.write(value.replyToMsgId, into: &buf)
+        FfiConverterOptionData.write(value.senderDeviceId, into: &buf)
+        FfiConverterOptionData.write(value.senderRosterHead, into: &buf)
     }
 }
 
@@ -24703,6 +25451,359 @@ public func FfiConverterTypeRelayUpdateContent_lower(_ value: RelayUpdateContent
 
 
 /**
+ * The person-signed, versioned device document of §4.
+ *
+ * DL-5: keys, ids, counters, one signature. An endpoint has nowhere to live.
+ */
+public struct Roster {
+    public var personId: Data
+    /**
+     * Raised only by a roster signed with the recovery material — the person
+     * root secret in the encrypted backup (§14.2). A higher epoch always
+     * supersedes anything the approving device signed, which is how a stolen
+     * approving device is dethroned.
+     */
+    public var recoveryEpoch: UInt64
+    /**
+     * Monotone within a `recovery_epoch`.
+     */
+    public var seq: UInt64
+    /**
+     * Active device certificates.
+     */
+    public var devices: [DeviceCert]
+    /**
+     * Revoked devices, forever (DL-4).
+     */
+    public var tombstones: [DeviceTombstone]
+    /**
+     * The device currently holding the roster-signing role (§3).
+     */
+    public var approvingDeviceId: Data
+    /**
+     * §6; bumped on every revocation. WP5 rotates the key itself.
+     */
+    public var inboxKeyGeneration: UInt64
+    /**
+     * The key that signed this document: the approving device, or the person
+     * root (genesis and recovery).
+     */
+    public var signerSignPk: Data
+    /**
+     * Raw 64-byte Ed25519 signature over [`roster_signed_bytes`].
+     */
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personId: Data, 
+        /**
+         * Raised only by a roster signed with the recovery material — the person
+         * root secret in the encrypted backup (§14.2). A higher epoch always
+         * supersedes anything the approving device signed, which is how a stolen
+         * approving device is dethroned.
+         */recoveryEpoch: UInt64, 
+        /**
+         * Monotone within a `recovery_epoch`.
+         */seq: UInt64, 
+        /**
+         * Active device certificates.
+         */devices: [DeviceCert], 
+        /**
+         * Revoked devices, forever (DL-4).
+         */tombstones: [DeviceTombstone], 
+        /**
+         * The device currently holding the roster-signing role (§3).
+         */approvingDeviceId: Data, 
+        /**
+         * §6; bumped on every revocation. WP5 rotates the key itself.
+         */inboxKeyGeneration: UInt64, 
+        /**
+         * The key that signed this document: the approving device, or the person
+         * root (genesis and recovery).
+         */signerSignPk: Data, 
+        /**
+         * Raw 64-byte Ed25519 signature over [`roster_signed_bytes`].
+         */signature: Data) {
+        self.personId = personId
+        self.recoveryEpoch = recoveryEpoch
+        self.seq = seq
+        self.devices = devices
+        self.tombstones = tombstones
+        self.approvingDeviceId = approvingDeviceId
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.signerSignPk = signerSignPk
+        self.signature = signature
+    }
+}
+
+
+
+extension Roster: Equatable, Hashable {
+    public static func ==(lhs: Roster, rhs: Roster) -> Bool {
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.recoveryEpoch != rhs.recoveryEpoch {
+            return false
+        }
+        if lhs.seq != rhs.seq {
+            return false
+        }
+        if lhs.devices != rhs.devices {
+            return false
+        }
+        if lhs.tombstones != rhs.tombstones {
+            return false
+        }
+        if lhs.approvingDeviceId != rhs.approvingDeviceId {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.signerSignPk != rhs.signerSignPk {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personId)
+        hasher.combine(recoveryEpoch)
+        hasher.combine(seq)
+        hasher.combine(devices)
+        hasher.combine(tombstones)
+        hasher.combine(approvingDeviceId)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(signerSignPk)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRoster: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Roster {
+        return
+            try Roster(
+                personId: FfiConverterData.read(from: &buf), 
+                recoveryEpoch: FfiConverterUInt64.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf), 
+                devices: FfiConverterSequenceTypeDeviceCert.read(from: &buf), 
+                tombstones: FfiConverterSequenceTypeDeviceTombstone.read(from: &buf), 
+                approvingDeviceId: FfiConverterData.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                signerSignPk: FfiConverterData.read(from: &buf), 
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: Roster, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterUInt64.write(value.recoveryEpoch, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+        FfiConverterSequenceTypeDeviceCert.write(value.devices, into: &buf)
+        FfiConverterSequenceTypeDeviceTombstone.write(value.tombstones, into: &buf)
+        FfiConverterData.write(value.approvingDeviceId, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterData.write(value.signerSignPk, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRoster_lift(_ buf: RustBuffer) throws -> Roster {
+    return try FfiConverterTypeRoster.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRoster_lower(_ value: Roster) -> RustBuffer {
+    return FfiConverterTypeRoster.lower(value)
+}
+
+
+/**
+ * The verdict, plus the quarantine bit the caller must persist.
+ */
+public struct RosterUpdateDecision {
+    public var outcome: RosterUpdateOutcome
+    public var reason: RosterUpdateReason
+    /**
+     * Why the document was rejected, when `reason` is
+     * [`RosterUpdateReason::Invalid`].
+     */
+    public var rejection: RosterRejection?
+    /**
+     * DL-2: once true this stays true. A later, perfectly good roster is not a
+     * resolution — a fork is resolved by a person, never by arithmetic.
+     */
+    public var quarantined: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: RosterUpdateOutcome, reason: RosterUpdateReason, 
+        /**
+         * Why the document was rejected, when `reason` is
+         * [`RosterUpdateReason::Invalid`].
+         */rejection: RosterRejection?, 
+        /**
+         * DL-2: once true this stays true. A later, perfectly good roster is not a
+         * resolution — a fork is resolved by a person, never by arithmetic.
+         */quarantined: Bool) {
+        self.outcome = outcome
+        self.reason = reason
+        self.rejection = rejection
+        self.quarantined = quarantined
+    }
+}
+
+
+
+extension RosterUpdateDecision: Equatable, Hashable {
+    public static func ==(lhs: RosterUpdateDecision, rhs: RosterUpdateDecision) -> Bool {
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        if lhs.rejection != rhs.rejection {
+            return false
+        }
+        if lhs.quarantined != rhs.quarantined {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outcome)
+        hasher.combine(reason)
+        hasher.combine(rejection)
+        hasher.combine(quarantined)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterUpdateDecision: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterUpdateDecision {
+        return
+            try RosterUpdateDecision(
+                outcome: FfiConverterTypeRosterUpdateOutcome.read(from: &buf), 
+                reason: FfiConverterTypeRosterUpdateReason.read(from: &buf), 
+                rejection: FfiConverterOptionTypeRosterRejection.read(from: &buf), 
+                quarantined: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RosterUpdateDecision, into buf: inout [UInt8]) {
+        FfiConverterTypeRosterUpdateOutcome.write(value.outcome, into: &buf)
+        FfiConverterTypeRosterUpdateReason.write(value.reason, into: &buf)
+        FfiConverterOptionTypeRosterRejection.write(value.rejection, into: &buf)
+        FfiConverterBool.write(value.quarantined, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateDecision_lift(_ buf: RustBuffer) throws -> RosterUpdateDecision {
+    return try FfiConverterTypeRosterUpdateDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateDecision_lower(_ value: RosterUpdateDecision) -> RustBuffer {
+    return FfiConverterTypeRosterUpdateDecision.lower(value)
+}
+
+
+/**
+ * `(recovery_epoch, seq)` — the DL-1 ordering key, compared lexicographically.
+ */
+public struct RosterVersion {
+    public var recoveryEpoch: UInt64
+    public var seq: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(recoveryEpoch: UInt64, seq: UInt64) {
+        self.recoveryEpoch = recoveryEpoch
+        self.seq = seq
+    }
+}
+
+
+
+extension RosterVersion: Equatable, Hashable {
+    public static func ==(lhs: RosterVersion, rhs: RosterVersion) -> Bool {
+        if lhs.recoveryEpoch != rhs.recoveryEpoch {
+            return false
+        }
+        if lhs.seq != rhs.seq {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recoveryEpoch)
+        hasher.combine(seq)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterVersion: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterVersion {
+        return
+            try RosterVersion(
+                recoveryEpoch: FfiConverterUInt64.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RosterVersion, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.recoveryEpoch, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterVersion_lift(_ buf: RustBuffer) throws -> RosterVersion {
+    return try FfiConverterTypeRosterVersion.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterVersion_lower(_ value: RosterVersion) -> RustBuffer {
+    return FfiConverterTypeRosterVersion.lower(value)
+}
+
+
+/**
  * One contact's friend card, deliberately handed to somebody else by a mutual
  * acquaintance (specs/share-contact.md). Carries the stored card
  * byte-identical (decision 8: never substitute the sharer's own credentials),
@@ -25847,16 +26948,42 @@ public struct StoredMessage {
     public var timestamp: Int64
     public var kind: UInt8
     public var payload: Data
+    /**
+     * §5: which of the sender's devices authored this row. Read side only —
+     * every insert takes the authoring device as its own argument
+     * (`insert_message_from_device` and friends), because the device comes
+     * from inside the envelope's seal rather than from the caller, and this
+     * field is ignored on the way in.
+     *
+     * [`LEGACY_DEVICE_ID`] is the honest default: it is what every migrated
+     * row, every legacy peer's traffic, and every locally authored row
+     * carries until WP3 mints a device identity. A caller building one of
+     * these by hand should write it, not something invented.
+     */
+    public var senderDeviceId: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(chatId: Data, senderUserId: Data, lamport: UInt64, timestamp: Int64, kind: UInt8, payload: Data) {
+    public init(chatId: Data, senderUserId: Data, lamport: UInt64, timestamp: Int64, kind: UInt8, payload: Data, 
+        /**
+         * §5: which of the sender's devices authored this row. Read side only —
+         * every insert takes the authoring device as its own argument
+         * (`insert_message_from_device` and friends), because the device comes
+         * from inside the envelope's seal rather than from the caller, and this
+         * field is ignored on the way in.
+         *
+         * [`LEGACY_DEVICE_ID`] is the honest default: it is what every migrated
+         * row, every legacy peer's traffic, and every locally authored row
+         * carries until WP3 mints a device identity. A caller building one of
+         * these by hand should write it, not something invented.
+         */senderDeviceId: Data) {
         self.chatId = chatId
         self.senderUserId = senderUserId
         self.lamport = lamport
         self.timestamp = timestamp
         self.kind = kind
         self.payload = payload
+        self.senderDeviceId = senderDeviceId
     }
 }
 
@@ -25882,6 +27009,9 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.payload != rhs.payload {
             return false
         }
+        if lhs.senderDeviceId != rhs.senderDeviceId {
+            return false
+        }
         return true
     }
 
@@ -25892,6 +27022,7 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(timestamp)
         hasher.combine(kind)
         hasher.combine(payload)
+        hasher.combine(senderDeviceId)
     }
 }
 
@@ -25908,7 +27039,8 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 lamport: FfiConverterUInt64.read(from: &buf), 
                 timestamp: FfiConverterInt64.read(from: &buf), 
                 kind: FfiConverterUInt8.read(from: &buf), 
-                payload: FfiConverterData.read(from: &buf)
+                payload: FfiConverterData.read(from: &buf), 
+                senderDeviceId: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -25919,6 +27051,7 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterInt64.write(value.timestamp, into: &buf)
         FfiConverterUInt8.write(value.kind, into: &buf)
         FfiConverterData.write(value.payload, into: &buf)
+        FfiConverterData.write(value.senderDeviceId, into: &buf)
     }
 }
 
@@ -26374,6 +27507,88 @@ public func FfiConverterTypeContactDelivery_lower(_ value: ContactDelivery) -> R
 
 
 extension ContactDelivery: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Whether a contact's roster vouches for one of their devices.
+ */
+
+public enum ContactDeviceState {
+    
+    /**
+     * No roster names this device — including every device of a contact who
+     * has never sent a roster at all.
+     */
+    case unknown
+    case active
+    /**
+     * DL-4: tombstoned, forever. Re-linking the same hardware mints a fresh
+     * key and therefore a different device id.
+     */
+    case revoked
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeContactDeviceState: FfiConverterRustBuffer {
+    typealias SwiftType = ContactDeviceState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ContactDeviceState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .unknown
+        
+        case 2: return .active
+        
+        case 3: return .revoked
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ContactDeviceState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .active:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .revoked:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDeviceState_lift(_ buf: RustBuffer) throws -> ContactDeviceState {
+    return try FfiConverterTypeContactDeviceState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeContactDeviceState_lower(_ value: ContactDeviceState) -> RustBuffer {
+    return FfiConverterTypeContactDeviceState.lower(value)
+}
+
+
+
+extension ContactDeviceState: Equatable, Hashable {}
 
 
 
@@ -30567,6 +31782,169 @@ extension DeepLinkRoute: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What adding a device does, given the count the roster would hold afterwards.
+ */
+
+public enum DeviceAddOutcome {
+    
+    case added
+    /**
+     * Allowed, but the person is past the soft cap and should be told.
+     */
+    case addedWithWarning
+    case refused
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceAddOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = DeviceAddOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceAddOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .added
+        
+        case 2: return .addedWithWarning
+        
+        case 3: return .refused
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeviceAddOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .added:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .addedWithWarning:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .refused:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceAddOutcome_lift(_ buf: RustBuffer) throws -> DeviceAddOutcome {
+    return try FfiConverterTypeDeviceAddOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceAddOutcome_lower(_ value: DeviceAddOutcome) -> RustBuffer {
+    return FfiConverterTypeDeviceAddOutcome.lower(value)
+}
+
+
+
+extension DeviceAddOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which context string a raw device signature is bound to.
+ *
+ * Message authoring and sync records are signed through
+ * [`core_device_sign`]; certificates and rosters have their own canonical
+ * layouts and use [`core_sign_device_cert`] / [`core_sign_roster`], which
+ * reach the same primitive with their own domain.
+ */
+
+public enum DeviceSigningDomain {
+    
+    case deviceCert
+    case rosterUpdate
+    case messageAuthoring
+    case syncRecord
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceSigningDomain: FfiConverterRustBuffer {
+    typealias SwiftType = DeviceSigningDomain
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceSigningDomain {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .deviceCert
+        
+        case 2: return .rosterUpdate
+        
+        case 3: return .messageAuthoring
+        
+        case 4: return .syncRecord
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeviceSigningDomain, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .deviceCert:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .rosterUpdate:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .messageAuthoring:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .syncRecord:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceSigningDomain_lift(_ buf: RustBuffer) throws -> DeviceSigningDomain {
+    return try FfiConverterTypeDeviceSigningDomain.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceSigningDomain_lower(_ value: DeviceSigningDomain) -> RustBuffer {
+    return FfiConverterTypeDeviceSigningDomain.lower(value)
+}
+
+
+
+extension DeviceSigningDomain: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A parsed link frame. HELLO, DIGEST, LAN endpoint hints, and probes are
  * link-control traffic; message content remains inside sealed envelopes.
  */
@@ -31403,6 +32781,464 @@ public func FfiConverterTypeRelayMailboxWalkAction_lower(_ value: RelayMailboxWa
 
 
 extension RelayMailboxWalkAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a roster is not acceptable on its own terms. `None` from
+ * [`core_roster_validate`] means the document is well-formed and every
+ * signature in it verifies to a person-authorized key.
+ */
+
+public enum RosterRejection {
+    
+    /**
+     * The document names a different person than the root key it is checked
+     * against.
+     */
+    case personMismatch
+    /**
+     * A key, id, or signature is the wrong length — the DL-5 shape check.
+     */
+    case malformedField
+    /**
+     * A certificate derives to the reserved [`LEGACY_DEVICE_ID`].
+     */
+    case reservedDeviceId
+    /**
+     * The same device appears twice in `devices` or in `tombstones`.
+     */
+    case duplicateDevice
+    /**
+     * A certificate's own signature does not verify.
+     */
+    case certSignatureInvalid
+    /**
+     * DL-1: a certificate's signature chain does not terminate at the person
+     * root — the signer is a stranger, a device whose own certificate is no
+     * longer listed (a revoked predecessor's orphan), or a cycle of
+     * certificates vouching only for each other.
+     */
+    case chainBroken
+    /**
+     * The roster's own signature does not verify.
+     */
+    case signatureInvalid
+    /**
+     * The roster was signed by neither the person root nor its approving
+     * device.
+     */
+    case signerNotAuthorized
+    /**
+     * `approving_device_id` names no active device.
+     */
+    case approvingDeviceMissing
+    /**
+     * The roster-signing flag is not on exactly the approving device.
+     */
+    case approvingRoleMismatch
+    /**
+     * Roster genesis (`seq == 0`) must be signed by the person root (§3). A
+     * recovery roster takes the same shape — a new `recovery_epoch` resets the
+     * seq — so this rule refuses a device-signed recovery document too.
+     */
+    case genesisNotRootSigned
+    /**
+     * DL-4: a tombstoned device id is listed as active.
+     */
+    case tombstonedDeviceActive
+    /**
+     * §14.3: more than 16 active devices.
+     */
+    case deviceCapExceeded
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterRejection: FfiConverterRustBuffer {
+    typealias SwiftType = RosterRejection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterRejection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .personMismatch
+        
+        case 2: return .malformedField
+        
+        case 3: return .reservedDeviceId
+        
+        case 4: return .duplicateDevice
+        
+        case 5: return .certSignatureInvalid
+        
+        case 6: return .chainBroken
+        
+        case 7: return .signatureInvalid
+        
+        case 8: return .signerNotAuthorized
+        
+        case 9: return .approvingDeviceMissing
+        
+        case 10: return .approvingRoleMismatch
+        
+        case 11: return .genesisNotRootSigned
+        
+        case 12: return .tombstonedDeviceActive
+        
+        case 13: return .deviceCapExceeded
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RosterRejection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .personMismatch:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .malformedField:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .reservedDeviceId:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .duplicateDevice:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .certSignatureInvalid:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .chainBroken:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .signatureInvalid:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .signerNotAuthorized:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .approvingDeviceMissing:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .approvingRoleMismatch:
+            writeInt(&buf, Int32(10))
+        
+        
+        case .genesisNotRootSigned:
+            writeInt(&buf, Int32(11))
+        
+        
+        case .tombstonedDeviceActive:
+            writeInt(&buf, Int32(12))
+        
+        
+        case .deviceCapExceeded:
+            writeInt(&buf, Int32(13))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterRejection_lift(_ buf: RustBuffer) throws -> RosterRejection {
+    return try FfiConverterTypeRosterRejection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterRejection_lower(_ value: RosterRejection) -> RustBuffer {
+    return FfiConverterTypeRosterRejection.lower(value)
+}
+
+
+
+extension RosterRejection: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a contact does with an incoming roster.
+ */
+
+public enum RosterUpdateOutcome {
+    
+    /**
+     * Store the incoming roster in place of what was held.
+     */
+    case accepted
+    /**
+     * Keep what was stored (DL-1 idempotent gossip, or a document that does
+     * not verify).
+     */
+    case ignored
+    /**
+     * DL-2: a fork. Keep the stored roster and quarantine this person's roster
+     * updates from here on — never auto-resolved.
+     */
+    case forkQuarantined
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterUpdateOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = RosterUpdateOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterUpdateOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .accepted
+        
+        case 2: return .ignored
+        
+        case 3: return .forkQuarantined
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RosterUpdateOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .accepted:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .ignored:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .forkQuarantined:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateOutcome_lift(_ buf: RustBuffer) throws -> RosterUpdateOutcome {
+    return try FfiConverterTypeRosterUpdateOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateOutcome_lower(_ value: RosterUpdateOutcome) -> RustBuffer {
+    return FfiConverterTypeRosterUpdateOutcome.lower(value)
+}
+
+
+
+extension RosterUpdateOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which rule produced the outcome. Diagnostic, and the shape the WP0 vectors
+ * read when they name a rule.
+ */
+
+public enum RosterUpdateReason {
+    
+    /**
+     * Nothing was stored for this person yet, so the document is judged on
+     * its own merits: it must validate against the person root this device
+     * already has for that contact, and then it is adopted at whatever
+     * `(recovery_epoch, seq)` it names.
+     *
+     * This is trust-on-first-gossip, and it is deliberate. The safety it
+     * rests on is the chain: a first roster still has to terminate at the
+     * person root (§3), which is the very key that already authenticates
+     * every message from that contact — so a stranger cannot seed one.
+     *
+     * KNOWN RESIDUAL, owned by WP5's recovery flow: a *stolen approving
+     * device* can seed a brand-new contact with a roster at an inflated
+     * `recovery_epoch`, and that contact, having no baseline, adopts it.
+     * Every later honest roster from the real person is then a
+     * [`RosterUpdateReason::Rollback`] until the person recovers past the
+     * inflated epoch. §14.2 supremacy still holds — only the root secret in
+     * the encrypted backup can climb — so the recovery path resolves it; what
+     * WP1 does not have is a way to notice it at adoption time.
+     */
+    case firstRoster
+    /**
+     * DL-1: strictly higher `(recovery_epoch, seq)`, and it verifies.
+     */
+    case superseded
+    /**
+     * DL-1: lower `(recovery_epoch, seq)` — a replay or a stale gossip copy.
+     */
+    case rollback
+    /**
+     * DL-1: the same version and the same document.
+     */
+    case idempotentRepeat
+    /**
+     * DL-2: the same version, a different document.
+     */
+    case forkedContent
+    /**
+     * DL-2: this person's rosters are already quarantined.
+     */
+    case personQuarantined
+    /**
+     * The document itself is not acceptable; see `rejection`.
+     */
+    case invalid
+    /**
+     * §14.2: raising `recovery_epoch` requires the recovery material — the
+     * person root secret from the encrypted backup. An approving device
+     * cannot mint itself a higher epoch.
+     *
+     * Scope, deliberately: this rule compares an incoming roster against a
+     * **stored** one, so it can only refuse an epoch that climbs above a
+     * baseline this device already holds. It says nothing about the first
+     * roster ever seen for a person — there is no baseline to climb above —
+     * and [`RosterUpdateReason::FirstRoster`] documents what happens there.
+     */
+    case recoveryEpochRequiresRoot
+    /**
+     * DL-4: the incoming roster drops a tombstone the stored one carries, or
+     * re-activates a device it already buried.
+     */
+    case tombstoneResurrected
+    /**
+     * A roster's `inbox_key_generation` never goes backwards within one
+     * recovery epoch (§6).
+     */
+    case inboxGenerationRegressed
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterUpdateReason: FfiConverterRustBuffer {
+    typealias SwiftType = RosterUpdateReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterUpdateReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .firstRoster
+        
+        case 2: return .superseded
+        
+        case 3: return .rollback
+        
+        case 4: return .idempotentRepeat
+        
+        case 5: return .forkedContent
+        
+        case 6: return .personQuarantined
+        
+        case 7: return .invalid
+        
+        case 8: return .recoveryEpochRequiresRoot
+        
+        case 9: return .tombstoneResurrected
+        
+        case 10: return .inboxGenerationRegressed
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RosterUpdateReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .firstRoster:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .superseded:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .rollback:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .idempotentRepeat:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .forkedContent:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .personQuarantined:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .invalid:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .recoveryEpochRequiresRoot:
+            writeInt(&buf, Int32(8))
+        
+        
+        case .tombstoneResurrected:
+            writeInt(&buf, Int32(9))
+        
+        
+        case .inboxGenerationRegressed:
+            writeInt(&buf, Int32(10))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateReason_lift(_ buf: RustBuffer) throws -> RosterUpdateReason {
+    return try FfiConverterTypeRosterUpdateReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterUpdateReason_lower(_ value: RosterUpdateReason) -> RustBuffer {
+    return FfiConverterTypeRosterUpdateReason.lower(value)
+}
+
+
+
+extension RosterUpdateReason: Equatable, Hashable {}
 
 
 
@@ -34023,6 +35859,30 @@ fileprivate struct FfiConverterOptionTypeRelayEndpoint: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeRoster: FfiConverterRustBuffer {
+    typealias SwiftType = Roster?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRoster.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRoster.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeSharedFriendCard: FfiConverterRustBuffer {
     typealias SwiftType = SharedFriendCard?
 
@@ -34351,6 +36211,30 @@ fileprivate struct FfiConverterOptionTypeDeepLinkRoute: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeDeepLinkRoute.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeRosterRejection: FfiConverterRustBuffer {
+    typealias SwiftType = RosterRejection?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeRosterRejection.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeRosterRejection.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -35350,6 +37234,56 @@ fileprivate struct FfiConverterSequenceTypeCoreTransportRoute: FfiConverterRustB
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeCoreTransportRoute.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeDeviceCert: FfiConverterRustBuffer {
+    typealias SwiftType = [DeviceCert]
+
+    public static func write(_ value: [DeviceCert], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDeviceCert.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DeviceCert] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DeviceCert]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDeviceCert.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeDeviceTombstone: FfiConverterRustBuffer {
+    typealias SwiftType = [DeviceTombstone]
+
+    public static func write(_ value: [DeviceTombstone], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDeviceTombstone.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DeviceTombstone] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DeviceTombstone]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDeviceTombstone.read(from: &buf))
         }
         return seq
     }
@@ -36361,6 +38295,21 @@ public func coreContactRouteUsable(directLink: Bool, ownRelayUsable: Bool, conta
 })
 }
 /**
+ * Device id = first 16 bytes of BLAKE2b(device signing pubkey).
+ *
+ * §3 calls the device signing pubkey the `device_id`; on the wire and in the
+ * store that key is addressed by this 16-byte derivation, which is the same
+ * construction `user_id` already uses and the width the `sender_device_id`
+ * column carries.
+ */
+public func coreDeriveDeviceId(deviceSignPk: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_derive_device_id(
+        FfiConverterData.lower(deviceSignPk),$0
+    )
+})
+}
+/**
  * Find every link in `body`, in order, non-overlapping.
  *
  * Returns an empty list for a body with no links (including an empty body).
@@ -36373,6 +38322,55 @@ public func coreDetectLinks(body: String) -> [CoreDetectedLink] {
         FfiConverterString.lower(body),$0
     )
 })
+}
+/**
+ * §14.3, boundary as resolved on 2026-08-16: the count is the roster size
+ * AFTER the add. Up to 8 is silent, the 9th warns, 16 is the last allowed, the
+ * 17th is refused.
+ */
+public func coreDeviceAddOutcome(resultingDeviceCount: UInt32) -> DeviceAddOutcome {
+    return try!  FfiConverterTypeDeviceAddOutcome.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_device_add_outcome(
+        FfiConverterUInt32.lower(resultingDeviceCount),$0
+    )
+})
+}
+/**
+ * Sign `message` under a device's Ed25519 key in one domain (§3).
+ */
+public func coreDeviceSign(domain: DeviceSigningDomain, deviceSignSk: Data, message: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_device_sign(
+        FfiConverterTypeDeviceSigningDomain.lower(domain),
+        FfiConverterData.lower(deviceSignSk),
+        FfiConverterData.lower(message),$0
+    )
+})
+}
+/**
+ * Map an optional sealed-body device field onto a stream id: absent (a legacy
+ * envelope, or any row minted before the migration) means
+ * [`LEGACY_DEVICE_ID`], never an error (§5).
+ */
+public func coreDeviceStreamId(senderDeviceId: Data?) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_device_stream_id(
+        FfiConverterOptionData.lower(senderDeviceId),$0
+    )
+})
+}
+/**
+ * Verify a device signature in one domain. A signature from another domain
+ * fails here, which is the whole point of the context strings.
+ */
+public func coreDeviceVerify(domain: DeviceSigningDomain, deviceSignPk: Data, message: Data, signature: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_device_verify(
+        FfiConverterTypeDeviceSigningDomain.lower(domain),
+        FfiConverterData.lower(deviceSignPk),
+        FfiConverterData.lower(message),
+        FfiConverterData.lower(signature),$0
+    )
+}
 }
 /**
  * The default [`CoreFailoverResumeDebounce`] window, exported so both shells
@@ -36780,6 +38778,15 @@ public func coreLateArrivalFlags(rows: [LateArrivalInput]) -> [Bool] {
     return try!  FfiConverterSequenceBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_late_arrival_flags(
         FfiConverterSequenceTypeLateArrivalInput.lower(rows),$0
+    )
+})
+}
+/**
+ * The reserved all-zero legacy stream id (§5).
+ */
+public func coreLegacyDeviceId() -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_legacy_device_id($0
     )
 })
 }
@@ -37328,6 +39335,87 @@ public func coreRelayShadowSample(state: CoreRelayShadowSampler, nowMs: Int64) -
 })
 }
 /**
+ * Decide what to do with an incoming roster (DL-1, DL-2, DL-4).
+ *
+ * Pure: `stored` and `stored_quarantined` are what the caller has persisted
+ * for this person, and the returned [`RosterUpdateDecision::quarantined`] is
+ * what it must persist afterwards. Nothing here reads a clock, a store, or a
+ * transport — DL-3 gossip is the caller's business, and a roster arriving over
+ * relay, LAN, BLE, or carry is judged identically.
+ */
+public func coreRosterAccept(stored: Roster?, storedQuarantined: Bool, incoming: Roster, personRootSignPk: Data) -> RosterUpdateDecision {
+    return try!  FfiConverterTypeRosterUpdateDecision.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_accept(
+        FfiConverterOptionTypeRoster.lower(stored),
+        FfiConverterBool.lower(storedQuarantined),
+        FfiConverterTypeRoster.lower(incoming),
+        FfiConverterData.lower(personRootSignPk),$0
+    )
+})
+}
+/**
+ * The active device ids of a roster, in document order.
+ */
+public func coreRosterDeviceIds(roster: Roster) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_device_ids(
+        FfiConverterTypeRoster.lower(roster),$0
+    )
+})
+}
+/**
+ * BLAKE2b-256 of the roster document — the digest a `CMFRIEND4:` card carries
+ * (§12) and the value a linking device acknowledges back to the approving
+ * device (§9.4).
+ *
+ * It covers the roster's content, not its signature, so the head names *which
+ * roster* this is; two documents with the same head are the same document.
+ * That is also what makes it the DL-2 fork discriminator.
+ */
+public func coreRosterHeadHash(roster: Roster) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_head_hash(
+        FfiConverterTypeRoster.lower(roster),$0
+    )
+})
+}
+/**
+ * Validate a roster against the person root key it claims to descend from.
+ *
+ * This answers DL-1's second half — "the signature chain verifies back to the
+ * person root" — plus the structural rules that keep the document what §4 says
+ * it is. Ordering against a stored roster is [`core_roster_accept`]'s job.
+ *
+ * The chain rule: the document must be signed by the person root or by its
+ * approving device, and every certificate must *terminate at the person root*.
+ * That is computed rather than asserted — the vouched set starts as the root
+ * alone and grows to a fixpoint, admitting a certificate only once the key
+ * that signed it is already vouched for. A certificate left over when the
+ * fixpoint stops is [`RosterRejection::ChainBroken`], which is what stops two
+ * smuggled certificates from vouching for each other, or one from vouching for
+ * itself: neither can ever reach the seed.
+ *
+ * The deliberate representational consequence: **tombstoned devices do not
+ * carry their certificates** — a [`DeviceTombstone`] names an id and nothing
+ * else (DL-4), so a revoked device is not a link the chain can pass through.
+ * Every active certificate must therefore chain to the root through
+ * certificates that are *still listed*. Re-rostering after a revocation must
+ * consequently re-sign whatever the revoked device had signed, which is
+ * exactly what §10.1's revocation step does at the moment it buries the
+ * device: the approving device tombstones the revoked one and re-signs its
+ * orphans in the same roster update. Revoking the approving device itself is
+ * §10's recovery-code path, where the person root signs the new epoch's
+ * genesis and re-issues the certificates directly.
+ */
+public func coreRosterValidate(roster: Roster, personRootSignPk: Data) -> RosterRejection? {
+    return try!  FfiConverterOptionTypeRosterRejection.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_validate(
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(personRootSignPk),$0
+    )
+})
+}
+/**
  * Turn the facts into the checklist.
  *
  * The rules, in full:
@@ -37503,6 +39591,33 @@ public func coreShouldAckInbound(disposition: CoreInboundDisposition) -> Bool {
 })
 }
 /**
+ * Sign a device certificate under the authorizing key (person root, or the
+ * approving device). `signer_sign_pk` and `signature` are filled in from
+ * `signer_sign_sk`, so the recorded signer can never disagree with the key
+ * that actually signed.
+ */
+public func coreSignDeviceCert(cert: DeviceCert, signerSignSk: Data)throws  -> DeviceCert {
+    return try  FfiConverterTypeDeviceCert.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_sign_device_cert(
+        FfiConverterTypeDeviceCert.lower(cert),
+        FfiConverterData.lower(signerSignSk),$0
+    )
+})
+}
+/**
+ * Sign a roster under the approving device's key or the person root's (§3).
+ * As with certificates, the recorded signer is derived from the secret so the
+ * two can never disagree.
+ */
+public func coreSignRoster(roster: Roster, signerSignSk: Data)throws  -> Roster {
+    return try  FfiConverterTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_sign_roster(
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(signerSignSk),$0
+    )
+})
+}
+/**
  * See [`SPRAY_RETRY_ARM_MAX_MS`]. Exported so neither shell owns the number.
  */
 public func coreSprayRetryArmMaxMs() -> Int64 {
@@ -37565,6 +39680,17 @@ public func coreUnreadCount(messages: [StoredMessage], ownUserId: Data, readThro
         FfiConverterUInt64.lower(readThrough),$0
     )
 })
+}
+/**
+ * Verify a certificate against its own recorded signer. Whether that signer is
+ * *person-authorized* is a roster-level question, answered by
+ * [`core_roster_validate`].
+ */
+public func coreVerifyDeviceCert(cert: DeviceCert)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_verify_device_cert(
+        FfiConverterTypeDeviceCert.lower(cert),$0
+    )
+}
 }
 public func coreVisibleChatMessages(messages: [StoredMessage]) -> [StoredMessage] {
     return try!  FfiConverterSequenceTypeStoredMessage.lift(try! rustCall() {
@@ -38005,6 +40131,28 @@ public func encodeMessageBody(body: MessageBody)throws  -> Data {
 })
 }
 /**
+ * Encode a message body with any combination of the private extensions,
+ * including the multi-device ones (`specs/multi-device-v1.md` §5, §12).
+ *
+ * Passing `None` for `sender_device_id` emits no device TLV at all, which is
+ * byte-for-byte what every build in the field emits today and what a recipient
+ * maps onto [`crate::LEGACY_DEVICE_ID`]. That is the WP1 default: a device may
+ * not claim a device id before it has one, and §9.4's two-phase activation
+ * says a device authors nothing until the roster that names it is
+ * acknowledged, so the authoring call sites start passing a real id in the
+ * work package that mints one.
+ */
+public func encodeMessageBodyExtended(body: MessageBody, replyToMsgId: Data?, senderDeviceId: Data?, senderRosterHead: Data?)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_message_body_extended(
+        FfiConverterTypeMessageBody.lower(body),
+        FfiConverterOptionData.lower(replyToMsgId),
+        FfiConverterOptionData.lower(senderDeviceId),
+        FfiConverterOptionData.lower(senderRosterHead),$0
+    )
+})
+}
+/**
  * Encode a message body with an encrypted reference to the message being
  * replied to. The fixed-width id is the target envelope's public `msg_id`,
  * but it remains private here because the extension is inside the seal.
@@ -38167,6 +40315,15 @@ public func friendCardUserId(card: FriendCard) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_friend_card_user_id(
         FfiConverterTypeFriendCard.lower(card),$0
+    )
+})
+}
+/**
+ * Generate a device's Ed25519 signing keypair and X25519 DH keypair (§3).
+ */
+public func generateDeviceKeypair() -> DeviceKeypair {
+    return try!  FfiConverterTypeDeviceKeypair.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_generate_device_keypair($0
     )
 })
 }
@@ -39964,7 +42121,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_route_usable() != 20984) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_derive_device_id() != 23875) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_detect_links() != 34673) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_add_outcome() != 35034) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_sign() != 951) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_stream_id() != 65121) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_verify() != 56789) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_failover_resume_window_ms() != 41431) {
@@ -40040,6 +42212,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_late_arrival_flags() != 29354) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_legacy_device_id() != 53292) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_link_openable_scheme() != 40398) {
@@ -40144,6 +42319,18 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_sample() != 54520) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_accept() != 33112) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_device_ids() != 3525) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_head_hash() != 1927) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_validate() != 10) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_sail_checklist() != 31707) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -40180,6 +42367,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_should_ack_inbound() != 65218) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_sign_device_cert() != 2572) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sign_roster() != 42957) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_spray_retry_arm_max_ms() != 63580) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -40193,6 +42386,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_unread_count() != 12034) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_verify_device_cert() != 40924) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_visible_chat_messages() != 48182) {
@@ -40312,6 +42508,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body() != 32564) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_message_body_extended() != 47594) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -40346,6 +42545,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_friend_card_user_id() != 30116) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_generate_device_keypair() != 38372) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_generate_identity() != 63024) {
@@ -40852,6 +43054,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 49600) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -40957,16 +43162,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_msg_id_recorded() != 24623) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_active_device_ids() != 58680) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar() != 36175) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_avatar_epoch() != 49788) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_device_state() != 34246) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_matching_hint() != 11008) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_relay_epoch() != 12666) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_roster_state() != 8489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_commit_inbound_delivery() != 60150) {
@@ -41080,7 +43294,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_protocol_events() != 27445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 43009) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 58409) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
@@ -41098,13 +43312,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_classified() != 47726) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_from_device() != 40050) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_incoming_message_with_arrival() != 54638) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 16710) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message() != 45071) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 32750) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_message_from_device() != 36381) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_message() != 51437) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_insert_outgoing_reply() != 64676) {
@@ -41149,7 +43369,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_relay_fanout_row_posted() != 62196) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 44635) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_arrival() != 20203) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_by_msg_id() != 40731) {
@@ -41161,7 +43381,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_message_origin_by_msg_id() != 12991) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 37519) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference() != 47361) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_reference_from_device() != 13737) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_message_stream_device_ids() != 9061) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_messages_after() != 55946) {
@@ -41197,7 +43423,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_envelopes_after() != 35551) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_message_expiry() != 65173) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_outbound_message_expiry() != 133) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outgoing_receipt_envelope() != 31920) {
@@ -41266,7 +43492,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_identity_clone_warning() != 18260) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 42850) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_record_message_arrival() != 29254) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_record_outgoing_receipt() != 8142) {

@@ -3,7 +3,7 @@ import XCTest
 
 final class GroupChatLogicTests: XCTestCase {
     private func message(chatId: Data, sender: Data, lamport: UInt64, timestamp: Int64, kind: UInt8, payload: Data = Data()) -> StoredMessage {
-        StoredMessage(chatId: chatId, senderUserId: sender, lamport: lamport, timestamp: timestamp, kind: kind, payload: payload)
+        StoredMessage(chatId: chatId, senderUserId: sender, lamport: lamport, timestamp: timestamp, kind: kind, payload: payload, senderDeviceId: coreLegacyDeviceId())
     }
 
     func testUnknownGroupMemberUsesStableReadableIdSuffix() {

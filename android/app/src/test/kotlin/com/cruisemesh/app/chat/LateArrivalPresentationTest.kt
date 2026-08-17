@@ -5,6 +5,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreMessageReceivedAt
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 private val OWN = byteArrayOf(9, 9)
 private val THEM = byteArrayOf(1, 1)
@@ -20,6 +21,7 @@ private fun message(sender: ByteArray, lamport: ULong, sentAt: Long): StoredMess
         timestamp = sentAt,
         kind = 1u,
         payload = ByteArray(0),
+        senderDeviceId = coreLegacyDeviceId(),
     )
 
 private fun arrival(sender: ByteArray, lamport: ULong, receivedAt: Long): CoreMessageReceivedAt =

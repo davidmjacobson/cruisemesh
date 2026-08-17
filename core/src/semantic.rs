@@ -350,27 +350,58 @@ impl MessageStore {
         messages: Vec<StoredMessage>,
     ) -> Result<Vec<CoreReplyMetadata>, CoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        messages.into_iter().map(|message| {
-            let reference: Option<ReplyReference> = conn.query_row(
-                "SELECT msg_id, reply_to_msg_id FROM messages
+        messages
+            .into_iter()
+            .map(|message| {
+                let reference: Option<ReplyReference> = conn
+                    .query_row(
+                        "SELECT msg_id, reply_to_msg_id FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
-                params![message.chat_id, message.sender_user_id, message.lamport as i64],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional().map_err(store_err)?;
-            let (msg_id, reply_to_msg_id) = reference.unwrap_or((None, None));
-            let target = match &reply_to_msg_id {
-                Some(id) => conn.query_row(
-                    "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload FROM messages
+                        params![
+                            message.chat_id,
+                            message.sender_user_id,
+                            message.lamport as i64
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(store_err)?;
+                let (msg_id, reply_to_msg_id) = reference.unwrap_or((None, None));
+                let target = match &reply_to_msg_id {
+                    Some(id) => conn
+                        .query_row(
+                            "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                            sender_device_id FROM messages
                      WHERE chat_id = ?1 AND msg_id = ?2 ORDER BY id ASC LIMIT 1",
-                    params![message.chat_id, id], |row| Ok(StoredMessage { chat_id: row.get(0)?,
-                        sender_user_id: row.get(1)?, lamport: row.get::<_, i64>(2)? as u64,
-                        timestamp: row.get(3)?, kind: row.get::<_, i64>(4)? as u8, payload: row.get(5)? }),
-                ).optional().map_err(store_err)?,
-                None => None,
-            };
-            Ok(CoreReplyMetadata { message: CoreMessageTarget { sender_user_id: message.sender_user_id,
-                lamport: message.lamport, kind: message.kind }, msg_id, reply_to_msg_id, target })
-        }).collect()
+                            params![message.chat_id, id],
+                            |row| {
+                                Ok(StoredMessage {
+                                    chat_id: row.get(0)?,
+                                    sender_user_id: row.get(1)?,
+                                    lamport: row.get::<_, i64>(2)? as u64,
+                                    timestamp: row.get(3)?,
+                                    kind: row.get::<_, i64>(4)? as u8,
+                                    payload: row.get(5)?,
+                                    sender_device_id: row.get(6)?,
+                                })
+                            },
+                        )
+                        .optional()
+                        .map_err(store_err)?,
+                    None => None,
+                };
+                Ok(CoreReplyMetadata {
+                    message: CoreMessageTarget {
+                        sender_user_id: message.sender_user_id,
+                        lamport: message.lamport,
+                        kind: message.kind,
+                    },
+                    msg_id,
+                    reply_to_msg_id,
+                    target,
+                })
+            })
+            .collect()
     }
 }
 
@@ -403,6 +434,7 @@ mod tests {
             timestamp: lamport as i64,
             kind,
             payload,
+            sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
         }
     }
 

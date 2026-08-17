@@ -28,7 +28,8 @@ final class ReceiptRepairTests: XCTestCase {
             lamport: lamport,
             timestamp: Int64(lamport) * 1_000,
             kind: kind,
-            payload: Data()
+            payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         ))
     }
 

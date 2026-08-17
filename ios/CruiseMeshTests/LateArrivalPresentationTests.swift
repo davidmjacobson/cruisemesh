@@ -19,7 +19,8 @@ final class LateArrivalPresentationTests: XCTestCase {
             lamport: lamport,
             timestamp: timestampMs,
             kind: ProtocolKind.text,
-            payload: Data()
+            payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         )
     }
 

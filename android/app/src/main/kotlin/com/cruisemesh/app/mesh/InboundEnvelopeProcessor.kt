@@ -49,6 +49,7 @@ import uniffi.cruisemesh_core.coreCarriedPageMaxRows
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 import uniffi.cruisemesh_core.corePairwiseSenderAuthorized
 import uniffi.cruisemesh_core.corePeerTransportForArrival
 import uniffi.cruisemesh_core.decodeExtendedMessageBody
@@ -1007,6 +1008,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                extendedBody.senderDeviceId,
             )
             KIND_ATTACHMENT_MANIFEST -> handleIncomingChatMessage(
                 address,
@@ -1017,6 +1019,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                extendedBody.senderDeviceId,
             )
             KIND_REACTION -> handleIncomingChatMessage(
                 address,
@@ -1027,6 +1030,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                extendedBody.senderDeviceId,
             )
             KIND_RECEIPT -> handleIncomingReceipt(
                 address,
@@ -1084,6 +1088,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_LAN_ENDPOINT_HINT,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) return
@@ -1179,6 +1184,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                extendedBody.senderDeviceId,
                 identity,
             )
             KIND_GROUP_METADATA_UPDATE -> handleIncomingGroupMetadataUpdate(
@@ -1189,6 +1195,7 @@ internal class InboundEnvelopeProcessor(
                 arrival,
                 msgId,
                 extendedBody.replyToMsgId,
+                extendedBody.senderDeviceId,
             )
             else -> Log.i(TAG, "Dropping group envelope from $address: unhandled kind=${body.kind}")
         }
@@ -1229,6 +1236,7 @@ internal class InboundEnvelopeProcessor(
         arrival: MessageArrival,
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
+        senderDeviceId: ByteArray?,
     ) {
         val updated = try {
             val update = decodeGroupMetadataUpdate(body.content)
@@ -1237,7 +1245,7 @@ internal class InboundEnvelopeProcessor(
             Log.w(TAG, "Dropping invalid group metadata from $address: ${e.message}")
             return
         }
-        val outcome = store.insertIncomingMessageWithArrival(
+        val outcome = store.insertIncomingMessageFromDevice(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1245,7 +1253,9 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = body.kind,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
+            senderDeviceId,
             msgId,
             replyToMsgId,
             arrival,
@@ -1266,9 +1276,10 @@ internal class InboundEnvelopeProcessor(
         arrival: MessageArrival,
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
+        senderDeviceId: ByteArray?,
         identity: Identity,
     ) {
-        val outcome = store.insertIncomingMessageWithArrival(
+        val outcome = store.insertIncomingMessageFromDevice(
             StoredMessage(
                 chatId = group.id,
                 senderUserId = senderUserId,
@@ -1276,7 +1287,9 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = body.kind,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
+            senderDeviceId,
             msgId,
             replyToMsgId,
             arrival,
@@ -1354,6 +1367,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_GROUP_INVITE,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) {
@@ -1479,6 +1493,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_FRIEND_REQUEST,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) return
@@ -1578,6 +1593,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_FRIEND_REQUEST,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         // Not a contact, so the receipt is sealed to the card in the request
@@ -1627,6 +1643,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_PROFILE_SYNC,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) return
@@ -1690,6 +1707,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_RELAY_UPDATE,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) return
@@ -1737,6 +1755,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_FRIEND_DIRECTORY,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         if (!inserted) return
@@ -1849,6 +1868,7 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = KIND_INTRODUCED_FRIEND_REQUEST,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
         acknowledgeHiddenMessage(address, senderUserId, identity, contact)
@@ -1952,6 +1972,11 @@ internal class InboundEnvelopeProcessor(
      * anything back. Combined with authored resend only ever replaying kinds
      * that *we* originated (text, attachment, friend-request — never a
      * receipt), there's no cycle where a receipt causes a receipt.
+     *
+     * [senderDeviceId] is whatever the sealed body named as its authoring
+     * device (§5). It is nullable because a legacy peer names nothing, which
+     * core maps to the reserved legacy stream — the same stream this path has
+     * always written to — so absence is expected, not an error.
      */
     private fun handleIncomingChatMessage(
         address: String,
@@ -1962,8 +1987,9 @@ internal class InboundEnvelopeProcessor(
         arrival: MessageArrival,
         msgId: ByteArray,
         replyToMsgId: ByteArray?,
+        senderDeviceId: ByteArray?,
     ) {
-        val outcome = store.insertIncomingMessageWithArrival(
+        val outcome = store.insertIncomingMessageFromDevice(
             StoredMessage(
                 chatId = senderUserId,
                 senderUserId = senderUserId,
@@ -1971,7 +1997,9 @@ internal class InboundEnvelopeProcessor(
                 timestamp = body.timestamp,
                 kind = kind,
                 payload = body.content,
+                senderDeviceId = coreLegacyDeviceId(),
             ),
+            senderDeviceId,
             msgId,
             replyToMsgId,
             arrival,

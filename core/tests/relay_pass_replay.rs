@@ -1768,6 +1768,7 @@ fn seed_group_authored(store: &MessageStore, group: &cruisemesh_core::Group, now
                 timestamp: now_ms,
                 kind: KIND_TEXT,
                 payload: b"cabin at seven".to_vec(),
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             },
             OutboundEnvelope {
                 msg_id: msg_id(0x4000),
@@ -1808,6 +1809,7 @@ fn seed_authored_to(
                     timestamp: now_ms,
                     kind: KIND_TEXT,
                     payload: b"hello".to_vec(),
+                    sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
                 },
                 OutboundEnvelope {
                     msg_id: msg_id(seed_base + index as u64),
@@ -1880,6 +1882,7 @@ fn seed_authored(store: &MessageStore, count: usize, now_ms: i64) {
                     timestamp: now_ms,
                     kind: KIND_TEXT,
                     payload: b"hello".to_vec(),
+                    sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
                 },
                 OutboundEnvelope {
                     msg_id: msg_id(0x2000 + index as u64),

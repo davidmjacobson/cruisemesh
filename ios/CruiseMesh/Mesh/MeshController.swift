@@ -2175,6 +2175,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 kind: body.kind,
                 msgId: msgId,
                 replyToMsgId: extendedBody.replyToMsgId,
+                senderDeviceId: extendedBody.senderDeviceId,
                 arrival: arrival
             )
         case ProtocolKind.receipt:
@@ -2295,6 +2296,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 body: body,
                 msgId: msgId,
                 replyToMsgId: extendedBody.replyToMsgId,
+                senderDeviceId: extendedBody.senderDeviceId,
                 arrival: arrival
             )
         case ProtocolKind.groupMetadataUpdate:
@@ -2305,6 +2307,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 body: body,
                 msgId: msgId,
                 replyToMsgId: extendedBody.replyToMsgId,
+                senderDeviceId: extendedBody.senderDeviceId,
                 arrival: arrival
             )
         default:
@@ -2343,6 +2346,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         body: MessageBody,
         msgId: Data,
         replyToMsgId: Data?,
+        senderDeviceId: Data?,
         arrival: MessageArrival?
     ) throws {
         let updated: Group?
@@ -2367,22 +2371,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: body.kind,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         )
-        let outcome = if let arrival {
-            try store.insertIncomingMessageWithArrival(
-                message: message,
-                msgId: msgId,
-                replyToMsgId: replyToMsgId,
-                arrival: arrival
-            )
-        } else {
-            try store.insertIncomingMessageClassified(
-                message: message,
-                msgId: msgId,
-                replyToMsgId: replyToMsgId
-            )
-        }
+        // A nil `arrival` is a carry-queue drain, where no live transport can
+        // truthfully be attributed to the original arrival; the device-aware
+        // insert takes that as an optional rather than needing a second entry
+        // point.
+        let outcome = try store.insertIncomingMessageFromDevice(
+            message: message,
+            senderDeviceId: senderDeviceId,
+            msgId: msgId,
+            replyToMsgId: replyToMsgId,
+            arrival: arrival
+        )
         guard acceptIncomingInsert(
             outcome,
             sourceLabel: sourceLabel,
@@ -2406,6 +2408,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         body: MessageBody,
         msgId: Data,
         replyToMsgId: Data?,
+        senderDeviceId: Data?,
         arrival: MessageArrival?
     ) throws {
         // T4-06: primary store failure propagates (see handleIncomingChat).
@@ -2415,22 +2418,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: body.kind,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         )
-        let outcome = if let arrival {
-            try store.insertIncomingMessageWithArrival(
-                message: message,
-                msgId: msgId,
-                replyToMsgId: replyToMsgId,
-                arrival: arrival
-            )
-        } else {
-            try store.insertIncomingMessageClassified(
-                message: message,
-                msgId: msgId,
-                replyToMsgId: replyToMsgId
-            )
-        }
+        // See [handleIncomingGroupMetadataUpdate] for why `arrival` stays
+        // optional here.
+        let outcome = try store.insertIncomingMessageFromDevice(
+            message: message,
+            senderDeviceId: senderDeviceId,
+            msgId: msgId,
+            replyToMsgId: replyToMsgId,
+            arrival: arrival
+        )
         guard acceptIncomingInsert(
             outcome,
             sourceLabel: "group transport",
@@ -2520,7 +2519,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.groupInvite,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         guard inserted else { return }
         ChatEvents.notifyChatChanged(group.id)
@@ -2558,6 +2558,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         kind: UInt8,
         msgId: Data,
         replyToMsgId: Data?,
+        senderDeviceId: Data?,
         arrival: MessageArrival
     ) throws {
         // T4-06: let a store failure propagate (do NOT `try?`-swallow it into
@@ -2565,15 +2566,21 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // turns the throw into `.failed`, leaving the envelope re-presentable
         // and its relay copy un-acked. A `false` here is a real duplicate --
         // already durably stored -- so it stays a terminal (return) state.
-        let outcome = try store.insertIncomingMessageWithArrival(
+        // `senderDeviceId` is whatever the sealed body named as its authoring
+        // device (§5). A legacy peer names nothing, and core maps that absence
+        // onto the reserved legacy stream -- the one this path has always
+        // written to -- so nil is expected here, not missing data.
+        let outcome = try store.insertIncomingMessageFromDevice(
             message: StoredMessage(
                 chatId: senderUserId,
                 senderUserId: senderUserId,
                 lamport: body.lamport,
                 timestamp: body.timestamp,
                 kind: kind,
-                payload: body.content
+                payload: body.content,
+                senderDeviceId: coreLegacyDeviceId()
             ),
+            senderDeviceId: senderDeviceId,
             msgId: msgId,
             replyToMsgId: replyToMsgId,
             arrival: arrival
@@ -2827,7 +2834,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.friendRequest,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         guard inserted else { return }
         ChatEvents.notifyChatChanged(senderUserId)
@@ -2976,7 +2984,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.lanEndpointHint,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         if inserted {
             acknowledgeHiddenMessage(
@@ -3012,7 +3021,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.relayUpdate,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         guard inserted else { return }
 
@@ -3059,7 +3069,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.profileSync,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         guard inserted else { return }
 
@@ -3154,7 +3165,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.friendDirectory,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         guard inserted else { return }
         if FriendsOfFriendsStore.isEnabled() {
@@ -3244,7 +3256,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             lamport: body.lamport,
             timestamp: body.timestamp,
             kind: ProtocolKind.introducedFriendRequest,
-            payload: body.content
+            payload: body.content,
+            senderDeviceId: coreLegacyDeviceId()
         ))
         acknowledgeHiddenMessage(
             sourceAddress: sourceAddress,

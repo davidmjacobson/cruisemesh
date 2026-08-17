@@ -82,7 +82,8 @@ final class AttachmentPayloadTests: XCTestCase {
             lamport: 1,
             timestamp: 1,
             kind: kind,
-            payload: payload
+            payload: payload,
+            senderDeviceId: coreLegacyDeviceId()
         )
     }
 }

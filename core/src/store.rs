@@ -1,8 +1,14 @@
 //! Message + contact store: SQLite-backed persistence (DESIGN.md §7.1,
 //! §10). `insert_message` is idempotent on (chat_id, sender_user_id,
-//! lamport): re-delivering the same envelope (expected under DTN) is a
-//! no-op. A conflict whose (timestamp, kind, payload) *don't* match is
-//! ambiguous and is ignored: the current wire format has no authenticated
+//! sender_device_id, lamport): re-delivering the same envelope (expected
+//! under DTN) is a no-op. The device is part of that key per
+//! `specs/multi-device-v1.md` §5, so two devices of one person authoring
+//! offline occupy separate streams; an envelope that names no device, and
+//! every row written before that migration, belongs to the reserved all-zero
+//! `LEGACY_DEVICE_ID` stream, which is what keeps a single-device peer
+//! looking exactly as it always did. A conflict whose (timestamp, kind,
+//! payload) *don't* match is ambiguous and is ignored: the current wire
+//! format has no authenticated
 //! stream generation with which to prove that either branch supersedes the
 //! other, so an incoming copy must never erase visible history -- see
 //! [MessageStore::insert_message]'s doc comment. Per-chat lamport counters
@@ -113,11 +119,14 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::groups::{canonicalize_members, validate_group};
 use crate::limits::MAX_ENVELOPE_SEALED_BYTES;
+use crate::roster_store::{ContactDeviceState, ContactRosterState};
 use crate::{
     core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
     CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, CoreRelayShadowReport,
-    FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, SuggestedFriendCard,
-    KIND_INTRODUCED_FRIEND_REQUEST, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, Roster, RosterRejection,
+    RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, SuggestedFriendCard,
+    KIND_INTRODUCED_FRIEND_REQUEST, LEGACY_DEVICE_ID, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    RECEIPT_TYPE_READ,
 };
 
 type CarriedHintRecipient = (Vec<u8>, Vec<u8>);
@@ -154,6 +163,17 @@ pub struct StoredMessage {
     pub timestamp: i64,
     pub kind: u8,
     pub payload: Vec<u8>,
+    /// §5: which of the sender's devices authored this row. Read side only —
+    /// every insert takes the authoring device as its own argument
+    /// (`insert_message_from_device` and friends), because the device comes
+    /// from inside the envelope's seal rather than from the caller, and this
+    /// field is ignored on the way in.
+    ///
+    /// [`LEGACY_DEVICE_ID`] is the honest default: it is what every migrated
+    /// row, every legacy peer's traffic, and every locally authored row
+    /// carries until WP3 mints a device identity. A caller building one of
+    /// these by hand should write it, not something invented.
+    pub sender_device_id: Vec<u8>,
 }
 
 /// Local-only diagnostics for how an incoming message reached this device.
@@ -1100,6 +1120,10 @@ impl MessageStore {
         conn.execute_batch(SCHEMA).map_err(store_err)?;
         conn.execute_batch(crate::protocol_event::PROTOCOL_EVENT_SCHEMA_SQL)
             .map_err(store_err)?;
+        conn.execute_batch(crate::roster_store::CONTACT_ROSTER_SCHEMA_SQL)
+            .map_err(store_err)?;
+        // A roster describes a contact, so it has no business outliving one.
+        crate::roster_store::sweep_orphaned_persons(&conn)?;
         migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
@@ -1228,6 +1252,11 @@ impl MessageStore {
         ensure_column(&conn, "messages", "msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "reply_to_msg_id", "BLOB")?;
         ensure_column(&conn, "messages", "outbound_expiry", "INTEGER")?;
+        // §5's device dimension. Runs after the plain column adds above so the
+        // rebuild copies a table that is otherwise already current, and before
+        // the `messages` indexes created further down, which the rebuild drops
+        // along with the old table and those statements then put back.
+        migrate_message_device_streams(&mut conn)?;
         ensure_column(
             &conn,
             "groups",
@@ -1249,6 +1278,13 @@ impl MessageStore {
         // Older stores already have stable ids for locally authored rows in
         // the outbound queue. Backfill those so they can be quoted after an
         // upgrade; received legacy rows cannot be recovered retroactively.
+        //
+        // §5: scoped to the legacy stream, which is where every locally
+        // authored row is and where the device migration above put every
+        // pre-existing row. `outbound_envelopes` has no device dimension, so
+        // an unscoped UPDATE would happily copy this device's outbound id onto
+        // a *sibling's* row at the same (chat, sender, lamport) once sibling
+        // rows exist -- handing two different messages one wire identity.
         conn.execute(
             "UPDATE messages
              SET msg_id = (
@@ -1261,13 +1297,14 @@ impl MessageStore {
                  LIMIT 1
              )
              WHERE msg_id IS NULL
+               AND messages.sender_device_id = ?1
                AND EXISTS (
                    SELECT 1 FROM outbound_envelopes
                    WHERE outbound_envelopes.chat_id = messages.chat_id
                      AND outbound_envelopes.sender_user_id = messages.sender_user_id
                      AND outbound_envelopes.lamport = messages.lamport
                )",
-            [],
+            params![&LEGACY_DEVICE_ID[..]],
         )
         .map_err(store_err)?;
         conn.execute(
@@ -1519,8 +1556,13 @@ impl MessageStore {
     /// true duplicate while failing closed when two different authenticated
     /// messages claim the same stream position.
     ///
-    /// A conflict on `(chat_id, sender_user_id, lamport)` is ambiguous on its
-    /// own: it could be a digest resend or relay copy of a message we already
+    /// This entry point puts the message on the sender's legacy device stream
+    /// (§5); [`Self::insert_message_from_device`] is the same insert for an
+    /// envelope that named its authoring device.
+    ///
+    /// A conflict on `(chat_id, sender_user_id, sender_device_id, lamport)` is
+    /// ambiguous on its own: it could be a digest resend or relay copy of a
+    /// message we already
     /// have (same sealed content, arriving twice -- expected under DTN and
     /// harmless to ignore), or it could be a sender who reset their stream
     /// (e.g. deleted the chat and re-added the contact, per DESIGN.md §7.1's
@@ -1543,8 +1585,32 @@ impl MessageStore {
     ///   recovery therefore requires a future protocol revision carrying an
     ///   explicit authenticated stream generation/epoch.
     pub fn insert_message(&self, message: StoredMessage) -> Result<bool, CoreError> {
+        self.insert_message_from_device(message, None)
+    }
+
+    /// [`Self::insert_message`] for an envelope whose sealed body named the
+    /// authoring device (§5).
+    ///
+    /// `sender_device_id` follows the §5 mapping exactly, through
+    /// [`crate::core_device_stream_id`]: absent — a legacy envelope, or a kind
+    /// that carries no device field — means the reserved all-zero
+    /// [`LEGACY_DEVICE_ID`] stream, and so does an id of the wrong width. It is
+    /// never an error, because a legacy peer must stay indistinguishable from
+    /// today.
+    pub fn insert_message_from_device(
+        &self,
+        message: StoredMessage,
+        sender_device_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
         Ok(matches!(
-            incoming_message_reference::insert(self, message, None, None, None)?,
+            incoming_message_reference::insert(
+                self,
+                message,
+                crate::core_device_stream_id(sender_device_id),
+                None,
+                None,
+                None
+            )?,
             IncomingMessageInsertOutcome::Inserted
         ))
     }
@@ -1576,11 +1642,7 @@ impl MessageStore {
         msg_id: Vec<u8>,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<IncomingMessageInsertOutcome, CoreError> {
-        validate_msg_id("msg_id", &msg_id)?;
-        if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
-            validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
-        }
-        incoming_message_reference::insert(self, message, Some(msg_id), reply_to_msg_id, None)
+        self.insert_incoming_message_from_device(message, None, msg_id, reply_to_msg_id, None)
     }
 
     /// Insert an opened incoming message and atomically retain first-arrival
@@ -1594,17 +1656,45 @@ impl MessageStore {
         reply_to_msg_id: Option<Vec<u8>>,
         arrival: MessageArrival,
     ) -> Result<IncomingMessageInsertOutcome, CoreError> {
+        self.insert_incoming_message_from_device(
+            message,
+            None,
+            msg_id,
+            reply_to_msg_id,
+            Some(arrival),
+        )
+    }
+
+    /// The device-aware incoming insert (§5): the same conflict and quarantine
+    /// rules as [`Self::insert_incoming_message_with_arrival`], discriminated
+    /// per *device* stream rather than per person. This is what the open path
+    /// calls once it has a sealed-body device field to pass; the older methods
+    /// remain exactly themselves and land on the legacy stream.
+    ///
+    /// `sender_device_id` is mapped by [`crate::core_device_stream_id`] —
+    /// absent or wrong-width means [`LEGACY_DEVICE_ID`], never an error.
+    pub fn insert_incoming_message_from_device(
+        &self,
+        message: StoredMessage,
+        sender_device_id: Option<Vec<u8>>,
+        msg_id: Vec<u8>,
+        reply_to_msg_id: Option<Vec<u8>>,
+        arrival: Option<MessageArrival>,
+    ) -> Result<IncomingMessageInsertOutcome, CoreError> {
         validate_msg_id("msg_id", &msg_id)?;
         if let Some(reply_to_msg_id) = reply_to_msg_id.as_deref() {
             validate_msg_id("reply_to_msg_id", reply_to_msg_id)?;
         }
-        validate_message_arrival(&arrival)?;
+        if let Some(arrival) = arrival.as_ref() {
+            validate_message_arrival(arrival)?;
+        }
         incoming_message_reference::insert(
             self,
             message,
+            crate::core_device_stream_id(sender_device_id),
             Some(msg_id),
             reply_to_msg_id,
-            Some(arrival),
+            arrival,
         )
     }
 
@@ -2051,12 +2141,16 @@ fn quarantine_message_conflict(
     existing_kind: i64,
     existing_payload: &[u8],
     incoming: &StoredMessage,
+    sender_device_id: &[u8],
     incoming_msg_id: Option<&[u8]>,
     incoming_reply_to_msg_id: Option<&[u8]>,
     arrival: Option<&MessageArrival>,
 ) -> Result<(), CoreError> {
     let existing_kind = u8::try_from(existing_kind)
         .map_err(|_| CoreError::Store("stored message kind is outside u8 range".into()))?;
+    // The fingerprint stays content-only: the row's key already carries the
+    // device stream the branch belongs to (§5), and a fingerprint is a stable
+    // hash of what the two branches disagree about, not of where they sit.
     let existing_fingerprint = message_conflict_fingerprint(
         &incoming.chat_id,
         &incoming.sender_user_id,
@@ -2077,12 +2171,12 @@ fn quarantine_message_conflict(
     };
     tx.execute(
         "INSERT INTO message_conflicts
-            (chat_id, sender_user_id, lamport, existing_fingerprint,
+            (chat_id, sender_user_id, sender_device_id, lamport, existing_fingerprint,
              incoming_fingerprint, incoming_timestamp, incoming_kind,
              incoming_payload, incoming_msg_id, incoming_reply_to_msg_id,
              arrival_transport, hops_taken, first_seen_at, last_seen_at, seen_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 1)
-         ON CONFLICT(chat_id, sender_user_id, lamport, incoming_fingerprint)
+         VALUES (?1, ?2, ?14, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, 1)
+         ON CONFLICT(chat_id, sender_user_id, sender_device_id, lamport, incoming_fingerprint)
          DO UPDATE SET
              existing_fingerprint = excluded.existing_fingerprint,
              last_seen_at = MAX(message_conflicts.last_seen_at, excluded.last_seen_at),
@@ -2105,6 +2199,7 @@ fn quarantine_message_conflict(
             arrival.map(|value| value.transport as i64),
             arrival.map(|value| value.hops_taken as i64),
             observed_at,
+            sender_device_id,
         ],
     )
     .map_err(store_err)?;
@@ -2321,9 +2416,13 @@ impl MessageStore {
 mod incoming_message_reference {
     use super::*;
 
+    /// `sender_device_id` is already mapped onto a stream id by the public
+    /// entry points (§5): 16 bytes, the reserved all-zero [`LEGACY_DEVICE_ID`]
+    /// when the envelope named no device.
     pub(super) fn insert(
         store: &MessageStore,
         message: StoredMessage,
+        sender_device_id: Vec<u8>,
         msg_id: Option<Vec<u8>>,
         reply_to_msg_id: Option<Vec<u8>>,
         arrival: Option<MessageArrival>,
@@ -2338,9 +2437,9 @@ mod incoming_message_reference {
         let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO messages
-                    (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                    (chat_id, sender_user_id, sender_device_id, lamport, timestamp, kind, payload,
                      msg_id, reply_to_msg_id, arrival_transport, hops_taken, received_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?12, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     message.chat_id,
                     message.sender_user_id,
@@ -2353,6 +2452,7 @@ mod incoming_message_reference {
                     arrival.as_ref().map(|value| value.transport as i64),
                     arrival.as_ref().map(|value| value.hops_taken as i64),
                     arrival.as_ref().map(|value| value.received_at),
+                    sender_device_id,
                 ],
             )
             .map_err(store_err)?
@@ -2384,7 +2484,10 @@ mod incoming_message_reference {
         }
 
         // Conflict: a row already exists at this (chat_id, sender_user_id,
-        // lamport). Figure out whether it's the same message or a fork.
+        // sender_device_id, lamport). Figure out whether it's the same message
+        // or a fork. §5: the device is part of that question now -- a sibling
+        // device authoring the same lamport offline occupies its own stream and
+        // never lands here, which is the whole point of the widened key.
         //
         // FC9: `reply_to_msg_id` is deliberately NOT part of this
         // comparison. It used to be, but the plain `insert_message` path
@@ -2399,11 +2502,13 @@ mod incoming_message_reference {
         let existing: Option<(i64, i64, Vec<u8>)> = tx
             .query_row(
                 "SELECT timestamp, kind, payload FROM messages
-                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                 WHERE chat_id = ?1 AND sender_user_id = ?2 AND sender_device_id = ?4
+                   AND lamport = ?3",
                 params![
                     message.chat_id,
                     message.sender_user_id,
-                    message.lamport as i64
+                    message.lamport as i64,
+                    sender_device_id
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -2430,13 +2535,15 @@ mod incoming_message_reference {
                     "UPDATE messages
                      SET msg_id = COALESCE(msg_id, ?4),
                          reply_to_msg_id = COALESCE(reply_to_msg_id, ?5)
-                     WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+                     WHERE chat_id = ?1 AND sender_user_id = ?2 AND sender_device_id = ?6
+                       AND lamport = ?3",
                     params![
                         message.chat_id,
                         message.sender_user_id,
                         message.lamport as i64,
                         msg_id,
                         reply_to_msg_id,
+                        sender_device_id,
                     ],
                 )
                 .map_err(store_err)?;
@@ -2460,6 +2567,7 @@ mod incoming_message_reference {
             existing_kind,
             &existing_payload,
             &message,
+            &sender_device_id,
             msg_id.as_deref(),
             reply_to_msg_id.as_deref(),
             arrival.as_ref(),
@@ -2473,10 +2581,11 @@ mod incoming_message_reference {
 impl MessageStore {
     /// Atomically persist one locally authored message and the exact sealed
     /// envelope that should be retried for it over BLE and relay. The message
-    /// row stays idempotent on `(chat_id, sender_user_id, lamport)`; the
-    /// outbound queue uses the same logical identity as its dedupe key, so
-    /// re-queuing the same authored message is a no-op instead of creating a
-    /// second `msg_id`.
+    /// row stays idempotent on `(chat_id, sender_user_id, lamport)` within
+    /// this device's own stream -- which is the legacy one until linking mints
+    /// a device identity (§5); the outbound queue uses the same logical
+    /// identity as its dedupe key, so re-queuing the same authored message is
+    /// a no-op instead of creating a second `msg_id`.
     pub fn insert_outgoing_message(
         &self,
         message: StoredMessage,
@@ -2522,11 +2631,19 @@ mod outgoing_message_reference {
         validate_sqlite_u64("envelope lamport", envelope.lamport)?;
         let mut conn = lock_conn(&store.conn);
         let tx = conn.transaction().map_err(store_err)?;
+        // §5: locally authored rows stay on this person's legacy stream for
+        // now. This device has no persisted device identity yet -- WP3 mints
+        // one at linking time and WP4 moves authoring into that device's own
+        // stream -- and until then the honest value is the same reserved id
+        // every pre-migration row carries. Naming it explicitly (rather than
+        // leaning on the column default) is what lets the UPDATE below scope
+        // itself to one stream instead of every device's.
+        let sender_device_id = &LEGACY_DEVICE_ID[..];
         tx.execute(
             "INSERT OR IGNORE INTO messages
-                (chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                (chat_id, sender_user_id, sender_device_id, lamport, timestamp, kind, payload,
                  msg_id, reply_to_msg_id, outbound_expiry)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?10, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -2537,6 +2654,7 @@ mod outgoing_message_reference {
                 envelope.msg_id,
                 reply_to_msg_id,
                 envelope.expiry,
+                sender_device_id,
             ],
         )
         .map_err(store_err)?;
@@ -2545,7 +2663,8 @@ mod outgoing_message_reference {
              SET msg_id = COALESCE(msg_id, ?4),
                  reply_to_msg_id = COALESCE(reply_to_msg_id, ?5),
                  outbound_expiry = COALESCE(outbound_expiry, ?6)
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND sender_device_id = ?7
+               AND lamport = ?3",
             params![
                 message.chat_id,
                 message.sender_user_id,
@@ -2553,6 +2672,7 @@ mod outgoing_message_reference {
                 envelope.msg_id,
                 reply_to_msg_id,
                 envelope.expiry,
+                sender_device_id,
             ],
         )
         .map_err(store_err)?;
@@ -2605,7 +2725,7 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
-                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                  FROM messages WHERE chat_id = ?1 ORDER BY timestamp ASC, id ASC",
             )
             .map_err(store_err)?;
@@ -2629,7 +2749,7 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         let last_message = conn
             .query_row(
-                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                  FROM messages
                  WHERE chat_id = ?1 AND kind IN (?2, ?3, ?4)
                  ORDER BY timestamp DESC, id DESC
@@ -2781,6 +2901,11 @@ impl MessageStore {
 
     /// Stable id and optional reply target for one stored message. Returns
     /// `None` for legacy rows whose inbound envelope id was never recorded.
+    ///
+    /// Person-level: it names a position in a *person's* stream, so when that
+    /// person has several device streams at one lamport it answers with the
+    /// lowest device id — §5's display tie-break, which puts the legacy stream
+    /// first. [`Self::message_reference_from_device`] asks about one stream.
     pub fn message_reference(
         &self,
         chat_id: Vec<u8>,
@@ -2792,7 +2917,9 @@ impl MessageStore {
             "SELECT msg_id, reply_to_msg_id
              FROM messages
              WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
-               AND msg_id IS NOT NULL",
+               AND msg_id IS NOT NULL
+             ORDER BY sender_device_id ASC
+             LIMIT 1",
             params![chat_id, sender_user_id, lamport as i64],
             |row| {
                 Ok(MessageReference {
@@ -2805,8 +2932,68 @@ impl MessageStore {
         .map_err(store_err)
     }
 
+    /// [`Self::message_reference`] for one device's stream (§5). `None` for
+    /// `sender_device_id` asks about the legacy stream, which is where every
+    /// migrated row and every legacy peer's traffic lives.
+    pub fn message_reference_from_device(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+        sender_device_id: Option<Vec<u8>>,
+        lamport: u64,
+    ) -> Result<Option<MessageReference>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        conn.query_row(
+            "SELECT msg_id, reply_to_msg_id
+             FROM messages
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND sender_device_id = ?4
+               AND lamport = ?3
+               AND msg_id IS NOT NULL",
+            params![
+                chat_id,
+                sender_user_id,
+                lamport as i64,
+                crate::core_device_stream_id(sender_device_id)
+            ],
+            |row| {
+                Ok(MessageReference {
+                    msg_id: row.get(0)?,
+                    reply_to_msg_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(store_err)
+    }
+
+    /// The device streams one person actually has history on in a chat (§5),
+    /// lowest device id first. A one-device person — every legacy peer, and
+    /// every peer at all until linking ships — answers with exactly the
+    /// reserved legacy id.
+    pub fn message_stream_device_ids(
+        &self,
+        chat_id: Vec<u8>,
+        sender_user_id: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT sender_device_id FROM messages
+                 WHERE chat_id = ?1 AND sender_user_id = ?2
+                 ORDER BY sender_device_id ASC",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map(params![chat_id, sender_user_id], |row| row.get(0))
+            .map_err(store_err)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_err)
+    }
+
     /// Expiry of a locally-authored message's durable outbound envelope.
     /// This remains available after the retry queue prunes expired ciphertext.
+    ///
+    /// Person-level, with §5's lowest-device-id tie-break: this device's own
+    /// authored rows are on the legacy stream, which that ordering names first.
     pub fn outbound_message_expiry(
         &self,
         chat_id: Vec<u8>,
@@ -2816,7 +3003,9 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         conn.query_row(
             "SELECT outbound_expiry FROM messages
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+             ORDER BY sender_device_id ASC
+             LIMIT 1",
             params![chat_id, sender_user_id, lamport as i64],
             |row| row.get::<_, Option<i64>>(0),
         )
@@ -2834,7 +3023,7 @@ impl MessageStore {
     ) -> Result<Option<StoredMessage>, CoreError> {
         let conn = lock_conn(&self.conn);
         conn.query_row(
-            "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+            "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
              FROM messages
              WHERE chat_id = ?1 AND msg_id = ?2
              ORDER BY id ASC
@@ -2902,6 +3091,12 @@ impl MessageStore {
     /// Attach first-arrival diagnostics to an already inserted incoming
     /// message. A redundant mesh/relay copy never overwrites the original
     /// route, hop count, or receive time.
+    ///
+    /// §5: this entry point carries no device field, so it stamps the sender's
+    /// legacy stream — the one every legacy peer and every migrated row is on.
+    /// The WHERE says so explicitly rather than matching every device the
+    /// person has at that lamport, which would attribute one envelope's route
+    /// to a sibling device's separate message.
     pub fn record_message_arrival(
         &self,
         chat_id: Vec<u8>,
@@ -2916,6 +3111,7 @@ impl MessageStore {
                 "UPDATE messages
                  SET arrival_transport = ?4, hops_taken = ?5, received_at = ?6
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+                   AND sender_device_id = ?7
                    AND arrival_transport IS NULL",
                 params![
                     chat_id,
@@ -2924,6 +3120,7 @@ impl MessageStore {
                     arrival.transport as i64,
                     arrival.hops_taken as i64,
                     arrival.received_at,
+                    &LEGACY_DEVICE_ID[..],
                 ],
             )
             .map_err(store_err)?;
@@ -3108,6 +3305,11 @@ impl MessageStore {
 
     /// First-arrival diagnostics for one message, or `None` for locally
     /// authored/legacy rows that predate diagnostics.
+    ///
+    /// Person-level, like [`Self::message_reference`]: when the person has
+    /// several device streams at one lamport it answers with the lowest device
+    /// id — §5's display tie-break, which puts the legacy stream first — rather
+    /// than whichever row SQLite happened to reach.
     pub fn message_arrival(
         &self,
         chat_id: Vec<u8>,
@@ -3119,7 +3321,9 @@ impl MessageStore {
             "SELECT arrival_transport, hops_taken, received_at
              FROM messages
              WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
-               AND arrival_transport IS NOT NULL",
+               AND arrival_transport IS NOT NULL
+             ORDER BY sender_device_id ASC
+             LIMIT 1",
             params![chat_id, sender_user_id, lamport as i64],
             |row| {
                 Ok(MessageArrival {
@@ -3173,6 +3377,14 @@ impl MessageStore {
     /// sender in this chat is present -- the point up to which there's no
     /// gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
     /// waiting"). Returns 0 if message 1 itself hasn't arrived yet.
+    ///
+    /// Still per person rather than per device stream, which is deliberate for
+    /// now: a digest is what this device tells a peer it already has, and the
+    /// per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
+    /// Until then the person's device streams are merged into one run of
+    /// lamport values, and the merge is over DISTINCT values -- two of that
+    /// person's devices sharing a lamport is a normal §5 outcome, not a gap,
+    /// and counting it twice would truncate the watermark there forever.
     pub fn highest_contiguous_lamport(
         &self,
         chat_id: Vec<u8>,
@@ -3285,7 +3497,7 @@ impl MessageStore {
         let conn = lock_conn(&self.conn);
         let mut stmt = conn
             .prepare(
-                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                "SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                  FROM messages
                  WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport > ?3
                  ORDER BY lamport ASC",
@@ -5570,8 +5782,102 @@ impl MessageStore {
             params![user_id],
         )
         .map_err(store_err)?;
+        // The roster describes this contact's devices, so it goes when they
+        // do. DL-4's "tombstones are forever" is a rule about a roster's own
+        // history, not a reason to keep a deleted person's device list.
+        crate::roster_store::delete_person(&tx, &user_id)?;
         tx.commit().map_err(store_err)?;
         Ok(removed > 0)
+    }
+
+    /// Apply a contact's gossiped device roster (§4), storing the result.
+    ///
+    /// The decision itself is `core_roster_accept`'s (DL-1 ordering, DL-2 fork
+    /// quarantine, DL-4 tombstone persistence); this method supplies the two
+    /// things that decision needs from durable state and writes back what it
+    /// says. The person root it verifies against is the contact's existing
+    /// `sign_pk` — §3's whole premise is that the deployed Ed25519 identity key
+    /// *becomes* the person root, so a roster is checked against the same key
+    /// that already authenticates that contact's messages, with no new trust
+    /// anchor and no re-friending.
+    ///
+    /// A roster for someone who is not a contact is ignored rather than
+    /// refused: rosters gossip as ordinary sealed traffic (DL-3), and a
+    /// document about a stranger is simply not this device's business.
+    pub fn apply_contact_roster(
+        &self,
+        incoming: Roster,
+    ) -> Result<RosterUpdateDecision, CoreError> {
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        let person_root_sign_pk: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT sign_pk FROM contacts WHERE user_id = ?1",
+                params![incoming.person_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let Some(person_root_sign_pk) = person_root_sign_pk else {
+            return Ok(RosterUpdateDecision {
+                outcome: RosterUpdateOutcome::Ignored,
+                reason: RosterUpdateReason::Invalid,
+                rejection: Some(RosterRejection::PersonMismatch),
+                quarantined: false,
+            });
+        };
+        let state = crate::roster_store::load_state(&tx, &incoming.person_id)?;
+        let decision = crate::core_roster_accept(
+            state.roster,
+            state.quarantined,
+            incoming.clone(),
+            person_root_sign_pk,
+        );
+        match decision.outcome {
+            RosterUpdateOutcome::Accepted => {
+                crate::roster_store::save_roster(&tx, &incoming, decision.quarantined)?;
+            }
+            // DL-2: keep the stored roster exactly as it is and record the
+            // quarantine, which from here on refuses this person's updates
+            // without re-examining them.
+            RosterUpdateOutcome::ForkQuarantined => {
+                crate::roster_store::set_quarantined(&tx, &incoming.person_id, true)?;
+            }
+            RosterUpdateOutcome::Ignored => {}
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(decision)
+    }
+
+    /// What this device holds about one contact's devices (§4). A contact who
+    /// has never gossiped a roster reads as no roster and no quarantine, which
+    /// is the synthetic one-device person of §5.
+    pub fn contact_roster_state(
+        &self,
+        person_user_id: Vec<u8>,
+    ) -> Result<ContactRosterState, CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::roster_store::load_state(&conn, &person_user_id)
+    }
+
+    /// Whether a contact's roster vouches for one of their devices, or has
+    /// buried it (DL-4).
+    pub fn contact_device_state(
+        &self,
+        person_user_id: Vec<u8>,
+        device_id: Vec<u8>,
+    ) -> Result<ContactDeviceState, CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::roster_store::device_state(&conn, &person_user_id, &device_id)
+    }
+
+    /// A contact's active device ids in roster order.
+    pub fn contact_active_device_ids(
+        &self,
+        person_user_id: Vec<u8>,
+    ) -> Result<Vec<Vec<u8>>, CoreError> {
+        let conn = lock_conn(&self.conn);
+        crate::roster_store::active_device_ids(&conn, &person_user_id)
     }
 
     /// Look up a single contact by UserID, or `None` if not a contact.
@@ -7593,6 +7899,139 @@ fn metric_sender_self() -> Vec<u8> {
     vec![0u8; METRIC_CHAT_HASH_LEN]
 }
 
+/// §5 migration: widen the message stream key with the authoring device.
+///
+/// An added column would ordinarily be an [`ensure_column`] call, but the
+/// device dimension belongs *inside* the tables' UNIQUE keys, and SQLite cannot
+/// alter a constraint. So this is the standard table rebuild: create the shape
+/// [`SCHEMA`] declares today, copy every column both shapes share, drop the
+/// old table, rename. Existing rows keep their `id` (the display-order
+/// tie-breaker) and take the column's default — the reserved all-zero
+/// [`LEGACY_DEVICE_ID`] stream — so a store that upgrades loses nothing and
+/// every peer it already knows keeps presenting as a one-device person.
+///
+/// Both tables are rebuilt together because they are two halves of one rule:
+/// `messages` decides what a stream position is, `message_conflicts` records
+/// what happened when two branches claimed one. A key widened on only one of
+/// them would quarantine per person while inserting per device. They are
+/// rebuilt in two separate transactions, so a process killed between them
+/// leaves a half-migrated store — which the next `open` finishes, because each
+/// table's rebuild is independently guarded by its own column check.
+///
+/// **This migration is one-way, deliberately, and downgrading a store that has
+/// run it is not supported.** An older build sees the widened tables and its
+/// own SQL keeps working for `messages` (the new column has a default, and the
+/// old build's inserts simply land on the legacy stream) — but not for
+/// `message_conflicts`: the old build's quarantine upsert names the old
+/// `UNIQUE(chat_id, sender_user_id, lamport, incoming_fingerprint)` in its
+/// `ON CONFLICT` clause, and SQLite refuses an `ON CONFLICT` target that
+/// matches no index. So every conflicting insert on that build fails with an
+/// error rather than quarantining, which the receive path reports as a
+/// durability failure — the envelope is never committed, the peer keeps
+/// re-presenting it, and the pair settles into a redelivery loop for as long
+/// as the downgraded build stays installed. The upgrade path is the supported
+/// one; the fix for a downgrade is to upgrade again.
+fn migrate_message_device_streams(conn: &mut Connection) -> Result<(), CoreError> {
+    let mut rebuilt = false;
+    for table in ["messages", "message_conflicts"] {
+        rebuilt |= rebuild_table_with_device_column(conn, table)?;
+    }
+    if rebuilt {
+        // Dropping a table drops its indexes. Re-running the schema batch is
+        // idempotent (every statement is `IF NOT EXISTS`) and takes the index
+        // set from the same place a fresh store does, so a rebuilt table can
+        // never end up with fewer indexes than a new one.
+        conn.execute_batch(SCHEMA).map_err(store_err)?;
+    }
+    Ok(())
+}
+
+/// One table's rebuild. A no-op once `sender_device_id` is present, which is
+/// the case for every store created after this shipped.
+///
+/// One thing the rebuild does not preserve: an `AUTOINCREMENT` table's
+/// `sqlite_sequence` high-water mark comes back as `MAX(id)` rather than
+/// whatever it was, because the copy re-inserts the surviving ids explicitly.
+/// That is accepted rather than worked around. A row `id` is a local display
+/// tie-breaker for equal timestamps and nothing else — message identity is the
+/// stream key and the `msg_id`, neither of which is derived from it — so the
+/// only consequence is that an id belonging to a row that was *deleted* from
+/// the tail can be issued again, to a row that cannot coexist with the one it
+/// reuses.
+fn rebuild_table_with_device_column(conn: &mut Connection, table: &str) -> Result<bool, CoreError> {
+    if table_column_names(conn, table)?
+        .iter()
+        .any(|name| name == "sender_device_id")
+    {
+        return Ok(false);
+    }
+    let staging = format!("{table}_device_stream_migration");
+    let tx = conn.transaction().map_err(store_err)?;
+    tx.execute_batch(&format!("DROP TABLE IF EXISTS {staging};"))
+        .map_err(store_err)?;
+    tx.execute_batch(&schema_table_sql(table, &staging)?)
+        .map_err(store_err)?;
+    // Copy by name over the intersection of the two shapes rather than by
+    // position: an on-disk store may predate any number of `ensure_column`
+    // additions, and a positional copy would quietly shift a column into its
+    // neighbour's meaning.
+    let target_columns = table_column_names(&tx, &staging)?;
+    let carried = table_column_names(&tx, table)?
+        .into_iter()
+        .filter(|name| target_columns.contains(name))
+        .collect::<Vec<_>>();
+    // No shared column means the two shapes have nothing in common, which is
+    // never true of this migration and can only mean the staging table was not
+    // created from the shape we think it was. Refusing here is the difference
+    // between a loud failed open and an `INSERT INTO staging () SELECT` that
+    // silently discards every row before the original is dropped.
+    if carried.is_empty() {
+        return Err(CoreError::Store(format!(
+            "device-stream migration found no columns to carry from {table}"
+        )));
+    }
+    let carried = carried.join(", ");
+    tx.execute_batch(&format!(
+        "INSERT INTO {staging} ({carried}) SELECT {carried} FROM {table};
+         DROP TABLE {table};
+         ALTER TABLE {staging} RENAME TO {table};"
+    ))
+    .map_err(store_err)?;
+    tx.commit().map_err(store_err)?;
+    Ok(true)
+}
+
+/// The `CREATE TABLE` statement [`SCHEMA`] declares for `table`, re-aimed at
+/// `as_name`. Taking the shape from the same string a fresh store is built
+/// from is what keeps a migrated table and a new one identical: there is no
+/// second copy of the column list to forget to update.
+fn schema_table_sql(table: &str, as_name: &str) -> Result<String, CoreError> {
+    let header = format!("CREATE TABLE IF NOT EXISTS {table} (");
+    let start = SCHEMA
+        .find(&header)
+        .ok_or_else(|| CoreError::Store(format!("schema declares no {table} table")))?
+        + header.len();
+    let end = SCHEMA[start..]
+        .find("\n);")
+        .ok_or_else(|| CoreError::Store(format!("schema's {table} table is unterminated")))?;
+    Ok(format!(
+        "CREATE TABLE {as_name} ({}\n);",
+        &SCHEMA[start..start + end]
+    ))
+}
+
+fn table_column_names(conn: &Connection, table: &str) -> Result<Vec<String>, CoreError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(store_err)?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(store_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(store_err)?;
+    Ok(names)
+}
+
 /// FC1 migration: pre-existing on-disk stores have `delivery_metrics` keyed
 /// on `(chat_hash, lamport, direction)` only, which silently drops a group
 /// arrival whenever two senders share a lamport value at the same watermark
@@ -8120,19 +8559,19 @@ impl MessageStore {
         let mut stmt = conn
             .prepare(&format!(
                 "WITH recent_visible AS (
-                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                     FROM messages
                     WHERE chat_id = ?1 AND kind IN ({visible})
                     ORDER BY timestamp DESC, id DESC
                     LIMIT ?2
                  ), recent_reactions AS (
-                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                     FROM messages
                     WHERE chat_id = ?1 AND kind = ?3
                     ORDER BY timestamp DESC, id DESC
                     LIMIT ?4
                  )
-                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                  FROM (
                     SELECT * FROM recent_visible
                     UNION ALL
@@ -8170,21 +8609,21 @@ impl MessageStore {
         let mut stmt = conn
             .prepare(&format!(
                 "WITH recent_visible AS (
-                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                     FROM messages
                     WHERE chat_id = ?1 AND kind IN ({visible})
                       AND (?5 IS NULL OR timestamp < ?5)
                     ORDER BY timestamp DESC, id DESC
                     LIMIT ?2
                  ), recent_reactions AS (
-                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload
+                    SELECT id, chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                     FROM messages
                     WHERE chat_id = ?1 AND kind = ?3
                       AND (?5 IS NULL OR timestamp < ?5)
                     ORDER BY timestamp DESC, id DESC
                     LIMIT ?4
                  )
-                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload
+                 SELECT chat_id, sender_user_id, lamport, timestamp, kind, payload, sender_device_id
                  FROM (
                     SELECT * FROM recent_visible
                     UNION ALL
@@ -8255,9 +8694,15 @@ fn highest_contiguous_lamport_locked(
     chat_id: &[u8],
     sender_user_id: &[u8],
 ) -> Result<u64, CoreError> {
+    // DISTINCT is load-bearing, not tidiness: this is a *person-level*
+    // watermark over a per-device stream key (§5), so one person's two devices
+    // legitimately hold the same lamport value. Without it the duplicate
+    // arrives where the walk expects the next value, the run stops early, and
+    // the person's watermark truncates at the first lamport any two of their
+    // devices happen to share -- permanently, for as long as both rows exist.
     let mut stmt = conn
         .prepare(
-            "SELECT lamport FROM messages
+            "SELECT DISTINCT lamport FROM messages
              WHERE chat_id = ?1 AND sender_user_id = ?2
              ORDER BY lamport ASC",
         )
@@ -8285,6 +8730,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<StoredMessage> {
         timestamp: row.get(3)?,
         kind: row.get::<_, i64>(4)? as u8,
         payload: row.get(5)?,
+        sender_device_id: row.get(6)?,
     })
 }
 
@@ -8855,10 +9301,19 @@ fn family_carried_upload_sql(skip_clause: &str) -> String {
 }
 
 const SCHEMA: &str = "
+-- `sender_device_id` is the device dimension of the message stream key
+-- (`specs/multi-device-v1.md` §5): the logical stream is
+-- `(chat_id, sender_user_id, sender_device_id, lamport)`, so two devices of
+-- one person authoring offline occupy different streams and can never fork
+-- each other. Every row written before the migration, and every envelope that
+-- carries no sealed-body device field, belongs to the reserved all-zero
+-- `LEGACY_DEVICE_ID` stream of its person -- which is the default below, and
+-- is why a v1 peer keeps presenting as a one-device person.
 CREATE TABLE IF NOT EXISTS messages (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id        BLOB NOT NULL,
     sender_user_id BLOB NOT NULL,
+    sender_device_id BLOB NOT NULL DEFAULT X'00000000000000000000000000000000',
     lamport        INTEGER NOT NULL,
     timestamp      INTEGER NOT NULL,
     kind           INTEGER NOT NULL,
@@ -8869,7 +9324,7 @@ CREATE TABLE IF NOT EXISTS messages (
     msg_id         BLOB,
     reply_to_msg_id BLOB,
     outbound_expiry INTEGER,
-    UNIQUE(chat_id, sender_user_id, lamport)
+    UNIQUE(chat_id, sender_user_id, sender_device_id, lamport)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport);
 CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp_id ON messages(chat_id, timestamp, id);
@@ -8877,10 +9332,14 @@ CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp_id ON messages(chat_id, t
 -- Conflicting authenticated branches cannot be resolved safely without a
 -- wire-level stream generation. Keep the visible branch in `messages` and
 -- retain each distinct incoming branch here for bounded recovery/diagnostics.
+-- §5: the quarantine discriminates per DEVICE stream, so the branch a sibling
+-- device authored at the same lamport is not evidence of a fork at all -- it
+-- is a different stream, and it never reaches this table.
 CREATE TABLE IF NOT EXISTS message_conflicts (
     id                       INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id                  BLOB NOT NULL,
     sender_user_id           BLOB NOT NULL,
+    sender_device_id         BLOB NOT NULL DEFAULT X'00000000000000000000000000000000',
     lamport                  INTEGER NOT NULL,
     existing_fingerprint     BLOB NOT NULL,
     incoming_fingerprint     BLOB NOT NULL,
@@ -8894,7 +9353,7 @@ CREATE TABLE IF NOT EXISTS message_conflicts (
     first_seen_at            INTEGER NOT NULL,
     last_seen_at             INTEGER NOT NULL,
     seen_count               INTEGER NOT NULL DEFAULT 1,
-    UNIQUE(chat_id, sender_user_id, lamport, incoming_fingerprint)
+    UNIQUE(chat_id, sender_user_id, sender_device_id, lamport, incoming_fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_message_conflicts_recent
     ON message_conflicts(last_seen_at DESC, id DESC);
@@ -9299,7 +9758,9 @@ CREATE TABLE IF NOT EXISTS contact_presence (
 mod tests {
     use super::*;
     use crate::{
-        create_introduction_ticket, generate_identity, FriendDirectoryEntry, Group,
+        core_sign_device_cert, core_sign_roster, create_introduction_ticket,
+        generate_device_keypair, generate_identity, DeviceCert, DeviceTombstone,
+        FriendDirectoryEntry, Group, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_ID_LEN,
         KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
     };
     use std::fs;
@@ -9315,6 +9776,7 @@ mod tests {
             timestamp: 1_700_000_000_000,
             kind: 1,
             payload: text.as_bytes().to_vec(),
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         }
     }
 
@@ -10320,6 +10782,7 @@ mod tests {
                 timestamp: 100,
                 kind: crate::KIND_FRIEND_REQUEST,
                 payload: b"noise".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         store
@@ -10330,6 +10793,7 @@ mod tests {
                 timestamp: 200,
                 kind: crate::KIND_TEXT,
                 payload: b"hello".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         store
@@ -10340,6 +10804,7 @@ mod tests {
                 timestamp: 300,
                 kind: crate::KIND_TEXT,
                 payload: b"world".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         let preview = store.chat_preview(peer.clone(), own).unwrap();
@@ -10552,6 +11017,7 @@ mod tests {
             timestamp: 1_700_000_000_000,
             kind: 0,
             payload: b"hi".to_vec(),
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let legacy_id = vec![9; MESSAGE_ID_LEN];
         assert!(!store
@@ -10569,6 +11035,601 @@ mod tests {
 
         drop(store);
         fs::remove_file(path).unwrap();
+    }
+
+    /// §5: an on-disk store written before the device dimension existed must
+    /// come back whole, with every row on the reserved legacy stream and the
+    /// widened key in force -- no data loss, no re-friending, and no peer that
+    /// suddenly looks like more than one device.
+    #[test]
+    fn open_migrates_a_pre_device_store_onto_the_legacy_stream() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-migration-device-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        // The exact shape shipped before this work package: the person-keyed
+        // stream key, and the person-keyed conflict quarantine beside it.
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        BLOB NOT NULL,
+                sender_user_id BLOB NOT NULL,
+                lamport        INTEGER NOT NULL,
+                timestamp      INTEGER NOT NULL,
+                kind           INTEGER NOT NULL,
+                payload        BLOB NOT NULL,
+                arrival_transport INTEGER,
+                hops_taken     INTEGER,
+                received_at    INTEGER,
+                msg_id         BLOB,
+                reply_to_msg_id BLOB,
+                outbound_expiry INTEGER,
+                UNIQUE(chat_id, sender_user_id, lamport)
+            );
+            INSERT INTO messages
+                (id, chat_id, sender_user_id, lamport, timestamp, kind, payload,
+                 arrival_transport, hops_taken, received_at, msg_id)
+            VALUES
+                (7, x'636861742D61', x'616C696365', 1, 1700000000000, 1, x'6669727374',
+                 2, 3, 1700000000500, x'0102030405060708090A0B0C0D0E0F10'),
+                (9, x'636861742D61', x'616C696365', 2, 1700000001000, 1, x'7365636F6E64',
+                 NULL, NULL, NULL, NULL);
+            CREATE TABLE message_conflicts (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id                  BLOB NOT NULL,
+                sender_user_id           BLOB NOT NULL,
+                lamport                  INTEGER NOT NULL,
+                existing_fingerprint     BLOB NOT NULL,
+                incoming_fingerprint     BLOB NOT NULL,
+                incoming_timestamp       INTEGER NOT NULL,
+                incoming_kind            INTEGER NOT NULL,
+                incoming_payload         BLOB NOT NULL,
+                incoming_msg_id          BLOB,
+                incoming_reply_to_msg_id BLOB,
+                arrival_transport        INTEGER,
+                hops_taken               INTEGER,
+                first_seen_at            INTEGER NOT NULL,
+                last_seen_at             INTEGER NOT NULL,
+                seen_count               INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(chat_id, sender_user_id, lamport, incoming_fingerprint)
+            );
+            INSERT INTO message_conflicts
+                (chat_id, sender_user_id, lamport, existing_fingerprint,
+                 incoming_fingerprint, incoming_timestamp, incoming_kind,
+                 incoming_payload, first_seen_at, last_seen_at, seen_count)
+            VALUES
+                (x'636861742D61', x'616C696365', 1, x'AA', x'BB', 1700000000000, 1,
+                 x'666F726B', 1700000002000, 1700000002000, 4);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+
+        // Nothing lost: both message rows, their bodies, and their arrival
+        // diagnostics survive the rebuild.
+        let messages = store.messages_for_chat(b"chat-a".to_vec()).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![b"first".to_vec(), b"second".to_vec()],
+        );
+        assert_eq!(
+            store
+                .message_arrival(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap(),
+            Some(MessageArrival {
+                transport: 2,
+                hops_taken: 3,
+                received_at: 1_700_000_000_500,
+            }),
+        );
+        assert_eq!(
+            store
+                .message_reference(b"chat-a".to_vec(), b"alice".to_vec(), 1)
+                .unwrap()
+                .map(|reference| reference.msg_id),
+            Some((1..=16).collect::<Vec<u8>>()),
+        );
+        // The quarantined branch is evidence about history; it survives too.
+        let conflicts = store.message_conflict_summaries(10).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].seen_count, 4);
+
+        // Every migrated row is on the reserved legacy stream, so the sender
+        // still presents as exactly one device.
+        assert_eq!(
+            store
+                .message_stream_device_ids(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            vec![LEGACY_DEVICE_ID.to_vec()],
+        );
+
+        // And the widened key is real: a sibling device at a lamport the
+        // legacy stream already holds is a different stream, not a fork.
+        assert!(store
+            .insert_message_from_device(
+                msg(b"chat-a", b"alice", 1, "from the tablet"),
+                Some(vec![7; DEVICE_ID_LEN]),
+            )
+            .unwrap());
+        assert_eq!(store.message_conflict_summaries(10).unwrap().len(), 1);
+
+        drop(store);
+        let conn = Connection::open(&path_str).unwrap();
+        // Row identity is preserved: `id` is the display-order tie-breaker, so
+        // a rebuild that renumbered rows would silently reorder history.
+        let rows = {
+            let mut stmt = conn
+                .prepare("SELECT id, sender_device_id FROM messages ORDER BY id ASC")
+                .unwrap();
+            let collected = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            collected
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (7, LEGACY_DEVICE_ID.to_vec()),
+                (9, LEGACY_DEVICE_ID.to_vec()),
+                (10, vec![7; DEVICE_ID_LEN]),
+            ],
+        );
+        let indexes = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'messages'",
+                )
+                .unwrap();
+            let collected = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            collected
+        };
+        for expected in [
+            "idx_messages_chat_lamport",
+            "idx_messages_chat_timestamp_id",
+            "idx_messages_chat_msg_id",
+            "idx_messages_msg_id",
+        ] {
+            assert!(
+                indexes.iter().any(|name| name == expected),
+                "the rebuild must put back {expected}, got {indexes:?}"
+            );
+        }
+        drop(conn);
+
+        // A migrated table and a freshly created one must be the same table.
+        // If a later column is added to SCHEMA alone this fails, which is the
+        // point: the rebuild reads its shape from SCHEMA, so the two can only
+        // diverge if the migration stops running at all.
+        let fresh = MessageStore::open(":memory:".to_string()).unwrap();
+        let fresh_conn = lock_conn(&fresh.conn);
+        let migrated_conn = Connection::open(&path_str).unwrap();
+        for table in ["messages", "message_conflicts"] {
+            assert_eq!(
+                table_column_names(&migrated_conn, table).unwrap(),
+                table_column_names(&fresh_conn, table).unwrap(),
+                "migrated {table} must match a fresh one",
+            );
+        }
+        drop(migrated_conn);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The half-migrated store: `messages` was rebuilt and the process died
+    /// before `message_conflicts` was. Each table's rebuild is guarded by its
+    /// own column check, so the next open must finish the job rather than
+    /// skipping it because the first table already looks current.
+    #[test]
+    fn open_finishes_a_device_migration_that_stopped_between_the_two_tables() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-migration-half-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+        let conn = Connection::open(&path_str).unwrap();
+        // `messages` in today's shape; `message_conflicts` still person-keyed.
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        BLOB NOT NULL,
+                sender_user_id BLOB NOT NULL,
+                sender_device_id BLOB NOT NULL DEFAULT X'00000000000000000000000000000000',
+                lamport        INTEGER NOT NULL,
+                timestamp      INTEGER NOT NULL,
+                kind           INTEGER NOT NULL,
+                payload        BLOB NOT NULL,
+                arrival_transport INTEGER,
+                hops_taken     INTEGER,
+                received_at    INTEGER,
+                msg_id         BLOB,
+                reply_to_msg_id BLOB,
+                outbound_expiry INTEGER,
+                UNIQUE(chat_id, sender_user_id, sender_device_id, lamport)
+            );
+            INSERT INTO messages
+                (id, chat_id, sender_user_id, lamport, timestamp, kind, payload)
+            VALUES
+                (3, x'636861742D61', x'616C696365', 1, 1700000000000, 1, x'6669727374');
+            CREATE TABLE message_conflicts (
+                id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id                  BLOB NOT NULL,
+                sender_user_id           BLOB NOT NULL,
+                lamport                  INTEGER NOT NULL,
+                existing_fingerprint     BLOB NOT NULL,
+                incoming_fingerprint     BLOB NOT NULL,
+                incoming_timestamp       INTEGER NOT NULL,
+                incoming_kind            INTEGER NOT NULL,
+                incoming_payload         BLOB NOT NULL,
+                incoming_msg_id          BLOB,
+                incoming_reply_to_msg_id BLOB,
+                arrival_transport        INTEGER,
+                hops_taken               INTEGER,
+                first_seen_at            INTEGER NOT NULL,
+                last_seen_at             INTEGER NOT NULL,
+                seen_count               INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(chat_id, sender_user_id, lamport, incoming_fingerprint)
+            );
+            INSERT INTO message_conflicts
+                (chat_id, sender_user_id, lamport, existing_fingerprint,
+                 incoming_fingerprint, incoming_timestamp, incoming_kind,
+                 incoming_payload, first_seen_at, last_seen_at, seen_count)
+            VALUES
+                (x'636861742D61', x'616C696365', 1, x'AA', x'BB', 1700000000000, 1,
+                 x'666F726B', 1700000002000, 1700000002000, 2);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        // The interrupted half is finished, and neither table lost anything.
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
+        let conflicts = store.message_conflict_summaries(10).unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].seen_count, 2);
+        drop(store);
+
+        let fresh = MessageStore::open(":memory:".to_string()).unwrap();
+        let fresh_conn = lock_conn(&fresh.conn);
+        let migrated_conn = Connection::open(&path_str).unwrap();
+        for table in ["messages", "message_conflicts"] {
+            assert_eq!(
+                table_column_names(&migrated_conn, table).unwrap(),
+                table_column_names(&fresh_conn, table).unwrap(),
+                "both halves must end up on the current shape",
+            );
+        }
+        drop(migrated_conn);
+        drop(fresh_conn);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// The rebuild drops the old table and its indexes with it. A legacy store
+    /// that really had the shipped `messages` indexes must come back with all
+    /// of them -- not just the ones a test happened to name.
+    #[test]
+    fn a_legacy_store_with_the_real_indexes_gets_every_one_of_them_back() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("cruisemesh-store-migration-idx-{unique}.sqlite"));
+        let path_str = path.to_string_lossy().to_string();
+
+        // The index set a fresh store carries, taken from a fresh store rather
+        // than from a literal list, so this cannot drift out of date.
+        let expected_indexes = {
+            let fresh = MessageStore::open(":memory:".to_string()).unwrap();
+            let conn = lock_conn(&fresh.conn);
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'messages' AND name IS NOT NULL
+                     ORDER BY name ASC",
+                )
+                .unwrap();
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap();
+            drop(stmt);
+            drop(conn);
+            names
+        };
+        assert!(
+            !expected_indexes.is_empty(),
+            "a fresh messages table has indexes"
+        );
+
+        let conn = Connection::open(&path_str).unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE messages (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id        BLOB NOT NULL,
+                sender_user_id BLOB NOT NULL,
+                lamport        INTEGER NOT NULL,
+                timestamp      INTEGER NOT NULL,
+                kind           INTEGER NOT NULL,
+                payload        BLOB NOT NULL,
+                arrival_transport INTEGER,
+                hops_taken     INTEGER,
+                received_at    INTEGER,
+                msg_id         BLOB,
+                reply_to_msg_id BLOB,
+                outbound_expiry INTEGER,
+                UNIQUE(chat_id, sender_user_id, lamport)
+            );
+            INSERT INTO messages
+                (chat_id, sender_user_id, lamport, timestamp, kind, payload)
+            VALUES
+                (x'636861742D61', x'616C696365', 1, 1700000000000, 1, x'6669727374');
+            ",
+        )
+        .unwrap();
+        // Exactly the shipped index statements, as an upgraded store would
+        // already have them.
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_lamport ON messages(chat_id, lamport)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_timestamp_id
+                 ON messages(chat_id, timestamp, id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_msg_id ON messages(chat_id, msg_id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_msg_id ON messages(msg_id)",
+        ] {
+            conn.execute(statement, []).unwrap();
+        }
+        drop(conn);
+
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            1
+        );
+        drop(store);
+
+        let conn = Connection::open(&path_str).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'messages' AND name IS NOT NULL
+                 ORDER BY name ASC",
+            )
+            .unwrap();
+        let after = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        drop(stmt);
+        for expected in &expected_indexes {
+            assert!(
+                after.contains(expected),
+                "the rebuild must put back {expected}, got {after:?}",
+            );
+        }
+        drop(conn);
+        fs::remove_file(path).unwrap();
+    }
+
+    /// §1/§5: the failure this work package exists to remove. Two of one
+    /// person's devices author at the same lamport while offline; before the
+    /// device dimension the second row was classified as a fork and
+    /// quarantined, taking one side's history out of view.
+    #[test]
+    fn sibling_devices_authoring_one_lamport_keep_separate_streams() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let phone = vec![1; DEVICE_ID_LEN];
+        let tablet = vec![2; DEVICE_ID_LEN];
+
+        assert_eq!(
+            store
+                .insert_incoming_message_from_device(
+                    msg(b"chat-a", b"alice", 4, "from the phone"),
+                    Some(phone.clone()),
+                    vec![1; MESSAGE_ID_LEN],
+                    None,
+                    None,
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::Inserted,
+        );
+        assert_eq!(
+            store
+                .insert_incoming_message_from_device(
+                    msg(b"chat-a", b"alice", 4, "from the tablet"),
+                    Some(tablet.clone()),
+                    vec![2; MESSAGE_ID_LEN],
+                    None,
+                    None,
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::Inserted,
+        );
+        assert!(
+            !store.has_message_conflicts().unwrap(),
+            "a sibling device's stream position is not a fork"
+        );
+
+        // Both rows are visible history, merged for display by timestamp as
+        // every other row is -- §5 changes the stream key, not the ordering.
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            store
+                .message_stream_device_ids(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            vec![phone, tablet.clone()],
+        );
+        assert_eq!(
+            store
+                .message_reference_from_device(
+                    b"chat-a".to_vec(),
+                    b"alice".to_vec(),
+                    Some(tablet),
+                    4,
+                )
+                .unwrap()
+                .map(|reference| reference.msg_id),
+            Some(vec![2; MESSAGE_ID_LEN]),
+        );
+        // Person-level lookups answer with the lowest device id (§5's display
+        // tie-break), which keeps the legacy stream first.
+        assert_eq!(
+            store
+                .message_reference(b"chat-a".to_vec(), b"alice".to_vec(), 4)
+                .unwrap()
+                .map(|reference| reference.msg_id),
+            Some(vec![1; MESSAGE_ID_LEN]),
+        );
+    }
+
+    /// §5 + DESIGN.md §7.3: the person-level contiguity watermark must climb
+    /// straight through a lamport two of that person's devices both used. A
+    /// duplicated value is a normal merged-stream outcome, not a gap, and a
+    /// watermark that stopped there would stall the digest permanently -- every
+    /// later message from that person would look unreceived forever.
+    #[test]
+    fn a_lamport_shared_by_two_device_streams_does_not_truncate_the_watermark() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let phone = Some(vec![1; DEVICE_ID_LEN]);
+        let tablet = Some(vec![2; DEVICE_ID_LEN]);
+        for (lamport, device) in [
+            (1, phone.clone()),
+            (2, phone.clone()),
+            (2, tablet.clone()),
+            (3, tablet),
+            (4, phone),
+        ] {
+            assert!(store
+                .insert_message_from_device(
+                    msg(b"chat-a", b"alice", lamport, "merged stream"),
+                    device,
+                )
+                .unwrap());
+        }
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            4,
+            "the shared lamport 2 must not stop the walk at 1",
+        );
+        // And a real gap still stops it, in the same merged view.
+        assert!(store
+            .insert_message_from_device(msg(b"chat-a", b"alice", 7, "after a gap"), None)
+            .unwrap());
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            4,
+        );
+    }
+
+    /// The duplicate/fork rules are unchanged *within* a device stream: only
+    /// the stream they apply to got narrower.
+    #[test]
+    fn one_device_stream_still_dedupes_and_still_quarantines_a_fork() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let phone = Some(vec![1; DEVICE_ID_LEN]);
+        assert!(store
+            .insert_message_from_device(msg(b"chat-a", b"alice", 4, "hi"), phone.clone())
+            .unwrap());
+        assert!(
+            !store
+                .insert_message_from_device(msg(b"chat-a", b"alice", 4, "hi"), phone.clone())
+                .unwrap(),
+            "the same message on the same device stream is still a duplicate"
+        );
+        assert!(!store.has_message_conflicts().unwrap());
+
+        assert_eq!(
+            store
+                .insert_incoming_message_from_device(
+                    msg(b"chat-a", b"alice", 4, "a different branch"),
+                    phone,
+                    vec![3; MESSAGE_ID_LEN],
+                    None,
+                    None,
+                )
+                .unwrap(),
+            IncomingMessageInsertOutcome::QuarantinedConflict,
+        );
+        assert_eq!(
+            store.messages_for_chat(b"chat-a".to_vec()).unwrap()[0].payload,
+            b"hi".to_vec(),
+            "the branch already rendered to the user wins, as before",
+        );
+    }
+
+    /// §5: absence maps to the legacy stream, and so does an id of the wrong
+    /// width -- never an error, because a legacy peer must stay
+    /// indistinguishable from today.
+    #[test]
+    fn an_absent_or_malformed_device_id_lands_on_the_legacy_stream() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(store
+            .insert_message_from_device(msg(b"chat-a", b"alice", 1, "no device field"), None)
+            .unwrap());
+        assert!(
+            !store
+                .insert_message_from_device(
+                    msg(b"chat-a", b"alice", 1, "no device field"),
+                    Some(b"three bytes too short".to_vec()),
+                )
+                .unwrap(),
+            "a wrong-width id is the legacy stream, so this is the same row"
+        );
+        assert_eq!(
+            store
+                .message_stream_device_ids(b"chat-a".to_vec(), b"alice".to_vec())
+                .unwrap(),
+            vec![LEGACY_DEVICE_ID.to_vec()],
+        );
+        // Locally authored rows share that stream until linking exists.
+        let authored = msg(b"chat-a", b"me", 1, "authored here");
+        store
+            .insert_outgoing_message(
+                authored.clone(),
+                outbound_for(&authored, b"alice", &[4; MESSAGE_ID_LEN]),
+                1_700_000_000_000,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .message_stream_device_ids(b"chat-a".to_vec(), b"me".to_vec())
+                .unwrap(),
+            vec![LEGACY_DEVICE_ID.to_vec()],
+        );
     }
 
     #[test]
@@ -11864,6 +12925,7 @@ mod tests {
             timestamp,
             kind,
             payload: b"body".to_vec(),
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let msg_id = format!("out-{}-{lamport}", String::from_utf8_lossy(recipient)).into_bytes();
         let mut envelope = outbound_for(&message, recipient, &msg_id);
@@ -11891,6 +12953,7 @@ mod tests {
             timestamp: DELIVERY_NOW + 3_600_000,
             kind: crate::KIND_TEXT,
             payload: b"body".to_vec(),
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let mut envelope = outbound_for(&message, BOB, b"out-bob-skewed");
         envelope.expiry = DELIVERY_NOW + 60_000;
@@ -12018,6 +13081,7 @@ mod tests {
             timestamp: 1_000_000,
             kind: crate::KIND_TEXT,
             payload: b"body".to_vec(),
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let mut envelope = outbound_for(&message, group, b"out-group-1");
         envelope.expiry = DELIVERY_NOW + 60_000;
@@ -15503,6 +16567,524 @@ mod tests {
         assert!(store.list_contacts().unwrap().is_empty());
     }
 
+    /// A contact's person root, their devices, and the rosters that bind them
+    /// (`specs/multi-device-v1.md` §3, §4). The root here is an ordinary
+    /// [`generate_identity`] keypair on purpose: that is exactly §3's claim
+    /// that the deployed identity key *becomes* the person root.
+    struct RosterFixture {
+        root: crate::Identity,
+        approving: crate::DeviceKeypair,
+        second: crate::DeviceKeypair,
+    }
+
+    impl RosterFixture {
+        fn new() -> Self {
+            Self {
+                root: generate_identity(),
+                approving: generate_device_keypair(),
+                second: generate_device_keypair(),
+            }
+        }
+
+        fn contact(&self) -> Contact {
+            Contact {
+                user_id: self.root.user_id.clone(),
+                name: "Alice".to_string(),
+                sign_pk: self.root.sign_pk.clone(),
+                agree_pk: self.root.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            }
+        }
+
+        fn cert(&self, device: &crate::DeviceKeypair, flags: u32, signer_sk: &[u8]) -> DeviceCert {
+            core_sign_device_cert(
+                DeviceCert {
+                    person_id: self.root.user_id.clone(),
+                    device_sign_pk: device.sign_pk.clone(),
+                    device_agree_pk: device.agree_pk.clone(),
+                    added_epoch: 0,
+                    flags,
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                signer_sk.to_vec(),
+            )
+            .unwrap()
+        }
+
+        /// The genesis roster: one device, root-signed (§3 requires that of
+        /// `seq == 0`).
+        fn genesis(&self) -> Roster {
+            self.sign(
+                Roster {
+                    person_id: self.root.user_id.clone(),
+                    recovery_epoch: 0,
+                    seq: 0,
+                    devices: vec![self.cert(
+                        &self.approving,
+                        DEVICE_CERT_FLAG_ROSTER_SIGNING,
+                        &self.root.sign_sk,
+                    )],
+                    tombstones: Vec::new(),
+                    approving_device_id: self.approving.device_id.clone(),
+                    inbox_key_generation: 0,
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                &self.root.sign_sk,
+            )
+        }
+
+        /// A later roster signed by the approving device, as every ordinary
+        /// add and revoke is.
+        fn next(
+            &self,
+            seq: u64,
+            devices: Vec<DeviceCert>,
+            tombstones: Vec<DeviceTombstone>,
+            inbox_key_generation: u64,
+        ) -> Roster {
+            let mut all = vec![self.cert(
+                &self.approving,
+                DEVICE_CERT_FLAG_ROSTER_SIGNING,
+                &self.root.sign_sk,
+            )];
+            all.extend(devices);
+            self.sign(
+                Roster {
+                    person_id: self.root.user_id.clone(),
+                    recovery_epoch: 0,
+                    seq,
+                    devices: all,
+                    tombstones,
+                    approving_device_id: self.approving.device_id.clone(),
+                    inbox_key_generation,
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                &self.approving.sign_sk,
+            )
+        }
+
+        fn sign(&self, roster: Roster, signer_sk: &[u8]) -> Roster {
+            core_sign_roster(roster, signer_sk.to_vec()).unwrap()
+        }
+    }
+
+    #[test]
+    fn a_contacts_roster_round_trips_through_the_store() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+
+        let genesis = fixture.genesis();
+        let decision = store.apply_contact_roster(genesis.clone()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Accepted);
+        assert_eq!(decision.reason, RosterUpdateReason::FirstRoster);
+
+        // Byte-identical, which is what DL-2 fork detection depends on: the
+        // stored document is re-hashed and compared against the next copy that
+        // arrives, so a lossy round-trip would invent forks.
+        let state = store
+            .contact_roster_state(fixture.root.user_id.clone())
+            .unwrap();
+        assert_eq!(state.roster.as_ref(), Some(&genesis));
+        assert!(!state.quarantined);
+        assert_eq!(
+            store
+                .contact_active_device_ids(fixture.root.user_id.clone())
+                .unwrap(),
+            vec![fixture.approving.device_id.clone()],
+        );
+        assert_eq!(
+            store
+                .contact_device_state(
+                    fixture.root.user_id.clone(),
+                    fixture.approving.device_id.clone(),
+                )
+                .unwrap(),
+            ContactDeviceState::Active,
+        );
+        assert_eq!(
+            store
+                .contact_device_state(
+                    fixture.root.user_id.clone(),
+                    fixture.second.device_id.clone(),
+                )
+                .unwrap(),
+            ContactDeviceState::Unknown,
+        );
+
+        // Deleting the contact forgets their devices with them.
+        assert!(store
+            .delete_contact(fixture.root.user_id.clone(), 1)
+            .unwrap());
+        assert_eq!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap(),
+            ContactRosterState {
+                roster: None,
+                quarantined: false,
+            },
+        );
+    }
+
+    /// DL-1 through the store: a strictly higher version supersedes, a lower
+    /// one is ignored, and the stored document is the one that decides.
+    #[test]
+    fn stored_rosters_advance_and_never_roll_back() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+
+        let linked = fixture.next(
+            1,
+            vec![fixture.cert(&fixture.second, 0, &fixture.approving.sign_sk)],
+            Vec::new(),
+            0,
+        );
+        let decision = store.apply_contact_roster(linked.clone()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Accepted);
+        assert_eq!(decision.reason, RosterUpdateReason::Superseded);
+        assert_eq!(
+            store
+                .contact_active_device_ids(fixture.root.user_id.clone())
+                .unwrap(),
+            vec![
+                fixture.approving.device_id.clone(),
+                fixture.second.device_id.clone(),
+            ],
+        );
+
+        let decision = store.apply_contact_roster(fixture.genesis()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Ignored);
+        assert_eq!(decision.reason, RosterUpdateReason::Rollback);
+        assert_eq!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .roster,
+            Some(linked),
+        );
+    }
+
+    /// DL-4 through the store: the tombstone has to come *back* out of the
+    /// database for the rule to work at all -- a roster that quietly dropped
+    /// its tombstones on the way to disk would let a revoked device return the
+    /// next time the person's roster advanced.
+    #[test]
+    fn a_stored_tombstone_still_refuses_a_roster_that_forgets_it() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+        store
+            .apply_contact_roster(fixture.next(
+                1,
+                vec![fixture.cert(&fixture.second, 0, &fixture.approving.sign_sk)],
+                Vec::new(),
+                0,
+            ))
+            .unwrap();
+
+        // Revocation: the second device is buried and the inbox generation is
+        // bumped, exactly as §10 requires.
+        let revoked = fixture.next(
+            2,
+            Vec::new(),
+            vec![DeviceTombstone {
+                device_id: fixture.second.device_id.clone(),
+                revoked_at_seq: 2,
+            }],
+            1,
+        );
+        assert_eq!(
+            store.apply_contact_roster(revoked).unwrap().outcome,
+            RosterUpdateOutcome::Accepted,
+        );
+        assert_eq!(
+            store
+                .contact_device_state(
+                    fixture.root.user_id.clone(),
+                    fixture.second.device_id.clone(),
+                )
+                .unwrap(),
+            ContactDeviceState::Revoked,
+        );
+        assert_eq!(
+            store
+                .contact_active_device_ids(fixture.root.user_id.clone())
+                .unwrap(),
+            vec![fixture.approving.device_id.clone()],
+        );
+
+        let forgets_the_burial = fixture.next(3, Vec::new(), Vec::new(), 1);
+        let decision = store.apply_contact_roster(forgets_the_burial).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Ignored);
+        assert_eq!(decision.reason, RosterUpdateReason::TombstoneResurrected);
+    }
+
+    /// DL-2 through the store: a fork quarantines the person, the quarantine
+    /// is persisted, and it is not lifted by a later, perfectly valid roster.
+    #[test]
+    fn a_forked_roster_quarantines_the_person_for_good() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+        let first = fixture.next(
+            1,
+            vec![fixture.cert(&fixture.second, 0, &fixture.approving.sign_sk)],
+            Vec::new(),
+            0,
+        );
+        store.apply_contact_roster(first.clone()).unwrap();
+
+        // Same (recovery_epoch, seq), different content.
+        let fork = fixture.next(1, Vec::new(), Vec::new(), 0);
+        let decision = store.apply_contact_roster(fork).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::ForkQuarantined);
+        assert_eq!(decision.reason, RosterUpdateReason::ForkedContent);
+        assert!(decision.quarantined);
+
+        let state = store
+            .contact_roster_state(fixture.root.user_id.clone())
+            .unwrap();
+        assert!(state.quarantined);
+        assert_eq!(
+            state.roster,
+            Some(first),
+            "the stored roster is kept; a fork is never auto-resolved",
+        );
+
+        let later = fixture.next(9, Vec::new(), Vec::new(), 0);
+        let decision = store.apply_contact_roster(later).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::ForkQuarantined);
+        assert_eq!(decision.reason, RosterUpdateReason::PersonQuarantined);
+        assert!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .quarantined,
+            "quarantine is sticky across later versions",
+        );
+    }
+
+    /// DL-3: rosters arrive as ordinary sealed traffic, so one about somebody
+    /// this device does not know is simply not its business.
+    #[test]
+    fn a_roster_for_someone_who_is_not_a_contact_is_ignored() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        let decision = store.apply_contact_roster(fixture.genesis()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Ignored);
+        assert_eq!(decision.rejection, Some(RosterRejection::PersonMismatch));
+        assert_eq!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .roster,
+            None,
+        );
+    }
+
+    /// A roster signed by a key this contact's person root never vouched for
+    /// is not stored, whatever it says about itself.
+    #[test]
+    fn a_roster_that_does_not_chain_to_the_contacts_own_key_is_not_stored() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+
+        let impostor = RosterFixture::new();
+        let mut forged = impostor.genesis();
+        forged.person_id = fixture.root.user_id.clone();
+        let decision = store.apply_contact_roster(forged).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Ignored);
+        assert_eq!(decision.reason, RosterUpdateReason::Invalid);
+        assert_eq!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .roster,
+            None,
+        );
+    }
+
+    /// A roster whose stored rows no longer reproduce their recorded head
+    /// hash must not brick the contact. Returning an error there would fail
+    /// every later read *and* every later `apply_contact_roster`, since the
+    /// apply path has to load the stored roster first -- so local damage would
+    /// become a permanent, unrecoverable outage for that person.
+    #[test]
+    fn a_roster_that_no_longer_matches_its_head_hash_self_heals() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+
+        // Damage one device row so the reconstructed document no longer
+        // hashes to what was written beside it.
+        {
+            let conn = lock_conn(&store.conn);
+            conn.execute(
+                "UPDATE contact_devices SET added_epoch = added_epoch + 1",
+                [],
+            )
+            .unwrap();
+        }
+        let state = store
+            .contact_roster_state(fixture.root.user_id.clone())
+            .unwrap();
+        assert_eq!(state.roster, None, "the damaged document is not served");
+        assert!(!state.quarantined);
+        // The damaged rows are gone, not merely hidden.
+        {
+            let conn = lock_conn(&store.conn);
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM contact_devices", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
+
+        // And the next honest gossip re-establishes the person from scratch.
+        let decision = store.apply_contact_roster(fixture.genesis()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Accepted);
+        assert_eq!(decision.reason, RosterUpdateReason::FirstRoster);
+        assert_eq!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .roster,
+            Some(fixture.genesis()),
+        );
+    }
+
+    /// DL-2 is a safety state a person clears, so self-healing local damage
+    /// must not clear it: a quarantined person stays quarantined even when the
+    /// document beside the bit had to be thrown away.
+    #[test]
+    fn self_healing_keeps_the_quarantine_bit() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+        store
+            .apply_contact_roster(fixture.next(
+                1,
+                vec![fixture.cert(&fixture.second, 0, &fixture.approving.sign_sk)],
+                Vec::new(),
+                0,
+            ))
+            .unwrap();
+        // Same version, different content.
+        assert_eq!(
+            store
+                .apply_contact_roster(fixture.next(1, Vec::new(), Vec::new(), 0))
+                .unwrap()
+                .outcome,
+            RosterUpdateOutcome::ForkQuarantined,
+        );
+
+        {
+            let conn = lock_conn(&store.conn);
+            conn.execute("UPDATE contact_rosters SET seq = seq + 5", [])
+                .unwrap();
+        }
+        let state = store
+            .contact_roster_state(fixture.root.user_id.clone())
+            .unwrap();
+        assert_eq!(state.roster, None);
+        assert!(state.quarantined, "the fork quarantine survives the repair");
+        // Still sticky across reads, and still refusing later rosters.
+        assert!(
+            store
+                .contact_roster_state(fixture.root.user_id.clone())
+                .unwrap()
+                .quarantined
+        );
+        let decision = store.apply_contact_roster(fixture.genesis()).unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::ForkQuarantined);
+        assert_eq!(decision.reason, RosterUpdateReason::PersonQuarantined);
+    }
+
+    /// A roster is authority data about a contact, so it must never outlive
+    /// one. Deleting a contact and re-adding them starts clean.
+    #[test]
+    fn a_deleted_contacts_roster_never_comes_back_when_they_are_re_added() {
+        let path = std::env::temp_dir().join(format!(
+            "cruisemesh-roster-orphan-{}.sqlite",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let fixture = RosterFixture::new();
+        {
+            let store = MessageStore::open(path_str.clone()).unwrap();
+            store.upsert_contact(fixture.contact()).unwrap();
+            store.apply_contact_roster(fixture.genesis()).unwrap();
+            assert!(store
+                .delete_contact(fixture.root.user_id.clone(), 1)
+                .unwrap());
+            assert_eq!(
+                store
+                    .contact_roster_state(fixture.root.user_id.clone())
+                    .unwrap()
+                    .roster,
+                None,
+            );
+            store.upsert_contact(fixture.contact()).unwrap();
+            assert_eq!(
+                store
+                    .contact_roster_state(fixture.root.user_id.clone())
+                    .unwrap()
+                    .roster,
+                None,
+                "re-adding a contact must not resurrect their old roster",
+            );
+        }
+
+        // And the open-time sweep is the backstop for rows that reached the
+        // file some other way -- a restored backup, or an interrupted write.
+        {
+            let conn = Connection::open(&path_str).unwrap();
+            conn.execute("DELETE FROM contacts", []).unwrap();
+            conn.execute(
+                "INSERT INTO contact_rosters
+                    (person_user_id, recovery_epoch, seq, approving_device_id,
+                     inbox_key_generation, signer_sign_pk, signature, head_hash, quarantined)
+                 VALUES (?1, 0, 0, X'', 0, X'', X'', X'AA', 0)",
+                params![fixture.root.user_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO contact_devices (person_user_id, device_id, ordinal)
+                 VALUES (?1, X'BB', 0)",
+                params![fixture.root.user_id],
+            )
+            .unwrap();
+        }
+        let store = MessageStore::open(path_str.clone()).unwrap();
+        {
+            let conn = lock_conn(&store.conn);
+            let rosters: i64 = conn
+                .query_row("SELECT COUNT(*) FROM contact_rosters", [], |row| row.get(0))
+                .unwrap();
+            let devices: i64 = conn
+                .query_row("SELECT COUNT(*) FROM contact_devices", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!((rosters, devices), (0, 0), "open sweeps orphaned rosters");
+        }
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn delete_contact_is_a_noop_for_unknown_contact() {
         let store = MessageStore::open(":memory:".to_string()).unwrap();
@@ -15991,6 +17573,7 @@ mod tests {
                 timestamp: 1_700_000_000_000,
                 kind: crate::KIND_TEXT,
                 payload: b"already read".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         store
@@ -16039,6 +17622,7 @@ mod tests {
                 timestamp: 1_700_000_000_000,
                 kind: 1,
                 payload: b"group hi".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         store

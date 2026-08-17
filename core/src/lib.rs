@@ -11,6 +11,7 @@ mod contact_relay_health;
 mod content;
 mod crypto;
 mod deep_link;
+mod device_roster;
 mod engine;
 mod framing;
 mod gossip;
@@ -34,6 +35,7 @@ mod relay_cursor;
 mod relay_setup;
 mod relay_status;
 mod relay_wire;
+mod roster_store;
 mod sail_checklist;
 mod semantic;
 mod session;
@@ -79,6 +81,15 @@ pub use content::{
 };
 pub use crypto::{open_message, seal_message, OpenedMessage};
 pub use deep_link::{deep_link_route, DeepLinkRoute};
+pub use device_roster::{
+    core_derive_device_id, core_device_add_outcome, core_device_sign, core_device_stream_id,
+    core_device_verify, core_legacy_device_id, core_roster_accept, core_roster_device_ids,
+    core_roster_head_hash, core_roster_validate, core_sign_device_cert, core_sign_roster,
+    core_verify_device_cert, generate_device_keypair, DeviceAddOutcome, DeviceCert, DeviceKeypair,
+    DeviceSigningDomain, DeviceTombstone, Roster, RosterRejection, RosterUpdateDecision,
+    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
+    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+};
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
     core_group_fanout_rows, core_hello_identity_matches, core_inbound_gate,
@@ -138,17 +149,17 @@ pub use protocol::{
     decode_relay_update_content, default_expiry, encode_digest, encode_envelope_frame,
     encode_friend_directory_content, encode_hello, encode_hello2, encode_introduced_friend_request,
     encode_lan_endpoint, encode_lan_endpoint_content, encode_message_body,
-    encode_message_body_with_reply, encode_profile_sync_content, encode_receipt_content,
-    encode_relay_update_content, encode_transport_probe, fanout_msg_id, generate_msg_id,
-    parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
-    FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
-    MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
-    CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL,
-    GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
-    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE,
-    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
-    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
-    RECEIPT_TYPE_READ,
+    encode_message_body_extended, encode_message_body_with_reply, encode_profile_sync_content,
+    encode_receipt_content, encode_relay_update_content, encode_transport_probe, fanout_msg_id,
+    generate_msg_id, parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame,
+    FriendDirectoryContent, FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket,
+    LanEndpointContent, MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent,
+    SuggestedFriendCard, CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE,
+    DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK,
+    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY,
+    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 // Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
 // below: no shell composes an event. Core decision points emit them and the
@@ -190,6 +201,7 @@ pub use relay_wire::{
     CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, GroupRelayMember,
     RelayEndpoint,
 };
+pub use roster_store::{ContactDeviceState, ContactRosterState};
 pub use sail_checklist::{
     core_sail_checklist, CoreSailChecklistInput, CoreSailChecklistItem, CoreSailChecklistItemId,
     CoreSailChecklistReport, CoreSailPermission, CoreSailPermissionRow,

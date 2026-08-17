@@ -1333,6 +1333,7 @@ mod tests {
                     timestamp: 1,
                     kind: 1,
                     payload: b"hi".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 one_to_one_msg_id.clone(),
                 None,
@@ -1349,6 +1350,7 @@ mod tests {
                     timestamp: 1,
                     kind: 1,
                     payload: b"hi group".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 group_msg_id.clone(),
                 None,
@@ -1369,6 +1371,7 @@ mod tests {
                 timestamp: 1,
                 kind: 1,
                 payload: b"visible branch".to_vec(),
+                sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         let quarantined_msg_id = vec![26_u8; 16];
@@ -1382,6 +1385,7 @@ mod tests {
                         timestamp: 2,
                         kind: 1,
                         payload: b"conflicting branch".to_vec(),
+                        sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                     },
                     quarantined_msg_id.clone(),
                     None,
@@ -1832,6 +1836,7 @@ mod tests {
                     timestamp: 1,
                     kind: KIND_TEXT,
                     payload: b"hi".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 one_to_one.clone(),
                 None,
@@ -1846,6 +1851,7 @@ mod tests {
                     timestamp: 1,
                     kind: KIND_TEXT,
                     payload: b"hi all".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 group_row.clone(),
                 None,
@@ -2267,6 +2273,7 @@ mod tests {
                 timestamp: now_ms,
                 kind: 1,
                 payload: b"hi".to_vec(),
+                sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
             };
             let envelope = OutboundEnvelope {
                 msg_id: vec![msg_id; 16],
@@ -2357,6 +2364,7 @@ mod tests {
                 timestamp: now_ms,
                 kind,
                 payload: b"hi".to_vec(),
+                sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
             };
             let envelope = OutboundEnvelope {
                 msg_id: vec![msg_id; 16],
@@ -2593,6 +2601,7 @@ mod tests {
                     timestamp: now_ms,
                     kind: 1,
                     payload: b"hi".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 OutboundEnvelope {
                     msg_id: vec![7_u8; 16],
@@ -2814,6 +2823,7 @@ mod tests {
                     timestamp: 1,
                     kind: 1,
                     payload: b"hi".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                 },
                 vec![2; 16],
                 None,
@@ -2856,6 +2866,7 @@ mod tests {
                         timestamp: 1 + i as i64,
                         kind: 1,
                         payload: b"hi".to_vec(),
+                        sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
                     },
                     msg_id,
                     None,

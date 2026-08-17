@@ -19,7 +19,8 @@ final class MessageInfoRowTests: XCTestCase {
             lamport: lamport,
             timestamp: timestampMs,
             kind: kind,
-            payload: Data("hello".utf8)
+            payload: Data("hello".utf8),
+            senderDeviceId: coreLegacyDeviceId()
         )
     }
 
