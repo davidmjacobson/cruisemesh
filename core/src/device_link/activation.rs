@@ -179,9 +179,12 @@ pub fn core_link_genesis_roster(
 ///
 /// It starts the epoch with this device alone. Note what it deliberately does
 /// NOT do: it does not tombstone the devices it drops. Burying a device is
-/// §10's revocation and WP5's work package, with the relay-token rotation that
-/// has to come with it; dropping one here simply means the new epoch does not
-/// vouch for it. Tombstones already recorded are carried forward untouched,
+/// §10's revocation — [`crate::core_recovery_revoke_roster`] is the same epoch
+/// climb that *does* bury, and names which devices it is burying — while
+/// dropping one here simply means the new epoch does not vouch for it. The
+/// distinction is the product difference between "I lost my phone" and "I am
+/// setting up a replacement": the second must not silently unlink the tablet.
+/// Tombstones already recorded are carried forward untouched either way,
 /// because DL-4 is forever.
 ///
 /// **The inbox key generation moves, the key material does not.** §14.2 is
@@ -189,10 +192,13 @@ pub fn core_link_genesis_roster(
 /// to stop sealing to what that device could open — and §6 says the way a
 /// person says that is by advancing `inbox_key_generation`. So this bumps it.
 /// What it does not do is mint the new keypair: rotating the actual inbox key,
-/// and re-sealing to it, is WP5's, and until WP5 lands the generation this
-/// roster announces runs ahead of the material behind it. That is a deliberate,
-/// stated gap — a generation that never moved would be worse, because contacts
-/// would have no signal at all that anything had changed.
+/// and re-sealing to it, belongs to §10's revocation
+/// ([`crate::core_recovery_revoke_roster`], which does both), so on THIS path
+/// the generation this roster announces runs ahead of the material behind it.
+/// That is a deliberate, stated gap — a generation that never moved would be
+/// worse, because contacts would have no signal at all that anything had
+/// changed — and a caller that means "cut that phone off" should be reaching for
+/// the revocation instead.
 ///
 /// The `.cmbak` restore path (`ReplaceThisDevice`) does not come through here
 /// and must not: nothing was recovered, so nothing is announced.

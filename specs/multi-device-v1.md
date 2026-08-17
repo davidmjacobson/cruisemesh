@@ -128,7 +128,14 @@ Roster rules (cite as DL-n in code comments):
   `(recovery_epoch, seq)` but different content = fork. Keep the stored
   one, quarantine further roster updates for that person, and surface the
   same safety-warning treatment as a changed fingerprint. Never
-  auto-resolve a fork.
+  auto-resolve a fork. *Refinement (WP5):* a roster signed by the **person
+  root itself** at a strictly higher `recovery_epoch` is heard through the
+  quarantine and clears it — that is the one signature a thief provably
+  cannot produce, so honouring it is the person resolving the fork rather
+  than arithmetic resolving it, and refusing it would leave an
+  attacker-caused fork permanently unrecoverable. Everything else stays
+  quarantined until a person clears it after out-of-band re-verification
+  (`MessageStore::clear_roster_quarantine`).
 - **DL-3 (no directory).** Rosters gossip exactly like other sealed 1:1
   traffic — relay, LAN, BLE, and carry equally, sealed pairwise per
   contact. There is no central roster service and the relay never sees
@@ -307,6 +314,33 @@ On "Remove device" (approving device) or recovery-code override:
    received events (already-stored history stays; the stream is sealed
    at its last pre-revocation point).
 4. Contacts get the standard changed-safety-state surface treatment.
+
+Notes on step 3, recorded so the guarantee is not read as stronger than
+it is (WP5):
+
+- **The device id it refuses is not yet device-signed.** §5's authoring
+  signature is WP1's and unbuilt, so `sender_device_id` is a label
+  authenticated as coming from the sender rather than a signature by the
+  device it names. Step 3 therefore stops a revoked device speaking under
+  its own name, and does not stop whoever holds that install's identity
+  key from relabelling. The capability half of §10 — the inbox key and
+  the relay token — is what does not depend on this. Prerequisite filed
+  as `MD-AUTHORING-DEVICE-SIGNED`.
+- **Arrival, not authorship, is what is judged.** A body the device
+  wrote before its revocation and that arrives after it — an ordinary DTN
+  carry or a relay row that sat for days — is dropped, because the only
+  "when" available is one the sender chose and believing it would let a
+  thief backdate everything.
+- **Step 2's rotation is authorized by the person root, not by the
+  member token**, since the revoked device holds that token. relayd
+  registers the rotation key on first use and pins it after; the
+  consequence is that a shared Shore Pass becomes rotatable by exactly
+  one person, which matches the organizer reality.
+- **Step 1 does not rotate the key contacts write to.** Inbox key
+  generation 0 *is* the deployed person agreement key that every friend
+  card carries, so rotating it would mean re-friending everybody — a §2
+  non-goal. What the rotation withdraws is the fleet's self-sync channel,
+  the retained backlog, and (with step 2) the relay mailbox.
 
 Long-term (out of v1, tracked as WP8): per-device opaque fetch/ack
 capabilities in relayd, so one device can be cut without rotating the

@@ -3030,9 +3030,13 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // deterministic reject, not a store failure. The message row above
         // still stands so the sender's watermark advances and they stop
         // re-spraying it.
+        // The clock is passed so core can refuse an epoch further ahead than
+        // believable skew -- a notice stamped past the end of time would
+        // otherwise pin this contact's endpoint shut forever.
         let applied = (try? store.applyContactRelayUpdate(
             senderUserId: senderUserId,
-            content: content
+            content: content,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1000)
         )) ?? false
         if applied {
             log.info("Applied a relay update from \(UserIdHex.encode(contact.userId), privacy: .public)")

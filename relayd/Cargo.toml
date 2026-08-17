@@ -10,7 +10,17 @@ repository.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 blake2 = "0.10"
+# Rotation authority (`POST /family/rotate`): verifying the caller's Ed25519
+# signature over the token change. Pinned to the same major version core signs
+# with (`core/Cargo.toml`), so a signature core produces is one this verifies.
+# The `rand_core` feature is for the test module, which mints keypairs to sign
+# with; verification itself needs no randomness.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 jsonwebtoken = "9"
+# Minting the opaque `families.family_id`. The OS CSPRNG rather than a seeded
+# PRNG: the id is an addressing handle an operator types, not a secret, but a
+# predictable one would let a caller enumerate which families exist.
+rand_core = { version = "0.6", features = ["getrandom"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

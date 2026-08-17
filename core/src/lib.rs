@@ -8,6 +8,7 @@ mod backup;
 mod causal_order;
 mod connection_health;
 mod contact_relay_health;
+mod contact_safety;
 mod content;
 mod crypto;
 mod deep_link;
@@ -33,9 +34,11 @@ mod protocol;
 mod protocol_event;
 mod recipient_hints;
 mod relay_cursor;
+mod relay_rotation;
 mod relay_setup;
 mod relay_status;
 mod relay_wire;
+mod revocation;
 mod roster_store;
 mod sail_checklist;
 mod semantic;
@@ -78,6 +81,10 @@ pub use contact_relay_health::{
     core_contact_relay_unreachable_is_stale, CONTACT_RELAY_RECHECK_MS, CONTACT_RELAY_STALE_STREAK,
     CONTACT_RELAY_UNREACHABLE_REST_MS, CONTACT_RELAY_UNREACHABLE_STALE_STREAK,
     CONTACT_RELAY_UNREACHABLE_STREAK,
+};
+pub use contact_safety::{
+    core_roster_safety_changes, ContactSafetyChange, ContactSafetyFact, ContactSafetyReason,
+    CONTACT_SAFETY_FACT_PAGE,
 };
 pub use content::{
     attachment_max_blob_bytes, decode_attachment_payload, decode_reaction_payload,
@@ -124,6 +131,7 @@ pub use device_roster::{
     DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
     RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
     DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+    ROSTER_MAX_VERSION_JUMP,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
@@ -225,6 +233,10 @@ pub use relay_cursor::{
     RELAY_MAILBOX_MAX_ENVELOPES_PER_PASS, RELAY_MAILBOX_MAX_PAGES_PER_PASS,
     RELAY_SWEEP_INTERVAL_MS,
 };
+pub use relay_rotation::{
+    core_mint_relay_member_token, core_plan_relay_rotation, RelayRotationCommit, RelayRotationPlan,
+    RELAY_EPOCH_MAX_SKEW_MS, RELAY_MEMBER_TOKEN_PREFIX, SYNC_RELAY_CREDENTIAL_SETTING_KEY,
+};
 pub use relay_setup::{
     make_relay_setup_card, parse_relay_setup_text, relay_setup_is_official, RelaySetup,
 };
@@ -235,13 +247,19 @@ pub use relay_status::{
 pub use relay_wire::{
     core_group_fanout_relay_target, normalize_relay_url, relay_build_fetch_path,
     relay_contact_shares_own_family, relay_decode_fetch_page, relay_decode_post_response,
-    relay_decode_presence_page, relay_deposit_token_for, relay_encode_ack_request,
-    relay_encode_post_envelope, relay_encode_presence_request, relay_fetch_batch_limit,
-    relay_fetch_shrunk_limit, relay_max_response_bytes, relay_token_is_deposit,
+    relay_decode_presence_page, relay_decode_rotate_response, relay_deposit_token_for,
+    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
+    relay_encode_rotate_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
+    relay_max_response_bytes, relay_rotate_path, relay_token_is_deposit,
     resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
     resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
-    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, GroupRelayMember,
-    RelayEndpoint,
+    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, CoreRelayRotation,
+    GroupRelayMember, RelayEndpoint,
+};
+pub use revocation::{
+    core_recovery_revoke_roster, core_revoke_devices_roster, core_roster_newly_revoked,
+    PendingRevocation, RevocationAdoption, RevocationAdoptionOutcome, RevocationCommit,
+    RevocationHandoff, RevocationPath, RevocationUpdate,
 };
 pub use roster_store::{ContactDeviceState, ContactRosterState};
 pub use sail_checklist::{
@@ -359,8 +377,9 @@ pub use sync_record::{
     core_decode_sync_watermarks, core_device_sync_identity, core_encode_sync_contacts,
     core_encode_sync_groups, core_encode_sync_history, core_encode_sync_own_roster,
     core_encode_sync_record, core_encode_sync_settings, core_encode_sync_watermarks,
-    core_mint_inbox_key, core_open_sync_record, core_rotate_inbox_key, core_seal_sync_record,
-    core_sign_sync_record, core_sync_kind_is_stream, core_sync_record_admit, core_sync_record_id,
+    core_mint_inbox_key, core_open_sync_handoff, core_open_sync_record, core_rotate_inbox_key,
+    core_seal_sync_handoff, core_seal_sync_record, core_sign_sync_record, core_sync_handoff_admit,
+    core_sync_kind_is_stream, core_sync_record_admit, core_sync_record_id,
     core_sync_record_kind_of, core_sync_record_kind_wire, core_sync_seal_is_current,
     core_verify_sync_record, InboxKey, SealedSyncRecord, SyncContactEntry, SyncContactsPayload,
     SyncGroupsPayload, SyncHistoryDirection, SyncHistoryEntry, SyncHistoryPayload,

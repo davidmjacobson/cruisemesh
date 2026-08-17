@@ -181,6 +181,89 @@ named volume so this cannot silently drift.
   same routes; the server never inspects `kind`.
 - **WebSocket push** (`GET /ws`): see §7. Acks remain `POST /envelopes/ack`;
   poll stays available and unchanged for offline/reconnect catch-up.
+- **Self-service token rotation** (`POST /family/rotate`): see §6.1.
+
+### 6.1 Self-service token rotation (`POST /family/rotate`)
+
+The one route where a family credential authorizes changing that credential.
+It exists because every table here is scoped by `family_token`, so a phone that
+has been removed from its owner's device roster keeps full fetch *and ack*
+access to the family mailbox — and ack deletes — until the token itself moves.
+Waiting for an operator would make "remove this stolen phone" a support ticket
+(`specs/multi-device-v1.md` §10 step 2).
+
+```sh
+curl -sS -X POST https://relay.example.com/family/rotate \
+  -H "Authorization: Bearer $CURRENT_MEMBER_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"new_token":"cmfam1-...",
+       "rotation_pk":"<32 bytes, base64url, no padding>",
+       "rotation_sig":"<64 bytes, base64url, no padding>"}'
+# → {"family_token":"cmfam1-…","deposit_token":"cmdep1-…",
+#    "envelopes_moved":42,"rotated":true}
+```
+
+| Concern | Behavior |
+|---|---|
+| Auth | The family's **member** token **and** an Ed25519 signature (below). A deposit credential gets `403 deposit_only` before anything else — deposit tokens ride friend cards, so a rotatable one would let anyone the family ever showed a QR code lock them out. |
+| Who picks the token | The **client**, which is what makes a lost response survivable: it writes the candidate down before calling, so it can always ask again. The app mints one with 32 bytes of randomness behind a `cmfam1-` prefix. Minimum accepted length is 24 characters — the only entropy check a server can make from outside. |
+| Idempotency | Presenting the *new* token returns `rotated: false` with the same values. That is the recovery path after a dropped connection, and it is a success, not a conflict. The retry must be signed too, over `(new, new)`. |
+| What moves | Envelopes (ids, hints and fetch order untouched) and presence, in one transaction. Nothing is deleted: a rotation must never cost a sibling an un-fetched row. |
+| What is purged | **Push registrations.** Each row is one device's APNs wake channel, and the relay cannot tell the revoked device's from a sibling's — carrying them across would leave the evicted phone still being woken for the family's mail. Siblings re-register on their next round, so the cost is one round of notification latency. |
+| What dies | The old member token **and** its derived deposit token, at once. Friend cards minted from the old token stop depositing immediately; the app repairs contacts with a `CAP_RELAY_UPDATE` notice carrying the new deposit token, and anyone sharing the pass with a re-shared `CMRELAY1` setup card. |
+| Static families | `409 rotation_unsupported`. A token from `CRUISEMESH_RELAY_TOKENS` has no row to re-key — change the env var and hand out a new setup card. |
+| Taken token | `409 rotation_token_taken` if another family already holds the proposed token as its member *or* deposit credential. |
+| Not authorized | `403 rotation_unauthorized` — the token is real but the signature is not the family's. See below. |
+| Malformed signature | `400` for a missing field, unparseable base64, or a wrong decoded length. Distinct from the 403 on purpose: the remedy is to fix the encoder, not to find a different key. |
+| Rate limit | Its own small bucket, **not** the family's shared request allowance (§10). |
+
+#### Rotation authority (why the token alone is not enough)
+
+The device this ceremony exists to evict is holding the family's member token.
+If possession authorized the rotation, that device could run the ceremony first
+and lock the owner out. So a rotation must also be signed:
+
+```
+message = b"CruiseMesh family token rotation v1\0"
+       || u16_be(len(current_token)) || current_token
+       || u16_be(len(new_token))     || new_token
+```
+
+`current_token` is the bearer token presented on the request (trimmed);
+`new_token` is the trimmed replacement. `rotation_pk` is the 32-byte Ed25519
+public key, `rotation_sig` the 64-byte signature over those bytes, both
+base64url **without** padding.
+
+Verification happens inside the same transaction that performs the re-key:
+
+- **No key registered yet** (`rotation_pk` NULL, which is every family
+  provisioned before this shipped): the signature is checked against the
+  *presented* key, and if it verifies that key is written to the row —
+  trust on first rotation.
+- **A key is registered**: the presented key must be that key, and the
+  signature must verify under it. A different key is refused without its
+  signature being examined.
+
+Two consequences worth stating to an operator plainly:
+
+1. **After a family's first rotation, exactly one key can ever rotate it
+   again.** There is no recovery here for a family that loses that key short
+   of re-provisioning. On a shared Shore Pass this means only the organizer's
+   person root can rotate — which matches who actually administers a shared
+   pass.
+2. **A thief can race trust-on-first-rotation, once.** On the very first
+   rotation of a legacy family there is no stored key to check against, so a
+   revoked device holding a live member token could register its own key
+   first and keep the authority. This residual is accepted deliberately and is
+   bounded three ways: families provisioned before this shipped only, until
+   their first rotation only, and it requires the hostile device to still hold
+   a valid member token. Refusing legacy families their first rotation instead
+   would leave exactly the families most likely to need a revocation unable to
+   perform one.
+
+Operational note: after a rotation the family appears under a **new token** in
+`GET /admin/families`, but its `family_id` is unchanged — record that, not the
+token, if you track a customer across time (§12).
 
 ## 7. WebSocket push (`GET /ws`)
 
@@ -483,6 +566,7 @@ connection on a $4 VPS. Three token buckets close it:
 | Uploaded `sealed` bytes, per deposit token | 6 MiB/min | `CRUISEMESH_RELAY_DEPOSIT_RATE_BYTES_PER_MIN` |
 | Requests, all tokens combined | 6,000/min | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` |
 | Cross-family presence queries, per deposit token | 4 per 15 min | `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES`, `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS` |
+| `POST /family/rotate`, per family | 10 per hour | not tunable by env yet |
 
 The last one is shaped the other way round from the rest — a small burst over
 a long window rather than a generous per-minute figure — and it is charged to
@@ -492,10 +576,26 @@ so, it spends neither the request nor the byte allowance of the family whose
 relay answers. The client asks at most once per contact per fifteen minutes,
 so four in a window is a device asking on schedule with three spare.
 
-Buckets are keyed by the *presented* credential, so a family's deposit
-traffic (friend cards, i.e. what strangers can hold) exhausts its own
-tighter allowance and never spends the family's member-class budget — and
-vice versa. The deposit defaults are a tenth of the member ones: one post a
+The rotation bucket is shaped that way too, and for a sharper reason: a
+rotation is the *remedy* for a family whose member token is in hostile hands,
+and the device holding that token can burn the family's shared request
+allowance at will. Charging the remedy to the bucket the attacker controls
+would let the attacker hold the family's own eviction call at 429
+indefinitely. Ten per hour covers a real ceremony plus retries plus a client
+fumbling the request shape a few times, and covers nothing else; the bucket is
+charged per attempt, before the request is even validated, so garbage is not
+free.
+
+Buckets are keyed by the family's **stable id** (§12) namespaced by the
+presented credential's class, so a family's deposit traffic (friend cards,
+i.e. what strangers can hold) exhausts its own tighter allowance and never
+spends the family's member-class budget — and vice versa. Keying on the id
+rather than the token string is what stops `POST /family/rotate` from silently
+handing a family a fresh full allowance (and orphaning its WebSocket
+connection-cap entry) every time it re-keys. Static `CRUISEMESH_RELAY_TOKENS`
+families have no table row and so no id; they key on the token string, which
+is correct for them — an operator-configured token only changes when you edit
+the config and restart. The deposit defaults are a tenth of the member ones: one post a
 second sustained (~34 max-size attachments a minute) is generous for a real
 contact and useless for a card-scraping flood, which now caps out at noise
 instead of the family's full 64 MiB/min.
@@ -620,6 +720,18 @@ to take at most a few seconds; there is no separate migration step to run
 by hand. If you operate an unusually large relayd database, expect a
 one-time longer startup on the first upgrade.
 
+### `families` schema migrations
+
+Column additions to `families` are applied by `RelayStore::open` on start,
+idempotently, with no operator step and no downtime beyond the restart:
+`deposit_token` (backfilled by derivation from each existing member token),
+then `family_id` (backfilled with a freshly minted `cmfid1-…` per row) and
+`rotation_pk`. `rotation_pk` is deliberately **not** backfilled — NULL is its
+meaningful value and means "no rotation authority registered yet", which is
+the correct starting state for every family that predates §6.1. Re-running is
+a no-op, so a rollback and re-upgrade is safe; a downgrade to a build that
+predates these columns also works, since it simply ignores them.
+
 ## 12. Hosted-family admin API (`/admin/families`)
 
 Off by default. Setting `CRUISEMESH_RELAY_ADMIN_TOKEN` (generate like a family
@@ -649,8 +761,21 @@ implicit always-active families). Semantics:
   fields. The purchase flow keeps putting `token` on the setup card; nothing
   needs to deliver `deposit_token` anywhere (phones derive it themselves),
   it is returned for operator visibility and support. Member tokens starting
-  with the reserved `cmdep1-` deposit prefix are rejected with a 400. Routes
-  are keyed by the member token only; a deposit token in the path is a 404.
+  with the reserved `cmdep1-` deposit prefix are rejected with a 400. A deposit
+  token in the path is a 404.
+- **Stable `family_id`**: every family object also carries an opaque
+  `cmfid1-…` id, minted at provisioning and **never changed** — including by
+  `POST /family/rotate`, which replaces both tokens. Existing families were
+  backfilled with one on the first restart after this shipped. Record this,
+  not the token, if you need to find a customer's family again later.
+  `GET`/`PATCH`/`DELETE /admin/families/{id}` resolve the path segment as
+  **family id first, then current member token**, so the pass-issuing flow
+  that stored a token keeps working while that token is current, and an
+  operator can still reach a family that has rotated. The two namespaces
+  cannot collide — ids carry the `cmfid1-` prefix and provisioning and
+  rotation both reject tokens wearing it — so the resolution order is a
+  tie-break that never fires in practice. A token that has been rotated away
+  resolves to nothing (404), which is the point of rotating it.
 - All operations are idempotent — the billing webhook retries on failure,
   and re-provisioning the same member token derives the same deposit token.
 
@@ -666,8 +791,11 @@ curl -s -X POST https://relay.example.com/admin/families \
 curl -s "https://relay.example.com/admin/families?status=active&limit=50&offset=0" \
   -H "authorization: Bearer $ADMIN"
 
-# Inspect (includes usage_bytes / envelope_count for support)
+# Inspect (includes usage_bytes / envelope_count for support).
+# The path segment may be the current member token OR the stable family id —
+# after a rotation only the id still works.
 curl -s https://relay.example.com/admin/families/<family-token> -H "authorization: Bearer $ADMIN"
+curl -s https://relay.example.com/admin/families/cmfid1-<id> -H "authorization: Bearer $ADMIN"
 
 # Suspend / extend
 curl -s -X PATCH https://relay.example.com/admin/families/<family-token> \

@@ -134,6 +134,21 @@ struct PresenceResponse {
     presence: Vec<PresenceWire>,
 }
 
+#[derive(Serialize)]
+struct RotateFamilyRequest {
+    new_token: String,
+    rotation_pk: String,
+    rotation_sig: String,
+}
+
+#[derive(Deserialize)]
+struct RotateFamilyResponse {
+    family_token: String,
+    deposit_token: String,
+    envelopes_moved: u64,
+    rotated: bool,
+}
+
 /// CP4 (deposit-token split): class prefix that marks a *deposit* relay
 /// token — post-only into one family's mailbox, minted by attenuating the
 /// family's full member token. The prefix makes the class recognizable from
@@ -760,6 +775,170 @@ pub fn relay_decode_presence_page(body: Vec<u8>) -> Result<CoreRelayPresencePage
     Ok(CoreRelayPresencePage {
         now_ms: wire.now_ms,
         presence,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §10 step 2: rotating the family's own member token
+// ---------------------------------------------------------------------------
+
+/// What relayd reported about a rotation (`specs/multi-device-v1.md` §10 step
+/// 2, [`relay_decode_rotate_response`]).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreRelayRotation {
+    /// The family's member token from here on — read back from the server
+    /// rather than assumed, so a device that lost an earlier response learns
+    /// which credential actually won.
+    pub family_token: String,
+    /// Its deposit attenuation, the credential friend cards carry. A device
+    /// can derive this offline with [`relay_deposit_token_for`]; comparing the
+    /// two is how it notices a server that answered about a different family.
+    pub deposit_token: String,
+    /// Rows the server carried across. "Rotate, then drain": no sibling loses
+    /// un-fetched mail to make a rotation happen, and this is the figure that
+    /// says so.
+    pub envelopes_moved: u64,
+    /// `false` when the server found the rotation already committed — the
+    /// answer to a retry after a lost response, and a success, not a failure.
+    pub rotated: bool,
+}
+
+/// The path [`relay_encode_rotate_request`] posts to.
+///
+/// A function rather than a constant so both shells route identically and
+/// neither hand-writes the string, exactly as [`relay_build_fetch_path`]
+/// exists so neither hand-writes the fetch query.
+#[uniffi::export]
+pub fn relay_rotate_path() -> String {
+    "/family/rotate".to_string()
+}
+
+/// Signing domain for §10.2's rotation authorization. Its own domain, like
+/// every other signature in this codebase, so a signature minted to authorize
+/// a rotation can never be replayed as a roster, a certificate, or a card.
+const FAMILY_ROTATION_SIGN_DOMAIN: &[u8] = b"CruiseMesh family token rotation v1\0";
+
+/// The bytes a rotation signature covers: the domain, then both credentials,
+/// each length-prefixed.
+///
+/// Both tokens are in the message and both are length-prefixed, which is what
+/// makes the signature a statement about *this* rotation rather than a bearer
+/// token of its own. Covering only the replacement would let a captured
+/// signature be replayed to re-key some other family the same key controls;
+/// concatenating without lengths would let `("ab", "c")` and `("a", "bc")`
+/// share a signature.
+fn family_rotation_signing_bytes(current_token: &str, new_token: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        FAMILY_ROTATION_SIGN_DOMAIN.len() + 4 + current_token.len() + new_token.len(),
+    );
+    out.extend_from_slice(FAMILY_ROTATION_SIGN_DOMAIN);
+    for field in [current_token, new_token] {
+        out.extend_from_slice(&(field.len().min(u16::MAX as usize) as u16).to_be_bytes());
+        out.extend_from_slice(field.as_bytes());
+    }
+    out
+}
+
+/// Body for §10.2's rotation call.
+///
+/// # Why the bearer token is not the authority
+///
+/// The obvious design — the family's current member token authorizes changing
+/// that token — is the one thing §10's threat model forbids, because **the
+/// revoked device holds that token**. A rotation authorized by possession
+/// alone is a rotation the thief can perform first, re-keying the family to a
+/// credential only it knows and locking the owner out of their own mailbox
+/// with the owner's own remedy. So the bearer token still says *which* family
+/// this is, and a signature says *who may re-key it*.
+///
+/// The signing key is the **person root** public key, and that choice is the
+/// load-bearing one. It is stable across every change of approving device —
+/// §14.2 keeps it inside the passphrase-encrypted `.cmbak` and off every
+/// linked device, so a stolen phone never holds it, and the recovery path
+/// always can sign with it. A roster-signing device key would have had to be
+/// re-registered on the server every time the role moved, and the recovery
+/// path — the one that matters most, because it is the path a *stolen
+/// approving device* is dethroned by — could not have signed at all.
+///
+/// relayd registers the key on first use (trust on first rotation) and pins it
+/// thereafter; see its `rotate_family` handler for the server half, including
+/// the two consequences that follow (a shared pass becomes rotatable by one
+/// person only, and the bounded first-rotation-on-a-legacy-family window).
+///
+/// `new_token` is minted locally by [`crate::core_mint_relay_member_token`]
+/// and must already be written down durably before this is sent — see
+/// [`crate::MessageStore::begin_relay_rotation`]. The client choosing the
+/// replacement is what makes a lost response recoverable instead of terminal;
+/// a retry after a lost response presents the new token as both halves, so it
+/// re-signs over `(new_token, new_token)`, which this function produces
+/// naturally when the caller passes the new token as `current_token`.
+#[uniffi::export]
+pub fn relay_encode_rotate_request(
+    current_token: String,
+    new_token: String,
+    person_root_sign_sk: Vec<u8>,
+) -> Result<Vec<u8>, CoreError> {
+    if relay_token_is_deposit(new_token.clone()) {
+        return Err(malformed(
+            "a family's member token may not be deposit-class",
+        ));
+    }
+    if new_token.trim().is_empty() || current_token.trim().is_empty() {
+        return Err(malformed("a family token cannot be empty"));
+    }
+    // `current_token` is signed **exactly as it will be presented** in the
+    // Authorization header, because that is the string relayd resolves the
+    // family row by and therefore the string it reconstructs the signed bytes
+    // from. `new_token` is trimmed because relayd trims the field it parses.
+    // Two different rules, each matching the server's own handling of that
+    // side — a mismatch here is a rotation that fails to verify with no useful
+    // way to tell why.
+    let new_token = new_token.trim().to_string();
+    let signing_key = crate::crypto::signing_key_from_bytes(&person_root_sign_sk)?;
+    let signature = {
+        use ed25519_dalek::Signer;
+        signing_key.sign(&family_rotation_signing_bytes(&current_token, &new_token))
+    };
+    json_encode(&RotateFamilyRequest {
+        new_token,
+        rotation_pk: b64(signing_key.verifying_key().as_bytes()),
+        rotation_sig: b64(&signature.to_bytes()),
+    })
+}
+
+/// Decode relayd's answer, refusing one that does not describe the rotation
+/// that was asked for.
+///
+/// The `expected_token` check is the point of decoding this at all. A rotation
+/// is the one call whose *result* the device then commits to platform storage
+/// and gossips to its whole contact list, so an answer naming a different
+/// credential — a proxy replaying an older family's response, a server that
+/// resolved the bearer to something else — must not be adopted quietly. And
+/// the deposit half is re-derived rather than trusted: it is what friend cards
+/// will carry, so a server-supplied value that did not attenuate from the
+/// member token would put an unrelated credential on every card.
+#[uniffi::export]
+pub fn relay_decode_rotate_response(
+    body: Vec<u8>,
+    expected_token: String,
+) -> Result<CoreRelayRotation, CoreError> {
+    validate_response_body(&body)?;
+    let wire = json_decode::<RotateFamilyResponse>(&body)?;
+    if wire.family_token != expected_token {
+        return Err(malformed(
+            "the relay rotated to a different token than the one requested",
+        ));
+    }
+    if wire.deposit_token != relay_deposit_token_for(wire.family_token.clone()) {
+        return Err(malformed(
+            "the relay's deposit token does not attenuate from the rotated member token",
+        ));
+    }
+    Ok(CoreRelayRotation {
+        family_token: wire.family_token,
+        deposit_token: wire.deposit_token,
+        envelopes_moved: wire.envelopes_moved,
+        rotated: wire.rotated,
     })
 }
 

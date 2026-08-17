@@ -192,6 +192,21 @@ pub struct SyncApplyResult {
     /// back rather than stored for the same reason a watermark is not
     /// backfilled — it is true for exactly as long as it takes to act on.
     pub peer_digest: Option<SyncDigest>,
+    /// The family relay credential a sibling published, for
+    /// [`SyncRecordKind::Settings`] records that carried a *winning* write to
+    /// [`crate::SYNC_RELAY_CREDENTIAL_SETTING_KEY`] (§10 step 2).
+    ///
+    /// Surfaced for the same reason `own_roster` is, and with the same
+    /// division of labour: the setting itself is merged here, because it is
+    /// ordinary newest-wins shared state, but *acting* on it means writing a
+    /// bearer credential into platform-protected storage, which is a shell's
+    /// job and nobody else's. A device that had to poll
+    /// [`crate::MessageStore::relay_credential_setting`] after every round to
+    /// notice a rotation would keep hammering a dead token in between.
+    ///
+    /// `None` on every other record, and on a Settings record whose credential
+    /// entry lost the merge — a losing write is not news.
+    pub relay_credential: Option<crate::RelayEndpoint>,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +468,109 @@ pub(crate) fn backfill_offers(
     Ok(out)
 }
 
+/// Every sealed copy this device authored that is still sealed under
+/// `inbox_key_generation`, oldest slot first (§10.1's re-seal set).
+///
+/// Scoped to one generation on purpose. A revocation re-seals the backlog from
+/// the key it is rotating *away from* to the key it is rotating *to*, and this
+/// device holds exactly those two — a row sealed under some older generation
+/// would need a key that is gone, so it is not silently swept into a batch that
+/// cannot possibly open it. It is left alone and counted, never deleted:
+/// `rotate, then drain` means the rotation must not be able to lose a record.
+pub(crate) fn sealed_records_at_generation(
+    conn: &Connection,
+    author_device_id: &[u8],
+    inbox_key_generation: u64,
+) -> Result<Vec<StoredSyncRecord>, CoreError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, stream_seq, sealed, sealed_recovery_epoch, sealed_seq
+             FROM sync_stream_records
+             WHERE author_device_id = ?1 AND sealed IS NOT NULL AND inbox_key_generation = ?2
+             ORDER BY kind ASC, stream_seq ASC",
+        )
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map(
+            params![author_device_id.to_vec(), inbox_key_generation as i64],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as u8,
+                    row.get::<_, i64>(1)? as u64,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)? as u64,
+                ))
+            },
+        )
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (wire_kind, stream_seq, sealed, recovery_epoch, seq) = row.map_err(store_err)?;
+        // A kind this build cannot name is a row it cannot re-seal; leaving it
+        // untouched is the same "never lose it" rule as the generation scope.
+        let Some(kind) = core_sync_record_kind_of(wire_kind) else {
+            continue;
+        };
+        out.push(StoredSyncRecord {
+            author_device_id: author_device_id.to_vec(),
+            kind,
+            stream_seq,
+            sealed,
+            sealed_for: RosterVersion {
+                recovery_epoch,
+                seq,
+            },
+            inbox_key_generation,
+        });
+    }
+    Ok(out)
+}
+
+/// One sealed copy by its exact stream slot, whatever generation it is sealed
+/// under.
+///
+/// Deliberately *not* generation-scoped, unlike
+/// [`sealed_records_at_generation`], because the one caller
+/// ([`crate::MessageStore::revocation_handoffs_for`]) is asking for a record it
+/// already knows the identity of: §10.1's rotation announcement, whose slot the
+/// revocation journal wrote down. Scoping it by generation there would mean the
+/// re-issue path had to guess which generation the announcement ended up sealed
+/// under after some later rotation re-sealed it, and get it wrong exactly when
+/// the fleet has rotated twice.
+pub(crate) fn sealed_record_at_slot(
+    conn: &Connection,
+    author_device_id: &[u8],
+    kind: SyncRecordKind,
+    stream_seq: u64,
+) -> Result<Option<StoredSyncRecord>, CoreError> {
+    conn.query_row(
+        "SELECT sealed, sealed_recovery_epoch, sealed_seq, inbox_key_generation
+         FROM sync_stream_records
+         WHERE author_device_id = ?1 AND kind = ?2 AND stream_seq = ?3 AND sealed IS NOT NULL",
+        params![
+            author_device_id.to_vec(),
+            core_sync_record_kind_wire(kind) as i64,
+            stream_seq as i64
+        ],
+        |row| {
+            Ok(StoredSyncRecord {
+                author_device_id: author_device_id.to_vec(),
+                kind,
+                stream_seq,
+                sealed: row.get(0)?,
+                sealed_for: RosterVersion {
+                    recovery_epoch: row.get::<_, i64>(1)? as u64,
+                    seq: row.get::<_, i64>(2)? as u64,
+                },
+                inbox_key_generation: row.get::<_, i64>(3)? as u64,
+            })
+        },
+    )
+    .optional()
+    .map_err(store_err)
+}
+
 /// One of this device's own sealed records, ready to hand to a transport.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct StoredSyncRecord {
@@ -652,6 +770,7 @@ pub(crate) fn apply(
             through_seq: 0,
             own_roster: None,
             peer_digest: Some(peer_digest),
+            relay_credential: None,
         });
     }
 
@@ -679,16 +798,22 @@ pub(crate) fn apply(
             through_seq: stream_cursor(&conn, &author_device_id, kind)?,
             own_roster: None,
             peer_digest: None,
+            relay_credential: None,
         });
     }
 
     let mut own_roster = None;
+    let mut relay_credential = None;
     let applied_entries = match kind {
         SyncRecordKind::History => apply_history(store, &record)?,
         SyncRecordKind::Watermarks => apply_watermarks(store, &record)?,
         SyncRecordKind::Contacts => apply_contacts(store, &record)?,
         SyncRecordKind::Groups => apply_groups(store, &record)?,
-        SyncRecordKind::Settings => apply_settings(store, &record, now_ms)?,
+        SyncRecordKind::Settings => {
+            let (count, credential) = apply_settings(store, &record, now_ms)?;
+            relay_credential = credential;
+            count
+        }
         SyncRecordKind::OwnRoster => {
             let payload = core_decode_sync_own_roster(record.payload.clone())?;
             let count = payload.inbox_keys.len() as u32;
@@ -714,6 +839,7 @@ pub(crate) fn apply(
         through_seq: stream_cursor(&conn, &author_device_id, kind)?,
         own_roster,
         peer_digest: None,
+        relay_credential,
     })
 }
 
@@ -901,20 +1027,45 @@ fn apply_groups(store: &MessageStore, record: &SyncRecord) -> Result<u32, CoreEr
 /// on a surface, and a fleet where a stale sibling's list could *un*block
 /// somebody would be a fleet where the safety-relevant direction is the one
 /// that loses a race.
+///
+/// Two reserved keys are picked out of the merge as it runs, and the difference
+/// between them is the difference between state the core owns and state a shell
+/// owns. A won block-list write is *acted on* here, because the local block
+/// table is what refuses mail and the core owns it. A won relay credential
+/// (§10 step 2) is only *reported*, through
+/// [`SyncApplyResult::relay_credential`]: writing a bearer token into
+/// platform-protected storage is the shell's job, exactly as it is for the
+/// inbox keys an own-roster record carries.
 fn apply_settings(
     store: &MessageStore,
     record: &SyncRecord,
     now_ms: i64,
-) -> Result<u32, CoreError> {
+) -> Result<(u32, Option<crate::RelayEndpoint>), CoreError> {
     let payload = core_decode_sync_settings(record.payload.clone())?;
     let mut applied = 0;
     let mut newly_blocked: Vec<Vec<u8>> = Vec::new();
+    let mut relay_credential = None;
+    let own_roster = store.own_roster()?;
     {
         let conn = store.locked_conn();
         for entry in payload.entries {
+            if entry.key == crate::SYNC_RELAY_CREDENTIAL_SETTING_KEY
+                && !relay_credential_entry_is_admissible(&entry, own_roster.as_ref(), now_ms)
+            {
+                // Counted as seen but never stored. See
+                // `relay_credential_entry_is_admissible`: this is the one
+                // setting whose value is a bearer credential for the family
+                // mailbox, so an entry the revocation already disowned must
+                // not be allowed to win the merge on its way past.
+                applied += 1;
+                continue;
+            }
             let took = put_setting(&conn, &entry)?;
             if took && entry.key == SYNC_BLOCKED_SETTING_KEY {
                 newly_blocked = decode_block_list(&entry.value);
+            }
+            if took && entry.key == crate::SYNC_RELAY_CREDENTIAL_SETTING_KEY {
+                relay_credential = crate::relay_rotation::decode_relay_credential(&entry.value);
             }
             applied += 1;
         }
@@ -922,7 +1073,51 @@ fn apply_settings(
     for user_id in newly_blocked {
         store.block_user(user_id, now_ms)?;
     }
-    Ok(applied)
+    Ok((applied, relay_credential))
+}
+
+/// Whether an incoming `relay.credential` entry may be merged at all (§10.2).
+///
+/// Every other shared setting is content: a theme, a draft, a block list. This
+/// one is a **bearer credential for the whole family's relay mailbox**, and
+/// §10's threat model says the device the rotation is cutting off held the
+/// inbox key right up until the moment it was rotated. It could therefore have
+/// authored a perfectly well-formed Settings record before being buried, and
+/// the merge — "highest `(epoch, author_device_id, value)` wins" — would
+/// happily let it decide where the fleet's mail goes forever. So this key gets
+/// two admission rules the ordinary merge order cannot express:
+///
+/// * **A revoked author is refused** (DL-4, §10.3). `core_sync_record_admit`
+///   already refuses a record *authored* by a tombstoned device, but a
+///   settings record is a page of entries and each entry names its own author:
+///   a still-active sibling replaying the thief's entry inside its own record
+///   would otherwise carry it straight through. This is §10.3's rule applied
+///   one level in, at the entry.
+/// * **An epoch beyond bounded clock skew is refused**
+///   ([`crate::RELAY_EPOCH_MAX_SKEW_MS`]). An entry stamped at `u64::MAX` is
+///   not a device with a wrong clock, it is a device pinning the key shut: no
+///   honest rotation could ever stamp higher, so no replacement credential
+///   could ever be announced again.
+///
+/// Refusal is a skip, not an error. One inadmissible entry must not strand the
+/// other settings sharing its record — the same tolerance
+/// [`decode_block_list`] keeps for a value this build cannot read.
+pub(crate) fn relay_credential_entry_is_admissible(
+    entry: &SyncSettingEntry,
+    own_roster: Option<&crate::Roster>,
+    now_ms: i64,
+) -> bool {
+    if let Some(roster) = own_roster {
+        if roster
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone.device_id == entry.author_device_id)
+        {
+            return false;
+        }
+    }
+    let ceiling = now_ms.saturating_add(crate::RELAY_EPOCH_MAX_SKEW_MS).max(0) as u64;
+    entry.epoch <= ceiling
 }
 
 // ---------------------------------------------------------------------------

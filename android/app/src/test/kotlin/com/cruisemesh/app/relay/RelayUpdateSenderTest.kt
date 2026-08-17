@@ -58,7 +58,7 @@ class RelayUpdateSenderTest {
         assertEquals(RELAY_URL, update.relayUrl)
         assertEquals(DEPOSIT_TOKEN, update.relayToken)
 
-        assertTrue(bobStore.applyContactRelayUpdate(alice.userId, update))
+        assertTrue(bobStore.applyContactRelayUpdate(alice.userId, update, epoch))
         val repaired = bobStore.getContact(alice.userId)!!
         assertEquals(RELAY_URL, repaired.relayUrl)
         assertEquals(DEPOSIT_TOKEN, repaired.relayToken)

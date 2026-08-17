@@ -402,6 +402,33 @@ pub(crate) fn set_quarantined(
     Ok(())
 }
 
+/// DL-2 for a person this device may hold no *stored* roster row for.
+///
+/// [`set_quarantined`] is an update and deliberately so: a fork between two
+/// gossiped contact rosters is two documents at one version, so one of them is
+/// already in `contact_rosters` and there is always a row to flag. §10.1's
+/// handoff path broke that assumption — this person's own roster lives in
+/// `own_roster`, not here, so a fork discovered while adopting a sibling's
+/// rotation announcement has no row to update and the sticky bit would be
+/// dropped on the floor.
+///
+/// So this inserts the quarantine-only shape [`load_state`] already knows how
+/// to read: an empty `head_hash`, which is a value no real roster can have,
+/// and the bit. Nothing else is written, because nothing else is known — the
+/// document itself is not this table's to keep.
+pub(crate) fn mark_quarantined(conn: &Connection, person_user_id: &[u8]) -> Result<(), CoreError> {
+    conn.execute(
+        "INSERT INTO contact_rosters
+            (person_user_id, recovery_epoch, seq, approving_device_id,
+             inbox_key_generation, signer_sign_pk, signature, head_hash, quarantined)
+         VALUES (?1, 0, 0, X'', 0, X'', X'', X'', 1)
+         ON CONFLICT(person_user_id) DO UPDATE SET quarantined = 1",
+        params![person_user_id],
+    )
+    .map_err(store_err)?;
+    Ok(())
+}
+
 /// Whether this person's roster vouches for `device_id`.
 pub(crate) fn device_state(
     conn: &Connection,

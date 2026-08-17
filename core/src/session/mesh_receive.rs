@@ -58,6 +58,10 @@
 //!   delivered.
 //! - blocked sender — an opened pairwise envelope from a blocked identity is
 //!   consumed (so its relay copy acks away) but never delivered.
+//! - revoked signer (`specs/multi-device-v1.md` §10.3) — an event newly signed
+//!   by a device its person's roster has buried is consumed and never applied,
+//!   in either lane. Stored history is untouched: the buried device's stream
+//!   seals at its last pre-revocation point rather than being rewritten.
 //! - dedupe / expiry / reject gate, and the consumed-hidden set recording.
 
 use std::sync::Arc;
@@ -69,7 +73,7 @@ use crate::{
     decode_profile_sync_content, decode_receipt_content, decode_relay_update_content,
     encode_envelope_frame, friend_card_user_id, open_group_message, open_message, parse_frame,
     parse_friend_request_content, verify_shared_friend_card, CarriedEnvelope, Contact,
-    ContactDiscoveryPolicy, CoreError, CoreInboundDisposition, CoreInboundGate,
+    ContactDeviceState, ContactDiscoveryPolicy, CoreError, CoreInboundDisposition, CoreInboundGate,
     ExtendedMessageBody, Frame, FriendCard, Identity, IncomingMessageInsertOutcome,
     LanEndpointContent, MessageArrival, MessageStore, PendingSharedRequest, SeenIds,
     SharedFriendCard, StoredMessage, SyncDigest, DEVICE_HARD_CAP, KIND_FRIEND_REQUEST,
@@ -277,6 +281,29 @@ pub enum CoreDeliveryVerdict {
     /// ([`crate::core_pairwise_sender_authorized`]). Terminal, not a failure:
     /// retrying cannot make an already-authored envelope more authorized.
     DroppedUnauthorizedSender,
+    /// §10.3: the sealed body names a device its person's roster has buried
+    /// (DL-4), so this is a **newly received** event signed by a revoked
+    /// device. Terminal in the strongest sense available — a tombstone is
+    /// forever, so no later state can make these bytes acceptable, and the
+    /// stream they would have landed on stays sealed at its last
+    /// pre-revocation point.
+    ///
+    /// Nothing already stored is touched. §10.3 seals the future of that
+    /// stream, it does not rewrite its past: history a device wrote while it
+    /// was still trusted was legitimately received, and deleting it on a later
+    /// revocation would hand a thief the power to erase a conversation by
+    /// getting themselves revoked.
+    ///
+    /// **Bodies written before the revocation and delivered after it are
+    /// dropped too**, and that is a deliberate cost rather than an oversight.
+    /// A DTN carry or a relay row can sit for days, so a message the revoked
+    /// phone sent in good faith an hour before it was lost arrives to this
+    /// verdict and is discarded. The alternative — believing a timestamp the
+    /// sender chose — would let the thief backdate everything it writes and
+    /// walk straight through §10.3. There is no authenticated "when" to check
+    /// against, so the rule is the arrival, not the claim.
+    /// `pre_revocation_carry_arriving_after_the_tombstone_is_dropped` pins it.
+    DroppedRevokedDevice,
     /// The body — or the per-kind content inside it — could not be decoded, or
     /// failed a body-shape check the sender controls (a receipt that does not
     /// acknowledge this device, a group invite whose membership omits its own
@@ -390,14 +417,19 @@ impl MessageStore {
     ///
     /// A rejection the bytes themselves earn is not an error. It comes back as
     /// a terminal [`CoreDeliveryVerdict::DroppedForeignChat`],
-    /// [`CoreDeliveryVerdict::DroppedUnauthorizedSender`] or
+    /// [`CoreDeliveryVerdict::DroppedUnauthorizedSender`],
+    /// [`CoreDeliveryVerdict::DroppedRevokedDevice`] or
     /// [`CoreDeliveryVerdict::DroppedMalformed`], which the caller commits like
     /// any other consumption so the relay copy acks away instead of refetching
     /// and re-failing forever. Retrying a signed body that will not decode
     /// cannot make it decode.
     ///
-    /// The two gates it applies before any kind runs:
+    /// The three gates it applies before any kind runs:
     ///
+    /// - §10.3 — an event newly signed by a device its person's roster has
+    ///   buried is refused outright ([`Self::signer_device_revoked`]). It runs
+    ///   first because a tombstone answers whether the signature counts at
+    ///   all, which precedes any question about where the body wanted to write.
     /// - `DELIVER-01` — a pairwise body is written only into its verified
     ///   sender's own thread, and a group body only into the group whose key
     ///   opened it. `chat_id` is attacker-chosen data inside a signed body;
@@ -910,6 +942,23 @@ impl MessageStore {
         let pairwise = commit.group_id.is_none();
         let now_ms = arrival.received_at;
 
+        // §10.3, before every other gate and both lanes. The question a
+        // tombstone answers is *whether this signature counts at all*, which
+        // comes before where the body wanted to write (DELIVER-01) and before
+        // what kind it claims to be. A group body is checked identically: the
+        // signer is a person's device either way, and a member's buried phone
+        // has no more standing in a group than in a 1:1 thread.
+        if self.signer_device_revoked(
+            &sender_user_id,
+            &identity.user_id,
+            body.sender_device_id.clone(),
+        )? {
+            return Ok(CoreInboundDelivery::dropped(
+                CoreDeliveryVerdict::DroppedRevokedDevice,
+                body.kind,
+            ));
+        }
+
         // DELIVER-01, both halves. A pairwise body may only be written into
         // its verified sender's own thread; a group body may only be written
         // into the group whose key actually opened it. Either way the wire
@@ -1011,7 +1060,7 @@ impl MessageStore {
                 delivery.persisted = true;
                 // The hidden row stays durable even if the store rejects a
                 // mis-scoped or over-privileged credential update.
-                let _ = self.apply_contact_relay_update(sender_user_id.clone(), content);
+                let _ = self.apply_contact_relay_update(sender_user_id.clone(), content, now_ms);
             }
             KIND_PROFILE_SYNC if pairwise => {
                 let content = decode_profile_sync_content(body.content.clone())
@@ -1094,11 +1143,13 @@ impl MessageStore {
     /// anything, which is why WP1 honours it without a roster lookup. A body
     /// with no device field (every legacy peer, permanently) lands on
     /// `LEGACY_DEVICE_ID`, exactly where every pre-migration row already is.
-    /// Refusing a *tombstoned* signer's new events is DL-4's other half and
-    /// belongs to WP5, once rosters actually gossip.
+    /// DL-4's other half — refusing a *tombstoned* signer's new events — is
+    /// applied before this runs, by [`Self::signer_device_revoked`] (§10.3), so
+    /// nothing reaching here was signed by a buried device.
     ///
-    /// Because the id is honoured without a roster lookup, it is bounded
-    /// instead: see [`Self::bounded_device_stream`].
+    /// The id still partitions history rather than authorizing anything, and
+    /// most senders have gossiped no roster to check it against, so the stream
+    /// count is bounded as well: see [`Self::bounded_device_stream`].
     fn persist_inbound(
         &self,
         sender_user_id: &[u8],
@@ -1136,15 +1187,108 @@ impl MessageStore {
         }
     }
 
+    /// **§10.3: has this person's roster buried the device that signed this
+    /// event?**
+    ///
+    /// The device id comes from inside the seal, so it is already bound to the
+    /// verified sender — the same fact [`Self::persist_inbound`] relies on to
+    /// partition a sender's history. What WP5 adds is that the id is now
+    /// checked against an authority: the roster this device holds for that
+    /// person, which is the only place a tombstone can come from (DL-3 gossip
+    /// or a sibling's self-sync; there is no directory to ask).
+    ///
+    /// Three cases, and the boring ones matter most:
+    ///
+    /// * **No device field, or the legacy stream.** Every peer in the field
+    ///   today, permanently (§5/§12). A roster cannot bury `LEGACY_DEVICE_ID`
+    ///   — [`crate::core_roster_validate`] requires real fixed-width device
+    ///   ids and DL-4 tombstones name devices that once had certificates — so
+    ///   there is nothing to refuse, and a legacy sender is never affected by
+    ///   any revocation. That is the compatibility promise of §12 kept
+    ///   literally.
+    /// * **A contact's device.** Refused when their roster says
+    ///   [`crate::ContactDeviceState::Revoked`]. `Unknown` is *not* refused:
+    ///   a contact who has never gossiped a roster is §5's synthetic
+    ///   one-device person, and treating "I hold no roster for you" as "you
+    ///   are revoked" would silently stop delivering mail from every peer on
+    ///   the current build. DL-4 refuses what a roster buried, never what it
+    ///   failed to mention.
+    /// * **Our own device.** Checked against the own roster, so a person's
+    ///   revoked phone cannot author into their own history either. §8's sync
+    ///   records already refuse a tombstoned author
+    ///   ([`crate::SyncRecordRejection::RevokedAuthorDevice`]); this is the
+    ///   same rule for an ordinary message body that arrived by the ordinary
+    ///   path.
+    ///
+    /// The window this leaves is §6's accepted one, stated plainly: a device
+    /// that has not yet received the revoking roster still delivers the
+    /// thief's mail, exactly as a stale contact still seals to the thief's
+    /// inbox generation. Propagation-bounded, and it closes the moment the
+    /// roster lands — which is why §10.1 gossips it to contacts and siblings
+    /// in the same breath as the burial.
+    ///
+    /// # What this check is actually binding, and what it is not
+    ///
+    /// `sender_device_id` is a field **inside the sealed body**, so it is
+    /// authenticated as coming from the verified sender and nothing more. It
+    /// is *not* signed by the device it names, because §5's per-device
+    /// authoring signature does not exist yet: WP1 owns
+    /// [`crate::DeviceSigningDomain::MessageAuthoring`], the domain is frozen
+    /// and unused, and today a person's install signs with the identity key.
+    ///
+    /// So the honest statement of this rule is: **it stops a revoked device
+    /// from speaking under its own name, and it does not stop whoever holds
+    /// that device's identity key from re-labelling the same message as a
+    /// different device of theirs.** Against §10's threat model this is a real
+    /// but partial cut, and the parts that are not partial are the ones that
+    /// matter most: §10.1's inbox key rotation and §10.2's relay token
+    /// rotation withdraw *capability*, and no amount of relabelling gets that
+    /// back.
+    ///
+    /// It becomes a full cut the moment authoring is device-signed, at which
+    /// point this same check is a signature-authority rule rather than a label
+    /// rule and nothing here has to change. That prerequisite is filed as
+    /// `MD-AUTHORING-DEVICE-SIGNED` in `core/src/device_link/mod.rs`, where
+    /// this codebase keeps its dormancy notes.
+    fn signer_device_revoked(
+        &self,
+        sender_user_id: &[u8],
+        own_user_id: &[u8],
+        sender_device_id: Option<Vec<u8>>,
+    ) -> Result<bool, CoreError> {
+        let Some(device_id) = sender_device_id else {
+            return Ok(false);
+        };
+        if device_id == LEGACY_DEVICE_ID {
+            return Ok(false);
+        }
+        if sender_user_id == own_user_id {
+            return Ok(self
+                .own_roster()?
+                .map(|roster| {
+                    roster
+                        .tombstones
+                        .iter()
+                        .any(|tombstone| tombstone.device_id == device_id)
+                })
+                .unwrap_or(false));
+        }
+        Ok(
+            self.contact_device_state(sender_user_id.to_vec(), device_id)?
+                == ContactDeviceState::Revoked,
+        )
+    }
+
     /// Bound how many device streams one sender can open in one chat (§14.3).
     ///
-    /// The sealed-body device id is authenticated as *coming from* the sender,
-    /// but nothing yet checks it against that person's roster — WP5 does, once
-    /// rosters gossip. Until then a sender who wanted to could stamp a fresh
-    /// random id on every message and mint an unbounded number of streams in
-    /// this device's store, each one its own conflict namespace and its own
-    /// entry in every per-stream read. That is a storage and query cost a peer
-    /// should not be able to choose.
+    /// The sealed-body device id is authenticated as *coming from* the sender.
+    /// §10.3 now checks it against that person's roster where one exists — but
+    /// a roster refuses only what it *buried*, and most peers have gossiped
+    /// none at all, so a sender who wanted to could still stamp a fresh random
+    /// id on every message and mint an unbounded number of streams in this
+    /// device's store, each one its own conflict namespace and its own entry in
+    /// every per-stream read. That is a storage and query cost a peer should
+    /// not be able to choose, and no revocation rule bounds it.
     ///
     /// So the count is capped at what §14.3 allows a person to have:
     /// [`DEVICE_HARD_CAP`] device streams, alongside the always-available
@@ -1791,13 +1935,15 @@ mod delivery_tests {
     use std::sync::Arc;
 
     use crate::{
-        compute_recipient_hint, encode_envelope_frame, encode_group_invite_content,
-        encode_lan_endpoint_content, encode_message_body, encode_message_body_extended,
-        encode_profile_sync_content, encode_receipt_content, encode_relay_update_content,
-        generate_identity, generate_msg_id, make_friend_card, seal_group_message, seal_message,
-        Contact, CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundSource, Group, Identity,
+        compute_recipient_hint, core_link_genesis_roster, core_link_sign_new_device_roster,
+        core_mint_inbox_key, core_revoke_devices_roster, encode_envelope_frame,
+        encode_group_invite_content, encode_lan_endpoint_content, encode_message_body,
+        encode_message_body_extended, encode_profile_sync_content, encode_receipt_content,
+        encode_relay_update_content, generate_device_keypair, generate_identity, generate_msg_id,
+        make_friend_card, seal_group_message, seal_message, Contact, CoreDeliveryVerdict,
+        CoreDiscoveryPolicyState, CoreInboundSource, DeviceKeypair, Group, Identity,
         LanEndpointContent, MessageArrival, MessageBody, MessageStore, ProfileSyncContent,
-        ReceiptContent, RelayUpdateContent, SeenIds, DEFAULT_HOP_TTL, DEVICE_ID_LEN,
+        ReceiptContent, RelayUpdateContent, Roster, SeenIds, DEFAULT_HOP_TTL, DEVICE_ID_LEN,
         KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
         KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LEGACY_DEVICE_ID, MS_PER_DAY,
         RECEIPT_TYPE_DELIVERED,
@@ -2692,5 +2838,391 @@ mod delivery_tests {
             "the invite row belongs to the group, not the 1:1 thread"
         );
         assert!(store.messages_for_chat(sender.user_id).unwrap().is_empty());
+    }
+    // -----------------------------------------------------------------------
+    // §10.3: a tombstoned device's newly received events
+    // -----------------------------------------------------------------------
+
+    /// A contact with two devices and the roster that buries one of them,
+    /// built through the shipped ceremonies so the documents under test are
+    /// the documents WP3 and WP5 really produce.
+    struct RevokingFriend {
+        person: Identity,
+        kept: DeviceKeypair,
+        buried: DeviceKeypair,
+        before: Roster,
+        after: Roster,
+    }
+
+    fn revoking_friend() -> RevokingFriend {
+        let person = generate_identity();
+        let kept = generate_device_keypair();
+        let buried = generate_device_keypair();
+        let genesis = core_link_genesis_roster(
+            person.sign_sk.clone(),
+            kept.sign_pk.clone(),
+            kept.agree_pk.clone(),
+        )
+        .expect("genesis");
+        let before = core_link_sign_new_device_roster(
+            genesis,
+            person.sign_pk.clone(),
+            kept.sign_sk.clone(),
+            buried.sign_pk.clone(),
+            buried.agree_pk.clone(),
+        )
+        .expect("link")
+        .roster;
+        let after = core_revoke_devices_roster(
+            before.clone(),
+            person.sign_pk.clone(),
+            kept.sign_sk.clone(),
+            vec![buried.device_id.clone()],
+            core_mint_inbox_key(before.inbox_key_generation),
+        )
+        .expect("revocation")
+        .roster;
+        RevokingFriend {
+            person,
+            kept,
+            buried,
+            before,
+            after,
+        }
+    }
+
+    fn text_from(
+        friend: &RevokingFriend,
+        device: &DeviceKeypair,
+        lamport: u64,
+        text: &str,
+    ) -> Vec<u8> {
+        encode_message_body_extended(
+            MessageBody {
+                kind: KIND_TEXT,
+                chat_id: friend.person.user_id.clone(),
+                lamport,
+                timestamp: NOW,
+                content: text.as_bytes().to_vec(),
+            },
+            None,
+            Some(device.device_id.clone()),
+            None,
+        )
+        .expect("encode body")
+    }
+
+    /// §10.3 in one test: **the stream seals at its last pre-revocation
+    /// point.** Everything the buried device wrote while it was trusted stays
+    /// exactly where it is; nothing it signs afterwards lands anywhere.
+    #[test]
+    fn a_buried_devices_new_events_are_refused_and_its_history_stays() {
+        let store = store();
+        let me = generate_identity();
+        let friend = revoking_friend();
+        store
+            .upsert_contact(contact(&friend.person, "Friend"))
+            .unwrap();
+        store.apply_contact_roster(friend.before.clone()).unwrap();
+
+        // Two messages from the phone while it was still one of theirs.
+        for (lamport, text) in [(1, "before one"), (2, "before two")] {
+            let delivery = deliver_pairwise(
+                &store,
+                &me,
+                &friend.person,
+                text_from(&friend, &friend.buried, lamport, text),
+            );
+            assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        }
+        let sealed_at = store
+            .messages_for_chat(friend.person.user_id.clone())
+            .unwrap()
+            .len();
+        assert_eq!(sealed_at, 2);
+
+        // The revocation reaches this device by DL-3 gossip.
+        store.apply_contact_roster(friend.after.clone()).unwrap();
+
+        // The thief keeps the phone, keeps its key, and carries on. This is a
+        // valid signature over a well-formed body: the ONLY thing wrong with
+        // it is who signed it.
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            text_from(&friend, &friend.buried, 3, "after the burial"),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedRevokedDevice);
+        assert!(!delivery.persisted);
+
+        // Sealed, not rewritten: the two rows it wrote while trusted are
+        // untouched, and its stream is still there — it simply stopped.
+        let stored = store
+            .messages_for_chat(friend.person.user_id.clone())
+            .unwrap();
+        assert_eq!(stored.len(), sealed_at);
+        assert!(stored
+            .iter()
+            .all(|message| message.sender_device_id == friend.buried.device_id));
+        assert!(store
+            .message_stream_device_ids(friend.person.user_id.clone(), friend.person.user_id.clone())
+            .unwrap()
+            .contains(&friend.buried.device_id));
+
+        // And the surviving device of the same person is unaffected — a
+        // revocation cuts off a device, never a person.
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            text_from(&friend, &friend.kept, 3, "still your friend"),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store
+                .messages_for_chat(friend.person.user_id.clone())
+                .unwrap()
+                .len(),
+            sealed_at + 1
+        );
+    }
+
+    /// The cost of judging **arrival** rather than authorship, pinned so it is
+    /// never mistaken for a bug.
+    ///
+    /// A DTN carry or a relay row can sit for days, so a message the phone
+    /// sent in good faith an hour before it was lost arrives after the
+    /// tombstone and is dropped. That is deliberate: the only "when" available
+    /// is a timestamp the sender chose, and believing it would let the thief
+    /// backdate everything it writes and walk straight through §10.3. Named by
+    /// `CoreDeliveryVerdict::DroppedRevokedDevice`'s doc comment.
+    #[test]
+    fn pre_revocation_carry_arriving_after_the_tombstone_is_dropped() {
+        let store = store();
+        let me = generate_identity();
+        let friend = revoking_friend();
+        store
+            .upsert_contact(contact(&friend.person, "Friend"))
+            .unwrap();
+        store.apply_contact_roster(friend.before.clone()).unwrap();
+
+        // Written while the phone was still trusted, and held by a carrier.
+        let carried = text_from(&friend, &friend.buried, 1, "sent before the theft");
+
+        // The revocation gossips in first, because a roster travels by every
+        // transport and this envelope happened to be in somebody's pocket.
+        store.apply_contact_roster(friend.after.clone()).unwrap();
+
+        let delivery = deliver_pairwise(&store, &me, &friend.person, carried);
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedRevokedDevice);
+        assert!(!delivery.persisted);
+        assert!(store
+            .messages_for_chat(friend.person.user_id.clone())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The refusal covers every kind, not just chat text. A buried device must
+    /// not be able to move a receipt watermark, rewrite a profile, or — the
+    /// one that would undo §10.2 — hand this device a new relay credential for
+    /// its person.
+    #[test]
+    fn a_buried_device_cannot_move_a_watermark_or_repoint_a_relay() {
+        let store = store();
+        let me = generate_identity();
+        let friend = revoking_friend();
+        store
+            .upsert_contact(contact(&friend.person, "Friend"))
+            .unwrap();
+        store.apply_contact_roster(friend.after.clone()).unwrap();
+
+        let relay = encode_relay_update_content(RelayUpdateContent {
+            subject_user_id: friend.person.user_id.clone(),
+            relay_epoch: NOW,
+            relay_url: "https://thief.example".to_string(),
+            relay_token: "cmfam1-thiefs-own-family-token".to_string(),
+        })
+        .unwrap();
+        let receipt = encode_receipt_content(ReceiptContent {
+            chat_id: friend.person.user_id.clone(),
+            sender_user_id: me.user_id.clone(),
+            lamport: 99,
+            receipt_type: RECEIPT_TYPE_DELIVERED,
+            group_id: None,
+        })
+        .unwrap();
+        for (kind, content) in [
+            (KIND_RELAY_UPDATE, relay),
+            (KIND_RECEIPT, receipt),
+            (KIND_TEXT, b"and an ordinary one".to_vec()),
+        ] {
+            let payload = encode_message_body_extended(
+                MessageBody {
+                    kind,
+                    chat_id: friend.person.user_id.clone(),
+                    lamport: 1,
+                    timestamp: NOW,
+                    content,
+                },
+                None,
+                Some(friend.buried.device_id.clone()),
+                None,
+            )
+            .expect("encode body");
+            let delivery = deliver_pairwise(&store, &me, &friend.person, payload);
+            assert_eq!(
+                delivery.verdict,
+                CoreDeliveryVerdict::DroppedRevokedDevice,
+                "kind {kind} from a buried device must not be applied"
+            );
+        }
+        // Nothing moved. The relay credential in particular is exactly the
+        // hole §10.2 spent a token rotation closing.
+        let stored = store
+            .get_contact(friend.person.user_id.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.relay_url, None);
+        assert_eq!(stored.relay_token, None);
+        assert!(store
+            .messages_for_chat(friend.person.user_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A group body gets the same rule: a member's buried phone has no more
+    /// standing in a group than in a 1:1 thread (§10.3, §11).
+    #[test]
+    fn a_buried_device_is_refused_in_a_group_too() {
+        let store = store();
+        let me = generate_identity();
+        let friend = revoking_friend();
+        store
+            .upsert_contact(contact(&friend.person, "Friend"))
+            .unwrap();
+        store.apply_contact_roster(friend.after.clone()).unwrap();
+        let group = Group {
+            id: vec![0x77; 16],
+            name: "Deck 9".into(),
+            member_user_ids: vec![me.user_id.clone(), friend.person.user_id.clone()],
+            key: vec![0x78; 32],
+            metadata_revision: 0,
+            metadata_changed_by: Vec::new(),
+        };
+        store.upsert_group(group.clone()).unwrap();
+
+        let payload = encode_message_body_extended(
+            MessageBody {
+                kind: KIND_TEXT,
+                chat_id: group.id.clone(),
+                lamport: 1,
+                timestamp: NOW,
+                content: b"still here".to_vec(),
+            },
+            None,
+            Some(friend.buried.device_id.clone()),
+            None,
+        )
+        .expect("encode body");
+        let delivery = deliver_group(&store, &me, &friend.person, &group, payload);
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedRevokedDevice);
+        assert!(store.messages_for_chat(group.id).unwrap().is_empty());
+    }
+
+    /// §12 kept literally: a peer that has gossiped no roster, and a body with
+    /// no device field at all, are never refused by this rule. A tombstone
+    /// refuses what a roster buried, never what it failed to mention — the
+    /// alternative would stop delivering mail from every build in the field.
+    #[test]
+    fn a_legacy_sender_and_an_unknown_device_are_never_refused() {
+        let store = store();
+        let me = generate_identity();
+        let friend = revoking_friend();
+        store
+            .upsert_contact(contact(&friend.person, "Friend"))
+            .unwrap();
+        store.apply_contact_roster(friend.after.clone()).unwrap();
+
+        // No device field: the reserved legacy stream, which no roster can
+        // bury.
+        let legacy = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            body(KIND_TEXT, friend.person.user_id.clone(), b"legacy".to_vec()),
+        );
+        assert_eq!(legacy.verdict, CoreDeliveryVerdict::Applied);
+
+        // A device this roster never named at all: unknown, not revoked.
+        let stranger = generate_device_keypair();
+        let unnamed = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            text_from(&friend, &stranger, 2, "a device we hold no cert for"),
+        );
+        assert_eq!(unnamed.verdict, CoreDeliveryVerdict::Applied);
+
+        // And a contact with no roster at all — every peer on today's build.
+        let plain = generate_identity();
+        store.upsert_contact(contact(&plain, "Plain")).unwrap();
+        let payload = encode_message_body_extended(
+            MessageBody {
+                kind: KIND_TEXT,
+                chat_id: plain.user_id.clone(),
+                lamport: 1,
+                timestamp: NOW,
+                content: b"one-device person".to_vec(),
+            },
+            None,
+            Some(generate_device_keypair().device_id),
+            None,
+        )
+        .expect("encode body");
+        assert_eq!(
+            deliver_pairwise(&store, &me, &plain, payload).verdict,
+            CoreDeliveryVerdict::Applied
+        );
+    }
+
+    /// The same rule turned on this person's own fleet: a device this person
+    /// revoked cannot author into their own history either.
+    ///
+    /// §8's sync records already refuse a tombstoned author. This is an
+    /// ordinary message body arriving by the ordinary path, which is what a
+    /// revoked phone replaying its own outbound looks like.
+    #[test]
+    fn a_persons_own_buried_device_cannot_author_into_their_own_history() {
+        let friend = revoking_friend();
+        let me = friend.person.clone();
+        let store = store();
+        store
+            .adopt_own_roster(
+                friend.after.clone(),
+                friend.person.sign_pk.clone(),
+                friend.kept.device_id.clone(),
+            )
+            .unwrap();
+
+        let payload = encode_message_body_extended(
+            MessageBody {
+                kind: KIND_TEXT,
+                chat_id: friend.person.user_id.clone(),
+                lamport: 1,
+                timestamp: NOW,
+                content: b"note to self from a phone that was taken".to_vec(),
+            },
+            None,
+            Some(friend.buried.device_id.clone()),
+            None,
+        )
+        .expect("encode body");
+        let delivery = deliver_pairwise(&store, &me, &friend.person, payload);
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedRevokedDevice);
+        assert!(store
+            .messages_for_chat(friend.person.user_id)
+            .unwrap()
+            .is_empty());
     }
 }

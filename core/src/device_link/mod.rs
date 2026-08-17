@@ -61,6 +61,50 @@
 //! gossip of the new roster to the person's CONTACTS. WP4 owns the carrier and
 //! WP5 the notification. See [`activation::MessageStore::complete_link_activation`]
 //! and `MD-ROSTER-GOSSIP-TO-CONTACTS` for what it costs meanwhile.
+//!
+//! # Dormancy notes: what later work packages must land, and what is untrue
+//! # until they do
+//!
+//! This crate keeps its "reserved but not yet load-bearing" facts here, in one
+//! place, because each of them is a claim a reader could reasonably believe the
+//! code already makes.
+//!
+//! * **`MD-AUTHORING-DEVICE-SIGNED` (owed by WP1).** §5 gives every message an
+//!   authoring device, and [`crate::DeviceSigningDomain::MessageAuthoring`] is
+//!   the frozen domain for signing as one — but nothing signs in it yet. Until
+//!   it does, a message body's `sender_device_id` is a **label authenticated as
+//!   coming from the sender**, not a signature by the device it names, so
+//!   §10.3's revocation check
+//!   ([`crate::MessageStore`]'s `signer_device_revoked`) binds an
+//!   unauthenticated id. It stops a revoked device speaking under its own name;
+//!   it does not stop whoever holds the identity key from relabelling. The
+//!   capability half of §10 (inbox key and relay token rotation) is what does
+//!   not depend on this.
+//!
+//! * **`MD-ROOT-OFF-DEVICE` (owed alongside the same work).** §14.2's whole
+//!   argument — "a stolen approving device provably cannot sign at a higher
+//!   recovery epoch" — rests on the person root secret living only inside the
+//!   passphrase-encrypted `.cmbak`. Today it is [`crate::Identity`]'s
+//!   `sign_sk`, and it is on every device, because that is the key an install
+//!   signs everything with. So the recovery premise is a **design invariant
+//!   that the deployment does not yet enforce**: a thief with a phone in an
+//!   unlocked state has the root too, and §14.2's dethroning is only as strong
+//!   as platform key storage until authoring moves to device keys and the root
+//!   can be retired from the running install. Every rule written against it
+//!   ([`crate::RosterUpdateReason::RecoveryEpochRequiresRoot`], §10's recovery
+//!   path, the relay rotation authority) is correct code resting on a premise
+//!   with a dated expiry, and this is that date.
+//!
+//! * **`MD-ROSTER-GOSSIP-TO-CONTACTS` (owed by WP6).** §10.1's contact leg
+//!   produces the sealed document and the exact recipient list
+//!   ([`crate::RevocationCommit::roster_document`] and `contact_user_ids`) and
+//!   stops there: **there is no envelope kind that carries a roster to a
+//!   contact**, so the leg is data with no carrier. Until WP6 adds one, a
+//!   contact learns of a revocation only if some other path tells them, and
+//!   §10.4's changed-safety-state surface has nothing to fire on. That
+//!   dependency is carried forward deliberately rather than left implicit,
+//!   because every §10 test that "gossips to contacts" is in fact asserting
+//!   about a list and a blob, not about delivery.
 
 pub mod activation;
 pub mod bootstrap;
