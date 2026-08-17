@@ -753,6 +753,35 @@ impl MessageStore {
         hidden_already_offered: Vec<Vec<u8>>,
         carried_cursor: Option<CoreCarriedCursor>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
+        // §9.4: a device between "the channel is confirmed" and "the roster head
+        // is acknowledged" may not advertise ANYTHING, and a digest spray is the
+        // loudest advertisement this device makes — it announces what it holds,
+        // what it carries for others, and that it is here at all. Empty rather
+        // than an error, matching the hint builders: the honest refusal for a
+        // path whose whole output is "here is what I have to offer" is having
+        // nothing to offer.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(CoreDigestSprayPlan {
+                carried_frames: Vec::new(),
+                own_outbound_frames: Vec::new(),
+                own_receipt_frames: Vec::new(),
+                offered_hidden_msg_ids: Vec::new(),
+                // Not `carried_cursor`: a device that offered nothing has not
+                // walked anywhere, so the next round starts where this one did.
+                next_carried_cursor: None,
+                carried_exhausted: false,
+                // Built through the same helper the real plan uses, so a
+                // silenced device's lane shape is byte-identical to a device
+                // that genuinely had nothing to offer -- and the spray policy
+                // cannot tell the two apart or treat them differently.
+                lanes: crate::CoreSprayPlanShape {
+                    carried: lane_plan(std::iter::empty()),
+                    own_outbound: lane_plan(std::iter::empty()),
+                    own_receipts: lane_plan(std::iter::empty()),
+                },
+                plan_bytes: 0,
+            });
+        }
         self.prune_expired_carried(now_ms)?;
         // The row ceiling is core's own, not a shell parameter: it is a
         // property of what a link can absorb in one round, and the shells have
@@ -986,6 +1015,13 @@ impl MessageStore {
         if !peer_authenticated {
             return Ok(0);
         }
+        // §9.4, in the same shape and for the same reason: retiring a carried
+        // envelope is the carry queue's ack, and a device still being adopted
+        // retires nothing. ACK-MD-3 is untouched — this only ever removes
+        // fewer rows, never more.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Ack)? {
+            return Ok(0);
+        }
         if peer_known_msg_ids.is_empty() {
             return Ok(0);
         }
@@ -1092,6 +1128,14 @@ impl MessageStore {
         own_user_id: Vec<u8>,
         own_sibling_sealed: Option<Vec<u8>>,
     ) -> Result<Vec<CoreGroupFanoutRow>, CoreError> {
+        // §9.4, the same rule as the hint builders and for the same reason: a
+        // relay upload is this device announcing itself to a server every
+        // contact can see. The queue is untouched -- these rows are re-planned
+        // identically the moment activation closes -- so the effect of the
+        // window is a pause, not a loss.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(Vec::new());
+        }
         if self
             .get_group(envelope.recipient_user_id.clone())?
             .is_some()
@@ -1246,6 +1290,14 @@ impl MessageStore {
         own_user_id: Vec<u8>,
         now_ms: i64,
     ) -> Result<Vec<i64>, CoreError> {
+        // §9.4: a device that has not finished being adopted acks nothing at
+        // all. Emptiness rather than an error, because an ack plan naming no
+        // rows is an answer every caller already handles — and because
+        // subtracting from an ack list can never make a deletion unsafe, only
+        // decline one.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Ack)? {
+            return Ok(Vec::new());
+        }
         // Recent-day hints of every imported group = the fingerprint of a
         // legacy shared-mailbox group row. Same day window the carry/confirm
         // paths use, so any row a member could still fetch is covered.

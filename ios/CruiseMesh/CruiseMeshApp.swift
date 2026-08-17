@@ -77,6 +77,13 @@ struct CruiseMeshApp: App {
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
                     LanTransportDiagnostics.shared.queueManualConnection(endpoint)
                     appModel.startMesh()
+                case .deviceLink:
+                    // A device-link offer is scanned inside the linking
+                    // ceremony, by the device that is already part of this
+                    // person. There is no screen to open cold yet, and opening
+                    // the wrong one would drop someone into a flow that cannot
+                    // finish what the link starts.
+                    return
                 }
             }
             .onChange(of: scenePhase) { phase in

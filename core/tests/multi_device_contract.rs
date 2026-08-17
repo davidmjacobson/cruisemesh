@@ -35,6 +35,19 @@
 //!   `a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands` pins
 //!   the honest half of that day today and points back here, so WP4 cannot
 //!   land the mechanism without deliberately editing both.
+//! * MD-ROSTER-GOSSIP-TO-CONTACTS is new with WP3, and it is the dormancy note
+//!   that matters most right now. §9 step 5 says the approving device tells the
+//!   person's CONTACTS about the new roster; DL-3's send side does not exist.
+//!   WP4 owns the own-device sync records that would carry it and WP5 owns the
+//!   contact notification, so nothing in WP3 can close it.
+//!
+//!   The consequence is concrete and worth stating rather than implying. WP3
+//!   makes fleets larger than one device real, and ACK-MD-2 forbids such a
+//!   fleet from acking the single person-addressed row a contact who has not
+//!   heard about the roster keeps uploading. Nobody deletes those rows, so each
+//!   one churns until its 7-day expiry. Bounded, and dev-only: linking is
+//!   behind Internal Tools until WP6, so the only fleets that exist are the
+//!   ones being deliberately tested.
 //!
 //! **What "implemented and pinned" does NOT mean here.** The ack vectors below
 //! run the production planner against a fleet of two devices — but no
@@ -209,6 +222,17 @@ enum Scenario {
         converges_by_self_sync: bool,
     },
     CapabilityReservation,
+    /// §9 step 5: a device is added to a person's roster, and the person's
+    /// contacts have to be told. `roster_reaches_contacts` is the target, not
+    /// the state of the world -- there is no envelope kind that carries a
+    /// roster document, so today it is false and the rows below churn.
+    RosterGossipToContacts {
+        fleet_size_after_link: u8,
+        roster_reaches_contacts: bool,
+        /// What an un-updated contact keeps uploading, and what ACK-MD-2
+        /// forbids the fleet from deleting.
+        person_addressed_rows_churn_until_expiry: bool,
+    },
     AddDevice {
         resulting_device_count: u8,
     },
@@ -261,6 +285,10 @@ enum Outcome {
     /// §8's target for a BLE-only day: the fleet converges through self-sync,
     /// not through a second device reading a row that has one true consumer.
     SiblingsConvergeBySelfSync,
+    /// §9 step 5's target: a person's contacts learn the new roster, so they
+    /// stop addressing that person as one device and the person-addressed rows
+    /// ACK-MD-2 forbids the fleet from acking stop being uploaded at all.
+    ContactsLearnTheRoster,
     PersonDigestProofOnly,
     DigestProofOnly,
     SurvivingDevicesDeliver,
@@ -604,6 +632,22 @@ const VECTORS: &[Vector] = &[
         target_outcome: Outcome::SiblingsConvergeBySelfSync,
         implemented: false,
     },
+    // §9 step 5, WP5: the person's contacts learn the roster. WP3 built the
+    // ceremony that makes a fleet larger than one device; the send side of
+    // DL-3's gossip is WP4's carrier plus WP5's notification, and neither
+    // exists. Data-only for exactly that reason -- there is nothing to drive,
+    // and a test-only stand-in for a wire format nobody has designed would be
+    // the one thing this ledger exists to prevent.
+    Vector {
+        id: "MD-ROSTER-GOSSIP-TO-CONTACTS",
+        scenario: Scenario::RosterGossipToContacts {
+            fleet_size_after_link: 2,
+            roster_reaches_contacts: true,
+            person_addressed_rows_churn_until_expiry: true,
+        },
+        target_outcome: Outcome::ContactsLearnTheRoster,
+        implemented: false,
+    },
     // §6: stale inbox-key sealing has bounded exposure, not a delivery brick.
     // A months-offline contact seals to the roster it knows -- which still
     // lists the revoked device and still uses the pre-revocation inbox key
@@ -728,6 +772,10 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
     (
         "MD-SYNC-BLE-DAY-CONVERGE",
         Outcome::SiblingsConvergeBySelfSync,
+    ),
+    (
+        "MD-ROSTER-GOSSIP-TO-CONTACTS",
+        Outcome::ContactsLearnTheRoster,
     ),
     ("MD-SEAL-STALE-ROSTER", Outcome::SurvivingDevicesDeliver),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
@@ -2193,6 +2241,7 @@ fn drive(vector: &Vector) -> Option<Outcome> {
         // yet mints or stores a person root separately from the identity key.
         // There is nothing real to execute.
         Scenario::RosterPairwiseGossipNoDirectory { .. }
+        | Scenario::RosterGossipToContacts { .. }
         | Scenario::StaleRosterSealing { .. }
         | Scenario::RosterFirstContactAnchor { .. }
         | Scenario::BleOnlyDayConverges { .. }
@@ -2402,6 +2451,17 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                     && surviving_devices_still_receive,
                 "§6 stale-roster sealing is a bounded exposure, never a delivery brick"
             ),
+            Scenario::RosterGossipToContacts {
+                fleet_size_after_link,
+                roster_reaches_contacts,
+                person_addressed_rows_churn_until_expiry,
+            } => contract_assert!(
+                vector.id,
+                fleet_size_after_link > 1
+                    && roster_reaches_contacts
+                    && person_addressed_rows_churn_until_expiry,
+                "§9 step 5's vector is a fleet of more than one whose contacts must be told,                  and whose person-addressed rows churn until they are"
+            ),
             Scenario::BleOnlyDayConverges {
                 reached_over_ble,
                 fleet_size,
@@ -2482,7 +2542,7 @@ fn unimplemented_vector_ledger_is_deliberate() {
         .filter(|vector| !vector.implemented)
         .map(|vector| vector.id)
         .collect();
-    // Five now, each waiting on a mechanism rather than on effort: DL-3's
+    // Six now, each waiting on a mechanism rather than on effort: DL-3's
     // roster gossip needs an envelope kind to seal (WP4/WP5); §6's
     // stale-roster sealing needs inbox key generations (WP5); first-contact
     // anchoring needs a second source of truth about a person's epoch, which is
@@ -2490,6 +2550,9 @@ fn unimplemented_vector_ledger_is_deliberate() {
     // minted and stored separately from the identity key, which is WP3's; and
     // §8's BLE-day convergence needs the self-sync records WP4 mints, which is
     // why WP2 added it here rather than pretending the sim stub was the gate.
+    // WP3 added the sixth: §9 step 5's roster gossip TO contacts needs WP4's
+    // carrier and WP5's notification, and WP3 is the work package that makes
+    // its absence cost something -- see this file's header.
     // Driving any of them today would mean writing a test-only stand-in and
     // calling it core, which is the one thing this ledger exists to prevent.
     let expected = [
@@ -2497,6 +2560,7 @@ fn unimplemented_vector_ledger_is_deliberate() {
         "MD-ROSTER-FIRST-CONTACT-ANCHOR",
         "MD-RECOVERY-ROOT-CUSTODY",
         "MD-SYNC-BLE-DAY-CONVERGE",
+        "MD-ROSTER-GOSSIP-TO-CONTACTS",
         "MD-SEAL-STALE-ROSTER",
     ];
     assert_eq!(

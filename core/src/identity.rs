@@ -40,9 +40,15 @@ const FRIEND_LINK_PREFIX_V3: &str = "CMFRIEND3:";
 /// trailing roster-head field so a new friendship can start multi-device-aware.
 /// Parser ships first; emit stays v3 until the fleet parses v4 (WP8).
 const FRIEND_LINK_PREFIX_V4: &str = "CMFRIEND4:";
-/// Device-link ceremony (`specs/multi-device-v1.md` §9). This build does not
-/// implement linking; seeing the prefix is the "update the app" fail-soft.
-const DEVICE_LINK_PREFIX: &str = "CMLINK1:";
+/// Device-link ceremony (`specs/multi-device-v1.md` §9). A link offer is not a
+/// friend card and never becomes a contact, so the friend-card path keeps
+/// refusing it here; [`core_parse_link_qr`](crate::core_parse_link_qr) is what
+/// reads it, reached through the `/link` deep-link route.
+///
+/// One definition, owned by the module that emits and parses the QR. It used to
+/// be spelled out a second time here, which is one edit away from a build whose
+/// friend path refuses a prefix its link path no longer emits.
+use crate::device_link::qr::DEVICE_LINK_PREFIX;
 
 /// Phase 2 of the friend-card self-signing rollout (`specs/friend-card-v3.md`
 /// §Rollout): emit signed `CMFRIEND3:` links. The fleet has shipped the v3
@@ -153,10 +159,19 @@ pub enum CoreError {
     #[error("malformed wire data: {0}")]
     Malformed(String),
     /// A friend-card or deep-link scheme this build does not implement
-    /// (`CMFRIEND5:`, `CMLINK1:`, …). Shells map this to "update the app"
-    /// copy; it is never a crash and never a half-parsed contact.
+    /// (`CMFRIEND5:`, a `CMSHARE` version from the future, …). Shells map this
+    /// to "update the app" copy; it is never a crash and never a half-parsed
+    /// contact.
     #[error("this link needs a newer version of CruiseMesh")]
     UnsupportedLink,
+    /// A `CMLINK1:` device-link offer handed to the friend-card path
+    /// (`specs/multi-device-v1.md` §9). This build *does* implement linking, so
+    /// telling its own user to update the app would be a lie — the code is
+    /// perfectly readable, it is simply not a friend card and never becomes a
+    /// contact. Distinct from [`CoreError::UnsupportedLink`] for exactly that
+    /// reason; WP6 owns the sentence a family reads.
+    #[error("that is a device link code, not a friend card")]
+    DeviceLinkOffer,
 }
 
 /// Generate a fresh identity: Ed25519 signing keypair + X25519 agreement keypair.
@@ -928,7 +943,7 @@ pub fn parse_friend_text(text: String) -> Result<FriendCard, CoreError> {
 /// (the caller filters internal whitespace, so a link split across lines still
 /// parses); when the prefix is embedded in a URL or prose, the body is cut at
 /// the first character that can't be part of a base64url token.
-fn extract_link_body<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+pub(crate) fn extract_link_body<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
     if let Some(rest) = text.strip_prefix(prefix) {
         return Some(rest);
     }
@@ -957,7 +972,15 @@ fn unsupported_link_error(text: &str) -> Option<CoreError> {
     {
         return Some(CoreError::UnsupportedLink);
     }
-    if cruise_scheme_version(text, "CMLINK").is_some() || text.contains(DEVICE_LINK_PREFIX) {
+    if text.contains(DEVICE_LINK_PREFIX) {
+        // A link offer this build can read perfectly well. It is not a friend
+        // card, and saying "update the app" about a code this very build emits
+        // would send a person chasing a version that does not exist.
+        return Some(CoreError::DeviceLinkOffer);
+    }
+    if cruise_scheme_version(text, "CMLINK").is_some() {
+        // A `CMLINK` version from the future: that one really does need a newer
+        // build.
         return Some(CoreError::UnsupportedLink);
     }
     if cruise_scheme_version(text, "CMSHARE").is_some_and(|version| version != 1) {
@@ -1864,9 +1887,12 @@ mod tests {
     #[test]
     fn parse_friend_text_and_import_fail_soft_on_future_link_schemes() {
         for text in [
-            "CMLINK1:abc",
             "Add me: https://cruisemesh.app/f#CMFRIEND5:abc",
             "CMSHARE2:abc",
+            // A `CMLINK` version this build has never heard of really is
+            // update-the-app; the `CMLINK1:` it emits itself is not, and has its
+            // own variant below.
+            "CMLINK9:abc",
         ] {
             let err = parse_friend_text(text.to_string()).unwrap_err();
             assert!(
@@ -1877,6 +1903,32 @@ mod tests {
             assert!(
                 matches!(err, CoreError::UnsupportedLink),
                 "import {text} -> {err:?}"
+            );
+        }
+    }
+
+    /// A link offer is not a friend card, and this build is not too old to read
+    /// it — it is the build that mints it. Telling its own user to update would
+    /// send them looking for a version that does not exist.
+    #[test]
+    fn a_device_link_offer_is_its_own_refusal_not_update_the_app() {
+        for text in [
+            "CMLINK1:abc",
+            "Add me: https://cruisemesh.app/link#CMLINK1:abc",
+        ] {
+            assert!(
+                matches!(
+                    parse_friend_text(text.to_string()),
+                    Err(CoreError::DeviceLinkOffer)
+                ),
+                "{text}"
+            );
+            assert!(
+                matches!(
+                    parse_friend_import(text.to_string()),
+                    Err(CoreError::DeviceLinkOffer)
+                ),
+                "import {text}"
             );
         }
     }

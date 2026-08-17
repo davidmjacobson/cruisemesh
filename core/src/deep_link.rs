@@ -14,8 +14,8 @@
 //! The routing table itself is one thing both shells must agree on, so it
 //! lives here rather than being written twice. Card parsing stays where it
 //! already is: the shells hand the fragment to `parse_friend_text` /
-//! `parse_relay_setup_text` / `parse_lan_endpoint_link`, which decide whether
-//! the payload is real.
+//! `parse_relay_setup_text` / `parse_lan_endpoint_link` / `core_parse_link_qr`,
+//! which decide whether the payload is real.
 
 /// The in-app destination named by a link, independent of which form the
 /// link arrived in.
@@ -27,6 +27,11 @@ pub enum DeepLinkRoute {
     RelaySetup,
     /// A LAN endpoint (`/lan`) — diagnostics-only manual connect.
     Lan,
+    /// A device-link offer (`/link`) — the `CMLINK1:` linking ceremony
+    /// (`specs/multi-device-v1.md` §9). The offer is normally scanned as a bare
+    /// `CMLINK1:` QR inside the app; the route exists so the URL form lands on
+    /// the same screen, exactly as `/f` does for every friend-card form.
+    DeviceLink,
 }
 
 const WEB_HOST: &str = "cruisemesh.app";
@@ -60,6 +65,7 @@ pub fn deep_link_route(scheme: String, host: String, path: String) -> Option<Dee
         "f" => Some(DeepLinkRoute::Friend),
         "r" => Some(DeepLinkRoute::RelaySetup),
         "lan" => Some(DeepLinkRoute::Lan),
+        "link" => Some(DeepLinkRoute::DeviceLink),
         _ => None,
     }
 }
@@ -77,6 +83,8 @@ mod tests {
             ("/r/", DeepLinkRoute::RelaySetup),
             ("/lan", DeepLinkRoute::Lan),
             ("/lan/", DeepLinkRoute::Lan),
+            ("/link", DeepLinkRoute::DeviceLink),
+            ("/link/", DeepLinkRoute::DeviceLink),
         ] {
             assert_eq!(
                 deep_link_route("https".into(), WEB_HOST.into(), path.into()),
@@ -120,6 +128,7 @@ mod tests {
             ("f", DeepLinkRoute::Friend),
             ("r", DeepLinkRoute::RelaySetup),
             ("lan", DeepLinkRoute::Lan),
+            ("link", DeepLinkRoute::DeviceLink),
         ] {
             assert_eq!(
                 deep_link_route(APP_SCHEME.into(), host.into(), String::new()),
@@ -146,6 +155,26 @@ mod tests {
         assert_eq!(
             deep_link_route("CruiseMesh".into(), "F".into(), String::new()),
             Some(DeepLinkRoute::Friend),
+        );
+    }
+
+    /// A device-link offer routes on scheme/host/path alone, whichever form the
+    /// fragment carries — the same rule the friend routes keep, so a later
+    /// `CMLINK2:` reaches the same screen without touching this table
+    /// (`specs/multi-device-v1.md` §9).
+    #[test]
+    fn a_device_link_routes_whatever_the_fragment_carries() {
+        for fragment in ["CMLINK1:aB-_cD", "CMLINK2:aB-_cD", ""] {
+            let path = "/link";
+            assert_eq!(
+                deep_link_route("https".into(), WEB_HOST.into(), path.into()),
+                Some(DeepLinkRoute::DeviceLink),
+                "https://{WEB_HOST}{path}#{fragment}"
+            );
+        }
+        assert_eq!(
+            deep_link_route(APP_SCHEME.into(), String::new(), "/link".into()),
+            Some(DeepLinkRoute::DeviceLink),
         );
     }
 

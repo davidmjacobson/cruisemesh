@@ -76,6 +76,19 @@ object MeshRouter {
         state.clear()
     }
 
+    /**
+     * LAN teardown must not discard BLE routes.
+     *
+     * The mirror of [resetBle], needed for the same reason: closing LAN sockets
+     * in bulk does not fire per-address disconnect callbacks, so without this a
+     * §9.4 silence window (or any other LAN restart) leaves stale LAN addresses
+     * that [sendToAddress] would happily target -- a phone that believes it can
+     * still reach peers over a transport it has just taken down.
+     */
+    fun resetLan() {
+        state.clearTransports(setOf(MeshRouterState.Transport.LAN))
+    }
+
     /** BLE teardown must not discard authenticated same-LAN routes. */
     fun resetBle() {
         state.clearTransports(

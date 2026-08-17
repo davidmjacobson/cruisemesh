@@ -1,6 +1,7 @@
 use rusqlite::{params, OptionalExtension, Transaction};
 
 use crate::causal_order::causal_display_timestamp;
+use crate::device_link::activation::CoreLinkGatedAction;
 use crate::outbound_retirement::{authored_expiry, backfill_rejoins_the_queue, retire_superseded};
 use crate::store::{
     outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
@@ -53,6 +54,9 @@ impl MessageStore {
         reply_to_msg_id: Option<Vec<u8>>,
         timestamp_ms: i64,
     ) -> Result<AuthoredEnvelope, CoreError> {
+        // §9.4: a device still being adopted may not author ANYTHING. First,
+        // before a lamport is spent or a transaction is opened.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if !is_pairwise_kind(kind) {
             return Err(CoreError::Malformed(format!(
                 "unsupported pairwise authored kind {kind}"
@@ -184,6 +188,9 @@ impl MessageStore {
         message: StoredMessage,
         reply_to_msg_id: Option<Vec<u8>>,
     ) -> Result<AuthoredEnvelope, CoreError> {
+        // §9.4: re-sealing a message is authoring one, as far as the mesh can
+        // tell.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if !is_pairwise_kind(message.kind)
             || message.chat_id != contact.user_id
             || message.sender_user_id != identity.user_id
@@ -243,6 +250,8 @@ impl MessageStore {
         reply_to_msg_id: Option<Vec<u8>>,
         timestamp_ms: i64,
     ) -> Result<AuthoredEnvelope, CoreError> {
+        // §9.4.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if kind != KIND_TEXT && kind != KIND_ATTACHMENT_MANIFEST && kind != KIND_REACTION {
             return Err(CoreError::Malformed(format!(
                 "unsupported group authored kind {kind}"
@@ -305,6 +314,8 @@ impl MessageStore {
         member_user_ids: Vec<Vec<u8>>,
         timestamp_ms: i64,
     ) -> Result<AuthoredGroupMetadataUpdate, CoreError> {
+        // §9.4.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         let update = create_group_metadata_update(
             group.clone(),
             identity.user_id.clone(),
@@ -367,6 +378,8 @@ impl MessageStore {
         members: Vec<Contact>,
         timestamp_ms: i64,
     ) -> Result<Vec<AuthoredEnvelope>, CoreError> {
+        // §9.4.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         let invite = encode_group_invite_content(group.clone())?;
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction().map_err(store_err)?;
@@ -414,6 +427,9 @@ impl MessageStore {
         through_lamport: u64,
         timestamp_ms: i64,
     ) -> Result<Option<AuthoredReceipt>, CoreError> {
+        // §9.4. A receipt is authored mail and is also half of an ack; a device
+        // that has not finished being adopted owes neither.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if receipt_type != RECEIPT_TYPE_DELIVERED && receipt_type != RECEIPT_TYPE_READ {
             return Err(CoreError::Malformed("invalid receipt type".to_string()));
         }
@@ -525,6 +541,8 @@ impl MessageStore {
         through_lamport: u64,
         timestamp_ms: i64,
     ) -> Result<AuthoredReceipt, CoreError> {
+        // §9.4.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if receipt_type != RECEIPT_TYPE_DELIVERED && receipt_type != RECEIPT_TYPE_READ {
             return Err(CoreError::Malformed("invalid receipt type".to_string()));
         }
@@ -656,6 +674,8 @@ impl MessageStore {
                 "receipt watermark must be positive".to_string(),
             ));
         }
+        // §9.4.
+        self.guard_link_gate(CoreLinkGatedAction::Author)?;
         if group_id.len() != crate::GROUP_ID_LEN {
             return Err(CoreError::Malformed(format!(
                 "group receipt id must be exactly {} bytes",

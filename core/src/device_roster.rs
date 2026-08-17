@@ -89,6 +89,19 @@ const MESSAGE_AUTHORING_SIGN_DOMAIN: &[u8] = b"CruiseMesh device message authori
 /// Own-device sync records (§8). Same treatment: the domain is frozen here so
 /// WP4 cannot accidentally ship a colliding one.
 const SYNC_RECORD_SIGN_DOMAIN: &[u8] = b"CruiseMesh device sync record v1\0";
+/// The two frames of §9's linking ceremony a device signs with the key it is
+/// being certified for: the offer naming its fresh keys (§9.3), and the
+/// acknowledgement of the exact roster hash that closes activation (§9.4).
+/// Its own domain because these are the only signatures a device makes
+/// *before* it is a device — one minted here must never be replayable as a
+/// message, a sync record, or a certificate.
+const DEVICE_LINK_ACTIVATION_SIGN_DOMAIN: &[u8] = b"CruiseMesh device link activation v1\0";
+/// §9.3's bootstrap export, signed by the approving device over the whole
+/// payload, the channel it is crossing, and the moment it stops being valid.
+/// Its own domain for the same reason as the one above and one level stricter:
+/// this signature is what makes an export *this ceremony's* export, so it must
+/// never be mistakable for the activation frames riding the same channel.
+const DEVICE_LINK_BOOTSTRAP_SIGN_DOMAIN: &[u8] = b"CruiseMesh device link bootstrap v1\0";
 /// Roster head hashing. Not a signing domain — it separates the digest input
 /// from the signature input so the head can never be mistaken for a signature
 /// pre-image.
@@ -110,6 +123,13 @@ pub enum DeviceSigningDomain {
     RosterUpdate,
     MessageAuthoring,
     SyncRecord,
+    /// §9's link-ceremony frames, signed by a device that is not yet in any
+    /// roster (`device_link::activation`).
+    DeviceLinkActivation,
+    /// §9.3's canonical bootstrap, signed by the APPROVING device's
+    /// roster-signing key over the export, the channel binding, and the expiry
+    /// (`device_link::bootstrap`).
+    DeviceLinkBootstrap,
 }
 
 fn domain_separator(domain: DeviceSigningDomain) -> &'static [u8] {
@@ -118,6 +138,8 @@ fn domain_separator(domain: DeviceSigningDomain) -> &'static [u8] {
         DeviceSigningDomain::RosterUpdate => ROSTER_SIGN_DOMAIN,
         DeviceSigningDomain::MessageAuthoring => MESSAGE_AUTHORING_SIGN_DOMAIN,
         DeviceSigningDomain::SyncRecord => SYNC_RECORD_SIGN_DOMAIN,
+        DeviceSigningDomain::DeviceLinkActivation => DEVICE_LINK_ACTIVATION_SIGN_DOMAIN,
+        DeviceSigningDomain::DeviceLinkBootstrap => DEVICE_LINK_BOOTSTRAP_SIGN_DOMAIN,
     }
 }
 
@@ -158,6 +180,71 @@ pub fn generate_device_keypair() -> DeviceKeypair {
         agree_pk: agree_pk.as_bytes().to_vec(),
         agree_sk: agree_sk.to_bytes().to_vec(),
     }
+}
+
+/// Bytes of one [`DeviceKeypair`]: `device_id(16) || sign_pk || sign_sk ||
+/// agree_pk || agree_sk`.
+const DEVICE_KEYPAIR_LEN: usize = DEVICE_ID_LEN + 4 * KEY_LEN;
+
+/// Flatten a [`DeviceKeypair`] for the shell's platform-protected storage.
+///
+/// Same division of labour [`encode_identity_bytes`](crate::encode_identity_bytes)
+/// established, and here for the same reason: the core generates and never
+/// persists, the shell keeps the secrets in the Keystore or the Keychain, and
+/// neither of them gets to invent its own layout for the other to misread.
+/// Every field is fixed-width, so this is plain concatenation.
+#[uniffi::export]
+pub fn core_encode_device_keypair(device: DeviceKeypair) -> Result<Vec<u8>, CoreError> {
+    check_key_len(&device.device_id, DEVICE_ID_LEN)?;
+    for key in [
+        &device.sign_pk,
+        &device.sign_sk,
+        &device.agree_pk,
+        &device.agree_sk,
+    ] {
+        check_key_len(key, KEY_LEN)?;
+    }
+    let mut out = Vec::with_capacity(DEVICE_KEYPAIR_LEN);
+    out.extend_from_slice(&device.device_id);
+    out.extend_from_slice(&device.sign_pk);
+    out.extend_from_slice(&device.sign_sk);
+    out.extend_from_slice(&device.agree_pk);
+    out.extend_from_slice(&device.agree_sk);
+    Ok(out)
+}
+
+/// Read back what [`core_encode_device_keypair`] wrote, re-deriving the device
+/// id rather than trusting the stored one: a blob whose id does not follow from
+/// its own signing key is corrupt, not a device.
+#[uniffi::export]
+pub fn core_decode_device_keypair(bytes: Vec<u8>) -> Result<DeviceKeypair, CoreError> {
+    if bytes.len() != DEVICE_KEYPAIR_LEN {
+        return Err(CoreError::Malformed(format!(
+            "expected {DEVICE_KEYPAIR_LEN} device keypair bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let sign_pk = bytes[16..48].to_vec();
+    let device_id = derive_user_id(&sign_pk).to_vec();
+    if device_id != bytes[0..16] {
+        return Err(CoreError::Malformed(
+            "stored device keypair does not match its own signing key".to_string(),
+        ));
+    }
+    Ok(DeviceKeypair {
+        device_id,
+        sign_pk,
+        sign_sk: bytes[48..80].to_vec(),
+        agree_pk: bytes[80..112].to_vec(),
+        agree_sk: bytes[112..144].to_vec(),
+    })
+}
+
+fn check_key_len(key: &[u8], expected: usize) -> Result<(), CoreError> {
+    if key.len() != expected {
+        return Err(crate::crypto::key_len_err(expected as u32, key.len()));
+    }
+    Ok(())
 }
 
 /// Device id = first 16 bytes of BLAKE2b(device signing pubkey).
@@ -1149,6 +1236,63 @@ pub(crate) fn validate_own_device_fleet(fleet: &OwnDeviceFleet) -> Result<(), Co
     Ok(())
 }
 
+/// What a peer presenting this person's own identity actually is.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreOwnIdentityPeer {
+    /// A second phone running this person's identity that this person did not
+    /// link: the `.cmbak` clone of §1, two devices signing one author stream.
+    /// Worth interrupting someone over.
+    Clone,
+    /// A device this person's own roster lists. Deliberately linked, expected
+    /// to be here, and NOT worth a warning — §6 makes the inbox key
+    /// person-scoped, so a sibling legitimately holds the very key the clone
+    /// guard was built to recognise.
+    Sibling,
+}
+
+/// Classify a peer that just presented this person's own identity
+/// (`specs/multi-device-v1.md` §1, §6).
+///
+/// The clone guard predates linking, and its whole test was "does this peer
+/// hold my agreement key". That was a sound proxy while a person was a device.
+/// It stops being one the moment a person has two: a sibling holds the
+/// person-scoped inbox key by design, so the guard would greet every deliberate
+/// link with "another phone is using your backup" — the most alarming sentence
+/// the app can say, about the thing the person just did on purpose. A warning
+/// that fires on the normal case is a warning people learn to dismiss, and then
+/// it is not there for the real clone either.
+///
+/// `peer_device_id` is what separates the two, and there is no substitute for
+/// it: the keys are identical by construction. `None` means the transport could
+/// not tell which device it was talking to, and the verdict is
+/// [`CoreOwnIdentityPeer::Clone`] — fail loud, because an unidentified peer
+/// holding this person's identity is exactly the situation the guard exists
+/// for, and a person told about a sibling once is better served than a person
+/// never told about a clone.
+///
+/// WP4's own-device sync records are what will put a device id on this wire.
+/// Until then the shells pass `None` and the guard behaves precisely as it does
+/// today; the rule is implemented and pinned here so the day a device id
+/// arrives, the answer is already right.
+#[uniffi::export]
+pub fn core_own_identity_peer(
+    fleet: OwnDeviceFleet,
+    peer_device_id: Option<Vec<u8>>,
+) -> CoreOwnIdentityPeer {
+    let Some(peer_device_id) = peer_device_id else {
+        return CoreOwnIdentityPeer::Clone;
+    };
+    // A peer claiming to be THIS device is not a sibling; it is the clone case
+    // in its purest form, and the fleet listing that id says nothing else.
+    if fleet.own_device_id.as_ref() == Some(&peer_device_id) {
+        return CoreOwnIdentityPeer::Clone;
+    }
+    if fleet.device_ids.contains(&peer_device_id) {
+        return CoreOwnIdentityPeer::Sibling;
+    }
+    CoreOwnIdentityPeer::Clone
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,11 +1491,13 @@ mod tests {
 
     #[test]
     fn every_signing_domain_is_distinct_and_prefixes_its_signed_bytes() {
-        let domains: [&[u8]; 7] = [
+        let domains: [&[u8]; 9] = [
             DEVICE_CERT_SIGN_DOMAIN,
             ROSTER_SIGN_DOMAIN,
             MESSAGE_AUTHORING_SIGN_DOMAIN,
             SYNC_RECORD_SIGN_DOMAIN,
+            DEVICE_LINK_ACTIVATION_SIGN_DOMAIN,
+            DEVICE_LINK_BOOTSTRAP_SIGN_DOMAIN,
             ROSTER_HEAD_HASH_DOMAIN,
             // The pre-existing identity domains this must never collide with.
             b"CruiseMesh friend card self-signature v1\0",
@@ -1391,6 +1537,8 @@ mod tests {
             DeviceSigningDomain::DeviceCert,
             DeviceSigningDomain::RosterUpdate,
             DeviceSigningDomain::SyncRecord,
+            DeviceSigningDomain::DeviceLinkActivation,
+            DeviceSigningDomain::DeviceLinkBootstrap,
         ] {
             assert!(matches!(
                 core_device_verify(
@@ -2004,6 +2152,28 @@ mod tests {
         );
     }
 
+    /// The shell stores these bytes and hands them back a reboot later; a
+    /// round trip that quietly lost a field would cost a device its identity.
+    #[test]
+    fn a_device_keypair_survives_the_shell_storing_it() {
+        let device = generate_device_keypair();
+        let bytes = core_encode_device_keypair(device.clone()).expect("encodes");
+        assert_eq!(bytes.len(), DEVICE_KEYPAIR_LEN);
+        assert_eq!(core_decode_device_keypair(bytes.clone()).unwrap(), device);
+
+        // A blob whose id does not follow from its own signing key is corrupt,
+        // not a device this build should sign anything with.
+        let mut tampered = bytes.clone();
+        tampered[0] ^= 0x01;
+        assert!(core_decode_device_keypair(tampered).is_err());
+        assert!(core_decode_device_keypair(bytes[..DEVICE_KEYPAIR_LEN - 1].to_vec()).is_err());
+        assert!(core_decode_device_keypair(Vec::new()).is_err());
+
+        let mut short = device.clone();
+        short.agree_sk.pop();
+        assert!(core_encode_device_keypair(short).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // DL-1 / DL-2 acceptance, mirroring the WP0 vector scenarios
     // -----------------------------------------------------------------------
@@ -2429,6 +2599,46 @@ mod tests {
         let mut over_cap = capped.clone();
         over_cap.push(vec![0xFF; DEVICE_ID_LEN]);
         assert!(validate_own_device_fleet(&fleet(Some(capped[0].clone()), over_cap)).is_err());
+    }
+
+    /// The clone guard must not fire on the thing the person just deliberately
+    /// did — and must still fire on everything else.
+    #[test]
+    fn a_roster_listed_sibling_is_not_a_clone_and_a_stranger_still_is() {
+        let own = vec![0x01; DEVICE_ID_LEN];
+        let sibling = vec![0x02; DEVICE_ID_LEN];
+        let stranger = vec![0x03; DEVICE_ID_LEN];
+        let fleet = OwnDeviceFleet {
+            own_device_id: Some(own.clone()),
+            device_ids: vec![own.clone(), sibling.clone()],
+            projected_from: RosterVersion::default(),
+        };
+
+        assert_eq!(
+            core_own_identity_peer(fleet.clone(), Some(sibling)),
+            CoreOwnIdentityPeer::Sibling,
+            "a device this person's own roster lists is not a clone"
+        );
+        assert_eq!(
+            core_own_identity_peer(fleet.clone(), Some(stranger.clone())),
+            CoreOwnIdentityPeer::Clone,
+            "a device the fleet does not list is exactly what the guard is for"
+        );
+        // A peer claiming to be this very device is the purest clone case.
+        assert_eq!(
+            core_own_identity_peer(fleet.clone(), Some(own)),
+            CoreOwnIdentityPeer::Clone
+        );
+        // And an unidentified peer fails loud, not quiet.
+        assert_eq!(
+            core_own_identity_peer(fleet, None),
+            CoreOwnIdentityPeer::Clone
+        );
+        // On an install that never linked, nothing is ever a sibling.
+        assert_eq!(
+            core_own_identity_peer(OwnDeviceFleet::default(), Some(stranger)),
+            CoreOwnIdentityPeer::Clone
+        );
     }
 
     #[test]
