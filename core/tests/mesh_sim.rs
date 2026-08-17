@@ -30,14 +30,17 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cruisemesh_core::{
-    compute_recipient_hint, core_group_fanout_rows, core_own_capabilities, core_sign_device_cert,
-    core_sign_roster, dedupe_hints, default_expiry, device_fanout_msg_id, encode_envelope_frame,
+    compute_recipient_hint, core_device_namespace_id, core_encode_sync_history,
+    core_group_fanout_rows, core_own_capabilities, core_plan_sync_backfill, core_seal_sync_record,
+    core_sign_device_cert, core_sign_roster, core_sign_sync_record, core_sync_digest_gaps,
+    core_sync_record_id, dedupe_hints, default_expiry, device_fanout_msg_id, encode_envelope_frame,
     generate_device_keypair, generate_identity, generate_msg_id, parse_frame, seal_group_message,
     seal_message, CarriedEnvelope, Contact, CoreCarriedOfferGate, CoreInboundDisposition,
     CoreInboundSource, CoreMeetOutcome, CoreMeetRequest, CoreMeshRouterState,
     CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreSprayTrigger, CoreTransport, DeviceCert,
-    DeviceKeypair, Frame, Group, Identity, MessageStore, OutboundEnvelope, OwnDeviceFleet, Roster,
-    RosterUpdateOutcome, RosterVersion, SeenIds, StoredMessage, DEFAULT_HOP_TTL,
+    DeviceKeypair, Frame, Group, Identity, InboxKey, MessageStore, OutboundEnvelope,
+    OwnDeviceFleet, Roster, RosterUpdateOutcome, RosterVersion, SeenIds, StoredMessage,
+    SyncBackfillAction, SyncRecord, SyncRecordKind, DEFAULT_HOP_TTL,
     DEVICE_CERT_FLAG_ROSTER_SIGNING, KIND_TEXT,
 };
 
@@ -159,6 +162,56 @@ impl SimNode {
                 .core_commit_inbound_delivery(self.seen.clone(), commit);
         }
         outcome.relay_frame
+    }
+
+    /// Receive one §8 self-sync frame.
+    ///
+    /// There is deliberately almost nothing here. The whole disposition —
+    /// dedupe, expiry, the pairwise open, the SYNC-3 roster gate, the apply,
+    /// and the ACK-MD-1 consumed-hidden evidence that lets this device's
+    /// fan-out row be deleted — runs inside
+    /// [`MessageStore::process_inbound_frame`], because a sync record is
+    /// ordinary sealed 1:1 traffic and the inbound transaction is where this
+    /// codebase decides what ordinary sealed 1:1 traffic means. The sim used to
+    /// own the record/message split itself, which made it a fourth
+    /// implementation of a rule that has to be identical on both shells.
+    ///
+    /// What is left is what a shell has left: hand the frame in, deliver
+    /// whatever comes back out as ordinary mail, and commit.
+    ///
+    /// Returns how many sync records core applied — at most one, since a frame
+    /// carries one sealed body.
+    fn receive_sync(&mut self, frame_bytes: &[u8], now: i64) -> usize {
+        let outcome = self
+            .store
+            .process_inbound_frame(
+                self.identity.clone(),
+                self.seen.clone(),
+                CoreInboundSource::Mesh,
+                frame_bytes.to_vec(),
+                now,
+            )
+            .expect("process inbound mesh frame");
+        // A consumed frame that handed nothing back to deliver, and still
+        // counted as delivered work, is a sync record core applied itself.
+        let applied = usize::from(
+            outcome.delivered_payloads.is_empty()
+                && outcome.disposition == CoreInboundDisposition::Consumed
+                && outcome.work.delivered == 1,
+        );
+        let sender = outcome.delivered_sender.clone();
+        let delivered_msg_id = outcome.commit.as_ref().map(|commit| commit.msg_id.clone());
+        for payload in outcome.delivered_payloads {
+            if let (Some(sender), Some(msg_id)) = (sender.as_ref(), delivered_msg_id.as_ref()) {
+                self.record_delivery(&payload, sender, msg_id.clone());
+            }
+            self.inbox.push(payload);
+        }
+        if let Some(commit) = outcome.commit {
+            self.store
+                .core_commit_inbound_delivery(self.seen.clone(), commit);
+        }
+        applied
     }
 
     /// Relay-source counterpart to [`Self::receive`], through the same core
@@ -333,6 +386,25 @@ fn teach_roster(sender: &SimNode, person: &Identity, devices: &[DeviceKeypair]) 
             nickname: None,
         })
         .expect("the person is a contact");
+    assert_eq!(
+        sender
+            .store
+            .apply_contact_roster(signed_roster(person, devices))
+            .expect("apply roster")
+            .outcome,
+        RosterUpdateOutcome::Accepted,
+        "the fixture roster must actually land"
+    );
+}
+
+/// The person-root-signed genesis roster for `devices`.
+///
+/// Shared by [`teach_roster`], which hands it to a *contact*, and by §8's
+/// self-sync, where the same document is the person's OWN roster — the one
+/// `core_sync_record_admit` checks a record's author against. One builder, so a
+/// sibling and a stranger are looking at identical bytes, which is the point of
+/// a roster being a signed document rather than a per-side projection.
+fn signed_roster(person: &Identity, devices: &[DeviceKeypair]) -> Roster {
     let certs = devices
         .iter()
         .enumerate()
@@ -356,7 +428,7 @@ fn teach_roster(sender: &SimNode, person: &Identity, devices: &[DeviceKeypair]) 
             .expect("device certificate signs")
         })
         .collect();
-    let roster = core_sign_roster(
+    core_sign_roster(
         Roster {
             person_id: person.user_id.clone(),
             recovery_epoch: 0,
@@ -370,17 +442,213 @@ fn teach_roster(sender: &SimNode, person: &Identity, devices: &[DeviceKeypair]) 
         },
         person.sign_sk.clone(),
     )
-    .expect("roster signs");
-    assert_eq!(
-        sender
-            .store
-            .apply_contact_roster(roster)
-            .expect("apply roster")
-            .outcome,
-        RosterUpdateOutcome::Accepted,
-        "the fixture roster must actually land"
-    );
+    .expect("roster signs")
 }
+
+/// §6's person-scoped inbox key, as v1 actually has it.
+///
+/// The person's identity agreement keypair *is* the inbox key in this build:
+/// every linked device holds the identity, §6 gives every linked device the
+/// inbox key, and WP4 has no linking ceremony of its own to mint a separate one
+/// with (§9/WP3 owns that, and WP5 owns rotating it). Naming it here rather
+/// than passing `identity.agree_pk` around keeps the seam visible: when the
+/// ceremony mints a real generation-N key, this function is the one call site
+/// the sim has to change, and `generation` is already the field that will carry
+/// it.
+fn person_inbox_key(person: &Identity) -> InboxKey {
+    InboxKey {
+        generation: 0,
+        agree_pk: person.agree_pk.clone(),
+        agree_sk: person.agree_sk.clone(),
+    }
+}
+
+/// The roster version a fixture roster names, as a record's `roster_version`.
+fn roster_version_of(roster: &Roster) -> RosterVersion {
+    RosterVersion {
+        recovery_epoch: roster.recovery_epoch,
+        seq: roster.seq,
+    }
+}
+
+/// Author one §8 History record on `device`'s own stream, covering everything
+/// this node holds in `chat_id` from `sender_person_id`, and retain it sealed.
+///
+/// Every step is a shipped primitive: the store pages the history, the store
+/// mints the stream position, `core_sign_sync_record` puts this device's
+/// signature on it in §3's sync domain, `core_seal_sync_record` seals it to the
+/// person's inbox key (SYNC-3 — there is no parameter here that could address
+/// it anywhere else), and the store retains the sealed copy so a sibling that
+/// is dark for a week is still answerable.
+fn author_history_record(
+    node: &SimNode,
+    device: &DeviceKeypair,
+    roster: &Roster,
+    inbox_key: &InboxKey,
+    chat_id: &[u8],
+    sender_person_id: &[u8],
+    now: i64,
+) -> SyncRecord {
+    let payload = node
+        .store
+        .core_sync_history_page(
+            node.user_id(),
+            chat_id.to_vec(),
+            sender_person_id.to_vec(),
+            0,
+            SYNC_PAGE_LIMIT,
+        )
+        .expect("page history");
+    assert!(
+        !payload.entries.is_empty(),
+        "there is nothing to sync if the authoring device holds nothing"
+    );
+    let stream_seq = node
+        .store
+        .core_sync_next_stream_seq(device.device_id.clone(), SyncRecordKind::History)
+        .expect("next stream position");
+    let record = core_sign_sync_record(
+        SyncRecord {
+            kind: SyncRecordKind::History,
+            person_id: node.user_id(),
+            author_device_id: Vec::new(),
+            roster_version: roster_version_of(roster),
+            inbox_key_generation: inbox_key.generation,
+            stream_seq,
+            timestamp_ms: now,
+            payload: core_encode_sync_history(payload).expect("encode history"),
+            signature: Vec::new(),
+        },
+        device.sign_sk.clone(),
+    )
+    .expect("record signs");
+    let sealed = core_seal_sync_record(record.clone(), node.identity.clone(), inbox_key.clone())
+        .expect("record seals to the person's own devices");
+    assert!(
+        node.store
+            .core_sync_retain_record(record.clone(), sealed, now)
+            .expect("retain"),
+        "a freshly minted stream position must be a new slot"
+    );
+    record
+}
+
+/// One SYNC-1 anti-entropy round from `from` to `to`, over BLE frames.
+///
+/// The shape is the whole point and is worth reading as the spec sentence it
+/// implements: `to` states the watermarks it can prove, `from` computes what it
+/// owes with the *same* gap function used in the other direction, the planner
+/// decides what fits, and each planned record goes out as an ordinary sealed
+/// envelope frame. Nothing here waits for anything: `to` never answers, and
+/// every input `from` used was already in its own store before the round began.
+///
+/// Returns how many records were applied.
+fn self_sync_round(
+    from: &SimNode,
+    to: &mut SimNode,
+    to_device_id: &[u8],
+    roster: &Roster,
+    inbox_key: &InboxKey,
+    now: i64,
+) -> usize {
+    let person_id = from.user_id();
+    let theirs = to
+        .store
+        .core_sync_digest(person_id.clone())
+        .expect("sibling digest");
+    let mine = from
+        .store
+        .core_sync_digest(person_id.clone())
+        .expect("own digest");
+    let owed = core_sync_digest_gaps(theirs, mine).expect("what we owe the sibling");
+    let records = from
+        .store
+        .core_sync_backfill_records(owed.clone(), SYNC_PAGE_LIMIT)
+        .expect("stored records for those gaps");
+    let offers = from.store.core_sync_backfill_offers(records.clone());
+    let plan = core_plan_sync_backfill(
+        owed,
+        offers,
+        roster_version_of(roster),
+        inbox_key.generation,
+        SYNC_ROUND_BUDGET_BYTES,
+    );
+
+    let mut applied = 0;
+    for step in &plan.steps {
+        assert_eq!(
+            step.action,
+            SyncBackfillAction::Send,
+            "the roster has not moved, so nothing needs re-sealing"
+        );
+        let stored = &records[step.offer_index as usize];
+        // Addressed exactly as §7's per-device fan-out addresses any other 1:1
+        // envelope, because that is what this is: one copy, for one sibling.
+        //
+        // The base id is derived rather than random — `core_sync_record_id`
+        // names the stream SLOT, so a record re-sent after a dropped link, or
+        // re-sealed after a roster change, dedupes against the copy already in
+        // flight instead of spending a second relay row. `device_fanout_msg_id`
+        // then puts each sibling's copy in its own id namespace, and the hint
+        // is that sibling's own daily device hint rather than the person's
+        // shared one. Both halves are what ACK-MD-1 needs: a row addressed to
+        // the person at large is one every device fetches and none may delete,
+        // so a self-sync row sent that way would sit in the mailbox until it
+        // expired. Addressed per device, the sibling that consumes it is
+        // provably its sole true endpoint consumer and may ack it away.
+        let msg_id = device_fanout_msg_id(
+            core_sync_record_id(
+                person_id.clone(),
+                stored.author_device_id.clone(),
+                stored.kind,
+                stored.stream_seq,
+            ),
+            to_device_id.to_vec(),
+        );
+        let frame = encode_envelope_frame(
+            msg_id,
+            DEFAULT_HOP_TTL,
+            default_expiry(now),
+            compute_recipient_hint(
+                core_device_namespace_id(person_id.clone(), to_device_id.to_vec()),
+                now,
+            ),
+            stored.sealed.clone(),
+        );
+        applied += to.receive_sync(&frame, now);
+    }
+    applied
+}
+
+/// A digest reduced to the claim two converged devices must agree on: which
+/// streams, at which watermark. The serve flag is deliberately excluded — it is
+/// a per-device fact (only an author can serve its own stream), so requiring it
+/// to match would be asserting that two phones authored the same records.
+fn watermarks(digest: &cruisemesh_core::SyncDigest) -> Vec<(Vec<u8>, u8, u64)> {
+    let mut out: Vec<(Vec<u8>, u8, u64)> = digest
+        .streams
+        .iter()
+        .map(|stream| {
+            (
+                stream.author_device_id.clone(),
+                stream.kind,
+                stream.through_seq,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Enough for any fixture here, and small enough that a page cap is still
+/// exercised rather than bypassed.
+const SYNC_PAGE_LIMIT: u32 = 64;
+
+/// One round's byte budget, matching the foreign-carry spray allowance: a
+/// self-sync round is one more lane competing for the same encounter, and
+/// giving it an unbounded budget would be the one place in this file where a
+/// lane is allowed to monopolize a link.
+const SYNC_ROUND_BUDGET_BYTES: u64 = 128 * 1024;
 
 /// Seal `payload` from `from` to the person `to` — the only sealing v1 has for
 /// 1:1 mail, and what every row of a per-device fan-out carries.
@@ -1278,24 +1546,27 @@ fn a_legacy_person_addressed_row_is_never_acked_by_a_multi_device_fleet() {
     );
 }
 
-/// WP2 gate 3: BLE-only-day convergence — **SIM STUB until WP4**.
+/// WP2 gate 3, now real: a BLE-only day converges through §8 self-sync.
 ///
-/// The gate §13 asks for is "a BLE-only day converges via §8 once WP4 lands",
-/// and §8's self-sync does not exist yet: there is no record kind, no digest
-/// anti-entropy, nothing for a sibling to learn from. So this test deliberately
-/// does NOT assert convergence. It pins the two things that are true today:
-/// the BLE copy reaches only the device that met the sender, and — the half
-/// WP2 does own — that device's BLE consumption still does not let it delete
-/// the relay copy its sibling is going to need.
+/// The gate §13 asks for is "a BLE-only day converges via §8 once WP4 lands".
+/// It did not, so this test used to stop at "the sibling has nothing" and said
+/// so. WP4's SYNC-1 anti-entropy is what closes it, and the shape of the close
+/// is the claim worth reading:
 ///
-/// When WP4 lands, replace the "sibling has nothing" assertion with a real
-/// convergence assertion after a self-sync round. WP0 vector
-/// `MD-SYNC-BLE-DAY-CONVERGE` (`core/tests/multi_device_contract.rs`) carries
-/// the target outcome in the pinned ledger, so WP4 cannot land the mechanism
-/// without a deliberate edit to both this test and that vector's
-/// `implemented` flag. Until then, this is the honest shape of the gate.
+/// * one message reaches exactly one device over BLE, as before — nothing here
+///   makes the radio reach further;
+/// * that device's consumption still does not let it delete the relay copy its
+///   sibling would otherwise need (ACK-MD-1, the half WP2 owns, unchanged);
+/// * and then, with **no relay leg and no second sender encounter**, one
+///   digest exchange between the two devices carries the message across. The
+///   sibling was never online with anybody but its own sibling, which is
+///   exactly the day the gate names.
+///
+/// WP0 vector `MD-SYNC-BLE-DAY-CONVERGE`
+/// (`core/tests/multi_device_contract.rs`) carries the target outcome in the
+/// pinned ledger and moves to `implemented: true` with this test.
 #[test]
-fn a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands() {
+fn a_ble_only_day_converges_through_sibling_self_sync() {
     let sender = SimNode::new();
     let (mut devices, fleet) = linked_devices(2);
     teach_roster(&sender, &devices[0].identity.clone(), &fleet);
@@ -1347,8 +1618,7 @@ fn a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands() {
     );
     assert!(
         devices[1].inbox.is_empty(),
-        "STUB (WP4): the sibling converges through §8 self-sync, which does \
-         not exist yet -- nothing in WP2 pretends otherwise"
+        "the radio reached one device, and self-sync has not run yet"
     );
 
     // Explicitly Seen, not merely "not Consumed": the row this device fetches
@@ -1377,6 +1647,114 @@ fn a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands() {
         relay.sealed_of(&sibling_row).as_deref(),
         Some(sibling_bytes.as_slice()),
         "untouched, not merely undeleted"
+    );
+
+    // --- §8: the two devices meet each other, and only each other -----------
+    let roster = signed_roster(&devices[0].identity.clone(), &fleet);
+    let inbox_key = person_inbox_key(&devices[0].identity.clone());
+    // Both devices are told, once, which roster and which inbox key generation
+    // their own sync traffic is admitted against (§4, §6). This is the
+    // ceremony's write — WP3's link and WP5's revocation own it in production —
+    // and without it the inbound transaction has nothing to check a record
+    // against and leaves sync dispatch inert, which is exactly what a v1
+    // single-device install wants.
+    for device in devices.iter() {
+        device
+            .store
+            .core_set_own_sync_context(roster.clone(), inbox_key.generation)
+            .expect("own sync context");
+    }
+    let sender_id = sender.user_id();
+
+    // The device that received the message writes it into its own author
+    // stream. Authoring is local and needs nobody: SYNC-1 forbids assuming the
+    // sibling is ever concurrently online, and nothing above this line knows
+    // whether it is.
+    author_history_record(
+        &devices[0],
+        &fleet[0],
+        &roster,
+        &inbox_key,
+        &sender_id,
+        &sender_id,
+        BASE_NOW,
+    );
+
+    let (first, rest) = devices.split_at_mut(1);
+    let applied = self_sync_round(
+        &first[0],
+        &mut rest[0],
+        &fleet[1].device_id,
+        &roster,
+        &inbox_key,
+        BASE_NOW,
+    );
+    assert_eq!(applied, 1, "one record answered the sibling's whole gap");
+
+    // ACK-MD-1's evidence, from the side that owes it. A sync record leaves no
+    // `messages` row of its own — it carries rows — so the consumed-hidden set
+    // is the only thing that can later prove this device took its own fan-out
+    // copy and may delete it. Without this the self-sync row would sit in the
+    // relay mailbox until it expired, which is the growth half of the
+    // multi-device relay problem.
+    assert!(
+        devices[1]
+            .store
+            .consumed_hidden_msg_id_count()
+            .expect("evidence")
+            > 0,
+        "a consumed sync record has to leave the one licence that lets its          per-device relay row be acked away"
+    );
+
+    let converged = devices[1]
+        .store
+        .messages_for_chat(sender_id.clone())
+        .expect("the sibling's chat with the sender");
+    assert_eq!(
+        converged.len(),
+        1,
+        "the sibling converged on a message it never had a radio path to"
+    );
+    assert_eq!(
+        converged[0].payload, msg,
+        "and it is the message itself, not a placeholder for one"
+    );
+
+    // Convergence is a property of the digests, not only of one lucky row:
+    // after the round the two devices advertise the same watermark for the
+    // stream, so a second round would move nothing.
+    let mine = devices[0]
+        .store
+        .core_sync_digest(person_id.clone())
+        .expect("digest");
+    let theirs = devices[1]
+        .store
+        .core_sync_digest(person_id.clone())
+        .expect("digest");
+    // The watermarks agree; the *serve* flags deliberately do not. Only the
+    // author holds bytes it could re-seal (SYNC-3), so the sibling advertises
+    // the same position with `can_serve = false` — which is what stops every
+    // other device asking it for records it can never hand over.
+    assert_eq!(
+        watermarks(&mine),
+        watermarks(&theirs),
+        "the two views agree on what is held"
+    );
+    assert!(mine.streams.iter().all(|stream| stream.can_serve));
+    assert!(theirs.streams.iter().all(|stream| !stream.can_serve));
+    assert!(
+        core_sync_digest_gaps(theirs, mine)
+            .expect("gaps")
+            .is_empty(),
+        "nothing is owed either way once the round has landed"
+    );
+
+    // The relay copy the sibling no longer needs is still sitting there
+    // unacked: SYNC-1 converging the *content* is not a licence to ack a row
+    // on the relay's behalf, and nothing in this round touched it.
+    assert!(
+        relay.holds(&sibling_row),
+        "self-sync never acks a sibling's relay row for it"
     );
 }
 

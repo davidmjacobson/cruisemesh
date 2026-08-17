@@ -296,6 +296,96 @@ pub const KIND_LAN_ENDPOINT_HINT: u8 = 8;
 /// scoped to the sealing sender, and it carries a *deposit*-class credential
 /// only (CP4). Hidden from chat history.
 pub const KIND_RELAY_UPDATE: u8 = 9;
+
+// --- §8 self-sync record kinds ---------------------------------------------
+//
+// Six kinds, filling the 10..=15 gap exactly, one per record kind
+// `specs/multi-device-v1.md` §8 enumerates. They are *sealed-body* kinds: the
+// envelope's public header (§6.4) is unchanged, so a legacy peer that somehow
+// received one sees bytes indistinguishable from ordinary 1:1 mail and drops
+// it at its `unhandled kind` arm — the WPT forward-tolerance guarantee, which
+// is why no new capability bit is needed here.
+//
+// They also never legitimately reach a contact at all. A sync record is sealed
+// to the person's own inbox key (§6) and addressed only to own devices, so
+// [`crate::core_pairwise_sender_authorized`] admits these kinds on the
+// `sender_is_self` branch alone — never from a contact, however well
+// authenticated. That is SYNC-3's person boundary expressed as an accept rule
+// rather than as a comment.
+//
+// One kind per record kind, rather than one wrapper kind with an inner
+// discriminator, because the downstream tables that answer "does this kind
+// leave a msg_id row", "is this a hidden spray kind", and "may this sender send
+// it" all take a bare `u8` and would otherwise be unable to tell replaceable
+// state (watermarks, contacts, settings — newest wins) from gap-filled history
+// (which SYNC-1's anti-entropy must deliver exactly once). The u8 space had
+// exactly six free values below the reserved attachment kinds, which is what
+// makes the split affordable.
+//
+// ## The kind-number layout, in one place
+//
+// The 10..=15 block below is *full*, so SYNC-1's digest carrier
+// ([`KIND_SYNC_DIGEST`]) could not join it and takes the next value above the
+// kinds already spoken for:
+//
+// | value  | meaning                                                        |
+// |--------|----------------------------------------------------------------|
+// | 10..15 | §8 sync record kinds (History … Settings)                      |
+// | 16, 17 | reserved attachment kinds — never reused, even though 17 is    |
+// |        | still unproduced, because a shipped build already routes on it |
+// | 18     | reaction                                                       |
+// | 19     | group metadata update                                          |
+// | 20     | §8 sync **digest** — SYNC-1's watermark exchange, a sync kind   |
+// |        | in every respect but a *record* stream in none                 |
+//
+// So the sync kinds are deliberately *not* one contiguous range any more, and
+// nothing may test for one: [`core_is_sync_record_kind`] is the only membership
+// test, and both 10..=15 and 20 answer `true` through it.
+
+/// §8 sync record: message history, authored and received
+/// ([`crate::SyncHistoryPayload`]).
+pub const KIND_SYNC_HISTORY: u8 = 10;
+/// §8 sync record: delivered/read watermarks
+/// ([`crate::SyncWatermarkPayload`]).
+pub const KIND_SYNC_WATERMARK: u8 = 11;
+/// §8 sync record: the contact list and contacts' rosters
+/// ([`crate::SyncContactsPayload`]).
+pub const KIND_SYNC_CONTACTS: u8 = 12;
+/// §8 sync record: the person's own roster and inbox keys
+/// ([`crate::SyncOwnRosterPayload`]). This is the one record kind that carries
+/// person-scoped *secret* material, which is exactly why every sync record is
+/// sealed to a key only own devices hold.
+pub const KIND_SYNC_OWN_ROSTER: u8 = 13;
+/// §8 sync record: group membership and state
+/// ([`crate::SyncGroupsPayload`]). §11 leaves group crypto untouched; a
+/// member's new device gets the group key through this record rather than
+/// through a re-invite.
+pub const KIND_SYNC_GROUPS: u8 = 14;
+/// §8 sync record: the settings the product deems shared
+/// ([`crate::SyncSettingsPayload`]).
+pub const KIND_SYNC_SETTINGS: u8 = 15;
+
+/// Whether `kind` is one of §8's self-sync kinds — the kinds that only ever
+/// travel between one person's own devices.
+///
+/// Both shells and every dispatch table call this instead of listing the
+/// values, so the set cannot drift between the accept gate, the routing lanes,
+/// and the store. Note the set is **not** a contiguous range: see the layout
+/// table above [`KIND_SYNC_HISTORY`].
+#[uniffi::export]
+pub fn core_is_sync_record_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        KIND_SYNC_HISTORY
+            | KIND_SYNC_WATERMARK
+            | KIND_SYNC_CONTACTS
+            | KIND_SYNC_OWN_ROSTER
+            | KIND_SYNC_GROUPS
+            | KIND_SYNC_SETTINGS
+            | KIND_SYNC_DIGEST
+    )
+}
+
 /// `MessageBody.kind` value for an attachment manifest (DESIGN.md §7.1
 /// reserved, §8). Android currently embeds the media blob inline in the
 /// manifest payload for BLE/relay-friendly sizes; `KIND_ATTACHMENT_CHUNK`
@@ -308,6 +398,25 @@ pub const KIND_ATTACHMENT_CHUNK: u8 = 17;
 pub const KIND_REACTION: u8 = 18;
 /// Hidden group-stream event carrying a convergent name/add-member update.
 pub const KIND_GROUP_METADATA_UPDATE: u8 = 19;
+
+/// §8 sync **digest**: SYNC-1's per-stream watermark exchange
+/// ([`crate::SyncDigest`]), carried as a sealed record like every other sync
+/// kind so the digest a device advertises is itself a document only that
+/// person's devices can read (§2's "device count is invisible to other
+/// people").
+///
+/// It sits at 20 rather than inside the 10..=15 block because that block was
+/// already full when SYNC-1 needed a carrier, and 16..=19 are spoken for — see
+/// the layout table above [`KIND_SYNC_HISTORY`]. The gap is deliberate: nothing
+/// may infer sync membership from a range.
+///
+/// A digest is the one sync kind that is **not** a gap-filled stream. It is
+/// authored on its own per-device stream so that it signs, seals, and dedupes
+/// exactly like the others, but the receiver consumes it and never files a
+/// stream slot for it: yesterday's watermark is worth nothing, so retaining or
+/// backfilling one would be storage spent on a document that is stale the
+/// moment it lands.
+pub const KIND_SYNC_DIGEST: u8 = 20;
 
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).
@@ -384,6 +493,13 @@ pub fn core_own_capabilities() -> u32 {
 /// stop condition is the peer's DELIVERED watermark advancing — which never
 /// happens against a peer that lacks [`CAP_ACKS_HIDDEN_KINDS`]. The spray
 /// plan bounds re-sends of exactly these kinds toward such peers.
+///
+/// §8's sync record kinds are deliberately absent, and their absence is a
+/// decision rather than an omission: this list is about what a *peer* can be
+/// trusted to ack, and a sync record never reaches a peer — it is addressed to
+/// this person's own devices, which are by construction builds that understand
+/// it. SYNC-1's anti-entropy gives own-device traffic its own stop condition
+/// (a sibling's stream watermark), so nothing here needs to bound its re-sends.
 #[uniffi::export]
 pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
     matches!(
@@ -419,6 +535,14 @@ pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
 /// NULL-`msg_id` row and so never advance a peer's DELIVERED watermark).
 /// `KIND_RECEIPT` is the highest-volume kind in a real mailbox and is hidden
 /// *here* while deliberately not being a hidden spray kind.
+///
+/// §8's sync record kinds answer `false`, which is correct rather than
+/// incidental: a sync record is not a chat message and leaves no `messages`
+/// row of its own — it *carries* rows, whose own stream keys and msg_ids come
+/// from [`crate::SyncHistoryEntry`]. Its consumption is therefore recorded
+/// through [`crate::MessageStore::core_record_consumed_hidden_msg_id`], the
+/// same evidence route every other row-less kind uses, which is what lets
+/// ACK-MD-1 delete the sibling's fan-out row once this device has it.
 #[uniffi::export]
 pub fn core_kind_persists_msg_id_row(kind: u8) -> bool {
     matches!(

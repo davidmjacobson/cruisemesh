@@ -95,12 +95,25 @@ pub enum CoreInboundDisposition {
 /// Every ordinary chat/control kind requires an accepted contact, except for
 /// this device's own relay/fan-out copies. Unknown and group-only kinds fail
 /// closed before either platform can write message or group state.
+///
+/// §8's self-sync kinds take the strictest branch of all, and take it first:
+/// `sender_is_self` and nothing else. SYNC-3 makes a sync record a document
+/// between one person's own devices, so "a contact sent me a sync record" is
+/// never a legitimate event — a contact holding those bytes is either replaying
+/// a record they could not open or is a compromised peer, and either way the
+/// answer is no. Sealing already makes such a record unopenable
+/// ([`crate::core_open_sync_record`] is the crypto half of the same rule); this
+/// gate makes it unauthorized as well, so the person boundary does not rest on
+/// one layer alone.
 #[uniffi::export]
 pub fn core_pairwise_sender_authorized(
     kind: u8,
     sender_is_contact: bool,
     sender_is_self: bool,
 ) -> bool {
+    if crate::core_is_sync_record_kind(kind) {
+        return sender_is_self;
+    }
     let recognized_pairwise_kind = matches!(
         kind,
         KIND_TEXT

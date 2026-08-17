@@ -31,10 +31,6 @@
 //!   person's recovery epoch (WP5's recovery flow).
 //! * MD-RECOVERY-ROOT-CUSTODY needs the person root minted and stored apart
 //!   from the identity key (WP3).
-//! * MD-SYNC-BLE-DAY-CONVERGE needs §8's self-sync records (WP4). The sim's
-//!   `a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands` pins
-//!   the honest half of that day today and points back here, so WP4 cannot
-//!   land the mechanism without deliberately editing both.
 //! * MD-ROSTER-GOSSIP-TO-CONTACTS is new with WP3, and it is the dormancy note
 //!   that matters most right now. §9 step 5 says the approving device tells the
 //!   person's CONTACTS about the new roster; DL-3's send side does not exist.
@@ -49,30 +45,49 @@
 //!   behind Internal Tools until WP6, so the only fleets that exist are the
 //!   ones being deliberately tested.
 //!
+//! WP4 moved `MD-SYNC-BLE-DAY-CONVERGE` out of that list — §8's records,
+//! digests and backfill plan exist, so the day is driven rather than described —
+//! and added three vectors of its own:
+//!
+//! * `MD-STREAM-AUTHOR-OWN-DEVICE` and `MD-STREAM-AUTHOR-UNLINKED`. WP1 built
+//!   §5's stream key and the sealed-body field that fills it, then deliberately
+//!   left every authoring call site on the legacy stream, because §9.4 says a
+//!   device authors nothing under an id no roster has named. WP4 is where the
+//!   id exists, so the pair pins both halves at once: an activated device
+//!   authors on its own stream in the store AND inside the seal, and an install
+//!   that has never linked emits byte-identical envelopes to today's.
+//! * `MD-SYNC-OUTBOUND-DEDUP` for SYNC-2, driven through the shipped claim on a
+//!   store holding a sibling's authored row.
+//!
 //! **What "implemented and pinned" does NOT mean here.** The ack vectors below
-//! run the production planner against a fleet of two devices — but no
-//! production code writes such a fleet yet. `set_own_device_fleet` has exactly
-//! one caller in the whole tree and it is a test; §9's activation ceremony,
-//! which is what will write it in the field, is WP3's. So ACK-MD-1 and
-//! ACK-MD-2 are implemented, pinned, and *dormant*: correct the day WP3 turns
-//! them on, and unreachable until then. Every device in the field reads §5's
-//! synthetic one-device person, whose planner output
-//! (`a_single_device_identity_plans_exactly_todays_acks`) is byte-identical to
-//! what it was before any of this existed. That is the intended state of the
-//! work package, not a gap in it.
+//! run the production planner against a fleet of two devices — and the fleet
+//! record itself still has no production writer. `set_own_device_fleet`'s only
+//! callers are tests; §9's activation ceremony, which is what will write it in
+//! the field, is WP3's. WP4 gave that record its first production *reader* —
+//! `author_pairwise_message` stamps §5's stream from it — which changes nothing
+//! about the dormancy: with no writer, every device in the field still reads an
+//! empty fleet, still authors on the legacy stream, and still plans exactly
+//! today's acks (`a_single_device_identity_plans_exactly_todays_acks`,
+//! `MD-STREAM-AUTHOR-UNLINKED`). So ACK-MD-1, ACK-MD-2 and §5's authoring
+//! stamp are implemented, pinned, and dormant: correct the day WP3 turns them
+//! on, and unreachable until then. That is the intended state of the work
+//! package, not a gap in it.
 
 use cruisemesh_core::{
     compute_recipient_hint, core_derive_device_id, core_device_add_outcome,
-    core_device_namespace_id, core_device_stream_id, core_own_capabilities, core_relay_ack_ids,
-    core_roster_validate, core_should_ack_inbound, core_sign_device_cert, core_sign_roster,
-    decode_extended_message_body, device_fanout_msg_id, encode_message_body,
-    encode_message_body_extended, generate_identity, open_message, seal_message, CarriedEnvelope,
+    core_device_namespace_id, core_device_stream_id, core_encode_sync_history,
+    core_open_sync_record, core_own_capabilities, core_plan_sync_backfill, core_relay_ack_ids,
+    core_roster_validate, core_seal_sync_record, core_should_ack_inbound, core_sign_device_cert,
+    core_sign_roster, core_sign_sync_record, core_sync_digest_gaps, decode_extended_message_body,
+    device_fanout_msg_id, encode_message_body, encode_message_body_extended,
+    generate_device_keypair, generate_identity, open_message, seal_message, CarriedEnvelope,
     Contact, ContactDeviceState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
-    DeviceAddOutcome, DeviceCert, DeviceTombstone, ExtendedMessageBody, Identity,
-    IncomingMessageInsertOutcome, MessageBody, MessageStore, OwnDeviceFleet, Roster,
-    RosterRejection, RosterUpdateOutcome, RosterUpdateReason, StoredMessage, CAP_MULTI_DEVICE,
+    DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceTombstone, ExtendedMessageBody, Identity,
+    InboxKey, IncomingMessageInsertOutcome, MessageBody, MessageStore, OutboundAuthorDecision,
+    OwnDeviceFleet, Roster, RosterRejection, RosterUpdateOutcome, RosterUpdateReason,
+    StoredMessage, SyncBackfillAction, SyncRecord, SyncRecordKind, CAP_MULTI_DEVICE,
     DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_TEXT,
-    LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
+    LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID, SYNC_OUTBOUND_DEDUP_WINDOW_MS,
 };
 use ed25519_dalek::SigningKey;
 
@@ -187,6 +202,17 @@ enum Scenario {
         first_device_id: &'static [u8],
         second_device_id: &'static [u8],
     },
+    /// §5, WP4: the other half of the stream key, which WP1 could describe but
+    /// not produce. A device that has been activated into a fleet must AUTHOR
+    /// on its own stream — the stored row and the sealed body both — while an
+    /// install that has never linked keeps emitting exactly today's bytes.
+    AuthoringDeviceStamped {
+        linked: bool,
+    },
+    /// §8 SYNC-2: one outbound, one author. Once a sibling's authored row has
+    /// reached this device, composing the same text again must edit the draft
+    /// rather than put a second copy on the stream.
+    SiblingAlreadyAuthoredThisOutbound,
     OwnDeviceFanoutConsumed,
     /// Named `…Carried` until WP2. The rename is the finding: a sibling's row
     /// is not withheld because this device failed to open it -- §6's inbox key
@@ -279,6 +305,16 @@ enum Outcome {
     ReservedNotAdvertised,
     LegacyDeviceStream,
     SeparateStreams,
+    /// §5, WP4: an activated device's own outbound lands on its own stream, in
+    /// the store and inside the seal.
+    AuthoredOnOwnDeviceStream,
+    /// §5, §12: an install that has never linked authors byte-identically to
+    /// every build in the field. The permanent state of a legacy peer, and the
+    /// state of every device today.
+    AuthoredOnLegacyStream,
+    /// §8 SYNC-2: the second device declines to re-author and the person's
+    /// message stays one message.
+    DeferredToSiblingAuthor,
     Acknowledged,
     NotAcknowledgedBecauseCarried,
     NotAcknowledgedByNamespaceRefusal,
@@ -572,6 +608,27 @@ const VECTORS: &[Vector] = &[
         target_outcome: Outcome::SeparateStreams,
         implemented: true,
     },
+    // §5, WP4: authoring puts this device's real id on the row and in the seal.
+    // WP1 built the stream key and the sealed-body field and deliberately left
+    // every authoring call site on the legacy stream, because a device may not
+    // claim an id before a roster names it (§9.4). WP4 is where the id exists,
+    // so this is where the authoring paths start using it.
+    Vector {
+        id: "MD-STREAM-AUTHOR-OWN-DEVICE",
+        scenario: Scenario::AuthoringDeviceStamped { linked: true },
+        target_outcome: Outcome::AuthoredOnOwnDeviceStream,
+        implemented: true,
+    },
+    // §5, §12: and the same call on an install that has never linked emits what
+    // it emits today, to the byte. This is the vector that would catch WP4
+    // accidentally making every device in the field start advertising a device
+    // id it does not have.
+    Vector {
+        id: "MD-STREAM-AUTHOR-UNLINKED",
+        scenario: Scenario::AuthoringDeviceStamped { linked: false },
+        target_outcome: Outcome::AuthoredOnLegacyStream,
+        implemented: true,
+    },
     // ACK-MD-1: a consumed row in this device's fan-out namespace acks.
     Vector {
         id: "MD-ACK-OWN-FANOUT",
@@ -616,12 +673,12 @@ const VECTORS: &[Vector] = &[
         implemented: true,
     },
     // §8, WP4: a BLE-only day reaches one device of a fleet, and the fleet
-    // converges afterwards by self-sync. Data-only: there is no record kind,
-    // no digest anti-entropy, nothing to drive. The sim's
-    // `a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands` pins
-    // what IS true today (one device receives it, and its BLE consumption does
-    // not let it delete the copy the sibling will need) and names this vector,
-    // so the two move together or not at all.
+    // converges afterwards by self-sync. Driven for real since WP4's SYNC-1
+    // anti-entropy landed -- the driver below runs the shipped digest, gap and
+    // backfill surface, and the sim's
+    // `a_ble_only_day_converges_through_sibling_self_sync` runs the same
+    // convergence over real BLE frames. The two moved together, as WP2 wrote
+    // them to have to.
     Vector {
         id: "MD-SYNC-BLE-DAY-CONVERGE",
         scenario: Scenario::BleOnlyDayConverges {
@@ -630,7 +687,17 @@ const VECTORS: &[Vector] = &[
             converges_by_self_sync: true,
         },
         target_outcome: Outcome::SiblingsConvergeBySelfSync,
-        implemented: false,
+        implemented: true,
+    },
+    // §8 SYNC-2: two distinct authored copies of one text are a product bug.
+    // Driven through the shipped claim on a store that has taken the sibling's
+    // row; `core/tests/sync_convergence.rs` runs the same rule against
+    // generated schedules and pins the window it cannot close.
+    Vector {
+        id: "MD-SYNC-OUTBOUND-DEDUP",
+        scenario: Scenario::SiblingAlreadyAuthoredThisOutbound,
+        target_outcome: Outcome::DeferredToSiblingAuthor,
+        implemented: true,
     },
     // §9 step 5, WP5: the person's contacts learn the roster. WP3 built the
     // ceremony that makes a fleet larger than one device; the send side of
@@ -752,6 +819,11 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
     ),
     ("MD-STREAM-LEGACY-ID", Outcome::LegacyDeviceStream),
     ("MD-STREAM-SIBLING-LAMPORT", Outcome::SeparateStreams),
+    (
+        "MD-STREAM-AUTHOR-OWN-DEVICE",
+        Outcome::AuthoredOnOwnDeviceStream,
+    ),
+    ("MD-STREAM-AUTHOR-UNLINKED", Outcome::AuthoredOnLegacyStream),
     ("MD-ACK-OWN-FANOUT", Outcome::Acknowledged),
     (
         "MD-ACK-SIBLING-FANOUT",
@@ -773,6 +845,7 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
         "MD-SYNC-BLE-DAY-CONVERGE",
         Outcome::SiblingsConvergeBySelfSync,
     ),
+    ("MD-SYNC-OUTBOUND-DEDUP", Outcome::DeferredToSiblingAuthor),
     (
         "MD-ROSTER-GOSSIP-TO-CONTACTS",
         Outcome::ContactsLearnTheRoster,
@@ -811,6 +884,16 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
 /// is new and reports what `MD-ACK-SIBLING-FANOUT` used to: the scenario did
 /// not stop being true when the other vector was re-pointed at a consumed row,
 /// so it kept its coverage under its own id.
+///
+/// WP4 moved `MD-SYNC-BLE-DAY-CONVERGE` into this table — it had no driver at
+/// all before §8's records existed — and added
+/// `MD-STREAM-AUTHOR-OWN-DEVICE`, `MD-STREAM-AUTHOR-UNLINKED` and
+/// `MD-SYNC-OUTBOUND-DEDUP` as new ids rather than re-pointing any existing
+/// one. Nothing already in the table moved, and that is the claim worth
+/// reading: WP4 changed what an *activated* device authors, and a device in the
+/// field is not activated, so every previously pinned result is still the
+/// result. `MD-STREAM-AUTHOR-UNLINKED` exists precisely to make that stay true
+/// by accident-proof rather than by inspection.
 const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ROSTER-GREATER", Outcome::Accepted),
     ("MD-ROSTER-LOWER", Outcome::Ignored),
@@ -832,6 +915,11 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ),
     ("MD-STREAM-LEGACY-ID", Outcome::LegacyDeviceStream),
     ("MD-STREAM-SIBLING-LAMPORT", Outcome::SeparateStreams),
+    (
+        "MD-STREAM-AUTHOR-OWN-DEVICE",
+        Outcome::AuthoredOnOwnDeviceStream,
+    ),
+    ("MD-STREAM-AUTHOR-UNLINKED", Outcome::AuthoredOnLegacyStream),
     ("MD-ACK-OWN-FANOUT", Outcome::Acknowledged),
     (
         "MD-ACK-SIBLING-FANOUT",
@@ -846,6 +934,11 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
         Outcome::NotAcknowledgedByNamespaceRefusal,
     ),
     ("MD-ACK-CARRIED-DIGEST-PROOF", Outcome::DigestProofOnly),
+    (
+        "MD-SYNC-BLE-DAY-CONVERGE",
+        Outcome::SiblingsConvergeBySelfSync,
+    ),
+    ("MD-SYNC-OUTBOUND-DEDUP", Outcome::DeferredToSiblingAuthor),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
     ("MD-DEVICE-CAP-7", Outcome::DeviceAdded),
     ("MD-DEVICE-CAP-8", Outcome::DeviceAdded),
@@ -1113,6 +1206,61 @@ fn roster_store() -> MessageStore {
         .upsert_contact(roster_contact())
         .expect("the fixture person is a contact");
     store
+}
+
+/// The envelope id the BLE-day vector's one message rides under. Fixed rather
+/// than generated: the vector is about one message reaching one device, and a
+/// fresh id per run would make "the sibling already has it" indistinguishable
+/// from "the sibling got a different message".
+const BLE_DAY_MSG_ID: [u8; 16] = [0xB1; 16];
+
+/// A person's OWN genesis roster over a freshly generated fleet, signed by the
+/// person root (§3) — the document `core_open_sync_record` admits a sync
+/// record's author against.
+///
+/// Distinct from [`roster_of`] and friends, which build a *contact's* roster
+/// from this file's pinned device labels. §8's vector needs real X25519
+/// material to seal with, which the label fixtures deliberately do not carry
+/// (a roster never seals anything), so it generates its own.
+fn own_fleet_roster(person: &Identity, fleet: &[DeviceKeypair]) -> Roster {
+    let certs = fleet
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            core_sign_device_cert(
+                DeviceCert {
+                    person_id: person.user_id.clone(),
+                    device_sign_pk: device.sign_pk.clone(),
+                    device_agree_pk: device.agree_pk.clone(),
+                    added_epoch: 0,
+                    flags: if index == 0 {
+                        DEVICE_CERT_FLAG_ROSTER_SIGNING
+                    } else {
+                        0
+                    },
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                person.sign_sk.clone(),
+            )
+            .expect("device certificate signs")
+        })
+        .collect();
+    core_sign_roster(
+        Roster {
+            person_id: person.user_id.clone(),
+            recovery_epoch: 0,
+            seq: 0,
+            devices: certs,
+            tombstones: Vec::new(),
+            approving_device_id: fleet[0].device_id.clone(),
+            inbox_key_generation: 0,
+            signer_sign_pk: Vec::new(),
+            signature: Vec::new(),
+        },
+        person.sign_sk.clone(),
+    )
+    .expect("own roster signs")
 }
 
 /// The message this device would store for a body it just opened.
@@ -1902,6 +2050,190 @@ fn drive(vector: &Vector) -> Option<Outcome> {
             );
             Outcome::SeparateStreams
         }
+        // §5, WP4: the authoring path itself. Nothing here hands the store a
+        // device id — the whole claim is that `author_pairwise_message` reads
+        // the fleet this device was activated into and stamps both the stored
+        // row and the sealed body from it, which is what makes a sibling's copy
+        // of the person's own outbound distinguishable from this device's.
+        Scenario::AuthoringDeviceStamped { linked } => {
+            let person = generate_identity();
+            let recipient = generate_identity();
+            let contact = Contact {
+                user_id: recipient.user_id.clone(),
+                name: "Ash".to_string(),
+                sign_pk: recipient.sign_pk.clone(),
+                agree_pk: recipient.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            };
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            store.upsert_contact(contact.clone()).expect("contact");
+            let own = device(OWN_DEVICE_ID);
+            if linked {
+                store
+                    .set_own_device_fleet(OwnDeviceFleet {
+                        own_device_id: Some(own.device_id.clone()),
+                        device_ids: vec![
+                            own.device_id.clone(),
+                            device(SIBLING_DEVICE_ID).device_id,
+                        ],
+                        projected_from: cruisemesh_core::RosterVersion {
+                            recovery_epoch: 0,
+                            seq: 1,
+                        },
+                    })
+                    .expect("this device is activated into its own fleet");
+            }
+
+            let authored = store
+                .author_pairwise_message(
+                    person.clone(),
+                    contact,
+                    KIND_TEXT,
+                    b"we docked early".to_vec(),
+                    None,
+                    NOW_MS,
+                )
+                .expect("author");
+            let expected_stream = if linked {
+                own.device_id.clone()
+            } else {
+                CORE_LEGACY_DEVICE_ID.to_vec()
+            };
+            contract_assert!(
+                vector.id,
+                authored.message.sender_device_id == expected_stream,
+                "the stored row must live on this device's stream, got {:?}",
+                authored.message.sender_device_id
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .message_stream_device_ids(recipient.user_id.clone(), person.user_id.clone())
+                    .expect("stream device ids")
+                    == vec![expected_stream],
+                "and on that stream only"
+            );
+
+            // The seal is where it has to survive: a recipient reads the
+            // authoring device out of the sealed body, never out of the public
+            // header, which is unchanged by any of this (§5, §12).
+            let opened =
+                open_message(recipient, authored.envelope.sealed.clone()).expect("recipient opens");
+            let decoded = decode_extended_message_body(opened.payload).expect("decodes");
+            if linked {
+                contract_assert!(
+                    vector.id,
+                    decoded.sender_device_id.as_deref() == Some(own.device_id.as_slice()),
+                    "an activated device must name itself inside the seal"
+                );
+                contract_assert!(
+                    vector.id,
+                    core_device_stream_id(decoded.sender_device_id) == own.device_id,
+                    "and the recipient must file it on that device's stream"
+                );
+                Outcome::AuthoredOnOwnDeviceStream
+            } else {
+                contract_assert!(
+                    vector.id,
+                    decoded.sender_device_id.is_none(),
+                    "an install that has never linked must emit no device field \
+                     at all: §12's compatibility rests on its envelopes being \
+                     identical to today's, not merely equivalent to them"
+                );
+                let body = MessageBody {
+                    kind: KIND_TEXT,
+                    chat_id: person.user_id.clone(),
+                    lamport: authored.message.lamport,
+                    timestamp: authored.message.timestamp,
+                    content: b"we docked early".to_vec(),
+                };
+                contract_assert!(
+                    vector.id,
+                    encode_message_body(body.clone()).expect("legacy body encodes")
+                        == encode_message_body_extended(body, None, None, None)
+                            .expect("extended encoder with nothing to add"),
+                    "the unlinked authoring path must not have grown a byte"
+                );
+                Outcome::AuthoredOnLegacyStream
+            }
+        }
+        // §8 SYNC-2: this device has taken the sibling's authored row through
+        // the History stream. Composing the same text again must edit the
+        // draft, not put a second copy on a second stream.
+        Scenario::SiblingAlreadyAuthoredThisOutbound => {
+            let person = generate_identity();
+            let recipient = generate_identity();
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            let own = device(OWN_DEVICE_ID);
+            let sibling = device(SIBLING_DEVICE_ID);
+            store
+                .set_own_device_fleet(OwnDeviceFleet {
+                    own_device_id: Some(own.device_id.clone()),
+                    device_ids: vec![own.device_id.clone(), sibling.device_id.clone()],
+                    projected_from: cruisemesh_core::RosterVersion {
+                        recovery_epoch: 0,
+                        seq: 1,
+                    },
+                })
+                .expect("this device is activated into its own fleet");
+
+            // Exactly what `core_apply_sync_record` leaves behind for a
+            // sibling's authored row: the person's own message, on the
+            // sibling's device stream.
+            store
+                .insert_incoming_message_from_device(
+                    StoredMessage {
+                        chat_id: recipient.user_id.clone(),
+                        sender_user_id: person.user_id.clone(),
+                        lamport: 4,
+                        timestamp: NOW_MS,
+                        kind: KIND_TEXT,
+                        payload: b"we docked early".to_vec(),
+                        sender_device_id: sibling.device_id.clone(),
+                    },
+                    Some(sibling.device_id.clone()),
+                    vec![9; 16],
+                    None,
+                    None,
+                )
+                .expect("the sibling's authored row lands");
+
+            let claim = store
+                .core_sync_outbound_claim(
+                    person.user_id.clone(),
+                    recipient.user_id.clone(),
+                    KIND_TEXT,
+                    b"we docked early".to_vec(),
+                    NOW_MS - SYNC_OUTBOUND_DEDUP_WINDOW_MS,
+                )
+                .expect("SYNC-2 claim");
+            contract_assert!(
+                vector.id,
+                claim.decision == OutboundAuthorDecision::AlreadyAuthoredBySibling
+                    && claim.author_device_id.as_deref() == Some(sibling.device_id.as_slice()),
+                "SYNC-2 must name the sibling that already sent it, got {claim:?}"
+            );
+            // The discriminator: a different message in the same chat is not
+            // the same send, and refusing it would be the app losing mail.
+            contract_assert!(
+                vector.id,
+                store
+                    .core_sync_outbound_claim(
+                        person.user_id,
+                        recipient.user_id,
+                        KIND_TEXT,
+                        b"we docked late".to_vec(),
+                        NOW_MS - SYNC_OUTBOUND_DEDUP_WINDOW_MS,
+                    )
+                    .expect("SYNC-2 claim")
+                    .decision
+                    == OutboundAuthorDecision::Author,
+                "only the identical outbound is deduped"
+            );
+            Outcome::DeferredToSiblingAuthor
+        }
         Scenario::OwnDeviceFanoutConsumed => {
             // ACK-MD-1: this device successfully opened a row addressed to its
             // OWN device hint namespace. This is the row that keeps acking
@@ -2231,20 +2563,178 @@ fn drive(vector: &Vector) -> Option<Outcome> {
                 }
             }
         }
+        // §8's BLE-only day, driven end to end through the shipped self-sync
+        // surface: no relay leg, no second encounter with the sender, and no
+        // moment at which the two devices are assumed to be up together.
+        Scenario::BleOnlyDayConverges {
+            reached_over_ble,
+            fleet_size,
+            converges_by_self_sync,
+        } => {
+            let person = generate_identity();
+            let contact = generate_identity();
+            // §6's person-scoped inbox key as v1 has it: the identity
+            // agreement keypair every linked device already holds. WP3's
+            // ceremony mints a separate one; `generation` is the field that
+            // will carry it when it does.
+            let inbox_key = InboxKey {
+                generation: 0,
+                agree_pk: person.agree_pk.clone(),
+                agree_sk: person.agree_sk.clone(),
+            };
+            let fleet: Vec<DeviceKeypair> =
+                (0..fleet_size).map(|_| generate_device_keypair()).collect();
+            let roster = own_fleet_roster(&person, &fleet);
+            let roster_version = cruisemesh_core::RosterVersion {
+                recovery_epoch: roster.recovery_epoch,
+                seq: roster.seq,
+            };
+            let stores: Vec<MessageStore> = (0..fleet_size)
+                .map(|_| MessageStore::open(":memory:".to_string()).expect("in-memory store"))
+                .collect();
+
+            // The BLE leg. One sealed envelope, opened and filed by exactly
+            // `reached_over_ble` devices -- the radio reaches who it reaches,
+            // and nothing in this vector pretends otherwise.
+            let sealed = seal_message(
+                contact.clone(),
+                person.agree_pk.clone(),
+                encode_message_body_extended(
+                    MessageBody {
+                        kind: KIND_TEXT,
+                        chat_id: person.user_id.clone(),
+                        lamport: 1,
+                        timestamp: NOW_MS,
+                        content: b"we docked early".to_vec(),
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .expect("body encodes"),
+            )
+            .expect("the contact seals to the person");
+            for store in stores.iter().take(reached_over_ble as usize) {
+                let opened = open_message(person.clone(), sealed.clone()).expect("opens");
+                let decoded = decode_extended_message_body(opened.payload).expect("body decodes");
+                store
+                    .insert_incoming_message(
+                        stored_message(&opened.sender_user_id, &decoded),
+                        BLE_DAY_MSG_ID.to_vec(),
+                        None,
+                    )
+                    .expect("the device that met the sender files the row");
+            }
+
+            // That device writes what it holds into its own §8 author stream.
+            // Every call is local, and none of them asks whether a sibling is
+            // reachable -- SYNC-1's standing constraint, as an absence.
+            let payload = stores[0]
+                .core_sync_history_page(
+                    person.user_id.clone(),
+                    contact.user_id.clone(),
+                    contact.user_id.clone(),
+                    0,
+                    64,
+                )
+                .expect("history pages");
+            let record = core_sign_sync_record(
+                SyncRecord {
+                    kind: SyncRecordKind::History,
+                    person_id: person.user_id.clone(),
+                    author_device_id: Vec::new(),
+                    roster_version,
+                    inbox_key_generation: inbox_key.generation,
+                    stream_seq: stores[0]
+                        .core_sync_next_stream_seq(
+                            fleet[0].device_id.clone(),
+                            SyncRecordKind::History,
+                        )
+                        .expect("stream position"),
+                    timestamp_ms: NOW_MS,
+                    payload: core_encode_sync_history(payload).expect("history encodes"),
+                    signature: Vec::new(),
+                },
+                fleet[0].sign_sk.clone(),
+            )
+            .expect("the authoring device signs it");
+            let sealed_record =
+                core_seal_sync_record(record.clone(), person.clone(), inbox_key.clone())
+                    .expect("SYNC-3: sealed to the person's own device set");
+            stores[0]
+                .core_sync_retain_record(record, sealed_record, NOW_MS)
+                .expect("retained for whenever a sibling next surfaces");
+
+            // SYNC-1, once per sibling: the sibling states the watermark it can
+            // prove, the author computes what it owes with the same gap
+            // function, the planner decides what fits, and each planned record
+            // is opened against the own roster and applied.
+            for store in stores.iter().skip(1) {
+                let owed = core_sync_digest_gaps(
+                    store
+                        .core_sync_digest(person.user_id.clone())
+                        .expect("the sibling's digest"),
+                    stores[0]
+                        .core_sync_digest(person.user_id.clone())
+                        .expect("the author's digest"),
+                )
+                .expect("gaps");
+                let records = stores[0]
+                    .core_sync_backfill_records(owed.clone(), 64)
+                    .expect("stored records");
+                let offers = stores[0].core_sync_backfill_offers(records.clone());
+                let plan = core_plan_sync_backfill(
+                    owed,
+                    offers,
+                    roster_version,
+                    inbox_key.generation,
+                    128 * 1024,
+                );
+                for step in &plan.steps {
+                    contract_assert!(
+                        vector.id,
+                        step.action == SyncBackfillAction::Send,
+                        "the roster has not moved, so nothing needs re-sealing"
+                    );
+                    let opened = core_open_sync_record(
+                        records[step.offer_index as usize].sealed.clone(),
+                        inbox_key.clone(),
+                        roster.clone(),
+                    )
+                    .expect("the sibling opens and admits it");
+                    store
+                        .core_apply_sync_record(opened, NOW_MS)
+                        .expect("and applies it");
+                }
+            }
+
+            let converged = stores.iter().all(|store| {
+                store
+                    .messages_for_chat(contact.user_id.clone())
+                    .expect("the chat")
+                    .len()
+                    == 1
+            });
+            contract_assert!(
+                vector.id,
+                converged == converges_by_self_sync,
+                "a fleet of {fleet_size} reached {reached_over_ble} time(s) over BLE must \
+                 converge by self-sync, got converged={converged}"
+            );
+            Outcome::SiblingsConvergeBySelfSync
+        }
         // Still data-only, and each for a mechanism reason rather than a
-        // shrug: DL-3's roster gossip has no envelope kind to seal yet
-        // (WP4/WP5); §6's inbox key generations do not exist yet (WP5);
-        // first-contact anchoring has no second source of truth to check an
-        // adopted epoch against (WP5's recovery flow); §8's self-sync has no
-        // record kind and no anti-entropy, so a BLE-only day has nothing to
-        // converge WITH (WP4); and root-secret custody is WP3's, since nothing
-        // yet mints or stores a person root separately from the identity key.
-        // There is nothing real to execute.
+        // shrug: DL-3's roster gossip is contact-FACING distribution, which
+        // WP4's own-device self-sync deliberately does not touch (WP4/WP5);
+        // §6's inbox key generations do not rotate yet (WP5); first-contact
+        // anchoring has no second source of truth to check an adopted epoch
+        // against (WP5's recovery flow); and root-secret custody is WP3's,
+        // since nothing yet mints or stores a person root separately from the
+        // identity key. There is nothing real to execute.
         Scenario::RosterPairwiseGossipNoDirectory { .. }
         | Scenario::RosterGossipToContacts { .. }
         | Scenario::StaleRosterSealing { .. }
         | Scenario::RosterFirstContactAnchor { .. }
-        | Scenario::BleOnlyDayConverges { .. }
         | Scenario::RecoveryRootCustody { .. } => {
             unreachable!("unimplemented vector ran")
         }
@@ -2542,24 +3032,33 @@ fn unimplemented_vector_ledger_is_deliberate() {
         .filter(|vector| !vector.implemented)
         .map(|vector| vector.id)
         .collect();
-    // Six now, each waiting on a mechanism rather than on effort: DL-3's
-    // roster gossip needs an envelope kind to seal (WP4/WP5); §6's
-    // stale-roster sealing needs inbox key generations (WP5); first-contact
+    // Five now: `MD-SYNC-BLE-DAY-CONVERGE` left this list when WP4's SYNC-1
+    // anti-entropy gave it something real to drive, and its departure is the
+    // only *removal* the work package makes. WP4's own three vectors
+    // (`MD-STREAM-AUTHOR-OWN-DEVICE`, `MD-STREAM-AUTHOR-UNLINKED`,
+    // `MD-SYNC-OUTBOUND-DEDUP`) were never on this list: each arrived with its
+    // driver, which is the only way a vector is allowed to arrive implemented.
+    //
+    // `MD-ROSTER-PAIRWISE-GOSSIP` deliberately stays, and so does WP3's
+    // `MD-ROSTER-GOSSIP-TO-CONTACTS`. WP4 syncs a person's rosters to that
+    // person's OWN devices; DL-3 and §9 step 5 are about a roster reaching a
+    // *contact* without a directory, which is a different recipient set and a
+    // different rule -- WP4's carrier exists now, but WP5 owns the contact
+    // notification, and flipping either on the strength of self-sync would be
+    // claiming coverage this work package does not have (see this file's
+    // header for what the gap costs while it stands).
+    //
+    // The rest each wait on a mechanism rather than on effort: §6's
+    // stale-roster sealing needs inbox key *rotation* (WP5); first-contact
     // anchoring needs a second source of truth about a person's epoch, which is
-    // WP5's recovery flow; root-secret custody needs the person root to be
-    // minted and stored separately from the identity key, which is WP3's; and
-    // §8's BLE-day convergence needs the self-sync records WP4 mints, which is
-    // why WP2 added it here rather than pretending the sim stub was the gate.
-    // WP3 added the sixth: §9 step 5's roster gossip TO contacts needs WP4's
-    // carrier and WP5's notification, and WP3 is the work package that makes
-    // its absence cost something -- see this file's header.
-    // Driving any of them today would mean writing a test-only stand-in and
-    // calling it core, which is the one thing this ledger exists to prevent.
+    // WP5's recovery flow; root-secret custody needs the person root minted and
+    // stored separately from the identity key, which is WP3's. Driving any of
+    // them today would mean writing a test-only stand-in and calling it core,
+    // which is the one thing this ledger exists to prevent.
     let expected = [
         "MD-ROSTER-PAIRWISE-GOSSIP",
         "MD-ROSTER-FIRST-CONTACT-ANCHOR",
         "MD-RECOVERY-ROOT-CUSTODY",
-        "MD-SYNC-BLE-DAY-CONVERGE",
         "MD-ROSTER-GOSSIP-TO-CONTACTS",
         "MD-SEAL-STALE-ROSTER",
     ];

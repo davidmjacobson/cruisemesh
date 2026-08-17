@@ -95,7 +95,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::store::store_err;
 use crate::{
     CoreError, OutboundEnvelope, DEFAULT_EXPIRY_MS, KIND_FRIEND_DIRECTORY, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_RELAY_UPDATE, RECEIPT_TYPE_DELIVERED,
+    KIND_PROFILE_SYNC, KIND_RELAY_UPDATE, KIND_SYNC_DIGEST, RECEIPT_TYPE_DELIVERED,
 };
 
 /// How long a queued LAN endpoint hint stays deliverable.
@@ -142,6 +142,22 @@ pub const LAN_ENDPOINT_HINT_EXPIRY_MS: i64 = 30 * 60 * 1_000;
 ///   contact who is posting to a dead mailbox; the endpoint it announces stays
 ///   true until the next change. A short expiry would make the repair path
 ///   fail exactly for the contact it is meant to reach — the unreachable one.
+///
+/// * **`KIND_SYNC_HISTORY` (10) through `KIND_SYNC_SETTINGS` (15), and
+///   `KIND_SYNC_DIGEST` (20) — unchanged.** `specs/multi-device-v1.md` §8's
+///   self-sync traffic goes to this person's own devices, and SYNC-1 forbids
+///   assuming two of them are ever online together. A sibling that has been in
+///   a drawer for five days is precisely the case self-sync exists for, so a
+///   short lifetime would retire the records exactly where convergence needs
+///   them most. What retires a sync record is the sibling having it —
+///   anti-entropy — not a clock.
+///
+///   The digest is the one where a short lifetime is *tempting* and still
+///   wrong. A week-old watermark is stale, but stale in the harmless direction:
+///   it under-reports what its author holds, so the answer is a few records the
+///   asker already had. Expiring it instead means the sibling in the drawer
+///   surfaces to an empty mailbox and no round happens at all, which is the
+///   failure that costs a message rather than some bytes.
 ///
 /// Group envelopes are authored with [`crate::default_expiry`] directly and
 /// never route through here. That matters for one specific reason:
@@ -200,10 +216,29 @@ pub fn authored_delivery_lifetime_ms(kind: u8) -> i64 {
 ///   is still queued. Retiring one on the authoring of another would change
 ///   what that state machine observes.
 /// * **Every visible kind** is chat history. Two texts are two texts.
+/// * **§8's six sync *record* kinds (10-15)** look like snapshots and are
+///   deliberately not treated as ones. SYNC-1 numbers each record within its
+///   `(author device, kind)` stream and a sibling asks for what it is missing
+///   by that number, so retiring a queued record on authoring the next one
+///   punches a hole in a sequence the far side is counting through — and for
+///   `KIND_SYNC_HISTORY` it would discard messages outright, since two runs of
+///   history are two runs of history, not two generations of one snapshot.
+///   Retirement for these kinds is the sibling's stream watermark advancing,
+///   which is the anti-entropy exchange's job rather than the queue's.
+/// * **`KIND_SYNC_DIGEST` (20) — supersedes.** The one §8 kind that genuinely
+///   is a snapshot, and the exception is the reason it is a separate kind at
+///   all. A digest states where its author's streams stand *now*; the next one
+///   states the same thing better, and nothing counts through them. A queue
+///   holding three generations of one device's watermarks would spend three
+///   relay rows to answer one question, and the two older answers are wrong.
 pub fn supersedes_queued_generations(kind: u8) -> bool {
     matches!(
         kind,
-        KIND_PROFILE_SYNC | KIND_FRIEND_DIRECTORY | KIND_LAN_ENDPOINT_HINT | KIND_RELAY_UPDATE
+        KIND_PROFILE_SYNC
+            | KIND_FRIEND_DIRECTORY
+            | KIND_LAN_ENDPOINT_HINT
+            | KIND_RELAY_UPDATE
+            | KIND_SYNC_DIGEST
     )
 }
 
@@ -461,7 +496,8 @@ mod tests {
         create_group, generate_identity, Contact, Group, Identity, MessageStore,
         KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
         KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_REACTION, KIND_RECEIPT,
-        KIND_TEXT, RECEIPT_TYPE_READ,
+        KIND_SYNC_CONTACTS, KIND_SYNC_GROUPS, KIND_SYNC_HISTORY, KIND_SYNC_OWN_ROSTER,
+        KIND_SYNC_SETTINGS, KIND_SYNC_WATERMARK, KIND_TEXT, RECEIPT_TYPE_READ,
     };
 
     const NOW: i64 = 1_700_000_000_000;
@@ -613,6 +649,25 @@ mod tests {
                 DEFAULT_EXPIRY_MS,
                 "group stream",
             ),
+            (KIND_SYNC_HISTORY, DEFAULT_EXPIRY_MS, "self-sync converges"),
+            (
+                KIND_SYNC_WATERMARK,
+                DEFAULT_EXPIRY_MS,
+                "self-sync converges",
+            ),
+            (KIND_SYNC_CONTACTS, DEFAULT_EXPIRY_MS, "self-sync converges"),
+            (
+                KIND_SYNC_OWN_ROSTER,
+                DEFAULT_EXPIRY_MS,
+                "self-sync converges",
+            ),
+            (KIND_SYNC_GROUPS, DEFAULT_EXPIRY_MS, "self-sync converges"),
+            (KIND_SYNC_SETTINGS, DEFAULT_EXPIRY_MS, "self-sync converges"),
+            (
+                KIND_SYNC_DIGEST,
+                DEFAULT_EXPIRY_MS,
+                "a stale watermark under-reports; an expired one means no round",
+            ),
         ];
         for (kind, expected, why) in table {
             assert_eq!(
@@ -683,6 +738,33 @@ mod tests {
             (KIND_ATTACHMENT_CHUNK, false, "a slice, not a snapshot"),
             (KIND_REACTION, false, "chat history"),
             (KIND_GROUP_METADATA_UPDATE, false, "convergent group stream"),
+            (KIND_SYNC_HISTORY, false, "two runs of history are two runs"),
+            (
+                KIND_SYNC_WATERMARK,
+                false,
+                "a numbered stream, not a snapshot",
+            ),
+            (
+                KIND_SYNC_CONTACTS,
+                false,
+                "a numbered stream, not a snapshot",
+            ),
+            (
+                KIND_SYNC_OWN_ROSTER,
+                false,
+                "a numbered stream, not a snapshot",
+            ),
+            (KIND_SYNC_GROUPS, false, "a numbered stream, not a snapshot"),
+            (
+                KIND_SYNC_SETTINGS,
+                false,
+                "a numbered stream, not a snapshot",
+            ),
+            (
+                KIND_SYNC_DIGEST,
+                true,
+                "the one §8 kind that really is a snapshot",
+            ),
         ];
         for (kind, expected, why) in table {
             assert_eq!(

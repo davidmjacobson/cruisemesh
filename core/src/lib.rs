@@ -43,6 +43,10 @@ mod session;
 mod ship_wifi;
 mod spray_policy;
 mod store;
+mod sync_outbound;
+mod sync_record;
+mod sync_store;
+mod sync_stream;
 mod transport_policy;
 mod voice;
 
@@ -111,15 +115,15 @@ pub use device_link::restore::{
     core_backup_restore_plan, core_backup_restore_plans, CoreRestoreIntent, CoreRestorePlan,
 };
 pub use device_roster::{
-    core_decode_device_keypair, core_derive_device_id, core_device_add_outcome,
+    core_decode_device_keypair, core_decode_roster, core_derive_device_id, core_device_add_outcome,
     core_device_namespace_id, core_device_sign, core_device_stream_id, core_device_verify,
-    core_encode_device_keypair, core_legacy_device_id, core_own_identity_peer, core_roster_accept,
-    core_roster_device_ids, core_roster_head_hash, core_roster_validate, core_sign_device_cert,
-    core_sign_roster, core_verify_device_cert, generate_device_keypair, CoreOwnIdentityPeer,
-    DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain, DeviceTombstone,
-    OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision, RosterUpdateOutcome,
-    RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP,
-    DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+    core_encode_device_keypair, core_encode_roster, core_legacy_device_id, core_own_identity_peer,
+    core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_validate,
+    core_sign_device_cert, core_sign_roster, core_verify_device_cert, generate_device_keypair,
+    CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain,
+    DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
+    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
+    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
@@ -174,24 +178,26 @@ pub use outbound_retirement::{
     supersedes_queued_generations, LAN_ENDPOINT_HINT_EXPIRY_MS,
 };
 pub use protocol::{
-    compute_recipient_hint, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
-    core_own_capabilities, create_introduction_ticket, decode_extended_message_body,
-    decode_friend_directory_content, decode_introduced_friend_request, decode_lan_endpoint_content,
-    decode_message_body, decode_profile_sync_content, decode_receipt_content,
-    decode_relay_update_content, default_expiry, device_fanout_msg_id, encode_digest,
-    encode_envelope_frame, encode_friend_directory_content, encode_hello, encode_hello2,
-    encode_introduced_friend_request, encode_lan_endpoint, encode_lan_endpoint_content,
-    encode_message_body, encode_message_body_extended, encode_message_body_with_reply,
-    encode_profile_sync_content, encode_receipt_content, encode_relay_update_content,
-    encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,
-    verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
-    FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
-    MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
-    CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL,
-    GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
-    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE,
-    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
-    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    compute_recipient_hint, core_is_hidden_spray_kind, core_is_sync_record_kind,
+    core_kind_persists_msg_id_row, core_own_capabilities, create_introduction_ticket,
+    decode_extended_message_body, decode_friend_directory_content,
+    decode_introduced_friend_request, decode_lan_endpoint_content, decode_message_body,
+    decode_profile_sync_content, decode_receipt_content, decode_relay_update_content,
+    default_expiry, device_fanout_msg_id, encode_digest, encode_envelope_frame,
+    encode_friend_directory_content, encode_hello, encode_hello2, encode_introduced_friend_request,
+    encode_lan_endpoint, encode_lan_endpoint_content, encode_message_body,
+    encode_message_body_extended, encode_message_body_with_reply, encode_profile_sync_content,
+    encode_receipt_content, encode_relay_update_content, encode_transport_probe, fanout_msg_id,
+    generate_msg_id, parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame,
+    FriendDirectoryContent, FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket,
+    LanEndpointContent, MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent,
+    SuggestedFriendCard, CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE,
+    DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK,
+    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_SYNC_CONTACTS,
+    KIND_SYNC_DIGEST, KIND_SYNC_GROUPS, KIND_SYNC_HISTORY, KIND_SYNC_OWN_ROSTER,
+    KIND_SYNC_SETTINGS, KIND_SYNC_WATERMARK, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
     RECEIPT_TYPE_READ,
 };
 // Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
@@ -343,6 +349,32 @@ pub use store::{
     MessageOrigin, MessageReference, MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope,
     PeerConnectionEvent, PeerConnectionEventKind, PeerConnectionSummary, PeerConnectionTransport,
     PendingSharedRequest, RelayFetchCursor, StoredMessage, DEFAULT_CARRIED_PAGE_MAX_ROWS,
+};
+pub use sync_outbound::{
+    core_sync_draft_key, OutboundAuthorClaim, OutboundAuthorDecision, SYNC_OUTBOUND_DEDUP_WINDOW_MS,
+};
+pub use sync_record::{
+    core_decode_sync_contacts, core_decode_sync_groups, core_decode_sync_history,
+    core_decode_sync_own_roster, core_decode_sync_record, core_decode_sync_settings,
+    core_decode_sync_watermarks, core_device_sync_identity, core_encode_sync_contacts,
+    core_encode_sync_groups, core_encode_sync_history, core_encode_sync_own_roster,
+    core_encode_sync_record, core_encode_sync_settings, core_encode_sync_watermarks,
+    core_mint_inbox_key, core_open_sync_record, core_rotate_inbox_key, core_seal_sync_record,
+    core_sign_sync_record, core_sync_kind_is_stream, core_sync_record_admit, core_sync_record_id,
+    core_sync_record_kind_of, core_sync_record_kind_wire, core_sync_seal_is_current,
+    core_verify_sync_record, InboxKey, SealedSyncRecord, SyncContactEntry, SyncContactsPayload,
+    SyncGroupsPayload, SyncHistoryDirection, SyncHistoryEntry, SyncHistoryPayload,
+    SyncOwnRosterPayload, SyncRecord, SyncRecordKind, SyncRecordRejection, SyncSettingEntry,
+    SyncSettingsPayload, SyncWatermarkEntry, SyncWatermarkPayload, SYNC_RECORD_MAX_ENTRIES,
+    SYNC_RECORD_MAX_PAYLOAD_BYTES,
+};
+pub use sync_store::{
+    OwnSyncContext, StoredSyncRecord, SyncApplyOutcome, SyncApplyResult, SYNC_BLOCKED_SETTING_KEY,
+};
+pub use sync_stream::{
+    core_decode_sync_digest, core_encode_sync_digest, core_plan_sync_backfill,
+    core_sync_digest_gaps, SyncBackfillAction, SyncBackfillOffer, SyncBackfillPlan,
+    SyncBackfillStep, SyncDigest, SyncGap, SyncStreamDigest, SYNC_DIGEST_MAX_STREAMS,
 };
 pub use transport_policy::{
     core_carried_offer_epoch_ms, core_transport_send_plan, digest_is_expected_chat_id,

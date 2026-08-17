@@ -4,21 +4,33 @@ use crate::causal_order::causal_display_timestamp;
 use crate::device_link::activation::CoreLinkGatedAction;
 use crate::outbound_retirement::{authored_expiry, backfill_rejoins_the_queue, retire_superseded};
 use crate::store::{
-    outbound_message_dedupe_key, row_to_outbound, row_to_outgoing_receipt, store_err,
-    upsert_group_tx,
+    outbound_message_dedupe_key, own_authoring_device_id, row_to_outbound, row_to_outgoing_receipt,
+    store_err, upsert_group_tx,
 };
+use crate::sync_outbound::clear_chat_draft;
 use crate::{
     apply_group_metadata_update, compute_recipient_hint, create_group_metadata_update,
     default_expiry, encode_envelope_frame, encode_group_invite_content,
-    encode_group_metadata_update, encode_message_body, encode_message_body_with_reply,
-    encode_receipt_content, generate_msg_id, seal_group_message, seal_message, Contact, CoreError,
-    Group, GroupMetadataUpdate, Identity, MessageBody, MessageStore, OutboundEnvelope,
-    OutgoingReceiptEnvelope, ReceiptContent, StoredMessage, DEFAULT_HOP_TTL,
-    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LEGACY_DEVICE_ID,
-    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    encode_group_metadata_update, encode_message_body, encode_message_body_extended,
+    encode_message_body_with_reply, encode_receipt_content, generate_msg_id, seal_group_message,
+    seal_message, Contact, CoreError, Group, GroupMetadataUpdate, Identity, MessageBody,
+    MessageStore, OutboundEnvelope, OutgoingReceiptEnvelope, ReceiptContent, StoredMessage,
+    DEFAULT_HOP_TTL, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
+    KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE,
+    KIND_TEXT, LEGACY_DEVICE_ID, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
+
+/// The device id to put in a sealed body, given the stream a row lives on.
+///
+/// [`LEGACY_DEVICE_ID`] becomes `None`, so an unlinked device emits *no*
+/// extension TLV at all and its envelopes stay byte-identical to what every
+/// build in the field emits today (§5, §12). A linked device emits the real id
+/// and a legacy receiver skips the unknown-to-it-shaped-but-well-formed TLV, as
+/// WPT's tolerance tests pin.
+fn wire_device_id(sender_device_id: &[u8]) -> Option<Vec<u8>> {
+    (sender_device_id != LEGACY_DEVICE_ID).then(|| sender_device_id.to_vec())
+}
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct AuthoredEnvelope {
@@ -76,7 +88,11 @@ impl MessageStore {
             timestamp: display_ts,
             kind,
             payload,
-            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
+            // §5: this device's own stream, or the legacy one on an install
+            // that has never linked. Read inside the transaction that is about
+            // to write the row, so a link landing concurrently cannot leave the
+            // stored row and the sealed body naming different streams.
+            sender_device_id: own_authoring_device_id(&tx)?,
         };
         let envelope = build_pairwise_envelope(
             identity,
@@ -274,7 +290,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind,
             payload,
-            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
+            sender_device_id: own_authoring_device_id(&tx)?,
         };
         let body = encoded_body(&message, group.id.clone(), reply_to_msg_id.as_deref())?;
         let msg_id = generate_msg_id();
@@ -341,7 +357,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind: KIND_GROUP_METADATA_UPDATE,
             payload,
-            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
+            sender_device_id: own_authoring_device_id(&tx)?,
         };
         let body = encoded_body(&message, group.id.clone(), None)?;
         let msg_id = generate_msg_id();
@@ -393,7 +409,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind: KIND_GROUP_INVITE,
             payload: invite,
-            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
+            sender_device_id: own_authoring_device_id(&tx)?,
         };
         let mut authored_invites = Vec::new();
         for member in members {
@@ -906,17 +922,22 @@ fn build_pairwise_envelope(
 /// A row authored before the column existed has no id. It gets one, written
 /// back in the same transaction so the identity is stable from then on.
 ///
-/// §5: both statements are scoped to this device's own authoring stream, named
-/// explicitly the way `outgoing_message_reference::insert` names it. Locally
-/// authored rows live on [`LEGACY_DEVICE_ID`] until WP3/WP4 mint a device
-/// identity; leaving the scope off would let a sibling's row at the same
-/// lamport answer the SELECT, and would let the UPDATE stamp this device's
-/// fresh `msg_id` onto a message this device never authored.
+/// §5: both statements are scoped to the row's own authoring stream, named
+/// explicitly the way `outgoing_message_reference::insert` names it. Leaving
+/// the scope off would let a sibling's row at the same lamport answer the
+/// SELECT, and would let the UPDATE stamp this device's fresh `msg_id` onto a
+/// message this device never authored — a real hazard now that a sibling's
+/// authored rows arrive here through §8's History stream and sit in the same
+/// table under their own device id.
+///
+/// The stream comes from the *message*, not from this device: a repair re-seal
+/// is asked to re-send a stored row, and that row may predate linking (the
+/// legacy stream) even on a device that has since linked.
 fn stable_backfill_msg_id(
     tx: &Transaction<'_>,
     message: &StoredMessage,
 ) -> Result<Vec<u8>, CoreError> {
-    let sender_device_id = &LEGACY_DEVICE_ID[..];
+    let sender_device_id = crate::core_device_stream_id(Some(message.sender_device_id.clone()));
     let stored: Option<Vec<u8>> = tx
         .query_row(
             "SELECT msg_id FROM messages
@@ -954,6 +975,14 @@ fn stable_backfill_msg_id(
     Ok(msg_id)
 }
 
+/// The sealed body for one authored row.
+///
+/// §5: the authoring device rides the body's `0x20` extension whenever this
+/// install has one, so a message authored after linking carries the stream it
+/// actually belongs to instead of being filed on the person's legacy stream by
+/// every receiver — including this person's own siblings, which is what SYNC-2's
+/// dedup reads. An unlinked device emits neither the extension nor any other
+/// difference (see [`wire_device_id`]).
 fn encoded_body(
     message: &StoredMessage,
     wire_chat_id: Vec<u8>,
@@ -966,9 +995,23 @@ fn encoded_body(
         timestamp: message.timestamp,
         content: message.payload.clone(),
     };
-    match reply_to_msg_id {
-        Some(id) => encode_message_body_with_reply(body, id.to_vec()),
-        None => encode_message_body(body),
+    match (
+        reply_to_msg_id,
+        wire_device_id(&message.sender_device_id).as_ref(),
+    ) {
+        // The legacy shapes, byte-for-byte, so an unlinked device's envelopes
+        // are not merely equivalent to today's but identical to them.
+        (Some(id), None) => encode_message_body_with_reply(body, id.to_vec()),
+        (None, None) => encode_message_body(body),
+        (reply, device) => encode_message_body_extended(
+            body,
+            reply.map(<[u8]>::to_vec),
+            device.cloned(),
+            // §12's roster head is a WP5 concern: nothing yet fetches a roster
+            // on the strength of it, and emitting a reference a receiver cannot
+            // act on would grow every envelope for nothing.
+            None,
+        ),
     }
 }
 
@@ -1042,13 +1085,19 @@ fn insert_authored_rows(
     queued_at_ms: i64,
 ) -> Result<(), CoreError> {
     record_authored_watermark(tx, message)?;
+    // §5: the device column is named rather than left to its legacy default.
+    // On an unlinked install the value IS the default, so nothing about the row
+    // changes; on a linked one this is what puts the person's own outbound on
+    // the stream a sibling can tell apart from its own.
     tx.execute(
         "INSERT OR IGNORE INTO messages
-            (chat_id, sender_user_id, lamport, timestamp, kind, payload, msg_id, reply_to_msg_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (chat_id, sender_user_id, sender_device_id, lamport, timestamp, kind, payload,
+             msg_id, reply_to_msg_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             message.chat_id,
             message.sender_user_id,
+            message.sender_device_id,
             message.lamport as i64,
             message.timestamp,
             message.kind as i64,
@@ -1059,6 +1108,16 @@ fn insert_authored_rows(
     )
     .map_err(store_err)?;
     queue_outbound_row(tx, envelope, queued_at_ms)?;
+    // SYNC-2: what the person was composing has now been said. Clearing the
+    // shared draft in the *authoring* transaction is what makes "send from
+    // whichever device is in hand edits the draft, not the stream" true on the
+    // other device: the clear converges through the Settings stream and the
+    // sibling's composer empties instead of holding a message already on the
+    // wire. Only the kinds a person actually composes — a reaction or a group
+    // invite was never a draft.
+    if matches!(message.kind, KIND_TEXT | KIND_ATTACHMENT_MANIFEST) {
+        clear_chat_draft(tx, &message.chat_id, queued_at_ms)?;
+    }
     // Supersession (#283, contract QUEUE-01), in the same transaction that
     // queued the replacement so the queue never briefly holds both. For a
     // snapshot kind only the newest generation can inform the recipient of
