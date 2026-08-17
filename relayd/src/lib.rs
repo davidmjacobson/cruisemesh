@@ -6205,6 +6205,40 @@ mod tests {
         );
     }
 
+    /// The other direction of the same discipline: core mirrors this cap as
+    /// `RELAY_MAX_FETCH_HINTS` because it is core that *builds* the hint set
+    /// (this device's own §7 namespace included) and has to argue that a
+    /// worst-case family fits inside it. Raising the server cap without the
+    /// mirror — or the mirror without the server — fails here.
+    #[test]
+    fn fetch_hint_cap_matches_the_core() {
+        assert_eq!(MAX_FETCH_HINTS, cruisemesh_core::RELAY_MAX_FETCH_HINTS);
+    }
+
+    /// The same discipline for the three budget numbers a per-DEVICE fan-out
+    /// spends (`specs/multi-device-v1.md` §7): core plans one relay row per
+    /// recipient device, each carrying the whole sealed body, so one message
+    /// costs `fleet_size × sealed_len` against these server limits. Core
+    /// mirrors them and argues the max-cap worst case against them
+    /// (`a_max_cap_fanout_fits_the_family_relay_budget`); loosening one here
+    /// without the mirror — or tightening one without re-running that argument
+    /// — fails at this line instead of in a family's mailbox.
+    #[test]
+    fn family_budget_constants_match_the_core() {
+        assert_eq!(
+            MAX_ENVELOPE_SEALED_BYTES as u64,
+            cruisemesh_core::RELAY_MAX_ENVELOPE_SEALED_BYTES
+        );
+        assert_eq!(
+            DEFAULT_FAMILY_QUOTA_BYTES,
+            cruisemesh_core::RELAY_FAMILY_QUOTA_BYTES
+        );
+        assert_eq!(
+            DEFAULT_RATE_BYTES_PER_MIN,
+            cruisemesh_core::RELAY_RATE_BYTES_PER_MIN
+        );
+    }
+
     #[test]
     fn a_byte_heavy_page_is_truncated_by_bytes_and_the_cursor_still_advances() {
         let (_db, store) = test_store();

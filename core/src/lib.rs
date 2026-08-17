@@ -82,20 +82,22 @@ pub use content::{
 pub use crypto::{open_message, seal_message, OpenedMessage};
 pub use deep_link::{deep_link_route, DeepLinkRoute};
 pub use device_roster::{
-    core_derive_device_id, core_device_add_outcome, core_device_sign, core_device_stream_id,
-    core_device_verify, core_legacy_device_id, core_roster_accept, core_roster_device_ids,
-    core_roster_head_hash, core_roster_validate, core_sign_device_cert, core_sign_roster,
-    core_verify_device_cert, generate_device_keypair, DeviceAddOutcome, DeviceCert, DeviceKeypair,
-    DeviceSigningDomain, DeviceTombstone, Roster, RosterRejection, RosterUpdateDecision,
-    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
-    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+    core_derive_device_id, core_device_add_outcome, core_device_namespace_id, core_device_sign,
+    core_device_stream_id, core_device_verify, core_legacy_device_id, core_roster_accept,
+    core_roster_device_ids, core_roster_head_hash, core_roster_validate, core_sign_device_cert,
+    core_sign_roster, core_verify_device_cert, generate_device_keypair, DeviceAddOutcome,
+    DeviceCert, DeviceKeypair, DeviceSigningDomain, DeviceTombstone, OwnDeviceFleet, Roster,
+    RosterRejection, RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, RosterVersion,
+    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP,
+    LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
-    core_group_fanout_rows, core_hello_identity_matches, core_inbound_gate,
-    core_is_own_fanout_hint, core_pairwise_sender_authorized, core_relay_ack_ids,
-    core_should_ack_inbound, CoreDigestSprayPlan, CoreGroupFanoutRow, CoreInboundDisposition,
-    CoreInboundGate, CoreRelayEnvelopeDisposition, MAX_CARRY_FUTURE_MS,
+    core_device_fanout_rows, core_group_fanout_rows, core_hello_identity_matches,
+    core_inbound_gate, core_is_own_fanout_hint, core_pairwise_sender_authorized,
+    core_relay_ack_ids, core_should_ack_inbound, CoreDigestSprayPlan, CoreGroupFanoutRow,
+    CoreInboundDisposition, CoreInboundGate, CoreRelayEnvelopeDisposition, MAX_CARRY_FUTURE_MS,
+    RELAY_FAMILY_QUOTA_BYTES, RELAY_MAX_ENVELOPE_SEALED_BYTES, RELAY_RATE_BYTES_PER_MIN,
 };
 pub use framing::{
     ble_att_header_overhead, ble_default_att_mtu, ble_max_att_value_len, fragment_ble_frame,
@@ -146,20 +148,21 @@ pub use protocol::{
     core_own_capabilities, create_introduction_ticket, decode_extended_message_body,
     decode_friend_directory_content, decode_introduced_friend_request, decode_lan_endpoint_content,
     decode_message_body, decode_profile_sync_content, decode_receipt_content,
-    decode_relay_update_content, default_expiry, encode_digest, encode_envelope_frame,
-    encode_friend_directory_content, encode_hello, encode_hello2, encode_introduced_friend_request,
-    encode_lan_endpoint, encode_lan_endpoint_content, encode_message_body,
-    encode_message_body_extended, encode_message_body_with_reply, encode_profile_sync_content,
-    encode_receipt_content, encode_relay_update_content, encode_transport_probe, fanout_msg_id,
-    generate_msg_id, parse_frame, verify_introduction_ticket, ExtendedMessageBody, Frame,
-    FriendDirectoryContent, FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket,
-    LanEndpointContent, MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent,
-    SuggestedFriendCard, CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE,
-    DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK,
-    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY,
-    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    decode_relay_update_content, default_expiry, device_fanout_msg_id, encode_digest,
+    encode_envelope_frame, encode_friend_directory_content, encode_hello, encode_hello2,
+    encode_introduced_friend_request, encode_lan_endpoint, encode_lan_endpoint_content,
+    encode_message_body, encode_message_body_extended, encode_message_body_with_reply,
+    encode_profile_sync_content, encode_receipt_content, encode_relay_update_content,
+    encode_transport_probe, fanout_msg_id, generate_msg_id, parse_frame,
+    verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
+    FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
+    MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
+    CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL,
+    GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
+    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE,
+    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
+    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    RECEIPT_TYPE_READ,
 };
 // Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
 // below: no shell composes an event. Core decision points emit them and the
@@ -172,7 +175,10 @@ pub use protocol_event::{
     PROTOCOL_EVENT_MAX_BYTES, PROTOCOL_EVENT_MAX_RECORDS, PROTOCOL_EVENT_RECORD_KEYS,
     PROTOCOL_EVENT_SCHEMA, PROTOCOL_INVARIANT_IDS,
 };
-pub use recipient_hints::{dedupe_hints, recent_hints_for, recent_presence_hints_for};
+pub use recipient_hints::{
+    dedupe_hints, recent_device_hints_for, recent_hints_for, recent_presence_hints_for,
+    HINTS_PER_ID_FETCH, HINTS_PER_ID_PUSH, RELAY_MAX_FETCH_HINTS,
+};
 pub use relay_cursor::{
     relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
     relay_frontier_after_completed_sweep, relay_hint_source_digest,

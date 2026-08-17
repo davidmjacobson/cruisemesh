@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use crate::recipient_hints::FleetHint;
 use crate::{
     compute_recipient_hint, encode_envelope_frame, fanout_msg_id, CarriedEnvelope,
     CoreCarriedCursor, CoreError, MessageOrigin, MessageStore, OutboundEnvelope,
@@ -191,6 +192,13 @@ pub struct CoreDigestSprayPlan {
 /// queue. Every field here is copied onto the wire verbatim by
 /// [`encode_envelope_frame`]/the relay POST body; see
 /// [`core_group_fanout_rows`] for how each field is derived.
+///
+/// Named for the fan-out that first needed it, and reused unchanged by
+/// `specs/multi-device-v1.md` §7's per-device fan-out
+/// ([`core_device_fanout_rows`], [`MessageStore::core_outbound_relay_rows`]).
+/// Reused rather than copied on purpose: a relay row is a relay row, and both
+/// shells already have exactly one upload path for this shape -- a second
+/// record would have bought a second upload path and nothing else.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreGroupFanoutRow {
     pub msg_id: Vec<u8>,
@@ -272,6 +280,81 @@ pub fn core_group_fanout_rows_for_carried(
         expiry - crate::DEFAULT_EXPIRY_MS,
     )
 }
+
+/// [`core_group_fanout_rows`]'s per-DEVICE twin (`specs/multi-device-v1.md`
+/// §7): one row per entry of `device_ids`, each addressed to that device's own
+/// routing namespace.
+///
+/// The two functions are deliberately the same shape, because §7 asks for
+/// exactly that -- "mirror the group fan-out machinery, per recipient device"
+/// -- and they differ in exactly the two derivations that make a row findable
+/// and deletable by one device rather than by one person:
+///
+/// - `msg_id`: [`crate::device_fanout_msg_id`] rather than
+///   [`fanout_msg_id`], a disjoint id space with its own prologue, so a device
+///   row and a group row for the same original can never collide.
+/// - `recipient_hint`: the daily hint of
+///   [`crate::core_device_namespace_id`]`(person_id, device_id)` rather than
+///   of a bare id -- the hint that device polls under
+///   ([`crate::recent_device_hints_for`]) and no one else does.
+///
+/// `hop_ttl`, `expiry` and `sealed` are copied unchanged, as in the group
+/// case: fan-out changes addressing only, never crypto or hop budget. §6 is
+/// what makes one sealed body legitimate across a person's devices -- the
+/// inbox key is person-scoped, so every row of a fan-out to one person carries
+/// identical bytes and only the addressing differs.
+///
+/// Pure, undeduplicated, and store-free, for the same reasons its group twin
+/// is: callers re-plan it on retry and the ids converge.
+///
+/// **What it costs.** Every row carries the whole sealed body — §6 gives the
+/// person one inbox key, so the bytes are identical and only the addressing
+/// differs — which makes the relay cost of one 1:1 message
+/// `fleet_size × sealed_len`, linear in the recipient's device count and paid
+/// out of the family's shared relay budget. That is the price of per-device
+/// deletability, and it is deliberately bounded rather than open-ended:
+/// [`crate::DEVICE_HARD_CAP`] bounds the multiplier and
+/// [`RELAY_MAX_ENVELOPE_SEALED_BYTES`] bounds the body.
+/// `a_max_cap_fanout_fits_the_family_relay_budget` states the worst case
+/// against the two relayd constants mirrored below, so widening either cap has
+/// to be a deliberate edit with the arithmetic in front of it.
+#[uniffi::export]
+pub fn core_device_fanout_rows(
+    original_msg_id: Vec<u8>,
+    person_id: Vec<u8>,
+    device_ids: Vec<Vec<u8>>,
+    hop_ttl: u8,
+    expiry: i64,
+    sealed: Vec<u8>,
+    envelope_timestamp_ms: i64,
+) -> Vec<CoreGroupFanoutRow> {
+    device_ids
+        .into_iter()
+        .map(|device_id| CoreGroupFanoutRow {
+            msg_id: crate::device_fanout_msg_id(original_msg_id.clone(), device_id.clone()),
+            hop_ttl,
+            expiry,
+            recipient_hint: compute_recipient_hint(
+                crate::core_device_namespace_id(person_id.clone(), device_id),
+                envelope_timestamp_ms,
+            ),
+            sealed: sealed.clone(),
+        })
+        .collect()
+}
+
+/// relayd's `MAX_ENVELOPE_SEALED_BYTES`, mirrored here for the same reason
+/// [`crate::RELAY_MAX_FETCH_HINTS`] is: the thing that multiplies the cost
+/// ([`core_device_fanout_rows`]) is built in core, while the budget it has to
+/// fit inside is a server rule. relayd's own test suite asserts the copies are
+/// equal, so neither can drift silently.
+pub const RELAY_MAX_ENVELOPE_SEALED_BYTES: u64 = 512 * 1024;
+/// relayd's `DEFAULT_FAMILY_QUOTA_BYTES` — the sum of sealed bytes one family
+/// token may hold at once.
+pub const RELAY_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
+/// relayd's `DEFAULT_RATE_BYTES_PER_MIN` — how fast one family token may push
+/// bytes in.
+pub const RELAY_RATE_BYTES_PER_MIN: u64 = 64 * 1024 * 1024;
 
 /// No-gossip-reinjection classifier for relay-sourced group mail
 /// (`specs/group-relay-durability.md` §4.3): returns whether
@@ -927,6 +1010,141 @@ impl MessageStore {
         Ok(removed)
     }
 
+    /// The relay rows one queued 1:1 envelope should be uploaded as
+    /// (`specs/multi-device-v1.md` §7) — the outbound half of the same rule
+    /// [`Self::core_relay_ack_ids_with_consumed`] enforces on the way back in.
+    ///
+    /// Exactly one of two shapes, decided by what this device knows about the
+    /// recipient's roster:
+    ///
+    /// - **A person with fewer than two known devices — today's row, byte for
+    ///   byte.** One row carrying the envelope's own `msg_id` and its own
+    ///   stored `recipient_hint`; nothing is recomputed, so a legacy contact
+    ///   (and a contact whose roster simply has not reached us) receives an
+    ///   upload indistinguishable from the one this code posted before §7
+    ///   existed. This covers the entire fleet in the field.
+    /// - **A person with two or more roster-known devices — one row per
+    ///   device.** Each carries [`crate::device_fanout_msg_id`] of
+    ///   `(envelope.msg_id, device_id)` and that device's own daily hint, so
+    ///   each row has exactly one true consumer and ACK-MD-1 can let that
+    ///   consumer delete it.
+    ///
+    /// **Why the boundary is two and not one.** A person cannot hold a second
+    /// device until §9's linking ceremony exists (WP3, after this work
+    /// package), so a roster naming two devices can only have been signed by a
+    /// build that also fetches under §7's per-device namespaces. A roster
+    /// naming *one* device, by contrast, may well come from a build that
+    /// publishes rosters and still polls only its person hints — addressing it
+    /// per-device would starve it. Keeping the single-device case
+    /// person-addressed is also exactly what the receiving side already
+    /// believes: [`MessageStore::own_fleet_hints`] treats a fleet of one as
+    /// owning the person's hints outright, so sender and recipient agree about
+    /// which row has one true consumer without ever having to negotiate.
+    ///
+    /// **That argument is a debt WP3 inherits.** "A roster naming two devices
+    /// implies a build that fetches per-device" holds only for as long as the
+    /// linking ceremony that publishes such a roster is the same ceremony that
+    /// activates §7 fetching on the joining device. §9's two-phase activation
+    /// must therefore keep the two together: a device may not appear in a
+    /// published roster until it has imported the bootstrap and is fetching
+    /// under its own namespace. Splitting them — publishing the roster first
+    /// and activating later — would silently starve the new device for the
+    /// length of the gap, and nothing in this function could tell.
+    ///
+    /// **Dormant in WP2.** The per-device branch below cannot be reached in
+    /// the field yet: no production writer creates a fleet larger than one
+    /// device (that is WP3's activation ceremony), and no contact publishes a
+    /// two-device roster for the same reason. The rule is implemented and
+    /// pinned here so that the day WP3 writes the first fleet, addressing and
+    /// acks are already correct on both sides of the wire.
+    ///
+    /// `own_sibling_sealed` is §7's "the sender's own sibling devices get rows
+    /// too": when supplied, one further row per sibling of THIS device,
+    /// addressed to that sibling's namespace. It is a separate body and not the
+    /// envelope's, deliberately — `envelope.sealed` is sealed to the recipient,
+    /// and a sibling could no more open it than a stranger could. What belongs
+    /// in it is §8's sync record, sealed to the person's own inbox key, which
+    /// WP4 mints; until then every caller passes `None` and no sibling row is
+    /// produced. Passing the recipient-sealed bytes here would put copies on
+    /// the relay that no device can ever open, so callers must not.
+    ///
+    /// Pure with respect to the store: it reads the rosters and the fleet and
+    /// writes nothing, so a failed upload can re-plan the identical row set
+    /// next pass. Every id is deterministic, so those retries dedupe
+    /// server-side on `msg_id` with no relay change (`relayd` scopes rows by
+    /// `(family_token, msg_id, recipient_hint)`).
+    ///
+    /// **1:1 envelopes only, and refused rather than merely documented.** A
+    /// group-addressed envelope carries the group id in `recipient_user_id` and
+    /// fans out per MEMBER through [`core_group_fanout_rows`]; §11 leaves that
+    /// untouched, and a member's new device gets the group's mail through that
+    /// member's own self-sync rather than through an M×D fan-out here. Handed a
+    /// group envelope, this function would find no roster for the group id and
+    /// plan the single group-hinted row that predates group fan-out entirely —
+    /// plausible looking, and a durability regression that would only show up
+    /// as a member somewhere not receiving mail. So `recipient_user_id` is
+    /// looked up in the imported groups and a match is a [`CoreError`]: a doc
+    /// comment is not a guard, and this one costs a single indexed lookup on a
+    /// path that already reads the roster tables.
+    pub fn core_outbound_relay_rows(
+        &self,
+        envelope: OutboundEnvelope,
+        own_user_id: Vec<u8>,
+        own_sibling_sealed: Option<Vec<u8>>,
+    ) -> Result<Vec<CoreGroupFanoutRow>, CoreError> {
+        if self
+            .get_group(envelope.recipient_user_id.clone())?
+            .is_some()
+        {
+            return Err(CoreError::Store(
+                "core_outbound_relay_rows is for 1:1 envelopes only; a group-addressed envelope \
+                 fans out per member through core_group_fanout_rows"
+                    .to_string(),
+            ));
+        }
+        let recipient_devices =
+            self.contact_active_device_ids(envelope.recipient_user_id.clone())?;
+        let mut rows = if recipient_devices.len() < 2 {
+            vec![CoreGroupFanoutRow {
+                msg_id: envelope.msg_id.clone(),
+                hop_ttl: envelope.hop_ttl,
+                expiry: envelope.expiry,
+                // The stored hint, not a fresh one: this row must be the row
+                // that would have been posted anyway.
+                recipient_hint: envelope.recipient_hint.clone(),
+                sealed: envelope.sealed.clone(),
+            }]
+        } else {
+            core_device_fanout_rows(
+                envelope.msg_id.clone(),
+                envelope.recipient_user_id.clone(),
+                recipient_devices,
+                envelope.hop_ttl,
+                envelope.expiry,
+                envelope.sealed.clone(),
+                envelope.timestamp,
+            )
+        };
+        if let Some(sealed) = own_sibling_sealed {
+            let fleet = self.own_device_fleet()?;
+            let siblings = fleet
+                .device_ids
+                .into_iter()
+                .filter(|device_id| Some(device_id) != fleet.own_device_id.as_ref())
+                .collect();
+            rows.extend(core_device_fanout_rows(
+                envelope.msg_id,
+                own_user_id,
+                siblings,
+                envelope.hop_ttl,
+                envelope.expiry,
+                sealed,
+                envelope.timestamp,
+            ));
+        }
+        Ok(rows)
+    }
+
     /// Relay ack ids for one poll pass, folding the consumed-SEEN rule
     /// (DTN_TODOS.md §3.1) in on top of [`core_should_ack_inbound`]'s
     /// Consumed/Expired rule -- so a device that has already consumed an
@@ -955,14 +1173,16 @@ impl MessageStore {
     ///   echoed back as our own outbound, or read one copy of out of a
     ///   shared-mailbox group envelope.
     ///
-    /// The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
-    /// BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
-    /// routing-time hint check uses -- deliberately NOT the forward-looking
-    /// push-subscription variants ([`MessageStore::relay_self_push_hints`]).
-    /// A forward day is safe for *subscribing* to a topic and wrong here:
-    /// this is a claim about an envelope that already exists, and envelopes
-    /// are only ever created with a backward-looking hint
-    /// (`causal_order.rs`).
+    /// The own-self-hint check is the multi-device rules' [`FleetHint::OwnDevice`]
+    /// classification (it was [`core_is_own_fanout_hint`] back when a person
+    /// was a device, and reduces to exactly that on an unlinked install). Either
+    /// way it is the BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every
+    /// other routing-time hint check uses -- deliberately NOT the
+    /// forward-looking push-subscription variants
+    /// ([`MessageStore::relay_self_push_hints`]). A forward day is safe for
+    /// *subscribing* to a topic and wrong here: this is a claim about an
+    /// envelope that already exists, and envelopes are only ever created with a
+    /// backward-looking hint (`causal_order.rs`).
     ///
     /// Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
     /// relay copy unless THIS device was the envelope's sole true endpoint
@@ -982,6 +1202,44 @@ impl MessageStore {
     /// is correct precisely because each row has exactly one reader. Legacy
     /// rows simply age out within their normal expiry; the rule is
     /// unconditional per the approved spec (§7.3, no escape hatch).
+    ///
+    /// **Multi-device rules** (`specs/multi-device-v1.md` §7). The group rule
+    /// above says a row with more than one true consumer is never deleted by
+    /// one of them; ACK-MD-1 and ACK-MD-2 are the same sentence one level
+    /// down, where the several consumers are one person's own devices. Each
+    /// item's `recipient_hint` is classified against this device's own fleet
+    /// ([`MessageStore::own_fleet_hints`]) and:
+    ///
+    /// - [`FleetHint::OwnDevice`] — a row in this device's own per-device
+    ///   namespace, which has exactly one true consumer. Judged by every rule
+    ///   below exactly as a 1:1 row is today (ACK-MD-1: only on `Consumed`,
+    ///   never on `Carried` or `Expired`).
+    /// - [`FleetHint::PersonShared`] — the bare person hint, on a fleet that
+    ///   holds more than one device. Never acked (ACK-MD-2): a legacy sender
+    ///   uploads exactly ONE such row, so the first sibling to fetch it must
+    ///   leave it for the others; the content spreads by self-sync (§8, WP4)
+    ///   and the churn is bounded by the row's 7-day expiry and ends when the
+    ///   sender upgrades. Unconditional, like the legacy group rule and for
+    ///   the identical reason — there is no `Expired` escape from it either.
+    /// - [`FleetHint::Sibling`] — a row in a sibling's namespace. Never acked
+    ///   (ACK-MD-1). This is the refusal that cannot be left to the crypto: §6
+    ///   makes the inbox key person-scoped, so a sibling's row genuinely opens
+    ///   here and would otherwise be reported `Consumed` and deleted out from
+    ///   under the device it was addressed to — the §1 starvation failure,
+    ///   exactly.
+    /// - [`FleetHint::Foreign`] — everything else, judged as today.
+    ///
+    /// A device that has never linked has no siblings and no own device id, so
+    /// every one of its own rows classifies as [`FleetHint::OwnDevice`] and
+    /// nothing classifies as the other two: its behaviour here is byte-identical
+    /// to before this rule existed, which
+    /// `a_single_device_identity_plans_exactly_todays_acks` pins.
+    ///
+    /// ACK-MD-3 needs no code here and gets none: carried copies are governed
+    /// by `Carried` never being ackable (above) and by the carry queue's
+    /// digest-proof rule (`core_confirm_carried_deliveries`), neither of which
+    /// this change touches. A person-sealed carried copy is still removed only
+    /// on proof of receipt, never on dispatch.
     pub fn core_relay_ack_ids_with_consumed(
         &self,
         items: Vec<CoreRelayEnvelopeDisposition>,
@@ -1000,6 +1258,10 @@ impl MessageStore {
                 ));
             }
         }
+        // §7's per-device namespaces, resolved once for the whole pass. Empty
+        // of siblings and of a shared set on every install that has not
+        // linked, which is what makes the classification below a no-op there.
+        let fleet_hints = self.own_fleet_hints(&own_user_id, now_ms)?;
         let mut acked = Vec::with_capacity(items.len());
         for item in items {
             if legacy_group_hints.contains(&item.recipient_hint) {
@@ -1008,6 +1270,17 @@ impl MessageStore {
                 // never acks anything, so a legacy row's expiry cannot delete
                 // the shared copy the other members are still fetching either
                 // -- `relayd` prunes it server-side when it is truly dead.)
+                continue;
+            }
+            let fleet_hint = fleet_hints.classify(&item.recipient_hint);
+            if matches!(fleet_hint, FleetHint::PersonShared | FleetHint::Sibling) {
+                // ACK-MD-2 (the person's one shared row, left for the
+                // siblings) and ACK-MD-1 (a sibling's row is not ours to
+                // delete). Both are unconditional in the disposition for the
+                // same reason the legacy group row above is: this device is
+                // not the sole true consumer, so nothing it observed about the
+                // row -- consuming it, or calling it expired -- makes deleting
+                // it safe for the device it was addressed to.
                 continue;
             }
             if core_should_ack_inbound(item.disposition) {
@@ -1019,10 +1292,21 @@ impl MessageStore {
                 // Only pay for the hidden-kind lookups when the cheap
                 // `messages`-row route has nothing to say (the common case
                 // for chat mail is `Some(..)`, which short-circuits).
+                //
+                // ACK-MD-1 supplies the own-hint half now: on a linked device
+                // the hidden-kind row has to be in this device's OWN namespace,
+                // which is what `core_is_own_fanout_hint`'s person-wide check
+                // meant back when a person was a device. Unlinked, the two are
+                // the same set of hints over the same backward-only window.
+                //
+                // `core_record_consumed_hidden_msg_id` grants the licence
+                // through this same `FleetHints` classification, so the write
+                // side and the read side name one namespace and cannot drift
+                // into disagreeing about which rows a marker vouches for.
                 let (recorded_hidden, hint_is_own) = if origin.is_none() {
                     (
                         self.consumed_hidden_msg_id_recorded(item.msg_id, now_ms)?,
-                        core_is_own_fanout_hint(item.recipient_hint, own_user_id.clone(), now_ms),
+                        fleet_hint == FleetHint::OwnDevice,
                     )
                 } else {
                     (false, false)
@@ -1067,12 +1351,19 @@ impl MessageStore {
     /// 2. **The kind leaves no `messages` row**
     ///    ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
     ///    durable evidence; duplicating it here would only grow the table.
-    /// 3. **The `recipient_hint` is one of THIS device's own hints**, over
-    ///    the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
-    ///    ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
-    ///    braces: a pairwise open already implies the envelope was sealed to
-    ///    us, and this additionally refuses anything whose *addressing* says
-    ///    it might be for someone else.
+    /// 3. **The `recipient_hint` is in THIS device's own namespace**, over
+    ///    the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window — the same
+    ///    [`FleetHint::OwnDevice`] classification
+    ///    ([`MessageStore::own_fleet_hints`]) that
+    ///    [`Self::core_relay_ack_ids_with_consumed`] reads at ack time, so the
+    ///    write side of the licence and the read side of it name one namespace
+    ///    and cannot drift apart. (It was [`core_is_own_fanout_hint`]'s
+    ///    person-wide check back when a person was a device, and reduces to
+    ///    exactly that on an unlinked install.) This is the belt to condition
+    ///    1's braces: a pairwise open already implies the envelope was sealed
+    ///    to us, and this additionally refuses anything whose *addressing* says
+    ///    it might be for someone else — a sibling's namespace, or the person's
+    ///    one shared row that ACK-MD-2 leaves for the whole fleet.
     /// 4. **The `recipient_hint` is not a group's shared hint.** A group hint
     ///    names a row every member fetches, so it is never ackable by anyone
     ///    -- checked here as well as at ack time, since a hint collision
@@ -1110,7 +1401,11 @@ impl MessageStore {
         if expiry_ms <= now_ms {
             return Ok(false);
         }
-        if !core_is_own_fanout_hint(recipient_hint.clone(), own_user_id, now_ms) {
+        if self
+            .own_fleet_hints(&own_user_id, now_ms)?
+            .classify(&recipient_hint)
+            != FleetHint::OwnDevice
+        {
             return Ok(false);
         }
         if !self
@@ -1941,6 +2236,567 @@ mod tests {
             .core_relay_ack_ids_with_consumed(items, own, now)
             .unwrap();
         assert_eq!(acked, vec![1]);
+    }
+
+    // -- ACK-MD-1/2: per-device relay namespaces (multi-device-v1.md §7) ----
+
+    const MD_NOW: i64 = 1_700_000_000_000;
+    const MD_PERSON: [u8; 16] = [0x5A; 16];
+    const MD_OWN_DEVICE: [u8; 16] = [0xA1; 16];
+    const MD_SIBLING_DEVICE: [u8; 16] = [0xB2; 16];
+
+    /// A store whose own fleet is what §9's two-phase activation would have
+    /// left behind: this device first, then its siblings.
+    fn store_with_fleet(device_ids: &[[u8; 16]]) -> MessageStore {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .set_own_device_fleet(crate::OwnDeviceFleet {
+                own_device_id: device_ids.first().map(|id| id.to_vec()),
+                device_ids: device_ids.iter().map(|id| id.to_vec()).collect(),
+                projected_from: crate::RosterVersion {
+                    recovery_epoch: 0,
+                    seq: 1,
+                },
+            })
+            .unwrap();
+        store
+    }
+
+    fn device_hint_at(device_id: &[u8; 16], days_ago: i64) -> Vec<u8> {
+        compute_recipient_hint(
+            crate::core_device_namespace_id(MD_PERSON.to_vec(), device_id.to_vec()),
+            MD_NOW - days_ago * MS_PER_DAY,
+        )
+    }
+
+    fn person_hint_at(days_ago: i64) -> Vec<u8> {
+        compute_recipient_hint(MD_PERSON.to_vec(), MD_NOW - days_ago * MS_PER_DAY)
+    }
+
+    fn md_item(
+        relay_id: i64,
+        disposition: CoreInboundDisposition,
+        recipient_hint: Vec<u8>,
+    ) -> CoreRelayEnvelopeDisposition {
+        CoreRelayEnvelopeDisposition {
+            relay_id,
+            msg_id: vec![relay_id as u8; 16],
+            disposition,
+            recipient_hint,
+        }
+    }
+
+    /// One row from a contact, durably retained -- the evidence that makes a
+    /// `Seen` row ackable at all, so a namespace refusal that only worked
+    /// because the store was empty would fail these tests.
+    fn retain_incoming(store: &MessageStore, relay_id: i64) {
+        store
+            .insert_incoming_message(
+                crate::StoredMessage {
+                    chat_id: vec![0x01_u8; 16],
+                    sender_user_id: vec![0x01_u8; 16],
+                    lamport: relay_id as u64,
+                    timestamp: relay_id,
+                    kind: KIND_TEXT,
+                    payload: b"hi".to_vec(),
+                    sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
+                },
+                vec![relay_id as u8; 16],
+                None,
+            )
+            .unwrap();
+    }
+
+    fn md_plan(store: &MessageStore, items: Vec<CoreRelayEnvelopeDisposition>) -> Vec<i64> {
+        store
+            .core_relay_ack_ids_with_consumed(items, MD_PERSON.to_vec(), MD_NOW)
+            .unwrap()
+    }
+
+    /// ACK-MD-1: the one namespace this device may delete from, and only on
+    /// CONSUMED. The window edge is included because a hint is a day salt: a
+    /// row uploaded a week ago is still this device's own row.
+    #[test]
+    fn a_row_in_this_devices_own_namespace_is_acked_when_consumed() {
+        let store = store_with_fleet(&[MD_OWN_DEVICE, MD_SIBLING_DEVICE]);
+        let items = vec![
+            md_item(
+                1,
+                CoreInboundDisposition::Consumed,
+                device_hint_at(&MD_OWN_DEVICE, 0),
+            ),
+            md_item(
+                2,
+                CoreInboundDisposition::Consumed,
+                device_hint_at(&MD_OWN_DEVICE, CARRY_HINT_DAY_WINDOW_DAYS),
+            ),
+            md_item(
+                3,
+                CoreInboundDisposition::Carried,
+                device_hint_at(&MD_OWN_DEVICE, 0),
+            ),
+            md_item(
+                4,
+                CoreInboundDisposition::Expired,
+                device_hint_at(&MD_OWN_DEVICE, 0),
+            ),
+        ];
+        assert_eq!(md_plan(&store, items), vec![1, 2]);
+    }
+
+    /// ACK-MD-1's refusal, which is the whole reason the rule is stated about
+    /// namespaces rather than about seals: §6 makes the inbox key
+    /// person-scoped, so a sibling's row really does open here and really is
+    /// reported CONSUMED. Deleting it would be the §1 starvation failure.
+    #[test]
+    fn a_siblings_row_is_refused_by_namespace_even_when_consumed() {
+        let store = store_with_fleet(&[MD_OWN_DEVICE, MD_SIBLING_DEVICE]);
+        for relay_id in 1..=3 {
+            retain_incoming(&store, relay_id);
+        }
+        let items = vec![
+            md_item(
+                1,
+                CoreInboundDisposition::Consumed,
+                device_hint_at(&MD_SIBLING_DEVICE, 0),
+            ),
+            // No Expired escape, exactly as for a legacy group row: a clock
+            // this device controls must not delete another device's mail.
+            md_item(
+                2,
+                CoreInboundDisposition::Expired,
+                device_hint_at(&MD_SIBLING_DEVICE, 0),
+            ),
+            // Nor the consumed-SEEN route: the sibling's row is refused before
+            // any store evidence is consulted.
+            md_item(
+                3,
+                CoreInboundDisposition::Seen,
+                device_hint_at(&MD_SIBLING_DEVICE, CARRY_HINT_DAY_WINDOW_DAYS),
+            ),
+        ];
+        assert!(
+            md_plan(&store, items).is_empty(),
+            "a sibling device's rows are never this device's to delete"
+        );
+    }
+
+    /// ACK-MD-2: a legacy sender uploads ONE person-addressed row for the
+    /// whole fleet. The first sibling to fetch it must leave it; the content
+    /// spreads by self-sync (§8) and the row ages out on its own.
+    #[test]
+    fn a_multi_device_fleet_never_acks_the_legacy_person_row() {
+        let store = store_with_fleet(&[MD_OWN_DEVICE, MD_SIBLING_DEVICE]);
+        for relay_id in 1..=3 {
+            retain_incoming(&store, relay_id);
+        }
+        let items = vec![
+            md_item(1, CoreInboundDisposition::Consumed, person_hint_at(0)),
+            md_item(2, CoreInboundDisposition::Expired, person_hint_at(0)),
+            md_item(
+                3,
+                CoreInboundDisposition::Seen,
+                person_hint_at(CARRY_HINT_DAY_WINDOW_DAYS),
+            ),
+        ];
+        assert!(
+            md_plan(&store, items).is_empty(),
+            "the person's one shared row is left for the siblings"
+        );
+        // And the discriminator: the identical rows in this device's OWN
+        // namespace are still acked, so the refusal is about addressing and
+        // not about having stopped acking.
+        let own_items = vec![
+            md_item(
+                1,
+                CoreInboundDisposition::Consumed,
+                device_hint_at(&MD_OWN_DEVICE, 0),
+            ),
+            md_item(
+                3,
+                CoreInboundDisposition::Seen,
+                device_hint_at(&MD_OWN_DEVICE, 0),
+            ),
+        ];
+        assert_eq!(md_plan(&store, own_items), vec![1, 3]);
+    }
+
+    /// The compatibility pin: a device with no sibling plans exactly the acks
+    /// it planned before §7 existed, whether or not it has ever been linked.
+    /// Every legacy build in the field is the first case; a person who links
+    /// and then removes their second device is the second.
+    #[test]
+    fn a_single_device_identity_plans_exactly_todays_acks() {
+        let unlinked = MessageStore::open(":memory:".to_string()).unwrap();
+        let linked_alone = store_with_fleet(&[MD_OWN_DEVICE]);
+        for store in [&unlinked, &linked_alone] {
+            for relay_id in [1_i64, 4] {
+                retain_incoming(store, relay_id);
+            }
+            let items = vec![
+                md_item(1, CoreInboundDisposition::Consumed, person_hint_at(0)),
+                md_item(2, CoreInboundDisposition::Carried, person_hint_at(0)),
+                md_item(3, CoreInboundDisposition::Expired, person_hint_at(0)),
+                // The consumed-SEEN route, which reads the own-hint check the
+                // fleet classification now supplies: a person-addressed row
+                // with a retained message row acks.
+                md_item(
+                    4,
+                    CoreInboundDisposition::Seen,
+                    person_hint_at(CARRY_HINT_DAY_WINDOW_DAYS),
+                ),
+                // A contact's hint stays foreign, and Carried stays unackable.
+                md_item(
+                    5,
+                    CoreInboundDisposition::Carried,
+                    compute_recipient_hint(vec![0x01_u8; 16], MD_NOW),
+                ),
+            ];
+            assert_eq!(md_plan(store, items), vec![1, 4]);
+        }
+    }
+
+    // -- §7 outbound fan-out ------------------------------------------------
+
+    /// A person this device knows, holding `count` linked devices, taught
+    /// through the real roster path rather than by writing the table: a
+    /// contact row whose `sign_pk` is the person root (§3), then a genesis
+    /// roster that root signed. If any DL rule would reject the document, this
+    /// fixture fails rather than quietly leaving the store device-less.
+    fn contact_with_linked_devices(store: &MessageStore, count: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let person = crate::generate_identity();
+        let devices: Vec<crate::DeviceKeypair> = (0..count)
+            .map(|_| crate::generate_device_keypair())
+            .collect();
+        store
+            .upsert_contact(crate::Contact {
+                user_id: person.user_id.clone(),
+                name: "Roster fixture".to_string(),
+                sign_pk: person.sign_pk.clone(),
+                agree_pk: person.agree_pk.clone(),
+                relay_url: None,
+                relay_token: None,
+                nickname: None,
+            })
+            .unwrap();
+        if count > 0 {
+            let certs = devices
+                .iter()
+                .enumerate()
+                .map(|(index, device)| {
+                    crate::core_sign_device_cert(
+                        crate::DeviceCert {
+                            person_id: person.user_id.clone(),
+                            device_sign_pk: device.sign_pk.clone(),
+                            device_agree_pk: device.agree_pk.clone(),
+                            added_epoch: 0,
+                            flags: if index == 0 {
+                                crate::DEVICE_CERT_FLAG_ROSTER_SIGNING
+                            } else {
+                                0
+                            },
+                            signer_sign_pk: Vec::new(),
+                            signature: Vec::new(),
+                        },
+                        person.sign_sk.clone(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let roster = crate::core_sign_roster(
+                crate::Roster {
+                    person_id: person.user_id.clone(),
+                    recovery_epoch: 0,
+                    seq: 0,
+                    devices: certs,
+                    tombstones: Vec::new(),
+                    approving_device_id: devices[0].device_id.clone(),
+                    inbox_key_generation: 0,
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                person.sign_sk.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                store.apply_contact_roster(roster).unwrap().outcome,
+                crate::RosterUpdateOutcome::Accepted,
+                "the fixture roster must actually land"
+            );
+        }
+        (
+            person.user_id,
+            devices.into_iter().map(|device| device.device_id).collect(),
+        )
+    }
+
+    fn outbound_to(recipient_user_id: &[u8]) -> OutboundEnvelope {
+        OutboundEnvelope {
+            msg_id: vec![0x77; 16],
+            recipient_user_id: recipient_user_id.to_vec(),
+            chat_id: recipient_user_id.to_vec(),
+            sender_user_id: MD_PERSON.to_vec(),
+            kind: KIND_TEXT,
+            lamport: 4,
+            timestamp: MD_NOW,
+            hop_ttl: 7,
+            expiry: MD_NOW + crate::DEFAULT_EXPIRY_MS,
+            recipient_hint: compute_recipient_hint(recipient_user_id.to_vec(), MD_NOW),
+            sealed: b"sealed to the recipient person".to_vec(),
+        }
+    }
+
+    fn plan_rows(store: &MessageStore, envelope: &OutboundEnvelope) -> Vec<CoreGroupFanoutRow> {
+        store
+            .core_outbound_relay_rows(envelope.clone(), MD_PERSON.to_vec(), None)
+            .unwrap()
+    }
+
+    /// The compatibility pin the whole outbound half rests on: a contact this
+    /// device holds no roster for -- every contact in the field -- is uploaded
+    /// as the one person-addressed row it was uploaded as before §7, with the
+    /// envelope's own id and its own stored hint, nothing recomputed.
+    #[test]
+    fn a_contact_with_no_roster_is_uploaded_exactly_as_today() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let (person_id, _) = contact_with_linked_devices(&store, 0);
+        let envelope = outbound_to(&person_id);
+        assert_eq!(
+            plan_rows(&store, &envelope),
+            vec![CoreGroupFanoutRow {
+                msg_id: envelope.msg_id.clone(),
+                hop_ttl: envelope.hop_ttl,
+                expiry: envelope.expiry,
+                recipient_hint: envelope.recipient_hint.clone(),
+                sealed: envelope.sealed.clone(),
+            }]
+        );
+    }
+
+    /// A person who publishes a roster naming ONE device is still addressed as
+    /// a person. The build that signed that roster may predate §7's fetch --
+    /// two devices cannot exist before §9's linking does -- so addressing it
+    /// per-device could starve it, and there is nothing to gain: one device is
+    /// the sole true consumer of the person row either way.
+    #[test]
+    fn a_single_device_contact_is_still_addressed_as_a_person() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let (person_id, device_ids) = contact_with_linked_devices(&store, 1);
+        let envelope = outbound_to(&person_id);
+        let rows = plan_rows(&store, &envelope);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].msg_id, envelope.msg_id);
+        assert_eq!(rows[0].recipient_hint, envelope.recipient_hint);
+        assert_ne!(
+            rows[0].msg_id,
+            crate::device_fanout_msg_id(envelope.msg_id.clone(), device_ids[0].clone()),
+            "no device dimension appears anywhere in a single-device upload"
+        );
+    }
+
+    /// §7: one row per recipient device, each findable and deletable by that
+    /// device alone.
+    #[test]
+    fn a_multi_device_contact_gets_one_row_per_device() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let (person_id, device_ids) = contact_with_linked_devices(&store, 3);
+        let envelope = outbound_to(&person_id);
+        let rows = plan_rows(&store, &envelope);
+
+        assert_eq!(rows.len(), 3);
+        for (row, device_id) in rows.iter().zip(&device_ids) {
+            assert_eq!(
+                row.msg_id,
+                crate::device_fanout_msg_id(envelope.msg_id.clone(), device_id.clone())
+            );
+            assert!(
+                crate::recent_device_hints_for(person_id.clone(), device_id.clone(), MD_NOW)
+                    .contains(&row.recipient_hint),
+                "each row is addressed where that device actually polls"
+            );
+            // §6: the seal is to the person, so every row carries identical
+            // bytes and only the addressing differs.
+            assert_eq!(row.sealed, envelope.sealed);
+            assert_eq!(
+                (row.hop_ttl, row.expiry),
+                (envelope.hop_ttl, envelope.expiry)
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| row.recipient_hint != envelope.recipient_hint),
+            "ACK-MD-2: no bare person row is uploaded beside them -- it would \
+             be a row no device is allowed to delete"
+        );
+        let ids: HashSet<Vec<u8>> = rows.iter().map(|row| row.msg_id.clone()).collect();
+        assert_eq!(ids.len(), 3, "each device's row is independently ackable");
+    }
+
+    /// §7's own-sibling rows. The addressing ships here; the body does not
+    /// exist until §8's sync records do (WP4), so the rows appear only when a
+    /// caller supplies bytes the siblings can actually open.
+    #[test]
+    fn own_sibling_rows_wait_for_a_body_a_sibling_can_open() {
+        let store = store_with_fleet(&[MD_OWN_DEVICE, MD_SIBLING_DEVICE]);
+        let (person_id, _) = contact_with_linked_devices(&store, 0);
+        let envelope = outbound_to(&person_id);
+
+        assert_eq!(
+            plan_rows(&store, &envelope).len(),
+            1,
+            "no caller mints a sync body yet, so no sibling row is planned"
+        );
+
+        let sync_sealed = b"sealed to this person's own inbox key".to_vec();
+        let rows = store
+            .core_outbound_relay_rows(
+                envelope.clone(),
+                MD_PERSON.to_vec(),
+                Some(sync_sealed.clone()),
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].sealed, sync_sealed, "never the recipient's bytes");
+        assert_eq!(
+            rows[1].msg_id,
+            crate::device_fanout_msg_id(envelope.msg_id.clone(), MD_SIBLING_DEVICE.to_vec())
+        );
+        assert!(crate::recent_device_hints_for(
+            MD_PERSON.to_vec(),
+            MD_SIBLING_DEVICE.to_vec(),
+            MD_NOW
+        )
+        .contains(&rows[1].recipient_hint));
+        assert!(
+            !rows.iter().any(|row| row.msg_id
+                == crate::device_fanout_msg_id(envelope.msg_id.clone(), MD_OWN_DEVICE.to_vec())),
+            "this device does not post itself mail it already holds"
+        );
+    }
+
+    /// A group-addressed envelope is REFUSED here, not quietly mis-planned.
+    /// Handed one, this function would find no roster for the group id and
+    /// plan the single group-hinted row that predates group fan-out — a
+    /// durability regression whose only symptom is a member somewhere not
+    /// receiving mail.
+    #[test]
+    fn a_group_addressed_envelope_is_refused_rather_than_mis_planned() {
+        let (store, group_id) = store_with_group(vec![MD_PERSON.to_vec()]);
+        let envelope = outbound_to(&group_id);
+        assert!(
+            store
+                .core_outbound_relay_rows(envelope.clone(), MD_PERSON.to_vec(), None)
+                .is_err(),
+            "a group id in recipient_user_id must be refused"
+        );
+        // The discriminator: the identical envelope addressed to a person this
+        // device holds no roster for still plans its one row, so the refusal is
+        // about the group and not about the function having stopped working.
+        let (person_id, _) = contact_with_linked_devices(&store, 0);
+        let mut to_person = envelope;
+        to_person.recipient_user_id = person_id;
+        assert_eq!(plan_rows(&store, &to_person).len(), 1);
+    }
+
+    /// The relay cost of §7's fan-out, stated as arithmetic rather than as a
+    /// hope: one message costs `fleet_size × sealed_len`, and the worst case
+    /// this codebase permits has to fit the family budget it is spending.
+    ///
+    /// The numbers are asserted exactly. Widening `DEVICE_HARD_CAP`, raising
+    /// relayd's per-envelope cap, or shrinking a family's quota or rate all
+    /// land here first, with the multiplication in front of whoever does it.
+    #[test]
+    fn a_max_cap_fanout_fits_the_family_relay_budget() {
+        let worst_case_message_bytes =
+            crate::DEVICE_HARD_CAP as u64 * RELAY_MAX_ENVELOPE_SEALED_BYTES;
+        assert_eq!(worst_case_message_bytes, 8 * 1024 * 1024);
+
+        // And that really is what the planner emits: rows carry the sealed body
+        // unchanged, one per device (§6 — the seal is to the person).
+        let sealed = vec![0xEE_u8; 4096];
+        let device_ids: Vec<Vec<u8>> = (0..crate::DEVICE_HARD_CAP)
+            .map(|index| vec![index as u8 + 1; crate::DEVICE_ID_LEN])
+            .collect();
+        let rows = core_device_fanout_rows(
+            vec![0x77; 16],
+            MD_PERSON.to_vec(),
+            device_ids,
+            7,
+            MD_NOW + crate::DEFAULT_EXPIRY_MS,
+            sealed.clone(),
+            MD_NOW,
+        );
+        let planned_bytes: u64 = rows.iter().map(|row| row.sealed.len() as u64).sum();
+        assert_eq!(rows.len(), crate::DEVICE_HARD_CAP as usize);
+        assert_eq!(planned_bytes, crate::DEVICE_HARD_CAP as u64 * 4096);
+
+        // A family may HOLD 32 such worst-case messages at once...
+        assert_eq!(RELAY_FAMILY_QUOTA_BYTES / worst_case_message_bytes, 32);
+        // ...and may PUSH 8 of them per minute, so the rate limiter cannot be
+        // tripped by a single sender's ordinary traffic even at the hard cap.
+        assert_eq!(RELAY_RATE_BYTES_PER_MIN / worst_case_message_bytes, 8);
+        // The storage quota is the binding constraint, not the rate: a family
+        // that pushed flat out for four minutes would fill it.
+        assert_eq!(
+            RELAY_FAMILY_QUOTA_BYTES / RELAY_RATE_BYTES_PER_MIN,
+            4,
+            "if this inverts, the rate limiter has become the tighter of the two"
+        );
+    }
+
+    /// ACK-MD-1 on the WRITE side (fix: one namespace, named once). The
+    /// consumed-hidden licence is granted through the same classification the
+    /// ack planner reads, so a device-namespaced hidden-kind row records its
+    /// marker and a sibling's does not.
+    #[test]
+    fn a_device_namespaced_hidden_kind_records_its_consumed_marker() {
+        let store = store_with_fleet(&[MD_OWN_DEVICE, MD_SIBLING_DEVICE]);
+        let expiry = MD_NOW + 60_000;
+        let record = |msg_id: u8, hint: Vec<u8>| {
+            store
+                .core_record_consumed_hidden_msg_id(
+                    vec![msg_id; 16],
+                    crate::KIND_RECEIPT,
+                    hint,
+                    expiry,
+                    MD_PERSON.to_vec(),
+                    MD_NOW,
+                )
+                .unwrap()
+        };
+
+        assert!(
+            record(1, device_hint_at(&MD_OWN_DEVICE, 0)),
+            "a row in this device's own namespace is the one shape that records"
+        );
+        assert!(
+            store
+                .consumed_hidden_msg_id_recorded(vec![1; 16], MD_NOW)
+                .unwrap(),
+            "and the marker is readable back by the ack planner"
+        );
+        assert!(
+            !record(2, device_hint_at(&MD_SIBLING_DEVICE, 0)),
+            "a sibling's namespace is not this device's to license a delete in"
+        );
+        assert!(
+            !record(3, person_hint_at(0)),
+            "nor is the person's one shared row, on a fleet of more than one"
+        );
+
+        // The compatibility half: unlinked, the person's hints ARE this
+        // device's own namespace, so the licence is granted exactly as before.
+        let unlinked = MessageStore::open(":memory:".to_string()).unwrap();
+        assert!(unlinked
+            .core_record_consumed_hidden_msg_id(
+                vec![4; 16],
+                crate::KIND_RECEIPT,
+                person_hint_at(0),
+                expiry,
+                MD_PERSON.to_vec(),
+                MD_NOW,
+            )
+            .unwrap());
     }
 
     #[test]
