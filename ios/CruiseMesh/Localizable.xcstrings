@@ -1375,12 +1375,32 @@
         }
       }
     },
+    "Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family's messages over the internet when you're spread out or someone's back home.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family's messages over the internet when you're spread out or someone's back home."
+          }
+        }
+      }
+    },
     "Friend": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Friend"
+          }
+        }
+      }
+    },
+    "Get a Shore Pass at cruisemesh.app": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Get a Shore Pass at cruisemesh.app"
           }
         }
       }
@@ -1693,6 +1713,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received."
+          }
+        }
+      }
+    },
+    "One pass covers your whole family. Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One pass covers your whole family. Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card."
+          }
+        }
+      }
+    },
+    "One Shore Pass covers your whole family. If someone in your family already has one, ask them to share their setup card instead of buying another.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One Shore Pass covers your whole family. If someone in your family already has one, ask them to share their setup card instead of buying another."
           }
         }
       }
@@ -2039,6 +2079,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Shore Pass"
+          }
+        }
+      }
+    },
+    "Shore Pass carries messages over the internet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass carries messages over the internet"
           }
         }
       }

@@ -19,7 +19,7 @@ struct OnboardingView: View {
     /// because the page count previously appeared as a bare `4` in three
     /// places (dot row, button label, button action) and adding a slide meant
     /// finding all of them.
-    private static let pageCount = 5
+    private static let pageCount = 6
     private var lastPage: Int { Self.pageCount - 1 }
 
     // There is deliberately no device-name default here. `UIDevice.current.name`
@@ -55,13 +55,26 @@ struct OnboardingView: View {
                 )
                 .tag(1)
 
+                // The one paid part, introduced where expectations are being
+                // set anyway: what a Shore Pass is for, that everything nearby
+                // stays free, and that one pass covers the family.
+                // Deliberately informational -- no purchase link here; the
+                // Shore Pass screen in Settings is where the doing happens.
+                OnboardingSlide(
+                    systemImage: "ticket",
+                    title: "Shore Pass carries messages over the internet",
+                    bodyText: "Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family's messages over the internet when you're spread out or someone's back home.",
+                    supportText: "One pass covers your whole family. Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card."
+                )
+                .tag(2)
+
                 PermissionsSlide(
                     onEnable: {
                         MessageNotifier.requestPermission()
                         appModel.startMesh()
                     }
                 )
-                .tag(2)
+                .tag(3)
 
                 // T5 slide 4: the least guessable thing about running
                 // CruiseMesh -- staying on a Wi-Fi network with no internet is
@@ -73,7 +86,7 @@ struct OnboardingView: View {
                     bodyText: "On a ship or anywhere the Wi-Fi has no internet, keep it connected anyway — CruiseMesh uses that local network to reach phones near you faster than Bluetooth alone.",
                     supportText: "CruiseMesh won't use the dead connection for the internet; it just uses it to find and talk to nearby phones."
                 )
-                .tag(3)
+                .tag(4)
 
                 ProfileSetupSlide(
                     identity: identity,
@@ -81,7 +94,7 @@ struct OnboardingView: View {
                     avatarImage: $avatarImage,
                     photoItem: $photoItem
                 )
-                .tag(4)
+                .tag(5)
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
 

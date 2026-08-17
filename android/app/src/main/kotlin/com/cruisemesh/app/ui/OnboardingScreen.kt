@@ -73,7 +73,7 @@ fun OnboardingScreen(
     onComplete: () -> Unit,
 ) {
     var page by rememberSaveable { mutableStateOf(0) }
-    val pages = 5
+    val pages = 6
     val canGoBack = page > 0
     val isLastPage = page == pages - 1
 
@@ -209,7 +209,8 @@ fun OnboardingScreen(
                             when (currentPage) {
                                 0 -> WelcomeSlide(onRestore = onRestore)
                                 1 -> DeliverySlide()
-                                2 -> PermissionsSlide(
+                                2 -> ShorePassSlide()
+                                3 -> PermissionsSlide(
                                     meshPermissionsGranted = meshPermissionsGranted,
                                     notificationPermissionGranted = notificationPermissionGranted,
                                     batteryExemptionGranted = batteryExemptionGranted,
@@ -217,7 +218,7 @@ fun OnboardingScreen(
                                     onRequestNotificationPermission = onRequestNotificationPermission,
                                     onRequestBatteryExemption = onRequestBatteryExemption,
                                 )
-                                3 -> WifiSlide()
+                                4 -> WifiSlide()
                                 else -> ProfileSlide(
                                     userId = userId,
                                     displayId = displayId,
@@ -269,6 +270,26 @@ private fun DeliverySlide() {
         HighlightCard(
             title = stringResource(R.string.ui_onboarding_private_title),
             detail = stringResource(R.string.ui_onboarding_private_detail),
+        )
+    }
+}
+
+/**
+ * The one paid part, introduced where expectations are being set anyway: what
+ * a Shore Pass is for, that everything nearby stays free, and that one pass
+ * covers the family. Deliberately informational — no purchase link here; the
+ * Shore Pass screen in Settings is where the doing happens.
+ */
+@Composable
+private fun ShorePassSlide() {
+    SlideScaffold(
+        eyebrow = stringResource(R.string.ui_onboarding_shore_pass_eyebrow),
+        title = stringResource(R.string.ui_onboarding_shore_pass_title),
+        body = stringResource(R.string.ui_onboarding_shore_pass_body),
+    ) {
+        HighlightCard(
+            title = stringResource(R.string.ui_onboarding_shore_pass_family_title),
+            detail = stringResource(R.string.ui_onboarding_shore_pass_family_detail),
         )
     }
 }
