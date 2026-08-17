@@ -73,7 +73,7 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.onboarding").waitForExistence(timeout: 10))
         XCTAssertTrue(app.staticTexts["Messages that find a way through"].exists)
 
-        for _ in 0..<4 {
+        for _ in 0..<5 {
             let next = app.buttons["Next"]
             XCTAssertTrue(next.waitForExistence(timeout: 3))
             next.tap()
@@ -95,7 +95,7 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.onboarding").waitForExistence(timeout: 10))
 
         XCUIDevice.shared.orientation = .landscapeLeft
-        for _ in 0..<4 {
+        for _ in 0..<5 {
             let next = app.buttons["Next"]
             XCTAssertTrue(next.waitForExistence(timeout: 3))
             XCTAssertTrue(next.isHittable, "Next must remain visible outside the scrolling page content")
