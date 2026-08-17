@@ -606,6 +606,201 @@ pub fn core_roster_device_ids(roster: Roster) -> Vec<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Roster wire codec (DL-3)
+// ---------------------------------------------------------------------------
+
+/// Leading byte of an encoded roster document.
+const ROSTER_WIRE_VERSION: u8 = 1;
+
+/// Encode a roster as a transferable document (DL-3: a roster gossips as
+/// ordinary sealed 1:1 traffic, and §8 syncs the *own* roster to siblings
+/// inside a sync record — see [`crate::SyncOwnRosterPayload`]).
+///
+/// Deliberately NOT [`roster_signed_bytes`]: that output is a signature
+/// pre-image — domain-prefixed and *without* the signature — so it can never
+/// round-trip. This layout carries every field, signature included, each
+/// length-framed, so `decode(encode(r)) == r` and so a receiver re-checks
+/// through [`core_roster_validate`] exactly the document its signer signed.
+///
+/// DL-5 survives the codec for the same reason it holds in the type: every
+/// field written here is a fixed-width key, id, or counter that the validator
+/// re-checks on the way back in. The codec adds no free-form field, so it
+/// cannot become the place an endpoint fits.
+#[uniffi::export]
+pub fn core_encode_roster(roster: Roster) -> Result<Vec<u8>, CoreError> {
+    let mut out = vec![ROSTER_WIRE_VERSION];
+    push_wire_bytes(&mut out, &roster.person_id)?;
+    out.extend_from_slice(&roster.recovery_epoch.to_be_bytes());
+    out.extend_from_slice(&roster.seq.to_be_bytes());
+    push_wire_count(&mut out, roster.devices.len(), "devices")?;
+    for cert in &roster.devices {
+        push_wire_bytes(&mut out, &cert.person_id)?;
+        push_wire_bytes(&mut out, &cert.device_sign_pk)?;
+        push_wire_bytes(&mut out, &cert.device_agree_pk)?;
+        out.extend_from_slice(&cert.added_epoch.to_be_bytes());
+        out.extend_from_slice(&cert.flags.to_be_bytes());
+        push_wire_bytes(&mut out, &cert.signer_sign_pk)?;
+        push_wire_bytes(&mut out, &cert.signature)?;
+    }
+    push_wire_count(&mut out, roster.tombstones.len(), "tombstones")?;
+    for tombstone in &roster.tombstones {
+        push_wire_bytes(&mut out, &tombstone.device_id)?;
+        out.extend_from_slice(&tombstone.revoked_at_seq.to_be_bytes());
+    }
+    push_wire_bytes(&mut out, &roster.approving_device_id)?;
+    out.extend_from_slice(&roster.inbox_key_generation.to_be_bytes());
+    push_wire_bytes(&mut out, &roster.signer_sign_pk)?;
+    push_wire_bytes(&mut out, &roster.signature)?;
+    Ok(out)
+}
+
+/// Decode a roster document. Fully bounds-checked and never panics on
+/// attacker-controlled bytes; trailing bytes are an error. Nothing here judges
+/// the document — [`core_roster_validate`] and [`core_roster_accept`] remain
+/// the only authorities on whether a decoded roster may be believed.
+#[uniffi::export]
+pub fn core_decode_roster(bytes: Vec<u8>) -> Result<Roster, CoreError> {
+    let mut cursor = RosterCursor::new(&bytes);
+    let version = cursor.take_u8()?;
+    if version != ROSTER_WIRE_VERSION {
+        return Err(CoreError::Malformed(format!(
+            "unsupported roster wire version {version}"
+        )));
+    }
+    let person_id = cursor.take_bytes()?;
+    let recovery_epoch = cursor.take_u64()?;
+    let seq = cursor.take_u64()?;
+    let device_count = cursor.take_u16()? as usize;
+    // The capacity hint is capped at the §14.3 hard cap on purpose: a lying
+    // count must not be able to make this allocate before a single certificate
+    // has been read.
+    let mut devices = Vec::with_capacity(device_count.min(DEVICE_HARD_CAP as usize));
+    for _ in 0..device_count {
+        devices.push(DeviceCert {
+            person_id: cursor.take_bytes()?,
+            device_sign_pk: cursor.take_bytes()?,
+            device_agree_pk: cursor.take_bytes()?,
+            added_epoch: cursor.take_u64()?,
+            flags: cursor.take_u32()?,
+            signer_sign_pk: cursor.take_bytes()?,
+            signature: cursor.take_bytes()?,
+        });
+    }
+    let tombstone_count = cursor.take_u16()? as usize;
+    let mut tombstones = Vec::with_capacity(tombstone_count.min(DEVICE_HARD_CAP as usize));
+    for _ in 0..tombstone_count {
+        tombstones.push(DeviceTombstone {
+            device_id: cursor.take_bytes()?,
+            revoked_at_seq: cursor.take_u64()?,
+        });
+    }
+    let approving_device_id = cursor.take_bytes()?;
+    let inbox_key_generation = cursor.take_u64()?;
+    let signer_sign_pk = cursor.take_bytes()?;
+    let signature = cursor.take_bytes()?;
+    cursor.finish()?;
+    Ok(Roster {
+        person_id,
+        recovery_epoch,
+        seq,
+        devices,
+        tombstones,
+        approving_device_id,
+        inbox_key_generation,
+        signer_sign_pk,
+        signature,
+    })
+}
+
+fn push_wire_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CoreError> {
+    if bytes.len() > u16::MAX as usize {
+        return Err(CoreError::Malformed(
+            "roster field is too long to encode".to_string(),
+        ));
+    }
+    out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn push_wire_count(out: &mut Vec<u8>, count: usize, field: &str) -> Result<(), CoreError> {
+    if count > u16::MAX as usize {
+        return Err(CoreError::Malformed(format!(
+            "roster has too many {field} to encode"
+        )));
+    }
+    out.extend_from_slice(&(count as u16).to_be_bytes());
+    Ok(())
+}
+
+/// A bounds-checked cursor, in the shape every other codec in this crate keeps
+/// privately, so a truncated roster is a [`CoreError::Malformed`] and never a
+/// panic.
+struct RosterCursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RosterCursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], CoreError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| {
+                CoreError::Malformed(format!(
+                    "truncated roster: need {n} more byte(s) at offset {}",
+                    self.pos
+                ))
+            })?;
+        let slice = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, CoreError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn take_u16(&mut self) -> Result<u16, CoreError> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?.try_into().expect("exactly 2 bytes"),
+        ))
+    }
+
+    fn take_u32(&mut self) -> Result<u32, CoreError> {
+        Ok(u32::from_be_bytes(
+            self.take(4)?.try_into().expect("exactly 4 bytes"),
+        ))
+    }
+
+    fn take_u64(&mut self) -> Result<u64, CoreError> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().expect("exactly 8 bytes"),
+        ))
+    }
+
+    fn take_bytes(&mut self) -> Result<Vec<u8>, CoreError> {
+        let len = self.take_u16()? as usize;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    fn finish(self) -> Result<(), CoreError> {
+        if self.pos != self.data.len() {
+            return Err(CoreError::Malformed(format!(
+                "{} unexpected trailing byte(s) after the roster",
+                self.data.len() - self.pos
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation (DL-1 chain, DL-4 tombstones, DL-5 shape, §14.3 cap)
 // ---------------------------------------------------------------------------
 
@@ -1444,6 +1639,73 @@ mod tests {
         assert_eq!(hex(&roster.signature), ROSTER_SIGNATURE);
         assert_eq!(hex(&core_roster_head_hash(roster.clone())), ROSTER_HEAD);
         assert_eq!(core_roster_validate(roster, sign_pk(&ROOT_SK)), None);
+    }
+
+    /// The transferable roster document (DL-3), frozen the same way.
+    ///
+    /// Separate from `ROSTER_SIGNED_BYTES` above on purpose: that is the
+    /// signature pre-image and this is the document, and the difference between
+    /// them — a domain prefix, u64 framing versus u16, no signature versus a
+    /// trailing one — is exactly the kind of thing that goes wrong silently if
+    /// only one of the two is pinned.
+    #[test]
+    fn roster_wire_golden_vector() {
+        const ROSTER_WIRE: &str = "010010c0c5ecd7f1ee33f526dd27d34c3e1daa0000000000000001000000000000000100010010c0c5ecd7f1ee33f526dd27d34c3e1daa0020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f0002044444444444444444444444444444444444444444444444444444444444444440000000000000001000000010020d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c97787370040209755df19023c6622e38972314e986ce4dd6b90a96f73239ba276e78ab79becf8b3e8b7efcb215ffda887ebf724c62bdbccf6c72415cba995adfda213e28005000000104d3ae03a986747b7644cbf85c243495100000000000000010020a09aa5f47a6759802ff955f8dc2d2a14a5c99d23be97f864127ff9383455a4f00040d95f84ac165f8ca3c6488e7691d6ad116eb4be7b416d51b7078881dcc777071dffca09048e1278ed8402fd9ad17db6648e60fa89020cd4526e442e9a69ae1b04";
+
+        let roster = roster_at(1, 1);
+        assert_eq!(
+            hex(&core_encode_roster(roster.clone()).expect("encodes")),
+            ROSTER_WIRE
+        );
+        // The decoded document is the same document, signature and all, so a
+        // receiver validates exactly what its signer signed.
+        let decoded = core_decode_roster(core_encode_roster(roster.clone()).expect("encodes"))
+            .expect("decodes");
+        assert_eq!(decoded, roster);
+        assert_eq!(core_roster_validate(decoded, sign_pk(&ROOT_SK)), None);
+    }
+
+    /// A roster with tombstones and a second device round-trips too, and the
+    /// codec refuses the two shapes a decoder must never guess at.
+    #[test]
+    fn roster_wire_round_trips_and_refuses_malformed_bytes() {
+        let mut roster = unsigned_roster(
+            2,
+            9,
+            vec![approving_cert(), sibling_cert()],
+            vec![DeviceTombstone {
+                device_id: vec![0x7Au8; DEVICE_ID_LEN],
+                revoked_at_seq: 4,
+            }],
+        );
+        roster = core_sign_roster(roster, DEVICE_A_SK.to_vec()).expect("signs");
+        let encoded = core_encode_roster(roster.clone()).expect("encodes");
+        assert_eq!(
+            core_decode_roster(encoded.clone()).expect("decodes"),
+            roster
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            core_decode_roster(trailing),
+            Err(CoreError::Malformed(_))
+        ));
+        assert!(matches!(
+            core_decode_roster(encoded[..encoded.len() - 1].to_vec()),
+            Err(CoreError::Malformed(_))
+        ));
+        // A lying device count must not be able to make the decoder allocate
+        // before it has read a single certificate. The count sits right after
+        // version(1) ‖ len(person_id)(2) ‖ person_id(16) ‖ recovery_epoch(8) ‖
+        // seq(8).
+        let mut lying = encoded;
+        lying[35] = 0xFF;
+        lying[36] = 0xFF;
+        assert!(matches!(
+            core_decode_roster(lying),
+            Err(CoreError::Malformed(_))
+        ));
     }
 
     /// The two raw-signing domains WP4 and the authoring path will use, pinned

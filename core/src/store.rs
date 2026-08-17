@@ -148,6 +148,44 @@ fn lock_conn(conn: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
     conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+impl MessageStore {
+    /// The locked connection, for the sibling modules that own tables of their
+    /// own (`roster_store`, `sync_store`) rather than a copy of this one.
+    ///
+    /// `pub(crate)` and no further. The mutex is not reentrant, so a caller
+    /// holding this guard must not call back into a `&self` store method;
+    /// keeping the guard inside the crate is what makes that rule reviewable
+    /// in one place.
+    pub(crate) fn locked_conn(&self) -> MutexGuard<'_, Connection> {
+        lock_conn(&self.conn)
+    }
+}
+
+/// The device id this install authors under (`specs/multi-device-v1.md` §5),
+/// read inside whatever transaction the caller already holds.
+///
+/// [`MessageStore::own_device_fleet`] answers the same question but takes the
+/// store mutex, which an authoring transaction is already holding — so the
+/// authoring path reads the one column it needs through the connection it has.
+///
+/// [`LEGACY_DEVICE_ID`] for an install that has never linked, which is every
+/// device in the field today and every store in a test that never called
+/// [`MessageStore::set_own_device_fleet`]. That is §5's synthetic one-device
+/// person, and it is the *correct* answer rather than a fallback: a device with
+/// no roster cert has no id it could honestly claim, and §9.4 forbids authoring
+/// under one before the roster naming it is acknowledged.
+pub(crate) fn own_authoring_device_id(conn: &Connection) -> Result<Vec<u8>, CoreError> {
+    let stored: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT device_id FROM own_device_fleet WHERE is_self = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?;
+    Ok(crate::core_device_stream_id(stored))
+}
+
 const MESSAGE_ID_LEN: usize = 16;
 const CARRIED_CONTENT_DIGEST_LEN: usize = 32;
 const DEFAULT_TOTAL_CARRY_BUDGET_BYTES: i64 = 64 * 1024 * 1024;
@@ -1129,6 +1167,10 @@ impl MessageStore {
         // shape reads NULL here and its import is refused rather than
         // silently accepted against no binding at all.
         ensure_column(&conn, "device_link_activation", "channel_binding", "BLOB")?;
+        // §8's sync streams: stream positions, this device's own sealed
+        // records, and the shared settings a sibling may write.
+        conn.execute_batch(crate::sync_store::SYNC_STREAM_SCHEMA_SQL)
+            .map_err(store_err)?;
         // A roster describes a contact, so it has no business outliving one.
         crate::roster_store::sweep_orphaned_persons(&conn)?;
         migrate_delivery_metrics_schema(&conn)?;
@@ -2043,6 +2085,38 @@ fn sanitize_restore_contents(
         // authored_lamport_watermarks intentionally survives: it contains no
         // content and prevents a restored identity from reusing old stream
         // positions after the user chooses not to restore conversations.
+        //
+        // §8's sync streams get the same treatment for the same reason, split
+        // exactly along the content line. The retained *sealed* records carry
+        // message bodies, so leaving them would restore through self-sync the
+        // conversations the user just chose to exclude -- a sibling's next
+        // digest would be answered with them. Blanking the seal removes that
+        // content while the row, and therefore the stream position, survives:
+        // a restored device that reused a slot a sibling already holds would
+        // have its records silently ignored as duplicates, forever.
+        tx.execute(
+            "UPDATE sync_stream_records SET
+                 sealed = NULL,
+                 sealed_recovery_epoch = NULL,
+                 sealed_seq = NULL,
+                 inbox_key_generation = NULL",
+            [],
+        )
+        .map_err(store_err)?;
+        // SYNC-2's shared composer drafts are unsent message content and go
+        // with the rest of it. Same split as the sealed records above: the KEY
+        // and its epoch survive so the cleared state is a newer write that
+        // converges, while the text does not -- a restore that excluded
+        // conversations must not hand a sibling back the half-typed message the
+        // user chose to leave behind. Every other shared setting (§8's
+        // "settings the product deems shared") is preference state, not
+        // content, and survives untouched.
+        tx.execute(
+            "UPDATE sync_settings SET value = X'', epoch = epoch + 1
+             WHERE key LIKE ?1 AND LENGTH(value) > 0",
+            params![format!("{}%", crate::sync_outbound::SYNC_DRAFT_KEY_PREFIX)],
+        )
+        .map_err(store_err)?;
     }
 
     if options.include_pending_deliveries_for_others {
@@ -3385,13 +3459,18 @@ impl MessageStore {
     /// gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
     /// waiting"). Returns 0 if message 1 itself hasn't arrived yet.
     ///
-    /// Still per person rather than per device stream, which is deliberate for
-    /// now: a digest is what this device tells a peer it already has, and the
-    /// per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
-    /// Until then the person's device streams are merged into one run of
-    /// lamport values, and the merge is over DISTINCT values -- two of that
-    /// person's devices sharing a lamport is a normal §5 outcome, not a gap,
-    /// and counting it twice would truncate the watermark there forever.
+    /// Per person rather than per device stream, and -- now that SYNC-1 has
+    /// landed -- deliberately staying that way. The per-device digest lives
+    /// beside the records it describes ([`crate::SyncStreamDigest`],
+    /// `specs/multi-device-v1.md` §8) instead of here, because a chat digest is
+    /// what this device tells a *contact* it already has, and §2's first goal
+    /// is that a person's device count stays invisible to other people: one
+    /// entry per device on that wire would hand the fleet to every peer a
+    /// device meets. What this function merges instead is the person's device
+    /// streams into one run of lamport values, and the merge is over DISTINCT
+    /// values -- two of that person's devices sharing a lamport is a normal §5
+    /// outcome, not a gap, and counting it twice would truncate the watermark
+    /// there forever.
     pub fn highest_contiguous_lamport(
         &self,
         chat_id: Vec<u8>,

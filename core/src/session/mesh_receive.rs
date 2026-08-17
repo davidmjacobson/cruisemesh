@@ -63,7 +63,8 @@
 use std::sync::Arc;
 
 use crate::{
-    core_inbound_gate, core_is_own_fanout_hint, core_pairwise_sender_authorized,
+    core_decode_sync_record, core_inbound_gate, core_is_own_fanout_hint,
+    core_pairwise_sender_authorized, core_sync_record_admit, core_sync_record_kind_wire,
     decode_extended_message_body, decode_group_invite_content, decode_lan_endpoint_content,
     decode_profile_sync_content, decode_receipt_content, decode_relay_update_content,
     encode_envelope_frame, friend_card_user_id, open_group_message, open_message, parse_frame,
@@ -71,10 +72,32 @@ use crate::{
     ContactDiscoveryPolicy, CoreError, CoreInboundDisposition, CoreInboundGate,
     ExtendedMessageBody, Frame, FriendCard, Identity, IncomingMessageInsertOutcome,
     LanEndpointContent, MessageArrival, MessageStore, PendingSharedRequest, SeenIds,
-    SharedFriendCard, StoredMessage, DEVICE_HARD_CAP, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, LEGACY_DEVICE_ID,
-    RECEIPT_TYPE_DELIVERED,
+    SharedFriendCard, StoredMessage, SyncDigest, DEVICE_HARD_CAP, KIND_FRIEND_REQUEST,
+    KIND_GROUP_INVITE, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE,
+    LEGACY_DEVICE_ID, RECEIPT_TYPE_DELIVERED,
 };
+
+/// What the pairwise-open path found when it asked whether an opened payload
+/// was one of §8's sync records.
+///
+/// Deliberately not exported: a shell never sees this distinction, because
+/// every branch of it is finished inside core by the time
+/// [`MessageStore::process_inbound_frame`] returns.
+enum SyncConsumption {
+    /// An ordinary message body (or a payload that is not a content frame at
+    /// all). Falls through to the delivery path unchanged.
+    NotASyncRecord,
+    /// A sync record this person's roster refuses — a revoked author, a
+    /// superseded inbox generation, a foreign person, a bad signature.
+    /// Consumed by deliberate discard, never applied, and never vouched for.
+    Refused,
+    /// Admitted and applied, with the sealed-body kind for the ACK-MD-1
+    /// evidence and, for a digest, the sibling's watermarks to answer.
+    Applied {
+        kind: u8,
+        peer_digest: Option<SyncDigest>,
+    },
+}
 
 /// The shared per-envelope foreign carry budget, byte-identical to the shells'
 /// `FOREIGN_CARRY_BUDGET_BYTES` (Android `InboundEnvelopeProcessor`, iOS
@@ -192,6 +215,19 @@ pub struct CoreInboundOutcome {
     /// Whether an opened pairwise envelope was dropped because its sender is
     /// blocked — consumed for ack purposes, never delivered.
     pub dropped_blocked: bool,
+    /// A sibling's SYNC-1 watermarks, present exactly when this envelope
+    /// carried a [`crate::SyncRecordKind::Digest`] record that admitted (§8).
+    ///
+    /// The rest of a sync record's handling finishes inside core — the payload
+    /// is applied to the store before this returns, and nothing is handed back
+    /// to deliver. A digest is the exception because it is not state to apply
+    /// but a *question*: it says what a sibling holds, and the answer is a
+    /// backfill round only the driver can send. So the one sync outcome a shell
+    /// acts on is this one, and it acts on it by planning a round
+    /// ([`crate::core_sync_digest_gaps`] →
+    /// [`MessageStore::core_sync_backfill_records`] →
+    /// [`crate::core_plan_sync_backfill`]), never by writing anything.
+    pub sync_peer_digest: Option<SyncDigest>,
     /// Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
     /// D4 bookkeeping the caller commits after it durably delivers the payload.
     /// See [`CoreInboundCommit`]. `None` for every path that has no native
@@ -212,6 +248,7 @@ impl CoreInboundOutcome {
             carried: false,
             carried_family: false,
             dropped_blocked: false,
+            sync_peer_digest: None,
             commit: None,
             work,
         }
@@ -493,9 +530,86 @@ impl MessageStore {
                     carried: false,
                     carried_family: false,
                     dropped_blocked: true,
+                    sync_peer_digest: None,
                     commit: None,
                     work,
                 });
+            }
+
+            // §8 self-sync, before the message-body decode. A pairwise open
+            // against this device's own key is exactly the condition §6's
+            // person inbox key describes in v1 (every linked device holds the
+            // person identity, so the identity secret *is* the inbox secret),
+            // so a sibling's sync record surfaces here and nowhere else.
+            //
+            // It is dispatched in core rather than handed to the shells for the
+            // same reason the rest of this transaction is: a sync record is
+            // opened, admitted against the own roster and applied to the store
+            // in one place, or it is three places that will disagree about
+            // SYNC-3. Nothing is handed back to deliver — the store write has
+            // already committed when this returns — so this is terminal here,
+            // exactly like the blocked-sender drop above.
+            match self.consume_sync_record(&opened.sender_user_id, &opened.payload, now_ms)? {
+                SyncConsumption::NotASyncRecord => {}
+                SyncConsumption::Refused => {
+                    // Opened for us and deliberately discarded: consumed, so
+                    // the relay copy acks away rather than refetching a record
+                    // that will fail the same roster gate forever. No hidden
+                    // evidence: nothing of it was applied, and the licence to
+                    // delete a relay row is only ever written for what this
+                    // device actually took.
+                    seen.record(msg_id);
+                    work.dropped = 1;
+                    return Ok(CoreInboundOutcome {
+                        disposition: CoreInboundDisposition::Consumed,
+                        delivered_payloads: Vec::new(),
+                        delivered_sender: None,
+                        delivered_group_id: None,
+                        relay_frame: None,
+                        carried: false,
+                        carried_family: false,
+                        dropped_blocked: false,
+                        sync_peer_digest: None,
+                        commit: None,
+                        work,
+                    });
+                }
+                SyncConsumption::Applied { kind, peer_digest } => {
+                    // ACK-MD-1's evidence, written here rather than deferred to
+                    // a commit token, because there is no native delivery to
+                    // wait on: the apply above is the durable delivery, and it
+                    // has committed. This is what makes
+                    // `core_kind_persists_msg_id_row`'s claim about the sync
+                    // kinds true — they leave no `messages` row of their own,
+                    // so the consumed-hidden set is the only thing that can
+                    // later vouch for having taken this device's fan-out copy.
+                    // Best-effort exactly as every other hidden kind's is: the
+                    // store re-checks every safety condition and declines
+                    // otherwise, and a missing record costs one relay refetch.
+                    let _ = self.core_record_consumed_hidden_msg_id(
+                        msg_id.clone(),
+                        kind,
+                        recipient_hint,
+                        expiry,
+                        identity.user_id.clone(),
+                        now_ms,
+                    );
+                    seen.record(msg_id);
+                    work.delivered = 1;
+                    return Ok(CoreInboundOutcome {
+                        disposition: CoreInboundDisposition::Consumed,
+                        delivered_payloads: Vec::new(),
+                        delivered_sender: None,
+                        delivered_group_id: None,
+                        relay_frame: None,
+                        carried: false,
+                        carried_family: false,
+                        dropped_blocked: false,
+                        sync_peer_digest: peer_digest,
+                        commit: None,
+                        work,
+                    });
+                }
             }
 
             // A deliverable 1:1 message. Hand the payload back for the caller's
@@ -522,6 +636,7 @@ impl MessageStore {
                 carried: false,
                 carried_family: false,
                 dropped_blocked: false,
+                sync_peer_digest: None,
                 commit: Some(CoreInboundCommit {
                     msg_id,
                     group_id: None,
@@ -614,6 +729,7 @@ impl MessageStore {
                     carried: carry.stored,
                     carried_family: carry.family,
                     dropped_blocked: false,
+                    sync_peer_digest: None,
                     commit: Some(CoreInboundCommit {
                         msg_id: msg_id.clone(),
                         group_id: Some(group.id.clone()),
@@ -642,6 +758,7 @@ impl MessageStore {
                 carried: carry.stored,
                 carried_family: carry.family,
                 dropped_blocked: false,
+                sync_peer_digest: None,
                 commit: None,
                 work,
             });
@@ -681,6 +798,7 @@ impl MessageStore {
             carried: carry.stored,
             carried_family: carry.family,
             dropped_blocked: false,
+            sync_peer_digest: None,
             commit: None,
             work,
         })
@@ -718,6 +836,63 @@ impl MessageStore {
 /// gaining a raw `carry` method a shell could call to enqueue a carried row
 /// outside the single-authority disposition (A0 clean-surface discipline).
 impl MessageStore {
+    /// What the pairwise-open path found when it asked "is this a §8 sync
+    /// record?".
+    ///
+    /// `outer_signer` is the verified sender the pairwise open already
+    /// established — the id the envelope's own signature derives, which is a
+    /// *device* id for a record a linked device sealed and the person id for
+    /// one an un-linked install sealed (§14.2 keeps the root off every phone,
+    /// so the first case is the normal one). It is passed rather than
+    /// re-derived so this function cannot disagree with the open that produced
+    /// it.
+    fn consume_sync_record(
+        &self,
+        outer_signer: &[u8],
+        payload: &[u8],
+        now_ms: i64,
+    ) -> Result<SyncConsumption, CoreError> {
+        // No own roster, no admission. An install that has never linked a
+        // device has nothing to check a record against and no sibling that
+        // could have sent one, so the dispatch is inert there rather than
+        // guessing — which is also what keeps this path free on the v1 phones
+        // that are the overwhelming majority of the fleet.
+        let context = {
+            let conn = self.locked_conn();
+            crate::sync_store::own_sync_context(&conn)?
+        };
+        let Some(context) = context else {
+            return Ok(SyncConsumption::NotASyncRecord);
+        };
+        // Strict: a version byte, a named sync kind, exact framing and no
+        // trailing bytes. An ordinary message body fails all of them, so
+        // "decodes" is the discriminant and there is no ambiguous middle.
+        let Ok(record) = core_decode_sync_record(payload.to_vec()) else {
+            return Ok(SyncConsumption::NotASyncRecord);
+        };
+        let kind = core_sync_record_kind_wire(record.kind);
+        // The two SYNC-3 gates `core_open_sync_record` applies, in the same
+        // order, against the roster this device actually holds. The decryption
+        // half already happened — `open_message` above is the same open.
+        if !crate::sync_record::outer_signer_is_own(outer_signer, &context.roster) {
+            return Ok(SyncConsumption::Refused);
+        }
+        if core_sync_record_admit(
+            record.clone(),
+            context.inbox_key_generation,
+            context.roster.clone(),
+        )
+        .is_some()
+        {
+            return Ok(SyncConsumption::Refused);
+        }
+        let applied = self.core_apply_sync_record(record, now_ms)?;
+        Ok(SyncConsumption::Applied {
+            kind,
+            peer_digest: applied.peer_digest,
+        })
+    }
+
     /// The delivery fold itself. See [`Self::core_deliver_inbound`] for the
     /// contract; the only difference is the richer error type, which lets a
     /// deterministic body failure be told apart from a durability one.
@@ -1801,6 +1976,157 @@ mod delivery_tests {
                 .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
                 .unwrap(),
             expected
+        );
+    }
+
+    /// §5, WP4: the id an activated device authors under reaches the recipient.
+    ///
+    /// The test above proves the *path* carries a device id; this one proves
+    /// the authoring side actually puts one there. Nothing below hands the
+    /// sender's store a device id — `author_pairwise_message` reads the fleet
+    /// §9's activation left behind — and nothing tells the recipient one is
+    /// coming: it is an ordinary unlinked peer running the production inbound
+    /// pair, which is exactly what a legacy build is.
+    #[test]
+    fn an_activated_devices_authored_envelope_arrives_on_its_own_stream() {
+        let recipient_store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        recipient_store
+            .upsert_contact(contact(&sender, "Sender"))
+            .unwrap();
+
+        let sender_store = store();
+        sender_store.upsert_contact(contact(&me, "Me")).unwrap();
+        let phone = crate::generate_device_keypair();
+        sender_store
+            .set_own_device_fleet(crate::OwnDeviceFleet {
+                own_device_id: Some(phone.device_id.clone()),
+                device_ids: vec![
+                    phone.device_id.clone(),
+                    crate::generate_device_keypair().device_id,
+                ],
+                projected_from: crate::RosterVersion {
+                    recovery_epoch: 0,
+                    seq: 1,
+                },
+            })
+            .unwrap();
+
+        let authored = sender_store
+            .author_pairwise_message(
+                sender.clone(),
+                contact(&me, "Me"),
+                KIND_TEXT,
+                b"we docked early".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+
+        let frame = encode_envelope_frame(
+            authored.envelope.msg_id.clone(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            authored.envelope.sealed.clone(),
+        );
+        let outcome = recipient_store
+            .process_inbound_frame(
+                me.clone(),
+                Arc::new(SeenIds::new()),
+                CoreInboundSource::Mesh,
+                frame,
+                NOW,
+            )
+            .expect("inbound");
+        let delivery = recipient_store
+            .core_deliver_inbound(
+                me,
+                outcome.delivered_sender.expect("verified sender"),
+                outcome
+                    .delivered_payloads
+                    .first()
+                    .cloned()
+                    .expect("delivered"),
+                outcome.commit.expect("commit token"),
+                arrival(),
+                discovery(),
+            )
+            .expect("delivery");
+
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            recipient_store
+                .message_stream_device_ids(sender.user_id.clone(), sender.user_id)
+                .unwrap(),
+            vec![phone.device_id],
+            "the recipient files the message on the device that authored it, \
+             and never on the legacy stream"
+        );
+    }
+
+    /// §12's other half: an install that has never linked still emits exactly
+    /// today's envelope, and its mail still lands on the legacy stream. This is
+    /// every device in the field until WP3's ceremony writes a fleet.
+    #[test]
+    fn an_unlinked_devices_authored_envelope_stays_on_the_legacy_stream() {
+        let recipient_store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        recipient_store
+            .upsert_contact(contact(&sender, "Sender"))
+            .unwrap();
+
+        let sender_store = store();
+        let authored = sender_store
+            .author_pairwise_message(
+                sender.clone(),
+                contact(&me, "Me"),
+                KIND_TEXT,
+                b"we docked early".to_vec(),
+                None,
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(authored.message.sender_device_id, LEGACY_DEVICE_ID.to_vec());
+
+        let frame = encode_envelope_frame(
+            authored.envelope.msg_id.clone(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            authored.envelope.sealed.clone(),
+        );
+        let outcome = recipient_store
+            .process_inbound_frame(
+                me.clone(),
+                Arc::new(SeenIds::new()),
+                CoreInboundSource::Mesh,
+                frame,
+                NOW,
+            )
+            .expect("inbound");
+        recipient_store
+            .core_deliver_inbound(
+                me,
+                outcome.delivered_sender.expect("verified sender"),
+                outcome
+                    .delivered_payloads
+                    .first()
+                    .cloned()
+                    .expect("delivered"),
+                outcome.commit.expect("commit token"),
+                arrival(),
+                discovery(),
+            )
+            .expect("delivery");
+
+        assert_eq!(
+            recipient_store
+                .message_stream_device_ids(sender.user_id.clone(), sender.user_id)
+                .unwrap(),
+            vec![LEGACY_DEVICE_ID.to_vec()]
         );
     }
 

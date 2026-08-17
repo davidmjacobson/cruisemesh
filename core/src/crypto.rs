@@ -80,6 +80,23 @@ pub fn seal_message(
 /// signature, and return the sender's UserID alongside the plaintext payload.
 #[uniffi::export]
 pub fn open_message(recipient: Identity, sealed: Vec<u8>) -> Result<OpenedMessage, CoreError> {
+    open_sealed_with_agree_sk(&recipient.agree_sk, &sealed)
+}
+
+/// The same open, addressed by a bare X25519 secret rather than by an
+/// [`Identity`].
+///
+/// [`open_message`] is the whole-identity form every contact-facing path uses;
+/// this one exists because `specs/multi-device-v1.md` §6 gives a *person* — not
+/// a device identity — a scoped inbox key, and §8's sync records are sealed to
+/// exactly that key ([`crate::core_open_sync_record`]). The envelope format,
+/// the padding, and the embedded-signature check are identical; only the
+/// question "which secret opens this" differs, so it stays one implementation
+/// rather than two that could drift.
+pub(crate) fn open_sealed_with_agree_sk(
+    agree_sk: &[u8],
+    sealed: &[u8],
+) -> Result<OpenedMessage, CoreError> {
     if sealed.len() < 1 + EPHEMERAL_PK_LEN + NONCE_LEN {
         return Err(CoreError::Crypto("envelope too short".to_string()));
     }
@@ -94,7 +111,7 @@ pub fn open_message(recipient: Identity, sealed: Vec<u8>) -> Result<OpenedMessag
     let (nonce_bytes, ciphertext) = rest.split_at(NONCE_LEN);
 
     let ephemeral_pk = public_key_from_bytes(ephemeral_pk_bytes)?;
-    let recipient_sk = secret_key_from_bytes(&recipient.agree_sk)?;
+    let recipient_sk = secret_key_from_bytes(agree_sk)?;
     let opening_box = SalsaBox::new(&ephemeral_pk, &recipient_sk);
     // `nonce_bytes` is exactly NONCE_LEN bytes: it came from splitting at a
     // fixed offset after the length check above, so this can't panic.

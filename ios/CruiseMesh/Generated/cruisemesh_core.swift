@@ -5104,6 +5104,14 @@ public protocol MessageStoreProtocol : AnyObject {
     func contactRosterState(personUserId: Data) throws  -> ContactRosterState
     
     /**
+     * Apply one admitted sync record (SYNC-1). Idempotent per stream slot and
+     * safe to call with records in any order — see the module docs for why
+     * both hold, and for why the caller must have opened the record through
+     * [`crate::core_open_sync_record`] first.
+     */
+    func coreApplySyncRecord(record: SyncRecord, nowMs: Int64) throws  -> SyncApplyResult
+    
+    /**
      * Commit the DTN D4 bookkeeping for a payload the caller has now durably
      * delivered: record the ACK-01 consumed-hidden evidence (best-effort — the
      * store re-checks every safety condition and declines otherwise) and mark
@@ -5353,6 +5361,13 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreOutboundRelayRows(envelope: OutboundEnvelope, ownUserId: Data, ownSiblingSealed: Data?) throws  -> [CoreGroupFanoutRow]
     
     /**
+     * The stored own sync context, or `None` on an install that has never
+     * linked a device — which is the ordinary state of a v1 phone and is what
+     * makes the inbound sync dispatch inert there rather than guessing.
+     */
+    func coreOwnSyncContext() throws  -> OwnSyncContext?
+    
+    /**
      * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
      *
      * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
@@ -5524,6 +5539,203 @@ public protocol MessageStoreProtocol : AnyObject {
      * on proof of receipt, never on dispatch.
      */
     func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data, nowMs: Int64) throws  -> [Int64]
+    
+    /**
+     * Record the own roster and inbox key generation the inbound transaction
+     * admits sync records against (§4, §6).
+     *
+     * This is the **ceremony's** write — §9's activation and §10's revocation
+     * — and deliberately not anti-entropy's: an applied
+     * [`SyncRecordKind::OwnRoster`] record hands its payload back through
+     * [`SyncApplyResult::own_roster`] for a ceremony to act on rather than
+     * writing here, or a gossiped record could re-widen a fleet a revocation
+     * had just narrowed.
+     *
+     * Monotone in `(recovery_epoch, seq)`, for the reason
+     * [`MessageStore::set_own_device_fleet`] is: a roster that went backwards
+     * would re-admit a device the current one has already tombstoned. A
+     * non-superseding write returns `false` and changes nothing.
+     */
+    func coreSetOwnSyncContext(roster: Roster, inboxKeyGeneration: UInt64) throws  -> Bool
+    
+    /**
+     * The planner's view of a list of stored records, in the same order.
+     *
+     * Exported because a shell cannot call a plain Rust method on a
+     * `uniffi::Record`, and re-deriving `byte_len` and `sealed_for` on each
+     * platform is exactly the duplicated arithmetic core-first exists to stop.
+     */
+    func coreSyncBackfillOffers(records: [StoredSyncRecord])  -> [SyncBackfillOffer]
+    
+    /**
+     * The sealed records this device can send to answer `gaps`, oldest first
+     * and capped at `limit` rows.
+     *
+     * Feed the result through [`MessageStore::core_sync_backfill_offers`] into
+     * [`crate::core_plan_sync_backfill`] with the same `gaps`: this method
+     * decides what exists, the planner decides what fits.
+     */
+    func coreSyncBackfillRecords(gaps: [SyncGap], limit: UInt32) throws  -> [StoredSyncRecord]
+    
+    /**
+     * This chat's shared draft, or `None` when there is none — including the
+     * cleared-by-authoring case, which stores an empty value so the *clear*
+     * itself can converge.
+     */
+    func coreSyncChatDraft(chatId: Data) throws  -> String?
+    
+    /**
+     * This device's contacts, with their rosters, for a
+     * [`SyncRecordKind::Contacts`] record.
+     *
+     * The card is rebuilt from the stored contact rather than kept verbatim,
+     * and is therefore unsigned — which [`crate::parse_friend_card`] accepts,
+     * and which is honest about what vouches for it: the sibling's device
+     * signature on the record carrying it, inside a seal no third party can
+     * open. A nickname is never included, exactly as it is never written to
+     * any other wire format.
+     *
+     * **A blocked person is not offered.** The block list converges through
+     * the Settings stream ([`SYNC_BLOCKED_SETTING_KEY`]), and the two facts
+     * have to agree or the fleet oscillates: a device that both blocks Ash and
+     * keeps publishing Ash's card would re-seed Ash onto a sibling that had
+     * just dropped them, round after round. Blocking is the stronger
+     * statement, so it wins the page.
+     */
+    func coreSyncContactsPage(limit: UInt32) throws  -> SyncContactsPayload
+    
+    /**
+     * This device's SYNC-1 digest for `person_id`: every sync stream it holds
+     * anything of, at its contiguous watermark.
+     *
+     * Cheap enough to rebuild on every encounter, which is the point. A digest
+     * a device only refreshed occasionally would answer a sibling with a
+     * watermark it had already passed, and the sibling would spend the
+     * encounter re-sending what had already landed.
+     */
+    func coreSyncDigest(personId: Data) throws  -> SyncDigest
+    
+    /**
+     * One shared setting, or `None` if it has never been written.
+     */
+    func coreSyncGetSetting(key: String) throws  -> SyncSettingEntry?
+    
+    /**
+     * This device's groups, for a [`SyncRecordKind::Groups`] record.
+     */
+    func coreSyncGroupsPage(limit: UInt32) throws  -> SyncGroupsPayload
+    
+    /**
+     * A page of message history for a sync record, oldest first: everything in
+     * `chat_id` from `sender_person_id` above `after_lamport`.
+     *
+     * `own_person_id` decides each entry's [`crate::SyncHistoryDirection`]
+     * rather than leaving the receiver to infer it, so a sibling reading the
+     * record knows which entries are the person's own outbound before it has
+     * looked anything up — the fact SYNC-2's dedup turns on.
+     *
+     * Rows with no stored `msg_id` are skipped. A history entry names the
+     * original envelope so a sibling that already consumed the message
+     * recognizes it instead of storing it twice, and a row that predates the
+     * id column cannot offer that.
+     */
+    func coreSyncHistoryPage(ownPersonId: Data, chatId: Data, senderPersonId: Data, afterLamport: UInt64, limit: UInt32) throws  -> SyncHistoryPayload
+    
+    /**
+     * The next `stream_seq` for one of this device's own streams (§8): where
+     * its next record of `kind` goes.
+     *
+     * Gap-free by construction, because SYNC-1's contiguity rule means a hole
+     * in a stream stops a sibling's watermark at that hole forever. A caller
+     * that mints a seq and then fails to retain the record must reuse the seq,
+     * never skip past it.
+     */
+    func coreSyncNextStreamSeq(authorDeviceId: Data, kind: SyncRecordKind) throws  -> UInt64
+    
+    /**
+     * Ask, before authoring, whether a sibling already put this exact message
+     * on the wire (SYNC-2).
+     *
+     * `not_before_ms` is the oldest sibling copy that still counts as "the
+     * same send" — pass `now_ms - `[`SYNC_OUTBOUND_DEDUP_WINDOW_MS`] unless
+     * there is a reason to differ. A shell that skips this call does not
+     * break: it re-authors, the recipient sees the message twice, and the
+     * fleet converges on two rows. That is precisely the product bug §8 names,
+     * which is why the convergence property tests drive authoring through here
+     * and assert the fleet never holds two copies of one text.
+     */
+    func coreSyncOutboundClaim(ownPersonId: Data, chatId: Data, kind: UInt8, payload: Data, notBeforeMs: Int64) throws  -> OutboundAuthorClaim
+    
+    /**
+     * Publish this device's block list into the shared Settings stream (§8),
+     * so blocking on one device is blocking on all of them.
+     *
+     * Called by whichever surface performs the block, in the same breath as
+     * [`MessageStore::block_user`] — the local table is what refuses mail here
+     * and now, and this is what carries the decision to a sibling that may not
+     * be reachable for a week. `epoch` is milliseconds, like every other
+     * setting.
+     */
+    func coreSyncPublishBlockList(epoch: UInt64) throws  -> Bool
+    
+    /**
+     * Write a shared setting locally. `false` means a value that wins the
+     * merge order was already stored, so nothing changed.
+     *
+     * The entry's `author_device_id` is **overwritten** with this device's own
+     * authoring id, whatever the caller passed. A local write is authored
+     * here by definition, and letting a shell name somebody else as the author
+     * would hand it the tiebreak — the one field in the order that exists
+     * precisely because no writer may choose its own position in it.
+     */
+    func coreSyncPutSetting(entry: SyncSettingEntry) throws  -> Bool
+    
+    /**
+     * Replace a retained record's sealed bytes after a roster change (SYNC-3).
+     * The stream slot — and therefore [`crate::core_sync_record_id`] — is
+     * unchanged, so the re-seal costs no new relay row.
+     */
+    func coreSyncResealRecord(record: SyncRecord, sealed: SealedSyncRecord) throws  -> Bool
+    
+    /**
+     * Keep a record this device authored, with the sealed bytes a sibling will
+     * be sent whenever it next surfaces. `false` means the slot was already
+     * retained.
+     *
+     * Retention is what makes SYNC-1's "no operation may assume both devices
+     * are ever concurrently online" true rather than aspirational: the sealed
+     * copy outlives the encounter it was made for, so a sibling that has been
+     * dark for a fortnight is answered out of storage rather than out of a
+     * conversation nobody was present for.
+     */
+    func coreSyncRetainRecord(record: SyncRecord, sealed: SealedSyncRecord, nowMs: Int64) throws  -> Bool
+    
+    /**
+     * Write this chat's composer draft into the shared Settings stream, so the
+     * device in the person's hand is the one that finishes the sentence.
+     *
+     * `epoch` is the last-writer-wins ordering key and is milliseconds: pass
+     * the same `now_ms` the shell stamps everything else with. A stale write
+     * returns `false` and changes nothing, which is what lets a sibling that
+     * has been offline flush its typing without stamping on newer text.
+     */
+    func coreSyncSetChatDraft(chatId: Data, draft: String, epoch: UInt64) throws  -> Bool
+    
+    /**
+     * The shared settings this device holds, for a
+     * [`SyncRecordKind::Settings`] record.
+     */
+    func coreSyncSettingsPage(limit: UInt32) throws  -> SyncSettingsPayload
+    
+    /**
+     * Every delivered/read watermark this device holds, for a
+     * [`SyncRecordKind::Watermarks`] record.
+     *
+     * Cumulative and therefore whole: watermarks merge by maximum, so sending
+     * the current set is always correct and a truncated page is never wrong,
+     * only incomplete.
+     */
+    func coreSyncWatermarkPage(limit: UInt32) throws  -> SyncWatermarkPayload
     
     /**
      * Delete a contact and, with it, the entire 1:1 chat: the contact row,
@@ -5878,13 +6090,18 @@ public protocol MessageStoreProtocol : AnyObject {
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
      * waiting"). Returns 0 if message 1 itself hasn't arrived yet.
      *
-     * Still per person rather than per device stream, which is deliberate for
-     * now: a digest is what this device tells a peer it already has, and the
-     * per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
-     * Until then the person's device streams are merged into one run of
-     * lamport values, and the merge is over DISTINCT values -- two of that
-     * person's devices sharing a lamport is a normal §5 outcome, not a gap,
-     * and counting it twice would truncate the watermark there forever.
+     * Per person rather than per device stream, and -- now that SYNC-1 has
+     * landed -- deliberately staying that way. The per-device digest lives
+     * beside the records it describes ([`crate::SyncStreamDigest`],
+     * `specs/multi-device-v1.md` §8) instead of here, because a chat digest is
+     * what this device tells a *contact* it already has, and §2's first goal
+     * is that a person's device count stays invisible to other people: one
+     * entry per device on that wire would hand the fleet to every peer a
+     * device meets. What this function merges instead is the person's device
+     * streams into one run of lamport values, and the merge is over DISTINCT
+     * values -- two of that person's devices sharing a lamport is a normal §5
+     * outcome, not a gap, and counting it twice would truncate the watermark
+     * there forever.
      */
     func highestContiguousLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
     
@@ -8353,6 +8570,21 @@ open func contactRosterState(personUserId: Data)throws  -> ContactRosterState {
 }
     
     /**
+     * Apply one admitted sync record (SYNC-1). Idempotent per stream slot and
+     * safe to call with records in any order — see the module docs for why
+     * both hold, and for why the caller must have opened the record through
+     * [`crate::core_open_sync_record`] first.
+     */
+open func coreApplySyncRecord(record: SyncRecord, nowMs: Int64)throws  -> SyncApplyResult {
+    return try  FfiConverterTypeSyncApplyResult.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_apply_sync_record(self.uniffiClonePointer(),
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Commit the DTN D4 bookkeeping for a payload the caller has now durably
      * delivered: record the ACK-01 consumed-hidden evidence (best-effort — the
      * store re-checks every safety condition and declines otherwise) and mark
@@ -8658,6 +8890,18 @@ open func coreOutboundRelayRows(envelope: OutboundEnvelope, ownUserId: Data, own
 }
     
     /**
+     * The stored own sync context, or `None` on an install that has never
+     * linked a device — which is the ordinary state of a v1 phone and is what
+     * makes the inbound sync dispatch inert there rather than guessing.
+     */
+open func coreOwnSyncContext()throws  -> OwnSyncContext? {
+    return try  FfiConverterOptionTypeOwnSyncContext.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_own_sync_context(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
      *
      * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
@@ -8854,6 +9098,327 @@ open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], own
         FfiConverterSequenceTypeCoreRelayEnvelopeDisposition.lower(items),
         FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Record the own roster and inbox key generation the inbound transaction
+     * admits sync records against (§4, §6).
+     *
+     * This is the **ceremony's** write — §9's activation and §10's revocation
+     * — and deliberately not anti-entropy's: an applied
+     * [`SyncRecordKind::OwnRoster`] record hands its payload back through
+     * [`SyncApplyResult::own_roster`] for a ceremony to act on rather than
+     * writing here, or a gossiped record could re-widen a fleet a revocation
+     * had just narrowed.
+     *
+     * Monotone in `(recovery_epoch, seq)`, for the reason
+     * [`MessageStore::set_own_device_fleet`] is: a roster that went backwards
+     * would re-admit a device the current one has already tombstoned. A
+     * non-superseding write returns `false` and changes nothing.
+     */
+open func coreSetOwnSyncContext(roster: Roster, inboxKeyGeneration: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_set_own_sync_context(self.uniffiClonePointer(),
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterUInt64.lower(inboxKeyGeneration),$0
+    )
+})
+}
+    
+    /**
+     * The planner's view of a list of stored records, in the same order.
+     *
+     * Exported because a shell cannot call a plain Rust method on a
+     * `uniffi::Record`, and re-deriving `byte_len` and `sealed_for` on each
+     * platform is exactly the duplicated arithmetic core-first exists to stop.
+     */
+open func coreSyncBackfillOffers(records: [StoredSyncRecord]) -> [SyncBackfillOffer] {
+    return try!  FfiConverterSequenceTypeSyncBackfillOffer.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_backfill_offers(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeStoredSyncRecord.lower(records),$0
+    )
+})
+}
+    
+    /**
+     * The sealed records this device can send to answer `gaps`, oldest first
+     * and capped at `limit` rows.
+     *
+     * Feed the result through [`MessageStore::core_sync_backfill_offers`] into
+     * [`crate::core_plan_sync_backfill`] with the same `gaps`: this method
+     * decides what exists, the planner decides what fits.
+     */
+open func coreSyncBackfillRecords(gaps: [SyncGap], limit: UInt32)throws  -> [StoredSyncRecord] {
+    return try  FfiConverterSequenceTypeStoredSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_backfill_records(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeSyncGap.lower(gaps),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * This chat's shared draft, or `None` when there is none — including the
+     * cleared-by-authoring case, which stores an empty value so the *clear*
+     * itself can converge.
+     */
+open func coreSyncChatDraft(chatId: Data)throws  -> String? {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_chat_draft(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),$0
+    )
+})
+}
+    
+    /**
+     * This device's contacts, with their rosters, for a
+     * [`SyncRecordKind::Contacts`] record.
+     *
+     * The card is rebuilt from the stored contact rather than kept verbatim,
+     * and is therefore unsigned — which [`crate::parse_friend_card`] accepts,
+     * and which is honest about what vouches for it: the sibling's device
+     * signature on the record carrying it, inside a seal no third party can
+     * open. A nickname is never included, exactly as it is never written to
+     * any other wire format.
+     *
+     * **A blocked person is not offered.** The block list converges through
+     * the Settings stream ([`SYNC_BLOCKED_SETTING_KEY`]), and the two facts
+     * have to agree or the fleet oscillates: a device that both blocks Ash and
+     * keeps publishing Ash's card would re-seed Ash onto a sibling that had
+     * just dropped them, round after round. Blocking is the stronger
+     * statement, so it wins the page.
+     */
+open func coreSyncContactsPage(limit: UInt32)throws  -> SyncContactsPayload {
+    return try  FfiConverterTypeSyncContactsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_contacts_page(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * This device's SYNC-1 digest for `person_id`: every sync stream it holds
+     * anything of, at its contiguous watermark.
+     *
+     * Cheap enough to rebuild on every encounter, which is the point. A digest
+     * a device only refreshed occasionally would answer a sibling with a
+     * watermark it had already passed, and the sibling would spend the
+     * encounter re-sending what had already landed.
+     */
+open func coreSyncDigest(personId: Data)throws  -> SyncDigest {
+    return try  FfiConverterTypeSyncDigest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_digest(self.uniffiClonePointer(),
+        FfiConverterData.lower(personId),$0
+    )
+})
+}
+    
+    /**
+     * One shared setting, or `None` if it has never been written.
+     */
+open func coreSyncGetSetting(key: String)throws  -> SyncSettingEntry? {
+    return try  FfiConverterOptionTypeSyncSettingEntry.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_get_setting(self.uniffiClonePointer(),
+        FfiConverterString.lower(key),$0
+    )
+})
+}
+    
+    /**
+     * This device's groups, for a [`SyncRecordKind::Groups`] record.
+     */
+open func coreSyncGroupsPage(limit: UInt32)throws  -> SyncGroupsPayload {
+    return try  FfiConverterTypeSyncGroupsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_groups_page(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * A page of message history for a sync record, oldest first: everything in
+     * `chat_id` from `sender_person_id` above `after_lamport`.
+     *
+     * `own_person_id` decides each entry's [`crate::SyncHistoryDirection`]
+     * rather than leaving the receiver to infer it, so a sibling reading the
+     * record knows which entries are the person's own outbound before it has
+     * looked anything up — the fact SYNC-2's dedup turns on.
+     *
+     * Rows with no stored `msg_id` are skipped. A history entry names the
+     * original envelope so a sibling that already consumed the message
+     * recognizes it instead of storing it twice, and a row that predates the
+     * id column cannot offer that.
+     */
+open func coreSyncHistoryPage(ownPersonId: Data, chatId: Data, senderPersonId: Data, afterLamport: UInt64, limit: UInt32)throws  -> SyncHistoryPayload {
+    return try  FfiConverterTypeSyncHistoryPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_history_page(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownPersonId),
+        FfiConverterData.lower(chatId),
+        FfiConverterData.lower(senderPersonId),
+        FfiConverterUInt64.lower(afterLamport),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * The next `stream_seq` for one of this device's own streams (§8): where
+     * its next record of `kind` goes.
+     *
+     * Gap-free by construction, because SYNC-1's contiguity rule means a hole
+     * in a stream stops a sibling's watermark at that hole forever. A caller
+     * that mints a seq and then fails to retain the record must reuse the seq,
+     * never skip past it.
+     */
+open func coreSyncNextStreamSeq(authorDeviceId: Data, kind: SyncRecordKind)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_next_stream_seq(self.uniffiClonePointer(),
+        FfiConverterData.lower(authorDeviceId),
+        FfiConverterTypeSyncRecordKind.lower(kind),$0
+    )
+})
+}
+    
+    /**
+     * Ask, before authoring, whether a sibling already put this exact message
+     * on the wire (SYNC-2).
+     *
+     * `not_before_ms` is the oldest sibling copy that still counts as "the
+     * same send" — pass `now_ms - `[`SYNC_OUTBOUND_DEDUP_WINDOW_MS`] unless
+     * there is a reason to differ. A shell that skips this call does not
+     * break: it re-authors, the recipient sees the message twice, and the
+     * fleet converges on two rows. That is precisely the product bug §8 names,
+     * which is why the convergence property tests drive authoring through here
+     * and assert the fleet never holds two copies of one text.
+     */
+open func coreSyncOutboundClaim(ownPersonId: Data, chatId: Data, kind: UInt8, payload: Data, notBeforeMs: Int64)throws  -> OutboundAuthorClaim {
+    return try  FfiConverterTypeOutboundAuthorClaim.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_outbound_claim(self.uniffiClonePointer(),
+        FfiConverterData.lower(ownPersonId),
+        FfiConverterData.lower(chatId),
+        FfiConverterUInt8.lower(kind),
+        FfiConverterData.lower(payload),
+        FfiConverterInt64.lower(notBeforeMs),$0
+    )
+})
+}
+    
+    /**
+     * Publish this device's block list into the shared Settings stream (§8),
+     * so blocking on one device is blocking on all of them.
+     *
+     * Called by whichever surface performs the block, in the same breath as
+     * [`MessageStore::block_user`] — the local table is what refuses mail here
+     * and now, and this is what carries the decision to a sibling that may not
+     * be reachable for a week. `epoch` is milliseconds, like every other
+     * setting.
+     */
+open func coreSyncPublishBlockList(epoch: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_publish_block_list(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(epoch),$0
+    )
+})
+}
+    
+    /**
+     * Write a shared setting locally. `false` means a value that wins the
+     * merge order was already stored, so nothing changed.
+     *
+     * The entry's `author_device_id` is **overwritten** with this device's own
+     * authoring id, whatever the caller passed. A local write is authored
+     * here by definition, and letting a shell name somebody else as the author
+     * would hand it the tiebreak — the one field in the order that exists
+     * precisely because no writer may choose its own position in it.
+     */
+open func coreSyncPutSetting(entry: SyncSettingEntry)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_put_setting(self.uniffiClonePointer(),
+        FfiConverterTypeSyncSettingEntry.lower(entry),$0
+    )
+})
+}
+    
+    /**
+     * Replace a retained record's sealed bytes after a roster change (SYNC-3).
+     * The stream slot — and therefore [`crate::core_sync_record_id`] — is
+     * unchanged, so the re-seal costs no new relay row.
+     */
+open func coreSyncResealRecord(record: SyncRecord, sealed: SealedSyncRecord)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_reseal_record(self.uniffiClonePointer(),
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterTypeSealedSyncRecord.lower(sealed),$0
+    )
+})
+}
+    
+    /**
+     * Keep a record this device authored, with the sealed bytes a sibling will
+     * be sent whenever it next surfaces. `false` means the slot was already
+     * retained.
+     *
+     * Retention is what makes SYNC-1's "no operation may assume both devices
+     * are ever concurrently online" true rather than aspirational: the sealed
+     * copy outlives the encounter it was made for, so a sibling that has been
+     * dark for a fortnight is answered out of storage rather than out of a
+     * conversation nobody was present for.
+     */
+open func coreSyncRetainRecord(record: SyncRecord, sealed: SealedSyncRecord, nowMs: Int64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_retain_record(self.uniffiClonePointer(),
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterTypeSealedSyncRecord.lower(sealed),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Write this chat's composer draft into the shared Settings stream, so the
+     * device in the person's hand is the one that finishes the sentence.
+     *
+     * `epoch` is the last-writer-wins ordering key and is milliseconds: pass
+     * the same `now_ms` the shell stamps everything else with. A stale write
+     * returns `false` and changes nothing, which is what lets a sibling that
+     * has been offline flush its typing without stamping on newer text.
+     */
+open func coreSyncSetChatDraft(chatId: Data, draft: String, epoch: UInt64)throws  -> Bool {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_set_chat_draft(self.uniffiClonePointer(),
+        FfiConverterData.lower(chatId),
+        FfiConverterString.lower(draft),
+        FfiConverterUInt64.lower(epoch),$0
+    )
+})
+}
+    
+    /**
+     * The shared settings this device holds, for a
+     * [`SyncRecordKind::Settings`] record.
+     */
+open func coreSyncSettingsPage(limit: UInt32)throws  -> SyncSettingsPayload {
+    return try  FfiConverterTypeSyncSettingsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_settings_page(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+    
+    /**
+     * Every delivered/read watermark this device holds, for a
+     * [`SyncRecordKind::Watermarks`] record.
+     *
+     * Cumulative and therefore whole: watermarks merge by maximum, so sending
+     * the current set is always correct and a truncated page is never wrong,
+     * only incomplete.
+     */
+open func coreSyncWatermarkPage(limit: UInt32)throws  -> SyncWatermarkPayload {
+    return try  FfiConverterTypeSyncWatermarkPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_sync_watermark_page(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -9407,13 +9972,18 @@ open func hasProtocolEvents()throws  -> Bool {
      * gap (DESIGN.md §7.3: "message 12 arrived, 11 hasn't -- keep
      * waiting"). Returns 0 if message 1 itself hasn't arrived yet.
      *
-     * Still per person rather than per device stream, which is deliberate for
-     * now: a digest is what this device tells a peer it already has, and the
-     * per-device digest is WP4's (`specs/multi-device-v1.md` §8, SYNC-1).
-     * Until then the person's device streams are merged into one run of
-     * lamport values, and the merge is over DISTINCT values -- two of that
-     * person's devices sharing a lamport is a normal §5 outcome, not a gap,
-     * and counting it twice would truncate the watermark there forever.
+     * Per person rather than per device stream, and -- now that SYNC-1 has
+     * landed -- deliberately staying that way. The per-device digest lives
+     * beside the records it describes ([`crate::SyncStreamDigest`],
+     * `specs/multi-device-v1.md` §8) instead of here, because a chat digest is
+     * what this device tells a *contact* it already has, and §2's first goal
+     * is that a person's device count stays invisible to other people: one
+     * entry per device on that wire would hand the fleet to every peer a
+     * device meets. What this function merges instead is the person's device
+     * streams into one run of lamport values, and the merge is over DISTINCT
+     * values -- two of that person's devices sharing a lamport is a normal §5
+     * outcome, not a gap, and counting it twice would truncate the watermark
+     * there forever.
      */
 open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -15659,6 +16229,21 @@ public struct CoreInboundOutcome {
      */
     public var droppedBlocked: Bool
     /**
+     * A sibling's SYNC-1 watermarks, present exactly when this envelope
+     * carried a [`crate::SyncRecordKind::Digest`] record that admitted (§8).
+     *
+     * The rest of a sync record's handling finishes inside core — the payload
+     * is applied to the store before this returns, and nothing is handed back
+     * to deliver. A digest is the exception because it is not state to apply
+     * but a *question*: it says what a sibling holds, and the answer is a
+     * backfill round only the driver can send. So the one sync outcome a shell
+     * acts on is this one, and it acts on it by planning a round
+     * ([`crate::core_sync_digest_gaps`] →
+     * [`MessageStore::core_sync_backfill_records`] →
+     * [`crate::core_plan_sync_backfill`]), never by writing anything.
+     */
+    public var syncPeerDigest: SyncDigest?
+    /**
      * Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
      * D4 bookkeeping the caller commits after it durably delivers the payload.
      * See [`CoreInboundCommit`]. `None` for every path that has no native
@@ -15714,6 +16299,20 @@ public struct CoreInboundOutcome {
          * blocked — consumed for ack purposes, never delivered.
          */droppedBlocked: Bool, 
         /**
+         * A sibling's SYNC-1 watermarks, present exactly when this envelope
+         * carried a [`crate::SyncRecordKind::Digest`] record that admitted (§8).
+         *
+         * The rest of a sync record's handling finishes inside core — the payload
+         * is applied to the store before this returns, and nothing is handed back
+         * to deliver. A digest is the exception because it is not state to apply
+         * but a *question*: it says what a sibling holds, and the answer is a
+         * backfill round only the driver can send. So the one sync outcome a shell
+         * acts on is this one, and it acts on it by planning a round
+         * ([`crate::core_sync_digest_gaps`] →
+         * [`MessageStore::core_sync_backfill_records`] →
+         * [`crate::core_plan_sync_backfill`]), never by writing anything.
+         */syncPeerDigest: SyncDigest?, 
+        /**
          * Present exactly when [`Self::delivered_payloads`] is non-empty: the DTN
          * D4 bookkeeping the caller commits after it durably delivers the payload.
          * See [`CoreInboundCommit`]. `None` for every path that has no native
@@ -15728,6 +16327,7 @@ public struct CoreInboundOutcome {
         self.carried = carried
         self.carriedFamily = carriedFamily
         self.droppedBlocked = droppedBlocked
+        self.syncPeerDigest = syncPeerDigest
         self.commit = commit
         self.work = work
     }
@@ -15761,6 +16361,9 @@ extension CoreInboundOutcome: Equatable, Hashable {
         if lhs.droppedBlocked != rhs.droppedBlocked {
             return false
         }
+        if lhs.syncPeerDigest != rhs.syncPeerDigest {
+            return false
+        }
         if lhs.commit != rhs.commit {
             return false
         }
@@ -15779,6 +16382,7 @@ extension CoreInboundOutcome: Equatable, Hashable {
         hasher.combine(carried)
         hasher.combine(carriedFamily)
         hasher.combine(droppedBlocked)
+        hasher.combine(syncPeerDigest)
         hasher.combine(commit)
         hasher.combine(work)
     }
@@ -15800,6 +16404,7 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
                 carried: FfiConverterBool.read(from: &buf), 
                 carriedFamily: FfiConverterBool.read(from: &buf), 
                 droppedBlocked: FfiConverterBool.read(from: &buf), 
+                syncPeerDigest: FfiConverterOptionTypeSyncDigest.read(from: &buf), 
                 commit: FfiConverterOptionTypeCoreInboundCommit.read(from: &buf), 
                 work: FfiConverterTypeCoreInboundWork.read(from: &buf)
         )
@@ -15814,6 +16419,7 @@ public struct FfiConverterTypeCoreInboundOutcome: FfiConverterRustBuffer {
         FfiConverterBool.write(value.carried, into: &buf)
         FfiConverterBool.write(value.carriedFamily, into: &buf)
         FfiConverterBool.write(value.droppedBlocked, into: &buf)
+        FfiConverterOptionTypeSyncDigest.write(value.syncPeerDigest, into: &buf)
         FfiConverterOptionTypeCoreInboundCommit.write(value.commit, into: &buf)
         FfiConverterTypeCoreInboundWork.write(value.work, into: &buf)
     }
@@ -25582,6 +26188,106 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> RustBuffer {
 }
 
 
+/**
+ * §6's person-scoped X25519 inbox key, versioned by `generation`.
+ *
+ * Every linked device of one person holds this key; no one else does. That is
+ * the whole of the person boundary in one object, which is why it is also the
+ * only thing [`core_seal_sync_record`] will address a record to.
+ *
+ * The secret rides in this record because it *must* travel — §6 distributes
+ * the inbox key by link bootstrap (§9.3, WP3) and by self-sync
+ * ([`SyncOwnRosterPayload`]), so a type that held only the public half could
+ * not express the thing the spec asks for. Handle it exactly as
+ * [`crate::Identity`]'s secrets are handled: the core generates and never
+ * persists; the shell keeps it in platform-protected storage.
+ *
+ * `generation` is the counter [`Roster::inbox_key_generation`] carries. §10
+ * bumps it and rotates the key on every revocation; WP5 owns that ceremony,
+ * and [`core_rotate_inbox_key`] is the primitive it will reach for.
+ */
+public struct InboxKey {
+    /**
+     * Matches [`Roster::inbox_key_generation`] for the roster this key belongs
+     * to.
+     */
+    public var generation: UInt64
+    public var agreePk: Data
+    public var agreeSk: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Matches [`Roster::inbox_key_generation`] for the roster this key belongs
+         * to.
+         */generation: UInt64, agreePk: Data, agreeSk: Data) {
+        self.generation = generation
+        self.agreePk = agreePk
+        self.agreeSk = agreeSk
+    }
+}
+
+
+
+extension InboxKey: Equatable, Hashable {
+    public static func ==(lhs: InboxKey, rhs: InboxKey) -> Bool {
+        if lhs.generation != rhs.generation {
+            return false
+        }
+        if lhs.agreePk != rhs.agreePk {
+            return false
+        }
+        if lhs.agreeSk != rhs.agreeSk {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(generation)
+        hasher.combine(agreePk)
+        hasher.combine(agreeSk)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeInboxKey: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> InboxKey {
+        return
+            try InboxKey(
+                generation: FfiConverterUInt64.read(from: &buf), 
+                agreePk: FfiConverterData.read(from: &buf), 
+                agreeSk: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: InboxKey, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.generation, into: &buf)
+        FfiConverterData.write(value.agreePk, into: &buf)
+        FfiConverterData.write(value.agreeSk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInboxKey_lift(_ buf: RustBuffer) throws -> InboxKey {
+    return try FfiConverterTypeInboxKey.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeInboxKey_lower(_ value: InboxKey) -> RustBuffer {
+    return FfiConverterTypeInboxKey.lower(value)
+}
+
+
 public struct IntroducedFriendRequest {
     public var version: UInt8
     public var friendCardJson: String
@@ -27494,6 +28200,99 @@ public func FfiConverterTypeOpenedMessage_lower(_ value: OpenedMessage) -> RustB
 
 
 /**
+ * [`OutboundAuthorDecision`] plus who, so a shell can say something true.
+ */
+public struct OutboundAuthorClaim {
+    public var decision: OutboundAuthorDecision
+    /**
+     * The sibling that holds it, for
+     * [`OutboundAuthorDecision::AlreadyAuthoredBySibling`] only.
+     */
+    public var authorDeviceId: Data?
+    /**
+     * That row's lamport, so a shell can scroll to the message it is about to
+     * tell somebody they already sent.
+     */
+    public var lamport: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(decision: OutboundAuthorDecision, 
+        /**
+         * The sibling that holds it, for
+         * [`OutboundAuthorDecision::AlreadyAuthoredBySibling`] only.
+         */authorDeviceId: Data?, 
+        /**
+         * That row's lamport, so a shell can scroll to the message it is about to
+         * tell somebody they already sent.
+         */lamport: UInt64) {
+        self.decision = decision
+        self.authorDeviceId = authorDeviceId
+        self.lamport = lamport
+    }
+}
+
+
+
+extension OutboundAuthorClaim: Equatable, Hashable {
+    public static func ==(lhs: OutboundAuthorClaim, rhs: OutboundAuthorClaim) -> Bool {
+        if lhs.decision != rhs.decision {
+            return false
+        }
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.lamport != rhs.lamport {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(decision)
+        hasher.combine(authorDeviceId)
+        hasher.combine(lamport)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutboundAuthorClaim: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboundAuthorClaim {
+        return
+            try OutboundAuthorClaim(
+                decision: FfiConverterTypeOutboundAuthorDecision.read(from: &buf), 
+                authorDeviceId: FfiConverterOptionData.read(from: &buf), 
+                lamport: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutboundAuthorClaim, into buf: inout [UInt8]) {
+        FfiConverterTypeOutboundAuthorDecision.write(value.decision, into: &buf)
+        FfiConverterOptionData.write(value.authorDeviceId, into: &buf)
+        FfiConverterUInt64.write(value.lamport, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboundAuthorClaim_lift(_ buf: RustBuffer) throws -> OutboundAuthorClaim {
+    return try FfiConverterTypeOutboundAuthorClaim.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboundAuthorClaim_lower(_ value: OutboundAuthorClaim) -> RustBuffer {
+    return FfiConverterTypeOutboundAuthorClaim.lower(value)
+}
+
+
+/**
  * One locally authored sealed envelope persisted for resend over BLE and
  * relay. This is the exact §6.4 public header plus sealed bytes, alongside
  * the local message metadata needed to query the queue by chat/sender/lamport
@@ -28020,6 +28819,76 @@ public func FfiConverterTypeOwnDeviceFleet_lift(_ buf: RustBuffer) throws -> Own
 #endif
 public func FfiConverterTypeOwnDeviceFleet_lower(_ value: OwnDeviceFleet) -> RustBuffer {
     return FfiConverterTypeOwnDeviceFleet.lower(value)
+}
+
+
+/**
+ * The own roster and inbox key generation §8's inbound dispatch admits
+ * against.
+ */
+public struct OwnSyncContext {
+    public var roster: Roster
+    public var inboxKeyGeneration: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(roster: Roster, inboxKeyGeneration: UInt64) {
+        self.roster = roster
+        self.inboxKeyGeneration = inboxKeyGeneration
+    }
+}
+
+
+
+extension OwnSyncContext: Equatable, Hashable {
+    public static func ==(lhs: OwnSyncContext, rhs: OwnSyncContext) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(inboxKeyGeneration)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOwnSyncContext: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OwnSyncContext {
+        return
+            try OwnSyncContext(
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OwnSyncContext, into buf: inout [UInt8]) {
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOwnSyncContext_lift(_ buf: RustBuffer) throws -> OwnSyncContext {
+    return try FfiConverterTypeOwnSyncContext.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOwnSyncContext_lower(_ value: OwnSyncContext) -> RustBuffer {
+    return FfiConverterTypeOwnSyncContext.lower(value)
 }
 
 
@@ -29450,6 +30319,103 @@ public func FfiConverterTypeRosterVersion_lower(_ value: RosterVersion) -> RustB
 
 
 /**
+ * A sealed sync record, together with the two facts that decide whether it may
+ * still be sent.
+ *
+ * The sealed bytes are an ordinary sealed envelope payload — hand them
+ * straight to the transport that carries any other 1:1 body. `sealed_for` and
+ * `inbox_key_generation` are what make SYNC-3's "re-sealed on roster change"
+ * checkable: a planner holding a queue of these asks
+ * [`core_sync_seal_is_current`] before each send instead of assuming the
+ * roster it sealed under is still the roster it has.
+ */
+public struct SealedSyncRecord {
+    public var sealed: Data
+    /**
+     * The own-roster version these bytes were sealed for.
+     */
+    public var sealedFor: RosterVersion
+    /**
+     * The [`InboxKey::generation`] these bytes were sealed under.
+     */
+    public var inboxKeyGeneration: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sealed: Data, 
+        /**
+         * The own-roster version these bytes were sealed for.
+         */sealedFor: RosterVersion, 
+        /**
+         * The [`InboxKey::generation`] these bytes were sealed under.
+         */inboxKeyGeneration: UInt64) {
+        self.sealed = sealed
+        self.sealedFor = sealedFor
+        self.inboxKeyGeneration = inboxKeyGeneration
+    }
+}
+
+
+
+extension SealedSyncRecord: Equatable, Hashable {
+    public static func ==(lhs: SealedSyncRecord, rhs: SealedSyncRecord) -> Bool {
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        if lhs.sealedFor != rhs.sealedFor {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sealed)
+        hasher.combine(sealedFor)
+        hasher.combine(inboxKeyGeneration)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSealedSyncRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SealedSyncRecord {
+        return
+            try SealedSyncRecord(
+                sealed: FfiConverterData.read(from: &buf), 
+                sealedFor: FfiConverterTypeRosterVersion.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SealedSyncRecord, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.sealed, into: &buf)
+        FfiConverterTypeRosterVersion.write(value.sealedFor, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedSyncRecord_lift(_ buf: RustBuffer) throws -> SealedSyncRecord {
+    return try FfiConverterTypeSealedSyncRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedSyncRecord_lower(_ value: SealedSyncRecord) -> RustBuffer {
+    return FfiConverterTypeSealedSyncRecord.lower(value)
+}
+
+
+/**
  * One contact's friend card, deliberately handed to somebody else by a mutual
  * acquaintance (specs/share-contact.md). Carries the stored card
  * byte-identical (decision 8: never substitute the sharer's own credentials),
@@ -30718,6 +31684,107 @@ public func FfiConverterTypeStoredMessage_lower(_ value: StoredMessage) -> RustB
 
 
 /**
+ * One of this device's own sealed records, ready to hand to a transport.
+ */
+public struct StoredSyncRecord {
+    public var authorDeviceId: Data
+    public var kind: SyncRecordKind
+    public var streamSeq: UInt64
+    public var sealed: Data
+    public var sealedFor: RosterVersion
+    public var inboxKeyGeneration: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(authorDeviceId: Data, kind: SyncRecordKind, streamSeq: UInt64, sealed: Data, sealedFor: RosterVersion, inboxKeyGeneration: UInt64) {
+        self.authorDeviceId = authorDeviceId
+        self.kind = kind
+        self.streamSeq = streamSeq
+        self.sealed = sealed
+        self.sealedFor = sealedFor
+        self.inboxKeyGeneration = inboxKeyGeneration
+    }
+}
+
+
+
+extension StoredSyncRecord: Equatable, Hashable {
+    public static func ==(lhs: StoredSyncRecord, rhs: StoredSyncRecord) -> Bool {
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.streamSeq != rhs.streamSeq {
+            return false
+        }
+        if lhs.sealed != rhs.sealed {
+            return false
+        }
+        if lhs.sealedFor != rhs.sealedFor {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(authorDeviceId)
+        hasher.combine(kind)
+        hasher.combine(streamSeq)
+        hasher.combine(sealed)
+        hasher.combine(sealedFor)
+        hasher.combine(inboxKeyGeneration)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeStoredSyncRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> StoredSyncRecord {
+        return
+            try StoredSyncRecord(
+                authorDeviceId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterTypeSyncRecordKind.read(from: &buf), 
+                streamSeq: FfiConverterUInt64.read(from: &buf), 
+                sealed: FfiConverterData.read(from: &buf), 
+                sealedFor: FfiConverterTypeRosterVersion.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: StoredSyncRecord, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+        FfiConverterTypeSyncRecordKind.write(value.kind, into: &buf)
+        FfiConverterUInt64.write(value.streamSeq, into: &buf)
+        FfiConverterData.write(value.sealed, into: &buf)
+        FfiConverterTypeRosterVersion.write(value.sealedFor, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoredSyncRecord_lift(_ buf: RustBuffer) throws -> StoredSyncRecord {
+    return try FfiConverterTypeStoredSyncRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeStoredSyncRecord_lower(_ value: StoredSyncRecord) -> RustBuffer {
+    return FfiConverterTypeStoredSyncRecord.lower(value)
+}
+
+
+/**
  * Public identity forwarded by a mutual friend. Relay credentials and avatar
  * bytes are deliberately absent.
  */
@@ -30800,6 +31867,1827 @@ public func FfiConverterTypeSuggestedFriendCard_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeSuggestedFriendCard_lower(_ value: SuggestedFriendCard) -> RustBuffer {
     return FfiConverterTypeSuggestedFriendCard.lower(value)
+}
+
+
+/**
+ * The result of applying one sync record.
+ */
+public struct SyncApplyResult {
+    public var outcome: SyncApplyOutcome
+    /**
+     * Entries the payload carried. Reported rather than summed into a
+     * success/failure bit so a shell can show honest progress on a long
+     * backfill.
+     */
+    public var appliedEntries: UInt32
+    /**
+     * This stream's contiguous watermark *after* the apply — what the next
+     * digest will advertise for it. Unchanged from before when the record
+     * landed above a hole, which is the case worth being able to observe.
+     */
+    public var throughSeq: UInt64
+    /**
+     * The own-roster payload, for [`SyncRecordKind::OwnRoster`] records only.
+     * See the module docs: inbox key secrets and fleet membership are the
+     * link ceremony's to write, never anti-entropy's.
+     */
+    public var ownRoster: SyncOwnRosterPayload?
+    /**
+     * The sibling's SYNC-1 watermarks, for [`SyncRecordKind::Digest`] records
+     * only.
+     *
+     * This is what makes the exchange *driven by the exchange* rather than by
+     * a driver that already knew both sides' state: a device learns what a
+     * sibling holds by opening a sealed digest that sibling sent it, computes
+     * what it owes with [`crate::core_sync_digest_gaps`], and answers. Handed
+     * back rather than stored for the same reason a watermark is not
+     * backfilled — it is true for exactly as long as it takes to act on.
+     */
+    public var peerDigest: SyncDigest?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outcome: SyncApplyOutcome, 
+        /**
+         * Entries the payload carried. Reported rather than summed into a
+         * success/failure bit so a shell can show honest progress on a long
+         * backfill.
+         */appliedEntries: UInt32, 
+        /**
+         * This stream's contiguous watermark *after* the apply — what the next
+         * digest will advertise for it. Unchanged from before when the record
+         * landed above a hole, which is the case worth being able to observe.
+         */throughSeq: UInt64, 
+        /**
+         * The own-roster payload, for [`SyncRecordKind::OwnRoster`] records only.
+         * See the module docs: inbox key secrets and fleet membership are the
+         * link ceremony's to write, never anti-entropy's.
+         */ownRoster: SyncOwnRosterPayload?, 
+        /**
+         * The sibling's SYNC-1 watermarks, for [`SyncRecordKind::Digest`] records
+         * only.
+         *
+         * This is what makes the exchange *driven by the exchange* rather than by
+         * a driver that already knew both sides' state: a device learns what a
+         * sibling holds by opening a sealed digest that sibling sent it, computes
+         * what it owes with [`crate::core_sync_digest_gaps`], and answers. Handed
+         * back rather than stored for the same reason a watermark is not
+         * backfilled — it is true for exactly as long as it takes to act on.
+         */peerDigest: SyncDigest?) {
+        self.outcome = outcome
+        self.appliedEntries = appliedEntries
+        self.throughSeq = throughSeq
+        self.ownRoster = ownRoster
+        self.peerDigest = peerDigest
+    }
+}
+
+
+
+extension SyncApplyResult: Equatable, Hashable {
+    public static func ==(lhs: SyncApplyResult, rhs: SyncApplyResult) -> Bool {
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.appliedEntries != rhs.appliedEntries {
+            return false
+        }
+        if lhs.throughSeq != rhs.throughSeq {
+            return false
+        }
+        if lhs.ownRoster != rhs.ownRoster {
+            return false
+        }
+        if lhs.peerDigest != rhs.peerDigest {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outcome)
+        hasher.combine(appliedEntries)
+        hasher.combine(throughSeq)
+        hasher.combine(ownRoster)
+        hasher.combine(peerDigest)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncApplyResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncApplyResult {
+        return
+            try SyncApplyResult(
+                outcome: FfiConverterTypeSyncApplyOutcome.read(from: &buf), 
+                appliedEntries: FfiConverterUInt32.read(from: &buf), 
+                throughSeq: FfiConverterUInt64.read(from: &buf), 
+                ownRoster: FfiConverterOptionTypeSyncOwnRosterPayload.read(from: &buf), 
+                peerDigest: FfiConverterOptionTypeSyncDigest.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncApplyResult, into buf: inout [UInt8]) {
+        FfiConverterTypeSyncApplyOutcome.write(value.outcome, into: &buf)
+        FfiConverterUInt32.write(value.appliedEntries, into: &buf)
+        FfiConverterUInt64.write(value.throughSeq, into: &buf)
+        FfiConverterOptionTypeSyncOwnRosterPayload.write(value.ownRoster, into: &buf)
+        FfiConverterOptionTypeSyncDigest.write(value.peerDigest, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncApplyResult_lift(_ buf: RustBuffer) throws -> SyncApplyResult {
+    return try FfiConverterTypeSyncApplyResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncApplyResult_lower(_ value: SyncApplyResult) -> RustBuffer {
+    return FfiConverterTypeSyncApplyResult.lower(value)
+}
+
+
+/**
+ * One stored record this device could send, described by everything the
+ * planner needs and nothing it does not.
+ *
+ * The sealed bytes are deliberately absent: a plan is computed over hundreds
+ * of candidates and copying half a megabyte per candidate to decide against it
+ * would be the expensive part of a cheap decision. The caller holds the rows;
+ * the plan hands back indices into the list it passed.
+ */
+public struct SyncBackfillOffer {
+    public var authorDeviceId: Data
+    /**
+     * The sealed-body kind byte, matching [`SyncGap::kind`].
+     */
+    public var kind: UInt8
+    public var streamSeq: UInt64
+    /**
+     * The own-roster version these bytes were sealed for (SYNC-3).
+     */
+    public var sealedFor: RosterVersion
+    /**
+     * The inbox key generation these bytes were sealed under (§6, §10.1). The
+     * other half of "may these bytes still be sent" — see
+     * [`crate::core_sync_seal_is_current`].
+     */
+    public var inboxKeyGeneration: UInt64
+    /**
+     * Sealed size, charged against the round's budget.
+     */
+    public var byteLen: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(authorDeviceId: Data, 
+        /**
+         * The sealed-body kind byte, matching [`SyncGap::kind`].
+         */kind: UInt8, streamSeq: UInt64, 
+        /**
+         * The own-roster version these bytes were sealed for (SYNC-3).
+         */sealedFor: RosterVersion, 
+        /**
+         * The inbox key generation these bytes were sealed under (§6, §10.1). The
+         * other half of "may these bytes still be sent" — see
+         * [`crate::core_sync_seal_is_current`].
+         */inboxKeyGeneration: UInt64, 
+        /**
+         * Sealed size, charged against the round's budget.
+         */byteLen: UInt64) {
+        self.authorDeviceId = authorDeviceId
+        self.kind = kind
+        self.streamSeq = streamSeq
+        self.sealedFor = sealedFor
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.byteLen = byteLen
+    }
+}
+
+
+
+extension SyncBackfillOffer: Equatable, Hashable {
+    public static func ==(lhs: SyncBackfillOffer, rhs: SyncBackfillOffer) -> Bool {
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.streamSeq != rhs.streamSeq {
+            return false
+        }
+        if lhs.sealedFor != rhs.sealedFor {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.byteLen != rhs.byteLen {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(authorDeviceId)
+        hasher.combine(kind)
+        hasher.combine(streamSeq)
+        hasher.combine(sealedFor)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(byteLen)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncBackfillOffer: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncBackfillOffer {
+        return
+            try SyncBackfillOffer(
+                authorDeviceId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                streamSeq: FfiConverterUInt64.read(from: &buf), 
+                sealedFor: FfiConverterTypeRosterVersion.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                byteLen: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncBackfillOffer, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterUInt64.write(value.streamSeq, into: &buf)
+        FfiConverterTypeRosterVersion.write(value.sealedFor, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterUInt64.write(value.byteLen, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillOffer_lift(_ buf: RustBuffer) throws -> SyncBackfillOffer {
+    return try FfiConverterTypeSyncBackfillOffer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillOffer_lower(_ value: SyncBackfillOffer) -> RustBuffer {
+    return FfiConverterTypeSyncBackfillOffer.lower(value)
+}
+
+
+/**
+ * One round's answer to a sibling's digest.
+ */
+public struct SyncBackfillPlan {
+    /**
+     * Records to send, **in this order**. The order is load-bearing: a
+     * receiver's watermark only advances across a gap-free prefix, so a round
+     * that is cut short mid-stream still moves the sibling forward if and only
+     * if what was sent was the oldest missing run.
+     */
+    public var steps: [SyncBackfillStep]
+    /**
+     * Records that answer a real gap but did not fit this round. Not a
+     * failure and not a retry list: the sibling's next digest will ask for
+     * them again from whatever watermark this round actually achieved.
+     */
+    public var deferred: [UInt32]
+    /**
+     * Sealed bytes the steps add up to, for a caller pacing several links.
+     */
+    public var plannedBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Records to send, **in this order**. The order is load-bearing: a
+         * receiver's watermark only advances across a gap-free prefix, so a round
+         * that is cut short mid-stream still moves the sibling forward if and only
+         * if what was sent was the oldest missing run.
+         */steps: [SyncBackfillStep], 
+        /**
+         * Records that answer a real gap but did not fit this round. Not a
+         * failure and not a retry list: the sibling's next digest will ask for
+         * them again from whatever watermark this round actually achieved.
+         */deferred: [UInt32], 
+        /**
+         * Sealed bytes the steps add up to, for a caller pacing several links.
+         */plannedBytes: UInt64) {
+        self.steps = steps
+        self.deferred = deferred
+        self.plannedBytes = plannedBytes
+    }
+}
+
+
+
+extension SyncBackfillPlan: Equatable, Hashable {
+    public static func ==(lhs: SyncBackfillPlan, rhs: SyncBackfillPlan) -> Bool {
+        if lhs.steps != rhs.steps {
+            return false
+        }
+        if lhs.deferred != rhs.deferred {
+            return false
+        }
+        if lhs.plannedBytes != rhs.plannedBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(steps)
+        hasher.combine(deferred)
+        hasher.combine(plannedBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncBackfillPlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncBackfillPlan {
+        return
+            try SyncBackfillPlan(
+                steps: FfiConverterSequenceTypeSyncBackfillStep.read(from: &buf), 
+                deferred: FfiConverterSequenceUInt32.read(from: &buf), 
+                plannedBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncBackfillPlan, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSyncBackfillStep.write(value.steps, into: &buf)
+        FfiConverterSequenceUInt32.write(value.deferred, into: &buf)
+        FfiConverterUInt64.write(value.plannedBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillPlan_lift(_ buf: RustBuffer) throws -> SyncBackfillPlan {
+    return try FfiConverterTypeSyncBackfillPlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillPlan_lower(_ value: SyncBackfillPlan) -> RustBuffer {
+    return FfiConverterTypeSyncBackfillPlan.lower(value)
+}
+
+
+/**
+ * One planned record, in send order.
+ */
+public struct SyncBackfillStep {
+    /**
+     * Index into the `offers` list the plan was computed over.
+     */
+    public var offerIndex: UInt32
+    public var action: SyncBackfillAction
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Index into the `offers` list the plan was computed over.
+         */offerIndex: UInt32, action: SyncBackfillAction) {
+        self.offerIndex = offerIndex
+        self.action = action
+    }
+}
+
+
+
+extension SyncBackfillStep: Equatable, Hashable {
+    public static func ==(lhs: SyncBackfillStep, rhs: SyncBackfillStep) -> Bool {
+        if lhs.offerIndex != rhs.offerIndex {
+            return false
+        }
+        if lhs.action != rhs.action {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(offerIndex)
+        hasher.combine(action)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncBackfillStep: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncBackfillStep {
+        return
+            try SyncBackfillStep(
+                offerIndex: FfiConverterUInt32.read(from: &buf), 
+                action: FfiConverterTypeSyncBackfillAction.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncBackfillStep, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.offerIndex, into: &buf)
+        FfiConverterTypeSyncBackfillAction.write(value.action, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillStep_lift(_ buf: RustBuffer) throws -> SyncBackfillStep {
+    return try FfiConverterTypeSyncBackfillStep.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillStep_lower(_ value: SyncBackfillStep) -> RustBuffer {
+    return FfiConverterTypeSyncBackfillStep.lower(value)
+}
+
+
+/**
+ * One contact, as this person already holds them.
+ *
+ * `card_json` is the contact's [`crate::FriendCard`] in the JSON form
+ * [`crate::parse_friend_card`] already accepts — the same bytes a friend
+ * request carries. Reused rather than re-specified so that a synced contact
+ * lands through the existing import path, signature check included, and so
+ * that a field added to a card is a field synced without touching this codec.
+ *
+ * This is the record kind §8 means by "may contain contacts' data the person
+ * already legitimately holds". It is exactly that and no more: what the person
+ * was given. It never travels unsealed, never reaches a third party, and
+ * widens nothing (DL-5) — the sealing model above is what makes those
+ * statements true rather than aspirational.
+ */
+public struct SyncContactEntry {
+    public var personId: Data
+    public var cardJson: String
+    /**
+     * The contact's roster as this device believes it, or `None` for a contact
+     * whose roster has not been gossiped yet — which is every legacy contact,
+     * permanently, and is not an error.
+     */
+    public var roster: Roster?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personId: Data, cardJson: String, 
+        /**
+         * The contact's roster as this device believes it, or `None` for a contact
+         * whose roster has not been gossiped yet — which is every legacy contact,
+         * permanently, and is not an error.
+         */roster: Roster?) {
+        self.personId = personId
+        self.cardJson = cardJson
+        self.roster = roster
+    }
+}
+
+
+
+extension SyncContactEntry: Equatable, Hashable {
+    public static func ==(lhs: SyncContactEntry, rhs: SyncContactEntry) -> Bool {
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.cardJson != rhs.cardJson {
+            return false
+        }
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personId)
+        hasher.combine(cardJson)
+        hasher.combine(roster)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncContactEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncContactEntry {
+        return
+            try SyncContactEntry(
+                personId: FfiConverterData.read(from: &buf), 
+                cardJson: FfiConverterString.read(from: &buf), 
+                roster: FfiConverterOptionTypeRoster.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncContactEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterString.write(value.cardJson, into: &buf)
+        FfiConverterOptionTypeRoster.write(value.roster, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncContactEntry_lift(_ buf: RustBuffer) throws -> SyncContactEntry {
+    return try FfiConverterTypeSyncContactEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncContactEntry_lower(_ value: SyncContactEntry) -> RustBuffer {
+    return FfiConverterTypeSyncContactEntry.lower(value)
+}
+
+
+/**
+ * A contact list slice (§8, [`SyncRecordKind::Contacts`]).
+ */
+public struct SyncContactsPayload {
+    public var entries: [SyncContactEntry]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(entries: [SyncContactEntry]) {
+        self.entries = entries
+    }
+}
+
+
+
+extension SyncContactsPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncContactsPayload, rhs: SyncContactsPayload) -> Bool {
+        if lhs.entries != rhs.entries {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(entries)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncContactsPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncContactsPayload {
+        return
+            try SyncContactsPayload(
+                entries: FfiConverterSequenceTypeSyncContactEntry.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncContactsPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSyncContactEntry.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncContactsPayload_lift(_ buf: RustBuffer) throws -> SyncContactsPayload {
+    return try FfiConverterTypeSyncContactsPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncContactsPayload_lower(_ value: SyncContactsPayload) -> RustBuffer {
+    return FfiConverterTypeSyncContactsPayload.lower(value)
+}
+
+
+/**
+ * One device's whole view of one person's sync streams (SYNC-1).
+ *
+ * `person_id` is carried so a receiver can refuse a digest that wandered in
+ * from another person rather than silently merging it — the same reason
+ * [`crate::encode_digest`] carries its sender's id.
+ */
+public struct SyncDigest {
+    public var personId: Data
+    public var streams: [SyncStreamDigest]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(personId: Data, streams: [SyncStreamDigest]) {
+        self.personId = personId
+        self.streams = streams
+    }
+}
+
+
+
+extension SyncDigest: Equatable, Hashable {
+    public static func ==(lhs: SyncDigest, rhs: SyncDigest) -> Bool {
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.streams != rhs.streams {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personId)
+        hasher.combine(streams)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncDigest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncDigest {
+        return
+            try SyncDigest(
+                personId: FfiConverterData.read(from: &buf), 
+                streams: FfiConverterSequenceTypeSyncStreamDigest.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncDigest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterSequenceTypeSyncStreamDigest.write(value.streams, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncDigest_lift(_ buf: RustBuffer) throws -> SyncDigest {
+    return try FfiConverterTypeSyncDigest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncDigest_lower(_ value: SyncDigest) -> RustBuffer {
+    return FfiConverterTypeSyncDigest.lower(value)
+}
+
+
+/**
+ * A run of one stream that one side holds and the other does not.
+ *
+ * Half-open on the low side and inclusive on the high: the missing records are
+ * `after_seq + 1 ..= through_seq`. That is the same shape
+ * [`crate::MessageStore::messages_after`] takes, and for the same reason —
+ * the requester states the watermark it can prove, never the list of ids it
+ * lacks, so a gap of ten thousand records costs the same bytes as a gap of
+ * one.
+ */
+public struct SyncGap {
+    public var authorDeviceId: Data
+    /**
+     * The sealed-body kind byte. Always one this build can name — see
+     * [`core_sync_digest_gaps`] for why an unnameable kind never becomes a gap.
+     */
+    public var kind: UInt8
+    /**
+     * The watermark the side that lacks these records can prove.
+     */
+    public var afterSeq: UInt64
+    /**
+     * The watermark the side that holds them advertised.
+     */
+    public var throughSeq: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(authorDeviceId: Data, 
+        /**
+         * The sealed-body kind byte. Always one this build can name — see
+         * [`core_sync_digest_gaps`] for why an unnameable kind never becomes a gap.
+         */kind: UInt8, 
+        /**
+         * The watermark the side that lacks these records can prove.
+         */afterSeq: UInt64, 
+        /**
+         * The watermark the side that holds them advertised.
+         */throughSeq: UInt64) {
+        self.authorDeviceId = authorDeviceId
+        self.kind = kind
+        self.afterSeq = afterSeq
+        self.throughSeq = throughSeq
+    }
+}
+
+
+
+extension SyncGap: Equatable, Hashable {
+    public static func ==(lhs: SyncGap, rhs: SyncGap) -> Bool {
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.afterSeq != rhs.afterSeq {
+            return false
+        }
+        if lhs.throughSeq != rhs.throughSeq {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(authorDeviceId)
+        hasher.combine(kind)
+        hasher.combine(afterSeq)
+        hasher.combine(throughSeq)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncGap: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncGap {
+        return
+            try SyncGap(
+                authorDeviceId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                afterSeq: FfiConverterUInt64.read(from: &buf), 
+                throughSeq: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncGap, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterUInt64.write(value.afterSeq, into: &buf)
+        FfiConverterUInt64.write(value.throughSeq, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncGap_lift(_ buf: RustBuffer) throws -> SyncGap {
+    return try FfiConverterTypeSyncGap.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncGap_lower(_ value: SyncGap) -> RustBuffer {
+    return FfiConverterTypeSyncGap.lower(value)
+}
+
+
+/**
+ * Group state for a sibling (§8, [`SyncRecordKind::Groups`]).
+ *
+ * §11 leaves group crypto untouched in v1: `member_user_ids` stay person ids
+ * and the group keeps its shared symmetric key. This record is how a member's
+ * new device obtains that key and the membership snapshot — through the
+ * member's own self-sync, with no re-invites and no M×D sender-side fan-out.
+ * Each group is carried in exactly the bytes
+ * [`crate::encode_group_invite_content`] already produces, so a synced group
+ * and an invited group are the same document by construction.
+ *
+ * **The metadata revision rides alongside those bytes rather than inside
+ * them**, and both halves of that sentence are deliberate. An invite is a
+ * document handed to somebody who has never seen the group, so it has no
+ * revision to state and its format is not this record's to change. But
+ * `(metadata_revision, metadata_changed_by)` is exactly the pair
+ * [`crate::apply_group_metadata_update`] and the store's group upsert use to
+ * decide a name conflict, and a record that dropped it would hand a sibling a
+ * group at revision 0 — which the sibling's own store then *correctly* refuses
+ * as older than what it holds. The visible symptom is a rename that converges
+ * once and then never again: the fleet sits on two names, each device certain
+ * its own is newer. So the pair travels, and the merge on the far side is the
+ * shipped one rather than a second rule invented here.
+ */
+public struct SyncGroupsPayload {
+    public var groups: [Group]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groups: [Group]) {
+        self.groups = groups
+    }
+}
+
+
+
+extension SyncGroupsPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncGroupsPayload, rhs: SyncGroupsPayload) -> Bool {
+        if lhs.groups != rhs.groups {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(groups)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncGroupsPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncGroupsPayload {
+        return
+            try SyncGroupsPayload(
+                groups: FfiConverterSequenceTypeGroup.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncGroupsPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeGroup.write(value.groups, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncGroupsPayload_lift(_ buf: RustBuffer) throws -> SyncGroupsPayload {
+    return try FfiConverterTypeSyncGroupsPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncGroupsPayload_lower(_ value: SyncGroupsPayload) -> RustBuffer {
+    return FfiConverterTypeSyncGroupsPayload.lower(value)
+}
+
+
+/**
+ * One message, carried whole to a sibling.
+ *
+ * `body` is the original's encoded message body — the very bytes
+ * [`crate::encode_message_body_extended`] produced or
+ * [`crate::decode_extended_message_body`] accepted — so `chat_id`, `lamport`,
+ * `timestamp`, `kind` and `content` are not restated here and cannot drift
+ * from the message they describe. What the body *cannot* carry is the sender's
+ * person id: on the original envelope that came from the outer signature,
+ * which does not survive re-sealing to a sibling. So it rides explicitly, and
+ * with it the device dimension, completing §5's stream key
+ * `(chat_id, sender_person_id, sender_device_id, lamport)` in one place.
+ *
+ * `sender_device_id` is [`LEGACY_DEVICE_ID`] for every message from a v1 peer
+ * and for every row that predates the migration — the same synthetic
+ * one-device view §5 gives those rows everywhere else. Where the body also
+ * carries a device extension, the two agree; if a malformed sender ever made
+ * them disagree, this field wins, because it is the stream the authoring
+ * device actually filed the row under.
+ */
+public struct SyncHistoryEntry {
+    /**
+     * The original envelope's 16-byte `msg_id`, so a sibling that already
+     * consumed the message over another transport recognizes it rather than
+     * storing it twice.
+     */
+    public var originMsgId: Data
+    public var direction: SyncHistoryDirection
+    public var senderPersonId: Data
+    public var senderDeviceId: Data
+    public var body: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The original envelope's 16-byte `msg_id`, so a sibling that already
+         * consumed the message over another transport recognizes it rather than
+         * storing it twice.
+         */originMsgId: Data, direction: SyncHistoryDirection, senderPersonId: Data, senderDeviceId: Data, body: Data) {
+        self.originMsgId = originMsgId
+        self.direction = direction
+        self.senderPersonId = senderPersonId
+        self.senderDeviceId = senderDeviceId
+        self.body = body
+    }
+}
+
+
+
+extension SyncHistoryEntry: Equatable, Hashable {
+    public static func ==(lhs: SyncHistoryEntry, rhs: SyncHistoryEntry) -> Bool {
+        if lhs.originMsgId != rhs.originMsgId {
+            return false
+        }
+        if lhs.direction != rhs.direction {
+            return false
+        }
+        if lhs.senderPersonId != rhs.senderPersonId {
+            return false
+        }
+        if lhs.senderDeviceId != rhs.senderDeviceId {
+            return false
+        }
+        if lhs.body != rhs.body {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(originMsgId)
+        hasher.combine(direction)
+        hasher.combine(senderPersonId)
+        hasher.combine(senderDeviceId)
+        hasher.combine(body)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncHistoryEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncHistoryEntry {
+        return
+            try SyncHistoryEntry(
+                originMsgId: FfiConverterData.read(from: &buf), 
+                direction: FfiConverterTypeSyncHistoryDirection.read(from: &buf), 
+                senderPersonId: FfiConverterData.read(from: &buf), 
+                senderDeviceId: FfiConverterData.read(from: &buf), 
+                body: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncHistoryEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.originMsgId, into: &buf)
+        FfiConverterTypeSyncHistoryDirection.write(value.direction, into: &buf)
+        FfiConverterData.write(value.senderPersonId, into: &buf)
+        FfiConverterData.write(value.senderDeviceId, into: &buf)
+        FfiConverterData.write(value.body, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryEntry_lift(_ buf: RustBuffer) throws -> SyncHistoryEntry {
+    return try FfiConverterTypeSyncHistoryEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryEntry_lower(_ value: SyncHistoryEntry) -> RustBuffer {
+    return FfiConverterTypeSyncHistoryEntry.lower(value)
+}
+
+
+/**
+ * A run of history for one or more streams (§8, [`SyncRecordKind::History`]).
+ */
+public struct SyncHistoryPayload {
+    public var entries: [SyncHistoryEntry]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(entries: [SyncHistoryEntry]) {
+        self.entries = entries
+    }
+}
+
+
+
+extension SyncHistoryPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncHistoryPayload, rhs: SyncHistoryPayload) -> Bool {
+        if lhs.entries != rhs.entries {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(entries)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncHistoryPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncHistoryPayload {
+        return
+            try SyncHistoryPayload(
+                entries: FfiConverterSequenceTypeSyncHistoryEntry.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncHistoryPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSyncHistoryEntry.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryPayload_lift(_ buf: RustBuffer) throws -> SyncHistoryPayload {
+    return try FfiConverterTypeSyncHistoryPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryPayload_lower(_ value: SyncHistoryPayload) -> RustBuffer {
+    return FfiConverterTypeSyncHistoryPayload.lower(value)
+}
+
+
+/**
+ * The person's own roster plus the inbox keys that go with it (§6, §8).
+ *
+ * This is the one payload that carries secret material, and it is the reason
+ * the whole boundary above is drawn the way it is: an inbox key sealed to
+ * anything but an own device would hand a stranger the ability to read every
+ * subsequent sync record, permanently.
+ *
+ * `inbox_keys` is a list rather than a single key because a device that has
+ * been offline across a §10 rotation still needs the older generation to open
+ * records sealed before it — a DTN store does not get to assume the newest key
+ * is the only one in flight. Callers send the generations a sibling could
+ * plausibly still need and no more; the roster's own
+ * [`Roster::inbox_key_generation`] names the current one.
+ */
+public struct SyncOwnRosterPayload {
+    public var roster: Roster
+    public var inboxKeys: [InboxKey]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(roster: Roster, inboxKeys: [InboxKey]) {
+        self.roster = roster
+        self.inboxKeys = inboxKeys
+    }
+}
+
+
+
+extension SyncOwnRosterPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncOwnRosterPayload, rhs: SyncOwnRosterPayload) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.inboxKeys != rhs.inboxKeys {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(inboxKeys)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncOwnRosterPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncOwnRosterPayload {
+        return
+            try SyncOwnRosterPayload(
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                inboxKeys: FfiConverterSequenceTypeInboxKey.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncOwnRosterPayload, into buf: inout [UInt8]) {
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterSequenceTypeInboxKey.write(value.inboxKeys, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncOwnRosterPayload_lift(_ buf: RustBuffer) throws -> SyncOwnRosterPayload {
+    return try FfiConverterTypeSyncOwnRosterPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncOwnRosterPayload_lower(_ value: SyncOwnRosterPayload) -> RustBuffer {
+    return FfiConverterTypeSyncOwnRosterPayload.lower(value)
+}
+
+
+/**
+ * One signed §8 sync record: a header naming the stream it belongs to, an
+ * opaque kind-specific payload, and the authoring device's signature.
+ *
+ * The header is what SYNC-1's anti-entropy reads. `author_device_id` plus
+ * `kind` name the stream; `stream_seq` is that stream's watermark, monotone
+ * per `(author_device_id, kind)` and gap-free, so a sibling can say "I have
+ * your Watermarks stream through 41" and be answered with exactly 42 onward.
+ * Nothing here assumes the two devices are ever online together, which is
+ * SYNC-1's standing constraint.
+ */
+public struct SyncRecord {
+    public var kind: SyncRecordKind
+    /**
+     * The person whose devices this record is for. Always this person: a sync
+     * record is never about anybody else's device set.
+     */
+    public var personId: Data
+    /**
+     * The 16-byte id of the device that authored the record. Never
+     * [`LEGACY_DEVICE_ID`] — a device with no device key cannot author a sync
+     * record at all, which is §9.4's two-phase activation seen from this side.
+     */
+    public var authorDeviceId: Data
+    /**
+     * The own-roster version this record was authored and sealed against
+     * (SYNC-3's "re-sealed on roster change").
+     */
+    public var rosterVersion: RosterVersion
+    /**
+     * The [`InboxKey::generation`] this record is sealed under (§6).
+     */
+    public var inboxKeyGeneration: UInt64
+    /**
+     * Monotone within `(author_device_id, kind)` — SYNC-1's per-stream
+     * watermark.
+     */
+    public var streamSeq: UInt64
+    public var timestampMs: Int64
+    /**
+     * The kind-specific payload, encoded by this module's matching codec.
+     */
+    public var payload: Data
+    /**
+     * Raw 64-byte Ed25519 signature over [`sync_record_signed_bytes`], in
+     * [`DeviceSigningDomain::SyncRecord`].
+     */
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: SyncRecordKind, 
+        /**
+         * The person whose devices this record is for. Always this person: a sync
+         * record is never about anybody else's device set.
+         */personId: Data, 
+        /**
+         * The 16-byte id of the device that authored the record. Never
+         * [`LEGACY_DEVICE_ID`] — a device with no device key cannot author a sync
+         * record at all, which is §9.4's two-phase activation seen from this side.
+         */authorDeviceId: Data, 
+        /**
+         * The own-roster version this record was authored and sealed against
+         * (SYNC-3's "re-sealed on roster change").
+         */rosterVersion: RosterVersion, 
+        /**
+         * The [`InboxKey::generation`] this record is sealed under (§6).
+         */inboxKeyGeneration: UInt64, 
+        /**
+         * Monotone within `(author_device_id, kind)` — SYNC-1's per-stream
+         * watermark.
+         */streamSeq: UInt64, timestampMs: Int64, 
+        /**
+         * The kind-specific payload, encoded by this module's matching codec.
+         */payload: Data, 
+        /**
+         * Raw 64-byte Ed25519 signature over [`sync_record_signed_bytes`], in
+         * [`DeviceSigningDomain::SyncRecord`].
+         */signature: Data) {
+        self.kind = kind
+        self.personId = personId
+        self.authorDeviceId = authorDeviceId
+        self.rosterVersion = rosterVersion
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.streamSeq = streamSeq
+        self.timestampMs = timestampMs
+        self.payload = payload
+        self.signature = signature
+    }
+}
+
+
+
+extension SyncRecord: Equatable, Hashable {
+    public static func ==(lhs: SyncRecord, rhs: SyncRecord) -> Bool {
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.rosterVersion != rhs.rosterVersion {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.streamSeq != rhs.streamSeq {
+            return false
+        }
+        if lhs.timestampMs != rhs.timestampMs {
+            return false
+        }
+        if lhs.payload != rhs.payload {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(kind)
+        hasher.combine(personId)
+        hasher.combine(authorDeviceId)
+        hasher.combine(rosterVersion)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(streamSeq)
+        hasher.combine(timestampMs)
+        hasher.combine(payload)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncRecord {
+        return
+            try SyncRecord(
+                kind: FfiConverterTypeSyncRecordKind.read(from: &buf), 
+                personId: FfiConverterData.read(from: &buf), 
+                authorDeviceId: FfiConverterData.read(from: &buf), 
+                rosterVersion: FfiConverterTypeRosterVersion.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                streamSeq: FfiConverterUInt64.read(from: &buf), 
+                timestampMs: FfiConverterInt64.read(from: &buf), 
+                payload: FfiConverterData.read(from: &buf), 
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncRecord, into buf: inout [UInt8]) {
+        FfiConverterTypeSyncRecordKind.write(value.kind, into: &buf)
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+        FfiConverterTypeRosterVersion.write(value.rosterVersion, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterUInt64.write(value.streamSeq, into: &buf)
+        FfiConverterInt64.write(value.timestampMs, into: &buf)
+        FfiConverterData.write(value.payload, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecord_lift(_ buf: RustBuffer) throws -> SyncRecord {
+    return try FfiConverterTypeSyncRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecord_lower(_ value: SyncRecord) -> RustBuffer {
+    return FfiConverterTypeSyncRecord.lower(value)
+}
+
+
+/**
+ * One shared setting, resolved by a **total order** so two devices writing the
+ * same key converge whatever order the records arrive in.
+ *
+ * `key` is an application-defined identifier and `value` is opaque to core: §8
+ * says "settings the product deems shared", and which those are is a product
+ * decision that must be changeable without a wire change.
+ *
+ * The merge rule is `(epoch, author_device_id, value)`, compared in that order,
+ * highest wins. `epoch` alone — the shape [`crate::ProfileSyncContent`] uses —
+ * is *not* enough here and that is the whole reason this field exists. A
+ * profile has one author; a person's shared settings have as many authors as
+ * the person has devices, and two of them writing the same key in the same
+ * millisecond is not a contrived case: a shell stamps `epoch` from `now_ms`,
+ * and the phone and the tablet toggling a setting inside one minute of each
+ * other while both offline is an ordinary afternoon. With `epoch` alone each
+ * device would keep its own value forever — every incoming record losing the
+ * strictly-greater test — and the fleet would sit permanently forked on a
+ * difference neither device could see.
+ *
+ * `author_device_id` is that tie's arbiter because it is the one field both
+ * devices already agree on and neither can choose to win with: it is derived
+ * from the signing key in [`core_sign_sync_record`]. `value` breaks the
+ * remaining tie (one device re-publishing another's entry), so the order is
+ * total rather than merely usually-decisive.
+ *
+ * It travels on the wire rather than being stamped by the receiver, and that
+ * distinction is load-bearing: a device that re-published a sibling's entry
+ * under its *own* id would make the winner depend on who spoke last, which is
+ * exactly the property a total order is supposed to remove.
+ */
+public struct SyncSettingEntry {
+    public var key: String
+    public var value: Data
+    public var epoch: UInt64
+    /**
+     * The 16-byte id of the device that wrote this value —
+     * [`LEGACY_DEVICE_ID`] on an install that has never linked, which is a
+     * legitimate participant in the order and not a placeholder.
+     */
+    public var authorDeviceId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(key: String, value: Data, epoch: UInt64, 
+        /**
+         * The 16-byte id of the device that wrote this value —
+         * [`LEGACY_DEVICE_ID`] on an install that has never linked, which is a
+         * legitimate participant in the order and not a placeholder.
+         */authorDeviceId: Data) {
+        self.key = key
+        self.value = value
+        self.epoch = epoch
+        self.authorDeviceId = authorDeviceId
+    }
+}
+
+
+
+extension SyncSettingEntry: Equatable, Hashable {
+    public static func ==(lhs: SyncSettingEntry, rhs: SyncSettingEntry) -> Bool {
+        if lhs.key != rhs.key {
+            return false
+        }
+        if lhs.value != rhs.value {
+            return false
+        }
+        if lhs.epoch != rhs.epoch {
+            return false
+        }
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(key)
+        hasher.combine(value)
+        hasher.combine(epoch)
+        hasher.combine(authorDeviceId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncSettingEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncSettingEntry {
+        return
+            try SyncSettingEntry(
+                key: FfiConverterString.read(from: &buf), 
+                value: FfiConverterData.read(from: &buf), 
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                authorDeviceId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncSettingEntry, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.key, into: &buf)
+        FfiConverterData.write(value.value, into: &buf)
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSettingEntry_lift(_ buf: RustBuffer) throws -> SyncSettingEntry {
+    return try FfiConverterTypeSyncSettingEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSettingEntry_lower(_ value: SyncSettingEntry) -> RustBuffer {
+    return FfiConverterTypeSyncSettingEntry.lower(value)
+}
+
+
+/**
+ * Shared settings (§8, [`SyncRecordKind::Settings`]).
+ */
+public struct SyncSettingsPayload {
+    public var entries: [SyncSettingEntry]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(entries: [SyncSettingEntry]) {
+        self.entries = entries
+    }
+}
+
+
+
+extension SyncSettingsPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncSettingsPayload, rhs: SyncSettingsPayload) -> Bool {
+        if lhs.entries != rhs.entries {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(entries)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncSettingsPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncSettingsPayload {
+        return
+            try SyncSettingsPayload(
+                entries: FfiConverterSequenceTypeSyncSettingEntry.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncSettingsPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSyncSettingEntry.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSettingsPayload_lift(_ buf: RustBuffer) throws -> SyncSettingsPayload {
+    return try FfiConverterTypeSyncSettingsPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncSettingsPayload_lower(_ value: SyncSettingsPayload) -> RustBuffer {
+    return FfiConverterTypeSyncSettingsPayload.lower(value)
+}
+
+
+/**
+ * One stream's watermark: "I hold this device's records of this kind
+ * contiguously through `through_seq`", plus whether I can actually hand them
+ * over.
+ *
+ * `through_seq` is 0 for a stream this device knows exists but holds nothing
+ * of, which is the honest thing to advertise for a sibling that has just been
+ * linked: it asks for the whole stream from 1 without needing a separate
+ * "I have nothing" signal.
+ *
+ * `kind` is the **wire byte**, not [`crate::SyncRecordKind`], and the
+ * difference is deliberate. A digest is a claim about what a database
+ * contains, and a build that could only name the kinds it understands would
+ * have to omit a stream a *newer* sibling's build wrote into this database
+ * (a downgrade, a restore from a newer `.cmbak`) — and an omitted stream reads
+ * to that sibling as "send me all of it", every round, forever. Carrying the
+ * raw byte lets a stream be advertised at its cursor whether or not this build
+ * can parse a record of it, which is the honest answer and the one that
+ * terminates.
+ */
+public struct SyncStreamDigest {
+    public var authorDeviceId: Data
+    /**
+     * The sealed-body kind byte (`protocol.rs`'s `KIND_SYNC_*`).
+     */
+    public var kind: UInt8
+    public var throughSeq: UInt64
+    /**
+     * Whether this device can *serve* records of this stream — i.e. holds
+     * their sealed bytes, which only their author does (SYNC-3: only the
+     * author can re-seal after a roster change).
+     *
+     * Advertising the watermark and advertising the ability to answer for it
+     * are two different claims, and collapsing them breaks anti-entropy in one
+     * direction or the other. A device that dropped a stream from its digest
+     * because it cannot serve it would be telling the stream's author "I have
+     * none of it", and would be sent the whole stream again on every single
+     * encounter. A device that claimed it could serve what it only holds
+     * positions for makes every sibling plan a gap-fill against it that comes
+     * back empty, round after round. So both facts travel, and
+     * [`core_sync_digest_gaps`] reads the second one.
+     */
+    public var canServe: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(authorDeviceId: Data, 
+        /**
+         * The sealed-body kind byte (`protocol.rs`'s `KIND_SYNC_*`).
+         */kind: UInt8, throughSeq: UInt64, 
+        /**
+         * Whether this device can *serve* records of this stream — i.e. holds
+         * their sealed bytes, which only their author does (SYNC-3: only the
+         * author can re-seal after a roster change).
+         *
+         * Advertising the watermark and advertising the ability to answer for it
+         * are two different claims, and collapsing them breaks anti-entropy in one
+         * direction or the other. A device that dropped a stream from its digest
+         * because it cannot serve it would be telling the stream's author "I have
+         * none of it", and would be sent the whole stream again on every single
+         * encounter. A device that claimed it could serve what it only holds
+         * positions for makes every sibling plan a gap-fill against it that comes
+         * back empty, round after round. So both facts travel, and
+         * [`core_sync_digest_gaps`] reads the second one.
+         */canServe: Bool) {
+        self.authorDeviceId = authorDeviceId
+        self.kind = kind
+        self.throughSeq = throughSeq
+        self.canServe = canServe
+    }
+}
+
+
+
+extension SyncStreamDigest: Equatable, Hashable {
+    public static func ==(lhs: SyncStreamDigest, rhs: SyncStreamDigest) -> Bool {
+        if lhs.authorDeviceId != rhs.authorDeviceId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.throughSeq != rhs.throughSeq {
+            return false
+        }
+        if lhs.canServe != rhs.canServe {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(authorDeviceId)
+        hasher.combine(kind)
+        hasher.combine(throughSeq)
+        hasher.combine(canServe)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncStreamDigest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncStreamDigest {
+        return
+            try SyncStreamDigest(
+                authorDeviceId: FfiConverterData.read(from: &buf), 
+                kind: FfiConverterUInt8.read(from: &buf), 
+                throughSeq: FfiConverterUInt64.read(from: &buf), 
+                canServe: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncStreamDigest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.authorDeviceId, into: &buf)
+        FfiConverterUInt8.write(value.kind, into: &buf)
+        FfiConverterUInt64.write(value.throughSeq, into: &buf)
+        FfiConverterBool.write(value.canServe, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncStreamDigest_lift(_ buf: RustBuffer) throws -> SyncStreamDigest {
+    return try FfiConverterTypeSyncStreamDigest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncStreamDigest_lower(_ value: SyncStreamDigest) -> RustBuffer {
+    return FfiConverterTypeSyncStreamDigest.lower(value)
+}
+
+
+/**
+ * One chat's read state, as one device knows it.
+ *
+ * Cumulative, exactly like [`crate::ReceiptContent`]: "delivered/read through
+ * this lamport, for messages from this person". That shape is what makes the
+ * merge trivial and order-independent — a sibling takes the maximum per
+ * `(chat_id, subject_person_id)` — which is the property SYNC-1 needs, since
+ * two devices' watermark records can arrive in either order, days apart, or
+ * twice.
+ *
+ * §8's surface rule lives one layer up: what a *contact* is shown is
+ * any-device, so the value a contact sees is the maximum across the person's
+ * devices, and per-device detail stays behind Advanced.
+ */
+public struct SyncWatermarkEntry {
+    public var chatId: Data
+    /**
+     * Whose messages this watermark is about.
+     */
+    public var subjectPersonId: Data
+    public var deliveredThroughLamport: UInt64
+    public var readThroughLamport: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(chatId: Data, 
+        /**
+         * Whose messages this watermark is about.
+         */subjectPersonId: Data, deliveredThroughLamport: UInt64, readThroughLamport: UInt64) {
+        self.chatId = chatId
+        self.subjectPersonId = subjectPersonId
+        self.deliveredThroughLamport = deliveredThroughLamport
+        self.readThroughLamport = readThroughLamport
+    }
+}
+
+
+
+extension SyncWatermarkEntry: Equatable, Hashable {
+    public static func ==(lhs: SyncWatermarkEntry, rhs: SyncWatermarkEntry) -> Bool {
+        if lhs.chatId != rhs.chatId {
+            return false
+        }
+        if lhs.subjectPersonId != rhs.subjectPersonId {
+            return false
+        }
+        if lhs.deliveredThroughLamport != rhs.deliveredThroughLamport {
+            return false
+        }
+        if lhs.readThroughLamport != rhs.readThroughLamport {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(chatId)
+        hasher.combine(subjectPersonId)
+        hasher.combine(deliveredThroughLamport)
+        hasher.combine(readThroughLamport)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncWatermarkEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncWatermarkEntry {
+        return
+            try SyncWatermarkEntry(
+                chatId: FfiConverterData.read(from: &buf), 
+                subjectPersonId: FfiConverterData.read(from: &buf), 
+                deliveredThroughLamport: FfiConverterUInt64.read(from: &buf), 
+                readThroughLamport: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncWatermarkEntry, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.chatId, into: &buf)
+        FfiConverterData.write(value.subjectPersonId, into: &buf)
+        FfiConverterUInt64.write(value.deliveredThroughLamport, into: &buf)
+        FfiConverterUInt64.write(value.readThroughLamport, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncWatermarkEntry_lift(_ buf: RustBuffer) throws -> SyncWatermarkEntry {
+    return try FfiConverterTypeSyncWatermarkEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncWatermarkEntry_lower(_ value: SyncWatermarkEntry) -> RustBuffer {
+    return FfiConverterTypeSyncWatermarkEntry.lower(value)
+}
+
+
+/**
+ * Watermarks for one or more chats (§8, [`SyncRecordKind::Watermarks`]).
+ */
+public struct SyncWatermarkPayload {
+    public var entries: [SyncWatermarkEntry]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(entries: [SyncWatermarkEntry]) {
+        self.entries = entries
+    }
+}
+
+
+
+extension SyncWatermarkPayload: Equatable, Hashable {
+    public static func ==(lhs: SyncWatermarkPayload, rhs: SyncWatermarkPayload) -> Bool {
+        if lhs.entries != rhs.entries {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(entries)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncWatermarkPayload: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncWatermarkPayload {
+        return
+            try SyncWatermarkPayload(
+                entries: FfiConverterSequenceTypeSyncWatermarkEntry.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncWatermarkPayload, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeSyncWatermarkEntry.write(value.entries, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncWatermarkPayload_lift(_ buf: RustBuffer) throws -> SyncWatermarkPayload {
+    return try FfiConverterTypeSyncWatermarkPayload.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncWatermarkPayload_lower(_ value: SyncWatermarkPayload) -> RustBuffer {
+    return FfiConverterTypeSyncWatermarkPayload.lower(value)
 }
 
 // Note that we don't yet support `indirect` for enums.
@@ -37238,6 +40126,82 @@ extension LanEndpointProvenance: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a device should do with a compose-and-send it is holding.
+ */
+
+public enum OutboundAuthorDecision {
+    
+    /**
+     * Nothing of this person's has this text on the wire. Author it.
+     */
+    case author
+    /**
+     * A **sibling** device already authored it, on its own stream, recently
+     * enough that this can only be a draft that had not caught up. Authoring
+     * again would put a second distinct copy of one message in front of the
+     * recipient (§8, SYNC-2). Clear the composer instead.
+     */
+    case alreadyAuthoredBySibling
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutboundAuthorDecision: FfiConverterRustBuffer {
+    typealias SwiftType = OutboundAuthorDecision
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutboundAuthorDecision {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .author
+        
+        case 2: return .alreadyAuthoredBySibling
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: OutboundAuthorDecision, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .author:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .alreadyAuthoredBySibling:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboundAuthorDecision_lift(_ buf: RustBuffer) throws -> OutboundAuthorDecision {
+    return try FfiConverterTypeOutboundAuthorDecision.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutboundAuthorDecision_lower(_ value: OutboundAuthorDecision) -> RustBuffer {
+    return FfiConverterTypeOutboundAuthorDecision.lower(value)
+}
+
+
+
+extension OutboundAuthorDecision: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * A metadata-only connection event. No addresses, network names, tokens, or
  * message content are retained.
  *
@@ -39642,6 +42606,504 @@ extension ShipWifiVpnReadiness: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What happened to one applied record.
+ */
+
+public enum SyncApplyOutcome {
+    
+    /**
+     * The payload was merged and the stream slot recorded.
+     */
+    case applied
+    /**
+     * This slot was already held. SYNC-1 re-offers records routinely, so this
+     * is an ordinary outcome and not a warning.
+     */
+    case alreadyHeld
+    /**
+     * A [`SyncRecordKind::Digest`] record: read, handed back through
+     * [`SyncApplyResult::peer_digest`], and deliberately given no stream slot.
+     * Always this outcome, never `AlreadyHeld` — two digests from one device
+     * are two different claims about a moving watermark, and deduping the
+     * second would freeze the exchange on the first.
+     */
+    case read
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncApplyOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = SyncApplyOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncApplyOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .applied
+        
+        case 2: return .alreadyHeld
+        
+        case 3: return .read
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncApplyOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .applied:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .alreadyHeld:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .read:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncApplyOutcome_lift(_ buf: RustBuffer) throws -> SyncApplyOutcome {
+    return try FfiConverterTypeSyncApplyOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncApplyOutcome_lower(_ value: SyncApplyOutcome) -> RustBuffer {
+    return FfiConverterTypeSyncApplyOutcome.lower(value)
+}
+
+
+
+extension SyncApplyOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What the caller must do with an offer before it can go out.
+ */
+
+public enum SyncBackfillAction {
+    
+    /**
+     * The stored seal is still current — send the bytes as they are.
+     */
+    case send
+    /**
+     * SYNC-3: the own roster has moved since these bytes were sealed, so the
+     * record must be re-sealed to the current device set before it is sent.
+     * The re-seal keeps the record's stream slot and therefore its
+     * [`crate::core_sync_record_id`], so it costs no extra relay row.
+     */
+    case reseal
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncBackfillAction: FfiConverterRustBuffer {
+    typealias SwiftType = SyncBackfillAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncBackfillAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .send
+        
+        case 2: return .reseal
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncBackfillAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .send:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .reseal:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillAction_lift(_ buf: RustBuffer) throws -> SyncBackfillAction {
+    return try FfiConverterTypeSyncBackfillAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncBackfillAction_lower(_ value: SyncBackfillAction) -> RustBuffer {
+    return FfiConverterTypeSyncBackfillAction.lower(value)
+}
+
+
+
+extension SyncBackfillAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which side of a conversation an entry came from.
+ *
+ * Kept explicit rather than inferred from `sender_person_id == person_id`,
+ * because the receiving sibling needs the distinction before it has decided
+ * anything about identity, and because SYNC-2's outbound dedup reads it: an
+ * `Authored` entry from a sibling is exactly the evidence that says "do not
+ * re-author this text, it already has a stream position".
+ */
+
+public enum SyncHistoryDirection {
+    
+    /**
+     * Authored by one of this person's own devices.
+     */
+    case authored
+    /**
+     * Received from a contact or a group.
+     */
+    case received
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncHistoryDirection: FfiConverterRustBuffer {
+    typealias SwiftType = SyncHistoryDirection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncHistoryDirection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .authored
+        
+        case 2: return .received
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncHistoryDirection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .authored:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .received:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryDirection_lift(_ buf: RustBuffer) throws -> SyncHistoryDirection {
+    return try FfiConverterTypeSyncHistoryDirection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncHistoryDirection_lower(_ value: SyncHistoryDirection) -> RustBuffer {
+    return FfiConverterTypeSyncHistoryDirection.lower(value)
+}
+
+
+
+extension SyncHistoryDirection: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which of §8's record kinds a [`SyncRecord`] carries.
+ *
+ * The enum and the sealed-body `kind` byte are two views of one thing:
+ * [`core_sync_record_kind_wire`] and [`core_sync_record_kind_of`] are the only
+ * mapping, so neither shell ever writes a bare `10`.
+ */
+
+public enum SyncRecordKind {
+    
+    /**
+     * Message history, authored and received ([`SyncHistoryPayload`]).
+     */
+    case history
+    /**
+     * Delivered and read watermarks ([`SyncWatermarkPayload`]).
+     */
+    case watermarks
+    /**
+     * The contact list and contacts' rosters ([`SyncContactsPayload`]).
+     */
+    case contacts
+    /**
+     * The person's own roster and inbox keys ([`SyncOwnRosterPayload`]).
+     */
+    case ownRoster
+    /**
+     * Group membership and state ([`SyncGroupsPayload`]).
+     */
+    case groups
+    /**
+     * The settings the product deems shared ([`SyncSettingsPayload`]).
+     */
+    case settings
+    /**
+     * SYNC-1's per-stream watermark digest ([`crate::SyncDigest`], encoded by
+     * [`crate::core_encode_sync_digest`]).
+     *
+     * The one kind that describes streams rather than being one. It is signed,
+     * sealed, admitted and deduped exactly like the others — that is what
+     * makes a watermark exchange a document only this person's devices can
+     * read — but a receiver applies it and files no stream slot: a digest is
+     * stale the moment it lands, so gap-filling yesterday's watermarks would
+     * be anti-entropy chasing its own tail.
+     */
+    case digest
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncRecordKind: FfiConverterRustBuffer {
+    typealias SwiftType = SyncRecordKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncRecordKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .history
+        
+        case 2: return .watermarks
+        
+        case 3: return .contacts
+        
+        case 4: return .ownRoster
+        
+        case 5: return .groups
+        
+        case 6: return .settings
+        
+        case 7: return .digest
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncRecordKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .history:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .watermarks:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .contacts:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .ownRoster:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .groups:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .settings:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .digest:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecordKind_lift(_ buf: RustBuffer) throws -> SyncRecordKind {
+    return try FfiConverterTypeSyncRecordKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecordKind_lower(_ value: SyncRecordKind) -> RustBuffer {
+    return FfiConverterTypeSyncRecordKind.lower(value)
+}
+
+
+
+extension SyncRecordKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why an opened sync record may not be believed. `None` from
+ * [`core_sync_record_admit`] means every SYNC-3 condition holds.
+ */
+
+public enum SyncRecordRejection {
+    
+    /**
+     * The record names a different person than the roster it is checked
+     * against. Sync records are within one person, always.
+     */
+    case foreignPerson
+    /**
+     * Sealed under an inbox key generation this key is not. A record from
+     * before a §10 rotation is refused rather than accepted late: the old
+     * generation is exactly the one a revoked device still holds.
+     */
+    case staleInboxKey
+    /**
+     * Authored on [`LEGACY_DEVICE_ID`] — the reserved stream of a person with
+     * no device keys, which by definition cannot have signed anything.
+     */
+    case legacyAuthorDevice
+    /**
+     * The author is tombstoned in this person's roster (DL-4, §10.3): a
+     * revoked device's newly received events are refused, and the history it
+     * already wrote stays.
+     */
+    case revokedAuthorDevice
+    /**
+     * The author is not an active device of this person.
+     */
+    case unknownAuthorDevice
+    /**
+     * The device signature does not verify in the sync-record domain.
+     */
+    case signatureInvalid
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncRecordRejection: FfiConverterRustBuffer {
+    typealias SwiftType = SyncRecordRejection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncRecordRejection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .foreignPerson
+        
+        case 2: return .staleInboxKey
+        
+        case 3: return .legacyAuthorDevice
+        
+        case 4: return .revokedAuthorDevice
+        
+        case 5: return .unknownAuthorDevice
+        
+        case 6: return .signatureInvalid
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncRecordRejection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .foreignPerson:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .staleInboxKey:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .legacyAuthorDevice:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .revokedAuthorDevice:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .unknownAuthorDevice:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .signatureInvalid:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecordRejection_lift(_ buf: RustBuffer) throws -> SyncRecordRejection {
+    return try FfiConverterTypeSyncRecordRejection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncRecordRejection_lower(_ value: SyncRecordRejection) -> RustBuffer {
+    return FfiConverterTypeSyncRecordRejection.lower(value)
+}
+
+
+
+extension SyncRecordRejection: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What the shell must do as a result of the last gesture event.
  */
 
@@ -40596,6 +44058,30 @@ fileprivate struct FfiConverterOptionTypeOutgoingReceiptEnvelope: FfiConverterRu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeOwnSyncContext: FfiConverterRustBuffer {
+    typealias SwiftType = OwnSyncContext?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeOwnSyncContext.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeOwnSyncContext.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypePendingSharedRequest: FfiConverterRustBuffer {
     typealias SwiftType = PendingSharedRequest?
 
@@ -40732,6 +44218,78 @@ fileprivate struct FfiConverterOptionTypeStoredMessage: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeStoredMessage.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSyncDigest: FfiConverterRustBuffer {
+    typealias SwiftType = SyncDigest?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSyncDigest.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSyncDigest.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSyncOwnRosterPayload: FfiConverterRustBuffer {
+    typealias SwiftType = SyncOwnRosterPayload?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSyncOwnRosterPayload.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSyncOwnRosterPayload.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSyncSettingEntry: FfiConverterRustBuffer {
+    typealias SwiftType = SyncSettingEntry?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSyncSettingEntry.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSyncSettingEntry.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -41020,6 +44578,54 @@ fileprivate struct FfiConverterOptionTypeRosterRejection: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeRosterRejection.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSyncRecordKind: FfiConverterRustBuffer {
+    typealias SwiftType = SyncRecordKind?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSyncRecordKind.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSyncRecordKind.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeSyncRecordRejection: FfiConverterRustBuffer {
+    typealias SwiftType = SyncRecordRejection?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSyncRecordRejection.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSyncRecordRejection.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -42277,6 +45883,31 @@ fileprivate struct FfiConverterSequenceTypeGroupRelayMember: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeInboxKey: FfiConverterRustBuffer {
+    typealias SwiftType = [InboxKey]
+
+    public static func write(_ value: [InboxKey], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeInboxKey.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [InboxKey] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [InboxKey]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeInboxKey.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeLateArrivalInput: FfiConverterRustBuffer {
     typealias SwiftType = [LateArrivalInput]
 
@@ -42544,6 +46175,231 @@ fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeStoredMessage.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeStoredSyncRecord: FfiConverterRustBuffer {
+    typealias SwiftType = [StoredSyncRecord]
+
+    public static func write(_ value: [StoredSyncRecord], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeStoredSyncRecord.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [StoredSyncRecord] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [StoredSyncRecord]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeStoredSyncRecord.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncBackfillOffer: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncBackfillOffer]
+
+    public static func write(_ value: [SyncBackfillOffer], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncBackfillOffer.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncBackfillOffer] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncBackfillOffer]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncBackfillOffer.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncBackfillStep: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncBackfillStep]
+
+    public static func write(_ value: [SyncBackfillStep], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncBackfillStep.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncBackfillStep] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncBackfillStep]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncBackfillStep.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncContactEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncContactEntry]
+
+    public static func write(_ value: [SyncContactEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncContactEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncContactEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncContactEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncContactEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncGap: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncGap]
+
+    public static func write(_ value: [SyncGap], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncGap.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncGap] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncGap]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncGap.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncHistoryEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncHistoryEntry]
+
+    public static func write(_ value: [SyncHistoryEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncHistoryEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncHistoryEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncHistoryEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncHistoryEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncSettingEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncSettingEntry]
+
+    public static func write(_ value: [SyncSettingEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncSettingEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncSettingEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncSettingEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncSettingEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncStreamDigest: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncStreamDigest]
+
+    public static func write(_ value: [SyncStreamDigest], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncStreamDigest.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncStreamDigest] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncStreamDigest]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncStreamDigest.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeSyncWatermarkEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [SyncWatermarkEntry]
+
+    public static func write(_ value: [SyncWatermarkEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeSyncWatermarkEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [SyncWatermarkEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [SyncWatermarkEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeSyncWatermarkEntry.read(from: &buf))
         }
         return seq
     }
@@ -43207,6 +47063,116 @@ public func coreDecodeDeviceKeypair(bytes: Data)throws  -> DeviceKeypair {
 })
 }
 /**
+ * Decode a roster document. Fully bounds-checked and never panics on
+ * attacker-controlled bytes; trailing bytes are an error. Nothing here judges
+ * the document — [`core_roster_validate`] and [`core_roster_accept`] remain
+ * the only authorities on whether a decoded roster may be believed.
+ */
+public func coreDecodeRoster(bytes: Data)throws  -> Roster {
+    return try  FfiConverterTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_roster(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a contacts payload.
+ */
+public func coreDecodeSyncContacts(bytes: Data)throws  -> SyncContactsPayload {
+    return try  FfiConverterTypeSyncContactsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_contacts(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a digest. Fully bounds-checked; trailing bytes, an unknown version
+ * and an unrecognized flag bit are errors rather than partial reads.
+ *
+ * An unknown *kind* is deliberately **not** an error, and this is the one
+ * judgement call in the codec. It used to be: a reader that silently dropped a
+ * stream it could not name would answer a newer sibling with a watermark that
+ * omitted it, which reads as "I have everything you offered" and loses records
+ * permanently. Carrying the raw kind byte (see [`SyncStreamDigest::kind`])
+ * removes the choice — the stream is preserved with its watermark intact, and
+ * the decision about what to *do* with a kind this build cannot parse is
+ * [`core_sync_digest_gaps`]'s, where it is one line and testable.
+ *
+ * An unrecognized flag bit still fails closed, for the reason the kind byte no
+ * longer needs to: a flag changes the *meaning* of the fields beside it, so a
+ * reader that ignored one would act on a claim it had misread.
+ */
+public func coreDecodeSyncDigest(bytes: Data)throws  -> SyncDigest {
+    return try  FfiConverterTypeSyncDigest.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_digest(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a groups payload.
+ */
+public func coreDecodeSyncGroups(bytes: Data)throws  -> SyncGroupsPayload {
+    return try  FfiConverterTypeSyncGroupsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_groups(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a history payload.
+ */
+public func coreDecodeSyncHistory(bytes: Data)throws  -> SyncHistoryPayload {
+    return try  FfiConverterTypeSyncHistoryPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_history(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode an own-roster payload.
+ */
+public func coreDecodeSyncOwnRoster(bytes: Data)throws  -> SyncOwnRosterPayload {
+    return try  FfiConverterTypeSyncOwnRosterPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_own_roster(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a sync record. Fully bounds-checked; trailing bytes are an error, and
+ * an unknown version or an unknown record kind fails closed rather than
+ * half-parsing — a sibling running a newer build gets "I cannot read this
+ * yet", never a misfiled stream.
+ */
+public func coreDecodeSyncRecord(bytes: Data)throws  -> SyncRecord {
+    return try  FfiConverterTypeSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_record(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a settings payload.
+ */
+public func coreDecodeSyncSettings(bytes: Data)throws  -> SyncSettingsPayload {
+    return try  FfiConverterTypeSyncSettingsPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_settings(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Decode a watermark payload.
+ */
+public func coreDecodeSyncWatermarks(bytes: Data)throws  -> SyncWatermarkPayload {
+    return try  FfiConverterTypeSyncWatermarkPayload.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_sync_watermarks(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
  * Device id = first 16 bytes of BLAKE2b(device signing pubkey).
  *
  * §3 calls the device signing pubkey the `device_id`; on the wire and in the
@@ -43359,6 +47325,27 @@ public func coreDeviceStreamId(senderDeviceId: Data?) -> Data {
 })
 }
 /**
+ * The [`Identity`] shape a device signs a sealed sync record's *outer*
+ * envelope with (§14.2: a linked device holds no person root).
+ *
+ * It is an `Identity` only because [`crate::seal_message`] is one — see the
+ * module docs. Read its fields for what they are: `user_id` is this
+ * **device's** id, not a person id, and the signature it produces proves a
+ * device rather than a person. [`core_open_sync_record`] is the only reader
+ * that resolves it, and it resolves it against the roster's device layer.
+ *
+ * The agreement half is carried through unchanged so the value round-trips a
+ * `DeviceKeypair`, but nothing in the sync path uses it: a sync record is
+ * sealed *to* the person's [`InboxKey`], never to a device key.
+ */
+public func coreDeviceSyncIdentity(device: DeviceKeypair) -> Identity {
+    return try!  FfiConverterTypeIdentity.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_device_sync_identity(
+        FfiConverterTypeDeviceKeypair.lower(device),$0
+    )
+})
+}
+/**
  * Verify a device signature in one domain. A signature from another domain
  * fails here, which is the whole point of the context strings.
  */
@@ -43384,6 +47371,145 @@ public func coreEncodeDeviceKeypair(device: DeviceKeypair)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_core_encode_device_keypair(
         FfiConverterTypeDeviceKeypair.lower(device),$0
+    )
+})
+}
+/**
+ * Encode a roster as a transferable document (DL-3: a roster gossips as
+ * ordinary sealed 1:1 traffic, and §8 syncs the *own* roster to siblings
+ * inside a sync record — see [`crate::SyncOwnRosterPayload`]).
+ *
+ * Deliberately NOT [`roster_signed_bytes`]: that output is a signature
+ * pre-image — domain-prefixed and *without* the signature — so it can never
+ * round-trip. This layout carries every field, signature included, each
+ * length-framed, so `decode(encode(r)) == r` and so a receiver re-checks
+ * through [`core_roster_validate`] exactly the document its signer signed.
+ *
+ * DL-5 survives the codec for the same reason it holds in the type: every
+ * field written here is a fixed-width key, id, or counter that the validator
+ * re-checks on the way back in. The codec adds no free-form field, so it
+ * cannot become the place an endpoint fits.
+ */
+public func coreEncodeRoster(roster: Roster)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_roster(
+        FfiConverterTypeRoster.lower(roster),$0
+    )
+})
+}
+/**
+ * Encode a contacts payload.
+ *
+ * Layout: `version(1) | entry_count(u16)`, then per entry
+ * `person_id_len(u16) | person_id | card_json_len(u32) | card_json_utf8 |
+ * roster_len(u32) | roster`, where a zero-length roster means "none".
+ */
+public func coreEncodeSyncContacts(payload: SyncContactsPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_contacts(
+        FfiConverterTypeSyncContactsPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Encode a digest to its canonical bytes.
+ *
+ * Layout: `version(1)=1 | person_id_len(u16) | person_id | stream_count(u16)`,
+ * then per stream `author_device_id(16) | kind(1) | flags(1) |
+ * through_seq(u64)`, where `flags` bit 0 is [`SyncStreamDigest::can_serve`]
+ * and every other bit is reserved and must be zero.
+ *
+ * Streams are sorted by `(author_device_id, kind)` and a repeated stream is an
+ * error, so one view encodes to exactly one byte string. That matters more
+ * here than it does for a chat digest: a sync digest is re-sent on every
+ * encounter, and two encodings of one unchanged view would defeat any
+ * dedupe a transport applies to it.
+ */
+public func coreEncodeSyncDigest(digest: SyncDigest)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_digest(
+        FfiConverterTypeSyncDigest.lower(digest),$0
+    )
+})
+}
+/**
+ * Encode a groups payload.
+ *
+ * Layout: `version(1) | group_count(u16)`, then per group
+ * `group_len(u32) | encode_group_invite_content(group) |
+ * metadata_revision(u64) | changed_by_len(u16) | metadata_changed_by`.
+ */
+public func coreEncodeSyncGroups(payload: SyncGroupsPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_groups(
+        FfiConverterTypeSyncGroupsPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Encode a history payload.
+ *
+ * Layout: `version(1) | entry_count(u16)`, then per entry
+ * `origin_msg_id(16) | direction(1) | sender_person_id_len(u16) |
+ * sender_person_id | sender_device_id(16) | body_len(u32) | body`.
+ */
+public func coreEncodeSyncHistory(payload: SyncHistoryPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_history(
+        FfiConverterTypeSyncHistoryPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Encode an own-roster payload.
+ *
+ * Layout: `version(1) | key_count(u16) | roster_len(u32) | roster`, then per
+ * key `generation(u64) | agree_pk(32) | agree_sk(32)`.
+ */
+public func coreEncodeSyncOwnRoster(payload: SyncOwnRosterPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_own_roster(
+        FfiConverterTypeSyncOwnRosterPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Encode a signed sync record: [`sync_record_signed_bytes`] followed by the
+ * length-framed signature.
+ */
+public func coreEncodeSyncRecord(record: SyncRecord)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_record(
+        FfiConverterTypeSyncRecord.lower(record),$0
+    )
+})
+}
+/**
+ * Encode a settings payload.
+ *
+ * Layout: `version(1) | entry_count(u16)`, then per entry
+ * `key_len(u16) | key_utf8 | epoch(u64) | author_device_id(16) |
+ * value_len(u32) | value`.
+ */
+public func coreEncodeSyncSettings(payload: SyncSettingsPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_settings(
+        FfiConverterTypeSyncSettingsPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Encode a watermark payload.
+ *
+ * Layout: `version(1) | entry_count(u16)`, then per entry
+ * `chat_id_len(u16) | chat_id | subject_person_id_len(u16) |
+ * subject_person_id | delivered_through_lamport(u64) |
+ * read_through_lamport(u64)`.
+ */
+public func coreEncodeSyncWatermarks(payload: SyncWatermarkPayload)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_sync_watermarks(
+        FfiConverterTypeSyncWatermarkPayload.lower(payload),$0
     )
 })
 }
@@ -43695,6 +47821,13 @@ public func coreInboundGate(isNewMsgId: Bool, hopTtl: UInt8, expiryMs: Int64, no
  * stop condition is the peer's DELIVERED watermark advancing — which never
  * happens against a peer that lacks [`CAP_ACKS_HIDDEN_KINDS`]. The spray
  * plan bounds re-sends of exactly these kinds toward such peers.
+ *
+ * §8's sync record kinds are deliberately absent, and their absence is a
+ * decision rather than an omission: this list is about what a *peer* can be
+ * trusted to ack, and a sync record never reaches a peer — it is addressed to
+ * this person's own devices, which are by construction builds that understand
+ * it. SYNC-1's anti-entropy gives own-device traffic its own stop condition
+ * (a sibling's stream watermark), so nothing here needs to bound its re-sends.
  */
 public func coreIsHiddenSprayKind(kind: UInt8) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -43722,6 +47855,22 @@ public func coreIsOwnFanoutHint(recipientHint: Data, ownUserId: Data, nowMs: Int
         FfiConverterData.lower(recipientHint),
         FfiConverterData.lower(ownUserId),
         FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * Whether `kind` is one of §8's self-sync kinds — the kinds that only ever
+ * travel between one person's own devices.
+ *
+ * Both shells and every dispatch table call this instead of listing the
+ * values, so the set cannot drift between the accept gate, the routing lanes,
+ * and the store. Note the set is **not** a contiguous range: see the layout
+ * table above [`KIND_SYNC_HISTORY`].
+ */
+public func coreIsSyncRecordKind(kind: UInt8) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_is_sync_record_kind(
+        FfiConverterUInt8.lower(kind),$0
     )
 })
 }
@@ -43756,6 +47905,14 @@ public func coreIsVisibleChatKind(kind: UInt8) -> Bool {
  * NULL-`msg_id` row and so never advance a peer's DELIVERED watermark).
  * `KIND_RECEIPT` is the highest-volume kind in a real mailbox and is hidden
  * *here* while deliberately not being a hidden spray kind.
+ *
+ * §8's sync record kinds answer `false`, which is correct rather than
+ * incidental: a sync record is not a chat message and leaves no `messages`
+ * row of its own — it *carries* rows, whose own stream keys and msg_ids come
+ * from [`crate::SyncHistoryEntry`]. Its consumption is therefore recorded
+ * through [`crate::MessageStore::core_record_consumed_hidden_msg_id`], the
+ * same evidence route every other row-less kind uses, which is what lets
+ * ACK-MD-1 delete the sibling's fan-out row once this device has it.
  */
 public func coreKindPersistsMsgIdRow(kind: UInt8) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -44163,6 +48320,48 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
 })
 }
 /**
+ * Mint a fresh inbox key at `generation` (§6).
+ */
+public func coreMintInboxKey(generation: UInt64) -> InboxKey {
+    return try!  FfiConverterTypeInboxKey.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_mint_inbox_key(
+        FfiConverterUInt64.lower(generation),$0
+    )
+})
+}
+/**
+ * Open a sealed sync record with the person's inbox key and admit it against
+ * the person's own roster (SYNC-3).
+ *
+ * Four independent things must hold, and a record that fails any of them is an
+ * error rather than a degraded success:
+ *
+ * 1. the inbox secret decrypts it — only own devices hold that key;
+ * 2. the outer envelope signature belongs to this person's own device set
+ * ([`outer_signer_is_own`]), so a record sealed *to* the inbox key by
+ * somebody who somehow learned its public half is still refused;
+ * 3. the record decodes; and
+ * 4. [`core_sync_record_admit`] passes.
+ *
+ * Condition 2 is the one worth naming twice. The inbox key's public half
+ * travels with the key, so possession of the *public* half is not evidence of
+ * anything; requiring an own outer signature is what turns "somebody sealed
+ * this to my inbox" into "one of my devices sealed this". And it is checked at
+ * the **device** layer rather than against the person root, because §14.2
+ * leaves the root inside the encrypted backup: a person-root-only rule would
+ * have meant no linked device could ever seal a sync record, which is the
+ * entire mechanism.
+ */
+public func coreOpenSyncRecord(sealed: Data, inboxKey: InboxKey, ownRoster: Roster)throws  -> SyncRecord {
+    return try  FfiConverterTypeSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_open_sync_record(
+        FfiConverterData.lower(sealed),
+        FfiConverterTypeInboxKey.lower(inboxKey),
+        FfiConverterTypeRoster.lower(ownRoster),$0
+    )
+})
+}
+/**
  * The capability bits this build advertises in HELLO2. Both shells call
  * this instead of hardcoding bits so they can never disagree with core.
  */
@@ -44216,6 +48415,16 @@ public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> C
  * Every ordinary chat/control kind requires an accepted contact, except for
  * this device's own relay/fan-out copies. Unknown and group-only kinds fail
  * closed before either platform can write message or group state.
+ *
+ * §8's self-sync kinds take the strictest branch of all, and take it first:
+ * `sender_is_self` and nothing else. SYNC-3 makes a sync record a document
+ * between one person's own devices, so "a contact sent me a sync record" is
+ * never a legitimate event — a contact holding those bytes is either replaying
+ * a record they could not open or is a compromised peer, and either way the
+ * answer is no. Sealing already makes such a record unopenable
+ * ([`crate::core_open_sync_record`] is the crypto half of the same rule); this
+ * gate makes it unauthorized as well, so the person boundary does not rest on
+ * one layer alone.
  */
 public func corePairwiseSenderAuthorized(kind: UInt8, senderIsContact: Bool, senderIsSelf: Bool) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -44362,6 +48571,50 @@ public func corePlanMeshHelloFrames(ownUserId: Data)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_core_plan_mesh_hello_frames(
         FfiConverterData.lower(ownUserId),$0
+    )
+})
+}
+/**
+ * Plan one round of gap-fill (SYNC-1).
+ *
+ * `gaps` is what the peer is missing — [`core_sync_digest_gaps`] called with
+ * the peer's digest as `have`. `offers` is what this device can actually
+ * produce; anything in `offers` that answers no gap is simply not planned.
+ *
+ * Three rules, in this order:
+ *
+ * 1. **Oldest first, per stream.** Steps come out sorted by
+ * `(author_device_id, kind, stream_seq)`, so the prefix a truncated round
+ * delivers is the prefix that advances a watermark. Sending the newest
+ * records first would move the same bytes and converge nothing.
+ * 2. **A truncated stream stays truncated.** Once one record of a stream is
+ * deferred, every later record of *that* stream is deferred too — sending
+ * them would put records above a hole the receiver cannot close, which
+ * costs the budget and advances no watermark. Other streams keep being
+ * planned, because a hole in one stream says nothing about another.
+ * 3. **Stale seals are re-sealed, not skipped.** SYNC-3 requires a record
+ * sealed under a superseded roster to be re-sealed rather than sent, and a
+ * planner that dropped it instead would strand exactly the records a
+ * just-linked device most needs.
+ *
+ * `budget_bytes` of 0 plans nothing and defers everything, which is a
+ * legitimate answer for a link with no room left this encounter.
+ *
+ * **A head record larger than the whole budget stalls its stream, and that is
+ * correct.** Rule 2 defers it and everything above it, so the round moves other
+ * streams instead of spending its budget on a record that advances nothing.
+ * The caller's escape is a larger budget on the next encounter, not a partial
+ * record: a sealed record is atomic, and half of one is not a thing a sibling
+ * can open.
+ */
+public func corePlanSyncBackfill(gaps: [SyncGap], offers: [SyncBackfillOffer], currentRoster: RosterVersion, currentInboxKeyGeneration: UInt64, budgetBytes: UInt64) -> SyncBackfillPlan {
+    return try!  FfiConverterTypeSyncBackfillPlan.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_plan_sync_backfill(
+        FfiConverterSequenceTypeSyncGap.lower(gaps),
+        FfiConverterSequenceTypeSyncBackfillOffer.lower(offers),
+        FfiConverterTypeRosterVersion.lower(currentRoster),
+        FfiConverterUInt64.lower(currentInboxKeyGeneration),
+        FfiConverterUInt64.lower(budgetBytes),$0
     )
 })
 }
@@ -44808,6 +49061,21 @@ public func coreRosterValidate(roster: Roster, personRootSignPk: Data) -> Roster
 })
 }
 /**
+ * Rotate an inbox key: brand-new material at `generation + 1` (§10.1).
+ *
+ * Nothing of the old key survives into the new one. A rotation whose output
+ * shared material with its input would leave a revoked device able to read
+ * mail sealed after its revocation, which is the exact hole §10 rotates to
+ * close.
+ */
+public func coreRotateInboxKey(current: InboxKey) -> InboxKey {
+    return try!  FfiConverterTypeInboxKey.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_rotate_inbox_key(
+        FfiConverterTypeInboxKey.lower(current),$0
+    )
+})
+}
+/**
  * Turn the facts into the checklist.
  *
  * The rules, in full:
@@ -44827,6 +49095,45 @@ public func coreSailChecklist(input: CoreSailChecklistInput) -> CoreSailChecklis
     return try!  FfiConverterTypeCoreSailChecklistReport.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_sail_checklist(
         FfiConverterTypeCoreSailChecklistInput.lower(input),$0
+    )
+})
+}
+/**
+ * Seal a signed sync record to the person's own current device set (SYNC-3).
+ *
+ * The only address this function accepts is an [`InboxKey`] whose secret half
+ * this device holds and whose two halves agree — see the module docs for why
+ * that, and not a doc comment, is what keeps a sync record from ever being
+ * addressed at a contact. Everything else is the ordinary sealed-envelope
+ * path: [`crate::seal_message`] signs and pads exactly as it does for a text
+ * message, so what leaves this device is indistinguishable on the wire from
+ * ordinary 1:1 traffic (§12).
+ *
+ * `author` is the material the *outer* signature is made with, and it may be
+ * either of the two things a real install can actually hold:
+ *
+ * * the **authoring device's** identity ([`core_device_sync_identity`]) — the
+ * normal case, and the only one available to a linked device, because §14.2
+ * keeps the person root inside the encrypted backup and off every phone; or
+ * * the **person root** — the un-linked install whose only key is the root
+ * (§3's upgrade-in-place), authoring on its own device stream.
+ *
+ * Anything else is refused here rather than at the far end of a DTN hop.
+ * Note what the device branch requires: `author.user_id` must be the record's
+ * own `author_device_id`, which [`core_sign_sync_record`] derived from the
+ * signing secret — so the device that signed the record is provably the device
+ * that sealed it, and one cannot be swapped for the other.
+ *
+ * The record must already carry its device signature — sealing an unsigned
+ * record would produce a document every sibling correctly refuses, and
+ * discovering that on the far side of a DTN hop is not a good way to find out.
+ */
+public func coreSealSyncRecord(record: SyncRecord, author: Identity, inboxKey: InboxKey)throws  -> SealedSyncRecord {
+    return try  FfiConverterTypeSealedSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_seal_sync_record(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterTypeIdentity.lower(author),
+        FfiConverterTypeInboxKey.lower(inboxKey),$0
     )
 })
 }
@@ -45010,6 +49317,26 @@ public func coreSignRoster(roster: Roster, signerSignSk: Data)throws  -> Roster 
 })
 }
 /**
+ * Sign a sync record under the authoring device's Ed25519 key (§3's
+ * [`DeviceSigningDomain::SyncRecord`] domain).
+ *
+ * `author_device_id` is derived from the signing secret rather than trusted
+ * from the caller, exactly as [`crate::core_sign_device_cert`] fills in its
+ * signer: the recorded author and the key that actually signed can then never
+ * disagree, which is what makes the stream key
+ * `(author_device_id, kind, stream_seq)` something a sibling can rely on. The
+ * public half is not a parameter for the same reason — one secret in, one
+ * author out, with no pair to get wrong.
+ */
+public func coreSignSyncRecord(record: SyncRecord, authorDeviceSignSk: Data)throws  -> SyncRecord {
+    return try  FfiConverterTypeSyncRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_sign_sync_record(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterData.lower(authorDeviceSignSk),$0
+    )
+})
+}
+/**
  * See [`SPRAY_RETRY_ARM_MAX_MS`]. Exported so neither shell owns the number.
  */
 public func coreSprayRetryArmMaxMs() -> Int64 {
@@ -45022,6 +49349,189 @@ public func coreSubnet24Hosts(address: String) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_subnet_24_hosts(
         FfiConverterString.lower(address),$0
+    )
+})
+}
+/**
+ * The streams `peer` advertises beyond what `have` does (SYNC-1).
+ *
+ * Deliberately one function used in both directions, because anti-entropy is
+ * symmetric and a second copy would be a second thing to get wrong:
+ *
+ * * `core_sync_digest_gaps(mine, theirs)` — what **I need**, to request.
+ * * `core_sync_digest_gaps(theirs, mine)` — what **I owe**, to send.
+ *
+ * The second form is the one that makes SYNC-1's standing constraint hold. A
+ * device that has just read a sibling's digest can compute everything it owes
+ * and hand it to a mule, a relay row, or a carry queue; nothing about the
+ * answer depends on the sibling still being there, and nothing about it
+ * changes if the sibling is unreachable for a week.
+ *
+ * A stream `have` knows nothing about is a gap from 0, so a freshly linked
+ * device asks for whole streams without a distinct "send me everything"
+ * message. A stream `have` is *ahead* on produces no gap: the reverse call is
+ * where that difference is answered, which is also why answering a digest
+ * never obliges the answerer to ask for one back.
+ *
+ * Two peer streams are deliberately skipped, and both skips exist to stop a
+ * round that can never do anything from being planned on every encounter for
+ * the rest of the fleet's life:
+ *
+ * * **`can_serve == false`** — the peer holds this stream's *positions* but
+ * not its bytes, which is every stream it did not author. Only an author can
+ * re-seal its own records (SYNC-3), so a gap addressed at a non-author is a
+ * plan that comes back empty. The records are still coming: their author
+ * answers for them on its own next encounter.
+ * * **a kind this build cannot name** — the downgrade case
+ * [`SyncStreamDigest::kind`] describes. Requesting records this build's
+ * decoder refuses would spend the round's budget on bytes that cannot be
+ * applied, leaving the watermark exactly where it was, so the same gap would
+ * be requested again next round, forever. Not asking is the terminating
+ * answer; the *advertising* side still names the stream, which is what stops
+ * the newer sibling re-offering it.
+ *
+ * Neither skip loses anything: a stream is only unreachable through one peer,
+ * never through its author.
+ */
+public func coreSyncDigestGaps(have: SyncDigest, peer: SyncDigest)throws  -> [SyncGap] {
+    return try  FfiConverterSequenceTypeSyncGap.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_sync_digest_gaps(
+        FfiConverterTypeSyncDigest.lower(have),
+        FfiConverterTypeSyncDigest.lower(peer),$0
+    )
+})
+}
+/**
+ * The Settings-stream key a chat's shared draft lives under.
+ *
+ * Exported because the shells write drafts and a key format re-derived on each
+ * platform is exactly the duplicated arithmetic core-first exists to stop: two
+ * devices that disagreed about the key would each hold a draft the other never
+ * saw, which is the SYNC-2 failure this key exists to prevent.
+ */
+public func coreSyncDraftKey(chatId: Data) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_draft_key(
+        FfiConverterData.lower(chatId),$0
+    )
+})
+}
+/**
+ * Whether this kind is a *stream* — a run of records SYNC-1 gap-fills and a
+ * device retains so a sibling can be backfilled weeks later.
+ *
+ * Every kind but [`SyncRecordKind::Digest`] is. The digest is the exception
+ * the whole anti-entropy exchange rests on: it is the message that *asks*, so
+ * treating it as something to be asked for would make a device request last
+ * week's watermarks, apply them, advertise them, and be offered them again —
+ * anti-entropy over its own control channel. One predicate rather than six
+ * `!= Digest` tests scattered through the store, so the exception has one
+ * place to be wrong.
+ */
+public func coreSyncKindIsStream(kind: SyncRecordKind) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_kind_is_stream(
+        FfiConverterTypeSyncRecordKind.lower(kind),$0
+    )
+})
+}
+/**
+ * The SYNC-3 gate on an opened record, against this person's own roster.
+ *
+ * Pure and separate from the crypto so it can be tested — and reasoned about —
+ * on its own, in the same split `device_roster.rs` keeps between
+ * [`crate::core_roster_validate`] and [`crate::core_roster_accept`].
+ *
+ * The checks run oldest-question-first: is this even my person, is this key
+ * the current one, is the author a device of mine that is still allowed to
+ * speak, and only then does the signature get verified. Ordering matters for
+ * what a caller learns, not for safety — every one of them must pass.
+ */
+public func coreSyncRecordAdmit(record: SyncRecord, inboxKeyGeneration: UInt64, ownRoster: Roster) -> SyncRecordRejection? {
+    return try!  FfiConverterOptionTypeSyncRecordRejection.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_record_admit(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterUInt64.lower(inboxKeyGeneration),
+        FfiConverterTypeRoster.lower(ownRoster),$0
+    )
+})
+}
+/**
+ * A stable 16-byte id for one record of one stream: `BLAKE2b-16(domain ‖
+ * person ‖ author device ‖ kind ‖ stream_seq)`.
+ *
+ * SYNC-1 needs an id that both devices compute identically without having
+ * exchanged anything, so that a record re-sent after a dropped link dedupes
+ * server-side instead of arriving twice — the same discipline
+ * [`crate::device_fanout_msg_id`] keeps for fan-out rows, and the same reason:
+ * relayd scopes rows by `(family_token, msg_id, recipient_hint)`, so a
+ * deterministic id makes an identical re-upload free.
+ *
+ * The payload is deliberately *not* hashed in. The id names the stream slot,
+ * not the bytes: re-sealing the same slot after a roster change (SYNC-3) must
+ * produce the same id, or every re-seal would spend a fresh relay row.
+ */
+public func coreSyncRecordId(personId: Data, authorDeviceId: Data, kind: SyncRecordKind, streamSeq: UInt64) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_record_id(
+        FfiConverterData.lower(personId),
+        FfiConverterData.lower(authorDeviceId),
+        FfiConverterTypeSyncRecordKind.lower(kind),
+        FfiConverterUInt64.lower(streamSeq),$0
+    )
+})
+}
+/**
+ * The record kind a sealed-body `kind` byte names, or `None` for every other
+ * kind — including a sync kind a *future* build invents, which this one must
+ * fail soft on rather than misfile.
+ */
+public func coreSyncRecordKindOf(kind: UInt8) -> SyncRecordKind? {
+    return try!  FfiConverterOptionTypeSyncRecordKind.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_record_kind_of(
+        FfiConverterUInt8.lower(kind),$0
+    )
+})
+}
+/**
+ * The sealed-body `kind` byte this record kind rides as.
+ */
+public func coreSyncRecordKindWire(kind: SyncRecordKind) -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_record_kind_wire(
+        FfiConverterTypeSyncRecordKind.lower(kind),$0
+    )
+})
+}
+/**
+ * Whether bytes sealed for `sealed_for` at `sealed_generation` may still be
+ * sent under `current` / `current_generation` (SYNC-3's "re-sealed on roster
+ * change").
+ *
+ * Any difference — not merely a lower version — means re-seal. A roster that
+ * moved *backwards* relative to what a queued record was sealed for is not a
+ * safe thing to keep sending either: DL-1 says the stored roster only advances,
+ * so a lower current version means this device's own roster was replaced (a
+ * restore, a recovery-epoch supersession), and the right response is to
+ * re-author against what is actually stored now.
+ *
+ * **Both halves of the seal are compared**, because SYNC-3's device set is
+ * named by two independent numbers and a roster change is not the only way to
+ * change it. §10.1 rotates the inbox key on revocation, and the rotation is
+ * what actually cuts the revoked device off: bytes sealed under generation *n*
+ * are readable by everyone who held generation *n*, revoked or not, so
+ * continuing to send them because "the roster version still matches" would
+ * hand the just-revoked device every subsequent record. The planner already
+ * holds the current generation for exactly this comparison — it is not derived
+ * here, so there is no second source of truth about which key is live.
+ */
+public func coreSyncSealIsCurrent(sealedFor: RosterVersion, sealedGeneration: UInt64, current: RosterVersion, currentGeneration: UInt64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_sync_seal_is_current(
+        FfiConverterTypeRosterVersion.lower(sealedFor),
+        FfiConverterUInt64.lower(sealedGeneration),
+        FfiConverterTypeRosterVersion.lower(current),
+        FfiConverterUInt64.lower(currentGeneration),$0
     )
 })
 }
@@ -45081,6 +49591,20 @@ public func coreUnreadCount(messages: [StoredMessage], ownUserId: Data, readThro
 public func coreVerifyDeviceCert(cert: DeviceCert)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_core_verify_device_cert(
         FfiConverterTypeDeviceCert.lower(cert),$0
+    )
+}
+}
+/**
+ * Verify a sync record's device signature against a device signing key.
+ *
+ * Whether that device is *this person's* — and still is — is a roster-level
+ * question, answered by [`core_sync_record_admit`], in the same split
+ * [`crate::core_verify_device_cert`] and [`crate::core_roster_validate`] keep.
+ */
+public func coreVerifySyncRecord(record: SyncRecord, authorDeviceSignPk: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_verify_sync_record(
+        FfiConverterTypeSyncRecord.lower(record),
+        FfiConverterData.lower(authorDeviceSignPk),$0
     )
 }
 }
@@ -47584,6 +52108,33 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_decode_device_keypair() != 50354) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_roster() != 20043) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_contacts() != 54487) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_digest() != 22244) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_groups() != 11901) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_history() != 58918) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_own_roster() != 23504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_record() != 27778) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_settings() != 2737) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_sync_watermarks() != 64229) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_derive_device_id() != 23875) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -47605,10 +52156,40 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_device_stream_id() != 65121) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_sync_identity() != 65186) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_device_verify() != 56789) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_encode_device_keypair() != 32064) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_roster() != 47544) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_contacts() != 16660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_digest() != 11435) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_groups() != 59841) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_history() != 1253) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_own_roster() != 36046) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_record() != 45489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_settings() != 54799) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_sync_watermarks() != 44984) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_failover_resume_window_ms() != 41431) {
@@ -47662,16 +52243,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 47063) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_is_hidden_spray_kind() != 59579) {
+    if (uniffi_cruisemesh_core_checksum_func_core_is_hidden_spray_kind() != 7830) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_is_sync_record_kind() != 31744) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 48246) {
+    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 53968) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
@@ -47752,13 +52336,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_mint_inbox_key() != 38877) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_open_sync_record() != 6040) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 18726) {
+    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 54640) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint() != 56400) {
@@ -47789,6 +52379,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_plan_mesh_hello_frames() != 39982) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_plan_sync_backfill() != 60379) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_reaction_summaries_by_target() != 52182) {
@@ -47866,7 +52459,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_roster_validate() != 10) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_rotate_inbox_key() != 47270) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_sail_checklist() != 31707) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_seal_sync_record() != 31661) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_ship_wifi_build_report() != 57483) {
@@ -47908,10 +52507,37 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_sign_roster() != 42957) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_sign_sync_record() != 30724) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_spray_retry_arm_max_ms() != 63580) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_subnet_24_hosts() != 3135) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_digest_gaps() != 31062) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_draft_key() != 47882) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_kind_is_stream() != 60552) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_record_admit() != 39059) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_record_id() != 15652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_record_kind_of() != 58753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_record_kind_wire() != 3457) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_sync_seal_is_current() != 28199) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_tick_status_for() != 17631) {
@@ -47924,6 +52550,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_verify_device_cert() != 40924) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_verify_sync_record() != 1826) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_visible_chat_messages() != 48182) {
@@ -48823,6 +53452,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_contact_roster_state() != 8489) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_apply_sync_record() != 64327) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_commit_inbound_delivery() != 60150) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -48841,6 +53473,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_outbound_relay_rows() != 40926) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_own_sync_context() != 57859) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_plan_mesh_meet() != 65521) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -48848,6 +53483,60 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 61550) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_set_own_sync_context() != 53614) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_backfill_offers() != 1022) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_backfill_records() != 38641) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_chat_draft() != 9152) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_contacts_page() != 467) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_digest() != 57380) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_get_setting() != 3954) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_groups_page() != 63755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_history_page() != 65336) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_next_stream_seq() != 20195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_outbound_claim() != 3328) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_publish_block_list() != 49207) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_put_setting() != 35158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_reseal_record() != 11821) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_retain_record() != 61547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_set_chat_draft() != 54358) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_settings_page() != 12912) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_sync_watermark_page() != 11881) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 60649) {
@@ -48937,7 +53626,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_has_protocol_events() != 27445) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 58409) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 34271) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
