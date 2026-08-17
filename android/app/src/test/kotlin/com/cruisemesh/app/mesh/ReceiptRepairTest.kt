@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 /**
  * The receipt-repair lane, pinned against the self-lock it used to have.
@@ -37,6 +38,7 @@ class ReceiptRepairTest {
                 timestamp = lamport.toLong() * 1_000L,
                 kind = kind,
                 payload = ByteArray(0),
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
     }
@@ -116,6 +118,7 @@ class ReceiptRepairTest {
                 timestamp = 3_000L,
                 kind = KIND_GROUP_INVITE,
                 payload = ByteArray(0),
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
 

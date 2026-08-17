@@ -59,6 +59,7 @@ import com.cruisemesh.app.mesh.WifiTipStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 import uniffi.cruisemesh_core.formatUserId
 import androidx.compose.ui.res.stringResource
 import com.cruisemesh.app.R
@@ -648,6 +649,7 @@ private fun ChatListScreenPreview() {
         timestamp = 1_783_614_000_000L + lamport.toLong() * 60_000L,
         kind = 1u.toUByte(),
         payload = text.toByteArray(),
+        senderDeviceId = coreLegacyDeviceId(),
     )
     CruiseMeshTheme {
         ChatListScreen(

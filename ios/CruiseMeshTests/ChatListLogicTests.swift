@@ -121,12 +121,12 @@ final class ChatListLogicTests: XCTestCase {
         let ownId = Data([1])
         let peerId = Data([2])
         let messages = [
-            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 1, timestamp: 1000, kind: 1, payload: Data()),
-            StoredMessage(chatId: peerId, senderUserId: ownId, lamport: 2, timestamp: 2000, kind: 1, payload: Data()),
-            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 3, timestamp: 3000, kind: 1, payload: Data()),
-            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 4, timestamp: 4000, kind: 1, payload: Data()),
+            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 1, timestamp: 1000, kind: 1, payload: Data(), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: peerId, senderUserId: ownId, lamport: 2, timestamp: 2000, kind: 1, payload: Data(), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 3, timestamp: 3000, kind: 1, payload: Data(), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 4, timestamp: 4000, kind: 1, payload: Data(), senderDeviceId: coreLegacyDeviceId()),
             // Hidden friend-request stream noise must not inflate the badge.
-            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 5, timestamp: 5000, kind: 3, payload: Data()),
+            StoredMessage(chatId: peerId, senderUserId: peerId, lamport: 5, timestamp: 5000, kind: 3, payload: Data(), senderDeviceId: coreLegacyDeviceId()),
         ]
         let unread = ChatListLogic.computeUnread(messages: messages, ownUserId: ownId, readThrough: 1)
         XCTAssertEqual(unread, 2)
@@ -137,11 +137,13 @@ final class ChatListLogicTests: XCTestCase {
         let messages = [
             StoredMessage(
                 chatId: peerId, senderUserId: peerId, lamport: 1, timestamp: 1000, kind: 1,
-                payload: Data("hello".utf8)
+                payload: Data("hello".utf8),
+                senderDeviceId: coreLegacyDeviceId()
             ),
             StoredMessage(
                 chatId: peerId, senderUserId: peerId, lamport: 2, timestamp: 2000, kind: 3,
-                payload: Data("{}".utf8)
+                payload: Data("{}".utf8),
+                senderDeviceId: coreLegacyDeviceId()
             ),
         ]
         let last = ChatListLogic.lastVisibleMessage(messages)
@@ -152,7 +154,8 @@ final class ChatListLogicTests: XCTestCase {
     func testGroupInviteIsVisibleWithSystemPreview() {
         let groupId = Data(repeating: 0x11, count: 16)
         let msg = StoredMessage(
-            chatId: groupId, senderUserId: Data([1]), lamport: 1, timestamp: 1000, kind: 4, payload: Data()
+            chatId: groupId, senderUserId: Data([1]), lamport: 1, timestamp: 1000, kind: 4, payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         )
         XCTAssertEqual(ChatListLogic.lastVisibleMessage([msg]), msg)
         XCTAssertEqual(ChatListLogic.previewText(msg, groupName: "Bridge"), "Group created: Bridge")
@@ -165,10 +168,10 @@ final class ChatListLogicTests: XCTestCase {
         let bob = Data([3])
         let groupId = Data(repeating: 0x22, count: 16)
         let messages = [
-            StoredMessage(chatId: groupId, senderUserId: alice, lamport: 1, timestamp: 1000, kind: 1, payload: Data("a1".utf8)),
-            StoredMessage(chatId: groupId, senderUserId: alice, lamport: 2, timestamp: 2000, kind: 1, payload: Data("a2".utf8)),
-            StoredMessage(chatId: groupId, senderUserId: bob, lamport: 1, timestamp: 3000, kind: 1, payload: Data("b1".utf8)),
-            StoredMessage(chatId: groupId, senderUserId: ownId, lamport: 1, timestamp: 4000, kind: 1, payload: Data("me".utf8)),
+            StoredMessage(chatId: groupId, senderUserId: alice, lamport: 1, timestamp: 1000, kind: 1, payload: Data("a1".utf8), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: groupId, senderUserId: alice, lamport: 2, timestamp: 2000, kind: 1, payload: Data("a2".utf8), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: groupId, senderUserId: bob, lamport: 1, timestamp: 3000, kind: 1, payload: Data("b1".utf8), senderDeviceId: coreLegacyDeviceId()),
+            StoredMessage(chatId: groupId, senderUserId: ownId, lamport: 1, timestamp: 4000, kind: 1, payload: Data("me".utf8), senderDeviceId: coreLegacyDeviceId()),
         ]
         let readThrough: [Data: UInt64] = [alice: 1, bob: 0]
         let unread = ChatListLogic.computeGroupUnread(messages: messages, ownUserId: ownId) { sender in

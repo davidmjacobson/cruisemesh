@@ -345,6 +345,7 @@ async fn no_internet_message_bridges_to_shore_and_receipt_returns_the_same_way()
                 timestamp: body.timestamp,
                 kind: body.kind,
                 payload: body.content,
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             },
             fetched.msg_id.clone(),
             None,

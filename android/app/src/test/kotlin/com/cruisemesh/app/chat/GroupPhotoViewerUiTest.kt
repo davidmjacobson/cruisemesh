@@ -15,6 +15,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 @RunWith(AndroidJUnit4::class)
 class GroupPhotoViewerUiTest {
@@ -40,6 +41,7 @@ class GroupPhotoViewerUiTest {
                 durationMs = 0,
                 blob = jpeg,
             ).encode(),
+            senderDeviceId = coreLegacyDeviceId(),
         )
         var opened: ByteArray? = null
 

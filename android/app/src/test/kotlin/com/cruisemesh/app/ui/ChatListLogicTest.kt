@@ -10,6 +10,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 import java.util.Calendar
 
 @RunWith(RobolectricTestRunner::class)
@@ -102,12 +103,12 @@ class ChatListLogicTest {
         val ownId = byteArrayOf(1)
         val peerId = byteArrayOf(2)
         val messages = listOf(
-            StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), byteArrayOf()), // read
-            StoredMessage(ownId, ownId, 2uL, 2000L, 1u.toUByte(), byteArrayOf()), // own message
-            StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf()), // unread
-            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf()), // unread
+            StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()), // read
+            StoredMessage(ownId, ownId, 2uL, 2000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()), // own message
+            StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()), // unread
+            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()), // unread
             // Hidden friend-request stream noise must not inflate the badge.
-            StoredMessage(peerId, peerId, 5uL, 5000L, 3u.toUByte(), byteArrayOf()),
+            StoredMessage(peerId, peerId, 5uL, 5000L, 3u.toUByte(), byteArrayOf(), coreLegacyDeviceId()),
         )
         val unread = ChatListLogic.computeUnread(messages, ownId, readThrough = 1uL)
         assertEquals(2, unread)
@@ -131,8 +132,8 @@ class ChatListLogicTest {
         val ownId = byteArrayOf(1)
         val peerId = byteArrayOf(2)
         val messages = listOf(
-            StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf()),
-            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf()),
+            StoredMessage(peerId, peerId, 3uL, 3000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()),
+            StoredMessage(peerId, peerId, 4uL, 4000L, 1u.toUByte(), byteArrayOf(), coreLegacyDeviceId()),
         )
 
         // The fix: a real store's highestLamport(peerId, peerId) would
@@ -152,8 +153,8 @@ class ChatListLogicTest {
     fun lastVisibleMessageSkipsFriendRequests() {
         val peerId = byteArrayOf(2)
         val messages = listOf(
-            StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), "hello".toByteArray()),
-            StoredMessage(peerId, peerId, 2uL, 2000L, 3u.toUByte(), "{}".toByteArray()),
+            StoredMessage(peerId, peerId, 1uL, 1000L, 1u.toUByte(), "hello".toByteArray(), coreLegacyDeviceId()),
+            StoredMessage(peerId, peerId, 2uL, 2000L, 3u.toUByte(), "{}".toByteArray(), coreLegacyDeviceId()),
         )
         val last = ChatListLogic.lastVisibleMessage(messages)
         assertEquals(1uL, last!!.lamport)
@@ -163,7 +164,7 @@ class ChatListLogicTest {
     @Test
     fun groupInviteIsVisibleWithSystemPreview() {
         val groupId = ByteArray(16) { 0x11 }
-        val msg = StoredMessage(groupId, byteArrayOf(1), 1uL, 1000L, 4u.toUByte(), byteArrayOf())
+        val msg = StoredMessage(groupId, byteArrayOf(1), 1uL, 1000L, 4u.toUByte(), byteArrayOf(), coreLegacyDeviceId())
         assertEquals(msg, ChatListLogic.lastVisibleMessage(listOf(msg)))
         assertEquals("Group created: Bridge", ChatListLogic.previewText(msg, "Bridge"))
         assertEquals("Group invite", ChatListLogic.previewText(msg))
@@ -176,10 +177,10 @@ class ChatListLogicTest {
         val bob = byteArrayOf(3)
         val groupId = ByteArray(16) { 0x22 }
         val messages = listOf(
-            StoredMessage(groupId, alice, 1uL, 1000L, 1u.toUByte(), "a1".toByteArray()),
-            StoredMessage(groupId, alice, 2uL, 2000L, 1u.toUByte(), "a2".toByteArray()),
-            StoredMessage(groupId, bob, 1uL, 3000L, 1u.toUByte(), "b1".toByteArray()),
-            StoredMessage(groupId, ownId, 1uL, 4000L, 1u.toUByte(), "me".toByteArray()),
+            StoredMessage(groupId, alice, 1uL, 1000L, 1u.toUByte(), "a1".toByteArray(), coreLegacyDeviceId()),
+            StoredMessage(groupId, alice, 2uL, 2000L, 1u.toUByte(), "a2".toByteArray(), coreLegacyDeviceId()),
+            StoredMessage(groupId, bob, 1uL, 3000L, 1u.toUByte(), "b1".toByteArray(), coreLegacyDeviceId()),
+            StoredMessage(groupId, ownId, 1uL, 4000L, 1u.toUByte(), "me".toByteArray(), coreLegacyDeviceId()),
         )
         val readThrough = mapOf(
             alice.contentHashCode() to 1uL,

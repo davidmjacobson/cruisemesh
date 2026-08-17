@@ -73,6 +73,7 @@ fn the_post_vector_is_the_request_a_live_pass_emits() {
                 timestamp: T0,
                 kind: KIND_TEXT,
                 payload: b"hello".to_vec(),
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             },
             OutboundEnvelope {
                 msg_id: vec![0x11; 16],
@@ -464,6 +465,7 @@ fn the_canary_write_touches_nothing_operational() {
                 timestamp: T0,
                 kind: KIND_TEXT,
                 payload: b"hello".to_vec(),
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             },
             OutboundEnvelope {
                 msg_id: vec![0x11; 16],

@@ -17,7 +17,7 @@ final class ChatRowModelTests: XCTestCase {
         kind: UInt8 = ProtocolKind.text,
         payload: Data = Data()
     ) -> StoredMessage {
-        StoredMessage(chatId: chatId, senderUserId: sender, lamport: lamport, timestamp: timestampMs, kind: kind, payload: payload)
+        StoredMessage(chatId: chatId, senderUserId: sender, lamport: lamport, timestamp: timestampMs, kind: kind, payload: payload, senderDeviceId: coreLegacyDeviceId())
     }
 
     private func reactionMessage(on target: StoredMessage, emoji: String, sender: Data, lamport: UInt64, timestampMs: Int64) -> StoredMessage {

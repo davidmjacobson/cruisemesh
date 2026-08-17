@@ -79,7 +79,10 @@ use crate::session::relay_pass::{
     CoreRelayPassPlan, CoreRelayPassSummary, CoreRelayTransportError,
 };
 use crate::store::{CarriedEnvelope, Contact, MessageStore, OutboundEnvelope, StoredMessage};
-use crate::{compute_recipient_hint, core_relay_pass_default_budgets, relay_cursor_key, KIND_TEXT};
+use crate::{
+    compute_recipient_hint, core_relay_pass_default_budgets, relay_cursor_key, KIND_TEXT,
+    LEGACY_DEVICE_ID,
+};
 
 // ---------------------------------------------------------------------------
 // The identities and endpoints a fixture scenario runs on
@@ -986,6 +989,7 @@ fn seed_group_authored(store: &MessageStore, now_ms: i64) {
                 timestamp: now_ms,
                 kind: KIND_TEXT,
                 payload: b"cabin at seven".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             },
             OutboundEnvelope {
                 msg_id: msg_id(0x4000),

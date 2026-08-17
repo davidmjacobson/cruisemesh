@@ -21,7 +21,8 @@ final class PeerStreamWatermarkTests: XCTestCase {
             lamport: lamport,
             timestamp: Int64(lamport) * 1_000,
             kind: kind,
-            payload: Data()
+            payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         ))
     }
 
@@ -106,11 +107,13 @@ final class PeerStreamWatermarkTests: XCTestCase {
         let bob = userId(2)
         _ = try store.insertMessage(message: StoredMessage(
             chatId: groupId, senderUserId: alice, lamport: 7,
-            timestamp: 7_000, kind: ProtocolKind.text, payload: Data()
+            timestamp: 7_000, kind: ProtocolKind.text, payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         ))
         _ = try store.insertMessage(message: StoredMessage(
             chatId: groupId, senderUserId: bob, lamport: 2,
-            timestamp: 2_000, kind: ProtocolKind.text, payload: Data()
+            timestamp: 2_000, kind: ProtocolKind.text, payload: Data(),
+            senderDeviceId: coreLegacyDeviceId()
         ))
 
         XCTAssertEqual(

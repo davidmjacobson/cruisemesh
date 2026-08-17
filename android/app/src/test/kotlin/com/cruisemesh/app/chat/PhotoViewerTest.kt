@@ -11,6 +11,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 class PhotoViewerTest {
     @Test
@@ -55,5 +56,6 @@ class PhotoViewerTest {
         timestamp = 1L,
         kind = kind,
         payload = payload,
+        senderDeviceId = coreLegacyDeviceId(),
     )
 }

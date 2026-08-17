@@ -108,6 +108,7 @@ impl SimNode {
                     timestamp: self.delivered_seq as i64,
                     kind: KIND_TEXT,
                     payload: payload.to_vec(),
+                    sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
                 },
                 msg_id,
                 None,

@@ -1077,9 +1077,14 @@ impl ChatService {
         reactions: &HashMap<(Vec<u8>, u64, u8), Vec<ReactionView>>,
     ) -> Result<MessageView> {
         let own = message.sender_user_id == self.bootstrap.identity().user_id;
-        let reference = store.message_reference(
+        // §5: a quote names this row's own stream position, not the person's.
+        // Asking person-level answers with the lowest device id at that
+        // lamport, which for a sender with two devices is a different message
+        // than the one being rendered.
+        let reference = store.message_reference_from_device(
             chat_id.to_vec(),
             message.sender_user_id.clone(),
+            Some(message.sender_device_id.clone()),
             message.lamport,
         )?;
         let (kind, text, attachment) = match message.kind {
@@ -1478,6 +1483,7 @@ mod tests {
                 timestamp: 1,
                 kind: KIND_TEXT,
                 payload: b"history survives".to_vec(),
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         store
@@ -1488,6 +1494,7 @@ mod tests {
                 timestamp: 2,
                 kind: KIND_ATTACHMENT_MANIFEST,
                 payload: b"not-an-attachment".to_vec(),
+                sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         for lamport in 3..=80 {
@@ -1499,6 +1506,7 @@ mod tests {
                     timestamp: lamport as i64,
                     kind: KIND_PROFILE_SYNC,
                     payload: Vec::new(),
+                    sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
                 })
                 .unwrap();
         }

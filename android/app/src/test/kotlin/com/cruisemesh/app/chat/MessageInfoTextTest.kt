@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 
 class MessageInfoTextTest {
     companion object {
@@ -21,6 +22,7 @@ class MessageInfoTextTest {
         timestamp = 1_783_608_000_000L,
         kind = 1u.toUByte(),
         payload = "hello".toByteArray(),
+        senderDeviceId = coreLegacyDeviceId(),
     )
 
     private fun MessageInfoRow.asSentence() = this as MessageInfoRow.Sentence

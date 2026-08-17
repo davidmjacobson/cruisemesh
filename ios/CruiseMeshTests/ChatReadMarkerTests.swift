@@ -12,7 +12,8 @@ final class ChatReadMarkerTests: XCTestCase {
             lamport: 7,
             timestamp: 1,
             kind: ProtocolKind.text,
-            payload: Data("hello".utf8)
+            payload: Data("hello".utf8),
+            senderDeviceId: coreLegacyDeviceId()
         ))
 
         XCTAssertEqual(
@@ -51,7 +52,8 @@ final class ChatReadMarkerTests: XCTestCase {
                 lamport: lamport,
                 timestamp: Int64(lamport),
                 kind: ProtocolKind.text,
-                payload: Data("hello".utf8)
+                payload: Data("hello".utf8),
+                senderDeviceId: coreLegacyDeviceId()
             ))
         }
 

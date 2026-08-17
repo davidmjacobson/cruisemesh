@@ -3,12 +3,39 @@
 //! Implemented vectors drive today's core. Future-surface vectors deliberately
 //! remain data-only: they describe the accepted v1 rules without a test-only
 //! roster, key, or linking implementation.
+//!
+//! WP1 moved most of this file out of the second category. Every roster vector
+//! now runs the shipped `core_roster_accept` through the shipped
+//! `MessageStore::apply_contact_roster`, and both stream vectors run a real
+//! body through encode → seal → open → decode → device-aware insert. What
+//! stays data-only stays that way because the mechanism genuinely does not
+//! exist yet, not because driving it was inconvenient:
+//!
+//! * MD-ROSTER-PAIRWISE-GOSSIP. Half of DL-3 already ships: the roster head
+//!   rides the `CMFRIEND4` card and the roster-head TLV travels inside the
+//!   pairwise seal, so nothing about a roster is ever exposed to a relay or a
+//!   directory. The missing piece is narrower than "gossip does not exist" —
+//!   there is no envelope kind that carries the roster *document* itself, so
+//!   there is no end-to-end path to drive. WP4/WP5 own that carrier.
+//! * MD-SEAL-STALE-ROSTER needs §6's inbox key generations (WP2/WP5).
+//! * MD-ROSTER-FIRST-CONTACT-ANCHOR needs a second source of truth about a
+//!   person's recovery epoch (WP5's recovery flow).
+//! * MD-RECOVERY-ROOT-CUSTODY needs the person root minted and stored apart
+//!   from the identity key (WP3).
 
 use cruisemesh_core::{
-    compute_recipient_hint, core_own_capabilities, core_relay_ack_ids, core_should_ack_inbound,
-    CarriedEnvelope, CoreInboundDisposition, CoreRelayEnvelopeDisposition, MessageStore,
-    StoredMessage, CAP_MULTI_DEVICE,
+    compute_recipient_hint, core_derive_device_id, core_device_add_outcome, core_device_stream_id,
+    core_own_capabilities, core_relay_ack_ids, core_roster_validate, core_should_ack_inbound,
+    core_sign_device_cert, core_sign_roster, decode_extended_message_body, encode_message_body,
+    encode_message_body_extended, generate_identity, open_message, seal_message, CarriedEnvelope,
+    Contact, ContactDeviceState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
+    DeviceAddOutcome, DeviceCert, DeviceTombstone, ExtendedMessageBody, Identity,
+    IncomingMessageInsertOutcome, MessageBody, MessageStore, Roster, RosterRejection,
+    RosterUpdateOutcome, RosterUpdateReason, StoredMessage, CAP_MULTI_DEVICE,
+    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_TEXT,
+    LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
 };
+use ed25519_dalek::SigningKey;
 
 /// Assert with the vector id in the failure message, following
 /// `protocol_contract.rs`'s contract assertion style.
@@ -24,8 +51,9 @@ macro_rules! contract_assert {
 }
 
 /// §5: envelopes with no sealed-body device field map to this reserved
-/// all-zero stream. The sentinel is pinned here so a future WP1 constant that
-/// picks a different value has to edit this vector deliberately.
+/// all-zero stream. The sentinel is written out here rather than imported so
+/// that a core constant which quietly picked a different value would have to
+/// be reconciled by hand; MD-STREAM-LEGACY-ID's driver asserts the two agree.
 const LEGACY_DEVICE_ID: [u8; 16] = [0u8; 16];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,10 +119,27 @@ enum Scenario {
         version: RosterVersion,
         document: RosterDocument,
     },
-    RecoveryAuthority {
+    /// §14.2 supremacy applied to the one case with no baseline: the FIRST
+    /// roster ever seen for a person. Nothing is stored, so the epoch rule has
+    /// nothing to compare against and the document is adopted at whatever
+    /// epoch it names.
+    RosterFirstContactAnchor {
+        adopted: RosterVersion,
+        stored_baseline_exists: bool,
+        signed_by_approving_device: bool,
+    },
+    /// §14.2's epoch rule: raising `recovery_epoch` above a *stored* one takes
+    /// the person root's signature.
+    RecoveryEpochRequiresRoot {
         version: RosterVersion,
-        root_secret_only_in_encrypted_backup: bool,
         device_key_alone_can_mint_higher_epoch: bool,
+    },
+    /// §3 / §14.2 custody, which is what makes the epoch rule mean anything:
+    /// the person root secret lives only inside the passphrase-encrypted
+    /// `.cmbak`, never on a device.
+    RecoveryRootCustody {
+        root_secret_only_in_encrypted_backup: bool,
+        device_keypair_can_carry_root_secret: bool,
     },
     LegacyEnvelopeWithoutDevice {
         legacy_device_id: [u8; 16],
@@ -119,26 +164,53 @@ enum Scenario {
     },
 }
 
+/// The vocabulary this file's targets and driver results are written in.
+///
+/// Variants no longer named by any vector are kept, not deleted. An outcome
+/// leaves this list only when the rule it describes is *abandoned*, and none of
+/// these were — a work package changed what the core does, which is a different
+/// thing. Keeping them means a rollback, or a regression that lands back on the
+/// old behaviour, stays expressible in the ledger instead of needing this enum
+/// re-invented to describe it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum Outcome {
     Accepted,
     Ignored,
     ForkQuarantined,
+    /// Retired by WP1. Before the message stream key gained its device
+    /// dimension, a sibling device authoring at a lamport the person already
+    /// held collided on `(chat_id, sender_user_id, lamport)` and was
+    /// quarantined as a fork -- which is exactly what
+    /// `MD-STREAM-SIBLING-LAMPORT`'s driver used to report.
+    Quarantined,
     TombstonePermanent,
     FreshKeyAccepted,
     PairwiseGossipNoDirectory,
     KeysOnlyNoEndpoints,
+    /// §3 / §14.2 custody: the root secret is only ever in the encrypted
+    /// backup. Data-only -- `MD-RECOVERY-ROOT-CUSTODY` owns it and WP3 owns
+    /// the mechanism.
     RecoveryRequiresEncryptedBackup,
+    /// §14.2's enforced half: only a root signature raises the epoch above a
+    /// stored one.
+    EpochRequiresRootSignature,
+    /// §14.2 supremacy at first contact, which nothing yet checks: an adoption
+    /// with no baseline should still be anchored to the person root's
+    /// authority over the epoch. `MD-ROSTER-FIRST-CONTACT-ANCHOR`'s target.
+    FirstAdoptionAnchoredToRoot,
+    /// Retired by WP1. Before `core_own_capabilities()` advertised
+    /// `CAP_MULTI_DEVICE`, WPT had reserved the bit without announcing it, and
+    /// `MD-CAPABILITY-RESERVED`'s driver reported this.
+    ReservedNotAdvertised,
     LegacyDeviceStream,
     SeparateStreams,
-    Quarantined,
     Acknowledged,
     NotAcknowledgedBecauseCarried,
     NotAcknowledgedByNamespaceRefusal,
     PersonDigestProofOnly,
     DigestProofOnly,
     SurvivingDevicesDeliver,
-    ReservedNotAdvertised,
     Advertised,
     DeviceAdded,
     DeviceAddedWithWarning,
@@ -167,7 +239,7 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::Accepted,
-        implemented: false,
+        implemented: true,
     },
     // DL-1: (1, 1001) must not roll back the already stored (2, 0).
     Vector {
@@ -183,7 +255,7 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::Ignored,
-        implemented: false,
+        implemented: true,
     },
     // DL-1: equal (recovery_epoch, seq) is idempotent gossip, not an update.
     Vector {
@@ -199,7 +271,7 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::Ignored,
-        implemented: false,
+        implemented: true,
     },
     // DL-1 discriminator: the ordinary case. Within one recovery epoch, a
     // strictly higher seq is the normal add/revoke and is accepted. Without
@@ -218,7 +290,7 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::Accepted,
-        implemented: false,
+        implemented: true,
     },
     // DL-1 discriminator: within one recovery epoch a lower seq is a replayed
     // or stale roster and is ignored -- the same-epoch twin of MD-ROSTER-LOWER.
@@ -235,7 +307,7 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::Ignored,
-        implemented: false,
+        implemented: true,
     },
     // DL-1 discriminator: version ordering is necessary, never sufficient. A
     // strictly higher (3, 0) whose signature chain does not verify back to the
@@ -254,7 +326,7 @@ const VECTORS: &[Vector] = &[
             chain_verifies_to_person_root: false,
         },
         target_outcome: Outcome::Ignored,
-        implemented: false,
+        implemented: true,
     },
     // DL-2: equal (recovery_epoch, seq) plus different content is a fork.
     Vector {
@@ -268,7 +340,7 @@ const VECTORS: &[Vector] = &[
             incoming_content: b"approved-device-b",
         },
         target_outcome: Outcome::ForkQuarantined,
-        implemented: false,
+        implemented: true,
     },
     // DL-2 follow-on: quarantine is sticky. A legitimately higher (2, 1)
     // roster arriving after the fork does NOT lift the quarantine -- "never
@@ -288,7 +360,7 @@ const VECTORS: &[Vector] = &[
             auto_resolves: false,
         },
         target_outcome: Outcome::ForkQuarantined,
-        implemented: false,
+        implemented: true,
     },
     // DL-4: the tombstoned device_id itself can never return.
     Vector {
@@ -302,7 +374,7 @@ const VECTORS: &[Vector] = &[
             returning_device_id: b"revoked-phone-key",
         },
         target_outcome: Outcome::TombstonePermanent,
-        implemented: false,
+        implemented: true,
     },
     // DL-4: re-linking that hardware mints a fresh key, which may be accepted.
     Vector {
@@ -316,7 +388,7 @@ const VECTORS: &[Vector] = &[
             replacement_device_id: b"relinked-phone-fresh-key",
         },
         target_outcome: Outcome::FreshKeyAccepted,
-        implemented: false,
+        implemented: true,
     },
     // DL-3: a roster is sealed pairwise gossip; no directory sees plaintext.
     Vector {
@@ -333,7 +405,13 @@ const VECTORS: &[Vector] = &[
         implemented: false,
     },
     // DL-5: roster documents carry device keys and tombstones, never
-    // third-party endpoints. The fixture type has no endpoint field at all.
+    // third-party endpoints. Be exact about what enforces that, because the
+    // fixture below is not it: every byte field of the real `Roster` is a
+    // `Vec<u8>`, so the *type* forbids nothing, and the single gate is
+    // `core_roster_validate`'s fixed-width check. What that gate actually buys
+    // is that no field can hold a free-form address -- not that a 16- or
+    // 32-byte value cannot be chosen adversarially, which it can, and which the
+    // driver below now includes.
     Vector {
         id: "MD-ROSTER-KEYS-NOT-ENDPOINTS",
         scenario: Scenario::RosterKeysNeverEndpoints {
@@ -347,18 +425,49 @@ const VECTORS: &[Vector] = &[
             },
         },
         target_outcome: Outcome::KeysOnlyNoEndpoints,
+        implemented: true,
+    },
+    // §14.2 supremacy where there is no baseline: the first roster ever seen
+    // for a person is adopted at whatever epoch it names, because nothing is
+    // stored to compare it against. The target is that a first adoption is
+    // still anchored to the person root's authority over the epoch -- which
+    // today it is not, and cannot be without a second source of truth about
+    // where that person's epoch had got to.
+    Vector {
+        id: "MD-ROSTER-FIRST-CONTACT-ANCHOR",
+        scenario: Scenario::RosterFirstContactAnchor {
+            adopted: RosterVersion {
+                recovery_epoch: 9,
+                seq: 4,
+            },
+            stored_baseline_exists: false,
+            signed_by_approving_device: true,
+        },
+        target_outcome: Outcome::FirstAdoptionAnchoredToRoot,
         implemented: false,
     },
-    // §3 / §14.2: only the encrypted backup's root secret can raise epoch.
+    // §14.2, the enforced half: an approving device cannot raise the epoch
+    // above a stored one; only a root signature can.
     Vector {
-        id: "MD-RECOVERY-BACKUP-AUTHORITY",
-        scenario: Scenario::RecoveryAuthority {
+        id: "MD-RECOVERY-EPOCH-REQUIRES-ROOT",
+        scenario: Scenario::RecoveryEpochRequiresRoot {
             version: RosterVersion {
                 recovery_epoch: 3,
                 seq: 0,
             },
-            root_secret_only_in_encrypted_backup: true,
             device_key_alone_can_mint_higher_epoch: false,
+        },
+        target_outcome: Outcome::EpochRequiresRootSignature,
+        implemented: true,
+    },
+    // §3 / §14.2, the custody half: the epoch rule is only worth anything
+    // because the root secret is not on any device. Data-only -- WP3 owns
+    // where that secret lives and how the encrypted backup carries it.
+    Vector {
+        id: "MD-RECOVERY-ROOT-CUSTODY",
+        scenario: Scenario::RecoveryRootCustody {
+            root_secret_only_in_encrypted_backup: true,
+            device_keypair_can_carry_root_secret: false,
         },
         target_outcome: Outcome::RecoveryRequiresEncryptedBackup,
         implemented: false,
@@ -370,7 +479,7 @@ const VECTORS: &[Vector] = &[
             legacy_device_id: LEGACY_DEVICE_ID,
         },
         target_outcome: Outcome::LegacyDeviceStream,
-        implemented: false,
+        implemented: true,
     },
     // §5: sibling author streams must remain independent even at one lamport.
     Vector {
@@ -445,7 +554,7 @@ const VECTORS: &[Vector] = &[
             resulting_device_count: 7,
         },
         target_outcome: Outcome::DeviceAdded,
-        implemented: false,
+        implemented: true,
     },
     Vector {
         id: "MD-DEVICE-CAP-8",
@@ -453,7 +562,7 @@ const VECTORS: &[Vector] = &[
             resulting_device_count: 8,
         },
         target_outcome: Outcome::DeviceAdded,
-        implemented: false,
+        implemented: true,
     },
     Vector {
         id: "MD-DEVICE-CAP-9",
@@ -461,7 +570,7 @@ const VECTORS: &[Vector] = &[
             resulting_device_count: 9,
         },
         target_outcome: Outcome::DeviceAddedWithWarning,
-        implemented: false,
+        implemented: true,
     },
     Vector {
         id: "MD-DEVICE-CAP-16",
@@ -469,7 +578,7 @@ const VECTORS: &[Vector] = &[
             resulting_device_count: 16,
         },
         target_outcome: Outcome::DeviceAddedWithWarning,
-        implemented: false,
+        implemented: true,
     },
     Vector {
         id: "MD-DEVICE-CAP-17",
@@ -477,7 +586,7 @@ const VECTORS: &[Vector] = &[
             resulting_device_count: 17,
         },
         target_outcome: Outcome::DeviceAddRefused,
-        implemented: false,
+        implemented: true,
     },
 ];
 
@@ -505,7 +614,15 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
     ),
     ("MD-ROSTER-KEYS-NOT-ENDPOINTS", Outcome::KeysOnlyNoEndpoints),
     (
-        "MD-RECOVERY-BACKUP-AUTHORITY",
+        "MD-ROSTER-FIRST-CONTACT-ANCHOR",
+        Outcome::FirstAdoptionAnchoredToRoot,
+    ),
+    (
+        "MD-RECOVERY-EPOCH-REQUIRES-ROOT",
+        Outcome::EpochRequiresRootSignature,
+    ),
+    (
+        "MD-RECOVERY-ROOT-CUSTODY",
         Outcome::RecoveryRequiresEncryptedBackup,
     ),
     ("MD-STREAM-LEGACY-ID", Outcome::LegacyDeviceStream),
@@ -535,8 +652,37 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
 /// The pinned map of executed vector id -> what today's core actually does.
 /// This is the WP0 photograph of current behaviour: every change to a driver
 /// result, in either direction, must be a deliberate edit here.
+///
+/// WP1's edits, and what made each of them true: every roster id joined the
+/// table because `core_roster_accept` and the contact-roster tables now exist
+/// and the drivers run them; `MD-STREAM-LEGACY-ID` and
+/// `MD-STREAM-SIBLING-LAMPORT` because the message stream key gained its
+/// device dimension and the sealed body gained the field that fills it (the
+/// sibling result moved from `Quarantined`, which was the shared-stream
+/// collision, to `SeparateStreams`); `MD-CAPABILITY-RESERVED` because
+/// `core_own_capabilities()` now advertises the bit. The four ack ids are
+/// untouched -- they are WP2's.
 const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
-    ("MD-STREAM-SIBLING-LAMPORT", Outcome::Quarantined),
+    ("MD-ROSTER-GREATER", Outcome::Accepted),
+    ("MD-ROSTER-LOWER", Outcome::Ignored),
+    ("MD-ROSTER-EQUAL", Outcome::Ignored),
+    ("MD-ROSTER-SAME-EPOCH-ADVANCE", Outcome::Accepted),
+    ("MD-ROSTER-SAME-EPOCH-ROLLBACK", Outcome::Ignored),
+    ("MD-ROSTER-CHAIN-BROKEN", Outcome::Ignored),
+    ("MD-ROSTER-FORK", Outcome::ForkQuarantined),
+    (
+        "MD-ROSTER-FORK-QUARANTINE-PERSISTS",
+        Outcome::ForkQuarantined,
+    ),
+    ("MD-ROSTER-TOMBSTONE", Outcome::TombstonePermanent),
+    ("MD-ROSTER-RELINK-FRESH-KEY", Outcome::FreshKeyAccepted),
+    ("MD-ROSTER-KEYS-NOT-ENDPOINTS", Outcome::KeysOnlyNoEndpoints),
+    (
+        "MD-RECOVERY-EPOCH-REQUIRES-ROOT",
+        Outcome::EpochRequiresRootSignature,
+    ),
+    ("MD-STREAM-LEGACY-ID", Outcome::LegacyDeviceStream),
+    ("MD-STREAM-SIBLING-LAMPORT", Outcome::SeparateStreams),
     ("MD-ACK-OWN-FANOUT", Outcome::Acknowledged),
     (
         "MD-ACK-SIBLING-FANOUT",
@@ -544,7 +690,12 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ),
     ("MD-ACK-LEGACY-PERSON-ROW", Outcome::Acknowledged),
     ("MD-ACK-CARRIED-DIGEST-PROOF", Outcome::DigestProofOnly),
-    ("MD-CAPABILITY-RESERVED", Outcome::ReservedNotAdvertised),
+    ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
+    ("MD-DEVICE-CAP-7", Outcome::DeviceAdded),
+    ("MD-DEVICE-CAP-8", Outcome::DeviceAdded),
+    ("MD-DEVICE-CAP-9", Outcome::DeviceAddedWithWarning),
+    ("MD-DEVICE-CAP-16", Outcome::DeviceAddedWithWarning),
+    ("MD-DEVICE-CAP-17", Outcome::DeviceAddRefused),
 ];
 
 /// This person's wire identity (`person_id` in new code, `user_id` today).
@@ -579,15 +730,233 @@ fn person_hint() -> Vec<u8> {
     compute_recipient_hint(PERSON_ID.to_vec(), NOW_MS)
 }
 
-fn stored_message(payload: &[u8]) -> StoredMessage {
-    StoredMessage {
-        chat_id: b"alice".to_vec(),
-        sender_user_id: b"alice".to_vec(),
-        lamport: 7,
-        timestamp: 1_700_000_000_000,
-        kind: 1,
-        payload: payload.to_vec(),
+// ---------------------------------------------------------------------------
+// Roster fixtures (§3, §4)
+// ---------------------------------------------------------------------------
+
+/// The person root secret. Fixed, never generated: "the signature chain
+/// verifies back to the person root" only means something if the root is one
+/// specific key on every run, in the same spirit as `identity.rs`'s golden
+/// vectors.
+const ROOT_SK: [u8; 32] = [0x11; 32];
+/// A key this person never vouched for, used to break a chain on purpose.
+const STRANGER_SK: [u8; 32] = [0x99; 32];
+/// The contact's X25519 key. Rosters never touch it; it is here because a
+/// contact row has one.
+const PERSON_AGREE_PK: [u8; 32] = [0x12; 32];
+
+/// One of the vectors' symbolic device names, resolved to a real keypair.
+struct FixtureDevice {
+    sign_sk: [u8; 32],
+    sign_pk: Vec<u8>,
+    agree_pk: Vec<u8>,
+    device_id: Vec<u8>,
+}
+
+fn sign_pk_of(sign_sk: &[u8; 32]) -> Vec<u8> {
+    SigningKey::from_bytes(sign_sk)
+        .verifying_key()
+        .as_bytes()
+        .to_vec()
+}
+
+/// Resolve a vector's device label to a fixed keypair. The mapping is a
+/// literal table rather than a hash of the label so that the bytes behind
+/// `b"revoked-phone-key"` are pinned, and so an unknown label is a loud
+/// failure instead of a silently different device.
+fn device(label: &[u8]) -> FixtureDevice {
+    let seed = match label {
+        b"alice-phone-device-key" => 0x21,
+        b"alice-tablet-device-key" => 0x22,
+        b"revoked-phone-key" => 0x23,
+        b"relinked-phone-fresh-key" => 0x24,
+        b"approved-device-a" => 0x25,
+        b"approved-device-b" => 0x26,
+        _ => unreachable!("unknown fixture device label"),
+    };
+    let sign_sk = [seed; 32];
+    let sign_pk = sign_pk_of(&sign_sk);
+    FixtureDevice {
+        device_id: core_derive_device_id(sign_pk.clone()).expect("16-byte device id"),
+        sign_sk,
+        sign_pk,
+        // Never used to seal anything here; distinct per device so two
+        // certificates can never accidentally be the same document.
+        agree_pk: vec![seed ^ 0x80; 32],
     }
+}
+
+fn person_root_sign_pk() -> Vec<u8> {
+    sign_pk_of(&ROOT_SK)
+}
+
+/// §3: the person id *is* the deployed identity's `user_id`. Nothing new is
+/// derived for it.
+fn person_id() -> Vec<u8> {
+    core_derive_device_id(person_root_sign_pk()).expect("16-byte person id")
+}
+
+/// The contact row a roster is verified against: `sign_pk` is the person root,
+/// which is §3's whole no-re-friending claim.
+fn roster_contact() -> Contact {
+    Contact {
+        user_id: person_id(),
+        name: "Roster fixture".to_string(),
+        sign_pk: person_root_sign_pk(),
+        agree_pk: PERSON_AGREE_PK.to_vec(),
+        relay_url: None,
+        relay_token: None,
+        nickname: None,
+    }
+}
+
+/// A device certificate, signed by `signer_sk`. Every fixture certificate is
+/// root-signed, which is the chain every roster here descends from; the
+/// chain-broken vector is the one that passes a stranger.
+fn cert(device: &FixtureDevice, flags: u32, signer_sk: &[u8; 32]) -> DeviceCert {
+    core_sign_device_cert(
+        DeviceCert {
+            person_id: person_id(),
+            device_sign_pk: device.sign_pk.clone(),
+            device_agree_pk: device.agree_pk.clone(),
+            added_epoch: 0,
+            flags,
+            signer_sign_pk: Vec::new(),
+            signature: Vec::new(),
+        },
+        signer_sk.to_vec(),
+    )
+    .expect("device certificate signs")
+}
+
+/// A valid roster for the fixture person at `version`.
+///
+/// `devices[0]` is the approving device and the only certificate carrying the
+/// roster-signing flag (§3's authority split). The signer follows the rule,
+/// never the convenience: `seq == 0` is root-signed, because genesis and the
+/// first roster of any recovery epoch must be (§3, §14.2); every other version
+/// is signed by the approving device, which is what an ordinary add or revoke
+/// looks like.
+fn roster_at(
+    version: RosterVersion,
+    devices: &[&[u8]],
+    tombstones: &[&[u8]],
+    inbox_key_generation: u64,
+) -> Roster {
+    roster_signed_by(version, devices, tombstones, inbox_key_generation, None)
+}
+
+/// The same document with the signer forced, for the vectors about who is
+/// allowed to sign what.
+fn roster_signed_by(
+    version: RosterVersion,
+    devices: &[&[u8]],
+    tombstones: &[&[u8]],
+    inbox_key_generation: u64,
+    signer_sk: Option<[u8; 32]>,
+) -> Roster {
+    let resolved: Vec<FixtureDevice> = devices.iter().map(|label| device(label)).collect();
+    let approver = resolved
+        .first()
+        .expect("a roster names an approving device");
+    let certs = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, dev)| {
+            let flags = if index == 0 {
+                DEVICE_CERT_FLAG_ROSTER_SIGNING
+            } else {
+                0
+            };
+            cert(dev, flags, &ROOT_SK)
+        })
+        .collect();
+    let signer = signer_sk.unwrap_or(if version.seq == 0 {
+        ROOT_SK
+    } else {
+        approver.sign_sk
+    });
+    core_sign_roster(
+        Roster {
+            person_id: person_id(),
+            recovery_epoch: version.recovery_epoch,
+            seq: version.seq,
+            devices: certs,
+            tombstones: tombstones
+                .iter()
+                .map(|label| DeviceTombstone {
+                    device_id: device(label).device_id,
+                    revoked_at_seq: version.seq,
+                })
+                .collect(),
+            approving_device_id: approver.device_id.clone(),
+            inbox_key_generation,
+            signer_sign_pk: Vec::new(),
+            signature: Vec::new(),
+        },
+        signer.to_vec(),
+    )
+    .expect("roster signs")
+}
+
+/// A store that already knows the fixture person as a contact — the only
+/// precondition `apply_contact_roster` has, since a roster about a stranger is
+/// not this device's business (DL-3).
+fn roster_store() -> MessageStore {
+    let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+    store
+        .upsert_contact(roster_contact())
+        .expect("the fixture person is a contact");
+    store
+}
+
+/// The message this device would store for a body it just opened.
+///
+/// Every field is read off the decoded body rather than restated from the
+/// constants that produced it: these vectors are about what survives the wire,
+/// and a row assembled from what the test already believes would be asserting
+/// against its own expectations. `chat_id` is the deliberate exception —
+/// DELIVER-01 pins a pairwise row to its *verified sender's* thread, never to
+/// the `chat_id` the sender wrote — so it comes from the verified sender.
+fn stored_message(sender_user_id: &[u8], decoded: &ExtendedMessageBody) -> StoredMessage {
+    StoredMessage {
+        chat_id: sender_user_id.to_vec(),
+        sender_user_id: sender_user_id.to_vec(),
+        lamport: decoded.lamport,
+        timestamp: decoded.timestamp,
+        kind: decoded.kind,
+        payload: decoded.content.clone(),
+        sender_device_id: core_device_stream_id(decoded.sender_device_id.clone()),
+    }
+}
+
+/// Author one body, seal it to `recipient`, open it, and hand back what the
+/// open path decoded. This is the real §5 wire path — the same
+/// `encode → seal_message → open_message → decode_extended_message_body` a
+/// delivery runs — so a device id that survives it survived everything the
+/// envelope does to it.
+fn round_trip_body(
+    sender: &Identity,
+    recipient: &Identity,
+    lamport: u64,
+    sender_device_id: Option<Vec<u8>>,
+) -> ExtendedMessageBody {
+    let body = MessageBody {
+        kind: KIND_TEXT,
+        chat_id: sender.user_id.clone(),
+        lamport,
+        timestamp: NOW_MS,
+        content: b"one person, one or more devices".to_vec(),
+    };
+    let payload = match sender_device_id {
+        // The legacy encoder, byte for byte: no extension bytes at all.
+        None => encode_message_body(body).expect("legacy body encodes"),
+        Some(device_id) => encode_message_body_extended(body, None, Some(device_id), None)
+            .expect("device-stamped body encodes"),
+    };
+    let sealed = seal_message(sender.clone(), recipient.agree_pk.clone(), payload).expect("seals");
+    let opened = open_message(recipient.clone(), sealed).expect("opens");
+    decode_extended_message_body(opened.payload).expect("decodes")
 }
 
 fn relay_item(
@@ -625,41 +994,678 @@ fn drive(vector: &Vector) -> Option<Outcome> {
     }
 
     let outcome = match vector.scenario {
+        // DL-1 ordering, driven end to end: every document below is really
+        // signed, and `apply_contact_roster` is the production entry point --
+        // `core_roster_accept` plus the `contact_rosters` / `contact_devices`
+        // tables that must agree with its verdict.
+        Scenario::RosterUpdate { stored, incoming } => {
+            let store = roster_store();
+            let devices: &[&[u8]] = &[b"alice-phone-device-key"];
+            let stored_doc = roster_at(stored, devices, &[], 0);
+            let first = store
+                .apply_contact_roster(stored_doc.clone())
+                .expect("the stored roster applies");
+            contract_assert!(
+                vector.id,
+                first.outcome == RosterUpdateOutcome::Accepted
+                    && first.reason == RosterUpdateReason::FirstRoster,
+                "the stored roster must be the one this contact holds, got {first:?}"
+            );
+
+            let incoming_doc = roster_at(incoming, devices, &[], 0);
+            let decision = store
+                .apply_contact_roster(incoming_doc.clone())
+                .expect("the incoming roster applies");
+            // The rule to expect is read off the fixture's own versions, never
+            // off `target_outcome` -- otherwise the driver would be agreeing
+            // with the answer key instead of with the core.
+            let expected_reason = match (incoming.recovery_epoch, incoming.seq)
+                .cmp(&(stored.recovery_epoch, stored.seq))
+            {
+                std::cmp::Ordering::Greater => RosterUpdateReason::Superseded,
+                std::cmp::Ordering::Equal => RosterUpdateReason::IdempotentRepeat,
+                std::cmp::Ordering::Less => RosterUpdateReason::Rollback,
+            };
+            contract_assert!(
+                vector.id,
+                decision.reason == expected_reason,
+                "DL-1 named the wrong rule: {decision:?}"
+            );
+            let held = store
+                .contact_roster_state(person_id())
+                .expect("stored roster state")
+                .roster;
+            let expected_held = if decision.outcome == RosterUpdateOutcome::Accepted {
+                &incoming_doc
+            } else {
+                &stored_doc
+            };
+            contract_assert!(
+                vector.id,
+                held.as_ref() == Some(expected_held),
+                "the persisted roster must be the one the decision named"
+            );
+            roster_outcome(decision.outcome)
+        }
+        // DL-1's second half: a strictly higher version whose device
+        // certificate was signed by a key this person never vouched for.
+        Scenario::RosterSignatureChain {
+            stored,
+            incoming,
+            chain_verifies_to_person_root,
+        } => {
+            contract_assert!(
+                vector.id,
+                !chain_verifies_to_person_root,
+                "the chain vector is the one whose chain does not verify"
+            );
+            let store = roster_store();
+            let devices: &[&[u8]] = &[b"alice-phone-device-key"];
+            let stored_doc = roster_at(stored, devices, &[], 0);
+            store
+                .apply_contact_roster(stored_doc.clone())
+                .expect("the stored roster applies");
+
+            let approver = device(b"alice-phone-device-key");
+            let mut forged = roster_at(incoming, devices, &[], 0);
+            forged.devices = vec![cert(
+                &approver,
+                DEVICE_CERT_FLAG_ROSTER_SIGNING,
+                &STRANGER_SK,
+            )];
+            // Re-signed by the person root, so nothing but the certificate's
+            // own authorizer is wrong: version ordering and the document
+            // signature both pass, and the chain rule is what refuses it.
+            let forged = core_sign_roster(forged, ROOT_SK.to_vec()).expect("forged roster signs");
+            let decision = store
+                .apply_contact_roster(forged)
+                .expect("the forged roster applies");
+            contract_assert!(
+                vector.id,
+                decision.rejection == Some(RosterRejection::ChainBroken),
+                "an unvouched certificate signer must break the chain, got {decision:?}"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_roster_state(person_id())
+                    .expect("stored roster state")
+                    .roster
+                    .as_ref()
+                    == Some(&stored_doc),
+                "a higher version that does not verify must not replace what is stored"
+            );
+            roster_outcome(decision.outcome)
+        }
+        // DL-2: one version, two documents.
+        Scenario::RosterFork {
+            version,
+            stored_content,
+            incoming_content,
+        } => {
+            let store = roster_store();
+            let stored_doc = roster_at(version, &[stored_content], &[], 0);
+            let incoming_doc = roster_at(version, &[incoming_content], &[], 0);
+            contract_assert!(
+                vector.id,
+                stored_doc != incoming_doc && stored_doc.version() == incoming_doc.version(),
+                "a fork is two different documents at one version"
+            );
+            store
+                .apply_contact_roster(stored_doc.clone())
+                .expect("the stored roster applies");
+            let decision = store
+                .apply_contact_roster(incoming_doc)
+                .expect("the forked roster applies");
+            contract_assert!(
+                vector.id,
+                decision.reason == RosterUpdateReason::ForkedContent && decision.quarantined,
+                "equal version plus different content is a fork, got {decision:?}"
+            );
+            let state = store
+                .contact_roster_state(person_id())
+                .expect("stored roster state");
+            contract_assert!(
+                vector.id,
+                state.quarantined && state.roster.as_ref() == Some(&stored_doc),
+                "DL-2 keeps the stored roster and records the quarantine"
+            );
+            roster_outcome(decision.outcome)
+        }
+        // DL-2's follow-on: quarantine is sticky, and a later good roster is
+        // not a resolution.
+        Scenario::RosterUpdateAfterFork {
+            quarantined_at,
+            incoming,
+            incoming_is_strictly_higher,
+            auto_resolves,
+        } => {
+            contract_assert!(
+                vector.id,
+                incoming_is_strictly_higher && !auto_resolves,
+                "the fixture is a strictly higher roster that must not auto-resolve"
+            );
+            let store = roster_store();
+            let stored_doc = roster_at(quarantined_at, &[b"approved-device-a"], &[], 0);
+            store
+                .apply_contact_roster(stored_doc.clone())
+                .expect("the stored roster applies");
+            let fork = store
+                .apply_contact_roster(roster_at(quarantined_at, &[b"approved-device-b"], &[], 0))
+                .expect("the forked roster applies");
+            contract_assert!(
+                vector.id,
+                fork.outcome == RosterUpdateOutcome::ForkQuarantined,
+                "the fork must quarantine before the follow-on is meaningful"
+            );
+
+            let later = roster_at(incoming, &[b"approved-device-a"], &[], 0);
+            contract_assert!(
+                vector.id,
+                core_roster_validate(later.clone(), person_root_sign_pk()).is_none(),
+                "the follow-on roster must be valid on its own terms"
+            );
+            let decision = store
+                .apply_contact_roster(later)
+                .expect("the later roster applies");
+            contract_assert!(
+                vector.id,
+                decision.reason == RosterUpdateReason::PersonQuarantined && decision.quarantined,
+                "a quarantined person's later rosters stay quarantined, got {decision:?}"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_roster_state(person_id())
+                    .expect("stored roster state")
+                    .roster
+                    .as_ref()
+                    == Some(&stored_doc),
+                "the pre-fork roster is what this device keeps holding"
+            );
+            roster_outcome(decision.outcome)
+        }
+        // DL-4: a revoked device id never returns, in either of the two shapes
+        // a returning device could take.
+        Scenario::RosterTombstonedDeviceReturns {
+            version,
+            tombstoned_device_id,
+            returning_device_id,
+        } => {
+            contract_assert!(
+                vector.id,
+                tombstoned_device_id == returning_device_id,
+                "this vector is the same key trying to come back"
+            );
+            let epoch = version.recovery_epoch;
+            let store = roster_store();
+            store
+                .apply_contact_roster(roster_at(
+                    RosterVersion {
+                        recovery_epoch: epoch,
+                        seq: 0,
+                    },
+                    &[b"alice-phone-device-key", tombstoned_device_id],
+                    &[],
+                    0,
+                ))
+                .expect("genesis applies");
+            // §10: the revocation buries the device and bumps the inbox key
+            // generation.
+            let revocation = store
+                .apply_contact_roster(roster_at(
+                    version,
+                    &[b"alice-phone-device-key"],
+                    &[tombstoned_device_id],
+                    1,
+                ))
+                .expect("the revocation applies");
+            contract_assert!(
+                vector.id,
+                revocation.outcome == RosterUpdateOutcome::Accepted,
+                "the revocation itself must be accepted, got {revocation:?}"
+            );
+
+            let next = RosterVersion {
+                recovery_epoch: epoch,
+                seq: version.seq + 1,
+            };
+            // Shape one: listed as active while still tombstoned.
+            let listed_again = store
+                .apply_contact_roster(roster_at(
+                    next,
+                    &[b"alice-phone-device-key", returning_device_id],
+                    &[returning_device_id],
+                    1,
+                ))
+                .expect("the resurrection applies");
+            contract_assert!(
+                vector.id,
+                listed_again.rejection == Some(RosterRejection::TombstonedDeviceActive),
+                "a tombstoned device may not also be active, got {listed_again:?}"
+            );
+            // Shape two: the tombstone quietly dropped, so the device looks
+            // new again. Only the stored roster remembers.
+            let decision = store
+                .apply_contact_roster(roster_at(
+                    next,
+                    &[b"alice-phone-device-key", returning_device_id],
+                    &[],
+                    1,
+                ))
+                .expect("the forgetful roster applies");
+            contract_assert!(
+                vector.id,
+                decision.reason == RosterUpdateReason::TombstoneResurrected,
+                "forgetting a burial is not a later version, got {decision:?}"
+            );
+            contract_assert!(
+                vector.id,
+                listed_again.outcome == RosterUpdateOutcome::Ignored
+                    && decision.outcome == RosterUpdateOutcome::Ignored,
+                "neither shape of a returning device may be accepted"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_device_state(person_id(), device(returning_device_id).device_id)
+                    .expect("device state")
+                    == ContactDeviceState::Revoked,
+                "the buried device stays buried"
+            );
+            Outcome::TombstonePermanent
+        }
+        // DL-4's other half: the hardware may come back, the key may not.
+        Scenario::RosterRelinkFreshKey {
+            version,
+            tombstoned_device_id,
+            replacement_device_id,
+        } => {
+            let tombstoned = device(tombstoned_device_id);
+            let replacement = device(replacement_device_id);
+            contract_assert!(
+                vector.id,
+                tombstoned.device_id != replacement.device_id,
+                "re-linking must mint a fresh key, not reuse the buried one"
+            );
+            let epoch = version.recovery_epoch;
+            let store = roster_store();
+            store
+                .apply_contact_roster(roster_at(
+                    RosterVersion {
+                        recovery_epoch: epoch,
+                        seq: 0,
+                    },
+                    &[b"alice-phone-device-key", tombstoned_device_id],
+                    &[],
+                    0,
+                ))
+                .expect("genesis applies");
+            store
+                .apply_contact_roster(roster_at(
+                    RosterVersion {
+                        recovery_epoch: epoch,
+                        seq: version.seq - 1,
+                    },
+                    &[b"alice-phone-device-key"],
+                    &[tombstoned_device_id],
+                    1,
+                ))
+                .expect("the revocation applies");
+
+            let decision = store
+                .apply_contact_roster(roster_at(
+                    version,
+                    &[b"alice-phone-device-key", replacement_device_id],
+                    &[tombstoned_device_id],
+                    1,
+                ))
+                .expect("the re-link applies");
+            contract_assert!(
+                vector.id,
+                decision.outcome == RosterUpdateOutcome::Accepted
+                    && decision.reason == RosterUpdateReason::Superseded,
+                "a fresh key beside the kept tombstone is an ordinary later roster, got {decision:?}"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_active_device_ids(person_id())
+                    .expect("active device ids")
+                    .contains(&replacement.device_id),
+                "the re-linked device must be active"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .contact_device_state(person_id(), tombstoned.device_id)
+                    .expect("device state")
+                    == ContactDeviceState::Revoked,
+                "the replaced key stays revoked"
+            );
+            Outcome::FreshKeyAccepted
+        }
+        // DL-5: a roster carries keys, ids, and counters. There is nowhere an
+        // endpoint could live, and the shape check is what makes that
+        // structural rather than conventional.
+        Scenario::RosterKeysNeverEndpoints { version, document } => {
+            let valid = roster_at(version, document.device_keys, document.tombstones, 0);
+            contract_assert!(
+                vector.id,
+                core_roster_validate(valid.clone(), person_root_sign_pk()).is_none(),
+                "a keys-and-tombstones document must be valid"
+            );
+            contract_assert!(
+                vector.id,
+                valid
+                    .devices
+                    .iter()
+                    .all(|cert| cert.device_sign_pk.len() == 32 && cert.device_agree_pk.len() == 32)
+                    && valid
+                        .tombstones
+                        .iter()
+                        .all(|tombstone| tombstone.device_id.len() == DEVICE_ID_LEN),
+                "every roster byte field is a fixed-width key or id"
+            );
+
+            // Try to smuggle an endpoint through each byte field that is not a
+            // counter. There is no field where it fits.
+            let endpoint = b"relay.example.com:8443".to_vec();
+            for smuggled in [
+                {
+                    let mut roster = valid.clone();
+                    roster.approving_device_id = endpoint.clone();
+                    roster
+                },
+                {
+                    let mut roster = valid.clone();
+                    roster.person_id = endpoint.clone();
+                    roster
+                },
+                {
+                    let mut roster = valid.clone();
+                    roster.devices[0].device_agree_pk = endpoint.clone();
+                    roster
+                },
+                {
+                    let mut roster = valid.clone();
+                    roster.tombstones[0].device_id = endpoint.clone();
+                    roster
+                },
+            ] {
+                let rejection = core_roster_validate(smuggled, person_root_sign_pk());
+                contract_assert!(
+                    vector.id,
+                    rejection == Some(RosterRejection::MalformedField),
+                    "an endpoint-shaped value must be refused by the shape check, got {rejection:?}"
+                );
+            }
+
+            // The honest limit of that gate, pinned so nobody reads the loop
+            // above as more than it is: an address padded to exactly the key
+            // width passes the shape check, because a fixed-width blob is
+            // indistinguishable from a key. What DL-5 rests on is that the
+            // width leaves no room for a *usable* free-form address and that
+            // nothing downstream ever reads these bytes as text -- so the
+            // smuggled value survives only as a key nobody can seal to, and
+            // the document it rides in still has to chain to the person root.
+            let mut padded = b"relay.example.com:8443".to_vec();
+            padded.resize(32, 0);
+            let mut correct_width = valid.clone();
+            correct_width.devices[0].device_agree_pk = padded.clone();
+            contract_assert!(
+                vector.id,
+                core_roster_validate(correct_width, person_root_sign_pk())
+                    == Some(RosterRejection::CertSignatureInvalid),
+                "a correct-width smuggle still has to survive the certificate signature"
+            );
+            // And re-signed, so the signature is not what stops it: the value
+            // is accepted, as a key. That is the residual DL-5 does not close,
+            // and it is bounded by there being nothing that reads it as a host.
+            let smuggler = device(document.device_keys[0]);
+            let mut resigned = valid.clone();
+            resigned.devices[0] = core_sign_device_cert(
+                DeviceCert {
+                    person_id: person_id(),
+                    device_sign_pk: smuggler.sign_pk.clone(),
+                    device_agree_pk: padded,
+                    added_epoch: 0,
+                    flags: DEVICE_CERT_FLAG_ROSTER_SIGNING,
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                ROOT_SK.to_vec(),
+            )
+            .expect("re-signed certificate");
+            let resigned = core_sign_roster(resigned, ROOT_SK.to_vec()).expect("roster re-signs");
+            contract_assert!(
+                vector.id,
+                core_roster_validate(resigned, person_root_sign_pk()).is_none(),
+                "the width check is a shape gate, not a content gate -- say so rather than \
+                 claiming endpoints are impossible"
+            );
+
+            let store = roster_store();
+            let decision = store
+                .apply_contact_roster(valid.clone())
+                .expect("the roster applies");
+            contract_assert!(
+                vector.id,
+                decision.outcome == RosterUpdateOutcome::Accepted
+                    && store
+                        .contact_roster_state(person_id())
+                        .expect("stored roster state")
+                        .roster
+                        .as_ref()
+                        == Some(&valid),
+                "what is stored is the same keys-only document"
+            );
+            Outcome::KeysOnlyNoEndpoints
+        }
+        // §14.2: the epoch belongs to the recovery material — the person root
+        // secret that lives only inside the encrypted `.cmbak`. What is driven
+        // here is the rule the code enforces: an approving device may not
+        // raise the epoch above a stored one. Where the secret *lives* is
+        // MD-RECOVERY-ROOT-CUSTODY's, and stays data-only.
+        Scenario::RecoveryEpochRequiresRoot {
+            version,
+            device_key_alone_can_mint_higher_epoch,
+        } => {
+            contract_assert!(
+                vector.id,
+                !device_key_alone_can_mint_higher_epoch,
+                "§14.2 epoch-rule fixture changed"
+            );
+            let store = roster_store();
+            let devices: &[&[u8]] = &[b"alice-phone-device-key"];
+            let previous = version.recovery_epoch - 1;
+            store
+                .apply_contact_roster(roster_at(
+                    RosterVersion {
+                        recovery_epoch: previous,
+                        seq: 0,
+                    },
+                    devices,
+                    &[],
+                    0,
+                ))
+                .expect("genesis applies");
+            let stored_doc = roster_at(
+                RosterVersion {
+                    recovery_epoch: previous,
+                    seq: 1,
+                },
+                devices,
+                &[],
+                0,
+            );
+            store
+                .apply_contact_roster(stored_doc.clone())
+                .expect("the approving device's ordinary roster applies");
+
+            // The approving device tries to mint the new epoch itself, in both
+            // shapes it could take.
+            let approver_sk = device(b"alice-phone-device-key").sign_sk;
+            let refused_genesis = store
+                .apply_contact_roster(roster_signed_by(
+                    version,
+                    devices,
+                    &[],
+                    0,
+                    Some(approver_sk),
+                ))
+                .expect("the device-signed epoch genesis applies");
+            contract_assert!(
+                vector.id,
+                refused_genesis.rejection == Some(RosterRejection::GenesisNotRootSigned),
+                "a new epoch's first roster must be root-signed, got {refused_genesis:?}"
+            );
+            let refused_later = store
+                .apply_contact_roster(roster_signed_by(
+                    RosterVersion {
+                        recovery_epoch: version.recovery_epoch,
+                        seq: 1,
+                    },
+                    devices,
+                    &[],
+                    0,
+                    Some(approver_sk),
+                ))
+                .expect("the device-signed epoch bump applies");
+            contract_assert!(
+                vector.id,
+                refused_later.reason == RosterUpdateReason::RecoveryEpochRequiresRoot,
+                "an approving device cannot raise the epoch, got {refused_later:?}"
+            );
+            contract_assert!(
+                vector.id,
+                refused_genesis.outcome == RosterUpdateOutcome::Ignored
+                    && refused_later.outcome == RosterUpdateOutcome::Ignored
+                    && store
+                        .contact_roster_state(person_id())
+                        .expect("stored roster state")
+                        .roster
+                        .as_ref()
+                        == Some(&stored_doc),
+                "a stolen approving device may not dethrone the backup"
+            );
+
+            let decision = store
+                .apply_contact_roster(roster_at(version, devices, &[], 0))
+                .expect("the recovery roster applies");
+            contract_assert!(
+                vector.id,
+                decision.outcome == RosterUpdateOutcome::Accepted
+                    && decision.reason == RosterUpdateReason::Superseded,
+                "only the root secret raises the epoch, got {decision:?}"
+            );
+            Outcome::EpochRequiresRootSignature
+        }
+        // §5: an envelope with no sealed-body device field -- which is every
+        // legacy sender, permanently -- lands on the reserved all-zero stream,
+        // through the real encode/seal/open/decode/insert path.
+        Scenario::LegacyEnvelopeWithoutDevice { legacy_device_id } => {
+            contract_assert!(
+                vector.id,
+                legacy_device_id == CORE_LEGACY_DEVICE_ID,
+                "core's reserved stream id must be the one this vector pins"
+            );
+            let sender = generate_identity();
+            let recipient = generate_identity();
+            let decoded = round_trip_body(&sender, &recipient, 7, None);
+            contract_assert!(
+                vector.id,
+                decoded.sender_device_id.is_none(),
+                "a legacy body carries no device field at all"
+            );
+            contract_assert!(
+                vector.id,
+                core_device_stream_id(decoded.sender_device_id.clone())
+                    == legacy_device_id.to_vec(),
+                "an absent device field maps onto the legacy stream"
+            );
+
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            let outcome = store
+                .insert_incoming_message_from_device(
+                    stored_message(&sender.user_id, &decoded),
+                    decoded.sender_device_id,
+                    vec![1; 16],
+                    None,
+                    None,
+                )
+                .expect("device-aware incoming insert");
+            contract_assert!(
+                vector.id,
+                outcome == IncomingMessageInsertOutcome::Inserted,
+                "the legacy row must insert, got {outcome:?}"
+            );
+            contract_assert!(
+                vector.id,
+                store
+                    .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+                    .expect("stream device ids")
+                    == vec![legacy_device_id.to_vec()],
+                "the row must land on the legacy stream and nowhere else"
+            );
+            Outcome::LegacyDeviceStream
+        }
+        // §5: two of one person's devices at one lamport are two streams, not
+        // a fork. Both bodies take the real wire path, because the device id
+        // has to survive the seal to be worth anything.
         Scenario::TwoDevicesSamePersonSameLamport {
             first_device_id,
             second_device_id,
         } => {
+            let first = device(first_device_id);
+            let second = device(second_device_id);
             contract_assert!(
                 vector.id,
-                first_device_id != second_device_id,
+                first.device_id != second.device_id,
                 "the scenario must name two distinct device ids"
             );
-            // §5: TODAY both device ids still map to the one legacy stream key
-            // `UNIQUE(chat_id, sender_user_id, lamport)`
-            // (`core/src/store.rs:8872`; the insert that trips it is at
-            // `core/src/store.rs:2338`). The two rows below differ only in the
-            // authoring device, which is exactly what today's key cannot see.
+            let sender = generate_identity();
+            let recipient = generate_identity();
             let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            for (index, authoring) in [&first, &second].iter().enumerate() {
+                let decoded =
+                    round_trip_body(&sender, &recipient, 7, Some(authoring.device_id.clone()));
+                contract_assert!(
+                    vector.id,
+                    decoded.sender_device_id.as_deref() == Some(authoring.device_id.as_slice()),
+                    "the authoring device must survive the seal"
+                );
+                let outcome = store
+                    .insert_incoming_message_from_device(
+                        stored_message(&sender.user_id, &decoded),
+                        decoded.sender_device_id,
+                        vec![index as u8 + 1; 16],
+                        None,
+                        None,
+                    )
+                    .expect("device-aware incoming insert");
+                contract_assert!(
+                    vector.id,
+                    outcome == IncomingMessageInsertOutcome::Inserted,
+                    "both sibling rows must insert, got {outcome:?} for device {index}"
+                );
+            }
+            contract_assert!(
+                vector.id,
+                !store.has_message_conflicts().expect("conflict diagnostic"),
+                "siblings at one lamport must not read as a fork"
+            );
+            let mut expected = vec![first.device_id, second.device_id];
+            expected.sort();
             contract_assert!(
                 vector.id,
                 store
-                    .insert_message(stored_message(first_device_id))
-                    .expect("first legacy-stream insert"),
-                "the first device row must insert"
+                    .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+                    .expect("stream device ids")
+                    == expected,
+                "the person must hold one stream per device"
             );
-            contract_assert!(
-                vector.id,
-                !store
-                    .insert_message(stored_message(second_device_id))
-                    .expect("second legacy-stream insert"),
-                "the shared legacy stream key must reject the sibling row"
-            );
-            contract_assert!(
-                vector.id,
-                store.has_message_conflicts().expect("conflict diagnostic"),
-                "the rejected sibling row must be conflict-quarantined"
-            );
-            Outcome::Quarantined
+            Outcome::SeparateStreams
         }
         Scenario::OwnDeviceFanoutConsumed => {
             // ACK-MD-1: this device successfully opened a row addressed to its
@@ -830,27 +1836,56 @@ fn drive(vector: &Vector) -> Option<Outcome> {
                 CAP_MULTI_DEVICE == 1 << 2,
                 "CAP_MULTI_DEVICE must retain its assigned bit"
             );
+            // §12: WPT reserved the bit, WP1 advertises it, and the claim is
+            // true -- MD-STREAM-LEGACY-ID and MD-STREAM-SIBLING-LAMPORT above
+            // drive the per-device streams this bit announces.
             contract_assert!(
                 vector.id,
-                core_own_capabilities() & CAP_MULTI_DEVICE == 0,
-                "CAP_MULTI_DEVICE remains reserved but unadvertised before WP1"
+                core_own_capabilities() & CAP_MULTI_DEVICE != 0,
+                "WP1 advertises CAP_MULTI_DEVICE through HELLO2"
             );
-            Outcome::ReservedNotAdvertised
+            Outcome::Advertised
         }
-        Scenario::RosterUpdate { .. }
-        | Scenario::RosterSignatureChain { .. }
-        | Scenario::RosterFork { .. }
-        | Scenario::RosterUpdateAfterFork { .. }
-        | Scenario::RosterTombstonedDeviceReturns { .. }
-        | Scenario::RosterRelinkFreshKey { .. }
-        | Scenario::RosterPairwiseGossipNoDirectory { .. }
-        | Scenario::RosterKeysNeverEndpoints { .. }
-        | Scenario::RecoveryAuthority { .. }
-        | Scenario::LegacyEnvelopeWithoutDevice { .. }
+        // §14.3, through the shipped cap policy rather than a copy of it.
+        Scenario::AddDevice {
+            resulting_device_count,
+        } => {
+            contract_assert!(
+                vector.id,
+                (DEVICE_SOFT_CAP, DEVICE_HARD_CAP) == (8, 16),
+                "the §14.3 caps are soft 8 / hard 16"
+            );
+            match core_device_add_outcome(u32::from(resulting_device_count)) {
+                DeviceAddOutcome::Added => Outcome::DeviceAdded,
+                DeviceAddOutcome::AddedWithWarning => Outcome::DeviceAddedWithWarning,
+                DeviceAddOutcome::Refused => Outcome::DeviceAddRefused,
+            }
+        }
+        // Still data-only, and each for a mechanism reason rather than a
+        // shrug: DL-3's roster gossip has no envelope kind to seal yet
+        // (WP4/WP5); §6's inbox key generations do not exist yet (WP2/WP5);
+        // first-contact anchoring has no second source of truth to check an
+        // adopted epoch against (WP5's recovery flow); and root-secret custody
+        // is WP3's, since nothing yet mints or stores a person root separately
+        // from the identity key. There is nothing real to execute.
+        Scenario::RosterPairwiseGossipNoDirectory { .. }
         | Scenario::StaleRosterSealing { .. }
-        | Scenario::AddDevice { .. } => unreachable!("unimplemented vector ran"),
+        | Scenario::RosterFirstContactAnchor { .. }
+        | Scenario::RecoveryRootCustody { .. } => {
+            unreachable!("unimplemented vector ran")
+        }
     };
     Some(outcome)
+}
+
+/// Map the shipped roster verdict onto this file's vocabulary. A driver arm
+/// returns what core decided, never what the vector hoped for.
+fn roster_outcome(outcome: RosterUpdateOutcome) -> Outcome {
+    match outcome {
+        RosterUpdateOutcome::Accepted => Outcome::Accepted,
+        RosterUpdateOutcome::Ignored => Outcome::Ignored,
+        RosterUpdateOutcome::ForkQuarantined => Outcome::ForkQuarantined,
+    }
 }
 
 /// Every vector's target outcome is pinned exactly once, in order. Flipping
@@ -980,10 +2015,13 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                 "DL-3 roster gossip is pairwise-sealed and directory-free"
             ),
             Scenario::RosterKeysNeverEndpoints { version, document } => {
-                // The fixture type itself is the assertion: `RosterDocument`
-                // has device keys and tombstones and no field an endpoint
-                // could live in. WP1's real `Roster` must keep endpoints
-                // structurally impossible, not merely omitted.
+                // `RosterDocument` has device keys and tombstones and no field
+                // an endpoint could live in -- but it is a fixture, and the
+                // real `Roster` is all `Vec<u8>`. The enforced invariant is
+                // the one the driver exercises: `core_roster_validate`'s
+                // fixed-width check is the single gate, and it is what keeps a
+                // free-form address out. The data here pins the fixture's
+                // shape; the driver pins the gate, including its limit.
                 contract_assert!(
                     vector.id,
                     (version.recovery_epoch, version.seq) == (2, 4)
@@ -996,16 +2034,31 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                     "DL-5 roster fixture must list device keys and tombstones, disjointly"
                 );
             }
-            Scenario::RecoveryAuthority {
+            Scenario::RosterFirstContactAnchor {
+                adopted,
+                stored_baseline_exists,
+                signed_by_approving_device,
+            } => contract_assert!(
+                vector.id,
+                !stored_baseline_exists && signed_by_approving_device && adopted.recovery_epoch > 0,
+                "the first-contact vector is an adoption with no baseline, at a raised epoch"
+            ),
+            Scenario::RecoveryEpochRequiresRoot {
                 version,
-                root_secret_only_in_encrypted_backup,
                 device_key_alone_can_mint_higher_epoch,
             } => contract_assert!(
                 vector.id,
                 (version.recovery_epoch, version.seq) == (3, 0)
-                    && root_secret_only_in_encrypted_backup
                     && !device_key_alone_can_mint_higher_epoch,
-                "§3 / §14.2 recovery authority fixture changed"
+                "§14.2 epoch-rule fixture changed"
+            ),
+            Scenario::RecoveryRootCustody {
+                root_secret_only_in_encrypted_backup,
+                device_keypair_can_carry_root_secret,
+            } => contract_assert!(
+                vector.id,
+                root_secret_only_in_encrypted_backup && !device_keypair_can_carry_root_secret,
+                "§3 / §14.2 root-secret custody fixture changed"
             ),
             Scenario::LegacyEnvelopeWithoutDevice { legacy_device_id } => contract_assert!(
                 vector.id,
@@ -1069,12 +2122,15 @@ fn divergence_ledger_is_derived_from_driver_results() {
                 .and_then(|current| (current != vector.target_outcome).then_some(vector.id))
         })
         .collect();
+    // WP1 closed two of these. `MD-STREAM-SIBLING-LAMPORT` closed because the
+    // stream key really gained its device dimension, and
+    // `MD-CAPABILITY-RESERVED` because the bit is really advertised. What is
+    // left is exactly WP2's list: acks are still planned per person rather
+    // than per device namespace.
     let expected = [
-        "MD-STREAM-SIBLING-LAMPORT",
         "MD-ACK-SIBLING-FANOUT",
         "MD-ACK-LEGACY-PERSON-ROW",
         "MD-ACK-CARRIED-DIGEST-PROOF",
-        "MD-CAPABILITY-RESERVED",
     ];
     assert_eq!(
         actual, expected,
@@ -1089,27 +2145,19 @@ fn unimplemented_vector_ledger_is_deliberate() {
         .filter(|vector| !vector.implemented)
         .map(|vector| vector.id)
         .collect();
+    // Four left after WP1, each waiting on a mechanism rather than on effort:
+    // DL-3's roster gossip needs an envelope kind to seal (WP4/WP5); §6's
+    // stale-roster sealing needs inbox key generations (WP2/WP5); first-contact
+    // anchoring needs a second source of truth about a person's epoch, which is
+    // WP5's recovery flow; and root-secret custody needs the person root to be
+    // minted and stored separately from the identity key, which is WP3's.
+    // Driving any of them today would mean writing a test-only stand-in and
+    // calling it core, which is the one thing this ledger exists to prevent.
     let expected = [
-        "MD-ROSTER-GREATER",
-        "MD-ROSTER-LOWER",
-        "MD-ROSTER-EQUAL",
-        "MD-ROSTER-SAME-EPOCH-ADVANCE",
-        "MD-ROSTER-SAME-EPOCH-ROLLBACK",
-        "MD-ROSTER-CHAIN-BROKEN",
-        "MD-ROSTER-FORK",
-        "MD-ROSTER-FORK-QUARANTINE-PERSISTS",
-        "MD-ROSTER-TOMBSTONE",
-        "MD-ROSTER-RELINK-FRESH-KEY",
         "MD-ROSTER-PAIRWISE-GOSSIP",
-        "MD-ROSTER-KEYS-NOT-ENDPOINTS",
-        "MD-RECOVERY-BACKUP-AUTHORITY",
-        "MD-STREAM-LEGACY-ID",
+        "MD-ROSTER-FIRST-CONTACT-ANCHOR",
+        "MD-RECOVERY-ROOT-CUSTODY",
         "MD-SEAL-STALE-ROSTER",
-        "MD-DEVICE-CAP-7",
-        "MD-DEVICE-CAP-8",
-        "MD-DEVICE-CAP-9",
-        "MD-DEVICE-CAP-16",
-        "MD-DEVICE-CAP-17",
     ];
     assert_eq!(
         actual, expected,

@@ -161,6 +161,7 @@ import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.VoiceCaptureEffect
 import uniffi.cruisemesh_core.VoiceCapturePhase
 import uniffi.cruisemesh_core.coreContactDisplayName
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 import uniffi.cruisemesh_core.formatUserId
 import uniffi.cruisemesh_core.voiceCaptureBytes
 import uniffi.cruisemesh_core.voiceCaptureCancel
@@ -2321,10 +2322,10 @@ private fun ConversationScreenPreview() {
             ),
             ownUserId = ownUserId,
             messages = listOf(
-                StoredMessage(mayaId, mayaId, 1uL, 1_783_608_000_000L, 1u.toUByte(), "Boarding now".toByteArray()),
-                StoredMessage(mayaId, mayaId, 2uL, 1_783_608_090_000L, 1u.toUByte(), "Deck 9 looks quiet".toByteArray()),
-                StoredMessage(ownUserId, mayaId, 3uL, 1_783_608_340_000L, 1u.toUByte(), "On my way".toByteArray()),
-                StoredMessage(ownUserId, mayaId, 4uL, 1_783_608_420_000L, 1u.toUByte(), "Save me a seat".toByteArray()),
+                StoredMessage(mayaId, mayaId, 1uL, 1_783_608_000_000L, 1u.toUByte(), "Boarding now".toByteArray(), coreLegacyDeviceId()),
+                StoredMessage(mayaId, mayaId, 2uL, 1_783_608_090_000L, 1u.toUByte(), "Deck 9 looks quiet".toByteArray(), coreLegacyDeviceId()),
+                StoredMessage(ownUserId, mayaId, 3uL, 1_783_608_340_000L, 1u.toUByte(), "On my way".toByteArray(), coreLegacyDeviceId()),
+                StoredMessage(ownUserId, mayaId, 4uL, 1_783_608_420_000L, 1u.toUByte(), "Save me a seat".toByteArray(), coreLegacyDeviceId()),
             ),
             deliveredThrough = 4uL,
             readThrough = 3uL,

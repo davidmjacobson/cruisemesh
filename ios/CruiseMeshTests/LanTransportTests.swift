@@ -309,7 +309,8 @@ final class LanTransportTests: XCTestCase {
             lamport: 4,
             timestamp: timestamp,
             kind: ProtocolKind.text,
-            payload: Data("hello".utf8)
+            payload: Data("hello".utf8),
+            senderDeviceId: coreLegacyDeviceId()
         )
         let direct = MessageArrival(transport: 3, hopsTaken: 0, receivedAt: timestamp)
 

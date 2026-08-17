@@ -15,7 +15,7 @@ use crate::{
     OutgoingReceiptEnvelope, ReceiptContent, StoredMessage, DEFAULT_HOP_TTL,
     KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
     KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
+    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LEGACY_DEVICE_ID,
     RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 
@@ -72,6 +72,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind,
             payload,
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let envelope = build_pairwise_envelope(
             identity,
@@ -264,6 +265,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind,
             payload,
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let body = encoded_body(&message, group.id.clone(), reply_to_msg_id.as_deref())?;
         let msg_id = generate_msg_id();
@@ -328,6 +330,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind: KIND_GROUP_METADATA_UPDATE,
             payload,
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let body = encoded_body(&message, group.id.clone(), None)?;
         let msg_id = generate_msg_id();
@@ -377,6 +380,7 @@ impl MessageStore {
             timestamp: display_ts,
             kind: KIND_GROUP_INVITE,
             payload: invite,
+            sender_device_id: LEGACY_DEVICE_ID.to_vec(),
         };
         let mut authored_invites = Vec::new();
         for member in members {
@@ -881,18 +885,28 @@ fn build_pairwise_envelope(
 ///
 /// A row authored before the column existed has no id. It gets one, written
 /// back in the same transaction so the identity is stable from then on.
+///
+/// §5: both statements are scoped to this device's own authoring stream, named
+/// explicitly the way `outgoing_message_reference::insert` names it. Locally
+/// authored rows live on [`LEGACY_DEVICE_ID`] until WP3/WP4 mint a device
+/// identity; leaving the scope off would let a sibling's row at the same
+/// lamport answer the SELECT, and would let the UPDATE stamp this device's
+/// fresh `msg_id` onto a message this device never authored.
 fn stable_backfill_msg_id(
     tx: &Transaction<'_>,
     message: &StoredMessage,
 ) -> Result<Vec<u8>, CoreError> {
+    let sender_device_id = &LEGACY_DEVICE_ID[..];
     let stored: Option<Vec<u8>> = tx
         .query_row(
             "SELECT msg_id FROM messages
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3",
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+               AND sender_device_id = ?4",
             params![
                 message.chat_id,
                 message.sender_user_id,
-                message.lamport as i64
+                message.lamport as i64,
+                sender_device_id
             ],
             |row| row.get::<_, Option<Vec<u8>>>(0),
         )
@@ -906,12 +920,14 @@ fn stable_backfill_msg_id(
     let msg_id = generate_msg_id();
     tx.execute(
         "UPDATE messages SET msg_id = ?4
-         WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3 AND msg_id IS NULL",
+         WHERE chat_id = ?1 AND sender_user_id = ?2 AND lamport = ?3
+           AND sender_device_id = ?5 AND msg_id IS NULL",
         params![
             message.chat_id,
             message.sender_user_id,
             message.lamport as i64,
-            msg_id
+            msg_id,
+            sender_device_id
         ],
     )
     .map_err(store_err)?;
@@ -1147,6 +1163,7 @@ mod tests {
                 timestamp: his_clock,
                 kind: KIND_TEXT,
                 payload: b"are you there?".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
 
@@ -1203,6 +1220,7 @@ mod tests {
                 timestamp: now - 60_000,
                 kind: KIND_TEXT,
                 payload: b"hi".to_vec(),
+                sender_device_id: LEGACY_DEVICE_ID.to_vec(),
             })
             .unwrap();
         let authored = store

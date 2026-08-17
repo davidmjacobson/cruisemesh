@@ -197,7 +197,8 @@ enum UITestConfiguration {
                 lamport: lamport,
                 timestamp: 1_700_000_000_000 + Int64(lamport) * 1_000,
                 kind: ProtocolKind.attachmentManifest,
-                payload: payload.encode()
+                payload: payload.encode(),
+                senderDeviceId: coreLegacyDeviceId()
             ))
         } catch {
             preconditionFailure("Could not seed UI-test voice message: \(error)")
@@ -217,7 +218,8 @@ enum UITestConfiguration {
                 lamport: lamport,
                 timestamp: 1_700_000_000_000 + Int64(lamport) * 1_000,
                 kind: ProtocolKind.text,
-                payload: Data(text.utf8)
+                payload: Data(text.utf8),
+                senderDeviceId: coreLegacyDeviceId()
             ))
         } catch {
             preconditionFailure("Could not seed UI-test message: \(error)")

@@ -102,7 +102,8 @@ final class ReplyMessagingTests: XCTestCase {
             lamport: 1,
             timestamp: 1,
             kind: ProtocolKind.attachmentManifest,
-            payload: photo.encode()
+            payload: photo.encode(),
+            senderDeviceId: coreLegacyDeviceId()
         )
         XCTAssertEqual(quotedMessageText(message), "📷 pool deck")
     }

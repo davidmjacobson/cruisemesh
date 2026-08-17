@@ -41,7 +41,9 @@
 //! 19+N    4     content_len     (u32 BE)
 //! 23+N    M     content         (M = content_len bytes)
 //! then, zero or more private extensions:
-//!         1     extension_type  (u8; 1 = reply-to msg_id)
+//!         1     extension_type  (u8; 1 = reply-to msg_id,
+//!                               0x20 = sender_device_id,
+//!                               0x21 = sender roster head)
 //!         2     extension_len   (u16 BE)
 //!         X     extension_value (X = extension_len bytes)
 //! ```
@@ -59,6 +61,14 @@
 //! fields; [`decode_extended_message_body`] also surfaces known extensions.
 //! The reply-to extension is a 16-byte envelope `msg_id` inside the signed
 //! and sealed payload, so public headers reveal no conversation linkage.
+//!
+//! The multi-device fields (`specs/multi-device-v1.md` §5) ride here for the
+//! same reason: the envelope's **public header layout is unchanged**, so a
+//! legacy peer sees bytes indistinguishable from today's, while the authoring
+//! device and the sender's roster head stay inside the seal where only the
+//! recipient reads them. Their absence is not an error and never will be — it
+//! maps to [`crate::LEGACY_DEVICE_ID`], the one stream every v1 peer and every
+//! pre-migration row already lives on.
 //!
 //! ## Receipts (DESIGN.md §7.2)
 //!
@@ -248,6 +258,7 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
+use crate::device_roster::{DEVICE_ID_LEN, ROSTER_HEAD_HASH_LEN};
 use crate::identity::derive_user_id;
 use crate::limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 use crate::store::DigestEntry;
@@ -343,17 +354,29 @@ pub const CAP_ACKS_HIDDEN_KINDS: u32 = 1;
 /// mixed-version resend chatter HELLO2 was introduced to end.
 pub const CAP_RELAY_UPDATE: u32 = 1 << 1;
 
-/// Capability bit reserved for multi-device (`specs/multi-device-v1.md` §12).
-/// Not advertised until the identity split ships (WP1+). Defined here so the
-/// bit assignment cannot drift, and so WPT can pin that an unknown future
-/// bit on a peer is ignored rather than treated as a parse failure.
+/// Capability bit for multi-device (`specs/multi-device-v1.md` §12). WPT
+/// reserved it so the assignment could not drift and so an unknown future bit
+/// on a peer was pinned as ignorable; WP1 flips the advertisement.
+///
+/// What this bit truthfully claims, and no more: this build understands §5's
+/// per-device author streams — it reads the sealed-body `sender_device_id`,
+/// keeps each of a person's devices on its own stream, and maps an absent
+/// field onto `LEGACY_DEVICE_ID`. It does NOT claim per-device relay fan-out
+/// or the ACK-MD rules; those are WP2's, and nothing a peer does with this bit
+/// may assume them. Legacy HELLO (frame 0x03) is untouched and never grows a
+/// field — the bit rides HELLO2's frame 0x06 only.
+///
+/// The claim is about the store's stream model, which every path shares. A
+/// receive path that has not yet adopted the device-aware insert files its
+/// peers on the legacy stream — the same conservative one-device view a v1
+/// build has, never a wrong stream and never a dropped message.
 pub const CAP_MULTI_DEVICE: u32 = 1 << 2;
 
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
 #[uniffi::export]
 pub fn core_own_capabilities() -> u32 {
-    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE
+    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE | CAP_MULTI_DEVICE
 }
 
 /// The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
@@ -414,6 +437,17 @@ const MAX_LAN_HOST_BYTES: usize = u8::MAX as usize;
 /// host ("fe80::1%wlan0"). Real interface names are far shorter.
 const MAX_LAN_HOST_ZONE_BYTES: usize = 32;
 const MESSAGE_EXTENSION_REPLY_TO_MSG_ID: u8 = 1;
+/// §5: the 16-byte id of the device that authored this body, the device
+/// dimension of the stream key `(chat_id, sender_person_id, sender_device_id,
+/// lamport)`. Type `0x20` is the id WPT's tolerance test already earmarked for
+/// it, so a build in the field has been skipping exactly this byte since before
+/// it meant anything.
+const MESSAGE_EXTENSION_SENDER_DEVICE_ID: u8 = 0x20;
+/// §12: BLAKE2b-256 of the sender's current roster — the same digest a
+/// `CMFRIEND4:` card carries. A recipient whose stored roster head differs
+/// knows it is behind and can ask for the roster; it is a reference, never the
+/// document, so an envelope never grows by a device list.
+const MESSAGE_EXTENSION_SENDER_ROSTER_HEAD: u8 = 0x21;
 /// Milliseconds in a day, for the [`compute_recipient_hint`] daily-rotating
 /// salt. `pub` (not just `const`) so `engine.rs`'s D2 mule-drain-confirm
 /// hint window can reuse the same constant instead of re-deriving it --
@@ -456,6 +490,14 @@ pub struct ExtendedMessageBody {
     pub timestamp: i64,
     pub content: Vec<u8>,
     pub reply_to_msg_id: Option<Vec<u8>>,
+    /// §5: the authoring device, or `None` for every legacy sender. `None` is
+    /// the permanent, expected case for a v1 peer — map it with
+    /// [`crate::core_device_stream_id`] rather than treating it as missing
+    /// data.
+    pub sender_device_id: Option<Vec<u8>>,
+    /// §12: the sender's roster head at authoring time, or `None`. Purely
+    /// informational to WP1: nothing here fetches a roster yet.
+    pub sender_roster_head: Option<Vec<u8>>,
 }
 
 /// Encode a [`MessageBody`] to its wire form (see module docs for layout).
@@ -485,16 +527,78 @@ pub fn encode_message_body_with_reply(
     body: MessageBody,
     reply_to_msg_id: Vec<u8>,
 ) -> Result<Vec<u8>, CoreError> {
-    if reply_to_msg_id.len() != MSG_ID_LEN {
+    encode_message_body_extended(body, Some(reply_to_msg_id), None, None)
+}
+
+/// Encode a message body with any combination of the private extensions,
+/// including the multi-device ones (`specs/multi-device-v1.md` §5, §12).
+///
+/// Passing `None` for `sender_device_id` emits no device TLV at all, which is
+/// byte-for-byte what every build in the field emits today and what a recipient
+/// maps onto [`crate::LEGACY_DEVICE_ID`]. That is the WP1 default: a device may
+/// not claim a device id before it has one, and §9.4's two-phase activation
+/// says a device authors nothing until the roster that names it is
+/// acknowledged, so the authoring call sites start passing a real id in the
+/// work package that mints one.
+#[uniffi::export]
+pub fn encode_message_body_extended(
+    body: MessageBody,
+    reply_to_msg_id: Option<Vec<u8>>,
+    sender_device_id: Option<Vec<u8>>,
+    sender_roster_head: Option<Vec<u8>>,
+) -> Result<Vec<u8>, CoreError> {
+    let mut out = encode_message_body(body)?;
+    // Extension order is fixed here so one body always encodes to one byte
+    // string; the decoder accepts any order, because a peer's encoder is not
+    // ours to constrain.
+    if let Some(reply_to_msg_id) = reply_to_msg_id {
+        push_extension(
+            &mut out,
+            MESSAGE_EXTENSION_REPLY_TO_MSG_ID,
+            &reply_to_msg_id,
+            MSG_ID_LEN,
+            "reply_to_msg_id",
+        )?;
+    }
+    if let Some(sender_device_id) = sender_device_id {
+        push_extension(
+            &mut out,
+            MESSAGE_EXTENSION_SENDER_DEVICE_ID,
+            &sender_device_id,
+            DEVICE_ID_LEN,
+            "sender_device_id",
+        )?;
+    }
+    if let Some(sender_roster_head) = sender_roster_head {
+        push_extension(
+            &mut out,
+            MESSAGE_EXTENSION_SENDER_ROSTER_HEAD,
+            &sender_roster_head,
+            ROSTER_HEAD_HASH_LEN,
+            "sender_roster_head",
+        )?;
+    }
+    Ok(out)
+}
+
+/// Append one fixed-width extension TLV, refusing a value of the wrong width
+/// rather than emitting a field a recipient would have to reject.
+fn push_extension(
+    out: &mut Vec<u8>,
+    extension_type: u8,
+    value: &[u8],
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CoreError> {
+    if value.len() != expected_len {
         return Err(CoreError::Malformed(format!(
-            "reply_to_msg_id must be exactly {MSG_ID_LEN} bytes"
+            "{field} must be exactly {expected_len} bytes"
         )));
     }
-    let mut out = encode_message_body(body)?;
-    out.push(MESSAGE_EXTENSION_REPLY_TO_MSG_ID);
-    out.extend_from_slice(&(MSG_ID_LEN as u16).to_be_bytes());
-    out.extend_from_slice(&reply_to_msg_id);
-    Ok(out)
+    out.push(extension_type);
+    out.extend_from_slice(&(expected_len as u16).to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(())
 }
 
 /// Decode a [`MessageBody`] from its wire form. Rejects truncated input,
@@ -523,22 +627,35 @@ pub fn decode_extended_message_body(bytes: Vec<u8>) -> Result<ExtendedMessageBod
     let timestamp = cursor.take_i64()?;
     let content = cursor.take_bytes32()?;
     let mut reply_to_msg_id = None;
+    let mut sender_device_id = None;
+    let mut sender_roster_head = None;
     while !cursor.is_finished() {
         let extension_type = cursor.take_u8()?;
         let extension_len = cursor.take_u16()? as usize;
         let value = cursor.take(extension_len)?;
-        if extension_type == MESSAGE_EXTENSION_REPLY_TO_MSG_ID {
-            if extension_len != MSG_ID_LEN {
-                return Err(CoreError::Malformed(format!(
-                    "reply-to extension must be exactly {MSG_ID_LEN} bytes"
-                )));
+        // Known types are checked; everything else is skipped, and that
+        // asymmetry is the whole forward-compatibility contract (WPT, §5).
+        match extension_type {
+            MESSAGE_EXTENSION_REPLY_TO_MSG_ID => {
+                take_extension(&mut reply_to_msg_id, value, MSG_ID_LEN, "reply-to")?;
             }
-            if reply_to_msg_id.is_some() {
-                return Err(CoreError::Malformed(
-                    "duplicate reply-to extension".to_string(),
-                ));
+            MESSAGE_EXTENSION_SENDER_DEVICE_ID => {
+                take_extension(
+                    &mut sender_device_id,
+                    value,
+                    DEVICE_ID_LEN,
+                    "sender device id",
+                )?;
             }
-            reply_to_msg_id = Some(value.to_vec());
+            MESSAGE_EXTENSION_SENDER_ROSTER_HEAD => {
+                take_extension(
+                    &mut sender_roster_head,
+                    value,
+                    ROSTER_HEAD_HASH_LEN,
+                    "sender roster head",
+                )?;
+            }
+            _ => {}
         }
     }
     validate_message_body_fields(kind, &chat_id, lamport, &content)?;
@@ -549,7 +666,31 @@ pub fn decode_extended_message_body(bytes: Vec<u8>) -> Result<ExtendedMessageBod
         timestamp,
         content,
         reply_to_msg_id,
+        sender_device_id,
+        sender_roster_head,
     })
+}
+
+/// Accept one fixed-width extension into its slot. A wrong width or a repeat
+/// is malformed rather than ignored: unlike an unknown type, a known type is a
+/// field this build understands, and understanding it half-way is worse than
+/// not shipping it.
+fn take_extension(
+    slot: &mut Option<Vec<u8>>,
+    value: &[u8],
+    expected_len: usize,
+    field: &str,
+) -> Result<(), CoreError> {
+    if value.len() != expected_len {
+        return Err(CoreError::Malformed(format!(
+            "{field} extension must be exactly {expected_len} bytes"
+        )));
+    }
+    if slot.is_some() {
+        return Err(CoreError::Malformed(format!("duplicate {field} extension")));
+    }
+    *slot = Some(value.to_vec());
+    Ok(())
 }
 
 /// The decoded form of a receipt's `content` (a `MessageBody` with
@@ -1964,19 +2105,34 @@ mod tests {
     /// WPT: the open path must skip unknown trailing sealed-body TLVs rather
     /// than reject the envelope. §5 of multi-device-v1 depends on every
     /// fielded build behaving this way.
+    ///
+    /// WP1 claimed types 0x20/0x21 — the ids WPT's version of this test used
+    /// as its unknown probes — for `sender_device_id` and the roster head, so
+    /// the probes moved up to types that really are unknown and the now-known
+    /// fields joined the same sealed round trip. The coverage grows: unknown
+    /// TLVs are still skipped, AND the multi-device fields survive intact
+    /// beside them, in an order no encoder here emits.
     #[test]
     fn unknown_sealed_body_fields_survive_seal_and_open() {
         let sender = generate_identity();
         let recipient = generate_identity();
         let body = sample_body();
         let reply_to = vec![7; MSG_ID_LEN];
-        let mut payload = encode_message_body_with_reply(body.clone(), reply_to.clone()).unwrap();
-        // A future sender_device_id / roster-ref TLV (type 0x20) after the
-        // known reply extension. Well-formed, unknown, must be ignored.
-        payload.push(0x20);
+        let device_id = vec![0x33; DEVICE_ID_LEN];
+        let roster_head = vec![0x44; ROSTER_HEAD_HASH_LEN];
+        let mut payload = encode_message_body_extended(
+            body.clone(),
+            Some(reply_to.clone()),
+            Some(device_id.clone()),
+            Some(roster_head.clone()),
+        )
+        .unwrap();
+        // Well-formed, genuinely unassigned types, one with a payload and one
+        // empty. Both must be consumed and discarded.
+        payload.push(0x40);
         payload.extend_from_slice(&8u16.to_be_bytes());
         payload.extend_from_slice(&[0x11; 8]);
-        payload.push(0x21);
+        payload.push(0x41);
         payload.extend_from_slice(&0u16.to_be_bytes());
 
         let sealed = seal_message(sender, recipient.agree_pk.clone(), payload).expect("seals");
@@ -1984,7 +2140,111 @@ mod tests {
         let decoded = decode_extended_message_body(opened.payload.clone()).expect("decodes");
         assert_eq!(decoded.content, body.content);
         assert_eq!(decoded.reply_to_msg_id, Some(reply_to));
+        assert_eq!(decoded.sender_device_id, Some(device_id));
+        assert_eq!(decoded.sender_roster_head, Some(roster_head));
         assert_eq!(decode_message_body(opened.payload).unwrap(), body);
+    }
+
+    /// §5: a body with no device TLV is not a body with missing data — it is
+    /// every legacy sender, forever, and it resolves to the reserved all-zero
+    /// stream.
+    #[test]
+    fn absent_device_field_maps_to_the_legacy_stream() {
+        let encoded = encode_message_body(sample_body()).unwrap();
+        let decoded = decode_extended_message_body(encoded).unwrap();
+        assert_eq!(decoded.sender_device_id, None);
+        assert_eq!(decoded.sender_roster_head, None);
+        assert_eq!(
+            crate::core_device_stream_id(decoded.sender_device_id),
+            crate::LEGACY_DEVICE_ID.to_vec()
+        );
+    }
+
+    /// The multi-device TLVs are fixed-width, single-shot fields: a wrong
+    /// width or a repeat is malformed, exactly as the reply-to extension is.
+    #[test]
+    fn device_extensions_reject_wrong_widths_and_repeats() {
+        assert!(matches!(
+            encode_message_body_extended(
+                sample_body(),
+                None,
+                Some(vec![1; DEVICE_ID_LEN - 1]),
+                None
+            )
+            .unwrap_err(),
+            CoreError::Malformed(_)
+        ));
+        assert!(matches!(
+            encode_message_body_extended(
+                sample_body(),
+                None,
+                None,
+                Some(vec![1; ROSTER_HEAD_HASH_LEN + 1])
+            )
+            .unwrap_err(),
+            CoreError::Malformed(_)
+        ));
+
+        let mut short = encode_message_body(sample_body()).unwrap();
+        short.push(MESSAGE_EXTENSION_SENDER_DEVICE_ID);
+        short.extend_from_slice(&4u16.to_be_bytes());
+        short.extend_from_slice(&[9; 4]);
+        assert!(matches!(
+            decode_extended_message_body(short).unwrap_err(),
+            CoreError::Malformed(_)
+        ));
+
+        let mut duplicated =
+            encode_message_body_extended(sample_body(), None, Some(vec![1; DEVICE_ID_LEN]), None)
+                .unwrap();
+        duplicated.push(MESSAGE_EXTENSION_SENDER_DEVICE_ID);
+        duplicated.extend_from_slice(&(DEVICE_ID_LEN as u16).to_be_bytes());
+        duplicated.extend_from_slice(&[2; DEVICE_ID_LEN]);
+        assert!(matches!(
+            decode_extended_message_body(duplicated).unwrap_err(),
+            CoreError::Malformed(_)
+        ));
+    }
+
+    /// Golden vector: the exact bytes a body with both multi-device TLVs
+    /// encodes to. Fixed inputs, a literal expectation — a field reorder, a
+    /// changed type id, or a different length prefix fails here rather than in
+    /// the field a release later.
+    #[test]
+    fn multi_device_extension_golden_vector() {
+        let body = MessageBody {
+            kind: KIND_TEXT,
+            chat_id: vec![0xAA; 4],
+            lamport: 1,
+            timestamp: 2,
+            content: b"hi".to_vec(),
+        };
+        let encoded = encode_message_body_extended(
+            body,
+            None,
+            Some(vec![0x33; DEVICE_ID_LEN]),
+            Some(vec![0x44; ROSTER_HEAD_HASH_LEN]),
+        )
+        .unwrap();
+        let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            concat!(
+                // kind, chat_id (u16 len + bytes), lamport, timestamp,
+                // content (u32 len + bytes) -- the unchanged legacy prefix.
+                "01",
+                "0004aaaaaaaa",
+                "0000000000000001",
+                "0000000000000002",
+                "000000026869",
+                // 0x20 | len 16 | device id
+                "200010",
+                "33333333333333333333333333333333",
+                // 0x21 | len 32 | roster head
+                "210020",
+                "4444444444444444444444444444444444444444444444444444444444444444",
+            )
+        );
     }
 
     #[test]
@@ -2864,11 +3124,14 @@ mod tests {
         // a relay-change notice unhandled.
         assert_ne!(core_own_capabilities() & CAP_RELAY_UPDATE, 0);
         assert_ne!(CAP_ACKS_HIDDEN_KINDS, CAP_RELAY_UPDATE);
-        // WPT: CAP_MULTI_DEVICE is reserved but not advertised. A peer that
-        // sets it (or any other unknown high bit) must still parse.
-        assert_eq!(core_own_capabilities() & CAP_MULTI_DEVICE, 0);
+        // WP1 (multi-device-v1 §12): the reserved bit is now advertised,
+        // because this build really does read §5's sealed-body device field
+        // and keep a person's devices on separate author streams. A peer that
+        // sets any other unknown high bit must still parse.
+        assert_ne!(core_own_capabilities() & CAP_MULTI_DEVICE, 0);
+        assert_eq!(CAP_MULTI_DEVICE, 1 << 2);
         let user_id = vec![7_u8; 16];
-        let future_caps = core_own_capabilities() | CAP_MULTI_DEVICE | (1 << 31);
+        let future_caps = core_own_capabilities() | (1 << 31);
         let frame = encode_hello2(user_id.clone(), future_caps).unwrap();
         match parse_frame(frame).unwrap() {
             Frame::Hello2 {

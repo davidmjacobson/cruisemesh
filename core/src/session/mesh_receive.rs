@@ -71,8 +71,8 @@ use crate::{
     ContactDiscoveryPolicy, CoreError, CoreInboundDisposition, CoreInboundGate,
     ExtendedMessageBody, Frame, FriendCard, Identity, IncomingMessageInsertOutcome,
     LanEndpointContent, MessageArrival, MessageStore, PendingSharedRequest, SeenIds,
-    SharedFriendCard, StoredMessage, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE,
+    SharedFriendCard, StoredMessage, DEVICE_HARD_CAP, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, LEGACY_DEVICE_ID,
     RECEIPT_TYPE_DELIVERED,
 };
 
@@ -912,6 +912,18 @@ impl MessageStore {
     /// duplicate is success; a quarantined stream conflict is a durability
     /// failure, so the caller must not commit and the envelope stays
     /// re-presentable.
+    ///
+    /// §5: the row lands on its author's device stream. The device id comes
+    /// from inside the seal, so it is already bound to the verified sender —
+    /// and it partitions that sender's own history rather than authorizing
+    /// anything, which is why WP1 honours it without a roster lookup. A body
+    /// with no device field (every legacy peer, permanently) lands on
+    /// `LEGACY_DEVICE_ID`, exactly where every pre-migration row already is.
+    /// Refusing a *tombstoned* signer's new events is DL-4's other half and
+    /// belongs to WP5, once rosters actually gossip.
+    ///
+    /// Because the id is honoured without a roster lookup, it is bounded
+    /// instead: see [`Self::bounded_device_stream`].
     fn persist_inbound(
         &self,
         sender_user_id: &[u8],
@@ -919,7 +931,12 @@ impl MessageStore {
         commit: &CoreInboundCommit,
         arrival: MessageArrival,
     ) -> Result<(), CoreError> {
-        let outcome = self.insert_incoming_message_with_arrival(
+        let sender_device_id = self.bounded_device_stream(
+            &body.chat_id,
+            sender_user_id,
+            body.sender_device_id.clone(),
+        )?;
+        let outcome = self.insert_incoming_message_from_device(
             StoredMessage {
                 chat_id: body.chat_id.clone(),
                 sender_user_id: sender_user_id.to_vec(),
@@ -927,10 +944,12 @@ impl MessageStore {
                 timestamp: body.timestamp,
                 kind: body.kind,
                 payload: body.content.clone(),
+                sender_device_id: sender_device_id.clone(),
             },
+            Some(sender_device_id),
             commit.msg_id.clone(),
             body.reply_to_msg_id.clone(),
-            arrival,
+            Some(arrival),
         )?;
         match outcome {
             IncomingMessageInsertOutcome::Inserted | IncomingMessageInsertOutcome::Duplicate => {
@@ -940,6 +959,47 @@ impl MessageStore {
                 "message stream conflict was quarantined".into(),
             )),
         }
+    }
+
+    /// Bound how many device streams one sender can open in one chat (§14.3).
+    ///
+    /// The sealed-body device id is authenticated as *coming from* the sender,
+    /// but nothing yet checks it against that person's roster — WP5 does, once
+    /// rosters gossip. Until then a sender who wanted to could stamp a fresh
+    /// random id on every message and mint an unbounded number of streams in
+    /// this device's store, each one its own conflict namespace and its own
+    /// entry in every per-stream read. That is a storage and query cost a peer
+    /// should not be able to choose.
+    ///
+    /// So the count is capped at what §14.3 allows a person to have:
+    /// [`DEVICE_HARD_CAP`] device streams, alongside the always-available
+    /// legacy stream. A device id that would open the 17th files on
+    /// [`LEGACY_DEVICE_ID`] instead — bounded, no message lost, and exactly the
+    /// shape everything had before WP1, which is the failure mode already
+    /// known to work. An id that already has a stream is always honoured, so a
+    /// real 16-device person never degrades.
+    fn bounded_device_stream(
+        &self,
+        chat_id: &[u8],
+        sender_user_id: &[u8],
+        sender_device_id: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, CoreError> {
+        let stream = crate::core_device_stream_id(sender_device_id);
+        if stream == LEGACY_DEVICE_ID {
+            return Ok(stream);
+        }
+        let held = self.message_stream_device_ids(chat_id.to_vec(), sender_user_id.to_vec())?;
+        if held.contains(&stream) {
+            return Ok(stream);
+        }
+        let device_streams = held
+            .iter()
+            .filter(|id| id.as_slice() != LEGACY_DEVICE_ID)
+            .count();
+        if device_streams >= DEVICE_HARD_CAP as usize {
+            return Ok(LEGACY_DEVICE_ID.to_vec());
+        }
+        Ok(stream)
     }
 
     /// A kind-1 friend request: either a direct card, which onboards its
@@ -1557,14 +1617,15 @@ mod delivery_tests {
 
     use crate::{
         compute_recipient_hint, encode_envelope_frame, encode_group_invite_content,
-        encode_lan_endpoint_content, encode_message_body, encode_profile_sync_content,
-        encode_receipt_content, encode_relay_update_content, generate_identity, generate_msg_id,
-        make_friend_card, seal_group_message, seal_message, Contact, CoreDeliveryVerdict,
-        CoreDiscoveryPolicyState, CoreInboundSource, Group, Identity, LanEndpointContent,
-        MessageArrival, MessageBody, MessageStore, ProfileSyncContent, ReceiptContent,
-        RelayUpdateContent, SeenIds, DEFAULT_HOP_TTL, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-        KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
-        MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+        encode_lan_endpoint_content, encode_message_body, encode_message_body_extended,
+        encode_profile_sync_content, encode_receipt_content, encode_relay_update_content,
+        generate_identity, generate_msg_id, make_friend_card, seal_group_message, seal_message,
+        Contact, CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundSource, Group, Identity,
+        LanEndpointContent, MessageArrival, MessageBody, MessageStore, ProfileSyncContent,
+        ReceiptContent, RelayUpdateContent, SeenIds, DEFAULT_HOP_TTL, DEVICE_ID_LEN,
+        KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
+        KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LEGACY_DEVICE_ID, MS_PER_DAY,
+        RECEIPT_TYPE_DELIVERED,
     };
 
     use super::CoreInboundDelivery;
@@ -1695,6 +1756,125 @@ mod delivery_tests {
             metadata_revision: 0,
             metadata_changed_by: Vec::new(),
         }
+    }
+
+    /// §5, through the one production pair: a person's devices author into
+    /// separate streams even at one lamport, and a body with no device field
+    /// lands on the reserved legacy stream beside them. The device id has to
+    /// survive the whole path — encode, seal, open, decode, insert — to be
+    /// worth anything, so nothing here short-circuits it.
+    #[test]
+    fn a_persons_devices_author_into_separate_streams() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let phone = vec![0x51; DEVICE_ID_LEN];
+        let tablet = vec![0x52; DEVICE_ID_LEN];
+        for authoring in [None, Some(phone.clone()), Some(tablet.clone())] {
+            let payload = encode_message_body_extended(
+                MessageBody {
+                    kind: KIND_TEXT,
+                    chat_id: sender.user_id.clone(),
+                    lamport: 1,
+                    timestamp: NOW,
+                    content: b"one person, three envelopes".to_vec(),
+                },
+                None,
+                authoring,
+                None,
+            )
+            .expect("encode body");
+            let delivery = deliver_pairwise(&store, &me, &sender, payload);
+            assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+            assert!(delivery.persisted);
+        }
+
+        // The pre-WP1 stream key would have called the second and third of
+        // these a fork of the first.
+        assert!(!store.has_message_conflicts().unwrap());
+        let mut expected = vec![LEGACY_DEVICE_ID.to_vec(), phone, tablet];
+        expected.sort();
+        assert_eq!(
+            store
+                .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+                .unwrap(),
+            expected
+        );
+    }
+
+    /// §14.3: the sealed-body device id is honoured without a roster check
+    /// (WP5 owns that), so the number of streams it can open is bounded here.
+    /// A sender stamping a fresh id on every message must not be able to mint
+    /// unbounded stream namespaces in this device's store; past the hard cap
+    /// the row files on the legacy stream, which loses nothing and is exactly
+    /// the pre-WP1 shape.
+    #[test]
+    fn a_sender_cannot_mint_more_device_streams_than_the_hard_cap() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        let mut lamport = 0;
+        let mut send = |device: u8| {
+            lamport += 1;
+            let payload = encode_message_body_extended(
+                MessageBody {
+                    kind: KIND_TEXT,
+                    chat_id: sender.user_id.clone(),
+                    lamport,
+                    timestamp: NOW,
+                    content: vec![device],
+                },
+                None,
+                Some(vec![device; DEVICE_ID_LEN]),
+                None,
+            )
+            .expect("encode body");
+            let delivery = deliver_pairwise(&store, &me, &sender, payload);
+            assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+            assert!(delivery.persisted);
+        };
+
+        for device in 1..=super::DEVICE_HARD_CAP as u8 {
+            send(device);
+        }
+        let held = store
+            .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+            .unwrap();
+        assert_eq!(held.len(), super::DEVICE_HARD_CAP as usize);
+        assert!(!held.contains(&LEGACY_DEVICE_ID.to_vec()));
+
+        // The 17th distinct device id opens no new stream; its message still
+        // arrives, on the legacy one.
+        send(super::DEVICE_HARD_CAP as u8 + 1);
+        let held = store
+            .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+            .unwrap();
+        assert_eq!(held.len(), super::DEVICE_HARD_CAP as usize + 1);
+        assert!(held.contains(&LEGACY_DEVICE_ID.to_vec()));
+        assert!(!held.contains(&vec![super::DEVICE_HARD_CAP as u8 + 1; DEVICE_ID_LEN]));
+        assert_eq!(
+            store
+                .messages_for_chat(sender.user_id.clone())
+                .unwrap()
+                .len(),
+            super::DEVICE_HARD_CAP as usize + 1,
+            "nothing is dropped: the capped row files on the legacy stream",
+        );
+
+        // A device that already has a stream keeps it -- a real 16-device
+        // person never degrades.
+        send(1);
+        assert_eq!(
+            store
+                .message_stream_device_ids(sender.user_id.clone(), sender.user_id.clone())
+                .unwrap()
+                .len(),
+            super::DEVICE_HARD_CAP as usize + 1,
+        );
     }
 
     #[test]
