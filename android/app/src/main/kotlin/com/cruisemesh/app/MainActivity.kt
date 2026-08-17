@@ -136,6 +136,7 @@ import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.ConnectionDetailsScreen
 import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
+import com.cruisemesh.app.devicelink.DeviceLinkTestScreen
 import com.cruisemesh.app.ui.DeveloperSettingsScreen
 import com.cruisemesh.app.ui.SettingsScreen
 import uniffi.cruisemesh_core.CoreSailChecklistReport
@@ -322,7 +323,16 @@ fun CruiseMeshApp(
         }
         composable("sailChecklist") { SailChecklistRoute(navController) }
         composable("developerSettings") {
-            DeveloperSettingsScreen(onBack = { navController.popOrExit(context) })
+            DeveloperSettingsScreen(
+                onBack = { navController.popOrExit(context) },
+                onDeviceLinkTest = { navController.navigate("deviceLinkTest") },
+            )
+        }
+        composable("deviceLinkTest") {
+            DeviceLinkTestScreen(
+                identity = identity,
+                onBack = { navController.popOrExit(context) },
+            )
         }
         composable("help") {
             HelpSupportScreen(
@@ -726,6 +736,12 @@ internal fun derivePendingDeepLink(intent: Intent?): PendingDeepLink? {
                 ?.let { PendingDeepLink(relayCard = it) }
         DeepLinkRoute.LAN ->
             parseLanEndpointLink(fragment)?.let { PendingDeepLink(lanEndpoint = it.display) }
+        DeepLinkRoute.DEVICE_LINK ->
+            // A device-link offer is scanned inside the linking ceremony, by
+            // the device that is already part of this person. There is no
+            // screen to open cold yet, and opening the wrong one would drop
+            // someone into a flow that cannot finish what the link starts.
+            null
     }
 }
 

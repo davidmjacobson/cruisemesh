@@ -289,7 +289,14 @@ object RelayClient {
         }
     }
 
-    private fun postEnvelope(
+    /**
+     * The one place an envelope becomes an HTTP POST. Internal rather than
+     * private because a device-link rendezvous
+     * ([com.cruisemesh.app.devicelink.LinkRelayWire]) posts a row that belongs
+     * to no conversation and no contact: it has a hint, a body and an expiry,
+     * and none of the addressing an [OutboundEnvelope] carries.
+     */
+    internal fun postEnvelope(
         config: RelayConfig,
         msgId: ByteArray,
         hopTtl: UByte,

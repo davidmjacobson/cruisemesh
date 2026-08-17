@@ -1819,6 +1819,648 @@ public func FfiConverterTypeCoreLanHealthTracker_lower(_ value: CoreLanHealthTra
 
 
 
+/**
+ * The half that scans the QR, holds the confirm, and will sign the roster.
+ */
+public protocol CoreLinkApprovingDeviceProtocol : AnyObject {
+    
+    /**
+     * §14.3's answer for this add, decided at scan time.
+     */
+    func addOutcome()  -> DeviceAddOutcome
+    
+    func cancel(nowMs: Int64)  -> CoreLinkSummary
+    
+    /**
+     * **§9.2's explicit action, on the existing device.** The person compared
+     * the digits on both screens and said they match.
+     */
+    func confirm(nowMs: Int64)  -> CoreLinkAction
+    
+    /**
+     * The digits did not match. The channel is told and then dropped; the
+     * person starts over with a fresh QR.
+     */
+    func decline(nowMs: Int64)  -> CoreLinkAction
+    
+    func openChannelFrame(frame: Data) throws  -> Data
+    
+    func phase()  -> CoreLinkPhase
+    
+    func rendezvous()  -> LinkRendezvous
+    
+    /**
+     * The mailbox namespace to meet the new device on, for a relay rendezvous.
+     */
+    func rendezvousId() throws  -> Data
+    
+    func resumePeerBytes(nowMs: Int64, bytes: Data)  -> CoreLinkAction
+    
+    func resumeSent(nowMs: Int64)  -> CoreLinkAction
+    
+    /**
+     * §9.3's seam: the bootstrap the approving device streams rides this.
+     */
+    func sealChannelFrame(plaintext: Data) throws  -> Data
+    
+    /**
+     * Open the channel: the first Noise message (§9.2).
+     */
+    func start(nowMs: Int64)  -> CoreLinkAction
+    
+    func summary()  -> CoreLinkSummary?
+    
+    func tick(nowMs: Int64)  -> CoreLinkAction
+    
+}
+
+/**
+ * The half that scans the QR, holds the confirm, and will sign the roster.
+ */
+open class CoreLinkApprovingDevice:
+    CoreLinkApprovingDeviceProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corelinkapprovingdevice(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corelinkapprovingdevice(pointer, $0) }
+    }
+
+    
+    /**
+     * Scan an offer (§9.2).
+     *
+     * `active_device_count` is how many devices this person's roster holds
+     * right now. §14.3's boundary is applied to the count *after* the add
+     * through the one function that owns it, so a refusal here and a refusal
+     * in [`core_roster_validate`](crate::core_roster_validate) can never
+     * disagree: past the hard cap the ceremony ends at `start` without a byte
+     * moving; past the soft cap it runs and the confirm screen carries the
+     * warning.
+     *
+     * An unparseable or newer-than-this-build code is an error rather than an
+     * outcome — there is no ceremony to summarise, and `UnsupportedLink` is
+     * the shells' existing "update the app" copy.
+     */
+public static func scan(qrText: String, activeDeviceCount: UInt32, budgets: LinkBudgets?)throws  -> CoreLinkApprovingDevice {
+    return try  FfiConverterTypeCoreLinkApprovingDevice.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_constructor_corelinkapprovingdevice_scan(
+        FfiConverterString.lower(qrText),
+        FfiConverterUInt32.lower(activeDeviceCount),
+        FfiConverterOptionTypeLinkBudgets.lower(budgets),$0
+    )
+})
+}
+    
+
+    
+    /**
+     * §14.3's answer for this add, decided at scan time.
+     */
+open func addOutcome() -> DeviceAddOutcome {
+    return try!  FfiConverterTypeDeviceAddOutcome.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_add_outcome(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func cancel(nowMs: Int64) -> CoreLinkSummary {
+    return try!  FfiConverterTypeCoreLinkSummary.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_cancel(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * **§9.2's explicit action, on the existing device.** The person compared
+     * the digits on both screens and said they match.
+     */
+open func confirm(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_confirm(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * The digits did not match. The channel is told and then dropped; the
+     * person starts over with a fresh QR.
+     */
+open func decline(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_decline(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func openChannelFrame(frame: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_open_channel_frame(self.uniffiClonePointer(),
+        FfiConverterData.lower(frame),$0
+    )
+})
+}
+    
+open func phase() -> CoreLinkPhase {
+    return try!  FfiConverterTypeCoreLinkPhase.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_phase(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func rendezvous() -> LinkRendezvous {
+    return try!  FfiConverterTypeLinkRendezvous.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_rendezvous(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The mailbox namespace to meet the new device on, for a relay rendezvous.
+     */
+open func rendezvousId()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_rendezvous_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func resumePeerBytes(nowMs: Int64, bytes: Data) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_resume_peer_bytes(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+open func resumeSent(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_resume_sent(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * §9.3's seam: the bootstrap the approving device streams rides this.
+     */
+open func sealChannelFrame(plaintext: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_seal_channel_frame(self.uniffiClonePointer(),
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+    /**
+     * Open the channel: the first Noise message (§9.2).
+     */
+open func start(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_start(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func summary() -> CoreLinkSummary? {
+    return try!  FfiConverterOptionTypeCoreLinkSummary.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_summary(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func tick(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinkapprovingdevice_tick(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkApprovingDevice: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreLinkApprovingDevice
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLinkApprovingDevice {
+        return CoreLinkApprovingDevice(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreLinkApprovingDevice) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkApprovingDevice {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreLinkApprovingDevice, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkApprovingDevice_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLinkApprovingDevice {
+    return try FfiConverterTypeCoreLinkApprovingDevice.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkApprovingDevice_lower(_ value: CoreLinkApprovingDevice) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreLinkApprovingDevice.lower(value)
+}
+
+
+
+
+/**
+ * The half that shows the QR and waits to be adopted.
+ *
+ * It holds no identity: a device running this has not been linked, has no
+ * roster, no [`OwnDeviceFleet`](crate::OwnDeviceFleet), and nothing to
+ * advertise, author, or ack with. §9.4's pre-activation invisibility starts as
+ * a fact about this object rather than as a rule someone has to enforce.
+ */
+public protocol CoreLinkNewDeviceProtocol : AnyObject {
+    
+    func cancel(nowMs: Int64)  -> CoreLinkSummary
+    
+    /**
+     * The ephemeral public key this offer publishes.
+     */
+    func linkPk()  -> Data
+    
+    func openChannelFrame(frame: Data) throws  -> Data
+    
+    func phase()  -> CoreLinkPhase
+    
+    /**
+     * The `CMLINK1:` text to render as a QR.
+     */
+    func qrText()  -> String
+    
+    func rendezvous()  -> LinkRendezvous
+    
+    /**
+     * The mailbox namespace to listen on for a relay rendezvous.
+     */
+    func rendezvousId() throws  -> Data
+    
+    /**
+     * Bytes arrived from the peer.
+     */
+    func resumePeerBytes(nowMs: Int64, bytes: Data)  -> CoreLinkAction
+    
+    /**
+     * The outstanding [`CoreLinkActionKind::SendBytes`] went out.
+     */
+    func resumeSent(nowMs: Int64)  -> CoreLinkAction
+    
+    /**
+     * §9.3's seam: once the channel is confirmed, the bootstrap rides it.
+     * Refused before then, and after any ending that is not a ready channel.
+     */
+    func sealChannelFrame(plaintext: Data) throws  -> Data
+    
+    /**
+     * Show the offer and start listening. Calling it twice restates rather
+     * than restarting: a ceremony is a one-shot object and a second QR is a
+     * second object.
+     */
+    func start(nowMs: Int64)  -> CoreLinkAction
+    
+    func summary()  -> CoreLinkSummary?
+    
+    /**
+     * No progress; re-state the outstanding action, or end on the deadline.
+     */
+    func tick(nowMs: Int64)  -> CoreLinkAction
+    
+}
+
+/**
+ * The half that shows the QR and waits to be adopted.
+ *
+ * It holds no identity: a device running this has not been linked, has no
+ * roster, no [`OwnDeviceFleet`](crate::OwnDeviceFleet), and nothing to
+ * advertise, author, or ack with. §9.4's pre-activation invisibility starts as
+ * a fact about this object rather than as a rule someone has to enforce.
+ */
+open class CoreLinkNewDevice:
+    CoreLinkNewDeviceProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_cruisemesh_core_fn_clone_corelinknewdevice(self.pointer, $0) }
+    }
+    /**
+     * Mint an ephemeral link keypair and build the offer (§9.1).
+     *
+     * `lan_endpoints` and `relay_base_urls` are this device's OWN endpoints —
+     * nothing discovered, nothing third-party. The secret half of the link key
+     * stays inside this object and crosses no binding.
+     */
+public convenience init(lanEndpoints: [String], relayBaseUrls: [String], nowMs: Int64, budgets: LinkBudgets?)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_constructor_corelinknewdevice_new(
+        FfiConverterSequenceString.lower(lanEndpoints),
+        FfiConverterSequenceString.lower(relayBaseUrls),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterOptionTypeLinkBudgets.lower(budgets),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_cruisemesh_core_fn_free_corelinknewdevice(pointer, $0) }
+    }
+
+    
+
+    
+open func cancel(nowMs: Int64) -> CoreLinkSummary {
+    return try!  FfiConverterTypeCoreLinkSummary.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_cancel(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * The ephemeral public key this offer publishes.
+     */
+open func linkPk() -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_link_pk(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func openChannelFrame(frame: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_open_channel_frame(self.uniffiClonePointer(),
+        FfiConverterData.lower(frame),$0
+    )
+})
+}
+    
+open func phase() -> CoreLinkPhase {
+    return try!  FfiConverterTypeCoreLinkPhase.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_phase(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The `CMLINK1:` text to render as a QR.
+     */
+open func qrText() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_qr_text(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func rendezvous() -> LinkRendezvous {
+    return try!  FfiConverterTypeLinkRendezvous.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_rendezvous(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The mailbox namespace to listen on for a relay rendezvous.
+     */
+open func rendezvousId()throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_rendezvous_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Bytes arrived from the peer.
+     */
+open func resumePeerBytes(nowMs: Int64, bytes: Data) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_resume_peer_bytes(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+    
+    /**
+     * The outstanding [`CoreLinkActionKind::SendBytes`] went out.
+     */
+open func resumeSent(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_resume_sent(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * §9.3's seam: once the channel is confirmed, the bootstrap rides it.
+     * Refused before then, and after any ending that is not a ready channel.
+     */
+open func sealChannelFrame(plaintext: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_seal_channel_frame(self.uniffiClonePointer(),
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+    /**
+     * Show the offer and start listening. Calling it twice restates rather
+     * than restarting: a ceremony is a one-shot object and a second QR is a
+     * second object.
+     */
+open func start(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_start(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+open func summary() -> CoreLinkSummary? {
+    return try!  FfiConverterOptionTypeCoreLinkSummary.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_summary(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * No progress; re-state the outstanding action, or end on the deadline.
+     */
+open func tick(nowMs: Int64) -> CoreLinkAction {
+    return try!  FfiConverterTypeCoreLinkAction.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_corelinknewdevice_tick(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkNewDevice: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CoreLinkNewDevice
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLinkNewDevice {
+        return CoreLinkNewDevice(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CoreLinkNewDevice) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkNewDevice {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CoreLinkNewDevice, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkNewDevice_lift(_ pointer: UnsafeMutableRawPointer) throws -> CoreLinkNewDevice {
+    return try FfiConverterTypeCoreLinkNewDevice.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkNewDevice_lower(_ value: CoreLinkNewDevice) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCoreLinkNewDevice.lower(value)
+}
+
+
+
+
 public protocol CoreMeshRouterStateProtocol : AnyObject {
     
     /**
@@ -3761,6 +4403,44 @@ public func FfiConverterTypeLanNoiseSession_lower(_ value: LanNoiseSession) -> U
 public protocol MessageStoreProtocol : AnyObject {
     
     /**
+     * **Leave §9.4's window the way it was entered.** A ceremony that began
+     * and did not finish gives the gates back.
+     *
+     * Without this the window is a one-way door: the moment
+     * [`Self::begin_link_activation`] runs, this device stops advertising,
+     * authoring and acking, and the ONLY exit is a successful
+     * [`Self::complete_link_activation`]. A declined confirm, a dropped
+     * socket, a peer that stopped answering, a person who put the phone down —
+     * each of those left a phone permanently silent with no way back except
+     * reinstalling the app. That is a worse failure than the one the gate
+     * exists to prevent.
+     *
+     * It refuses from [`CoreLinkActivationStage::Activated`] and from nothing
+     * else. An activated device is a device: unlinking one is §10's revocation
+     * with its key rotations and its roster update, not a local flag flip, and
+     * a call that could quietly undo a completed link would be a far easier
+     * mistake to make than the one it fixes. From `NotLinking` it is a no-op,
+     * so a failure path may call it without first asking where it is.
+     *
+     * Both `expected_roster_head` and `own_device_id` are cleared: a device id
+     * this install was never activated under must not survive to be read as
+     * evidence that it was.
+     */
+    func abandonLinkActivation(nowMs: Int64) throws  -> CoreLinkActivation
+    
+    /**
+     * Adopt a roster of this person's own devices: store the document and
+     * project the fleet routing and acks read from it.
+     *
+     * The approving device calls this when its own roster changes under it —
+     * at genesis, and again the moment a new device's acknowledgement lands
+     * (§9.4). The new device does not: its adoption goes through
+     * [`Self::import_link_bootstrap`] and [`Self::complete_link_activation`],
+     * which are the same two writes with §9.4's ordering enforced around them.
+     */
+    func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Data) throws 
+    
+    /**
      * Persist the frontier after one fetch page, and return what is now
      * remembered.
      *
@@ -3975,6 +4655,32 @@ public protocol MessageStoreProtocol : AnyObject {
     func backupInventory(nowMs: Int64) throws  -> BackupInventory
     
     /**
+     * §14.2's path out of "my only other phone is gone": sign a roster at the
+     * next recovery epoch with the root secret inside the opened backup,
+     * naming this fresh device as the approving device.
+     *
+     * **Call this on a store opened over the backup's own sqlite** — the bytes
+     * in [`CoreBackupPayload::sqlite`], written to a file and opened. The last
+     * roster the person's fleet was known to hold is read from there, by this
+     * function, because the caller has no other way to know it: the
+     * `LinkAsNewDevice` intent deliberately does not restore that store as its
+     * own history, so nothing else in the flow ever holds the document. It
+     * used to be a parameter, which meant every caller was asked for a value
+     * it could only produce by guessing — and a guess of `None` here silently
+     * mints epoch 1 over a fleet that had already recovered twice, producing a
+     * roster every contact ignores.
+     *
+     * A backup with no roster at all is genesis, not an error: a person whose
+     * fleet predates rosters entirely has nothing to supersede.
+     *
+     * This is deliberately NOT reachable from
+     * [`CoreRestoreIntent::ReplaceThisDevice`]: a replacement is the same
+     * device and needs no new epoch, and minting one would tell every contact
+     * that something was recovered when nothing was.
+     */
+    func backupRecoveryRoster(payload: CoreBackupPayload, deviceSignPk: Data, deviceAgreePk: Data) throws  -> Roster
+    
+    /**
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
@@ -4007,6 +4713,21 @@ public protocol MessageStoreProtocol : AnyObject {
     func backupToWithOptions(destination: String, options: BackupContentOptions, nowMs: Int64) throws  -> BackupSanitizationReport
     
     /**
+     * Enter §9.4's pre-activation window: from here this device is silent
+     * until it has imported a bootstrap and acknowledged the roster head.
+     *
+     * Called by the NEW device when its ceremony reaches a confirmed channel.
+     * Deliberately its own step rather than a side effect of importing: the
+     * silence has to start before the bootstrap arrives, or a device would be
+     * free to act during the very window the export is crossing the channel.
+     *
+     * `channel_binding` is that ceremony's Noise handshake hash, recorded here
+     * so the import can insist the export it is handed was made for *this*
+     * ceremony rather than merely arriving on it.
+     */
+    func beginLinkActivation(channelBinding: Data, nowMs: Int64) throws  -> CoreLinkActivation
+    
+    /**
      * Block an identity (specs/friends-of-friends.md "dismissal-block
      * tombstone"): inbound envelopes from it are dropped by both shells, it
      * never appears as a friend suggestion, and a replayed friend request
@@ -4016,6 +4737,36 @@ public protocol MessageStoreProtocol : AnyObject {
      * clears the block.
      */
     func blockUser(userId: Data, nowMs: Int64) throws 
+    
+    /**
+     * Build the canonical bootstrap this device will stream into the one it is
+     * adopting (§9.3).
+     *
+     * `roster` is the already-signed roster at `seq + 1`
+     * ([`core_link_sign_new_device_roster`](super::activation::core_link_sign_new_device_roster)),
+     * so the export and the document whose head closes activation are the same
+     * act, and the new device cannot be handed a fleet it was never certified
+     * into.
+     *
+     * `identity` supplies §6's inbox key: at generation 0 on a fleet that
+     * upgraded in place, the person's deployed X25519 agreement keypair. The
+     * person root SIGNING secret is not read here and never leaves the
+     * encrypted backup (§14.2).
+     *
+     * `history_head_per_chat` bounds the head — pass 0 for
+     * [`LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT`]. Everything older is WP4's
+     * catch-up, not this ceremony's.
+     *
+     * `approving_device_sign_sk` is the roster-signing device's secret — the
+     * same key that signed the roster being exported, and the only key whose
+     * signature the new device will accept. `channel_binding` is the ceremony's
+     * Noise handshake hash. Together they are what makes this export *this*
+     * ceremony's export rather than a file: see [`core_link_bootstrap_verify`].
+     *
+     * `lifetime_ms` bounds how long it stands — pass 0 for
+     * [`LINK_BOOTSTRAP_DEFAULT_LIFETIME_MS`].
+     */
+    func buildLinkBootstrap(identity: Identity, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64) throws  -> LinkBootstrap
     
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
@@ -4245,6 +4996,44 @@ public protocol MessageStoreProtocol : AnyObject {
      * clears both a suppression and any dismissal history.
      */
     func clearSharedRequestDismissal(requesterUserId: Data) throws 
+    
+    /**
+     * **§9.4(b), and the moment the device becomes visible.**
+     *
+     * `acked_roster_head` is the head this device actually put on the wire
+     * back to the approving device (the frame [`core_link_activation_ack`]
+     * built). It must equal the head of the roster that was imported —
+     * exactly, all 32 bytes — or activation does not close and the device
+     * stays silent. Call it once the acknowledgement has been sealed onto the
+     * confirmed channel: the ack is the last thing §9.4 asks for.
+     *
+     * The [`OwnDeviceFleet`](crate::OwnDeviceFleet) is written here, and only
+     * here. That is the whole of "may not ack ANYTHING until": before this
+     * call the ack planner sees an unlinked install with nothing to ack for,
+     * and the gate refuses the paths anyway.
+     *
+     * # What this call turns on that nothing yet turns off
+     *
+     * This is the line that first makes a fleet larger than one device real,
+     * and §9 step 5 — telling the person's CONTACTS about the new roster —
+     * does not exist. DL-3's send side is owed by WP4 (the own-device sync
+     * records that carry a roster document) and WP5 (the contact
+     * notification), and neither has landed.
+     *
+     * The consequence is not hypothetical and is worth stating where the
+     * switch is thrown. A contact who has not heard about the roster keeps
+     * uploading exactly ONE person-addressed relay row, and ACK-MD-2 forbids a
+     * multi-device fleet from acking it: whichever sibling fetches it first
+     * must leave it for the others, and nobody deletes it. Those rows churn
+     * until their 7-day expiry.
+     *
+     * It is bounded and it is dev-only — linking is behind Internal Tools
+     * until WP6, so the only fleets in existence are ones being deliberately
+     * tested — but it is a real cost of activating a device before its
+     * contacts can be told. `MD-ROSTER-GOSSIP-TO-CONTACTS` in
+     * `core/tests/multi_device_contract.rs` is the pinned form of this note.
+     */
+    func completeLinkActivation(ackedRosterHead: Data, nowMs: Int64) throws  -> CoreLinkActivation
     
     /**
      * Exact consumed control-message positions for one chat, grouped by the
@@ -5169,6 +5958,37 @@ public protocol MessageStoreProtocol : AnyObject {
     func hintMatchesKnownTarget(hint: Data, nowMs: Int64) throws  -> Bool
     
     /**
+     * **§9.4(a).** Import a canonical bootstrap (§9.3) into this device.
+     *
+     * `own_device_sign_pk` is the key this device offered; the roster must
+     * carry a certificate for it, and the device id this install adopts is
+     * taken from that certificate rather than from the caller — a device does
+     * not get to name itself.
+     *
+     * Everything is checked before anything is written: the roster validates
+     * against the person root the export names, the person id agrees with that
+     * root, and the inbox key is the right shape. Then contacts, their
+     * rosters, groups, and the history head land through ordinary store calls
+     * — the same paths a friend import and a group invite already use, because
+     * a bootstrap is a statement of what this person knows, not a database
+     * image.
+     *
+     * Those writes are individually transactional rather than collectively so,
+     * and that is survivable rather than sloppy: every one of them is an upsert
+     * or a duplicate-tolerant insert, the stage only advances after all of them
+     * land, and a device whose import died halfway is still in
+     * [`CoreLinkActivationStage::AwaitingBootstrap`] — silent, and free to be
+     * handed the same export again.
+     *
+     * It does NOT write [`OwnDeviceFleet`](crate::OwnDeviceFleet). The fleet
+     * record is what the ack planner reads to decide whose relay rows this
+     * device may delete; writing it here would make the device act on a
+     * membership it has not yet acknowledged. It is written by
+     * [`Self::complete_link_activation`], and by nothing else.
+     */
+    func importLinkBootstrap(bootstrap: LinkBootstrap, ownDeviceSignPk: Data, expectedPersonId: Data?, nowMs: Int64) throws  -> CoreLinkBootstrapImport
+    
+    /**
      * Durably ingest one fetched relay page inside **one** transaction, and
      * report what each row's disposition was.
      *
@@ -5335,6 +6155,35 @@ public protocol MessageStoreProtocol : AnyObject {
     func insertOutgoingReply(message: StoredMessage, envelope: OutboundEnvelope, replyToMsgId: Data, queuedAtMs: Int64) throws  -> Bool
     
     func isUserBlocked(userId: Data) throws  -> Bool
+    
+    /**
+     * This device's activation record (§9.4). A store that has never begun a
+     * link reads [`CoreLinkActivationStage::NotLinking`].
+     */
+    func linkActivation() throws  -> CoreLinkActivation
+    
+    /**
+     * Ask the gate about one action (§9.4). Every core path that advertises,
+     * authors, or acks goes through this; shells consult it for the paths core
+     * cannot see, above all their own BLE and LAN advertising.
+     */
+    func linkGate(action: CoreLinkGatedAction) throws  -> CoreLinkGateVerdict
+    
+    /**
+     * Whether this store may take a bootstrap (§9.3), and if not, why.
+     *
+     * `expected_person_id` is the person the caller believes this phone is
+     * being set up as — the id read out of an opened `.cmbak`, or whatever the
+     * restore flow already knows. `None` means "the caller does not know", and
+     * is only acceptable on a phone with nothing of its own: a bootstrap
+     * imported over a store that already holds someone's contacts and messages
+     * merges two people's worlds with no way back.
+     *
+     * Asked here as well as inside [`Self::import_link_bootstrap`] so a shell
+     * can refuse on the screen that offers the ceremony instead of at the end
+     * of one.
+     */
+    func linkImportReadiness(expectedPersonId: Data?) throws  -> CoreLinkImportReadiness
     
     func listBlockedUsers() throws  -> [Data]
     
@@ -5753,6 +6602,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * is §5's synthetic one-device person.
      */
     func ownDeviceFleet() throws  -> OwnDeviceFleet
+    
+    /**
+     * This person's own roster document (§4), or `None` on an install that has
+     * never linked.
+     */
+    func ownRoster() throws  -> Roster?
     
     func peerConnectionEvents(userId: Data?, limit: UInt32) throws  -> [PeerConnectionEvent]
     
@@ -6444,6 +7299,57 @@ public static func `open`(path: String)throws  -> MessageStore {
 
     
     /**
+     * **Leave §9.4's window the way it was entered.** A ceremony that began
+     * and did not finish gives the gates back.
+     *
+     * Without this the window is a one-way door: the moment
+     * [`Self::begin_link_activation`] runs, this device stops advertising,
+     * authoring and acking, and the ONLY exit is a successful
+     * [`Self::complete_link_activation`]. A declined confirm, a dropped
+     * socket, a peer that stopped answering, a person who put the phone down —
+     * each of those left a phone permanently silent with no way back except
+     * reinstalling the app. That is a worse failure than the one the gate
+     * exists to prevent.
+     *
+     * It refuses from [`CoreLinkActivationStage::Activated`] and from nothing
+     * else. An activated device is a device: unlinking one is §10's revocation
+     * with its key rotations and its roster update, not a local flag flip, and
+     * a call that could quietly undo a completed link would be a far easier
+     * mistake to make than the one it fixes. From `NotLinking` it is a no-op,
+     * so a failure path may call it without first asking where it is.
+     *
+     * Both `expected_roster_head` and `own_device_id` are cleared: a device id
+     * this install was never activated under must not survive to be read as
+     * evidence that it was.
+     */
+open func abandonLinkActivation(nowMs: Int64)throws  -> CoreLinkActivation {
+    return try  FfiConverterTypeCoreLinkActivation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_abandon_link_activation(self.uniffiClonePointer(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Adopt a roster of this person's own devices: store the document and
+     * project the fleet routing and acks read from it.
+     *
+     * The approving device calls this when its own roster changes under it —
+     * at genesis, and again the moment a new device's acknowledgement lands
+     * (§9.4). The new device does not: its adoption goes through
+     * [`Self::import_link_bootstrap`] and [`Self::complete_link_activation`],
+     * which are the same two writes with §9.4's ordering enforced around them.
+     */
+open func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Data)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_adopt_own_roster(self.uniffiClonePointer(),
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterData.lower(ownDeviceId),$0
+    )
+}
+}
+    
+    /**
      * Persist the frontier after one fetch page, and return what is now
      * remembered.
      *
@@ -6771,6 +7677,40 @@ open func backupInventory(nowMs: Int64)throws  -> BackupInventory {
 }
     
     /**
+     * §14.2's path out of "my only other phone is gone": sign a roster at the
+     * next recovery epoch with the root secret inside the opened backup,
+     * naming this fresh device as the approving device.
+     *
+     * **Call this on a store opened over the backup's own sqlite** — the bytes
+     * in [`CoreBackupPayload::sqlite`], written to a file and opened. The last
+     * roster the person's fleet was known to hold is read from there, by this
+     * function, because the caller has no other way to know it: the
+     * `LinkAsNewDevice` intent deliberately does not restore that store as its
+     * own history, so nothing else in the flow ever holds the document. It
+     * used to be a parameter, which meant every caller was asked for a value
+     * it could only produce by guessing — and a guess of `None` here silently
+     * mints epoch 1 over a fleet that had already recovered twice, producing a
+     * roster every contact ignores.
+     *
+     * A backup with no roster at all is genesis, not an error: a person whose
+     * fleet predates rosters entirely has nothing to supersede.
+     *
+     * This is deliberately NOT reachable from
+     * [`CoreRestoreIntent::ReplaceThisDevice`]: a replacement is the same
+     * device and needs no new epoch, and minting one would tell every contact
+     * that something was recovered when nothing was.
+     */
+open func backupRecoveryRoster(payload: CoreBackupPayload, deviceSignPk: Data, deviceAgreePk: Data)throws  -> Roster {
+    return try  FfiConverterTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_backup_recovery_roster(self.uniffiClonePointer(),
+        FfiConverterTypeCoreBackupPayload.lower(payload),
+        FfiConverterData.lower(deviceSignPk),
+        FfiConverterData.lower(deviceAgreePk),$0
+    )
+})
+}
+    
+    /**
      * Writes a transactionally consistent standalone SQLite snapshot.
      * The destination must not already exist; callers should use a unique
      * temporary path and remove it after reading the backup bytes.
@@ -6816,6 +7756,28 @@ open func backupToWithOptions(destination: String, options: BackupContentOptions
 }
     
     /**
+     * Enter §9.4's pre-activation window: from here this device is silent
+     * until it has imported a bootstrap and acknowledged the roster head.
+     *
+     * Called by the NEW device when its ceremony reaches a confirmed channel.
+     * Deliberately its own step rather than a side effect of importing: the
+     * silence has to start before the bootstrap arrives, or a device would be
+     * free to act during the very window the export is crossing the channel.
+     *
+     * `channel_binding` is that ceremony's Noise handshake hash, recorded here
+     * so the import can insist the export it is handed was made for *this*
+     * ceremony rather than merely arriving on it.
+     */
+open func beginLinkActivation(channelBinding: Data, nowMs: Int64)throws  -> CoreLinkActivation {
+    return try  FfiConverterTypeCoreLinkActivation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_begin_link_activation(self.uniffiClonePointer(),
+        FfiConverterData.lower(channelBinding),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Block an identity (specs/friends-of-friends.md "dismissal-block
      * tombstone"): inbound envelopes from it are dropped by both shells, it
      * never appears as a friend suggestion, and a replayed friend request
@@ -6830,6 +7792,48 @@ open func blockUser(userId: Data, nowMs: Int64)throws  {try rustCallWithError(Ff
         FfiConverterInt64.lower(nowMs),$0
     )
 }
+}
+    
+    /**
+     * Build the canonical bootstrap this device will stream into the one it is
+     * adopting (§9.3).
+     *
+     * `roster` is the already-signed roster at `seq + 1`
+     * ([`core_link_sign_new_device_roster`](super::activation::core_link_sign_new_device_roster)),
+     * so the export and the document whose head closes activation are the same
+     * act, and the new device cannot be handed a fleet it was never certified
+     * into.
+     *
+     * `identity` supplies §6's inbox key: at generation 0 on a fleet that
+     * upgraded in place, the person's deployed X25519 agreement keypair. The
+     * person root SIGNING secret is not read here and never leaves the
+     * encrypted backup (§14.2).
+     *
+     * `history_head_per_chat` bounds the head — pass 0 for
+     * [`LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT`]. Everything older is WP4's
+     * catch-up, not this ceremony's.
+     *
+     * `approving_device_sign_sk` is the roster-signing device's secret — the
+     * same key that signed the roster being exported, and the only key whose
+     * signature the new device will accept. `channel_binding` is the ceremony's
+     * Noise handshake hash. Together they are what makes this export *this*
+     * ceremony's export rather than a file: see [`core_link_bootstrap_verify`].
+     *
+     * `lifetime_ms` bounds how long it stands — pass 0 for
+     * [`LINK_BOOTSTRAP_DEFAULT_LIFETIME_MS`].
+     */
+open func buildLinkBootstrap(identity: Identity, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64)throws  -> LinkBootstrap {
+    return try  FfiConverterTypeLinkBootstrap.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_build_link_bootstrap(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(approvingDeviceSignSk),
+        FfiConverterData.lower(channelBinding),
+        FfiConverterUInt64.lower(historyHeadPerChat),
+        FfiConverterInt64.lower(lifetimeMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
     
     /**
@@ -7171,6 +8175,51 @@ open func clearSharedRequestDismissal(requesterUserId: Data)throws  {try rustCal
         FfiConverterData.lower(requesterUserId),$0
     )
 }
+}
+    
+    /**
+     * **§9.4(b), and the moment the device becomes visible.**
+     *
+     * `acked_roster_head` is the head this device actually put on the wire
+     * back to the approving device (the frame [`core_link_activation_ack`]
+     * built). It must equal the head of the roster that was imported —
+     * exactly, all 32 bytes — or activation does not close and the device
+     * stays silent. Call it once the acknowledgement has been sealed onto the
+     * confirmed channel: the ack is the last thing §9.4 asks for.
+     *
+     * The [`OwnDeviceFleet`](crate::OwnDeviceFleet) is written here, and only
+     * here. That is the whole of "may not ack ANYTHING until": before this
+     * call the ack planner sees an unlinked install with nothing to ack for,
+     * and the gate refuses the paths anyway.
+     *
+     * # What this call turns on that nothing yet turns off
+     *
+     * This is the line that first makes a fleet larger than one device real,
+     * and §9 step 5 — telling the person's CONTACTS about the new roster —
+     * does not exist. DL-3's send side is owed by WP4 (the own-device sync
+     * records that carry a roster document) and WP5 (the contact
+     * notification), and neither has landed.
+     *
+     * The consequence is not hypothetical and is worth stating where the
+     * switch is thrown. A contact who has not heard about the roster keeps
+     * uploading exactly ONE person-addressed relay row, and ACK-MD-2 forbids a
+     * multi-device fleet from acking it: whichever sibling fetches it first
+     * must leave it for the others, and nobody deletes it. Those rows churn
+     * until their 7-day expiry.
+     *
+     * It is bounded and it is dev-only — linking is behind Internal Tools
+     * until WP6, so the only fleets in existence are ones being deliberately
+     * tested — but it is a real cost of activating a device before its
+     * contacts can be told. `MD-ROSTER-GOSSIP-TO-CONTACTS` in
+     * `core/tests/multi_device_contract.rs` is the pinned form of this note.
+     */
+open func completeLinkActivation(ackedRosterHead: Data, nowMs: Int64)throws  -> CoreLinkActivation {
+    return try  FfiConverterTypeCoreLinkActivation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_complete_link_activation(self.uniffiClonePointer(),
+        FfiConverterData.lower(ackedRosterHead),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
 }
     
     /**
@@ -8459,6 +9508,46 @@ open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
 }
     
     /**
+     * **§9.4(a).** Import a canonical bootstrap (§9.3) into this device.
+     *
+     * `own_device_sign_pk` is the key this device offered; the roster must
+     * carry a certificate for it, and the device id this install adopts is
+     * taken from that certificate rather than from the caller — a device does
+     * not get to name itself.
+     *
+     * Everything is checked before anything is written: the roster validates
+     * against the person root the export names, the person id agrees with that
+     * root, and the inbox key is the right shape. Then contacts, their
+     * rosters, groups, and the history head land through ordinary store calls
+     * — the same paths a friend import and a group invite already use, because
+     * a bootstrap is a statement of what this person knows, not a database
+     * image.
+     *
+     * Those writes are individually transactional rather than collectively so,
+     * and that is survivable rather than sloppy: every one of them is an upsert
+     * or a duplicate-tolerant insert, the stage only advances after all of them
+     * land, and a device whose import died halfway is still in
+     * [`CoreLinkActivationStage::AwaitingBootstrap`] — silent, and free to be
+     * handed the same export again.
+     *
+     * It does NOT write [`OwnDeviceFleet`](crate::OwnDeviceFleet). The fleet
+     * record is what the ack planner reads to decide whose relay rows this
+     * device may delete; writing it here would make the device act on a
+     * membership it has not yet acknowledged. It is written by
+     * [`Self::complete_link_activation`], and by nothing else.
+     */
+open func importLinkBootstrap(bootstrap: LinkBootstrap, ownDeviceSignPk: Data, expectedPersonId: Data?, nowMs: Int64)throws  -> CoreLinkBootstrapImport {
+    return try  FfiConverterTypeCoreLinkBootstrapImport.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_import_link_bootstrap(self.uniffiClonePointer(),
+        FfiConverterTypeLinkBootstrap.lower(bootstrap),
+        FfiConverterData.lower(ownDeviceSignPk),
+        FfiConverterOptionData.lower(expectedPersonId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
      * Durably ingest one fetched relay page inside **one** transaction, and
      * report what each row's disposition was.
      *
@@ -8702,6 +9791,52 @@ open func isUserBlocked(userId: Data)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_is_user_blocked(self.uniffiClonePointer(),
         FfiConverterData.lower(userId),$0
+    )
+})
+}
+    
+    /**
+     * This device's activation record (§9.4). A store that has never begun a
+     * link reads [`CoreLinkActivationStage::NotLinking`].
+     */
+open func linkActivation()throws  -> CoreLinkActivation {
+    return try  FfiConverterTypeCoreLinkActivation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_link_activation(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Ask the gate about one action (§9.4). Every core path that advertises,
+     * authors, or acks goes through this; shells consult it for the paths core
+     * cannot see, above all their own BLE and LAN advertising.
+     */
+open func linkGate(action: CoreLinkGatedAction)throws  -> CoreLinkGateVerdict {
+    return try  FfiConverterTypeCoreLinkGateVerdict.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_link_gate(self.uniffiClonePointer(),
+        FfiConverterTypeCoreLinkGatedAction.lower(action),$0
+    )
+})
+}
+    
+    /**
+     * Whether this store may take a bootstrap (§9.3), and if not, why.
+     *
+     * `expected_person_id` is the person the caller believes this phone is
+     * being set up as — the id read out of an opened `.cmbak`, or whatever the
+     * restore flow already knows. `None` means "the caller does not know", and
+     * is only acceptable on a phone with nothing of its own: a bootstrap
+     * imported over a store that already holds someone's contacts and messages
+     * merges two people's worlds with no way back.
+     *
+     * Asked here as well as inside [`Self::import_link_bootstrap`] so a shell
+     * can refuse on the screen that offers the ceremony instead of at the end
+     * of one.
+     */
+open func linkImportReadiness(expectedPersonId: Data?)throws  -> CoreLinkImportReadiness {
+    return try  FfiConverterTypeCoreLinkImportReadiness.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_link_import_readiness(self.uniffiClonePointer(),
+        FfiConverterOptionData.lower(expectedPersonId),$0
     )
 })
 }
@@ -9352,6 +10487,17 @@ open func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: 
 open func ownDeviceFleet()throws  -> OwnDeviceFleet {
     return try  FfiConverterTypeOwnDeviceFleet.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_own_device_fleet(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * This person's own roster document (§4), or `None` on an install that has
+     * never linked.
+     */
+open func ownRoster()throws  -> Roster? {
+    return try  FfiConverterOptionTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_own_roster(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -15024,6 +16170,754 @@ public func FfiConverterTypeCoreLanHealthDecision_lower(_ value: CoreLanHealthDe
 
 
 /**
+ * One step of a ceremony.
+ */
+public struct CoreLinkAction {
+    public var role: CoreLinkRole
+    /**
+     * Strictly increasing across the actions one ceremony emits. A restated
+     * action — what a stale resume gets back — keeps the id it already had,
+     * because nothing new was emitted.
+     */
+    public var actionId: UInt64
+    public var phase: CoreLinkPhase
+    public var kind: CoreLinkActionKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(role: CoreLinkRole, 
+        /**
+         * Strictly increasing across the actions one ceremony emits. A restated
+         * action — what a stale resume gets back — keeps the id it already had,
+         * because nothing new was emitted.
+         */actionId: UInt64, phase: CoreLinkPhase, kind: CoreLinkActionKind) {
+        self.role = role
+        self.actionId = actionId
+        self.phase = phase
+        self.kind = kind
+    }
+}
+
+
+
+extension CoreLinkAction: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkAction, rhs: CoreLinkAction) -> Bool {
+        if lhs.role != rhs.role {
+            return false
+        }
+        if lhs.actionId != rhs.actionId {
+            return false
+        }
+        if lhs.phase != rhs.phase {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(role)
+        hasher.combine(actionId)
+        hasher.combine(phase)
+        hasher.combine(kind)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkAction: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkAction {
+        return
+            try CoreLinkAction(
+                role: FfiConverterTypeCoreLinkRole.read(from: &buf), 
+                actionId: FfiConverterUInt64.read(from: &buf), 
+                phase: FfiConverterTypeCoreLinkPhase.read(from: &buf), 
+                kind: FfiConverterTypeCoreLinkActionKind.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkAction, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreLinkRole.write(value.role, into: &buf)
+        FfiConverterUInt64.write(value.actionId, into: &buf)
+        FfiConverterTypeCoreLinkPhase.write(value.phase, into: &buf)
+        FfiConverterTypeCoreLinkActionKind.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkAction_lift(_ buf: RustBuffer) throws -> CoreLinkAction {
+    return try FfiConverterTypeCoreLinkAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkAction_lower(_ value: CoreLinkAction) -> RustBuffer {
+    return FfiConverterTypeCoreLinkAction.lower(value)
+}
+
+
+/**
+ * This device's activation record.
+ */
+public struct CoreLinkActivation {
+    public var stage: CoreLinkActivationStage
+    /**
+     * §9.4(b)'s target: the exact head that must come back, once the
+     * bootstrap has been imported.
+     */
+    public var expectedRosterHead: Data?
+    /**
+     * The device id this install was certified under, once it knows one.
+     */
+    public var ownDeviceId: Data?
+    /**
+     * The ceremony this window belongs to: the Noise handshake hash recorded
+     * by [`MessageStore::begin_link_activation`]. A bootstrap whose own
+     * binding is not this one is not this ceremony's bootstrap, whatever else
+     * is true about it. `None` on a store that never began a link, and on a
+     * dev install that began one under the pre-binding schema — where it means
+     * "no ceremony recorded", and the import is refused.
+     */
+    public var channelBinding: Data?
+    /**
+     * When this row was last written: the moment the window opened, or — on a
+     * `NotLinking` row that is not simply absent — the moment a failed
+     * ceremony was abandoned and the gates reopened.
+     */
+    public var startedAtMs: Int64
+    public var bootstrapImportedAtMs: Int64
+    public var activatedAtMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(stage: CoreLinkActivationStage, 
+        /**
+         * §9.4(b)'s target: the exact head that must come back, once the
+         * bootstrap has been imported.
+         */expectedRosterHead: Data?, 
+        /**
+         * The device id this install was certified under, once it knows one.
+         */ownDeviceId: Data?, 
+        /**
+         * The ceremony this window belongs to: the Noise handshake hash recorded
+         * by [`MessageStore::begin_link_activation`]. A bootstrap whose own
+         * binding is not this one is not this ceremony's bootstrap, whatever else
+         * is true about it. `None` on a store that never began a link, and on a
+         * dev install that began one under the pre-binding schema — where it means
+         * "no ceremony recorded", and the import is refused.
+         */channelBinding: Data?, 
+        /**
+         * When this row was last written: the moment the window opened, or — on a
+         * `NotLinking` row that is not simply absent — the moment a failed
+         * ceremony was abandoned and the gates reopened.
+         */startedAtMs: Int64, bootstrapImportedAtMs: Int64, activatedAtMs: Int64) {
+        self.stage = stage
+        self.expectedRosterHead = expectedRosterHead
+        self.ownDeviceId = ownDeviceId
+        self.channelBinding = channelBinding
+        self.startedAtMs = startedAtMs
+        self.bootstrapImportedAtMs = bootstrapImportedAtMs
+        self.activatedAtMs = activatedAtMs
+    }
+}
+
+
+
+extension CoreLinkActivation: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkActivation, rhs: CoreLinkActivation) -> Bool {
+        if lhs.stage != rhs.stage {
+            return false
+        }
+        if lhs.expectedRosterHead != rhs.expectedRosterHead {
+            return false
+        }
+        if lhs.ownDeviceId != rhs.ownDeviceId {
+            return false
+        }
+        if lhs.channelBinding != rhs.channelBinding {
+            return false
+        }
+        if lhs.startedAtMs != rhs.startedAtMs {
+            return false
+        }
+        if lhs.bootstrapImportedAtMs != rhs.bootstrapImportedAtMs {
+            return false
+        }
+        if lhs.activatedAtMs != rhs.activatedAtMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(stage)
+        hasher.combine(expectedRosterHead)
+        hasher.combine(ownDeviceId)
+        hasher.combine(channelBinding)
+        hasher.combine(startedAtMs)
+        hasher.combine(bootstrapImportedAtMs)
+        hasher.combine(activatedAtMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkActivation: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkActivation {
+        return
+            try CoreLinkActivation(
+                stage: FfiConverterTypeCoreLinkActivationStage.read(from: &buf), 
+                expectedRosterHead: FfiConverterOptionData.read(from: &buf), 
+                ownDeviceId: FfiConverterOptionData.read(from: &buf), 
+                channelBinding: FfiConverterOptionData.read(from: &buf), 
+                startedAtMs: FfiConverterInt64.read(from: &buf), 
+                bootstrapImportedAtMs: FfiConverterInt64.read(from: &buf), 
+                activatedAtMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkActivation, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreLinkActivationStage.write(value.stage, into: &buf)
+        FfiConverterOptionData.write(value.expectedRosterHead, into: &buf)
+        FfiConverterOptionData.write(value.ownDeviceId, into: &buf)
+        FfiConverterOptionData.write(value.channelBinding, into: &buf)
+        FfiConverterInt64.write(value.startedAtMs, into: &buf)
+        FfiConverterInt64.write(value.bootstrapImportedAtMs, into: &buf)
+        FfiConverterInt64.write(value.activatedAtMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActivation_lift(_ buf: RustBuffer) throws -> CoreLinkActivation {
+    return try FfiConverterTypeCoreLinkActivation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActivation_lower(_ value: CoreLinkActivation) -> RustBuffer {
+    return FfiConverterTypeCoreLinkActivation.lower(value)
+}
+
+
+/**
+ * What an import left behind.
+ */
+public struct CoreLinkBootstrapImport {
+    /**
+     * The identity material the shell must persist in platform-protected
+     * storage, exactly as it persists a generated [`Identity`](crate::Identity).
+     * The core does not keep secrets.
+     */
+    public var person: LinkBootstrapPerson
+    /**
+     * This device's own id, taken from the certificate the roster carries for
+     * it — never from the caller.
+     */
+    public var ownDeviceId: Data
+    /**
+     * §9.4(b)'s target: acknowledge exactly this.
+     */
+    public var rosterHead: Data
+    public var contactsImported: UInt32
+    public var contactRostersImported: UInt32
+    public var groupsImported: UInt32
+    public var messagesImported: UInt32
+    /**
+     * The WP4 seam, computed from what just landed.
+     */
+    public var catchUp: [CoreLinkCatchUp]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The identity material the shell must persist in platform-protected
+         * storage, exactly as it persists a generated [`Identity`](crate::Identity).
+         * The core does not keep secrets.
+         */person: LinkBootstrapPerson, 
+        /**
+         * This device's own id, taken from the certificate the roster carries for
+         * it — never from the caller.
+         */ownDeviceId: Data, 
+        /**
+         * §9.4(b)'s target: acknowledge exactly this.
+         */rosterHead: Data, contactsImported: UInt32, contactRostersImported: UInt32, groupsImported: UInt32, messagesImported: UInt32, 
+        /**
+         * The WP4 seam, computed from what just landed.
+         */catchUp: [CoreLinkCatchUp]) {
+        self.person = person
+        self.ownDeviceId = ownDeviceId
+        self.rosterHead = rosterHead
+        self.contactsImported = contactsImported
+        self.contactRostersImported = contactRostersImported
+        self.groupsImported = groupsImported
+        self.messagesImported = messagesImported
+        self.catchUp = catchUp
+    }
+}
+
+
+
+extension CoreLinkBootstrapImport: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkBootstrapImport, rhs: CoreLinkBootstrapImport) -> Bool {
+        if lhs.person != rhs.person {
+            return false
+        }
+        if lhs.ownDeviceId != rhs.ownDeviceId {
+            return false
+        }
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.contactsImported != rhs.contactsImported {
+            return false
+        }
+        if lhs.contactRostersImported != rhs.contactRostersImported {
+            return false
+        }
+        if lhs.groupsImported != rhs.groupsImported {
+            return false
+        }
+        if lhs.messagesImported != rhs.messagesImported {
+            return false
+        }
+        if lhs.catchUp != rhs.catchUp {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(person)
+        hasher.combine(ownDeviceId)
+        hasher.combine(rosterHead)
+        hasher.combine(contactsImported)
+        hasher.combine(contactRostersImported)
+        hasher.combine(groupsImported)
+        hasher.combine(messagesImported)
+        hasher.combine(catchUp)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkBootstrapImport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkBootstrapImport {
+        return
+            try CoreLinkBootstrapImport(
+                person: FfiConverterTypeLinkBootstrapPerson.read(from: &buf), 
+                ownDeviceId: FfiConverterData.read(from: &buf), 
+                rosterHead: FfiConverterData.read(from: &buf), 
+                contactsImported: FfiConverterUInt32.read(from: &buf), 
+                contactRostersImported: FfiConverterUInt32.read(from: &buf), 
+                groupsImported: FfiConverterUInt32.read(from: &buf), 
+                messagesImported: FfiConverterUInt32.read(from: &buf), 
+                catchUp: FfiConverterSequenceTypeCoreLinkCatchUp.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkBootstrapImport, into buf: inout [UInt8]) {
+        FfiConverterTypeLinkBootstrapPerson.write(value.person, into: &buf)
+        FfiConverterData.write(value.ownDeviceId, into: &buf)
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterUInt32.write(value.contactsImported, into: &buf)
+        FfiConverterUInt32.write(value.contactRostersImported, into: &buf)
+        FfiConverterUInt32.write(value.groupsImported, into: &buf)
+        FfiConverterUInt32.write(value.messagesImported, into: &buf)
+        FfiConverterSequenceTypeCoreLinkCatchUp.write(value.catchUp, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkBootstrapImport_lift(_ buf: RustBuffer) throws -> CoreLinkBootstrapImport {
+    return try FfiConverterTypeCoreLinkBootstrapImport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkBootstrapImport_lower(_ value: CoreLinkBootstrapImport) -> RustBuffer {
+    return FfiConverterTypeCoreLinkBootstrapImport.lower(value)
+}
+
+
+/**
+ * What WP4's catch-up will have to ask for, per chat, once it exists.
+ */
+public struct CoreLinkCatchUp {
+    public var chatId: Data
+    /**
+     * The oldest lamport the head carries for this chat. Everything strictly
+     * below it is what self-sync owes.
+     */
+    public var headFromLamport: UInt64
+    /**
+     * The newest lamport the head carries.
+     */
+    public var headThroughLamport: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(chatId: Data, 
+        /**
+         * The oldest lamport the head carries for this chat. Everything strictly
+         * below it is what self-sync owes.
+         */headFromLamport: UInt64, 
+        /**
+         * The newest lamport the head carries.
+         */headThroughLamport: UInt64) {
+        self.chatId = chatId
+        self.headFromLamport = headFromLamport
+        self.headThroughLamport = headThroughLamport
+    }
+}
+
+
+
+extension CoreLinkCatchUp: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkCatchUp, rhs: CoreLinkCatchUp) -> Bool {
+        if lhs.chatId != rhs.chatId {
+            return false
+        }
+        if lhs.headFromLamport != rhs.headFromLamport {
+            return false
+        }
+        if lhs.headThroughLamport != rhs.headThroughLamport {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(chatId)
+        hasher.combine(headFromLamport)
+        hasher.combine(headThroughLamport)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkCatchUp: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkCatchUp {
+        return
+            try CoreLinkCatchUp(
+                chatId: FfiConverterData.read(from: &buf), 
+                headFromLamport: FfiConverterUInt64.read(from: &buf), 
+                headThroughLamport: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkCatchUp, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.chatId, into: &buf)
+        FfiConverterUInt64.write(value.headFromLamport, into: &buf)
+        FfiConverterUInt64.write(value.headThroughLamport, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkCatchUp_lift(_ buf: RustBuffer) throws -> CoreLinkCatchUp {
+    return try FfiConverterTypeCoreLinkCatchUp.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkCatchUp_lower(_ value: CoreLinkCatchUp) -> RustBuffer {
+    return FfiConverterTypeCoreLinkCatchUp.lower(value)
+}
+
+
+/**
+ * One gate answer.
+ */
+public struct CoreLinkGateVerdict {
+    public var allowed: Bool
+    public var stage: CoreLinkActivationStage
+    public var action: CoreLinkGatedAction
+    public var reason: CoreLinkGateReason
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(allowed: Bool, stage: CoreLinkActivationStage, action: CoreLinkGatedAction, reason: CoreLinkGateReason) {
+        self.allowed = allowed
+        self.stage = stage
+        self.action = action
+        self.reason = reason
+    }
+}
+
+
+
+extension CoreLinkGateVerdict: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkGateVerdict, rhs: CoreLinkGateVerdict) -> Bool {
+        if lhs.allowed != rhs.allowed {
+            return false
+        }
+        if lhs.stage != rhs.stage {
+            return false
+        }
+        if lhs.action != rhs.action {
+            return false
+        }
+        if lhs.reason != rhs.reason {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(allowed)
+        hasher.combine(stage)
+        hasher.combine(action)
+        hasher.combine(reason)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkGateVerdict: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkGateVerdict {
+        return
+            try CoreLinkGateVerdict(
+                allowed: FfiConverterBool.read(from: &buf), 
+                stage: FfiConverterTypeCoreLinkActivationStage.read(from: &buf), 
+                action: FfiConverterTypeCoreLinkGatedAction.read(from: &buf), 
+                reason: FfiConverterTypeCoreLinkGateReason.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkGateVerdict, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.allowed, into: &buf)
+        FfiConverterTypeCoreLinkActivationStage.write(value.stage, into: &buf)
+        FfiConverterTypeCoreLinkGatedAction.write(value.action, into: &buf)
+        FfiConverterTypeCoreLinkGateReason.write(value.reason, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGateVerdict_lift(_ buf: RustBuffer) throws -> CoreLinkGateVerdict {
+    return try FfiConverterTypeCoreLinkGateVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGateVerdict_lower(_ value: CoreLinkGateVerdict) -> RustBuffer {
+    return FfiConverterTypeCoreLinkGateVerdict.lower(value)
+}
+
+
+/**
+ * How a ceremony ended, and what it leaves behind for §9.3.
+ */
+public struct CoreLinkSummary {
+    public var role: CoreLinkRole
+    public var outcome: CoreLinkOutcome
+    /**
+     * The digits both ends showed, once they existed.
+     */
+    public var sas: String?
+    /**
+     * The Noise handshake hash: 32 bytes committing to the prologue, both
+     * statics, and every handshake message. §9.3's bootstrap and §9.4's roster
+     * acknowledgement bind to this, so a bootstrap can never be replayed into
+     * a different ceremony.
+     */
+    public var channelBinding: Data?
+    /**
+     * The peer's Noise static key. On the approving device this is provably
+     * the key printed in the QR.
+     */
+    public var peerStaticPk: Data?
+    /**
+     * §14.3: this add takes the person past the soft cap and the shell should
+     * say so.
+     */
+    public var softCapWarning: Bool
+    public var startedAtMs: Int64
+    public var finishedAtMs: Int64
+    public var messagesSent: UInt32
+    public var messagesReceived: UInt32
+    /**
+     * Resumes that did not match the outstanding action and were ignored.
+     */
+    public var staleResumesIgnored: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(role: CoreLinkRole, outcome: CoreLinkOutcome, 
+        /**
+         * The digits both ends showed, once they existed.
+         */sas: String?, 
+        /**
+         * The Noise handshake hash: 32 bytes committing to the prologue, both
+         * statics, and every handshake message. §9.3's bootstrap and §9.4's roster
+         * acknowledgement bind to this, so a bootstrap can never be replayed into
+         * a different ceremony.
+         */channelBinding: Data?, 
+        /**
+         * The peer's Noise static key. On the approving device this is provably
+         * the key printed in the QR.
+         */peerStaticPk: Data?, 
+        /**
+         * §14.3: this add takes the person past the soft cap and the shell should
+         * say so.
+         */softCapWarning: Bool, startedAtMs: Int64, finishedAtMs: Int64, messagesSent: UInt32, messagesReceived: UInt32, 
+        /**
+         * Resumes that did not match the outstanding action and were ignored.
+         */staleResumesIgnored: UInt32) {
+        self.role = role
+        self.outcome = outcome
+        self.sas = sas
+        self.channelBinding = channelBinding
+        self.peerStaticPk = peerStaticPk
+        self.softCapWarning = softCapWarning
+        self.startedAtMs = startedAtMs
+        self.finishedAtMs = finishedAtMs
+        self.messagesSent = messagesSent
+        self.messagesReceived = messagesReceived
+        self.staleResumesIgnored = staleResumesIgnored
+    }
+}
+
+
+
+extension CoreLinkSummary: Equatable, Hashable {
+    public static func ==(lhs: CoreLinkSummary, rhs: CoreLinkSummary) -> Bool {
+        if lhs.role != rhs.role {
+            return false
+        }
+        if lhs.outcome != rhs.outcome {
+            return false
+        }
+        if lhs.sas != rhs.sas {
+            return false
+        }
+        if lhs.channelBinding != rhs.channelBinding {
+            return false
+        }
+        if lhs.peerStaticPk != rhs.peerStaticPk {
+            return false
+        }
+        if lhs.softCapWarning != rhs.softCapWarning {
+            return false
+        }
+        if lhs.startedAtMs != rhs.startedAtMs {
+            return false
+        }
+        if lhs.finishedAtMs != rhs.finishedAtMs {
+            return false
+        }
+        if lhs.messagesSent != rhs.messagesSent {
+            return false
+        }
+        if lhs.messagesReceived != rhs.messagesReceived {
+            return false
+        }
+        if lhs.staleResumesIgnored != rhs.staleResumesIgnored {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(role)
+        hasher.combine(outcome)
+        hasher.combine(sas)
+        hasher.combine(channelBinding)
+        hasher.combine(peerStaticPk)
+        hasher.combine(softCapWarning)
+        hasher.combine(startedAtMs)
+        hasher.combine(finishedAtMs)
+        hasher.combine(messagesSent)
+        hasher.combine(messagesReceived)
+        hasher.combine(staleResumesIgnored)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkSummary {
+        return
+            try CoreLinkSummary(
+                role: FfiConverterTypeCoreLinkRole.read(from: &buf), 
+                outcome: FfiConverterTypeCoreLinkOutcome.read(from: &buf), 
+                sas: FfiConverterOptionString.read(from: &buf), 
+                channelBinding: FfiConverterOptionData.read(from: &buf), 
+                peerStaticPk: FfiConverterOptionData.read(from: &buf), 
+                softCapWarning: FfiConverterBool.read(from: &buf), 
+                startedAtMs: FfiConverterInt64.read(from: &buf), 
+                finishedAtMs: FfiConverterInt64.read(from: &buf), 
+                messagesSent: FfiConverterUInt32.read(from: &buf), 
+                messagesReceived: FfiConverterUInt32.read(from: &buf), 
+                staleResumesIgnored: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLinkSummary, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreLinkRole.write(value.role, into: &buf)
+        FfiConverterTypeCoreLinkOutcome.write(value.outcome, into: &buf)
+        FfiConverterOptionString.write(value.sas, into: &buf)
+        FfiConverterOptionData.write(value.channelBinding, into: &buf)
+        FfiConverterOptionData.write(value.peerStaticPk, into: &buf)
+        FfiConverterBool.write(value.softCapWarning, into: &buf)
+        FfiConverterInt64.write(value.startedAtMs, into: &buf)
+        FfiConverterInt64.write(value.finishedAtMs, into: &buf)
+        FfiConverterUInt32.write(value.messagesSent, into: &buf)
+        FfiConverterUInt32.write(value.messagesReceived, into: &buf)
+        FfiConverterUInt32.write(value.staleResumesIgnored, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkSummary_lift(_ buf: RustBuffer) throws -> CoreLinkSummary {
+    return try FfiConverterTypeCoreLinkSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkSummary_lower(_ value: CoreLinkSummary) -> RustBuffer {
+    return FfiConverterTypeCoreLinkSummary.lower(value)
+}
+
+
+/**
  * The result of planning one encounter through [`MessageStore::plan_mesh_meet`].
  *
  * Every list here is the page this encounter is allowed to offer: the
@@ -20608,6 +22502,185 @@ public func FfiConverterTypeCoreReplyMetadata_lower(_ value: CoreReplyMetadata) 
 
 
 /**
+ * What one intent commits to. Every field is a decision the caller would
+ * otherwise have to re-derive, and getting one of them wrong is how a clone
+ * happens.
+ */
+public struct CoreRestorePlan {
+    public var intent: CoreRestoreIntent
+    /**
+     * The person this backup belongs to — the wire `user_id`, unchanged by
+     * either intent (§2 goal 2: no re-friending, ever).
+     */
+    public var personId: Data
+    /**
+     * Restore the backup's message store as this device's history.
+     */
+    public var restoresStoredHistory: Bool
+    /**
+     * Take the backup's own-device record as this device's own (§9: a
+     * replacement really is the same device, with the same id and siblings).
+     */
+    public var keepsExistingDeviceIdentity: Bool
+    /**
+     * Mint a fresh device keypair, because this is a different device.
+     */
+    public var mintsNewDeviceKey: Bool
+    /**
+     * Hand off to §9's ceremony rather than finishing here.
+     */
+    public var routesToLinkCeremony: Bool
+    /**
+     * §14.2: the backup carries a person root secret that can actually sign,
+     * so this device can mint a recovery-epoch roster if no approving device
+     * is left to ask. False when the root secret in the identity block does
+     * not produce the root key beside it — a backup that will restore history
+     * and will not recover a fleet.
+     */
+    public var carriesRecoveryMaterial: Bool
+    /**
+     * §1: choosing this intent while the source device is still running
+     * creates two devices signing one author stream. True for
+     * [`CoreRestoreIntent::ReplaceThisDevice`], which is the intent that has
+     * to be chosen with the old phone switched off.
+     */
+    public var cloneHazardIfSourceIsLive: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(intent: CoreRestoreIntent, 
+        /**
+         * The person this backup belongs to — the wire `user_id`, unchanged by
+         * either intent (§2 goal 2: no re-friending, ever).
+         */personId: Data, 
+        /**
+         * Restore the backup's message store as this device's history.
+         */restoresStoredHistory: Bool, 
+        /**
+         * Take the backup's own-device record as this device's own (§9: a
+         * replacement really is the same device, with the same id and siblings).
+         */keepsExistingDeviceIdentity: Bool, 
+        /**
+         * Mint a fresh device keypair, because this is a different device.
+         */mintsNewDeviceKey: Bool, 
+        /**
+         * Hand off to §9's ceremony rather than finishing here.
+         */routesToLinkCeremony: Bool, 
+        /**
+         * §14.2: the backup carries a person root secret that can actually sign,
+         * so this device can mint a recovery-epoch roster if no approving device
+         * is left to ask. False when the root secret in the identity block does
+         * not produce the root key beside it — a backup that will restore history
+         * and will not recover a fleet.
+         */carriesRecoveryMaterial: Bool, 
+        /**
+         * §1: choosing this intent while the source device is still running
+         * creates two devices signing one author stream. True for
+         * [`CoreRestoreIntent::ReplaceThisDevice`], which is the intent that has
+         * to be chosen with the old phone switched off.
+         */cloneHazardIfSourceIsLive: Bool) {
+        self.intent = intent
+        self.personId = personId
+        self.restoresStoredHistory = restoresStoredHistory
+        self.keepsExistingDeviceIdentity = keepsExistingDeviceIdentity
+        self.mintsNewDeviceKey = mintsNewDeviceKey
+        self.routesToLinkCeremony = routesToLinkCeremony
+        self.carriesRecoveryMaterial = carriesRecoveryMaterial
+        self.cloneHazardIfSourceIsLive = cloneHazardIfSourceIsLive
+    }
+}
+
+
+
+extension CoreRestorePlan: Equatable, Hashable {
+    public static func ==(lhs: CoreRestorePlan, rhs: CoreRestorePlan) -> Bool {
+        if lhs.intent != rhs.intent {
+            return false
+        }
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.restoresStoredHistory != rhs.restoresStoredHistory {
+            return false
+        }
+        if lhs.keepsExistingDeviceIdentity != rhs.keepsExistingDeviceIdentity {
+            return false
+        }
+        if lhs.mintsNewDeviceKey != rhs.mintsNewDeviceKey {
+            return false
+        }
+        if lhs.routesToLinkCeremony != rhs.routesToLinkCeremony {
+            return false
+        }
+        if lhs.carriesRecoveryMaterial != rhs.carriesRecoveryMaterial {
+            return false
+        }
+        if lhs.cloneHazardIfSourceIsLive != rhs.cloneHazardIfSourceIsLive {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(intent)
+        hasher.combine(personId)
+        hasher.combine(restoresStoredHistory)
+        hasher.combine(keepsExistingDeviceIdentity)
+        hasher.combine(mintsNewDeviceKey)
+        hasher.combine(routesToLinkCeremony)
+        hasher.combine(carriesRecoveryMaterial)
+        hasher.combine(cloneHazardIfSourceIsLive)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRestorePlan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRestorePlan {
+        return
+            try CoreRestorePlan(
+                intent: FfiConverterTypeCoreRestoreIntent.read(from: &buf), 
+                personId: FfiConverterData.read(from: &buf), 
+                restoresStoredHistory: FfiConverterBool.read(from: &buf), 
+                keepsExistingDeviceIdentity: FfiConverterBool.read(from: &buf), 
+                mintsNewDeviceKey: FfiConverterBool.read(from: &buf), 
+                routesToLinkCeremony: FfiConverterBool.read(from: &buf), 
+                carriesRecoveryMaterial: FfiConverterBool.read(from: &buf), 
+                cloneHazardIfSourceIsLive: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreRestorePlan, into buf: inout [UInt8]) {
+        FfiConverterTypeCoreRestoreIntent.write(value.intent, into: &buf)
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterBool.write(value.restoresStoredHistory, into: &buf)
+        FfiConverterBool.write(value.keepsExistingDeviceIdentity, into: &buf)
+        FfiConverterBool.write(value.mintsNewDeviceKey, into: &buf)
+        FfiConverterBool.write(value.routesToLinkCeremony, into: &buf)
+        FfiConverterBool.write(value.carriesRecoveryMaterial, into: &buf)
+        FfiConverterBool.write(value.cloneHazardIfSourceIsLive, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRestorePlan_lift(_ buf: RustBuffer) throws -> CoreRestorePlan {
+    return try FfiConverterTypeCoreRestorePlan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRestorePlan_lower(_ value: CoreRestorePlan) -> RustBuffer {
+    return FfiConverterTypeCoreRestorePlan.lower(value)
+}
+
+
+/**
  * Every fact the checklist consumes, gathered by the shell.
  *
  * All of it is state the app already holds for other reasons -- this screen
@@ -23994,6 +26067,913 @@ public func FfiConverterTypeLateArrivalInput_lift(_ buf: RustBuffer) throws -> L
 #endif
 public func FfiConverterTypeLateArrivalInput_lower(_ value: LateArrivalInput) -> RustBuffer {
     return FfiConverterTypeLateArrivalInput.lower(value)
+}
+
+
+/**
+ * §9.4(b): one exact roster head, acknowledged by the device that imported it.
+ */
+public struct LinkActivationAck {
+    public var deviceId: Data
+    public var rosterHead: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceId: Data, rosterHead: Data) {
+        self.deviceId = deviceId
+        self.rosterHead = rosterHead
+    }
+}
+
+
+
+extension LinkActivationAck: Equatable, Hashable {
+    public static func ==(lhs: LinkActivationAck, rhs: LinkActivationAck) -> Bool {
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceId)
+        hasher.combine(rosterHead)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkActivationAck: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkActivationAck {
+        return
+            try LinkActivationAck(
+                deviceId: FfiConverterData.read(from: &buf), 
+                rosterHead: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkActivationAck, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceId, into: &buf)
+        FfiConverterData.write(value.rosterHead, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkActivationAck_lift(_ buf: RustBuffer) throws -> LinkActivationAck {
+    return try FfiConverterTypeLinkActivationAck.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkActivationAck_lower(_ value: LinkActivationAck) -> RustBuffer {
+    return FfiConverterTypeLinkActivationAck.lower(value)
+}
+
+
+/**
+ * The §9.3 export itself.
+ */
+public struct LinkBootstrap {
+    public var version: UInt16
+    public var createdAtMs: Int64
+    public var person: LinkBootstrapPerson
+    /**
+     * The person's OWN roster at `seq + 1`, already naming the new device
+     * (§9.4). This is the document whose head the new device acknowledges to
+     * close activation, so it travels inside the bootstrap rather than beside
+     * it: importing the export and learning which roster to ack are one act.
+     */
+    public var roster: Roster
+    public var contacts: [LinkBootstrapContact]
+    public var groups: [Group]
+    /**
+     * Recent messages, newest chats and all, as §9.3's "recent history head".
+     */
+    public var historyHead: [StoredMessage]
+    /**
+     * The Noise handshake hash of the ceremony this export was made for
+     * ([`CoreLinkSummary::channel_binding`](super::ceremony::CoreLinkSummary)).
+     * The new device refuses a bootstrap whose binding is not the one it
+     * recorded when its own window opened, so an export captured from one
+     * ceremony is not an export in another.
+     */
+    public var channelBinding: Data
+    /**
+     * When this export stops being importable. A ceremony is minutes long; an
+     * export that is still good tomorrow is one that outlived the room.
+     */
+    public var expiresAtMs: Int64
+    /**
+     * The APPROVING device's signing key — the roster-signing device of §3,
+     * which the roster below names as `approving_device_id`. Verified against
+     * that roster rather than trusted, so the signature says "the device that
+     * is allowed to add devices made this", not merely "someone did".
+     */
+    public var signerSignPk: Data
+    /**
+     * Ed25519 over
+     * [`DeviceSigningDomain::DeviceLinkBootstrap`] ‖ everything above ‖
+     * `channel_binding` ‖ `expires_at_ms`.
+     */
+    public var signature: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(version: UInt16, createdAtMs: Int64, person: LinkBootstrapPerson, 
+        /**
+         * The person's OWN roster at `seq + 1`, already naming the new device
+         * (§9.4). This is the document whose head the new device acknowledges to
+         * close activation, so it travels inside the bootstrap rather than beside
+         * it: importing the export and learning which roster to ack are one act.
+         */roster: Roster, contacts: [LinkBootstrapContact], groups: [Group], 
+        /**
+         * Recent messages, newest chats and all, as §9.3's "recent history head".
+         */historyHead: [StoredMessage], 
+        /**
+         * The Noise handshake hash of the ceremony this export was made for
+         * ([`CoreLinkSummary::channel_binding`](super::ceremony::CoreLinkSummary)).
+         * The new device refuses a bootstrap whose binding is not the one it
+         * recorded when its own window opened, so an export captured from one
+         * ceremony is not an export in another.
+         */channelBinding: Data, 
+        /**
+         * When this export stops being importable. A ceremony is minutes long; an
+         * export that is still good tomorrow is one that outlived the room.
+         */expiresAtMs: Int64, 
+        /**
+         * The APPROVING device's signing key — the roster-signing device of §3,
+         * which the roster below names as `approving_device_id`. Verified against
+         * that roster rather than trusted, so the signature says "the device that
+         * is allowed to add devices made this", not merely "someone did".
+         */signerSignPk: Data, 
+        /**
+         * Ed25519 over
+         * [`DeviceSigningDomain::DeviceLinkBootstrap`] ‖ everything above ‖
+         * `channel_binding` ‖ `expires_at_ms`.
+         */signature: Data) {
+        self.version = version
+        self.createdAtMs = createdAtMs
+        self.person = person
+        self.roster = roster
+        self.contacts = contacts
+        self.groups = groups
+        self.historyHead = historyHead
+        self.channelBinding = channelBinding
+        self.expiresAtMs = expiresAtMs
+        self.signerSignPk = signerSignPk
+        self.signature = signature
+    }
+}
+
+
+
+extension LinkBootstrap: Equatable, Hashable {
+    public static func ==(lhs: LinkBootstrap, rhs: LinkBootstrap) -> Bool {
+        if lhs.version != rhs.version {
+            return false
+        }
+        if lhs.createdAtMs != rhs.createdAtMs {
+            return false
+        }
+        if lhs.person != rhs.person {
+            return false
+        }
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.contacts != rhs.contacts {
+            return false
+        }
+        if lhs.groups != rhs.groups {
+            return false
+        }
+        if lhs.historyHead != rhs.historyHead {
+            return false
+        }
+        if lhs.channelBinding != rhs.channelBinding {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.signerSignPk != rhs.signerSignPk {
+            return false
+        }
+        if lhs.signature != rhs.signature {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(version)
+        hasher.combine(createdAtMs)
+        hasher.combine(person)
+        hasher.combine(roster)
+        hasher.combine(contacts)
+        hasher.combine(groups)
+        hasher.combine(historyHead)
+        hasher.combine(channelBinding)
+        hasher.combine(expiresAtMs)
+        hasher.combine(signerSignPk)
+        hasher.combine(signature)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkBootstrap: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkBootstrap {
+        return
+            try LinkBootstrap(
+                version: FfiConverterUInt16.read(from: &buf), 
+                createdAtMs: FfiConverterInt64.read(from: &buf), 
+                person: FfiConverterTypeLinkBootstrapPerson.read(from: &buf), 
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                contacts: FfiConverterSequenceTypeLinkBootstrapContact.read(from: &buf), 
+                groups: FfiConverterSequenceTypeGroup.read(from: &buf), 
+                historyHead: FfiConverterSequenceTypeStoredMessage.read(from: &buf), 
+                channelBinding: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                signerSignPk: FfiConverterData.read(from: &buf), 
+                signature: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkBootstrap, into buf: inout [UInt8]) {
+        FfiConverterUInt16.write(value.version, into: &buf)
+        FfiConverterInt64.write(value.createdAtMs, into: &buf)
+        FfiConverterTypeLinkBootstrapPerson.write(value.person, into: &buf)
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterSequenceTypeLinkBootstrapContact.write(value.contacts, into: &buf)
+        FfiConverterSequenceTypeGroup.write(value.groups, into: &buf)
+        FfiConverterSequenceTypeStoredMessage.write(value.historyHead, into: &buf)
+        FfiConverterData.write(value.channelBinding, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterData.write(value.signerSignPk, into: &buf)
+        FfiConverterData.write(value.signature, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrap_lift(_ buf: RustBuffer) throws -> LinkBootstrap {
+    return try FfiConverterTypeLinkBootstrap.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrap_lower(_ value: LinkBootstrap) -> RustBuffer {
+    return FfiConverterTypeLinkBootstrap.lower(value)
+}
+
+
+/**
+ * One contact and what this person knows about that contact's devices.
+ */
+public struct LinkBootstrapContact {
+    public var contact: Contact
+    /**
+     * The contact's last accepted roster (§4), or `None` for a contact who
+     * has never gossiped one — which is every v1 peer, and reads on the new
+     * device as §5's synthetic one-device person.
+     */
+    public var roster: Roster?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(contact: Contact, 
+        /**
+         * The contact's last accepted roster (§4), or `None` for a contact who
+         * has never gossiped one — which is every v1 peer, and reads on the new
+         * device as §5's synthetic one-device person.
+         */roster: Roster?) {
+        self.contact = contact
+        self.roster = roster
+    }
+}
+
+
+
+extension LinkBootstrapContact: Equatable, Hashable {
+    public static func ==(lhs: LinkBootstrapContact, rhs: LinkBootstrapContact) -> Bool {
+        if lhs.contact != rhs.contact {
+            return false
+        }
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(contact)
+        hasher.combine(roster)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkBootstrapContact: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkBootstrapContact {
+        return
+            try LinkBootstrapContact(
+                contact: FfiConverterTypeContact.read(from: &buf), 
+                roster: FfiConverterOptionTypeRoster.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkBootstrapContact, into buf: inout [UInt8]) {
+        FfiConverterTypeContact.write(value.contact, into: &buf)
+        FfiConverterOptionTypeRoster.write(value.roster, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapContact_lift(_ buf: RustBuffer) throws -> LinkBootstrapContact {
+    return try FfiConverterTypeLinkBootstrapContact.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapContact_lower(_ value: LinkBootstrapContact) -> RustBuffer {
+    return FfiConverterTypeLinkBootstrapContact.lower(value)
+}
+
+
+/**
+ * The identity material of §9.3, minus everything §14.2 keeps in the backup.
+ */
+public struct LinkBootstrapPerson {
+    /**
+     * The wire `user_id` (§3's `person_id`), unchanged by linking.
+     */
+    public var personId: Data
+    /**
+     * The person root's *public* signing key: what every roster in this
+     * export chains to, and what the new device verifies later rosters
+     * against. The secret half is not here and never is (§14.2).
+     */
+    public var personSignPk: Data
+    /**
+     * §6's person-scoped inbox key generation, as the roster names it.
+     */
+    public var inboxKeyGeneration: UInt64
+    /**
+     * The person-scoped X25519 inbox keypair (§6). At generation 0 on an
+     * upgraded-in-place fleet this is the deployed person agreement keypair —
+     * the key contacts have been sealing to all along. WP5 rotates it on
+     * revocation and bumps the generation with it.
+     */
+    public var inboxAgreePk: Data
+    public var inboxAgreeSk: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The wire `user_id` (§3's `person_id`), unchanged by linking.
+         */personId: Data, 
+        /**
+         * The person root's *public* signing key: what every roster in this
+         * export chains to, and what the new device verifies later rosters
+         * against. The secret half is not here and never is (§14.2).
+         */personSignPk: Data, 
+        /**
+         * §6's person-scoped inbox key generation, as the roster names it.
+         */inboxKeyGeneration: UInt64, 
+        /**
+         * The person-scoped X25519 inbox keypair (§6). At generation 0 on an
+         * upgraded-in-place fleet this is the deployed person agreement keypair —
+         * the key contacts have been sealing to all along. WP5 rotates it on
+         * revocation and bumps the generation with it.
+         */inboxAgreePk: Data, inboxAgreeSk: Data) {
+        self.personId = personId
+        self.personSignPk = personSignPk
+        self.inboxKeyGeneration = inboxKeyGeneration
+        self.inboxAgreePk = inboxAgreePk
+        self.inboxAgreeSk = inboxAgreeSk
+    }
+}
+
+
+
+extension LinkBootstrapPerson: Equatable, Hashable {
+    public static func ==(lhs: LinkBootstrapPerson, rhs: LinkBootstrapPerson) -> Bool {
+        if lhs.personId != rhs.personId {
+            return false
+        }
+        if lhs.personSignPk != rhs.personSignPk {
+            return false
+        }
+        if lhs.inboxKeyGeneration != rhs.inboxKeyGeneration {
+            return false
+        }
+        if lhs.inboxAgreePk != rhs.inboxAgreePk {
+            return false
+        }
+        if lhs.inboxAgreeSk != rhs.inboxAgreeSk {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(personId)
+        hasher.combine(personSignPk)
+        hasher.combine(inboxKeyGeneration)
+        hasher.combine(inboxAgreePk)
+        hasher.combine(inboxAgreeSk)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkBootstrapPerson: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkBootstrapPerson {
+        return
+            try LinkBootstrapPerson(
+                personId: FfiConverterData.read(from: &buf), 
+                personSignPk: FfiConverterData.read(from: &buf), 
+                inboxKeyGeneration: FfiConverterUInt64.read(from: &buf), 
+                inboxAgreePk: FfiConverterData.read(from: &buf), 
+                inboxAgreeSk: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkBootstrapPerson, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.personId, into: &buf)
+        FfiConverterData.write(value.personSignPk, into: &buf)
+        FfiConverterUInt64.write(value.inboxKeyGeneration, into: &buf)
+        FfiConverterData.write(value.inboxAgreePk, into: &buf)
+        FfiConverterData.write(value.inboxAgreeSk, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapPerson_lift(_ buf: RustBuffer) throws -> LinkBootstrapPerson {
+    return try FfiConverterTypeLinkBootstrapPerson.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapPerson_lower(_ value: LinkBootstrapPerson) -> RustBuffer {
+    return FfiConverterTypeLinkBootstrapPerson.lower(value)
+}
+
+
+/**
+ * Declared budgets, in the style `PullBudgets` established.
+ */
+public struct LinkBudgets {
+    /**
+     * Wall-clock bound on one ceremony, from `start` to the confirmed channel.
+     * Generous, because a human tap is inside it.
+     */
+    public var deadlineMs: Int64
+    /**
+     * What an [`CoreLinkActionKind::AwaitPeer`] action suggests as a poll
+     * interval — advice for a relay rendezvous, ignored by a socket that can
+     * simply block.
+     */
+    public var pollIntervalMs: Int64
+    /**
+     * How long a freshly built offer stands.
+     */
+    public var qrLifetimeMs: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Wall-clock bound on one ceremony, from `start` to the confirmed channel.
+         * Generous, because a human tap is inside it.
+         */deadlineMs: Int64, 
+        /**
+         * What an [`CoreLinkActionKind::AwaitPeer`] action suggests as a poll
+         * interval — advice for a relay rendezvous, ignored by a socket that can
+         * simply block.
+         */pollIntervalMs: Int64, 
+        /**
+         * How long a freshly built offer stands.
+         */qrLifetimeMs: Int64) {
+        self.deadlineMs = deadlineMs
+        self.pollIntervalMs = pollIntervalMs
+        self.qrLifetimeMs = qrLifetimeMs
+    }
+}
+
+
+
+extension LinkBudgets: Equatable, Hashable {
+    public static func ==(lhs: LinkBudgets, rhs: LinkBudgets) -> Bool {
+        if lhs.deadlineMs != rhs.deadlineMs {
+            return false
+        }
+        if lhs.pollIntervalMs != rhs.pollIntervalMs {
+            return false
+        }
+        if lhs.qrLifetimeMs != rhs.qrLifetimeMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deadlineMs)
+        hasher.combine(pollIntervalMs)
+        hasher.combine(qrLifetimeMs)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkBudgets: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkBudgets {
+        return
+            try LinkBudgets(
+                deadlineMs: FfiConverterInt64.read(from: &buf), 
+                pollIntervalMs: FfiConverterInt64.read(from: &buf), 
+                qrLifetimeMs: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkBudgets, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.deadlineMs, into: &buf)
+        FfiConverterInt64.write(value.pollIntervalMs, into: &buf)
+        FfiConverterInt64.write(value.qrLifetimeMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBudgets_lift(_ buf: RustBuffer) throws -> LinkBudgets {
+    return try FfiConverterTypeLinkBudgets.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBudgets_lower(_ value: LinkBudgets) -> RustBuffer {
+    return FfiConverterTypeLinkBudgets.lower(value)
+}
+
+
+/**
+ * What the new device says first once the channel is confirmed (§9.3): the
+ * keys it just minted, bound to this channel and to nothing else.
+ */
+public struct LinkDeviceOffer {
+    public var deviceSignPk: Data
+    public var deviceAgreePk: Data
+    /**
+     * The 16-byte id derived from `device_sign_pk`.
+     */
+    public var deviceId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(deviceSignPk: Data, deviceAgreePk: Data, 
+        /**
+         * The 16-byte id derived from `device_sign_pk`.
+         */deviceId: Data) {
+        self.deviceSignPk = deviceSignPk
+        self.deviceAgreePk = deviceAgreePk
+        self.deviceId = deviceId
+    }
+}
+
+
+
+extension LinkDeviceOffer: Equatable, Hashable {
+    public static func ==(lhs: LinkDeviceOffer, rhs: LinkDeviceOffer) -> Bool {
+        if lhs.deviceSignPk != rhs.deviceSignPk {
+            return false
+        }
+        if lhs.deviceAgreePk != rhs.deviceAgreePk {
+            return false
+        }
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceSignPk)
+        hasher.combine(deviceAgreePk)
+        hasher.combine(deviceId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkDeviceOffer: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkDeviceOffer {
+        return
+            try LinkDeviceOffer(
+                deviceSignPk: FfiConverterData.read(from: &buf), 
+                deviceAgreePk: FfiConverterData.read(from: &buf), 
+                deviceId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkDeviceOffer, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceSignPk, into: &buf)
+        FfiConverterData.write(value.deviceAgreePk, into: &buf)
+        FfiConverterData.write(value.deviceId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkDeviceOffer_lift(_ buf: RustBuffer) throws -> LinkDeviceOffer {
+    return try FfiConverterTypeLinkDeviceOffer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkDeviceOffer_lower(_ value: LinkDeviceOffer) -> RustBuffer {
+    return FfiConverterTypeLinkDeviceOffer.lower(value)
+}
+
+
+/**
+ * Everything the `CMLINK1:` QR carries.
+ *
+ * Note what is absent, because the absence is the point: no `person_id`, no
+ * `device_id`, no signing key, no relay token, no name, no roster head. A
+ * scanner learns where to knock and which ephemeral key answers, and nothing
+ * about who lives there.
+ */
+public struct LinkRendezvous {
+    /**
+     * The new device's ephemeral X25519 public key for this one ceremony
+     * (32 bytes). Minted per ceremony and thrown away with it: it is never the
+     * device's long-term agreement key, so a photographed QR ages into
+     * nothing.
+     */
+    public var linkPk: Data
+    /**
+     * Unix milliseconds after which this offer is dead.
+     */
+    public var expiresAtMs: Int64
+    /**
+     * The new device's own LAN endpoints, `host:port` as
+     * [`core_format_lan_endpoint`](crate::core_format_lan_endpoint) writes
+     * them.
+     */
+    public var lanEndpoints: [String]
+    /**
+     * Relay base URLs the new device can already reach. Empty on a fresh
+     * install with no Shore Pass applied, which simply means the ceremony runs
+     * over LAN or BLE.
+     */
+    public var relayBaseUrls: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The new device's ephemeral X25519 public key for this one ceremony
+         * (32 bytes). Minted per ceremony and thrown away with it: it is never the
+         * device's long-term agreement key, so a photographed QR ages into
+         * nothing.
+         */linkPk: Data, 
+        /**
+         * Unix milliseconds after which this offer is dead.
+         */expiresAtMs: Int64, 
+        /**
+         * The new device's own LAN endpoints, `host:port` as
+         * [`core_format_lan_endpoint`](crate::core_format_lan_endpoint) writes
+         * them.
+         */lanEndpoints: [String], 
+        /**
+         * Relay base URLs the new device can already reach. Empty on a fresh
+         * install with no Shore Pass applied, which simply means the ceremony runs
+         * over LAN or BLE.
+         */relayBaseUrls: [String]) {
+        self.linkPk = linkPk
+        self.expiresAtMs = expiresAtMs
+        self.lanEndpoints = lanEndpoints
+        self.relayBaseUrls = relayBaseUrls
+    }
+}
+
+
+
+extension LinkRendezvous: Equatable, Hashable {
+    public static func ==(lhs: LinkRendezvous, rhs: LinkRendezvous) -> Bool {
+        if lhs.linkPk != rhs.linkPk {
+            return false
+        }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.lanEndpoints != rhs.lanEndpoints {
+            return false
+        }
+        if lhs.relayBaseUrls != rhs.relayBaseUrls {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(linkPk)
+        hasher.combine(expiresAtMs)
+        hasher.combine(lanEndpoints)
+        hasher.combine(relayBaseUrls)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkRendezvous: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkRendezvous {
+        return
+            try LinkRendezvous(
+                linkPk: FfiConverterData.read(from: &buf), 
+                expiresAtMs: FfiConverterInt64.read(from: &buf), 
+                lanEndpoints: FfiConverterSequenceString.read(from: &buf), 
+                relayBaseUrls: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkRendezvous, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.linkPk, into: &buf)
+        FfiConverterInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterSequenceString.write(value.lanEndpoints, into: &buf)
+        FfiConverterSequenceString.write(value.relayBaseUrls, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkRendezvous_lift(_ buf: RustBuffer) throws -> LinkRendezvous {
+    return try FfiConverterTypeLinkRendezvous.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkRendezvous_lower(_ value: LinkRendezvous) -> RustBuffer {
+    return FfiConverterTypeLinkRendezvous.lower(value)
+}
+
+
+/**
+ * A roster update that adds one device, plus everything the caller needs to
+ * drive §9.4 from it.
+ */
+public struct LinkRosterUpdate {
+    /**
+     * The signed roster at `seq + 1`.
+     */
+    public var roster: Roster
+    /**
+     * The 16-byte id of the device just added.
+     */
+    public var newDeviceId: Data
+    /**
+     * [`core_roster_head_hash`](crate::core_roster_head_hash) of `roster` —
+     * the exact value §9.4(b) has the new device acknowledge.
+     */
+    public var rosterHead: Data
+    /**
+     * §14.3 for THIS add, on the own-roster path where the soft-cap warning
+     * belongs (a person's own device count is their business; a contact's is
+     * not — see [`RosterUpdateDecision`](crate::RosterUpdateDecision)).
+     */
+    public var addOutcome: DeviceAddOutcome
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The signed roster at `seq + 1`.
+         */roster: Roster, 
+        /**
+         * The 16-byte id of the device just added.
+         */newDeviceId: Data, 
+        /**
+         * [`core_roster_head_hash`](crate::core_roster_head_hash) of `roster` —
+         * the exact value §9.4(b) has the new device acknowledge.
+         */rosterHead: Data, 
+        /**
+         * §14.3 for THIS add, on the own-roster path where the soft-cap warning
+         * belongs (a person's own device count is their business; a contact's is
+         * not — see [`RosterUpdateDecision`](crate::RosterUpdateDecision)).
+         */addOutcome: DeviceAddOutcome) {
+        self.roster = roster
+        self.newDeviceId = newDeviceId
+        self.rosterHead = rosterHead
+        self.addOutcome = addOutcome
+    }
+}
+
+
+
+extension LinkRosterUpdate: Equatable, Hashable {
+    public static func ==(lhs: LinkRosterUpdate, rhs: LinkRosterUpdate) -> Bool {
+        if lhs.roster != rhs.roster {
+            return false
+        }
+        if lhs.newDeviceId != rhs.newDeviceId {
+            return false
+        }
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.addOutcome != rhs.addOutcome {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(roster)
+        hasher.combine(newDeviceId)
+        hasher.combine(rosterHead)
+        hasher.combine(addOutcome)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkRosterUpdate: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkRosterUpdate {
+        return
+            try LinkRosterUpdate(
+                roster: FfiConverterTypeRoster.read(from: &buf), 
+                newDeviceId: FfiConverterData.read(from: &buf), 
+                rosterHead: FfiConverterData.read(from: &buf), 
+                addOutcome: FfiConverterTypeDeviceAddOutcome.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkRosterUpdate, into buf: inout [UInt8]) {
+        FfiConverterTypeRoster.write(value.roster, into: &buf)
+        FfiConverterData.write(value.newDeviceId, into: &buf)
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterTypeDeviceAddOutcome.write(value.addOutcome, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkRosterUpdate_lift(_ buf: RustBuffer) throws -> LinkRosterUpdate {
+    return try FfiConverterTypeLinkRosterUpdate.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkRosterUpdate_lower(_ value: LinkRosterUpdate) -> RustBuffer {
+    return FfiConverterTypeLinkRosterUpdate.lower(value)
 }
 
 
@@ -28952,10 +31932,20 @@ public enum CoreError {
     )
     /**
      * A friend-card or deep-link scheme this build does not implement
-     * (`CMFRIEND5:`, `CMLINK1:`, …). Shells map this to "update the app"
-     * copy; it is never a crash and never a half-parsed contact.
+     * (`CMFRIEND5:`, a `CMSHARE` version from the future, …). Shells map this
+     * to "update the app" copy; it is never a crash and never a half-parsed
+     * contact.
      */
     case UnsupportedLink
+    /**
+     * A `CMLINK1:` device-link offer handed to the friend-card path
+     * (`specs/multi-device-v1.md` §9). This build *does* implement linking, so
+     * telling its own user to update the app would be a lie — the code is
+     * perfectly readable, it is simply not a friend card and never becomes a
+     * contact. Distinct from [`CoreError::UnsupportedLink`] for exactly that
+     * reason; WP6 owns the sentence a family reads.
+     */
+    case DeviceLinkOffer
 }
 
 
@@ -28990,6 +31980,7 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
             try FfiConverterString.read(from: &buf)
             )
         case 7: return .UnsupportedLink
+        case 8: return .DeviceLinkOffer
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -29034,6 +32025,10 @@ public struct FfiConverterTypeCoreError: FfiConverterRustBuffer {
         
         case .UnsupportedLink:
             writeInt(&buf, Int32(7))
+        
+        
+        case .DeviceLinkOffer:
+            writeInt(&buf, Int32(8))
         
         }
     }
@@ -29623,6 +32618,893 @@ extension CoreLanHealthAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What an action asks of the shell.
+ */
+
+public enum CoreLinkActionKind {
+    
+    /**
+     * Put this on screen and listen on the rendezvous it names. Resumed by
+     * [`CoreLinkNewDevice::resume_peer_bytes`] when someone knocks.
+     */
+    case showQr(qrText: String
+    )
+    /**
+     * Hand these bytes to the peer, then call `resume_sent`. A peer reply that
+     * arrives first is itself proof of delivery and is accepted in place of
+     * the `resume_sent` that would have preceded it.
+     */
+    case sendBytes(bytes: Data
+    )
+    /**
+     * Nothing to send. Wait for peer bytes, polling a relay rendezvous no
+     * faster than `wait_ms`.
+     */
+    case awaitPeer(waitMs: Int64
+    )
+    /**
+     * Show these digits. `confirm_here` is true on the approving device only
+     * (§9.2) — it is the one screen with a button. `warn_soft_cap` carries
+     * §14.3's soft-cap warning to that same screen, where the person is
+     * already being asked to decide.
+     */
+    case showSas(sas: String, confirmHere: Bool, warnSoftCap: Bool
+    )
+    /**
+     * Nothing more. The summary carries the ending.
+     */
+    case finished(summary: CoreLinkSummary
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkActionKind: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkActionKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkActionKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .showQr(qrText: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 2: return .sendBytes(bytes: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 3: return .awaitPeer(waitMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 4: return .showSas(sas: try FfiConverterString.read(from: &buf), confirmHere: try FfiConverterBool.read(from: &buf), warnSoftCap: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 5: return .finished(summary: try FfiConverterTypeCoreLinkSummary.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkActionKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .showQr(qrText):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(qrText, into: &buf)
+            
+        
+        case let .sendBytes(bytes):
+            writeInt(&buf, Int32(2))
+            FfiConverterData.write(bytes, into: &buf)
+            
+        
+        case let .awaitPeer(waitMs):
+            writeInt(&buf, Int32(3))
+            FfiConverterInt64.write(waitMs, into: &buf)
+            
+        
+        case let .showSas(sas,confirmHere,warnSoftCap):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(sas, into: &buf)
+            FfiConverterBool.write(confirmHere, into: &buf)
+            FfiConverterBool.write(warnSoftCap, into: &buf)
+            
+        
+        case let .finished(summary):
+            writeInt(&buf, Int32(5))
+            FfiConverterTypeCoreLinkSummary.write(summary, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActionKind_lift(_ buf: RustBuffer) throws -> CoreLinkActionKind {
+    return try FfiConverterTypeCoreLinkActionKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActionKind_lower(_ value: CoreLinkActionKind) -> RustBuffer {
+    return FfiConverterTypeCoreLinkActionKind.lower(value)
+}
+
+
+
+extension CoreLinkActionKind: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where this device is in its own adoption.
+ */
+
+public enum CoreLinkActivationStage {
+    
+    /**
+     * No link ceremony has begun on this install. Every device in the field
+     * today, and §5's synthetic one-device person: everything is permitted,
+     * exactly as before this gate existed.
+     */
+    case notLinking
+    /**
+     * A channel was confirmed and the bootstrap has not landed (§9.4a).
+     */
+    case awaitingBootstrap
+    /**
+     * The bootstrap landed; the exact roster head has not been acknowledged
+     * back (§9.4b).
+     */
+    case awaitingRosterAck
+    /**
+     * Both halves done. This device is a device.
+     */
+    case activated
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkActivationStage: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkActivationStage
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkActivationStage {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .notLinking
+        
+        case 2: return .awaitingBootstrap
+        
+        case 3: return .awaitingRosterAck
+        
+        case 4: return .activated
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkActivationStage, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .notLinking:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .awaitingBootstrap:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .awaitingRosterAck:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .activated:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActivationStage_lift(_ buf: RustBuffer) throws -> CoreLinkActivationStage {
+    return try FfiConverterTypeCoreLinkActivationStage.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkActivationStage_lower(_ value: CoreLinkActivationStage) -> RustBuffer {
+    return FfiConverterTypeCoreLinkActivationStage.lower(value)
+}
+
+
+
+extension CoreLinkActivationStage: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why the gate answered the way it did.
+ */
+
+public enum CoreLinkGateReason {
+    
+    /**
+     * This install has never linked; nothing to gate.
+     */
+    case neverLinked
+    /**
+     * Activation completed.
+     */
+    case activated
+    /**
+     * §9.4a: the bootstrap has not been imported.
+     */
+    case bootstrapPending
+    /**
+     * §9.4b: the exact roster head has not been acknowledged.
+     */
+    case rosterAckPending
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkGateReason: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkGateReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkGateReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .neverLinked
+        
+        case 2: return .activated
+        
+        case 3: return .bootstrapPending
+        
+        case 4: return .rosterAckPending
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkGateReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .neverLinked:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .activated:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bootstrapPending:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .rosterAckPending:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGateReason_lift(_ buf: RustBuffer) throws -> CoreLinkGateReason {
+    return try FfiConverterTypeCoreLinkGateReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGateReason_lower(_ value: CoreLinkGateReason) -> RustBuffer {
+    return FfiConverterTypeCoreLinkGateReason.lower(value)
+}
+
+
+
+extension CoreLinkGateReason: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The three things §9.4 forbids before activation.
+ */
+
+public enum CoreLinkGatedAction {
+    
+    /**
+     * Announcing this device's existence or reachability: HELLO, LAN
+     * endpoints, relay hint sets, carry offers.
+     */
+    case advertise
+    /**
+     * Minting anything signed and outbound: messages, receipts, invites.
+     */
+    case author
+    /**
+     * Deleting a relay row or retiring a carried envelope on the person's
+     * behalf.
+     */
+    case ack
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkGatedAction: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkGatedAction
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkGatedAction {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .advertise
+        
+        case 2: return .author
+        
+        case 3: return .ack
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkGatedAction, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .advertise:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .author:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .ack:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGatedAction_lift(_ buf: RustBuffer) throws -> CoreLinkGatedAction {
+    return try FfiConverterTypeCoreLinkGatedAction.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkGatedAction_lower(_ value: CoreLinkGatedAction) -> RustBuffer {
+    return FfiConverterTypeCoreLinkGatedAction.lower(value)
+}
+
+
+
+extension CoreLinkGatedAction: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Whether this store may take a bootstrap at all (§9.3).
+ *
+ * The question is asked *before* a ceremony starts as well as during the
+ * import, so a shell can say "not this phone" on the setup screen rather than
+ * after a person has held two phones together and compared six digits.
+ */
+
+public enum CoreLinkImportReadiness {
+    
+    /**
+     * A phone with nothing of its own to lose, or one already known to belong
+     * to the person being restored.
+     */
+    case ready
+    /**
+     * This store already holds contacts, groups or messages, and the caller
+     * did not say whose they are. Importing would fold one person's world into
+     * another's — a silent, unrecoverable merge, and the exact shape of §1's
+     * failure with the identities swapped.
+     */
+    case storeHoldsSomeone
+    /**
+     * This store already holds a roster, and it is a different person's.
+     */
+    case storeHoldsAnotherPerson
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkImportReadiness: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkImportReadiness
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkImportReadiness {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .ready
+        
+        case 2: return .storeHoldsSomeone
+        
+        case 3: return .storeHoldsAnotherPerson
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkImportReadiness, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .ready:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .storeHoldsSomeone:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .storeHoldsAnotherPerson:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkImportReadiness_lift(_ buf: RustBuffer) throws -> CoreLinkImportReadiness {
+    return try FfiConverterTypeCoreLinkImportReadiness.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkImportReadiness_lower(_ value: CoreLinkImportReadiness) -> RustBuffer {
+    return FfiConverterTypeCoreLinkImportReadiness.lower(value)
+}
+
+
+
+extension CoreLinkImportReadiness: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which half of a rendezvous a mailbox belongs to.
+ *
+ * A store-and-forward rendezvous needs two mailboxes, not one: under a single
+ * namespace each side would fetch its own posts straight back and hand them to
+ * a state machine that has no state for them. The lane is the direction, named
+ * for the end that reads it.
+ */
+
+public enum CoreLinkLane {
+    
+    /**
+     * What the new device sends and the approving device reads.
+     */
+    case toApprovingDevice
+    /**
+     * What the approving device sends and the new device reads.
+     */
+    case toNewDevice
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkLane: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkLane
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkLane {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .toApprovingDevice
+        
+        case 2: return .toNewDevice
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkLane, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .toApprovingDevice:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .toNewDevice:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkLane_lift(_ buf: RustBuffer) throws -> CoreLinkLane {
+    return try FfiConverterTypeCoreLinkLane.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkLane_lower(_ value: CoreLinkLane) -> RustBuffer {
+    return FfiConverterTypeCoreLinkLane.lower(value)
+}
+
+
+
+extension CoreLinkLane: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a ceremony ended. Every ending is named; none is silent.
+ */
+
+public enum CoreLinkOutcome {
+    
+    /**
+     * §9.2 complete: a confirmed Noise channel, ready for §9.3's bootstrap.
+     */
+    case channelReady
+    /**
+     * The person said the digits did not match, or the other end did.
+     */
+    case declined
+    /**
+     * Someone put the phone down: [`CoreLinkNewDevice::cancel`] or
+     * [`CoreLinkApprovingDevice::cancel`].
+     */
+    case cancelled
+    /**
+     * The declared deadline passed with the ceremony unfinished.
+     */
+    case timedOut
+    /**
+     * The offer had already expired when the scanner arrived.
+     */
+    case qrExpired
+    /**
+     * §14.3: this person already holds the hard cap of devices, so the add is
+     * refused before a single byte moves.
+     */
+    case deviceCapReached
+    /**
+     * A Noise message failed to open, or the peer's static key was not the one
+     * in the scanned QR.
+     */
+    case handshakeFailed
+    /**
+     * A well-formed channel carried something this ceremony has no state for.
+     */
+    case protocolError
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkOutcome: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkOutcome
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkOutcome {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .channelReady
+        
+        case 2: return .declined
+        
+        case 3: return .cancelled
+        
+        case 4: return .timedOut
+        
+        case 5: return .qrExpired
+        
+        case 6: return .deviceCapReached
+        
+        case 7: return .handshakeFailed
+        
+        case 8: return .protocolError
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkOutcome, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .channelReady:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .declined:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .cancelled:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .timedOut:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .qrExpired:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .deviceCapReached:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .handshakeFailed:
+            writeInt(&buf, Int32(7))
+        
+        
+        case .protocolError:
+            writeInt(&buf, Int32(8))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkOutcome_lift(_ buf: RustBuffer) throws -> CoreLinkOutcome {
+    return try FfiConverterTypeCoreLinkOutcome.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkOutcome_lower(_ value: CoreLinkOutcome) -> RustBuffer {
+    return FfiConverterTypeCoreLinkOutcome.lower(value)
+}
+
+
+
+extension CoreLinkOutcome: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where a ceremony is. Additive by design: §9.3's bootstrap streaming and
+ * §9.4's roster acknowledgement extend this after [`CoreLinkPhase::ChannelReady`].
+ */
+
+public enum CoreLinkPhase {
+    
+    case notStarted
+    /**
+     * The offer is on screen and nobody has knocked (§9.1).
+     */
+    case showingQr
+    /**
+     * Noise messages are in flight (§9.2).
+     */
+    case handshaking
+    /**
+     * Both ends hold the digits; the existing device owes an explicit tap.
+     */
+    case awaitingConfirm
+    /**
+     * Confirmed channel. §9.3 continues from here.
+     */
+    case channelReady
+    case finished
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkPhase: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .notStarted
+        
+        case 2: return .showingQr
+        
+        case 3: return .handshaking
+        
+        case 4: return .awaitingConfirm
+        
+        case 5: return .channelReady
+        
+        case 6: return .finished
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .notStarted:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .showingQr:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .handshaking:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .awaitingConfirm:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .channelReady:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .finished:
+            writeInt(&buf, Int32(6))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkPhase_lift(_ buf: RustBuffer) throws -> CoreLinkPhase {
+    return try FfiConverterTypeCoreLinkPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkPhase_lower(_ value: CoreLinkPhase) -> RustBuffer {
+    return FfiConverterTypeCoreLinkPhase.lower(value)
+}
+
+
+
+extension CoreLinkPhase: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which half of the ceremony an object is.
+ */
+
+public enum CoreLinkRole {
+    
+    /**
+     * Shows the QR and is the Noise responder (§9.1).
+     */
+    case newDevice
+    /**
+     * Scans the QR, is the Noise initiator, and holds the confirm (§9.2).
+     */
+    case approvingDevice
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLinkRole: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLinkRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .newDevice
+        
+        case 2: return .approvingDevice
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLinkRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .newDevice:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .approvingDevice:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkRole_lift(_ buf: RustBuffer) throws -> CoreLinkRole {
+    return try FfiConverterTypeCoreLinkRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLinkRole_lower(_ value: CoreLinkRole) -> RustBuffer {
+    return FfiConverterTypeCoreLinkRole.lower(value)
+}
+
+
+
+extension CoreLinkRole: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which of the two allowed schemes a detected link uses. The shells route
  * on this: `Https` leaves the app (confirm first), `CruiseMesh` is handled
  * in-app via [`crate::deep_link_route`].
@@ -29789,6 +33671,84 @@ public func FfiConverterTypeCoreMeshRuntime_lower(_ value: CoreMeshRuntime) -> R
 
 
 extension CoreMeshRuntime: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a peer presenting this person's own identity actually is.
+ */
+
+public enum CoreOwnIdentityPeer {
+    
+    /**
+     * A second phone running this person's identity that this person did not
+     * link: the `.cmbak` clone of §1, two devices signing one author stream.
+     * Worth interrupting someone over.
+     */
+    case clone
+    /**
+     * A device this person's own roster lists. Deliberately linked, expected
+     * to be here, and NOT worth a warning — §6 makes the inbox key
+     * person-scoped, so a sibling legitimately holds the very key the clone
+     * guard was built to recognise.
+     */
+    case sibling
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreOwnIdentityPeer: FfiConverterRustBuffer {
+    typealias SwiftType = CoreOwnIdentityPeer
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreOwnIdentityPeer {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .clone
+        
+        case 2: return .sibling
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreOwnIdentityPeer, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .clone:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sibling:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreOwnIdentityPeer_lift(_ buf: RustBuffer) throws -> CoreOwnIdentityPeer {
+    return try FfiConverterTypeCoreOwnIdentityPeer.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreOwnIdentityPeer_lower(_ value: CoreOwnIdentityPeer) -> RustBuffer {
+    return FfiConverterTypeCoreOwnIdentityPeer.lower(value)
+}
+
+
+
+extension CoreOwnIdentityPeer: Equatable, Hashable {}
 
 
 
@@ -31717,6 +35677,81 @@ extension CoreRelayTransportError: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * The two things a restore can mean (§9).
+ */
+
+public enum CoreRestoreIntent {
+    
+    /**
+     * Old semantics, unchanged: this phone becomes the phone in the backup.
+     * The device count does not change, because no device was added.
+     */
+    case replaceThisDevice
+    /**
+     * This phone becomes an ADDITIONAL device of the person in the backup, by
+     * way of §9's linking ceremony.
+     */
+    case linkAsNewDevice
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreRestoreIntent: FfiConverterRustBuffer {
+    typealias SwiftType = CoreRestoreIntent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreRestoreIntent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .replaceThisDevice
+        
+        case 2: return .linkAsNewDevice
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreRestoreIntent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .replaceThisDevice:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .linkAsNewDevice:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRestoreIntent_lift(_ buf: RustBuffer) throws -> CoreRestoreIntent {
+    return try FfiConverterTypeCoreRestoreIntent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreRestoreIntent_lower(_ value: CoreRestoreIntent) -> RustBuffer {
+    return FfiConverterTypeCoreRestoreIntent.lower(value)
+}
+
+
+
+extension CoreRestoreIntent: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The checklist items, in the order they are shown.
  *
  * The enum order is the display order, and both are the order the spec fixes;
@@ -32382,6 +36417,13 @@ public enum DeepLinkRoute {
      * A LAN endpoint (`/lan`) — diagnostics-only manual connect.
      */
     case lan
+    /**
+     * A device-link offer (`/link`) — the `CMLINK1:` linking ceremony
+     * (`specs/multi-device-v1.md` §9). The offer is normally scanned as a bare
+     * `CMLINK1:` QR inside the app; the route exists so the URL form lands on
+     * the same screen, exactly as `/f` does for every friend-card form.
+     */
+    case deviceLink
 }
 
 
@@ -32401,6 +36443,8 @@ public struct FfiConverterTypeDeepLinkRoute: FfiConverterRustBuffer {
         
         case 3: return .lan
         
+        case 4: return .deviceLink
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -32419,6 +36463,10 @@ public struct FfiConverterTypeDeepLinkRoute: FfiConverterRustBuffer {
         
         case .lan:
             writeInt(&buf, Int32(3))
+        
+        
+        case .deviceLink:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -32539,6 +36587,17 @@ public enum DeviceSigningDomain {
     case rosterUpdate
     case messageAuthoring
     case syncRecord
+    /**
+     * §9's link-ceremony frames, signed by a device that is not yet in any
+     * roster (`device_link::activation`).
+     */
+    case deviceLinkActivation
+    /**
+     * §9.3's canonical bootstrap, signed by the APPROVING device's
+     * roster-signing key over the export, the channel binding, and the expiry
+     * (`device_link::bootstrap`).
+     */
+    case deviceLinkBootstrap
 }
 
 
@@ -32559,6 +36618,10 @@ public struct FfiConverterTypeDeviceSigningDomain: FfiConverterRustBuffer {
         case 3: return .messageAuthoring
         
         case 4: return .syncRecord
+        
+        case 5: return .deviceLinkActivation
+        
+        case 6: return .deviceLinkBootstrap
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -32582,6 +36645,14 @@ public struct FfiConverterTypeDeviceSigningDomain: FfiConverterRustBuffer {
         
         case .syncRecord:
             writeInt(&buf, Int32(4))
+        
+        
+        case .deviceLinkActivation:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .deviceLinkBootstrap:
+            writeInt(&buf, Int32(6))
         
         }
     }
@@ -36213,6 +40284,30 @@ fileprivate struct FfiConverterOptionTypeCoreLanEndpointIntent: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreLinkSummary: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLinkSummary?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreLinkSummary.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreLinkSummary.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreReactionPayload: FfiConverterRustBuffer {
     typealias SwiftType = CoreReactionPayload?
 
@@ -36373,6 +40468,30 @@ fileprivate struct FfiConverterOptionTypeLanEndpointCacheEntry: FfiConverterRust
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeLanEndpointCacheEntry.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLinkBudgets: FfiConverterRustBuffer {
+    typealias SwiftType = LinkBudgets?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLinkBudgets.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLinkBudgets.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -37283,6 +41402,31 @@ fileprivate struct FfiConverterSequenceTypeCoreIdentifiedRoute: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreLinkCatchUp: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreLinkCatchUp]
+
+    public static func write(_ value: [CoreLinkCatchUp], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreLinkCatchUp.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreLinkCatchUp] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreLinkCatchUp]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreLinkCatchUp.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreMessageReceivedAt: FfiConverterRustBuffer {
     typealias SwiftType = [CoreMessageReceivedAt]
 
@@ -37833,6 +41977,31 @@ fileprivate struct FfiConverterSequenceTypeCoreReplyMetadata: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCoreRestorePlan: FfiConverterRustBuffer {
+    typealias SwiftType = [CoreRestorePlan]
+
+    public static func write(_ value: [CoreRestorePlan], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCoreRestorePlan.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CoreRestorePlan] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CoreRestorePlan]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCoreRestorePlan.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeCoreSailChecklistItem: FfiConverterRustBuffer {
     typealias SwiftType = [CoreSailChecklistItem]
 
@@ -38125,6 +42294,31 @@ fileprivate struct FfiConverterSequenceTypeLateArrivalInput: FfiConverterRustBuf
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeLateArrivalInput.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLinkBootstrapContact: FfiConverterRustBuffer {
+    typealias SwiftType = [LinkBootstrapContact]
+
+    public static func write(_ value: [LinkBootstrapContact], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLinkBootstrapContact.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LinkBootstrapContact] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LinkBootstrapContact]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLinkBootstrapContact.read(from: &buf))
         }
         return seq
     }
@@ -38518,6 +42712,46 @@ public func contactDelivery(contactRelayUrl: String?, contactRelayToken: String?
         FfiConverterOptionString.lower(contactRelayToken),
         FfiConverterOptionString.lower(ownRelayUrl),
         FfiConverterOptionString.lower(ownRelayToken),$0
+    )
+})
+}
+/**
+ * One intent's plan.
+ */
+public func coreBackupRestorePlan(payload: CoreBackupPayload, intent: CoreRestoreIntent)throws  -> CoreRestorePlan {
+    return try  FfiConverterTypeCoreRestorePlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_backup_restore_plan(
+        FfiConverterTypeCoreBackupPayload.lower(payload),
+        FfiConverterTypeCoreRestoreIntent.lower(intent),$0
+    )
+})
+}
+/**
+ * Both intents, in the order a person should be offered them.
+ *
+ * "Link as new device" comes first deliberately: it is the safe one. A person
+ * restoring a backup onto a second phone that still has a first phone in the
+ * house wants this, and the intent that can strand two live clones should not
+ * be the one their thumb lands on.
+ */
+public func coreBackupRestorePlans(payload: CoreBackupPayload)throws  -> [CoreRestorePlan] {
+    return try  FfiConverterSequenceTypeCoreRestorePlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_backup_restore_plans(
+        FfiConverterTypeCoreBackupPayload.lower(payload),$0
+    )
+})
+}
+/**
+ * Build the QR text the new device displays (§9.1).
+ *
+ * Rejects rather than silently drops: these are the caller's own endpoints, so
+ * a hint that will not survive the round trip is a bug in the shell, not a
+ * peer being generous. Parsing is the lenient direction.
+ */
+public func coreBuildLinkQr(rendezvous: LinkRendezvous)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_build_link_qr(
+        FfiConverterTypeLinkRendezvous.lower(rendezvous),$0
     )
 })
 }
@@ -38961,6 +43195,18 @@ public func coreContactRouteUsable(directLink: Bool, ownRelayUsable: Bool, conta
 })
 }
 /**
+ * Read back what [`core_encode_device_keypair`] wrote, re-deriving the device
+ * id rather than trusting the stored one: a blob whose id does not follow from
+ * its own signing key is corrupt, not a device.
+ */
+public func coreDecodeDeviceKeypair(bytes: Data)throws  -> DeviceKeypair {
+    return try  FfiConverterTypeDeviceKeypair.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_decode_device_keypair(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
  * Device id = first 16 bytes of BLAKE2b(device signing pubkey).
  *
  * §3 calls the device signing pubkey the `device_id`; on the wire and in the
@@ -39124,6 +43370,22 @@ public func coreDeviceVerify(domain: DeviceSigningDomain, deviceSignPk: Data, me
         FfiConverterData.lower(signature),$0
     )
 }
+}
+/**
+ * Flatten a [`DeviceKeypair`] for the shell's platform-protected storage.
+ *
+ * Same division of labour [`encode_identity_bytes`](crate::encode_identity_bytes)
+ * established, and here for the same reason: the core generates and never
+ * persists, the shell keeps the secrets in the Keystore or the Keychain, and
+ * neither of them gets to invent its own layout for the other to misread.
+ * Every field is fixed-width, so this is plain concatenation.
+ */
+public func coreEncodeDeviceKeypair(device: DeviceKeypair)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_encode_device_keypair(
+        FfiConverterTypeDeviceKeypair.lower(device),$0
+    )
+})
 }
 /**
  * The default [`CoreFailoverResumeDebounce`] window, exported so both shells
@@ -39544,6 +43806,213 @@ public func coreLegacyDeviceId() -> Data {
 })
 }
 /**
+ * **§9.4(b).** The new device acknowledges the exact roster hash it imported.
+ */
+public func coreLinkActivationAck(deviceSignSk: Data, rosterHead: Data, channelBinding: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_activation_ack(
+        FfiConverterData.lower(deviceSignSk),
+        FfiConverterData.lower(rosterHead),
+        FfiConverterData.lower(channelBinding),$0
+    )
+})
+}
+/**
+ * **The gate.** Pure, so the rule can be read in one place and tested without
+ * a database; [`MessageStore::link_gate`] is the same rule applied to what is
+ * stored.
+ */
+public func coreLinkActivationGate(activation: CoreLinkActivation, action: CoreLinkGatedAction) -> CoreLinkGateVerdict {
+    return try!  FfiConverterTypeCoreLinkGateVerdict.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_link_activation_gate(
+        FfiConverterTypeCoreLinkActivation.lower(activation),
+        FfiConverterTypeCoreLinkGatedAction.lower(action),$0
+    )
+})
+}
+/**
+ * Split an encoded bootstrap into frames that fit
+ * [`LINK_CHANNEL_MAX_PLAINTEXT_BYTES`](super::ceremony::LINK_CHANNEL_MAX_PLAINTEXT_BYTES),
+ * each one sealed separately by `seal_channel_frame`.
+ *
+ * Each chunk states its own place in the sequence, so a receiver can refuse a
+ * reordered, duplicated, or truncated stream rather than reassembling a
+ * plausible-looking bootstrap out of it.
+ */
+public func coreLinkBootstrapChunks(payload: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_bootstrap_chunks(
+        FfiConverterData.lower(payload),$0
+    )
+})
+}
+/**
+ * Decode one. A newer version is [`CoreError::UnsupportedLink`]; anything
+ * malformed is [`CoreError::Malformed`], never a partial import.
+ */
+public func coreLinkBootstrapDecode(bytes: Data)throws  -> LinkBootstrap {
+    return try  FfiConverterTypeLinkBootstrap.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_bootstrap_decode(
+        FfiConverterData.lower(bytes),$0
+    )
+})
+}
+/**
+ * Encode a bootstrap for the ready link channel (§9.3).
+ */
+public func coreLinkBootstrapEncode(bootstrap: LinkBootstrap)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_bootstrap_encode(
+        FfiConverterTypeLinkBootstrap.lower(bootstrap),$0
+    )
+})
+}
+/**
+ * Reassemble what [`core_link_bootstrap_chunks`] split, refusing anything that
+ * is not exactly the sequence that was sent.
+ */
+public func coreLinkBootstrapJoin(chunks: [Data])throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_bootstrap_join(
+        FfiConverterSequenceData.lower(chunks),$0
+    )
+})
+}
+/**
+ * Verify a decoded bootstrap against the ceremony that was supposed to have
+ * produced it (§9.3).
+ *
+ * Three independent things, and none of them is redundant:
+ *
+ * * **The channel.** `channel_binding` must be the binding the importing
+ * device recorded when its own pre-activation window opened. This is what
+ * makes a captured export useless anywhere else — the binding commits to
+ * both statics and every handshake message, so no second ceremony can ever
+ * reproduce one.
+ * * **The signer.** The signature must verify under a key the export's OWN
+ * roster names as the approving device. The roster's chain to the person
+ * root is checked separately, by the import path, before this is consulted —
+ * so "signed by the approving device" means the device §3 actually put in
+ * charge of adding devices, not whichever key the payload nominated.
+ * * **The clock.** An export past `expires_at_ms` is refused. A ceremony is a
+ * person holding two phones for a minute; anything that arrives long after
+ * is not that ceremony.
+ */
+public func coreLinkBootstrapVerify(bootstrap: LinkBootstrap, channelBinding: Data, nowMs: Int64)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_bootstrap_verify(
+        FfiConverterTypeLinkBootstrap.lower(bootstrap),
+        FfiConverterData.lower(channelBinding),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+}
+}
+/**
+ * What self-sync catch-up owes this device after the head lands, per chat.
+ *
+ * **This is a stub, and deliberately a computed one.** WP4 owns the record
+ * kinds, the digests, and the trigger; none of that exists yet. What exists is
+ * the question WP4 will be asked — "which chats have history below the head I
+ * was given, and from where" — so it is answered here, from the head alone,
+ * with no transport and no store. When WP4 lands, its trigger consumes this
+ * and this comment goes away; until then the seam is visible rather than
+ * implied, and `catch_up_plan_names_every_chat_the_head_truncated` pins it.
+ */
+public func coreLinkCatchUpPlan(bootstrap: LinkBootstrap) -> [CoreLinkCatchUp] {
+    return try!  FfiConverterSequenceTypeCoreLinkCatchUp.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_link_catch_up_plan(
+        FfiConverterTypeLinkBootstrap.lower(bootstrap),$0
+    )
+})
+}
+public func coreLinkDefaultBudgets() -> LinkBudgets {
+    return try!  FfiConverterTypeLinkBudgets.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_link_default_budgets($0
+    )
+})
+}
+/**
+ * Build the new device's offer frame, signed with the key it is asking to have
+ * certified.
+ *
+ * The signature is what makes the certificate mean something: without it the
+ * approving device would be certifying a public key that arrived over a
+ * channel, with no evidence anyone holds the secret half. The channel binding
+ * is inside the signed bytes, so an offer captured from one ceremony is not a
+ * valid offer in another.
+ */
+public func coreLinkDeviceOffer(deviceSignSk: Data, deviceAgreePk: Data, channelBinding: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_device_offer(
+        FfiConverterData.lower(deviceSignSk),
+        FfiConverterData.lower(deviceAgreePk),
+        FfiConverterData.lower(channelBinding),$0
+    )
+})
+}
+/**
+ * Genesis: the first roster a person ever has, naming the device they are
+ * holding as the approving device (§3, §4).
+ *
+ * Root-signed, because [`core_roster_validate`] requires `seq == 0` to be —
+ * and because there is nothing else yet to sign it. This is the identity
+ * upgrade of §2 goal 2: the deployed Ed25519 key becomes the person root and
+ * the phone it is on becomes device one, with `person_id` (the wire
+ * `user_id`), chat ids, and fingerprints all unchanged.
+ */
+public func coreLinkGenesisRoster(personRootSignSk: Data, deviceSignPk: Data, deviceAgreePk: Data)throws  -> Roster {
+    return try  FfiConverterTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_genesis_roster(
+        FfiConverterData.lower(personRootSignSk),
+        FfiConverterData.lower(deviceSignPk),
+        FfiConverterData.lower(deviceAgreePk),$0
+    )
+})
+}
+/**
+ * Open an acknowledgement on the approving device.
+ *
+ * Four things must all hold, and the second is the point of §9.4: the frame is
+ * bound to this channel, it names **exactly** the head of the roster that was
+ * signed for this ceremony — not a later one, not a re-derived one, the same
+ * 32 bytes — it is signed by the very device that made the offer this ceremony
+ * certified, and that device is one the roster lists.
+ *
+ * `offered_device_sign_pk` is what closes the last gap. Roster membership
+ * alone is a weaker claim than it looks: on a fleet that already holds
+ * siblings, *any* listed device's signature would satisfy it, so an existing
+ * phone could close a ceremony that was opened for a different one — and the
+ * approving device would record the link as done while the phone in the
+ * person's hand stayed silent forever. Requiring the offered key means the
+ * device that finishes the ceremony is the device that started it. Membership
+ * stays as the second check rather than being replaced by this one: they fail
+ * for different reasons, and a roster that does not list the offering device
+ * is a bug worth hearing about separately.
+ *
+ * Anything else leaves the new device un-activated and therefore silent.
+ */
+public func coreLinkOpenActivationAck(frame: Data, roster: Roster, offeredDeviceSignPk: Data, channelBinding: Data)throws  -> LinkActivationAck {
+    return try  FfiConverterTypeLinkActivationAck.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_open_activation_ack(
+        FfiConverterData.lower(frame),
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(offeredDeviceSignPk),
+        FfiConverterData.lower(channelBinding),$0
+    )
+})
+}
+/**
+ * Open an offer frame on the approving device, refusing anything that is not
+ * signed by the key it names, for this channel.
+ */
+public func coreLinkOpenDeviceOffer(frame: Data, channelBinding: Data)throws  -> LinkDeviceOffer {
+    return try  FfiConverterTypeLinkDeviceOffer.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_open_device_offer(
+        FfiConverterData.lower(frame),
+        FfiConverterData.lower(channelBinding),$0
+    )
+})
+}
+/**
  * Is this exact string, whole and entire, a link we are willing to open?
  *
  * Shells call this at tap time, when all they hold is the destination
@@ -39557,6 +44026,132 @@ public func coreLinkOpenableScheme(url: String) -> CoreLinkScheme? {
     return try!  FfiConverterOptionTypeCoreLinkScheme.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_link_openable_scheme(
         FfiConverterString.lower(url),$0
+    )
+})
+}
+/**
+ * The tappable form of a QR text, for a shell that wants one. Empty for
+ * anything that is not a `CMLINK1:` payload.
+ */
+public func coreLinkQrUrl(qrText: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_link_qr_url(
+        FfiConverterString.lower(qrText),$0
+    )
+})
+}
+/**
+ * §14.2's recovery path: a roster at the NEXT recovery epoch, signed with the
+ * person root secret that was just opened out of a `.cmbak`.
+ *
+ * This is what "Link as new device" reaches for when there is no approving
+ * device left to ask — a lost or stolen phone, and a backup in hand. A higher
+ * `recovery_epoch` supersedes anything the old approving device ever signed
+ * (DL-1, and `core_roster_accept`'s rule that only the root may climb), which
+ * is precisely how §3 dethrones a stolen approving device.
+ *
+ * It starts the epoch with this device alone. Note what it deliberately does
+ * NOT do: it does not tombstone the devices it drops. Burying a device is
+ * §10's revocation and WP5's work package, with the relay-token rotation that
+ * has to come with it; dropping one here simply means the new epoch does not
+ * vouch for it. Tombstones already recorded are carried forward untouched,
+ * because DL-4 is forever.
+ *
+ * **The inbox key generation moves, the key material does not.** §14.2 is
+ * reached because a device was lost or stolen, so every contact must be told
+ * to stop sealing to what that device could open — and §6 says the way a
+ * person says that is by advancing `inbox_key_generation`. So this bumps it.
+ * What it does not do is mint the new keypair: rotating the actual inbox key,
+ * and re-sealing to it, is WP5's, and until WP5 lands the generation this
+ * roster announces runs ahead of the material behind it. That is a deliberate,
+ * stated gap — a generation that never moved would be worse, because contacts
+ * would have no signal at all that anything had changed.
+ *
+ * The `.cmbak` restore path (`ReplaceThisDevice`) does not come through here
+ * and must not: nothing was recovered, so nothing is announced.
+ */
+public func coreLinkRecoveryRoster(stored: Roster?, personRootSignSk: Data, deviceSignPk: Data, deviceAgreePk: Data)throws  -> Roster {
+    return try  FfiConverterTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_recovery_roster(
+        FfiConverterOptionTypeRoster.lower(stored),
+        FfiConverterData.lower(personRootSignSk),
+        FfiConverterData.lower(deviceSignPk),
+        FfiConverterData.lower(deviceAgreePk),$0
+    )
+})
+}
+/**
+ * The ephemeral mailbox namespace both devices derive from the QR's key:
+ * `BLAKE2b-16(domain || link_pk)`.
+ *
+ * It is derived rather than carried for two reasons. It cannot disagree with
+ * the key the channel is bound to, and it costs the QR nothing. It is
+ * deliberately not a person or device namespace: a link rendezvous is
+ * short-lived, is never reused as a contact hint, and dies with the ceremony,
+ * so it spends none of relayd's `MAX_FETCH_HINTS` budget beyond the minutes
+ * the ceremony is live.
+ */
+public func coreLinkRendezvousId(linkPk: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_rendezvous_id(
+        FfiConverterData.lower(linkPk),$0
+    )
+})
+}
+/**
+ * The mailbox namespace one direction of a relay rendezvous uses:
+ * `BLAKE2b-16(domain || lane || rendezvous_id)`.
+ *
+ * Both shells derive this from the same scanned offer, which is why it lives
+ * here and not in a shell: a lane byte invented twice is a lane byte invented
+ * differently, and the two halves would poll past each other forever. Feed the
+ * result to [`compute_recipient_hint`](crate::compute_recipient_hint) exactly
+ * as a `user_id` is fed to it — a lane is a namespace, not a hint.
+ *
+ * It inherits everything [`core_link_rendezvous_id`] is: ephemeral, derived
+ * rather than carried, never reused as a contact hint, and dead when the
+ * ceremony is.
+ */
+public func coreLinkRendezvousLane(rendezvousId: Data, lane: CoreLinkLane)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_rendezvous_lane(
+        FfiConverterData.lower(rendezvousId),
+        FfiConverterTypeCoreLinkLane.lower(lane),$0
+    )
+})
+}
+/**
+ * The short authentication string both ends derive from the channel binding
+ * (§9.2). Pure, and frozen by a golden vector: two builds that disagree here
+ * would show a person two different numbers for one channel and teach them to
+ * tap through a mismatch.
+ */
+public func coreLinkSas(channelBinding: Data)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_sas(
+        FfiConverterData.lower(channelBinding),$0
+    )
+})
+}
+/**
+ * **§9.4's first half.** The approving device signs the roster at `seq + 1`,
+ * including the new device's certificate.
+ *
+ * Signed by the approving device's key, never the root: §3's authority split
+ * says roster changes take the approving-device key or the recovery material,
+ * and the root secret is in the backup where §14.2 keeps it. The result is
+ * re-validated here against the person root before it is handed back, so a
+ * document that could not be accepted by a contact is never one this device
+ * produced.
+ */
+public func coreLinkSignNewDeviceRoster(current: Roster, personRootSignPk: Data, approvingDeviceSignSk: Data, newDeviceSignPk: Data, newDeviceAgreePk: Data)throws  -> LinkRosterUpdate {
+    return try  FfiConverterTypeLinkRosterUpdate.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_link_sign_new_device_roster(
+        FfiConverterTypeRoster.lower(current),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterData.lower(approvingDeviceSignSk),
+        FfiConverterData.lower(newDeviceSignPk),
+        FfiConverterData.lower(newDeviceAgreePk),$0
     )
 })
 }
@@ -39574,6 +44169,40 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
 public func coreOwnCapabilities() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_own_capabilities($0
+    )
+})
+}
+/**
+ * Classify a peer that just presented this person's own identity
+ * (`specs/multi-device-v1.md` §1, §6).
+ *
+ * The clone guard predates linking, and its whole test was "does this peer
+ * hold my agreement key". That was a sound proxy while a person was a device.
+ * It stops being one the moment a person has two: a sibling holds the
+ * person-scoped inbox key by design, so the guard would greet every deliberate
+ * link with "another phone is using your backup" — the most alarming sentence
+ * the app can say, about the thing the person just did on purpose. A warning
+ * that fires on the normal case is a warning people learn to dismiss, and then
+ * it is not there for the real clone either.
+ *
+ * `peer_device_id` is what separates the two, and there is no substitute for
+ * it: the keys are identical by construction. `None` means the transport could
+ * not tell which device it was talking to, and the verdict is
+ * [`CoreOwnIdentityPeer::Clone`] — fail loud, because an unidentified peer
+ * holding this person's identity is exactly the situation the guard exists
+ * for, and a person told about a sibling once is better served than a person
+ * never told about a clone.
+ *
+ * WP4's own-device sync records are what will put a device id on this wire.
+ * Until then the shells pass `None` and the guard behaves precisely as it does
+ * today; the rule is implemented and pinned here so the day a device id
+ * arrives, the answer is already right.
+ */
+public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> CoreOwnIdentityPeer {
+    return try!  FfiConverterTypeCoreOwnIdentityPeer.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_own_identity_peer(
+        FfiConverterTypeOwnDeviceFleet.lower(fleet),
+        FfiConverterOptionData.lower(peerDeviceId),$0
     )
 })
 }
@@ -39609,6 +44238,16 @@ public func coreParseLanEndpointLink(fragment: String?) -> CoreLanEndpoint? {
     return try!  FfiConverterOptionTypeCoreLanEndpoint.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_parse_lan_endpoint_link(
         FfiConverterOptionString.lower(fragment),$0
+    )
+})
+}
+/**
+ * Parse a scanned `CMLINK1:` payload, bare or inside a `/link#` URL.
+ */
+public func coreParseLinkQr(text: String)throws  -> LinkRendezvous {
+    return try  FfiConverterTypeLinkRendezvous.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_parse_link_qr(
+        FfiConverterString.lower(text),$0
     )
 })
 }
@@ -42876,6 +47515,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_contact_delivery() != 40561) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_backup_restore_plan() != 59731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_backup_restore_plans() != 14034) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_build_link_qr() != 31223) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_carried_offer_epoch_ms() != 47623) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -42933,6 +47581,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_contact_route_usable() != 20984) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_decode_device_keypair() != 50354) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_derive_device_id() != 23875) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -42955,6 +47606,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_device_verify() != 56789) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_encode_device_keypair() != 32064) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_failover_resume_window_ms() != 41431) {
@@ -43035,13 +47689,73 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_legacy_device_id() != 53292) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_activation_ack() != 14075) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_activation_gate() != 22748) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_bootstrap_chunks() != 59049) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_bootstrap_decode() != 10877) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_bootstrap_encode() != 54264) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_bootstrap_join() != 41180) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_bootstrap_verify() != 54601) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_catch_up_plan() != 21779) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_default_budgets() != 5050) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_device_offer() != 42397) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_genesis_roster() != 30191) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_open_activation_ack() != 3020) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_open_device_offer() != 56402) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_link_openable_scheme() != 40398) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_qr_url() != 9866) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_recovery_roster() != 55416) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_rendezvous_id() != 54978) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_rendezvous_lane() != 61723) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_sas() != 21179) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_link_sign_new_device_roster() != 6184) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 18726) {
@@ -43051,6 +47765,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint_link() != 63195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_parse_link_qr() != 10141) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_peer_transport_for_arrival() != 35493) {
@@ -43698,6 +48415,87 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corelanhealthtracker_response() != 52501) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_add_outcome() != 2203) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_cancel() != 215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_confirm() != 48652) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_decline() != 57224) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_open_channel_frame() != 18140) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_phase() != 46281) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_rendezvous() != 56114) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_rendezvous_id() != 51987) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_resume_peer_bytes() != 12485) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_resume_sent() != 36783) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_seal_channel_frame() != 44129) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_start() != 49680) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_summary() != 37257) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinkapprovingdevice_tick() != 40781) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_cancel() != 60391) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_link_pk() != 28150) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_open_channel_frame() != 31277) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_phase() != 60748) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_qr_text() != 7744) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_rendezvous() != 36258) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_rendezvous_id() != 29135) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_resume_peer_bytes() != 2989) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_resume_sent() != 8890) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_seal_channel_frame() != 56161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_start() != 2473) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_summary() != 4612) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_corelinknewdevice_tick() != 16072) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_carried_lane_for() != 28381) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -43869,6 +48667,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_abandon_link_activation() != 54731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_own_roster() != 39473) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -43908,13 +48712,22 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_inventory() != 55991) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_recovery_roster() != 35634) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to() != 30631) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_backup_to_with_options() != 33714) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_begin_link_activation() != 2143) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_build_link_bootstrap() != 46651) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
@@ -43975,6 +48788,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_clear_shared_request_dismissal() != 60027) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_complete_link_activation() != 14897) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_lamports() != 35201) {
@@ -44130,6 +48946,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 30294) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_import_link_bootstrap() != 19850) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 54199) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -44158,6 +48977,15 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_is_user_blocked() != 28386) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_link_activation() != 13844) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_link_gate() != 52966) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_link_import_readiness() != 55318) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_list_blocked_users() != 55393) {
@@ -44260,6 +49088,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_own_device_fleet() != 64083) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_own_roster() != 1875) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_peer_connection_events() != 65461) {
@@ -44467,6 +49298,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_corelanhealthtracker_new() != 56458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corelinkapprovingdevice_scan() != 27752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_constructor_corelinknewdevice_new() != 14529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_constructor_coremeshrouterstate_new() != 20926) {

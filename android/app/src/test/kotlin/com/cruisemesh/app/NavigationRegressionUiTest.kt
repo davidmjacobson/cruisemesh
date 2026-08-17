@@ -42,6 +42,21 @@ class NavigationRegressionUiTest {
         assertNull(derivePendingDeepLink(intent))
     }
 
+    /**
+     * A device-link offer is scanned inside the linking ceremony, by the device
+     * that is already part of this person. The route resolves, and it
+     * deliberately opens nothing: a cold tap must not land someone in a flow
+     * that cannot finish what the link starts.
+     */
+    @Test
+    fun aDeviceLinkOfferOpensNoScreenOnItsOwn() {
+        val intent = Intent(
+            Intent.ACTION_VIEW,
+            android.net.Uri.parse("https://cruisemesh.app/link#CMLINK1:AZoB"),
+        )
+        assertNull(derivePendingDeepLink(intent))
+    }
+
     @Test
     fun backFromOnlyDestinationFinishesInsteadOfBlankingActivity() {
         val activity = Robolectric.buildActivity(ComponentActivity::class.java).setup().get()

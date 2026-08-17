@@ -379,6 +379,10 @@ impl MessageStore {
         now_ms: i64,
         forward_days: i64,
     ) -> Result<Vec<Vec<u8>>, CoreError> {
+        // §9.4: muling for contacts is mesh work like any other.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(Vec::new());
+        }
         let mut groups = Vec::new();
         for contact_id in self.proxy_contact_ids(own_user_id)? {
             groups.push(hints_over_range(
@@ -416,6 +420,15 @@ impl MessageStore {
         forward_days: i64,
         include_proxy: bool,
     ) -> Result<Vec<Vec<Vec<u8>>>, CoreError> {
+        // §9.4: "invisible on the mesh", at the one place every relay hint set
+        // is built. A hint set is how this device tells a relay which mailboxes
+        // are its business — to fetch from, to subscribe to, to proxy for — so
+        // a device that has not finished being adopted publishes none of them
+        // and asks for nothing. Emptiness, not an error: a poll pass with no
+        // hints is a pass that fetches nothing, which is exactly the intent.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(Vec::new());
+        }
         let mut groups = vec![hints_over_range(
             own_user_id,
             now_ms,
@@ -601,6 +614,12 @@ impl MessageStore {
         peer_user_id: Vec<u8>,
         now_ms: i64,
     ) -> Result<Vec<Vec<u8>>, CoreError> {
+        // §9.4: this set drives the HELLO-time carry drain — offering mail to a
+        // peer that just met us. A device still being adopted offers nothing,
+        // because it should not have been in that encounter at all.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(Vec::new());
+        }
         let mut hints = hints_over_window(&peer_user_id, now_ms, CARRY_HINT_DAY_WINDOW_DAYS);
         for group in self.list_groups()? {
             if group.member_user_ids.contains(&peer_user_id) {

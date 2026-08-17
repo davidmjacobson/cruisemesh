@@ -1122,6 +1122,13 @@ impl MessageStore {
             .map_err(store_err)?;
         conn.execute_batch(crate::roster_store::CONTACT_ROSTER_SCHEMA_SQL)
             .map_err(store_err)?;
+        conn.execute_batch(crate::device_link::activation::DEVICE_LINK_SCHEMA_SQL)
+            .map_err(store_err)?;
+        // The ceremony a pre-activation window belongs to. Added after the
+        // table itself, so a dev install that began a link under the first
+        // shape reads NULL here and its import is refused rather than
+        // silently accepted against no binding at all.
+        ensure_column(&conn, "device_link_activation", "channel_binding", "BLOB")?;
         // A roster describes a contact, so it has no business outliving one.
         crate::roster_store::sweep_orphaned_persons(&conn)?;
         migrate_delivery_metrics_schema(&conn)?;
@@ -3575,6 +3582,17 @@ impl MessageStore {
         now_ms: i64,
         skip_recipient_user_ids: Vec<Vec<u8>>,
     ) -> Result<Vec<OutboundEnvelope>, CoreError> {
+        // `specs/multi-device-v1.md` §9.4: this is the one chokepoint both
+        // relay upload paths pass through -- the 1:1 rows planned by
+        // `core_outbound_relay_rows` and the per-member group fan-out the
+        // shells build from `core_group_fanout_rows`, which is a pure function
+        // and has no store to ask. Emptying it here is what actually stops a
+        // pre-activation device from uploading mail it queued before the window
+        // opened. Nothing is dequeued: the same rows are offered again, in the
+        // same order, the moment activation closes.
+        if !self.link_gate_allows(crate::device_link::activation::CoreLinkGatedAction::Advertise)? {
+            return Ok(Vec::new());
+        }
         let conn = lock_conn(&self.conn);
         let mut args: Vec<Value> = vec![Value::Integer(now_ms)];
         let skip_clause = if skip_recipient_user_ids.is_empty() {

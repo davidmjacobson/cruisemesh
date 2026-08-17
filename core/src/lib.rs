@@ -11,6 +11,7 @@ mod contact_relay_health;
 mod content;
 mod crypto;
 mod deep_link;
+mod device_link;
 mod device_roster;
 mod engine;
 mod framing;
@@ -81,15 +82,44 @@ pub use content::{
 };
 pub use crypto::{open_message, seal_message, OpenedMessage};
 pub use deep_link::{deep_link_route, DeepLinkRoute};
+pub use device_link::activation::{
+    core_link_activation_ack, core_link_activation_gate, core_link_device_offer,
+    core_link_genesis_roster, core_link_open_activation_ack, core_link_open_device_offer,
+    core_link_recovery_roster, core_link_sign_new_device_roster, CoreLinkActivation,
+    CoreLinkActivationStage, CoreLinkBootstrapImport, CoreLinkGateReason, CoreLinkGateVerdict,
+    CoreLinkGatedAction, CoreLinkImportReadiness, LinkActivationAck, LinkDeviceOffer,
+    LinkRosterUpdate,
+};
+pub use device_link::bootstrap::{
+    core_link_bootstrap_chunks, core_link_bootstrap_decode, core_link_bootstrap_encode,
+    core_link_bootstrap_join, core_link_bootstrap_verify, core_link_catch_up_plan, CoreLinkCatchUp,
+    LinkBootstrap, LinkBootstrapContact, LinkBootstrapPerson, LINK_BOOTSTRAP_DEFAULT_LIFETIME_MS,
+    LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT, LINK_BOOTSTRAP_MAX_BYTES,
+    LINK_BOOTSTRAP_MAX_MESSAGE_BYTES, LINK_BOOTSTRAP_VERSION,
+};
+pub use device_link::ceremony::{
+    core_link_default_budgets, core_link_sas, CoreLinkAction, CoreLinkActionKind,
+    CoreLinkApprovingDevice, CoreLinkNewDevice, CoreLinkOutcome, CoreLinkPhase, CoreLinkRole,
+    CoreLinkSummary, LinkBudgets, LINK_CHANNEL_MAX_PLAINTEXT_BYTES, LINK_SAS_DIGITS,
+};
+pub use device_link::qr::{
+    core_build_link_qr, core_link_qr_url, core_link_rendezvous_id, core_link_rendezvous_lane,
+    core_parse_link_qr, CoreLinkLane, LinkRendezvous, DEVICE_LINK_PREFIX,
+    LINK_QR_DEFAULT_LIFETIME_MS, LINK_QR_MAX_BYTES, LINK_QR_MAX_HINTS, LINK_RENDEZVOUS_ID_LEN,
+};
+pub use device_link::restore::{
+    core_backup_restore_plan, core_backup_restore_plans, CoreRestoreIntent, CoreRestorePlan,
+};
 pub use device_roster::{
-    core_derive_device_id, core_device_add_outcome, core_device_namespace_id, core_device_sign,
-    core_device_stream_id, core_device_verify, core_legacy_device_id, core_roster_accept,
+    core_decode_device_keypair, core_derive_device_id, core_device_add_outcome,
+    core_device_namespace_id, core_device_sign, core_device_stream_id, core_device_verify,
+    core_encode_device_keypair, core_legacy_device_id, core_own_identity_peer, core_roster_accept,
     core_roster_device_ids, core_roster_head_hash, core_roster_validate, core_sign_device_cert,
-    core_sign_roster, core_verify_device_cert, generate_device_keypair, DeviceAddOutcome,
-    DeviceCert, DeviceKeypair, DeviceSigningDomain, DeviceTombstone, OwnDeviceFleet, Roster,
-    RosterRejection, RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, RosterVersion,
-    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP,
-    LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+    core_sign_roster, core_verify_device_cert, generate_device_keypair, CoreOwnIdentityPeer,
+    DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain, DeviceTombstone,
+    OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision, RosterUpdateOutcome,
+    RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP,
+    DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,

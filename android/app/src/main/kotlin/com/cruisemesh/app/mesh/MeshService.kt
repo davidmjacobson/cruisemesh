@@ -35,11 +35,15 @@ import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.devicelink.LinkRadioPlan
+import com.cruisemesh.app.devicelink.LinkRadioStep
+import com.cruisemesh.app.devicelink.LinkVisibility
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.TermsAcceptanceStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.CoreOwnIdentityPeer
 import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.CoreSprayTrigger
 import uniffi.cruisemesh_core.DigestEntry
@@ -55,6 +59,7 @@ import uniffi.cruisemesh_core.digestIsSharedGroup
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.coreIsHiddenSprayKind
 import uniffi.cruisemesh_core.coreOwnCapabilities
+import uniffi.cruisemesh_core.coreOwnIdentityPeer
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeHello2
 import uniffi.cruisemesh_core.encodeLanEndpoint
@@ -684,6 +689,49 @@ class MeshService : Service() {
         MeshRouter.registerLan(lan::sendFrame)
         ChatViewEvents.register(processor::handleChatViewed)
         RelaySyncEvents.register { relaySync?.requestRelaySync("queue changed") }
+        // specs/multi-device-v1.md §9.4: a device between "the channel is
+        // confirmed" and "the roster head is acknowledged" may not advertise
+        // ANYTHING. Core refuses everything it holds -- authoring, acks, hint
+        // sets, carry offers -- but it has never heard of a BLE advertiser or
+        // an NSD registration, so the radios are this shell's to hold shut.
+        //
+        // Read here, on the main thread, deliberately: it is one select against
+        // a single-row table, and the alternative is racing the store executor
+        // against the radio start a dozen lines below. Getting that race wrong
+        // means a phone that must be silent is briefly not.
+        LinkVisibility.refresh(store)
+        LinkVisibility.register { allowed ->
+            relayMainHandler.post {
+                if (!running) {
+                    // Nothing to apply, but a waiter must not be left blocking
+                    // on a service that is on its way out.
+                    LinkVisibility.markApplied(allowed)
+                    return@post
+                }
+                // Which radios move is decided in [LinkRadioPlan], where a unit
+                // test can read it: this branch is inside a foreground service
+                // and is not reachable from one.
+                for (step in LinkRadioPlan.stepsFor(allowed)) {
+                    when (step) {
+                        // LanTransport.start() is idempotent; startMeshRoles()
+                        // is the same call the Bluetooth-toggle path relies on.
+                        LinkRadioStep.START_LAN -> lanTransport?.start()
+                        LinkRadioStep.START_BLE -> startMeshRoles()
+                        LinkRadioStep.STOP_BLE -> stopMeshRoles()
+                        LinkRadioStep.STOP_LAN -> {
+                            // The NSD registration, discovery, the accept
+                            // socket and every live link go down together --
+                            // and the routes with them, because closing sockets
+                            // in bulk fires no per-address disconnect.
+                            lanTransport?.stopForLinkSilence()
+                            MeshRouter.resetLan()
+                            MeshConnectivityStatus.refreshNearbyRoutes()
+                        }
+                    }
+                }
+                LinkVisibility.markApplied(allowed)
+            }
+        }
 
         running = true
         runOnStoreExecutor("initial relay health") { relaySync?.publishInitialRelayHealth() }
@@ -705,7 +753,7 @@ class MeshService : Service() {
         // (no link has ever changed this process) so this is driven purely
         // by [screenInteractive] and the carry queue's last-known state.
         evaluateRadioPower("service start")
-        lan.start()
+        if (LinkVisibility.mayAdvertise()) lan.start()
         // The mesh runs regardless of Bluetooth audio now (see
         // refreshBluetoothAudioStatus); start the roles unconditionally rather
         // than gating them on an audio-clear check. (startMeshRoles is a no-op
@@ -771,6 +819,7 @@ class MeshService : Service() {
         storeExecutor.shutdown()
         lanHealthTracker.clear()
         RelaySyncEvents.unregister()
+        LinkVisibility.unregister()
         stopMeshRoles()
         MeshRouter.unregisterCentral()
         MeshRouter.unregisterPeripheral()
@@ -846,6 +895,15 @@ class MeshService : Service() {
 
     private fun startMeshRoles() {
         if (meshRolesRunning) return
+        // §9.4 again, at the one place every path into the radios passes
+        // through: the Bluetooth-toggle restart, the audio-state refresh and
+        // the service start all land here, and none of them may bring a
+        // pre-activation device on air.
+        if (!LinkVisibility.mayAdvertise()) {
+            Log.i(TAG, "Holding the mesh roles down: this device is not yet linked")
+            refreshRuntimeState()
+            return
+        }
         peripheral.start()
         central.start()
         meshRolesRunning = true
@@ -1010,6 +1068,11 @@ class MeshService : Service() {
     private fun refreshCarryQueueSignal() {
         runOnStoreExecutor("radio power carry-queue check") {
             assertOffMainThreadForStore("refreshCarryQueueSignal")
+            // Riding this tick rather than owning one: §9.4's window opens and
+            // closes in another screen's process, and a device that finished
+            // activating should not have to be restarted to be heard. Off the
+            // main thread, so this is where the periodic read belongs.
+            LinkVisibility.refresh(store)
             val carried = try {
                 store.carriedLen().toLong()
             } catch (e: CoreException) {
@@ -1692,7 +1755,7 @@ class MeshService : Service() {
         val isLanLink = MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
         val sessionKey = if (isLanLink) lanTransport?.remoteStaticKeyFor(address) else null
         if (ownIdentityHelloIsAuthenticated(isLanLink, identity.agreePk, sessionKey)) {
-            recordOwnIdentityClone()
+            recordOwnIdentityClone(sessionKey?.let(::peerDeviceIdFor))
         } else {
             Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")
         }
@@ -1702,11 +1765,37 @@ class MeshService : Service() {
     private fun recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: ByteArray) {
         val id = identity ?: return
         if (!ownLanStaticKeyMatches(id.agreePk, remoteStaticKey)) return
-        recordOwnIdentityClone()
+        recordOwnIdentityClone(peerDeviceIdFor(remoteStaticKey))
     }
 
-    private fun recordOwnIdentityClone() {
+    /**
+     * Which of this person's devices a peer holding this person's own key is,
+     * if the transport can say (`specs/multi-device-v1.md` §6).
+     *
+     * Always null today, and honestly so: nothing on the BLE or LAN wire
+     * carries a device id, and the key itself cannot distinguish -- §6 makes
+     * the inbox key person-scoped, so a linked sibling holds exactly the key
+     * the clone guard recognises. WP4's own-device sync records are what will
+     * put a device id here. The seam exists now so the rule lives in
+     * [uniffi.cruisemesh_core.coreOwnIdentityPeer] rather than being invented
+     * at the call site on the day it can be answered.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun peerDeviceIdFor(remoteStaticKey: ByteArray): ByteArray? = null
+
+    private fun recordOwnIdentityClone(peerDeviceId: ByteArray?) {
         val id = identity ?: return
+        // A device this person's own roster lists is not a clone. Warning about
+        // one would greet a deliberate link with the most alarming sentence the
+        // app can say -- and a warning that fires on the normal case is one
+        // people learn to dismiss, which leaves it useless for the real thing.
+        val verdict = runCatching {
+            coreOwnIdentityPeer(store.ownDeviceFleet(), peerDeviceId)
+        }.getOrDefault(CoreOwnIdentityPeer.CLONE)
+        if (verdict == CoreOwnIdentityPeer.SIBLING) {
+            Log.i(TAG, "A device of ours presented our identity; not a clone")
+            return
+        }
         runCatching {
             store.recordIdentityCloneWarning(id.userId, System.currentTimeMillis())
             ChatEvents.notifyChatChanged(id.userId)

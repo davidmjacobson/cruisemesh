@@ -250,6 +250,38 @@ internal class LanTransport(
     fun stop() {
         check(Looper.myLooper() == Looper.getMainLooper())
         if (!started) return
+        goOffTheLan()
+        // Terminal, and the one thing [stopForLinkSilence] must not do: these
+        // pools are constructed once with this transport, so shutting them down
+        // is what makes this object unusable rather than merely idle.
+        acceptExecutor.shutdownNow()
+        connectionExecutor.shutdownNow()
+        scanExecutor.shutdownNow()
+        writeExecutor.shutdownNow()
+    }
+
+    /**
+     * Take this phone off the LAN for §9.4's pre-activation window, without
+     * ending the transport (`specs/multi-device-v1.md` §9.4).
+     *
+     * Everything [stop] does except the executor shutdown: the NSD service
+     * registration is unregistered, discovery stops, the accept socket closes,
+     * every live link is torn down, and the Wi-Fi callback is dropped. What is
+     * left is an object [start] can bring back, which is the whole difference --
+     * the window ends, and this phone has to be able to rejoin the mesh it was
+     * just adopted into.
+     *
+     * Core cannot do any of this. It has never heard of an NSD registration,
+     * and a phone still publishing `_cruisemesh._tcp` and answering handshakes
+     * is not invisible whatever its store refuses to do.
+     */
+    fun stopForLinkSilence() {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (!started) return
+        goOffTheLan()
+    }
+
+    private fun goOffTheLan() {
         started = false
         LanTransportDiagnostics.unregisterManualConnector()
         teardownNetworkSession()
@@ -264,10 +296,6 @@ internal class LanTransport(
         }
         wifiNetwork = null
         eligibleWifiNetworks.clear()
-        acceptExecutor.shutdownNow()
-        connectionExecutor.shutdownNow()
-        scanExecutor.shutdownNow()
-        writeExecutor.shutdownNow()
     }
 
     /** MeshRouter send function. Encryption and socket writes stay ordered. */
