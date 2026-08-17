@@ -7,9 +7,16 @@
 //! WP1 moved most of this file out of the second category. Every roster vector
 //! now runs the shipped `core_roster_accept` through the shipped
 //! `MessageStore::apply_contact_roster`, and both stream vectors run a real
-//! body through encode → seal → open → decode → device-aware insert. What
-//! stays data-only stays that way because the mechanism genuinely does not
-//! exist yet, not because driving it was inconvenient:
+//! body through encode → seal → open → decode → device-aware insert.
+//!
+//! WP2 moved the rest of what it owned. The ack vectors now address rows the
+//! way a real §7 fan-out does (`core_device_namespace_id`,
+//! `device_fanout_msg_id`) and run the production ack planner against a fleet
+//! written through the shipped `set_own_device_fleet`; the §14.3 cap vectors
+//! perform a real add through `apply_contact_roster` instead of asking the cap
+//! policy function what it thinks. What stays data-only stays that way because
+//! the mechanism genuinely does not exist yet, not because driving it was
+//! inconvenient:
 //!
 //! * MD-ROSTER-PAIRWISE-GOSSIP. Half of DL-3 already ships: the roster head
 //!   rides the `CMFRIEND4` card and the roster-head TLV travels inside the
@@ -17,21 +24,40 @@
 //!   directory. The missing piece is narrower than "gossip does not exist" —
 //!   there is no envelope kind that carries the roster *document* itself, so
 //!   there is no end-to-end path to drive. WP4/WP5 own that carrier.
-//! * MD-SEAL-STALE-ROSTER needs §6's inbox key generations (WP2/WP5).
+//! * MD-SEAL-STALE-ROSTER needs §6's inbox key generations. WP2 came and
+//!   went without minting them -- it generalized addressing and acks, not
+//!   sealing -- so this one is WP5's alone now.
 //! * MD-ROSTER-FIRST-CONTACT-ANCHOR needs a second source of truth about a
 //!   person's recovery epoch (WP5's recovery flow).
 //! * MD-RECOVERY-ROOT-CUSTODY needs the person root minted and stored apart
 //!   from the identity key (WP3).
+//! * MD-SYNC-BLE-DAY-CONVERGE needs §8's self-sync records (WP4). The sim's
+//!   `a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands` pins
+//!   the honest half of that day today and points back here, so WP4 cannot
+//!   land the mechanism without deliberately editing both.
+//!
+//! **What "implemented and pinned" does NOT mean here.** The ack vectors below
+//! run the production planner against a fleet of two devices — but no
+//! production code writes such a fleet yet. `set_own_device_fleet` has exactly
+//! one caller in the whole tree and it is a test; §9's activation ceremony,
+//! which is what will write it in the field, is WP3's. So ACK-MD-1 and
+//! ACK-MD-2 are implemented, pinned, and *dormant*: correct the day WP3 turns
+//! them on, and unreachable until then. Every device in the field reads §5's
+//! synthetic one-device person, whose planner output
+//! (`a_single_device_identity_plans_exactly_todays_acks`) is byte-identical to
+//! what it was before any of this existed. That is the intended state of the
+//! work package, not a gap in it.
 
 use cruisemesh_core::{
-    compute_recipient_hint, core_derive_device_id, core_device_add_outcome, core_device_stream_id,
-    core_own_capabilities, core_relay_ack_ids, core_roster_validate, core_should_ack_inbound,
-    core_sign_device_cert, core_sign_roster, decode_extended_message_body, encode_message_body,
+    compute_recipient_hint, core_derive_device_id, core_device_add_outcome,
+    core_device_namespace_id, core_device_stream_id, core_own_capabilities, core_relay_ack_ids,
+    core_roster_validate, core_should_ack_inbound, core_sign_device_cert, core_sign_roster,
+    decode_extended_message_body, device_fanout_msg_id, encode_message_body,
     encode_message_body_extended, generate_identity, open_message, seal_message, CarriedEnvelope,
     Contact, ContactDeviceState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
     DeviceAddOutcome, DeviceCert, DeviceTombstone, ExtendedMessageBody, Identity,
-    IncomingMessageInsertOutcome, MessageBody, MessageStore, Roster, RosterRejection,
-    RosterUpdateOutcome, RosterUpdateReason, StoredMessage, CAP_MULTI_DEVICE,
+    IncomingMessageInsertOutcome, MessageBody, MessageStore, OwnDeviceFleet, Roster,
+    RosterRejection, RosterUpdateOutcome, RosterUpdateReason, StoredMessage, CAP_MULTI_DEVICE,
     DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_TEXT,
     LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
 };
@@ -149,6 +175,22 @@ enum Scenario {
         second_device_id: &'static [u8],
     },
     OwnDeviceFanoutConsumed,
+    /// Named `…Carried` until WP2. The rename is the finding: a sibling's row
+    /// is not withheld because this device failed to open it -- §6's inbox key
+    /// is person-scoped, so it opens -- but because it is not addressed to
+    /// this device's namespace.
+    ///
+    /// The Carried scenario it was renamed *from* is kept as
+    /// [`Scenario::SiblingDeviceFanoutCarried`] rather than replaced. The two
+    /// plan no ack for two independent reasons, and a swap would have quietly
+    /// traded one of them away: changing which situation a vector describes is
+    /// a reason to ADD coverage, never to lose it.
+    SiblingDeviceFanoutConsumed,
+    /// The scenario WP0 originally wrote as `MD-ACK-SIBLING-FANOUT`: a
+    /// sibling's row this device merely muled. It is withheld by the
+    /// disposition rule alone -- `Carried` is never ackable -- which is a
+    /// different guarantee from the namespace refusal above, and the one that
+    /// still protects the row on a device whose fleet record is empty.
     SiblingDeviceFanoutCarried,
     LegacyPersonAddressedConsumed,
     PersonSealedCarriedCopy,
@@ -157,6 +199,14 @@ enum Scenario {
         sealed_with_inbox_key_generation: u64,
         current_inbox_key_generation: u64,
         surviving_devices_still_receive: bool,
+    },
+    /// §8, WP4: a day in which mail reaches one device of a fleet over BLE
+    /// only. The devices must converge afterwards by self-sync — no relay row
+    /// gets a second reader to make it happen.
+    BleOnlyDayConverges {
+        reached_over_ble: u8,
+        fleet_size: u8,
+        converges_by_self_sync: bool,
     },
     CapabilityReservation,
     AddDevice {
@@ -208,6 +258,9 @@ enum Outcome {
     Acknowledged,
     NotAcknowledgedBecauseCarried,
     NotAcknowledgedByNamespaceRefusal,
+    /// §8's target for a BLE-only day: the fleet converges through self-sync,
+    /// not through a second device reading a row that has one true consumer.
+    SiblingsConvergeBySelfSync,
     PersonDigestProofOnly,
     DigestProofOnly,
     SurvivingDevicesDeliver,
@@ -498,17 +551,28 @@ const VECTORS: &[Vector] = &[
         target_outcome: Outcome::Acknowledged,
         implemented: true,
     },
-    // ACK-MD-1: today a sibling-sealed row cannot open here, so it falls to
-    // Carried and happens not to ack. v1's required non-ack is instead an
-    // explicit namespace refusal; do not mistake today's crypto accident for it.
+    // ACK-MD-1: a sibling's row opens here (§6 seals to the person) and is
+    // refused anyway, by namespace. WP2 made the refusal real; before it, the
+    // row happened not to ack because the fixture called it Carried.
     Vector {
         id: "MD-ACK-SIBLING-FANOUT",
-        scenario: Scenario::SiblingDeviceFanoutCarried,
+        scenario: Scenario::SiblingDeviceFanoutConsumed,
         target_outcome: Outcome::NotAcknowledgedByNamespaceRefusal,
         implemented: true,
     },
-    // ACK-MD-2: a legacy person-addressed row opens here and therefore acks
-    // today, but a multi-device fleet must leave it for its sibling devices.
+    // ACK-MD-1, the OTHER reason a sibling's row survives: this device merely
+    // muled it. Kept beside the Consumed vector above rather than replaced by
+    // it -- disposition and namespace are two independent guarantees, and the
+    // disposition one is what still protects the row on a device whose fleet
+    // record is empty.
+    Vector {
+        id: "MD-ACK-SIBLING-FANOUT-CARRIED",
+        scenario: Scenario::SiblingDeviceFanoutCarried,
+        target_outcome: Outcome::NotAcknowledgedBecauseCarried,
+        implemented: true,
+    },
+    // ACK-MD-2: a legacy person-addressed row opens here and is consumed, and
+    // a multi-device fleet must leave it for its sibling devices anyway.
     Vector {
         id: "MD-ACK-LEGACY-PERSON-ROW",
         scenario: Scenario::LegacyPersonAddressedConsumed,
@@ -522,6 +586,23 @@ const VECTORS: &[Vector] = &[
         scenario: Scenario::PersonSealedCarriedCopy,
         target_outcome: Outcome::PersonDigestProofOnly,
         implemented: true,
+    },
+    // §8, WP4: a BLE-only day reaches one device of a fleet, and the fleet
+    // converges afterwards by self-sync. Data-only: there is no record kind,
+    // no digest anti-entropy, nothing to drive. The sim's
+    // `a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands` pins
+    // what IS true today (one device receives it, and its BLE consumption does
+    // not let it delete the copy the sibling will need) and names this vector,
+    // so the two move together or not at all.
+    Vector {
+        id: "MD-SYNC-BLE-DAY-CONVERGE",
+        scenario: Scenario::BleOnlyDayConverges {
+            reached_over_ble: 1,
+            fleet_size: 2,
+            converges_by_self_sync: true,
+        },
+        target_outcome: Outcome::SiblingsConvergeBySelfSync,
+        implemented: false,
     },
     // §6: stale inbox-key sealing has bounded exposure, not a delivery brick.
     // A months-offline contact seals to the roster it knows -- which still
@@ -633,12 +714,20 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
         Outcome::NotAcknowledgedByNamespaceRefusal,
     ),
     (
+        "MD-ACK-SIBLING-FANOUT-CARRIED",
+        Outcome::NotAcknowledgedBecauseCarried,
+    ),
+    (
         "MD-ACK-LEGACY-PERSON-ROW",
         Outcome::NotAcknowledgedByNamespaceRefusal,
     ),
     (
         "MD-ACK-CARRIED-DIGEST-PROOF",
         Outcome::PersonDigestProofOnly,
+    ),
+    (
+        "MD-SYNC-BLE-DAY-CONVERGE",
+        Outcome::SiblingsConvergeBySelfSync,
     ),
     ("MD-SEAL-STALE-ROSTER", Outcome::SurvivingDevicesDeliver),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
@@ -660,8 +749,20 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
 /// device dimension and the sealed body gained the field that fills it (the
 /// sibling result moved from `Quarantined`, which was the shared-stream
 /// collision, to `SeparateStreams`); `MD-CAPABILITY-RESERVED` because
-/// `core_own_capabilities()` now advertises the bit. The four ack ids are
-/// untouched -- they are WP2's.
+/// `core_own_capabilities()` now advertises the bit.
+///
+/// WP2 moved two of the four ack ids, and each is a real behaviour change in
+/// `core_relay_ack_ids_with_consumed` rather than a fixture edit:
+/// `MD-ACK-SIBLING-FANOUT` from `NotAcknowledgedBecauseCarried` because the
+/// planner now refuses a *consumed* sibling row by namespace, and
+/// `MD-ACK-LEGACY-PERSON-ROW` from `Acknowledged` because a fleet holding more
+/// than one device no longer deletes the person's one shared row (ACK-MD-2).
+/// `MD-ACK-OWN-FANOUT` is untouched, which is the point of it.
+/// `MD-ACK-CARRIED-DIGEST-PROOF` is untouched too: WP2 changed nothing about
+/// carried copies, so its divergence stands. `MD-ACK-SIBLING-FANOUT-CARRIED`
+/// is new and reports what `MD-ACK-SIBLING-FANOUT` used to: the scenario did
+/// not stop being true when the other vector was re-pointed at a consumed row,
+/// so it kept its coverage under its own id.
 const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ROSTER-GREATER", Outcome::Accepted),
     ("MD-ROSTER-LOWER", Outcome::Ignored),
@@ -686,9 +787,16 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ACK-OWN-FANOUT", Outcome::Acknowledged),
     (
         "MD-ACK-SIBLING-FANOUT",
+        Outcome::NotAcknowledgedByNamespaceRefusal,
+    ),
+    (
+        "MD-ACK-SIBLING-FANOUT-CARRIED",
         Outcome::NotAcknowledgedBecauseCarried,
     ),
-    ("MD-ACK-LEGACY-PERSON-ROW", Outcome::Acknowledged),
+    (
+        "MD-ACK-LEGACY-PERSON-ROW",
+        Outcome::NotAcknowledgedByNamespaceRefusal,
+    ),
     ("MD-ACK-CARRIED-DIGEST-PROOF", Outcome::DigestProofOnly),
     ("MD-CAPABILITY-RESERVED", Outcome::Advertised),
     ("MD-DEVICE-CAP-7", Outcome::DeviceAdded),
@@ -700,30 +808,39 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
 
 /// This person's wire identity (`person_id` in new code, `user_id` today).
 const PERSON_ID: [u8; 16] = [0x5A; 16];
+/// Device *labels*, resolved to real keypairs and real 16-byte device ids by
+/// [`device`], exactly as the roster vectors resolve theirs.
 const OWN_DEVICE_ID: &[u8] = b"alice-phone-device-key";
 const SIBLING_DEVICE_ID: &[u8] = b"alice-tablet-device-key";
 const NOW_MS: i64 = 1_700_000_000_000;
 
-/// §7's per-device hint namespace, derived from `(person_id, device_id)`.
+/// §7's per-device hint namespace.
 ///
-/// WP2 owns the real derivation (alongside `device_fanout_msg_id`); this stand-in
-/// only has to be *distinct per device and distinct from the bare person hint*,
-/// which is exactly the property the ack vectors below depend on. Today's
-/// planner cannot tell these hints apart -- it only special-cases imported
-/// group hints -- so both a device-namespaced row and a bare person row are
-/// planned for ack. When WP2 teaches the planner to ack only rows in this
-/// device's own namespace, the bare-person row stops being planned and
-/// `MD-ACK-LEGACY-PERSON-ROW`'s driver result flips from `Acknowledged`, which
-/// trips both `PINNED_DRIVER_RESULTS` and the divergence ledger with no hand
-/// edit to the fixtures.
-fn device_namespace_id(person_id: &[u8], device_id: &[u8]) -> Vec<u8> {
-    let mut id = person_id.to_vec();
-    id.extend_from_slice(device_id);
-    id
+/// WP2 replaced the test-only stand-in that stood here with the shipped
+/// derivation: these vectors now address a row exactly the way a real
+/// per-device fan-out does — `core_device_namespace_id` for the hint,
+/// `device_fanout_msg_id` for the row id — so a change to either derivation is
+/// a change to these vectors, and the ack rules below are being asked about
+/// the bytes that will really be on the wire.
+fn device_hint(device_label: &[u8]) -> Vec<u8> {
+    compute_recipient_hint(
+        core_device_namespace_id(PERSON_ID.to_vec(), device(device_label).device_id),
+        NOW_MS,
+    )
 }
 
-fn device_hint(device_id: &[u8]) -> Vec<u8> {
-    compute_recipient_hint(device_namespace_id(&PERSON_ID, device_id), NOW_MS)
+/// One relay row of a per-device fan-out, addressed to `device_label`.
+fn fanout_item(
+    relay_id: i64,
+    disposition: CoreInboundDisposition,
+    device_label: &[u8],
+) -> CoreRelayEnvelopeDisposition {
+    CoreRelayEnvelopeDisposition {
+        relay_id,
+        msg_id: device_fanout_msg_id(vec![relay_id as u8; 16], device(device_label).device_id),
+        disposition,
+        recipient_hint: device_hint(device_label),
+    }
 }
 
 fn person_hint() -> Vec<u8> {
@@ -774,6 +891,14 @@ fn device(label: &[u8]) -> FixtureDevice {
         b"approved-device-b" => 0x26,
         _ => unreachable!("unknown fixture device label"),
     };
+    device_from_seed(seed)
+}
+
+/// The unnamed devices §14.3's cap vectors need: a person may hold seventeen
+/// of them, and naming seventeen would say nothing that the count does not.
+/// Seeds start above every labelled device's so a cap roster can never
+/// accidentally contain one of the named fixtures.
+fn device_from_seed(seed: u8) -> FixtureDevice {
     let sign_sk = [seed; 32];
     let sign_pk = sign_pk_of(&sign_sk);
     FixtureDevice {
@@ -855,7 +980,24 @@ fn roster_signed_by(
     inbox_key_generation: u64,
     signer_sk: Option<[u8; 32]>,
 ) -> Roster {
-    let resolved: Vec<FixtureDevice> = devices.iter().map(|label| device(label)).collect();
+    roster_of(
+        version,
+        devices.iter().map(|label| device(label)).collect(),
+        tombstones,
+        inbox_key_generation,
+        signer_sk,
+    )
+}
+
+/// [`roster_signed_by`] over devices that are already resolved, for the §14.3
+/// vectors, whose devices are counted rather than named.
+fn roster_of(
+    version: RosterVersion,
+    resolved: Vec<FixtureDevice>,
+    tombstones: &[&[u8]],
+    inbox_key_generation: u64,
+    signer_sk: Option<[u8; 32]>,
+) -> Roster {
     let approver = resolved
         .first()
         .expect("a roster names an approving device");
@@ -897,6 +1039,21 @@ fn roster_signed_by(
         signer.to_vec(),
     )
     .expect("roster signs")
+}
+
+/// A valid roster holding exactly `device_count` devices. §14.3 counts the
+/// devices the document names, so a "resulting device count" of N is simply a
+/// roster of size N.
+fn roster_of_size(version: RosterVersion, device_count: usize) -> Roster {
+    roster_of(
+        version,
+        (0..device_count)
+            .map(|index| device_from_seed(0x30 + index as u8))
+            .collect(),
+        &[],
+        0,
+        None,
+    )
 }
 
 /// A store that already knows the fixture person as a contact — the only
@@ -973,12 +1130,42 @@ fn relay_item(
 }
 
 /// Run the PRODUCTION ack planner -- the same
-/// `MessageStore::core_relay_ack_ids_with_consumed` (`core/src/engine.rs:985`)
-/// every shell calls, where the legacy shared-hint withholding lives
-/// (`core/src/engine.rs:994-1006`) -- over one relay row, on an empty store
-/// owned by `PERSON_ID`.
+/// `MessageStore::core_relay_ack_ids_with_consumed` every shell calls, where
+/// the legacy shared-hint withholding lives and where WP2 added ACK-MD-1/2 --
+/// over one relay row, on a store owned by `PERSON_ID`.
+///
+/// The store is a *two-device* fleet, because that is the situation every ack
+/// vector below is about: `OWN_DEVICE_ID` is this device and
+/// `SIBLING_DEVICE_ID` is the one it must not delete mail out from under. This
+/// is the state §9's two-phase activation leaves behind, written through the
+/// shipped `set_own_device_fleet`. A single-device identity's planner output is
+/// unchanged by all of this, which `engine.rs`'s
+/// `a_single_device_identity_plans_exactly_todays_acks` pins.
+///
+/// **The precondition is dormant.** A stored fleet of more than one device is
+/// what activates every rule the vectors below assert, and nothing in
+/// production writes one yet — §9's linking ceremony is WP3's, and this fixture
+/// is the only kind of caller `set_own_device_fleet` has. The rules are
+/// implemented and pinned here so that they are already right on the day WP3
+/// supplies the writer; until then no device in the field ever reaches them.
 fn plan_acks(item: CoreRelayEnvelopeDisposition) -> Vec<i64> {
     let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+    store
+        .set_own_device_fleet(OwnDeviceFleet {
+            own_device_id: Some(device(OWN_DEVICE_ID).device_id),
+            device_ids: vec![
+                device(OWN_DEVICE_ID).device_id,
+                device(SIBLING_DEVICE_ID).device_id,
+            ],
+            // Core's own `RosterVersion`, not this file's same-named fixture:
+            // the projection carries the DL-1 ordering key of the roster §9's
+            // activation took it from.
+            projected_from: cruisemesh_core::RosterVersion {
+                recovery_epoch: 0,
+                seq: 1,
+            },
+        })
+        .expect("this device is activated into its own fleet");
     store
         .core_relay_ack_ids_with_consumed(vec![item], PERSON_ID.to_vec(), NOW_MS)
         .expect("production relay ack planner")
@@ -1669,13 +1856,10 @@ fn drive(vector: &Vector) -> Option<Outcome> {
         }
         Scenario::OwnDeviceFanoutConsumed => {
             // ACK-MD-1: this device successfully opened a row addressed to its
-            // OWN device hint namespace. This is the row that must keep acking
-            // after WP2 -- it is the one namespace this device may delete from.
-            let item = relay_item(
-                41,
-                CoreInboundDisposition::Consumed,
-                device_hint(OWN_DEVICE_ID),
-            );
+            // OWN device hint namespace. This is the row that keeps acking
+            // after WP2 -- it is the one namespace this device may delete from,
+            // and the row it names has exactly one true consumer.
+            let item = fanout_item(41, CoreInboundDisposition::Consumed, OWN_DEVICE_ID);
             let planned = plan_acks(item.clone());
             contract_assert!(
                 vector.id,
@@ -1695,71 +1879,107 @@ fn drive(vector: &Vector) -> Option<Outcome> {
             );
             Outcome::Acknowledged
         }
-        Scenario::SiblingDeviceFanoutCarried => {
-            // ACK-MD-1: mesh_receive's pairwise open fails for a sibling's key
-            // and its foreign-traffic branch returns Carried. Carried is never
-            // eligible for the production planner.
+        Scenario::SiblingDeviceFanoutConsumed => {
+            // ACK-MD-1, as a real namespace refusal. WP0 wrote this vector
+            // against a Carried fixture and said so: the row was merely an
+            // envelope this device could not open, so it was withheld by the
+            // disposition rule and the sibling hint was invisible to the
+            // planner. That reading was never the rule -- and it was never
+            // even the crypto, because §6 seals to a person-scoped inbox key,
+            // so a sibling's row genuinely opens on this device.
             //
-            // KNOWN, ACCEPTED RESIDUAL: this pin is label-inert until WP2
-            // introduces per-device relay rows. Today the sibling's row is
-            // merely an envelope this device cannot open, so it is withheld by
-            // the Carried rule and not by any namespace check -- the fixture's
-            // sibling hint is invisible to today's planner. The pin's value is
-            // that it must not START acking; when WP2 lands, the withholding
-            // reason must become the explicit namespace refusal named by
-            // `target_outcome`, and Carried alone will no longer be the story.
-            let item = relay_item(
-                42,
-                CoreInboundDisposition::Carried,
-                device_hint(SIBLING_DEVICE_ID),
-            );
+            // So the fixture is CONSUMED now, which is what a sibling's row
+            // really reports here, and the two assertions below are the
+            // discriminator: the disposition-only planner acks it, and the
+            // production planner does not. The namespace is the only thing
+            // standing between a sibling's mail and deletion.
+            let item = fanout_item(42, CoreInboundDisposition::Consumed, SIBLING_DEVICE_ID);
             let planned = plan_acks(item.clone());
             contract_assert!(
                 vector.id,
                 planned.is_empty(),
-                "the production planner must not ack a carried sibling row, got {planned:?}"
+                "the production planner must refuse a sibling's row by namespace, got {planned:?}"
+            );
+            // The fixture's `Consumed` is not self-evidence that a sibling's
+            // row opens here -- this file cannot open anything, it plans acks.
+            // The evidence that it does is elsewhere and is real: every row of
+            // a §7 fan-out carries IDENTICAL sealed bytes
+            // (`core_device_fanout_rows`, pinned by
+            // `a_multi_device_contact_gets_one_row_per_device`), because §6
+            // seals to a person-scoped inbox key; and `mesh_sim`'s
+            // `a_two_device_recipient_over_relay_does_not_starve_the_sibling`
+            // drives a real seal/open through the production inbound path on a
+            // fleet of two. What this assertion pins is narrower and is the
+            // discriminator: the disposition-only planner WOULD delete this
+            // row, so the namespace is the only thing standing between a
+            // sibling's mail and a deletion.
+            contract_assert!(
+                vector.id,
+                core_should_ack_inbound(item.disposition),
+                "the fixture must be a genuinely consumed row, or the refusal proves nothing"
+            );
+            contract_assert!(
+                vector.id,
+                core_relay_ack_ids(vec![item]) == vec![42],
+                "the disposition-only planner, which cannot see namespaces, would delete it"
+            );
+            Outcome::NotAcknowledgedByNamespaceRefusal
+        }
+        Scenario::SiblingDeviceFanoutCarried => {
+            // The guarantee the vector above no longer covers: a sibling's row
+            // this device only muled is withheld by the disposition rule, with
+            // no namespace reasoning involved at all. Both planners agree here,
+            // which is exactly how it differs from the consumed case.
+            let item = fanout_item(45, CoreInboundDisposition::Carried, SIBLING_DEVICE_ID);
+            let planned = plan_acks(item.clone());
+            contract_assert!(
+                vector.id,
+                planned.is_empty(),
+                "a carried sibling row must plan no acknowledgement, got {planned:?}"
             );
             contract_assert!(
                 vector.id,
                 !core_should_ack_inbound(item.disposition),
-                "the sibling-key open failure must fall through to non-ackable Carried"
+                "Carried must not be ackable on its disposition"
             );
             contract_assert!(
                 vector.id,
                 core_relay_ack_ids(vec![item]).is_empty(),
-                "the disposition-only planner also withholds the carried sibling row"
+                "the disposition-only planner refuses it too -- this row needs \
+                 no namespace rule to survive"
             );
             Outcome::NotAcknowledgedBecauseCarried
         }
         Scenario::LegacyPersonAddressedConsumed => {
             // ACK-MD-2: a legacy sender uploads ONE person-addressed row, so
             // this fixture carries the bare person hint -- not a device
-            // namespace hint. The legacy person key opens here, so the current
-            // core sees Consumed and (incorrectly for a multi-device fleet)
-            // deletes the only copy the siblings could still fetch.
+            // namespace hint. The person key opens it here, so it is genuinely
+            // Consumed; deleting it would take away the only copy the siblings
+            // could still fetch, which is §1's starvation failure told from the
+            // legacy sender's side.
             //
-            // This row and MD-ACK-OWN-FANOUT's differ in the one input the
-            // planner will learn to read: `recipient_hint`. When WP2 restricts
-            // acks to this device's own namespace, this vector's planner output
-            // becomes empty while MD-ACK-OWN-FANOUT's stays `[41]`.
+            // This row and MD-ACK-OWN-FANOUT's differ in exactly one input:
+            // `recipient_hint`. That is now the input the planner reads, and it
+            // is why this vector plans nothing while MD-ACK-OWN-FANOUT still
+            // plans `[41]`.
             let item = relay_item(43, CoreInboundDisposition::Consumed, person_hint());
             let planned = plan_acks(item.clone());
             contract_assert!(
                 vector.id,
-                planned == vec![43],
-                "the production planner currently deletes the legacy person row, got {planned:?}"
+                planned.is_empty(),
+                "a multi-device fleet must leave the legacy person row, got {planned:?}"
             );
             contract_assert!(
                 vector.id,
                 core_should_ack_inbound(item.disposition),
-                "a successfully opened legacy person row is consumed today"
+                "a successfully opened legacy person row really is consumed"
             );
             contract_assert!(
                 vector.id,
                 core_relay_ack_ids(vec![item]) == vec![43],
-                "the disposition-only planner also acks the legacy person row today"
+                "the disposition-only planner, which knows nothing of fleets, would delete it"
             );
-            Outcome::Acknowledged
+            Outcome::NotAcknowledgedByNamespaceRefusal
         }
         Scenario::PersonSealedCarriedCopy => {
             let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
@@ -1846,31 +2066,136 @@ fn drive(vector: &Vector) -> Option<Outcome> {
             );
             Outcome::Advertised
         }
-        // §14.3, through the shipped cap policy rather than a copy of it.
+        // §14.3, through the shipped ADD PATH rather than through the policy
+        // function alone.
+        //
+        // WP0 wrote these vectors against `core_device_add_outcome` directly,
+        // which was the only cap code that existed: a free-standing decision
+        // no roster ever consulted. The HARD cap has been enforced since WP1 —
+        // `core_roster_validate` refuses a document over `DEVICE_HARD_CAP`, so
+        // MD-DEVICE-CAP-17's refusal predates WP2. What WP2 added is the SOFT
+        // cap verdict travelling back with the decision, and the folding of
+        // both into one implementation, so the refusal and the verdict cannot
+        // drift apart. The driver now performs a real add and reads what the
+        // store did; the vectors' ids, scenarios and targets are unchanged.
+        //
+        // The verdict the CONTACT path returns is deliberately non-surfacing
+        // (§2 goal 1 — a person's device count is invisible to other users), so
+        // the driver reads the vector's outcome off the cap POLICY, which is
+        // what WP3's own-roster add path will surface, and separately asserts
+        // that the contact path declines to say it.
         Scenario::AddDevice {
             resulting_device_count,
         } => {
+            // Discriminating, where asserting the two cap constants was not:
+            // §14.3's boundary is only real if documents ONE device apart get
+            // different verdicts, at both the soft and the hard edge.
             contract_assert!(
                 vector.id,
-                (DEVICE_SOFT_CAP, DEVICE_HARD_CAP) == (8, 16),
-                "the §14.3 caps are soft 8 / hard 16"
+                core_device_add_outcome(DEVICE_SOFT_CAP) == DeviceAddOutcome::Added
+                    && core_device_add_outcome(DEVICE_SOFT_CAP + 1)
+                        == DeviceAddOutcome::AddedWithWarning
+                    && core_device_add_outcome(DEVICE_HARD_CAP)
+                        == DeviceAddOutcome::AddedWithWarning
+                    && core_device_add_outcome(DEVICE_HARD_CAP + 1) == DeviceAddOutcome::Refused,
+                "§14.3's boundaries must separate documents one device apart"
             );
-            match core_device_add_outcome(u32::from(resulting_device_count)) {
-                DeviceAddOutcome::Added => Outcome::DeviceAdded,
-                DeviceAddOutcome::AddedWithWarning => Outcome::DeviceAddedWithWarning,
-                DeviceAddOutcome::Refused => Outcome::DeviceAddRefused,
+            let store = roster_store();
+            let count = usize::from(resulting_device_count);
+            // The roster this person held before the add, then the document
+            // that performs it. Two applies, because "resulting device count"
+            // is a claim about an add and not about a document appearing from
+            // nowhere.
+            let before = store.apply_contact_roster(roster_of_size(
+                RosterVersion {
+                    recovery_epoch: 0,
+                    seq: 0,
+                },
+                count - 1,
+            ));
+            contract_assert!(
+                vector.id,
+                matches!(before.map(|d| d.outcome), Ok(RosterUpdateOutcome::Accepted)),
+                "the roster held before this add must itself be legal"
+            );
+            let decision = store
+                .apply_contact_roster(roster_of_size(
+                    RosterVersion {
+                        recovery_epoch: 0,
+                        seq: 1,
+                    },
+                    count,
+                ))
+                .expect("the shipped roster path");
+            let policy = core_device_add_outcome(u32::from(resulting_device_count));
+            // One implementation of §14.3, with one deliberate difference: the
+            // add path must agree with the policy about REFUSING, or a shell
+            // could warn about a device the store refused (or stay silent about
+            // one it kept) -- but it must NOT pass the soft-cap warning on,
+            // because this document is about someone else.
+            contract_assert!(
+                vector.id,
+                decision.device_count_outcome
+                    == if policy == DeviceAddOutcome::AddedWithWarning {
+                        DeviceAddOutcome::Added
+                    } else {
+                        policy
+                    },
+                "the contact path must report the cap verdict without surfacing \
+                 the soft cap, got {decision:?} for {resulting_device_count} devices"
+            );
+            contract_assert!(
+                vector.id,
+                decision.device_count_outcome != DeviceAddOutcome::AddedWithWarning,
+                "§2 goal 1: a contact's device count is never surfaced from gossip"
+            );
+            let held = store
+                .contact_active_device_ids(person_id())
+                .expect("stored devices")
+                .len();
+            match policy {
+                DeviceAddOutcome::Refused => {
+                    // Refusal is the roster being ignored whole (DL-1 leaves
+                    // the stored one alone), not a truncated add.
+                    contract_assert!(
+                        vector.id,
+                        decision.outcome == RosterUpdateOutcome::Ignored
+                            && decision.rejection == Some(RosterRejection::DeviceCapExceeded),
+                        "the {resulting_device_count}th device must be refused by the store, got {decision:?}"
+                    );
+                    contract_assert!(
+                        vector.id,
+                        held == count - 1,
+                        "a refused add leaves the person on the devices they had, got {held}"
+                    );
+                    Outcome::DeviceAddRefused
+                }
+                added => {
+                    contract_assert!(
+                        vector.id,
+                        decision.outcome == RosterUpdateOutcome::Accepted && held == count,
+                        "the {resulting_device_count}th device must land, got {decision:?} / {held} held"
+                    );
+                    match added {
+                        DeviceAddOutcome::AddedWithWarning => Outcome::DeviceAddedWithWarning,
+                        _ => Outcome::DeviceAdded,
+                    }
+                }
             }
         }
         // Still data-only, and each for a mechanism reason rather than a
         // shrug: DL-3's roster gossip has no envelope kind to seal yet
-        // (WP4/WP5); §6's inbox key generations do not exist yet (WP2/WP5);
+        // (WP4/WP5); §6's inbox key generations do not exist yet (WP5);
         // first-contact anchoring has no second source of truth to check an
-        // adopted epoch against (WP5's recovery flow); and root-secret custody
-        // is WP3's, since nothing yet mints or stores a person root separately
-        // from the identity key. There is nothing real to execute.
+        // adopted epoch against (WP5's recovery flow); §8's self-sync has no
+        // record kind and no anti-entropy, so a BLE-only day has nothing to
+        // converge WITH (WP4); and root-secret custody is WP3's, since nothing
+        // yet mints or stores a person root separately from the identity key.
+        // There is nothing real to execute.
         Scenario::RosterPairwiseGossipNoDirectory { .. }
         | Scenario::StaleRosterSealing { .. }
         | Scenario::RosterFirstContactAnchor { .. }
+        | Scenario::BleOnlyDayConverges { .. }
         | Scenario::RecoveryRootCustody { .. } => {
             unreachable!("unimplemented vector ran")
         }
@@ -2077,6 +2402,15 @@ fn roster_and_cap_data_encode_the_accepted_rules() {
                     && surviving_devices_still_receive,
                 "§6 stale-roster sealing is a bounded exposure, never a delivery brick"
             ),
+            Scenario::BleOnlyDayConverges {
+                reached_over_ble,
+                fleet_size,
+                converges_by_self_sync,
+            } => contract_assert!(
+                vector.id,
+                reached_over_ble < fleet_size && converges_by_self_sync,
+                "§8's BLE-day vector is a fleet only partly reached, converging by self-sync"
+            ),
             Scenario::AddDevice {
                 resulting_device_count,
             } => {
@@ -2122,16 +2456,19 @@ fn divergence_ledger_is_derived_from_driver_results() {
                 .and_then(|current| (current != vector.target_outcome).then_some(vector.id))
         })
         .collect();
-    // WP1 closed two of these. `MD-STREAM-SIBLING-LAMPORT` closed because the
-    // stream key really gained its device dimension, and
-    // `MD-CAPABILITY-RESERVED` because the bit is really advertised. What is
-    // left is exactly WP2's list: acks are still planned per person rather
-    // than per device namespace.
-    let expected = [
-        "MD-ACK-SIBLING-FANOUT",
-        "MD-ACK-LEGACY-PERSON-ROW",
-        "MD-ACK-CARRIED-DIGEST-PROOF",
-    ];
+    // WP1 closed two of these; WP2 closed two more, and both because acks are
+    // now planned per device namespace rather than per person:
+    // `MD-ACK-SIBLING-FANOUT` (a consumed sibling row is refused by namespace,
+    // not by disposition) and `MD-ACK-LEGACY-PERSON-ROW` (ACK-MD-2).
+    //
+    // One is left, and it is not WP2's to close. `MD-ACK-CARRIED-DIGEST-PROOF`
+    // diverges on the *person* half of ACK-MD-3: a carried copy is already
+    // removed only on digest proof, never on dispatch, which is
+    // `DigestProofOnly` -- but v1 wants proof that reaches the PERSON, and one
+    // device's digest cannot speak for its siblings. Closing it needs a
+    // person-scoped receipt, which needs self-sync (§8, WP4). WP2 deliberately
+    // changed nothing about carried copies, so nothing here moved.
+    let expected = ["MD-ACK-CARRIED-DIGEST-PROOF"];
     assert_eq!(
         actual, expected,
         "implemented current-core divergences must be discovered from drivers"
@@ -2145,18 +2482,21 @@ fn unimplemented_vector_ledger_is_deliberate() {
         .filter(|vector| !vector.implemented)
         .map(|vector| vector.id)
         .collect();
-    // Four left after WP1, each waiting on a mechanism rather than on effort:
-    // DL-3's roster gossip needs an envelope kind to seal (WP4/WP5); §6's
-    // stale-roster sealing needs inbox key generations (WP2/WP5); first-contact
+    // Five now, each waiting on a mechanism rather than on effort: DL-3's
+    // roster gossip needs an envelope kind to seal (WP4/WP5); §6's
+    // stale-roster sealing needs inbox key generations (WP5); first-contact
     // anchoring needs a second source of truth about a person's epoch, which is
-    // WP5's recovery flow; and root-secret custody needs the person root to be
-    // minted and stored separately from the identity key, which is WP3's.
+    // WP5's recovery flow; root-secret custody needs the person root to be
+    // minted and stored separately from the identity key, which is WP3's; and
+    // §8's BLE-day convergence needs the self-sync records WP4 mints, which is
+    // why WP2 added it here rather than pretending the sim stub was the gate.
     // Driving any of them today would mean writing a test-only stand-in and
     // calling it core, which is the one thing this ledger exists to prevent.
     let expected = [
         "MD-ROSTER-PAIRWISE-GOSSIP",
         "MD-ROSTER-FIRST-CONTACT-ANCHOR",
         "MD-RECOVERY-ROOT-CUSTODY",
+        "MD-SYNC-BLE-DAY-CONVERGE",
         "MD-SEAL-STALE-ROSTER",
     ];
     assert_eq!(

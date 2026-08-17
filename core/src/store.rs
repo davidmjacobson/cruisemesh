@@ -123,10 +123,10 @@ use crate::roster_store::{ContactDeviceState, ContactRosterState};
 use crate::{
     core_is_visible_chat_kind, verify_introduction_ticket, CoreError, CoreInboundDisposition,
     CoreRelayEnvelopeDisposition, CoreRelayFetchedEnvelope, CoreRelayShadowReport,
-    FriendDirectoryContent, Group, IntroductionTicket, RelayUpdateContent, Roster, RosterRejection,
-    RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, SuggestedFriendCard,
-    KIND_INTRODUCED_FRIEND_REQUEST, LEGACY_DEVICE_ID, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
-    RECEIPT_TYPE_READ,
+    FriendDirectoryContent, Group, IntroductionTicket, OwnDeviceFleet, RelayUpdateContent, Roster,
+    RosterRejection, RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason,
+    SuggestedFriendCard, KIND_INTRODUCED_FRIEND_REQUEST, LEGACY_DEVICE_ID, MS_PER_DAY,
+    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 
 type CarriedHintRecipient = (Vec<u8>, Vec<u8>);
@@ -5804,6 +5804,15 @@ impl MessageStore {
     /// A roster for someone who is not a contact is ignored rather than
     /// refused: rosters gossip as ordinary sealed traffic (DL-3), and a
     /// document about a stranger is simply not this device's business.
+    ///
+    /// **The §14.3 verdict this returns is deliberately non-surfacing** (§2
+    /// goal 1: a person's device count is invisible to other users). The
+    /// hard-cap [`DeviceAddOutcome::Refused`] stays — that is this device
+    /// refusing a document, and a caller must be able to see it — but the
+    /// soft-cap warning is stripped, because a shell that showed "this contact
+    /// now has 9 devices" would disclose from gossip exactly what the goal
+    /// protects. The warning belongs to the OWN-roster add path (§9's linking
+    /// ceremony, WP3), where the count is the user's own.
     pub fn apply_contact_roster(
         &self,
         incoming: Roster,
@@ -5824,6 +5833,13 @@ impl MessageStore {
                 reason: RosterUpdateReason::Invalid,
                 rejection: Some(RosterRejection::PersonMismatch),
                 quarantined: false,
+                // §14.3 describes the document either way, exactly as
+                // `core_roster_accept` would have stamped it had this
+                // document been about someone we know -- and stripped of the
+                // soft-cap warning for the same §2 reason as the main path.
+                device_count_outcome: crate::device_roster::non_surfacing_device_count_outcome(
+                    crate::core_device_add_outcome(incoming.devices.len() as u32),
+                ),
             });
         };
         let state = crate::roster_store::load_state(&tx, &incoming.person_id)?;
@@ -5833,6 +5849,12 @@ impl MessageStore {
             incoming.clone(),
             person_root_sign_pk,
         );
+        let decision = RosterUpdateDecision {
+            device_count_outcome: crate::device_roster::non_surfacing_device_count_outcome(
+                decision.device_count_outcome,
+            ),
+            ..decision
+        };
         match decision.outcome {
             RosterUpdateOutcome::Accepted => {
                 crate::roster_store::save_roster(&tx, &incoming, decision.quarantined)?;
@@ -5878,6 +5900,133 @@ impl MessageStore {
     ) -> Result<Vec<Vec<u8>>, CoreError> {
         let conn = lock_conn(&self.conn);
         crate::roster_store::active_device_ids(&conn, &person_user_id)
+    }
+
+    /// Record this device's own place in its person's fleet (§7/§9), replacing
+    /// whatever was stored.
+    ///
+    /// Whole-record replacement rather than add/remove, because every writer is
+    /// a ceremony that already holds the complete answer: §9's activation
+    /// imports a roster and then declares the fleet it just joined, §10's
+    /// revocation signs a new roster and then declares what is left. A
+    /// merge could leave a revoked sibling behind, and a stale sibling is a
+    /// device whose relay rows this one would keep withholding acks for.
+    ///
+    /// Refuses an internally inconsistent fleet rather than normalizing it (see
+    /// [`crate::OwnDeviceFleet`]): what is stored here decides which relay rows
+    /// this device may delete, so "roughly right" is not a state worth having.
+    ///
+    /// **Monotonic in `projected_from`, the way DL-1 is monotonic in a roster's
+    /// own `(recovery_epoch, seq)`.** A projection at or below the stored
+    /// version is refused with the same vocabulary DL-1 uses — a lower version
+    /// is a *rollback*, an equal one is an *idempotent repeat* — and for the
+    /// same reason: a stale copy of this record is not a harmless out-of-date
+    /// cache but a standing instruction about whose relay rows this device may
+    /// delete. The concrete attack it closes is a backup restore: the record
+    /// rides a `.cmbak` unsanitized, so without an ordering key restoring an
+    /// old backup would resurrect a fleet §10's revocation has since narrowed.
+    ///
+    /// **Dormant in WP2.** No production caller writes a fleet at all yet
+    /// (§9's activation ceremony is WP3's), so today this refusal only ever
+    /// judges test writes. It ships now because the rule is cheaper to pin
+    /// before there is a writer than to retrofit around one.
+    pub fn set_own_device_fleet(&self, fleet: OwnDeviceFleet) -> Result<(), CoreError> {
+        crate::device_roster::validate_own_device_fleet(&fleet)?;
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        let stored: Option<(u64, u64)> = tx
+            .query_row(
+                "SELECT recovery_epoch, seq FROM own_device_fleet_version WHERE id = 0",
+                [],
+                |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        if let Some((recovery_epoch, seq)) = stored {
+            let stored = crate::RosterVersion {
+                recovery_epoch,
+                seq,
+            };
+            if fleet.projected_from <= stored {
+                let rule = if fleet.projected_from == stored {
+                    "idempotent repeat"
+                } else {
+                    "rollback"
+                };
+                return Err(CoreError::Store(format!(
+                    "own device fleet {rule}: a projection from ({}, {}) does not supersede the \
+                     stored ({}, {})",
+                    fleet.projected_from.recovery_epoch,
+                    fleet.projected_from.seq,
+                    stored.recovery_epoch,
+                    stored.seq,
+                )));
+            }
+        }
+        tx.execute(
+            "INSERT INTO own_device_fleet_version (id, recovery_epoch, seq) VALUES (0, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET recovery_epoch = excluded.recovery_epoch,
+                                           seq = excluded.seq",
+            params![
+                fleet.projected_from.recovery_epoch as i64,
+                fleet.projected_from.seq as i64
+            ],
+        )
+        .map_err(store_err)?;
+        tx.execute("DELETE FROM own_device_fleet", [])
+            .map_err(store_err)?;
+        for (ordinal, device_id) in fleet.device_ids.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO own_device_fleet (device_id, ordinal, is_self) VALUES (?1, ?2, ?3)",
+                params![
+                    device_id,
+                    ordinal as i64,
+                    i64::from(fleet.own_device_id.as_ref() == Some(device_id)),
+                ],
+            )
+            .map_err(store_err)?;
+        }
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
+    /// What this device knows about its own fleet (§7/§9). An install that has
+    /// never linked reads the default — no own device id, no siblings — which
+    /// is §5's synthetic one-device person.
+    pub fn own_device_fleet(&self) -> Result<OwnDeviceFleet, CoreError> {
+        let conn = lock_conn(&self.conn);
+        let mut stmt = conn
+            .prepare("SELECT device_id, is_self FROM own_device_fleet ORDER BY ordinal ASC")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)? != 0))
+            })
+            .map_err(store_err)?;
+        let mut fleet = OwnDeviceFleet::default();
+        for row in rows {
+            let (device_id, is_self) = row.map_err(store_err)?;
+            if is_self {
+                fleet.own_device_id = Some(device_id.clone());
+            }
+            fleet.device_ids.push(device_id);
+        }
+        drop(stmt);
+        fleet.projected_from = conn
+            .query_row(
+                "SELECT recovery_epoch, seq FROM own_device_fleet_version WHERE id = 0",
+                [],
+                |row| {
+                    Ok(crate::RosterVersion {
+                        recovery_epoch: row.get::<_, i64>(0)? as u64,
+                        seq: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(store_err)?
+            .unwrap_or_default();
+        Ok(fleet)
     }
 
     /// Look up a single contact by UserID, or `None` if not a contact.
@@ -9752,6 +9901,44 @@ CREATE TABLE IF NOT EXISTS contact_presence (
     observed_at_ms INTEGER,
     asked_at_ms    INTEGER NOT NULL
 );
+
+-- This device's own place in its person's device fleet
+-- (`specs/multi-device-v1.md` §7/§9): one row per ACTIVE own device, with the
+-- one that is this device flagged. See `OwnDeviceFleet` for why this is a
+-- projection of the own roster rather than a second copy of the document.
+--
+-- Empty on every install that has never linked a second device, which is the
+-- whole fleet in the field today and is exactly §5's synthetic one-device
+-- person. `MessageStore::core_relay_ack_ids_with_consumed` reads it to decide
+-- which relay rows are this device's to delete (ACK-MD-1) and which belong to
+-- the person as a whole (ACK-MD-2); an empty table therefore reproduces
+-- today's ack behaviour byte for byte.
+--
+-- No endpoints, by construction as well as by rule (DL-5): a device id is all
+-- there is room for, so restoring a `.cmbak` cannot carry a stale address in
+-- here the way a relay endpoint column would.
+CREATE TABLE IF NOT EXISTS own_device_fleet (
+    device_id BLOB    PRIMARY KEY,
+    ordinal   INTEGER NOT NULL,
+    is_self   INTEGER NOT NULL
+);
+
+-- DL-1's ordering key applied to the projection above: the
+-- `(recovery_epoch, seq)` of the own roster it was taken from. A single row,
+-- pinned by `id = 0`, and deliberately a table of its own rather than a column
+-- on `own_device_fleet` -- an UNLINKED fleet has no device rows to hang it on,
+-- and unlinking at a version is exactly as much a fact worth ordering as
+-- joining a fleet at one.
+--
+-- `MessageStore::set_own_device_fleet` refuses anything at or below what is
+-- stored here, so a restored `.cmbak` cannot resurrect a fleet §10 has since
+-- narrowed. Absent = nothing has ever been written, so the first write wins
+-- whatever version it names.
+CREATE TABLE IF NOT EXISTS own_device_fleet_version (
+    id             INTEGER PRIMARY KEY CHECK (id = 0),
+    recovery_epoch INTEGER NOT NULL,
+    seq            INTEGER NOT NULL
+);
 ";
 
 #[cfg(test)]
@@ -9759,9 +9946,10 @@ mod tests {
     use super::*;
     use crate::{
         core_sign_device_cert, core_sign_roster, create_introduction_ticket,
-        generate_device_keypair, generate_identity, DeviceCert, DeviceTombstone,
-        FriendDirectoryEntry, Group, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_ID_LEN,
-        KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+        generate_device_keypair, generate_identity, DeviceAddOutcome, DeviceCert, DeviceTombstone,
+        FriendDirectoryEntry, Group, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP,
+        DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_GROUP_INVITE, RECEIPT_TYPE_DELIVERED,
+        RECEIPT_TYPE_READ,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -16668,9 +16856,202 @@ mod tests {
             )
         }
 
+        /// A roster holding exactly `devices` devices: the approving one
+        /// [`Self::next`] always prepends, plus freshly linked devices it
+        /// certifies. §14.3 counts the whole roster, not the additions.
+        fn roster_of_size(&self, seq: u64, devices: usize) -> Roster {
+            let linked = (1..devices)
+                .map(|_| {
+                    let device = generate_device_keypair();
+                    self.cert(&device, 0, &self.approving.sign_sk)
+                })
+                .collect();
+            self.next(seq, linked, Vec::new(), 0)
+        }
+
         fn sign(&self, roster: Roster, signer_sk: &[u8]) -> Roster {
             core_sign_roster(roster, signer_sk.to_vec()).unwrap()
         }
+    }
+
+    fn fleet_at(seq: u64, own: Option<&Vec<u8>>, device_ids: &[Vec<u8>]) -> OwnDeviceFleet {
+        OwnDeviceFleet {
+            own_device_id: own.cloned(),
+            device_ids: device_ids.to_vec(),
+            projected_from: crate::RosterVersion {
+                recovery_epoch: 0,
+                seq,
+            },
+        }
+    }
+
+    /// §7/§9: this device's own fleet round-trips, replaces wholesale, and
+    /// reads as §5's synthetic one-device person until something writes it.
+    #[test]
+    fn the_own_device_fleet_round_trips_and_replaces_wholesale() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![0xA1; DEVICE_ID_LEN];
+        let sibling = vec![0xB2; DEVICE_ID_LEN];
+        let successor = vec![0xC3; DEVICE_ID_LEN];
+
+        assert_eq!(store.own_device_fleet().unwrap(), OwnDeviceFleet::default());
+
+        let linked = fleet_at(1, Some(&own), &[own.clone(), sibling.clone()]);
+        store.set_own_device_fleet(linked.clone()).unwrap();
+        assert_eq!(store.own_device_fleet().unwrap(), linked);
+
+        // §10's revocation: the removed sibling must not survive the rewrite,
+        // or this device would keep withholding acks on behalf of a device
+        // that no longer exists.
+        let after_revocation = fleet_at(2, Some(&own), &[own.clone(), successor.clone()]);
+        store
+            .set_own_device_fleet(after_revocation.clone())
+            .unwrap();
+        assert_eq!(store.own_device_fleet().unwrap(), after_revocation);
+
+        // A refused fleet leaves the stored one alone: a half-applied fleet is
+        // worse than the previous one.
+        assert!(store
+            .set_own_device_fleet(fleet_at(3, None, &[sibling]))
+            .is_err());
+        assert_eq!(store.own_device_fleet().unwrap(), after_revocation);
+
+        // Unlinking is a ceremony like any other and needs a version like any
+        // other.
+        store.set_own_device_fleet(fleet_at(4, None, &[])).unwrap();
+        assert_eq!(
+            store.own_device_fleet().unwrap(),
+            fleet_at(4, None, &[]),
+            "an unlinked fleet still remembers what version unlinked it"
+        );
+    }
+
+    /// DL-1's ordering rule, one level down: the fleet projection is monotonic
+    /// in the `(recovery_epoch, seq)` of the roster it came from, so a stale
+    /// projection cannot widen this device's fleet behind its back.
+    #[test]
+    fn the_own_device_fleet_refuses_a_projection_that_does_not_supersede() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let own = vec![0xA1; DEVICE_ID_LEN];
+        let sibling = vec![0xB2; DEVICE_ID_LEN];
+        let wide = vec![own.clone(), sibling.clone()];
+
+        // The first write has no baseline, so it lands at whatever it names.
+        let joined = OwnDeviceFleet {
+            own_device_id: Some(own.clone()),
+            device_ids: wide.clone(),
+            projected_from: crate::RosterVersion {
+                recovery_epoch: 0,
+                seq: 4,
+            },
+        };
+        store.set_own_device_fleet(joined.clone()).unwrap();
+
+        // §10 revokes the sibling at seq 5: strictly higher, so it supersedes.
+        let narrowed = fleet_at(5, Some(&own), std::slice::from_ref(&own));
+        store.set_own_device_fleet(narrowed.clone()).unwrap();
+        assert_eq!(store.own_device_fleet().unwrap(), narrowed);
+
+        // The rollback this rule exists for: restoring a `.cmbak` taken before
+        // the revocation replays the WIDE fleet at its old version. Accepting
+        // it would resurrect the revoked sibling as a device this one keeps
+        // withholding acks for, forever.
+        let err = store.set_own_device_fleet(joined).unwrap_err();
+        assert!(
+            format!("{err}").contains("rollback"),
+            "a restore-shaped replay must be named a rollback, got {err}"
+        );
+        assert_eq!(store.own_device_fleet().unwrap(), narrowed);
+
+        // The same version is an idempotent repeat, refused for the same
+        // reason DL-1 ignores one: it supersedes nothing.
+        let err = store
+            .set_own_device_fleet(fleet_at(5, Some(&own), &wide))
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("idempotent repeat"),
+            "an equal version must be named an idempotent repeat, got {err}"
+        );
+        assert_eq!(store.own_device_fleet().unwrap(), narrowed);
+
+        // A recovery epoch outranks any seq, exactly as DL-1 compares them.
+        let recovered = OwnDeviceFleet {
+            own_device_id: Some(own.clone()),
+            device_ids: wide,
+            projected_from: crate::RosterVersion {
+                recovery_epoch: 1,
+                seq: 0,
+            },
+        };
+        store.set_own_device_fleet(recovered.clone()).unwrap();
+        assert_eq!(store.own_device_fleet().unwrap(), recovered);
+    }
+
+    /// §14.3 through the only roster path this device has: the cap decides
+    /// what lands, and the verdict travels back with the decision — but on
+    /// this path the verdict is deliberately NON-SURFACING (§2 goal 1: a
+    /// person's device count is invisible to other users). A contact crossing
+    /// the soft cap reads as a plain `Added`, so no shell can turn a gossiped
+    /// document into "your sister now has 9 devices"; only the hard-cap
+    /// refusal, which is this device refusing a document rather than a fact
+    /// about the person, comes back distinguishable.
+    #[test]
+    fn a_contacts_roster_carries_a_non_surfacing_device_cap_verdict() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let fixture = RosterFixture::new();
+        store.upsert_contact(fixture.contact()).unwrap();
+        store.apply_contact_roster(fixture.genesis()).unwrap();
+
+        // Every accepted contact document reads the same on this path, on both
+        // sides of the soft cap: the count is not other users' business, so
+        // there is nothing here for a shell to leak.
+        for (seq, devices) in [(1u64, 7usize), (2, 8), (3, 9), (4, 16)] {
+            let roster = fixture.roster_of_size(seq, devices);
+            assert_eq!(roster.devices.len(), devices);
+            let decision = store.apply_contact_roster(roster).unwrap();
+            assert_eq!(
+                decision.outcome,
+                RosterUpdateOutcome::Accepted,
+                "{devices} devices"
+            );
+            assert_eq!(
+                decision.device_count_outcome,
+                DeviceAddOutcome::Added,
+                "{devices} devices must not surface a soft-cap warning"
+            );
+            // The policy itself still knows the difference -- it is the own-add
+            // path (WP3) that will surface it, not this one.
+            assert_eq!(
+                crate::core_device_add_outcome(devices as u32)
+                    == DeviceAddOutcome::AddedWithWarning,
+                devices > DEVICE_SOFT_CAP as usize,
+                "{devices} devices",
+            );
+            assert_eq!(
+                store
+                    .contact_active_device_ids(fixture.root.user_id.clone())
+                    .unwrap()
+                    .len(),
+                devices,
+            );
+        }
+
+        // The 17th is refused, and refusal means the stored roster does not
+        // move: this device keeps the 16 it had.
+        let decision = store
+            .apply_contact_roster(fixture.roster_of_size(5, DEVICE_HARD_CAP as usize + 1))
+            .unwrap();
+        assert_eq!(decision.outcome, RosterUpdateOutcome::Ignored);
+        assert_eq!(decision.reason, RosterUpdateReason::Invalid);
+        assert_eq!(decision.rejection, Some(RosterRejection::DeviceCapExceeded));
+        assert_eq!(decision.device_count_outcome, DeviceAddOutcome::Refused);
+        assert_eq!(
+            store
+                .contact_active_device_ids(fixture.root.user_id.clone())
+                .unwrap()
+                .len(),
+            DEVICE_HARD_CAP as usize,
+        );
     }
 
     #[test]

@@ -93,6 +93,10 @@ const SYNC_RECORD_SIGN_DOMAIN: &[u8] = b"CruiseMesh device sync record v1\0";
 /// from the signature input so the head can never be mistaken for a signature
 /// pre-image.
 const ROSTER_HEAD_HASH_DOMAIN: &[u8] = b"CruiseMesh device roster head v1\0";
+/// Per-device recipient-hint namespaces (§7). Also not a signing domain: it
+/// keeps a device's routing namespace disjoint from every other digest this
+/// file computes over the same ids.
+const DEVICE_HINT_NAMESPACE_DOMAIN: &[u8] = b"CruiseMesh device hint namespace v1\0";
 
 /// Which context string a raw device signature is bound to.
 ///
@@ -188,6 +192,48 @@ pub fn core_device_stream_id(sender_device_id: Option<Vec<u8>>) -> Vec<u8> {
         Some(id) if id.len() == DEVICE_ID_LEN => id,
         _ => LEGACY_DEVICE_ID.to_vec(),
     }
+}
+
+/// The routing namespace one device's relay rows are addressed under (§7):
+/// `BLAKE2b-16(domain || person_id || device_id)`, both inputs length-framed.
+///
+/// Sixteen bytes, because that is exactly the width
+/// [`compute_recipient_hint`](crate::compute_recipient_hint) already consumes —
+/// a device namespace drops into every existing hint path where a `user_id`
+/// goes, and nothing downstream needs to learn a second shape.
+///
+/// Three properties earn the hash rather than a plain concatenation:
+///
+/// * **One-way.** The relay stores `BLAKE2b-8(namespace || day)` and nothing
+///   else. Hashing the person in means a device's daily hints cannot be walked
+///   back to the person they belong to, and two of one person's devices are
+///   not visibly siblings — which a `person_id || device_id` namespace would
+///   have given away to anyone holding either half.
+/// * **Ids only (DL-5).** Both inputs are fixed-width ids. Nothing here has a
+///   field an endpoint fits in, and the derivation forwards no addressing.
+/// * **Unambiguous.** Length framing means no `(person, device)` pair can
+///   collide with another by re-splitting the same bytes.
+///
+/// [`LEGACY_DEVICE_ID`] — and any absent or malformed device id, which §5 maps
+/// to it — returns `person_id` unchanged: the person namespace, which is
+/// today's hint, unchanged for every v1 peer. Paired with the same fallback in
+/// [`device_fanout_msg_id`](crate::device_fanout_msg_id), so a legacy row's id
+/// and the hint it is found under always agree.
+#[uniffi::export]
+pub fn core_device_namespace_id(person_id: Vec<u8>, device_id: Vec<u8>) -> Vec<u8> {
+    if device_id.len() != DEVICE_ID_LEN || device_id[..] == LEGACY_DEVICE_ID[..] {
+        return person_id;
+    }
+    let mut input = DEVICE_HINT_NAMESPACE_DOMAIN.to_vec();
+    push_len_prefixed(&mut input, &person_id);
+    push_len_prefixed(&mut input, &device_id);
+    let mut hasher = Blake2bVar::new(DEVICE_ID_LEN).expect("valid blake2b output length");
+    hasher.update(&input);
+    let mut out = vec![0u8; DEVICE_ID_LEN];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +433,7 @@ pub struct Roster {
 }
 
 /// `(recovery_epoch, seq)` — the DL-1 ordering key, compared lexicographically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, uniffi::Record)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, uniffi::Record)]
 pub struct RosterVersion {
     pub recovery_epoch: u64,
     pub seq: u64,
@@ -569,7 +615,11 @@ fn validate(roster: &Roster, person_root_sign_pk: &[u8]) -> Result<(), RosterRej
     if derive_user_id(person_root_sign_pk).to_vec() != roster.person_id {
         return Err(RosterRejection::PersonMismatch);
     }
-    if roster.devices.len() as u32 > DEVICE_HARD_CAP {
+    // §14.3 through the one function that owns the boundary, so the cap has a
+    // single implementation and the refusal here and the outcome the caller
+    // reads on [`RosterUpdateDecision::device_count_outcome`] can never disagree:
+    // a document holding more devices than the hard cap is the 17th-device add.
+    if core_device_add_outcome(roster.devices.len() as u32) == DeviceAddOutcome::Refused {
         return Err(RosterRejection::DeviceCapExceeded);
     }
 
@@ -770,6 +820,26 @@ pub struct RosterUpdateDecision {
     /// DL-2: once true this stays true. A later, perfectly good roster is not a
     /// resolution — a fork is resolved by a person, never by arithmetic.
     pub quarantined: bool,
+    /// §14.3 applied to the device count the *incoming* document carries —
+    /// named for what it measures (a count) rather than for an add, because
+    /// this decision is about a document that arrived, not about a device this
+    /// user chose to add.
+    ///
+    /// [`DeviceAddOutcome::Refused`] is exactly the
+    /// [`RosterRejection::DeviceCapExceeded`] refusal above — the same
+    /// [`core_device_add_outcome`] call decides both, so they cannot drift.
+    ///
+    /// **[`DeviceAddOutcome::AddedWithWarning`] is not for the contact path.**
+    /// The soft cap is advice to a person about their OWN fleet ("you now have
+    /// 9 or more devices"), and §2 goal 1 says a person's device count is
+    /// invisible to other users — so surfacing it about a *contact* would leak
+    /// exactly what the goal protects, from a document that arrived by gossip.
+    /// [`MessageStore::apply_contact_roster`](crate::MessageStore::apply_contact_roster)
+    /// therefore reports a non-surfacing verdict on that path. The warning
+    /// surface belongs to the own-roster ADD path — §9's linking ceremony,
+    /// which is WP3's — where the count is the user's own business and there is
+    /// a person to tell.
+    pub device_count_outcome: DeviceAddOutcome,
 }
 
 fn decision(
@@ -782,6 +852,20 @@ fn decision(
         reason,
         rejection: None,
         quarantined,
+        // Stamped by [`core_roster_accept`] on the way out: no inner rule
+        // decides §14.3, so no inner path can forget to.
+        device_count_outcome: DeviceAddOutcome::Added,
+    }
+}
+
+fn invalid(rejection: RosterRejection) -> RosterUpdateDecision {
+    RosterUpdateDecision {
+        rejection: Some(rejection),
+        ..decision(
+            RosterUpdateOutcome::Ignored,
+            RosterUpdateReason::Invalid,
+            false,
+        )
     }
 }
 
@@ -799,6 +883,39 @@ pub fn core_roster_accept(
     incoming: Roster,
     person_root_sign_pk: Vec<u8>,
 ) -> RosterUpdateDecision {
+    // §14.3 is stamped once, here, for every path below — including the ones
+    // that never reach [`validate`] — so the cap answer travels with the
+    // verdict rather than being recomputed by each caller from the roster it
+    // may or may not have kept.
+    let device_count_outcome = core_device_add_outcome(incoming.devices.len() as u32);
+    RosterUpdateDecision {
+        device_count_outcome,
+        ..ordering_verdict(stored, stored_quarantined, incoming, person_root_sign_pk)
+    }
+}
+
+/// §2 goal 1 through the contact path: a person's device count is invisible to
+/// other users, so a decision about a document that merely arrived about a
+/// CONTACT never carries the soft-cap warning a shell would surface.
+///
+/// [`DeviceAddOutcome::Refused`] survives untouched. It is not a fact about the
+/// person being disclosed — it is this device refusing a document, and a caller
+/// has to be able to tell a refusal from an acceptance.
+pub(crate) fn non_surfacing_device_count_outcome(outcome: DeviceAddOutcome) -> DeviceAddOutcome {
+    match outcome {
+        DeviceAddOutcome::AddedWithWarning => DeviceAddOutcome::Added,
+        other => other,
+    }
+}
+
+/// Everything [`core_roster_accept`] decides *except* §14.3: DL-1 ordering,
+/// DL-2 quarantine, DL-4 tombstones, and the [`validate`] gate.
+fn ordering_verdict(
+    stored: Option<Roster>,
+    stored_quarantined: bool,
+    incoming: Roster,
+    person_root_sign_pk: Vec<u8>,
+) -> RosterUpdateDecision {
     // DL-2: quarantine is sticky and is checked before anything else, so no
     // amount of later well-formed traffic can lift it.
     if stored_quarantined {
@@ -810,12 +927,7 @@ pub fn core_roster_accept(
     }
 
     if let Err(rejection) = validate(&incoming, &person_root_sign_pk) {
-        return RosterUpdateDecision {
-            outcome: RosterUpdateOutcome::Ignored,
-            reason: RosterUpdateReason::Invalid,
-            rejection: Some(rejection),
-            quarantined: false,
-        };
+        return invalid(rejection);
     }
 
     let Some(stored) = stored else {
@@ -828,12 +940,7 @@ pub fn core_roster_accept(
 
     // A roster for a different person is not an update to this one.
     if stored.person_id != incoming.person_id {
-        return RosterUpdateDecision {
-            outcome: RosterUpdateOutcome::Ignored,
-            reason: RosterUpdateReason::Invalid,
-            rejection: Some(RosterRejection::PersonMismatch),
-            quarantined: false,
-        };
+        return invalid(RosterRejection::PersonMismatch);
     }
 
     match incoming.version().cmp(&stored.version()) {
@@ -939,6 +1046,107 @@ pub fn core_device_add_outcome(resulting_device_count: u32) -> DeviceAddOutcome 
     } else {
         DeviceAddOutcome::Added
     }
+}
+
+// ---------------------------------------------------------------------------
+// This device's own fleet (§7, §9)
+// ---------------------------------------------------------------------------
+
+/// Which devices this person holds, and which one of them is *this* device.
+///
+/// Deliberately not a second copy of the own [`Roster`]: it is the projection
+/// of one that routing and acks read, and nothing more. Two rules need exactly
+/// these two fields and nothing else in the document:
+///
+/// * ACK-MD-1 — "a device acks only rows addressed to its own
+///   `device_fanout_msg_id` namespace" — needs to know which namespace is its
+///   own, which takes `own_device_id`.
+/// * ACK-MD-2 — "a multi-device recipient NEVER acks a legacy person-addressed
+///   row" — needs to know whether there is anyone to leave it for, which takes
+///   the count.
+///
+/// §9's two-phase activation is what writes it: a new device may not
+/// "advertise, author, or ack ANYTHING" until it has imported the bootstrap and
+/// confirmed the roster back to the approving device, and this record is how
+/// the ack planner is told that happened. §10's revocation rewrites it. Until
+/// either ceremony exists (WP3/WP5), every install reads
+/// [`OwnDeviceFleet::default`] — no own device id, no siblings — which is §5's
+/// synthetic one-device person and behaves exactly as today's fleet does.
+///
+/// It rides a `.cmbak` unsanitized, deliberately: restoring a backup is §9's
+/// "Replace this device", and a replacement really is the same device with the
+/// same id and the same siblings. The other restore branch — "Link as new
+/// device" — mints a fresh device key and must therefore overwrite this record
+/// as part of activating, which it does by construction, since activation is
+/// what writes it. WP3 owns that; the note is here so it cannot be missed.
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct OwnDeviceFleet {
+    /// This device's own device id, or `None` on an install that has never
+    /// linked — which is every device in the field today.
+    pub own_device_id: Option<Vec<u8>>,
+    /// Every active device id of this person, this device included, in roster
+    /// order. Revoked devices are absent: DL-4 keeps tombstones in the roster
+    /// document, but a tombstoned device has no rows worth fetching or
+    /// withholding on its behalf.
+    pub device_ids: Vec<Vec<u8>>,
+    /// The `(recovery_epoch, seq)` of the OWN roster this projection was taken
+    /// from — DL-1's ordering key, applied to the projection as well as to the
+    /// document.
+    ///
+    /// [`MessageStore::set_own_device_fleet`](crate::MessageStore::set_own_device_fleet)
+    /// refuses a projection at or below the stored version, for DL-1's reason
+    /// one level down: this record decides which relay rows this device may
+    /// delete and which siblings it must withhold acks for, so a *stale* copy
+    /// of it is not a harmless out-of-date cache. The concrete hazard is a
+    /// backup restore: a `.cmbak` carries this record unsanitized (§9's
+    /// "Replace this device"), and without an ordering key a restore of an old
+    /// backup could resurrect a fleet that has since been narrowed by §10's
+    /// revocation — reinstating a revoked sibling as a device whose mail this
+    /// one keeps politely refusing to ack, forever.
+    ///
+    /// `RosterVersion::default()` — `(0, 0)` — is the genesis version, so the
+    /// FIRST write on an install with nothing stored is always accepted; only a
+    /// second write has a baseline to be judged against.
+    pub projected_from: RosterVersion,
+}
+
+/// The shapes an [`OwnDeviceFleet`] may take, refused rather than normalized.
+///
+/// The refusals matter more than they look: this record is what tells the ack
+/// planner whose rows it may delete, so a fleet that is internally inconsistent
+/// must never be storable. In particular a fleet that names siblings but not
+/// *itself* is refused — a device that cannot say which device it is could not
+/// tell its own rows from a sibling's, and ACK-MD-1 would have nothing to name.
+pub(crate) fn validate_own_device_fleet(fleet: &OwnDeviceFleet) -> Result<(), CoreError> {
+    let invalid = |detail: &str| Err(CoreError::Store(format!("own device fleet {detail}")));
+    for device_id in &fleet.device_ids {
+        if device_id.len() != DEVICE_ID_LEN || device_id[..] == LEGACY_DEVICE_ID[..] {
+            return invalid("lists a device id that is not a real device id");
+        }
+    }
+    let mut unique = fleet.device_ids.clone();
+    unique.sort();
+    unique.dedup();
+    if unique.len() != fleet.device_ids.len() {
+        return invalid("lists the same device twice");
+    }
+    // §14.3 through the one function that owns the boundary, exactly as
+    // [`validate`] applies it to a roster document.
+    if core_device_add_outcome(fleet.device_ids.len() as u32) == DeviceAddOutcome::Refused {
+        return invalid("holds more devices than the hard cap");
+    }
+    match &fleet.own_device_id {
+        Some(own_device_id) => {
+            if !fleet.device_ids.contains(own_device_id) {
+                return invalid("does not list this device among its own devices");
+            }
+        }
+        None if !fleet.device_ids.is_empty() => {
+            return invalid("names siblings without naming which device is this one");
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1248,6 +1456,56 @@ mod tests {
         assert_eq!(
             core_device_stream_id(Some(device.device_id.clone())),
             device.device_id
+        );
+    }
+
+    /// §7: the routing namespace is a wire-visible derivation — two devices
+    /// converge on the same relay row only if they agree on these bytes — so
+    /// it is frozen by a fixed-key vector like every other derivation here.
+    #[test]
+    fn device_namespace_id_golden_vector() {
+        let namespace = core_device_namespace_id(vec![0x01; 16], vec![0x02; 16]);
+        assert_eq!(namespace.len(), DEVICE_ID_LEN);
+        assert_eq!(hex(&namespace), "676f185b83cefc5c8e5af09ea06d430e");
+    }
+
+    #[test]
+    fn device_namespaces_are_distinct_per_device_and_per_person() {
+        let alice = person_id();
+        let a = generate_device_keypair();
+        let b = generate_device_keypair();
+        assert_ne!(
+            core_device_namespace_id(alice.clone(), a.device_id.clone()),
+            core_device_namespace_id(alice.clone(), b.device_id.clone()),
+        );
+        // The same physical device id under a different person is a different
+        // namespace: a namespace names a (person, device) pair, not a device.
+        assert_ne!(
+            core_device_namespace_id(alice.clone(), a.device_id.clone()),
+            core_device_namespace_id(vec![0x09; 16], a.device_id.clone()),
+        );
+        // DL-5 / endpoint privacy: the namespace is one-way, so neither half
+        // of the pair it was derived from can be read back out of it.
+        let namespace = core_device_namespace_id(alice.clone(), a.device_id.clone());
+        assert!(!namespace
+            .windows(4)
+            .any(|w| alice.starts_with(w) || a.device_id.starts_with(w)));
+    }
+
+    #[test]
+    fn a_legacy_device_id_addresses_the_person_namespace() {
+        // §5 / ACK-MD-2: legacy and malformed device fields resolve to the
+        // person namespace, which is exactly today's hint input, so a v1
+        // sender's single person-addressed row stays findable unchanged.
+        let alice = person_id();
+        assert_eq!(
+            core_device_namespace_id(alice.clone(), LEGACY_DEVICE_ID.to_vec()),
+            alice,
+        );
+        assert_eq!(core_device_namespace_id(alice.clone(), Vec::new()), alice);
+        assert_eq!(
+            core_device_namespace_id(alice.clone(), vec![0x02; 8]),
+            alice,
         );
     }
 
@@ -2115,6 +2373,62 @@ mod tests {
         assert_eq!(core_device_add_outcome(17), DeviceAddOutcome::Refused);
         assert_eq!(DEVICE_SOFT_CAP, 8);
         assert_eq!(DEVICE_HARD_CAP, 16);
+    }
+
+    /// §7/§9: the fleet projection is what tells the ack planner whose relay
+    /// rows this device may delete, so every shape that could make that
+    /// question unanswerable is refused rather than normalized.
+    #[test]
+    fn an_inconsistent_own_fleet_is_refused() {
+        let own = vec![0xA1; DEVICE_ID_LEN];
+        let sibling = vec![0xB2; DEVICE_ID_LEN];
+        let fleet = |own_device_id: Option<Vec<u8>>, device_ids: Vec<Vec<u8>>| OwnDeviceFleet {
+            projected_from: RosterVersion::default(),
+            own_device_id,
+            device_ids,
+        };
+
+        // The install every device in the field is: no fleet at all.
+        assert!(validate_own_device_fleet(&OwnDeviceFleet::default()).is_ok());
+        assert!(validate_own_device_fleet(&fleet(
+            Some(own.clone()),
+            vec![own.clone(), sibling.clone()]
+        ))
+        .is_ok());
+
+        // A device that cannot say which device it is could not tell its own
+        // rows from a sibling's.
+        assert!(validate_own_device_fleet(&fleet(None, vec![own.clone()])).is_err());
+        // Nor one that is not in its own fleet.
+        assert!(
+            validate_own_device_fleet(&fleet(Some(own.clone()), vec![sibling.clone()])).is_err()
+        );
+        // The legacy id is a stream marker, never a device that holds rows.
+        assert!(validate_own_device_fleet(
+            &fleet(
+                Some(LEGACY_DEVICE_ID.to_vec()),
+                vec![LEGACY_DEVICE_ID.to_vec()]
+            )
+            .clone()
+        )
+        .is_err());
+        assert!(validate_own_device_fleet(&fleet(
+            Some(own.clone()),
+            vec![own.clone(), own.clone()]
+        ))
+        .is_err());
+        assert!(
+            validate_own_device_fleet(&fleet(Some(vec![0xA1; 8]), vec![vec![0xA1; 8]])).is_err()
+        );
+
+        // §14.3's hard cap, through the same function the roster uses.
+        let capped: Vec<Vec<u8>> = (0..DEVICE_HARD_CAP)
+            .map(|i| vec![i as u8 + 1; DEVICE_ID_LEN])
+            .collect();
+        assert!(validate_own_device_fleet(&fleet(Some(capped[0].clone()), capped.clone())).is_ok());
+        let mut over_cap = capped.clone();
+        over_cap.push(vec![0xFF; DEVICE_ID_LEN]);
+        assert!(validate_own_device_fleet(&fleet(Some(capped[0].clone()), over_cap)).is_err());
     }
 
     #[test]

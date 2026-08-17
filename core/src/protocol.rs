@@ -1551,6 +1551,53 @@ pub fn fanout_msg_id(original_msg_id: Vec<u8>, member_user_id: Vec<u8>) -> Vec<u
     out
 }
 
+/// Deterministic per-device relay-post id for multi-device fan-out
+/// (`specs/multi-device-v1.md` §7): `BLAKE2b-16(prologue || original_msg_id ||
+/// device_id)`, where `prologue` is the fixed ASCII string
+/// `"cruisemesh device fanout v1"`.
+///
+/// Same construction discipline as [`fanout_msg_id`], and for the same two
+/// reasons one level down:
+///
+/// - **Distinct per device**: every recipient device gets its own relay row id
+///   for the same logical message, so each row has exactly one true consumer
+///   and ACK-MD-1 ("a device acks only rows in its own
+///   `device_fanout_msg_id` namespace, and only on CONSUMED") has something
+///   concrete to name.
+/// - **Deterministic across calls**: a retried upload, or a sibling muling the
+///   same envelope, re-derives the identical ids and the relay's existing
+///   `ON CONFLICT` dedupe on `msg_id` absorbs the repeat with no server change.
+///
+/// The prologue differs from the group one deliberately and is not decoration:
+/// a `device_id` and a `member_user_id` are both 16 bytes drawn from the same
+/// derivation, so the domain separator is the *only* thing keeping the two id
+/// spaces disjoint.
+///
+/// [`LEGACY_DEVICE_ID`](crate::LEGACY_DEVICE_ID) — and any absent or malformed
+/// device id, which §5 maps to it — returns `original_msg_id` unchanged: the
+/// single person-addressed row a v1 sender uploads today, byte for byte. That
+/// fallback is paired with the one in
+/// [`core_device_namespace_id`](crate::core_device_namespace_id), so the id a
+/// legacy row is keyed by and the hint it is found under fall back together
+/// and a mixed fleet can never mint half a legacy row. Refusing to *ack* such
+/// a row is ACK-MD-2's job, not this function's.
+#[uniffi::export]
+pub fn device_fanout_msg_id(original_msg_id: Vec<u8>, device_id: Vec<u8>) -> Vec<u8> {
+    const DEVICE_FANOUT_PROLOGUE: &[u8] = b"cruisemesh device fanout v1";
+    if device_id.len() != crate::DEVICE_ID_LEN || device_id[..] == crate::LEGACY_DEVICE_ID[..] {
+        return original_msg_id;
+    }
+    let mut hasher = Blake2bVar::new(MSG_ID_LEN).expect("valid blake2b output length");
+    hasher.update(DEVICE_FANOUT_PROLOGUE);
+    hasher.update(&original_msg_id);
+    hasher.update(&device_id);
+    let mut out = vec![0u8; MSG_ID_LEN];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    out
+}
+
 /// `expiry` for a freshly authored envelope's §6.4 header:
 /// `timestamp_ms + DEFAULT_EXPIRY_MS` (7 days, DESIGN.md §5.3), saturating
 /// rather than overflowing for pathological inputs.
@@ -3041,6 +3088,82 @@ mod tests {
         let a = fanout_msg_id(vec![0x01; 16], member.clone());
         let b = fanout_msg_id(vec![0x02; 16], member);
         assert_ne!(a, b);
+    }
+
+    // -- device_fanout_msg_id (specs/multi-device-v1.md §7) -----------------
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Golden vector over fixed bytes: this id space is a wire format. Two
+    /// devices of a mixed fleet only converge on the same relay row if they
+    /// derive the same 16 bytes from the same pair, so the derivation is
+    /// frozen here rather than left to whatever the current implementation
+    /// happens to produce.
+    #[test]
+    fn device_fanout_msg_id_golden_vector() {
+        let id = device_fanout_msg_id(vec![0x11; 16], vec![0x22; 16]);
+        assert_eq!(hex(&id), "cd7061816a7028164af5f089a30d82b7");
+    }
+
+    #[test]
+    fn device_fanout_msg_id_is_deterministic_and_16_bytes() {
+        let original = vec![0x11; 16];
+        let device = vec![0x22; 16];
+        let a = device_fanout_msg_id(original.clone(), device.clone());
+        let b = device_fanout_msg_id(original, device);
+        assert_eq!(a, b);
+        assert_eq!(a.len(), MSG_ID_LEN);
+    }
+
+    #[test]
+    fn device_fanout_msg_id_differs_across_devices_for_the_same_message() {
+        let original = vec![0x11; 16];
+        let a = device_fanout_msg_id(original.clone(), vec![0x01; 16]);
+        let b = device_fanout_msg_id(original, vec![0x02; 16]);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn device_fanout_msg_id_differs_across_original_messages_for_the_same_device() {
+        let device = vec![0x22; 16];
+        let a = device_fanout_msg_id(vec![0x01; 16], device.clone());
+        let b = device_fanout_msg_id(vec![0x02; 16], device);
+        assert_ne!(a, b);
+    }
+
+    /// The prologue is the only separator between the two 16-byte id spaces:
+    /// a device id and a member user id are indistinguishable as bytes, so
+    /// this is what stops a group row and a device row from colliding.
+    #[test]
+    fn device_fanout_msg_id_is_disjoint_from_the_group_fanout_space() {
+        let original = vec![0x11; 16];
+        let id = vec![0x22; 16];
+        assert_ne!(
+            device_fanout_msg_id(original.clone(), id.clone()),
+            fanout_msg_id(original, id),
+        );
+    }
+
+    /// §5 / ACK-MD-2: a legacy device id (and the absent-or-malformed field
+    /// that maps to it) leaves the row exactly as a v1 sender uploads it
+    /// today, so legacy peers stay indistinguishable from today's behaviour.
+    #[test]
+    fn device_fanout_msg_id_leaves_a_legacy_row_alone() {
+        let original = vec![0x11; 16];
+        assert_eq!(
+            device_fanout_msg_id(original.clone(), crate::LEGACY_DEVICE_ID.to_vec()),
+            original,
+        );
+        assert_eq!(
+            device_fanout_msg_id(original.clone(), Vec::new()),
+            original.clone(),
+        );
+        assert_eq!(
+            device_fanout_msg_id(original.clone(), vec![0x22; 8]),
+            original
+        );
     }
 
     #[test]

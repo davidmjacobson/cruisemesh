@@ -30,13 +30,15 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cruisemesh_core::{
-    compute_recipient_hint, core_group_fanout_rows, core_own_capabilities, default_expiry,
-    encode_envelope_frame, generate_identity, generate_msg_id, parse_frame, seal_group_message,
-    seal_message, CarriedEnvelope, CoreCarriedOfferGate, CoreGroupFanoutRow,
-    CoreInboundDisposition, CoreInboundSource, CoreMeetOutcome, CoreMeetRequest,
-    CoreMeshRouterState, CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreSprayTrigger,
-    CoreTransport, Frame, Group, Identity, MessageStore, SeenIds, StoredMessage, DEFAULT_HOP_TTL,
-    KIND_TEXT,
+    compute_recipient_hint, core_group_fanout_rows, core_own_capabilities, core_sign_device_cert,
+    core_sign_roster, dedupe_hints, default_expiry, device_fanout_msg_id, encode_envelope_frame,
+    generate_device_keypair, generate_identity, generate_msg_id, parse_frame, seal_group_message,
+    seal_message, CarriedEnvelope, Contact, CoreCarriedOfferGate, CoreInboundDisposition,
+    CoreInboundSource, CoreMeetOutcome, CoreMeetRequest, CoreMeshRouterState,
+    CoreRelayEnvelopeDisposition, CoreSprayPolicy, CoreSprayTrigger, CoreTransport, DeviceCert,
+    DeviceKeypair, Frame, Group, Identity, MessageStore, OutboundEnvelope, OwnDeviceFleet, Roster,
+    RosterUpdateOutcome, RosterVersion, SeenIds, StoredMessage, DEFAULT_HOP_TTL,
+    DEVICE_CERT_FLAG_ROSTER_SIGNING, KIND_TEXT,
 };
 
 const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
@@ -249,6 +251,168 @@ fn recent_hints(user_id: &[u8], now: i64) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// The hints one node fetches under: the person's, plus
+/// (`specs/multi-device-v1.md` §7) THIS device's own namespace and no
+/// sibling's — a device fetches the rows it is the sole true consumer of, and
+/// the content of a sibling's rows converges by §8 self-sync (WP4) rather than
+/// by every device downloading every other device's mail.
+///
+/// A node that has never linked has no fleet, so this is exactly
+/// [`recent_hints`] over the person, and every single-device scenario below
+/// fetches precisely what it fetched before §7 existed.
+///
+/// The production builder, not a mirror of it: what a phone subscribes to is
+/// the thing these gates are about, so a divergence between core's fetch set
+/// and the sim's would hide exactly the bug they exist to catch.
+fn fetch_hints(node: &SimNode, now: i64) -> Vec<Vec<u8>> {
+    dedupe_hints(
+        node.store
+            .relay_self_hints(node.user_id(), now)
+            .expect("relay fetch hints"),
+    )
+}
+
+/// `count` nodes that are devices of ONE person: one identity, therefore one
+/// `user_id` and one set of person keys, with real per-device keypairs and
+/// each store told which device it is — the state §9's two-phase activation
+/// leaves behind.
+///
+/// The shared identity is not a shortcut. §6 makes the inbox key
+/// person-scoped, so in v1 every device of a person genuinely can open every
+/// sibling's mail; a fixture that gave each device its own key would make
+/// ACK-MD-1's namespace refusal untestable by hiding it behind a decryption
+/// failure that v1 does not have.
+///
+/// The device keypairs are real because a sender only learns this fleet by
+/// verifying its roster ([`teach_roster`]), and a roster of invented ids would
+/// not survive DL-1's chain check.
+fn linked_devices(count: usize) -> (Vec<SimNode>, Vec<DeviceKeypair>) {
+    let identity = generate_identity();
+    let devices: Vec<DeviceKeypair> = (0..count).map(|_| generate_device_keypair()).collect();
+    let device_ids: Vec<Vec<u8>> = devices.iter().map(|d| d.device_id.clone()).collect();
+    let nodes = device_ids
+        .iter()
+        .map(|device_id| {
+            let mut node = SimNode::new();
+            node.identity = identity.clone();
+            node.router.set_local_user_id(identity.user_id.clone());
+            node.store
+                .set_own_device_fleet(OwnDeviceFleet {
+                    own_device_id: Some(device_id.clone()),
+                    device_ids: device_ids.clone(),
+                    // The version of the roster `teach_roster` publishes, so
+                    // the projection and the document agree about where in
+                    // DL-1's ordering this fleet came from.
+                    projected_from: RosterVersion {
+                        recovery_epoch: 0,
+                        seq: 1,
+                    },
+                })
+                .expect("activate this device into its fleet");
+            node
+        })
+        .collect();
+    (nodes, devices)
+}
+
+/// Teach `sender` who `person` is and which devices they hold, the only way
+/// v1 allows: a contact row whose `sign_pk` is the person root (§3), then a
+/// person-root-signed genesis roster through the shipped
+/// `apply_contact_roster`. Nothing here writes the device table directly — if
+/// a DL rule would reject the document, this fixture fails.
+fn teach_roster(sender: &SimNode, person: &Identity, devices: &[DeviceKeypair]) {
+    sender
+        .store
+        .upsert_contact(Contact {
+            user_id: person.user_id.clone(),
+            name: "Linked person".to_string(),
+            sign_pk: person.sign_pk.clone(),
+            agree_pk: person.agree_pk.clone(),
+            relay_url: None,
+            relay_token: None,
+            nickname: None,
+        })
+        .expect("the person is a contact");
+    let certs = devices
+        .iter()
+        .enumerate()
+        .map(|(index, device)| {
+            core_sign_device_cert(
+                DeviceCert {
+                    person_id: person.user_id.clone(),
+                    device_sign_pk: device.sign_pk.clone(),
+                    device_agree_pk: device.agree_pk.clone(),
+                    added_epoch: 0,
+                    flags: if index == 0 {
+                        DEVICE_CERT_FLAG_ROSTER_SIGNING
+                    } else {
+                        0
+                    },
+                    signer_sign_pk: Vec::new(),
+                    signature: Vec::new(),
+                },
+                person.sign_sk.clone(),
+            )
+            .expect("device certificate signs")
+        })
+        .collect();
+    let roster = core_sign_roster(
+        Roster {
+            person_id: person.user_id.clone(),
+            recovery_epoch: 0,
+            seq: 0,
+            devices: certs,
+            tombstones: Vec::new(),
+            approving_device_id: devices[0].device_id.clone(),
+            inbox_key_generation: 0,
+            signer_sign_pk: Vec::new(),
+            signature: Vec::new(),
+        },
+        person.sign_sk.clone(),
+    )
+    .expect("roster signs");
+    assert_eq!(
+        sender
+            .store
+            .apply_contact_roster(roster)
+            .expect("apply roster")
+            .outcome,
+        RosterUpdateOutcome::Accepted,
+        "the fixture roster must actually land"
+    );
+}
+
+/// Seal `payload` from `from` to the person `to` — the only sealing v1 has for
+/// 1:1 mail, and what every row of a per-device fan-out carries.
+fn seal_to_person(from: &SimNode, to: &SimNode, payload: &[u8]) -> Vec<u8> {
+    seal_message(
+        from.identity.clone(),
+        to.identity.agree_pk.clone(),
+        payload.to_vec(),
+    )
+    .expect("seal")
+}
+
+/// The queued 1:1 envelope a send leaves behind, as
+/// `MessageStore::core_outbound_relay_rows` receives it. Composed here rather
+/// than read out of the outbound queue because these gates are about what the
+/// fan-out does with an envelope, not about how it got queued.
+fn outbound_envelope(from: &SimNode, to: &SimNode, sealed: Vec<u8>, now: i64) -> OutboundEnvelope {
+    OutboundEnvelope {
+        msg_id: generate_msg_id(),
+        recipient_user_id: to.user_id(),
+        chat_id: to.user_id(),
+        sender_user_id: from.user_id(),
+        kind: KIND_TEXT,
+        lamport: 1,
+        timestamp: now,
+        hop_ttl: DEFAULT_HOP_TTL,
+        expiry: default_expiry(now),
+        recipient_hint: compute_recipient_hint(to.user_id(), now),
+        sealed,
+    }
+}
+
 /// One server mailbox row. The relay is intentionally content-blind: it
 /// stores the public envelope header plus sealed bytes and routes only by
 /// recipient hint.
@@ -260,19 +424,6 @@ struct RelayEnvelope {
     expiry: i64,
     recipient_hint: Vec<u8>,
     sealed: Vec<u8>,
-}
-
-impl RelayEnvelope {
-    fn from_fanout_row(id: i64, row: CoreGroupFanoutRow) -> Self {
-        Self {
-            id,
-            msg_id: row.msg_id,
-            hop_ttl: row.hop_ttl,
-            expiry: row.expiry,
-            recipient_hint: row.recipient_hint,
-            sealed: row.sealed,
-        }
-    }
 }
 
 /// Minimal in-memory relay actor for client-side integration coverage. It
@@ -309,21 +460,79 @@ impl RelayActor {
             sealed,
             authored_at,
         ) {
-            if self
-                .rows
-                .iter()
-                .any(|existing| existing.msg_id == row.msg_id)
-            {
-                continue;
-            }
-            let id = self.next_id;
-            self.next_id += 1;
-            self.rows.push(RelayEnvelope::from_fanout_row(id, row));
+            self.post_row(
+                row.msg_id,
+                row.recipient_hint,
+                row.hop_ttl,
+                row.expiry,
+                row.sealed,
+            );
         }
     }
 
+    /// Upload one queued 1:1 envelope exactly as a shell would
+    /// (`specs/multi-device-v1.md` §7): whatever
+    /// `MessageStore::core_outbound_relay_rows` plans for it, posted row for
+    /// row, with the same `msg_id` dedupe [`Self::post_group`] gets.
+    ///
+    /// The sender decides the shape, not the sim: a sender that knows a
+    /// multi-device roster plans per-device rows, and one that does not plans
+    /// the single person-addressed row it always planned. Nothing here can
+    /// address a row the production planner would not have.
+    fn post_outbound(&mut self, sender: &SimNode, envelope: OutboundEnvelope) {
+        for row in sender
+            .store
+            .core_outbound_relay_rows(envelope, sender.user_id(), None)
+            .expect("plan the outbound relay rows")
+        {
+            self.post_row(
+                row.msg_id,
+                row.recipient_hint,
+                row.hop_ttl,
+                row.expiry,
+                row.sealed,
+            );
+        }
+    }
+
+    fn post_row(
+        &mut self,
+        msg_id: Vec<u8>,
+        recipient_hint: Vec<u8>,
+        hop_ttl: u8,
+        expiry: i64,
+        sealed: Vec<u8>,
+    ) {
+        if self.rows.iter().any(|existing| existing.msg_id == msg_id) {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.rows.push(RelayEnvelope {
+            id,
+            msg_id,
+            hop_ttl,
+            expiry,
+            recipient_hint,
+            sealed,
+        });
+    }
+
+    fn holds(&self, msg_id: &[u8]) -> bool {
+        self.rows.iter().any(|row| row.msg_id == msg_id)
+    }
+
+    /// The stored sealed bytes of one row, for gates that need "still there,
+    /// unchanged" rather than only "still there".
+    fn sealed_of(&self, msg_id: &[u8]) -> Option<Vec<u8>> {
+        self.rows
+            .iter()
+            .find(|row| row.msg_id == msg_id)
+            .map(|row| row.sealed.clone())
+    }
+
     fn poll(&mut self, node: &mut SimNode, now: i64) -> Vec<CoreInboundDisposition> {
-        let fetch_hints = recent_hints(&node.user_id(), now);
+        let fetch_hints = fetch_hints(node, now);
         let fetched: Vec<RelayEnvelope> = self
             .rows
             .iter()
@@ -894,6 +1103,280 @@ fn group_relay_fanout_opens_on_every_member_and_each_copy_is_acked() {
         relay.pending_len(),
         0,
         "each per-member row is removed only after its member consumes it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-device relay gates (`specs/multi-device-v1.md` §13, WP2).
+//
+// All three run the same production ack planner every shell calls,
+// `MessageStore::core_relay_ack_ids_with_consumed`, through `RelayActor::poll`.
+// Nothing here decides an ack; the sim only says who fetched what.
+// ---------------------------------------------------------------------------
+
+/// WP2 gate 1: "two-device recipient over relay — first fetcher must not
+/// starve the sibling."
+///
+/// End to end through both production planners: the sender learns the
+/// recipient's roster, `core_outbound_relay_rows` decides the fan-out, and
+/// `core_relay_ack_ids_with_consumed` decides every deletion.
+///
+/// Each device subscribes to its OWN namespace only, so each fetches, opens,
+/// delivers and deletes exactly one row — and the counts below are exact for
+/// that reason: a device that delivered the same logical message twice would be
+/// a device paying twice for it, which is precisely the duplicate-delivery
+/// failure the own-namespace-only rule exists to prevent.
+///
+/// The sibling's row is therefore never touched by the first device — not
+/// fetched, not opened, not acked — and is still there, byte for byte, on the
+/// day the sibling comes online and finds it under its own namespace.
+#[test]
+fn a_two_device_recipient_over_relay_does_not_starve_the_sibling() {
+    let sender = SimNode::new();
+    let (mut devices, fleet) = linked_devices(2);
+    teach_roster(&sender, &devices[0].identity.clone(), &fleet);
+    let mut relay = RelayActor::new();
+    let msg = b"the tender leaves from deck 3 at nine";
+
+    let envelope = outbound_envelope(
+        &sender,
+        &devices[0],
+        seal_to_person(&sender, &devices[0], msg),
+        BASE_NOW,
+    );
+    let original_msg_id = envelope.msg_id.clone();
+    relay.post_outbound(&sender, envelope);
+    assert_eq!(
+        relay.pending_len(),
+        2,
+        "one independently ackable row per recipient device"
+    );
+
+    let first_row = device_fanout_msg_id(original_msg_id.clone(), fleet[0].device_id.clone());
+    let sibling_row = device_fanout_msg_id(original_msg_id.clone(), fleet[1].device_id.clone());
+    assert!(
+        !relay.holds(&original_msg_id),
+        "ACK-MD-2: no bare person row is uploaded beside the per-device rows"
+    );
+
+    let sibling_bytes = relay.sealed_of(&sibling_row).expect("the sibling's row");
+
+    assert_eq!(
+        relay.poll(&mut devices[0], BASE_NOW),
+        vec![CoreInboundDisposition::Consumed],
+        "the first device fetches exactly the one row addressed to its own \
+         namespace -- a sibling's row is the sibling's to fetch"
+    );
+    assert_eq!(
+        devices[0]
+            .inbox
+            .iter()
+            .filter(|payload| *payload == msg)
+            .count(),
+        1,
+        "the first device delivers the message exactly once"
+    );
+    assert!(!relay.holds(&first_row), "it acks its own namespace's row");
+    assert!(
+        relay.holds(&sibling_row),
+        "ACK-MD-1: the sibling's row is not this device's to delete"
+    );
+    assert_eq!(
+        relay.sealed_of(&sibling_row).as_deref(),
+        Some(sibling_bytes.as_slice()),
+        "and it survives untouched, not merely undeleted"
+    );
+
+    // A day later, on a different network, the sibling finds its mail under
+    // its OWN namespace -- the id nobody else subscribes to.
+    assert_eq!(
+        relay.poll(&mut devices[1], BASE_NOW + MS_PER_DAY),
+        vec![CoreInboundDisposition::Consumed],
+        "the sibling fetches its own row, under its own namespace"
+    );
+    assert_eq!(
+        devices[1]
+            .inbox
+            .iter()
+            .filter(|payload| *payload == msg)
+            .count(),
+        1,
+        "the second device is not starved by the first, and delivers once"
+    );
+    assert_eq!(
+        relay.pending_len(),
+        0,
+        "each row is deleted by exactly the device it was addressed to"
+    );
+}
+
+/// WP2 gate 2: "legacy person-addressed row never acked by a multi-device
+/// fleet" (ACK-MD-2). A legacy sender uploads one row for the whole person; no
+/// device may delete it, and the control at the end shows the withholding is
+/// about the fleet and not about the planner having stopped acking.
+///
+/// The legacy sender is modelled as a sender that never learned the
+/// recipient's roster, which is what `core_outbound_relay_rows` turns into the
+/// single person-addressed row — the same bytes a build with no §7 in it at
+/// all would upload, since that row is copied from the envelope rather than
+/// recomputed. It is also what every sender in the field is today.
+#[test]
+fn a_legacy_person_addressed_row_is_never_acked_by_a_multi_device_fleet() {
+    let sender = SimNode::new();
+    let (mut devices, _fleet) = linked_devices(2);
+    let mut relay = RelayActor::new();
+    let msg = b"granddad is on the pier already";
+
+    let envelope = outbound_envelope(
+        &sender,
+        &devices[0],
+        seal_to_person(&sender, &devices[0], msg),
+        BASE_NOW,
+    );
+    let person_row = envelope.msg_id.clone();
+    relay.post_outbound(&sender, envelope);
+    assert!(
+        relay.holds(&person_row),
+        "an unrostered recipient is uploaded as the one row it always was"
+    );
+
+    for (index, now) in [(0_usize, BASE_NOW), (1, BASE_NOW + MS_PER_DAY)] {
+        relay.poll(&mut devices[index], now);
+        assert_eq!(
+            devices[index]
+                .inbox
+                .iter()
+                .filter(|payload| *payload == msg)
+                .count(),
+            1,
+            "every device of the person receives the legacy row, exactly once"
+        );
+        assert_eq!(
+            relay.pending_len(),
+            1,
+            "ACK-MD-2: the person's one shared row survives device {index}'s \
+             consumption; it ages out on the relay's own clock instead"
+        );
+    }
+
+    // Control: the identical row addressed to a person with ONE device is
+    // still deleted by that device. Legacy fleets see exactly today's
+    // behaviour.
+    let mut solo = SimNode::new();
+    let solo_envelope = outbound_envelope(
+        &sender,
+        &solo,
+        seal_to_person(&sender, &solo, msg),
+        BASE_NOW,
+    );
+    relay.post_outbound(&sender, solo_envelope);
+    relay.poll(&mut solo, BASE_NOW);
+    assert_eq!(
+        relay.pending_len(),
+        1,
+        "a single-device recipient is the sole true consumer and still acks"
+    );
+}
+
+/// WP2 gate 3: BLE-only-day convergence — **SIM STUB until WP4**.
+///
+/// The gate §13 asks for is "a BLE-only day converges via §8 once WP4 lands",
+/// and §8's self-sync does not exist yet: there is no record kind, no digest
+/// anti-entropy, nothing for a sibling to learn from. So this test deliberately
+/// does NOT assert convergence. It pins the two things that are true today:
+/// the BLE copy reaches only the device that met the sender, and — the half
+/// WP2 does own — that device's BLE consumption still does not let it delete
+/// the relay copy its sibling is going to need.
+///
+/// When WP4 lands, replace the "sibling has nothing" assertion with a real
+/// convergence assertion after a self-sync round. WP0 vector
+/// `MD-SYNC-BLE-DAY-CONVERGE` (`core/tests/multi_device_contract.rs`) carries
+/// the target outcome in the pinned ledger, so WP4 cannot land the mechanism
+/// without a deliberate edit to both this test and that vector's
+/// `implemented` flag. Until then, this is the honest shape of the gate.
+#[test]
+fn a_ble_only_day_reaches_one_device_only_until_wp4_self_sync_lands() {
+    let sender = SimNode::new();
+    let (mut devices, fleet) = linked_devices(2);
+    teach_roster(&sender, &devices[0].identity.clone(), &fleet);
+    let person_id = devices[0].user_id();
+    let msg = b"we docked early, walk down when you can";
+
+    // ONE authored message, fanned out once, from which BOTH legs are built.
+    // The BLE frame carries the same `msg_id` and the same sealed bytes as the
+    // row the relay is holding for this device — a mule that met the sender
+    // hands over the copy addressed to whoever it meets — so the relay copy
+    // genuinely duplicates the BLE copy. Two separately authored envelopes
+    // would carry two different ids and dedupe against nothing, which is a
+    // weaker claim wearing this one's clothes.
+    let mut relay = RelayActor::new();
+    let envelope = outbound_envelope(
+        &sender,
+        &devices[0],
+        seal_to_person(&sender, &devices[0], msg),
+        BASE_NOW,
+    );
+    let original_msg_id = envelope.msg_id.clone();
+    let hop_ttl = envelope.hop_ttl;
+    let expiry = envelope.expiry;
+    relay.post_outbound(&sender, envelope);
+
+    let own_row = device_fanout_msg_id(original_msg_id.clone(), fleet[0].device_id.clone());
+    let sibling_row = device_fanout_msg_id(original_msg_id.clone(), fleet[1].device_id.clone());
+    let own_bytes = relay.sealed_of(&own_row).expect("this device's row");
+    let sibling_bytes = relay.sealed_of(&sibling_row).expect("the sibling's row");
+
+    // The BLE leg: that copy, delivered to whichever device happened to be in
+    // radio range (§6 — constrained paths carry one copy).
+    let frame = encode_envelope_frame(
+        own_row.clone(),
+        hop_ttl,
+        expiry,
+        compute_recipient_hint(person_id.clone(), BASE_NOW),
+        own_bytes,
+    );
+    devices[0].receive(&frame, BASE_NOW);
+    assert_eq!(
+        devices[0]
+            .inbox
+            .iter()
+            .filter(|payload| *payload == msg)
+            .count(),
+        1,
+        "the device in radio range delivers it once"
+    );
+    assert!(
+        devices[1].inbox.is_empty(),
+        "STUB (WP4): the sibling converges through §8 self-sync, which does \
+         not exist yet -- nothing in WP2 pretends otherwise"
+    );
+
+    // Explicitly Seen, not merely "not Consumed": the row this device fetches
+    // carries the id it already handled over BLE, so it dedupes — and it is
+    // against exactly that disposition, with store evidence saying "we have
+    // this one", that ACK-MD-1 has to hold the line for the sibling.
+    assert_eq!(
+        relay.poll(&mut devices[0], BASE_NOW),
+        vec![CoreInboundDisposition::Seen],
+        "the relay copy is the same envelope the BLE frame already delivered"
+    );
+    assert_eq!(
+        devices[0]
+            .inbox
+            .iter()
+            .filter(|payload| *payload == msg)
+            .count(),
+        1,
+        "and it is not delivered a second time"
+    );
+    assert!(
+        relay.holds(&sibling_row),
+        "the sibling's relay copy is still there for the day it comes online"
+    );
+    assert_eq!(
+        relay.sealed_of(&sibling_row).as_deref(),
+        Some(sibling_bytes.as_slice()),
+        "untouched, not merely undeleted"
     );
 }
 

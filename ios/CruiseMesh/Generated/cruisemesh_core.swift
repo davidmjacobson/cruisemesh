@@ -3847,6 +3847,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * A roster for someone who is not a contact is ignored rather than
      * refused: rosters gossip as ordinary sealed traffic (DL-3), and a
      * document about a stranger is simply not this device's business.
+     *
+     * **The §14.3 verdict this returns is deliberately non-surfacing** (§2
+     * goal 1: a person's device count is invisible to other users). The
+     * hard-cap [`DeviceAddOutcome::Refused`] stays — that is this device
+     * refusing a document, and a caller must be able to see it — but the
+     * soft-cap warning is stripped, because a shell that showed "this contact
+     * now has 9 devices" would disclose from gossip exactly what the goal
+     * protects. The warning belongs to the OWN-roster add path (§9's linking
+     * ceremony, WP3), where the count is the user's own.
      */
     func applyContactRoster(incoming: Roster) throws  -> RosterUpdateDecision
     
@@ -4475,6 +4484,86 @@ public protocol MessageStoreProtocol : AnyObject {
     func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?) throws  -> CoreDigestSprayPlan
     
     /**
+     * The relay rows one queued 1:1 envelope should be uploaded as
+     * (`specs/multi-device-v1.md` §7) — the outbound half of the same rule
+     * [`Self::core_relay_ack_ids_with_consumed`] enforces on the way back in.
+     *
+     * Exactly one of two shapes, decided by what this device knows about the
+     * recipient's roster:
+     *
+     * - **A person with fewer than two known devices — today's row, byte for
+     * byte.** One row carrying the envelope's own `msg_id` and its own
+     * stored `recipient_hint`; nothing is recomputed, so a legacy contact
+     * (and a contact whose roster simply has not reached us) receives an
+     * upload indistinguishable from the one this code posted before §7
+     * existed. This covers the entire fleet in the field.
+     * - **A person with two or more roster-known devices — one row per
+     * device.** Each carries [`crate::device_fanout_msg_id`] of
+     * `(envelope.msg_id, device_id)` and that device's own daily hint, so
+     * each row has exactly one true consumer and ACK-MD-1 can let that
+     * consumer delete it.
+     *
+     * **Why the boundary is two and not one.** A person cannot hold a second
+     * device until §9's linking ceremony exists (WP3, after this work
+     * package), so a roster naming two devices can only have been signed by a
+     * build that also fetches under §7's per-device namespaces. A roster
+     * naming *one* device, by contrast, may well come from a build that
+     * publishes rosters and still polls only its person hints — addressing it
+     * per-device would starve it. Keeping the single-device case
+     * person-addressed is also exactly what the receiving side already
+     * believes: [`MessageStore::own_fleet_hints`] treats a fleet of one as
+     * owning the person's hints outright, so sender and recipient agree about
+     * which row has one true consumer without ever having to negotiate.
+     *
+     * **That argument is a debt WP3 inherits.** "A roster naming two devices
+     * implies a build that fetches per-device" holds only for as long as the
+     * linking ceremony that publishes such a roster is the same ceremony that
+     * activates §7 fetching on the joining device. §9's two-phase activation
+     * must therefore keep the two together: a device may not appear in a
+     * published roster until it has imported the bootstrap and is fetching
+     * under its own namespace. Splitting them — publishing the roster first
+     * and activating later — would silently starve the new device for the
+     * length of the gap, and nothing in this function could tell.
+     *
+     * **Dormant in WP2.** The per-device branch below cannot be reached in
+     * the field yet: no production writer creates a fleet larger than one
+     * device (that is WP3's activation ceremony), and no contact publishes a
+     * two-device roster for the same reason. The rule is implemented and
+     * pinned here so that the day WP3 writes the first fleet, addressing and
+     * acks are already correct on both sides of the wire.
+     *
+     * `own_sibling_sealed` is §7's "the sender's own sibling devices get rows
+     * too": when supplied, one further row per sibling of THIS device,
+     * addressed to that sibling's namespace. It is a separate body and not the
+     * envelope's, deliberately — `envelope.sealed` is sealed to the recipient,
+     * and a sibling could no more open it than a stranger could. What belongs
+     * in it is §8's sync record, sealed to the person's own inbox key, which
+     * WP4 mints; until then every caller passes `None` and no sibling row is
+     * produced. Passing the recipient-sealed bytes here would put copies on
+     * the relay that no device can ever open, so callers must not.
+     *
+     * Pure with respect to the store: it reads the rosters and the fleet and
+     * writes nothing, so a failed upload can re-plan the identical row set
+     * next pass. Every id is deterministic, so those retries dedupe
+     * server-side on `msg_id` with no relay change (`relayd` scopes rows by
+     * `(family_token, msg_id, recipient_hint)`).
+     *
+     * **1:1 envelopes only, and refused rather than merely documented.** A
+     * group-addressed envelope carries the group id in `recipient_user_id` and
+     * fans out per MEMBER through [`core_group_fanout_rows`]; §11 leaves that
+     * untouched, and a member's new device gets the group's mail through that
+     * member's own self-sync rather than through an M×D fan-out here. Handed a
+     * group envelope, this function would find no roster for the group id and
+     * plan the single group-hinted row that predates group fan-out entirely —
+     * plausible looking, and a durability regression that would only show up
+     * as a member somewhere not receiving mail. So `recipient_user_id` is
+     * looked up in the imported groups and a match is a [`CoreError`]: a doc
+     * comment is not a guard, and this one costs a single indexed lookup on a
+     * path that already reads the roster tables.
+     */
+    func coreOutboundRelayRows(envelope: OutboundEnvelope, ownUserId: Data, ownSiblingSealed: Data?) throws  -> [CoreGroupFanoutRow]
+    
+    /**
      * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
      *
      * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
@@ -4513,12 +4602,19 @@ public protocol MessageStoreProtocol : AnyObject {
      * 2. **The kind leaves no `messages` row**
      * ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
      * durable evidence; duplicating it here would only grow the table.
-     * 3. **The `recipient_hint` is one of THIS device's own hints**, over
-     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
-     * ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
-     * braces: a pairwise open already implies the envelope was sealed to
-     * us, and this additionally refuses anything whose *addressing* says
-     * it might be for someone else.
+     * 3. **The `recipient_hint` is in THIS device's own namespace**, over
+     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window — the same
+     * [`FleetHint::OwnDevice`] classification
+     * ([`MessageStore::own_fleet_hints`]) that
+     * [`Self::core_relay_ack_ids_with_consumed`] reads at ack time, so the
+     * write side of the licence and the read side of it name one namespace
+     * and cannot drift apart. (It was [`core_is_own_fanout_hint`]'s
+     * person-wide check back when a person was a device, and reduces to
+     * exactly that on an unlinked install.) This is the belt to condition
+     * 1's braces: a pairwise open already implies the envelope was sealed
+     * to us, and this additionally refuses anything whose *addressing* says
+     * it might be for someone else — a sibling's namespace, or the person's
+     * one shared row that ACK-MD-2 leaves for the whole fleet.
      * 4. **The `recipient_hint` is not a group's shared hint.** A group hint
      * names a row every member fetches, so it is never ackable by anyone
      * -- checked here as well as at ack time, since a hint collision
@@ -4570,14 +4666,16 @@ public protocol MessageStoreProtocol : AnyObject {
      * echoed back as our own outbound, or read one copy of out of a
      * shared-mailbox group envelope.
      *
-     * The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
-     * BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
-     * routing-time hint check uses -- deliberately NOT the forward-looking
-     * push-subscription variants ([`MessageStore::relay_self_push_hints`]).
-     * A forward day is safe for *subscribing* to a topic and wrong here:
-     * this is a claim about an envelope that already exists, and envelopes
-     * are only ever created with a backward-looking hint
-     * (`causal_order.rs`).
+     * The own-self-hint check is the multi-device rules' [`FleetHint::OwnDevice`]
+     * classification (it was [`core_is_own_fanout_hint`] back when a person
+     * was a device, and reduces to exactly that on an unlinked install). Either
+     * way it is the BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every
+     * other routing-time hint check uses -- deliberately NOT the
+     * forward-looking push-subscription variants
+     * ([`MessageStore::relay_self_push_hints`]). A forward day is safe for
+     * *subscribing* to a topic and wrong here: this is a claim about an
+     * envelope that already exists, and envelopes are only ever created with a
+     * backward-looking hint (`causal_order.rs`).
      *
      * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
      * relay copy unless THIS device was the envelope's sole true endpoint
@@ -4597,6 +4695,44 @@ public protocol MessageStoreProtocol : AnyObject {
      * is correct precisely because each row has exactly one reader. Legacy
      * rows simply age out within their normal expiry; the rule is
      * unconditional per the approved spec (§7.3, no escape hatch).
+     *
+     * **Multi-device rules** (`specs/multi-device-v1.md` §7). The group rule
+     * above says a row with more than one true consumer is never deleted by
+     * one of them; ACK-MD-1 and ACK-MD-2 are the same sentence one level
+     * down, where the several consumers are one person's own devices. Each
+     * item's `recipient_hint` is classified against this device's own fleet
+     * ([`MessageStore::own_fleet_hints`]) and:
+     *
+     * - [`FleetHint::OwnDevice`] — a row in this device's own per-device
+     * namespace, which has exactly one true consumer. Judged by every rule
+     * below exactly as a 1:1 row is today (ACK-MD-1: only on `Consumed`,
+     * never on `Carried` or `Expired`).
+     * - [`FleetHint::PersonShared`] — the bare person hint, on a fleet that
+     * holds more than one device. Never acked (ACK-MD-2): a legacy sender
+     * uploads exactly ONE such row, so the first sibling to fetch it must
+     * leave it for the others; the content spreads by self-sync (§8, WP4)
+     * and the churn is bounded by the row's 7-day expiry and ends when the
+     * sender upgrades. Unconditional, like the legacy group rule and for
+     * the identical reason — there is no `Expired` escape from it either.
+     * - [`FleetHint::Sibling`] — a row in a sibling's namespace. Never acked
+     * (ACK-MD-1). This is the refusal that cannot be left to the crypto: §6
+     * makes the inbox key person-scoped, so a sibling's row genuinely opens
+     * here and would otherwise be reported `Consumed` and deleted out from
+     * under the device it was addressed to — the §1 starvation failure,
+     * exactly.
+     * - [`FleetHint::Foreign`] — everything else, judged as today.
+     *
+     * A device that has never linked has no siblings and no own device id, so
+     * every one of its own rows classifies as [`FleetHint::OwnDevice`] and
+     * nothing classifies as the other two: its behaviour here is byte-identical
+     * to before this rule existed, which
+     * `a_single_device_identity_plans_exactly_todays_acks` pins.
+     *
+     * ACK-MD-3 needs no code here and gets none: carried copies are governed
+     * by `Carried` never being ackable (above) and by the carry queue's
+     * digest-proof rule (`core_confirm_carried_deliveries`), neither of which
+     * this change touches. A person-sealed carried copy is still removed only
+     * on proof of receipt, never on dispatch.
      */
     func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data, nowMs: Int64) throws  -> [Int64]
     
@@ -5014,6 +5150,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * True if `hint` matches a known contact or imported group -- the
      * family-vs-foreign classification the carry queue's eviction policy
      * keys on (DESIGN.md §5.3).
+     *
+     * **Person-level, and blind to §7 device namespaces.** This and its
+     * siblings ([`Self::contact_matching_hint`],
+     * [`Self::group_open_candidates`], and the relay pass's hint resolution)
+     * resolve a hint by hashing known PERSON and GROUP ids; a hint derived
+     * from [`crate::core_device_namespace_id`] matches none of them, so a
+     * contact's per-device row read as a carried frame classifies as foreign
+     * traffic and is evicted before family traffic would be. That is
+     * harmless in WP2 — no production writer creates a fleet larger than one
+     * device, so no such row exists in the field — and
+     * `a_contacts_device_namespaced_hint_is_still_invisible_here` pins the
+     * blindness so it is a discovered fact rather than a surprise. TODO
+     * (WP3/WP4): once §9's linking ceremony makes real fleets and §8's
+     * self-sync makes rows worth muling, resolve a contact's device
+     * namespaces here too, budgeting the extra hashes per contact.
      */
     func hintMatchesKnownTarget(hint: Data, nowMs: Int64) throws  -> Bool
     
@@ -5596,6 +5747,13 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: UInt8) throws  -> UInt64
     
+    /**
+     * What this device knows about its own fleet (§7/§9). An install that has
+     * never linked reads the default — no own device id, no siblings — which
+     * is §5's synthetic one-device person.
+     */
+    func ownDeviceFleet() throws  -> OwnDeviceFleet
+    
     func peerConnectionEvents(userId: Data?, limit: UInt32) throws  -> [PeerConnectionEvent]
     
     func peerConnectionSummaries() throws  -> [PeerConnectionSummary]
@@ -5981,6 +6139,10 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * The full deduped hint set a relay mailbox poll fetches: self + groups
      * ([`relay_self_hints`]) plus proxy ([`relay_proxy_hints`]).
+     *
+     * Built from one clamped id list rather than by concatenating two
+     * separately clamped ones, so the [`RELAY_MAX_FETCH_HINTS`] budget is
+     * argued about the set that is actually submitted.
      */
     func relayFetchHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
@@ -5992,10 +6154,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
      * safe).
      *
-     * Budget: each id contributes `CARRY_HINT_DAY_WINDOW_DAYS + 1 +
-     * PUSH_HINT_FORWARD_DAYS` = 9 hints (was 8 pre-fix) against relayd's
-     * `MAX_FETCH_HINTS` = 256, so this stays under the cap for up to ~28
-     * combined self/group/contact ids -- comfortably above family scale.
+     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 9 hints (was 8
+     * pre-fix) against relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays
+     * under the cap for up to 28 combined ids -- comfortably above family
+     * scale. `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
+     * device subscribes to its own namespace and to no sibling's (see
+     * [`MessageStore::own_device_namespace_ids`]), whatever the fleet's size,
+     * which leaves 26 for groups and proxy-polled contacts.
+     * `the_combined_fetch_budget_of_a_worst_case_family_fits` pins the
+     * arithmetic through these shipped builders; this doc is only its summary.
      */
     func relayFetchPushHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
@@ -6005,6 +6172,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * cluster can fetch mail addressed to *them* out of the shared
      * family-token partition and mule it the rest of the way. Cost scales
      * linearly with contact-list size -- fine at family scale.
+     *
+     * **Known gap, stated rather than hidden: proxy hints are PERSON-level
+     * only.** A contact's §7 per-device rows are addressed to
+     * [`crate::core_device_namespace_id`] namespaces this set says nothing
+     * about, so in WP2 a proxy cannot fetch or mule them; only the contact's
+     * own devices can. That is deliberate for three reasons. It keeps this
+     * cost linear in contacts rather than in contacts × devices, which is
+     * what the [`RELAY_MAX_FETCH_HINTS`] budget has room for. It keeps a
+     * proxy from becoming a second reader of a row whose whole point is
+     * having exactly one. And it costs nothing today, because no production
+     * writer creates a fleet larger than one device yet (WP3's linking
+     * ceremony), so no per-device row exists in the field to be missed.
+     * Extending proxy polling to a contact's device namespaces belongs to
+     * WP4/WP5, when real fleets exist and the budget can be re-argued
+     * against real contact-list sizes; §7's fan-out is unaffected either way.
      */
     func relayProxyHints(ownUserId: Data, nowMs: Int64) throws  -> [Data]
     
@@ -6108,6 +6290,38 @@ public protocol MessageStoreProtocol : AnyObject {
      * State values: 0 available, 1 requested, 2 hidden.
      */
     func setFriendSuggestionState(candidateUserId: Data, state: UInt8) throws 
+    
+    /**
+     * Record this device's own place in its person's fleet (§7/§9), replacing
+     * whatever was stored.
+     *
+     * Whole-record replacement rather than add/remove, because every writer is
+     * a ceremony that already holds the complete answer: §9's activation
+     * imports a roster and then declares the fleet it just joined, §10's
+     * revocation signs a new roster and then declares what is left. A
+     * merge could leave a revoked sibling behind, and a stale sibling is a
+     * device whose relay rows this one would keep withholding acks for.
+     *
+     * Refuses an internally inconsistent fleet rather than normalizing it (see
+     * [`crate::OwnDeviceFleet`]): what is stored here decides which relay rows
+     * this device may delete, so "roughly right" is not a state worth having.
+     *
+     * **Monotonic in `projected_from`, the way DL-1 is monotonic in a roster's
+     * own `(recovery_epoch, seq)`.** A projection at or below the stored
+     * version is refused with the same vocabulary DL-1 uses — a lower version
+     * is a *rollback*, an equal one is an *idempotent repeat* — and for the
+     * same reason: a stale copy of this record is not a harmless out-of-date
+     * cache but a standing instruction about whose relay rows this device may
+     * delete. The concrete attack it closes is a backup restore: the record
+     * rides a `.cmbak` unsanitized, so without an ordering key restoring an
+     * old backup would resurrect a fleet §10's revocation has since narrowed.
+     *
+     * **Dormant in WP2.** No production caller writes a fleet at all yet
+     * (§9's activation ceremony is WP3's), so today this refusal only ever
+     * judges test writes. It ships now because the rule is cheaper to pin
+     * before there is a writer than to retrofit around one.
+     */
+    func setOwnDeviceFleet(fleet: OwnDeviceFleet) throws 
     
     /**
      * "Don't ask again": a quiet local tombstone, no notification to anyone.
@@ -6340,6 +6554,15 @@ open func applyContactRelayUpdate(senderUserId: Data, content: RelayUpdateConten
      * A roster for someone who is not a contact is ignored rather than
      * refused: rosters gossip as ordinary sealed traffic (DL-3), and a
      * document about a stranger is simply not this device's business.
+     *
+     * **The §14.3 verdict this returns is deliberately non-surfacing** (§2
+     * goal 1: a person's device count is invisible to other users). The
+     * hard-cap [`DeviceAddOutcome::Refused`] stays — that is this device
+     * refusing a document, and a caller must be able to see it — but the
+     * soft-cap warning is stripped, because a shell that showed "this contact
+     * now has 9 devices" would disclose from gossip exactly what the goal
+     * protects. The warning belongs to the OWN-roster add path (§9's linking
+     * ceremony, WP3), where the count is the user's own.
      */
 open func applyContactRoster(incoming: Roster)throws  -> RosterUpdateDecision {
     return try  FfiConverterTypeRosterUpdateDecision.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -7298,6 +7521,94 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
 }
     
     /**
+     * The relay rows one queued 1:1 envelope should be uploaded as
+     * (`specs/multi-device-v1.md` §7) — the outbound half of the same rule
+     * [`Self::core_relay_ack_ids_with_consumed`] enforces on the way back in.
+     *
+     * Exactly one of two shapes, decided by what this device knows about the
+     * recipient's roster:
+     *
+     * - **A person with fewer than two known devices — today's row, byte for
+     * byte.** One row carrying the envelope's own `msg_id` and its own
+     * stored `recipient_hint`; nothing is recomputed, so a legacy contact
+     * (and a contact whose roster simply has not reached us) receives an
+     * upload indistinguishable from the one this code posted before §7
+     * existed. This covers the entire fleet in the field.
+     * - **A person with two or more roster-known devices — one row per
+     * device.** Each carries [`crate::device_fanout_msg_id`] of
+     * `(envelope.msg_id, device_id)` and that device's own daily hint, so
+     * each row has exactly one true consumer and ACK-MD-1 can let that
+     * consumer delete it.
+     *
+     * **Why the boundary is two and not one.** A person cannot hold a second
+     * device until §9's linking ceremony exists (WP3, after this work
+     * package), so a roster naming two devices can only have been signed by a
+     * build that also fetches under §7's per-device namespaces. A roster
+     * naming *one* device, by contrast, may well come from a build that
+     * publishes rosters and still polls only its person hints — addressing it
+     * per-device would starve it. Keeping the single-device case
+     * person-addressed is also exactly what the receiving side already
+     * believes: [`MessageStore::own_fleet_hints`] treats a fleet of one as
+     * owning the person's hints outright, so sender and recipient agree about
+     * which row has one true consumer without ever having to negotiate.
+     *
+     * **That argument is a debt WP3 inherits.** "A roster naming two devices
+     * implies a build that fetches per-device" holds only for as long as the
+     * linking ceremony that publishes such a roster is the same ceremony that
+     * activates §7 fetching on the joining device. §9's two-phase activation
+     * must therefore keep the two together: a device may not appear in a
+     * published roster until it has imported the bootstrap and is fetching
+     * under its own namespace. Splitting them — publishing the roster first
+     * and activating later — would silently starve the new device for the
+     * length of the gap, and nothing in this function could tell.
+     *
+     * **Dormant in WP2.** The per-device branch below cannot be reached in
+     * the field yet: no production writer creates a fleet larger than one
+     * device (that is WP3's activation ceremony), and no contact publishes a
+     * two-device roster for the same reason. The rule is implemented and
+     * pinned here so that the day WP3 writes the first fleet, addressing and
+     * acks are already correct on both sides of the wire.
+     *
+     * `own_sibling_sealed` is §7's "the sender's own sibling devices get rows
+     * too": when supplied, one further row per sibling of THIS device,
+     * addressed to that sibling's namespace. It is a separate body and not the
+     * envelope's, deliberately — `envelope.sealed` is sealed to the recipient,
+     * and a sibling could no more open it than a stranger could. What belongs
+     * in it is §8's sync record, sealed to the person's own inbox key, which
+     * WP4 mints; until then every caller passes `None` and no sibling row is
+     * produced. Passing the recipient-sealed bytes here would put copies on
+     * the relay that no device can ever open, so callers must not.
+     *
+     * Pure with respect to the store: it reads the rosters and the fleet and
+     * writes nothing, so a failed upload can re-plan the identical row set
+     * next pass. Every id is deterministic, so those retries dedupe
+     * server-side on `msg_id` with no relay change (`relayd` scopes rows by
+     * `(family_token, msg_id, recipient_hint)`).
+     *
+     * **1:1 envelopes only, and refused rather than merely documented.** A
+     * group-addressed envelope carries the group id in `recipient_user_id` and
+     * fans out per MEMBER through [`core_group_fanout_rows`]; §11 leaves that
+     * untouched, and a member's new device gets the group's mail through that
+     * member's own self-sync rather than through an M×D fan-out here. Handed a
+     * group envelope, this function would find no roster for the group id and
+     * plan the single group-hinted row that predates group fan-out entirely —
+     * plausible looking, and a durability regression that would only show up
+     * as a member somewhere not receiving mail. So `recipient_user_id` is
+     * looked up in the imported groups and a match is a [`CoreError`]: a doc
+     * comment is not a guard, and this one costs a single indexed lookup on a
+     * path that already reads the roster tables.
+     */
+open func coreOutboundRelayRows(envelope: OutboundEnvelope, ownUserId: Data, ownSiblingSealed: Data?)throws  -> [CoreGroupFanoutRow] {
+    return try  FfiConverterSequenceTypeCoreGroupFanoutRow.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_core_outbound_relay_rows(self.uniffiClonePointer(),
+        FfiConverterTypeOutboundEnvelope.lower(envelope),
+        FfiConverterData.lower(ownUserId),
+        FfiConverterOptionData.lower(ownSiblingSealed),$0
+    )
+})
+}
+    
+    /**
      * Plan one mesh encounter. See [`MessageStore::plan_mesh_meet`].
      *
      * Send [`CoreMeetOutcome`]'s frames in the field order — digest, then
@@ -7345,12 +7656,19 @@ open func corePlanMeshMeet(router: CoreMeshRouterState, spray: CoreSprayPolicy, 
      * 2. **The kind leaves no `messages` row**
      * ([`crate::core_kind_persists_msg_id_row`]). Chat kinds already have
      * durable evidence; duplicating it here would only grow the table.
-     * 3. **The `recipient_hint` is one of THIS device's own hints**, over
-     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window
-     * ([`core_is_own_fanout_hint`]). This is the belt to condition 1's
-     * braces: a pairwise open already implies the envelope was sealed to
-     * us, and this additionally refuses anything whose *addressing* says
-     * it might be for someone else.
+     * 3. **The `recipient_hint` is in THIS device's own namespace**, over
+     * the backward-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window — the same
+     * [`FleetHint::OwnDevice`] classification
+     * ([`MessageStore::own_fleet_hints`]) that
+     * [`Self::core_relay_ack_ids_with_consumed`] reads at ack time, so the
+     * write side of the licence and the read side of it name one namespace
+     * and cannot drift apart. (It was [`core_is_own_fanout_hint`]'s
+     * person-wide check back when a person was a device, and reduces to
+     * exactly that on an unlinked install.) This is the belt to condition
+     * 1's braces: a pairwise open already implies the envelope was sealed
+     * to us, and this additionally refuses anything whose *addressing* says
+     * it might be for someone else — a sibling's namespace, or the person's
+     * one shared row that ACK-MD-2 leaves for the whole fleet.
      * 4. **The `recipient_hint` is not a group's shared hint.** A group hint
      * names a row every member fetches, so it is never ackable by anyone
      * -- checked here as well as at ack time, since a hint collision
@@ -7413,14 +7731,16 @@ open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint:
      * echoed back as our own outbound, or read one copy of out of a
      * shared-mailbox group envelope.
      *
-     * The own-self-hint check uses [`core_is_own_fanout_hint`], i.e. the
-     * BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every other
-     * routing-time hint check uses -- deliberately NOT the forward-looking
-     * push-subscription variants ([`MessageStore::relay_self_push_hints`]).
-     * A forward day is safe for *subscribing* to a topic and wrong here:
-     * this is a claim about an envelope that already exists, and envelopes
-     * are only ever created with a backward-looking hint
-     * (`causal_order.rs`).
+     * The own-self-hint check is the multi-device rules' [`FleetHint::OwnDevice`]
+     * classification (it was [`core_is_own_fanout_hint`] back when a person
+     * was a device, and reduces to exactly that on an unlinked install). Either
+     * way it is the BACKWARD-only [`CARRY_HINT_DAY_WINDOW_DAYS`] window every
+     * other routing-time hint check uses -- deliberately NOT the
+     * forward-looking push-subscription variants
+     * ([`MessageStore::relay_self_push_hints`]). A forward day is safe for
+     * *subscribing* to a topic and wrong here: this is a claim about an
+     * envelope that already exists, and envelopes are only ever created with a
+     * backward-looking hint (`causal_order.rs`).
      *
      * Safety invariant, stated verbatim (DTN_TODOS.md §3.1): "never ack a
      * relay copy unless THIS device was the envelope's sole true endpoint
@@ -7440,6 +7760,44 @@ open func coreRecordConsumedHiddenMsgId(msgId: Data, kind: UInt8, recipientHint:
      * is correct precisely because each row has exactly one reader. Legacy
      * rows simply age out within their normal expiry; the rule is
      * unconditional per the approved spec (§7.3, no escape hatch).
+     *
+     * **Multi-device rules** (`specs/multi-device-v1.md` §7). The group rule
+     * above says a row with more than one true consumer is never deleted by
+     * one of them; ACK-MD-1 and ACK-MD-2 are the same sentence one level
+     * down, where the several consumers are one person's own devices. Each
+     * item's `recipient_hint` is classified against this device's own fleet
+     * ([`MessageStore::own_fleet_hints`]) and:
+     *
+     * - [`FleetHint::OwnDevice`] — a row in this device's own per-device
+     * namespace, which has exactly one true consumer. Judged by every rule
+     * below exactly as a 1:1 row is today (ACK-MD-1: only on `Consumed`,
+     * never on `Carried` or `Expired`).
+     * - [`FleetHint::PersonShared`] — the bare person hint, on a fleet that
+     * holds more than one device. Never acked (ACK-MD-2): a legacy sender
+     * uploads exactly ONE such row, so the first sibling to fetch it must
+     * leave it for the others; the content spreads by self-sync (§8, WP4)
+     * and the churn is bounded by the row's 7-day expiry and ends when the
+     * sender upgrades. Unconditional, like the legacy group rule and for
+     * the identical reason — there is no `Expired` escape from it either.
+     * - [`FleetHint::Sibling`] — a row in a sibling's namespace. Never acked
+     * (ACK-MD-1). This is the refusal that cannot be left to the crypto: §6
+     * makes the inbox key person-scoped, so a sibling's row genuinely opens
+     * here and would otherwise be reported `Consumed` and deleted out from
+     * under the device it was addressed to — the §1 starvation failure,
+     * exactly.
+     * - [`FleetHint::Foreign`] — everything else, judged as today.
+     *
+     * A device that has never linked has no siblings and no own device id, so
+     * every one of its own rows classifies as [`FleetHint::OwnDevice`] and
+     * nothing classifies as the other two: its behaviour here is byte-identical
+     * to before this rule existed, which
+     * `a_single_device_identity_plans_exactly_todays_acks` pins.
+     *
+     * ACK-MD-3 needs no code here and gets none: carried copies are governed
+     * by `Carried` never being ackable (above) and by the carry queue's
+     * digest-proof rule (`core_confirm_carried_deliveries`), neither of which
+     * this change touches. A person-sealed carried copy is still removed only
+     * on proof of receipt, never on dispatch.
      */
 open func coreRelayAckIdsWithConsumed(items: [CoreRelayEnvelopeDisposition], ownUserId: Data, nowMs: Int64)throws  -> [Int64] {
     return try  FfiConverterSequenceInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8075,6 +8433,21 @@ open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
      * True if `hint` matches a known contact or imported group -- the
      * family-vs-foreign classification the carry queue's eviction policy
      * keys on (DESIGN.md §5.3).
+     *
+     * **Person-level, and blind to §7 device namespaces.** This and its
+     * siblings ([`Self::contact_matching_hint`],
+     * [`Self::group_open_candidates`], and the relay pass's hint resolution)
+     * resolve a hint by hashing known PERSON and GROUP ids; a hint derived
+     * from [`crate::core_device_namespace_id`] matches none of them, so a
+     * contact's per-device row read as a carried frame classifies as foreign
+     * traffic and is evicted before family traffic would be. That is
+     * harmless in WP2 — no production writer creates a fleet larger than one
+     * device, so no such row exists in the field — and
+     * `a_contacts_device_namespaced_hint_is_still_invisible_here` pins the
+     * blindness so it is a discovered fact rather than a surprise. TODO
+     * (WP3/WP4): once §9's linking ceremony makes real fleets and §8's
+     * self-sync makes rows worth muling, resolve a contact's device
+     * namespaces here too, budgeting the extra hashes per contact.
      */
 open func hintMatchesKnownTarget(hint: Data, nowMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -8971,6 +9344,18 @@ open func outgoingReceiptThrough(chatId: Data, senderUserId: Data, receiptType: 
 })
 }
     
+    /**
+     * What this device knows about its own fleet (§7/§9). An install that has
+     * never linked reads the default — no own device id, no siblings — which
+     * is §5's synthetic one-device person.
+     */
+open func ownDeviceFleet()throws  -> OwnDeviceFleet {
+    return try  FfiConverterTypeOwnDeviceFleet.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_own_device_fleet(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func peerConnectionEvents(userId: Data?, limit: UInt32)throws  -> [PeerConnectionEvent] {
     return try  FfiConverterSequenceTypePeerConnectionEvent.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_peer_connection_events(self.uniffiClonePointer(),
@@ -9562,6 +9947,10 @@ open func relayFetchCursor(configKey: String)throws  -> RelayFetchCursor {
     /**
      * The full deduped hint set a relay mailbox poll fetches: self + groups
      * ([`relay_self_hints`]) plus proxy ([`relay_proxy_hints`]).
+     *
+     * Built from one clamped id list rather than by concatenating two
+     * separately clamped ones, so the [`RELAY_MAX_FETCH_HINTS`] budget is
+     * argued about the set that is actually submitted.
      */
 open func relayFetchHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -9580,10 +9969,15 @@ open func relayFetchHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
      * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
      * safe).
      *
-     * Budget: each id contributes `CARRY_HINT_DAY_WINDOW_DAYS + 1 +
-     * PUSH_HINT_FORWARD_DAYS` = 9 hints (was 8 pre-fix) against relayd's
-     * `MAX_FETCH_HINTS` = 256, so this stays under the cap for up to ~28
-     * combined self/group/contact ids -- comfortably above family scale.
+     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 9 hints (was 8
+     * pre-fix) against relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays
+     * under the cap for up to 28 combined ids -- comfortably above family
+     * scale. `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
+     * device subscribes to its own namespace and to no sibling's (see
+     * [`MessageStore::own_device_namespace_ids`]), whatever the fleet's size,
+     * which leaves 26 for groups and proxy-polled contacts.
+     * `the_combined_fetch_budget_of_a_worst_case_family_fits` pins the
+     * arithmetic through these shipped builders; this doc is only its summary.
      */
 open func relayFetchPushHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -9600,6 +9994,21 @@ open func relayFetchPushHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
      * cluster can fetch mail addressed to *them* out of the shared
      * family-token partition and mule it the rest of the way. Cost scales
      * linearly with contact-list size -- fine at family scale.
+     *
+     * **Known gap, stated rather than hidden: proxy hints are PERSON-level
+     * only.** A contact's §7 per-device rows are addressed to
+     * [`crate::core_device_namespace_id`] namespaces this set says nothing
+     * about, so in WP2 a proxy cannot fetch or mule them; only the contact's
+     * own devices can. That is deliberate for three reasons. It keeps this
+     * cost linear in contacts rather than in contacts × devices, which is
+     * what the [`RELAY_MAX_FETCH_HINTS`] budget has room for. It keeps a
+     * proxy from becoming a second reader of a row whose whole point is
+     * having exactly one. And it costs nothing today, because no production
+     * writer creates a fleet larger than one device yet (WP3's linking
+     * ceremony), so no per-device row exists in the field to be missed.
+     * Extending proxy polling to a contact's device namespaces belongs to
+     * WP4/WP5, when real fleets exist and the budget can be re-argued
+     * against real contact-list sizes; §7's fan-out is unaffected either way.
      */
 open func relayProxyHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -9772,6 +10181,43 @@ open func setFriendSuggestionState(candidateUserId: Data, state: UInt8)throws  {
     uniffi_cruisemesh_core_fn_method_messagestore_set_friend_suggestion_state(self.uniffiClonePointer(),
         FfiConverterData.lower(candidateUserId),
         FfiConverterUInt8.lower(state),$0
+    )
+}
+}
+    
+    /**
+     * Record this device's own place in its person's fleet (§7/§9), replacing
+     * whatever was stored.
+     *
+     * Whole-record replacement rather than add/remove, because every writer is
+     * a ceremony that already holds the complete answer: §9's activation
+     * imports a roster and then declares the fleet it just joined, §10's
+     * revocation signs a new roster and then declares what is left. A
+     * merge could leave a revoked sibling behind, and a stale sibling is a
+     * device whose relay rows this one would keep withholding acks for.
+     *
+     * Refuses an internally inconsistent fleet rather than normalizing it (see
+     * [`crate::OwnDeviceFleet`]): what is stored here decides which relay rows
+     * this device may delete, so "roughly right" is not a state worth having.
+     *
+     * **Monotonic in `projected_from`, the way DL-1 is monotonic in a roster's
+     * own `(recovery_epoch, seq)`.** A projection at or below the stored
+     * version is refused with the same vocabulary DL-1 uses — a lower version
+     * is a *rollback*, an equal one is an *idempotent repeat* — and for the
+     * same reason: a stale copy of this record is not a harmless out-of-date
+     * cache but a standing instruction about whose relay rows this device may
+     * delete. The concrete attack it closes is a backup restore: the record
+     * rides a `.cmbak` unsanitized, so without an ordering key restoring an
+     * old backup would resurrect a fleet §10's revocation has since narrowed.
+     *
+     * **Dormant in WP2.** No production caller writes a fleet at all yet
+     * (§9's activation ceremony is WP3's), so today this refusal only ever
+     * judges test writes. It ships now because the rule is cheaper to pin
+     * before there is a writer than to retrofit around one.
+     */
+open func setOwnDeviceFleet(fleet: OwnDeviceFleet)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_set_own_device_fleet(self.uniffiClonePointer(),
+        FfiConverterTypeOwnDeviceFleet.lower(fleet),$0
     )
 }
 }
@@ -13560,6 +14006,13 @@ public func FfiConverterTypeCoreFailoverResumeArm_lower(_ value: CoreFailoverRes
  * queue. Every field here is copied onto the wire verbatim by
  * [`encode_envelope_frame`]/the relay POST body; see
  * [`core_group_fanout_rows`] for how each field is derived.
+ *
+ * Named for the fan-out that first needed it, and reused unchanged by
+ * `specs/multi-device-v1.md` §7's per-device fan-out
+ * ([`core_device_fanout_rows`], [`MessageStore::core_outbound_relay_rows`]).
+ * Reused rather than copied on purpose: a relay row is a relay row, and both
+ * shells already have exactly one upload path for this shape -- a second
+ * record would have bought a second upload path and nothing else.
  */
 public struct CoreGroupFanoutRow {
     public var msgId: Data
@@ -24427,6 +24880,169 @@ public func FfiConverterTypeOutgoingSharedRequest_lower(_ value: OutgoingSharedR
 }
 
 
+/**
+ * Which devices this person holds, and which one of them is *this* device.
+ *
+ * Deliberately not a second copy of the own [`Roster`]: it is the projection
+ * of one that routing and acks read, and nothing more. Two rules need exactly
+ * these two fields and nothing else in the document:
+ *
+ * * ACK-MD-1 — "a device acks only rows addressed to its own
+ * `device_fanout_msg_id` namespace" — needs to know which namespace is its
+ * own, which takes `own_device_id`.
+ * * ACK-MD-2 — "a multi-device recipient NEVER acks a legacy person-addressed
+ * row" — needs to know whether there is anyone to leave it for, which takes
+ * the count.
+ *
+ * §9's two-phase activation is what writes it: a new device may not
+ * "advertise, author, or ack ANYTHING" until it has imported the bootstrap and
+ * confirmed the roster back to the approving device, and this record is how
+ * the ack planner is told that happened. §10's revocation rewrites it. Until
+ * either ceremony exists (WP3/WP5), every install reads
+ * [`OwnDeviceFleet::default`] — no own device id, no siblings — which is §5's
+ * synthetic one-device person and behaves exactly as today's fleet does.
+ *
+ * It rides a `.cmbak` unsanitized, deliberately: restoring a backup is §9's
+ * "Replace this device", and a replacement really is the same device with the
+ * same id and the same siblings. The other restore branch — "Link as new
+ * device" — mints a fresh device key and must therefore overwrite this record
+ * as part of activating, which it does by construction, since activation is
+ * what writes it. WP3 owns that; the note is here so it cannot be missed.
+ */
+public struct OwnDeviceFleet {
+    /**
+     * This device's own device id, or `None` on an install that has never
+     * linked — which is every device in the field today.
+     */
+    public var ownDeviceId: Data?
+    /**
+     * Every active device id of this person, this device included, in roster
+     * order. Revoked devices are absent: DL-4 keeps tombstones in the roster
+     * document, but a tombstoned device has no rows worth fetching or
+     * withholding on its behalf.
+     */
+    public var deviceIds: [Data]
+    /**
+     * The `(recovery_epoch, seq)` of the OWN roster this projection was taken
+     * from — DL-1's ordering key, applied to the projection as well as to the
+     * document.
+     *
+     * [`MessageStore::set_own_device_fleet`](crate::MessageStore::set_own_device_fleet)
+     * refuses a projection at or below the stored version, for DL-1's reason
+     * one level down: this record decides which relay rows this device may
+     * delete and which siblings it must withhold acks for, so a *stale* copy
+     * of it is not a harmless out-of-date cache. The concrete hazard is a
+     * backup restore: a `.cmbak` carries this record unsanitized (§9's
+     * "Replace this device"), and without an ordering key a restore of an old
+     * backup could resurrect a fleet that has since been narrowed by §10's
+     * revocation — reinstating a revoked sibling as a device whose mail this
+     * one keeps politely refusing to ack, forever.
+     *
+     * `RosterVersion::default()` — `(0, 0)` — is the genesis version, so the
+     * FIRST write on an install with nothing stored is always accepted; only a
+     * second write has a baseline to be judged against.
+     */
+    public var projectedFrom: RosterVersion
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * This device's own device id, or `None` on an install that has never
+         * linked — which is every device in the field today.
+         */ownDeviceId: Data?, 
+        /**
+         * Every active device id of this person, this device included, in roster
+         * order. Revoked devices are absent: DL-4 keeps tombstones in the roster
+         * document, but a tombstoned device has no rows worth fetching or
+         * withholding on its behalf.
+         */deviceIds: [Data], 
+        /**
+         * The `(recovery_epoch, seq)` of the OWN roster this projection was taken
+         * from — DL-1's ordering key, applied to the projection as well as to the
+         * document.
+         *
+         * [`MessageStore::set_own_device_fleet`](crate::MessageStore::set_own_device_fleet)
+         * refuses a projection at or below the stored version, for DL-1's reason
+         * one level down: this record decides which relay rows this device may
+         * delete and which siblings it must withhold acks for, so a *stale* copy
+         * of it is not a harmless out-of-date cache. The concrete hazard is a
+         * backup restore: a `.cmbak` carries this record unsanitized (§9's
+         * "Replace this device"), and without an ordering key a restore of an old
+         * backup could resurrect a fleet that has since been narrowed by §10's
+         * revocation — reinstating a revoked sibling as a device whose mail this
+         * one keeps politely refusing to ack, forever.
+         *
+         * `RosterVersion::default()` — `(0, 0)` — is the genesis version, so the
+         * FIRST write on an install with nothing stored is always accepted; only a
+         * second write has a baseline to be judged against.
+         */projectedFrom: RosterVersion) {
+        self.ownDeviceId = ownDeviceId
+        self.deviceIds = deviceIds
+        self.projectedFrom = projectedFrom
+    }
+}
+
+
+
+extension OwnDeviceFleet: Equatable, Hashable {
+    public static func ==(lhs: OwnDeviceFleet, rhs: OwnDeviceFleet) -> Bool {
+        if lhs.ownDeviceId != rhs.ownDeviceId {
+            return false
+        }
+        if lhs.deviceIds != rhs.deviceIds {
+            return false
+        }
+        if lhs.projectedFrom != rhs.projectedFrom {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ownDeviceId)
+        hasher.combine(deviceIds)
+        hasher.combine(projectedFrom)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOwnDeviceFleet: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OwnDeviceFleet {
+        return
+            try OwnDeviceFleet(
+                ownDeviceId: FfiConverterOptionData.read(from: &buf), 
+                deviceIds: FfiConverterSequenceData.read(from: &buf), 
+                projectedFrom: FfiConverterTypeRosterVersion.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OwnDeviceFleet, into buf: inout [UInt8]) {
+        FfiConverterOptionData.write(value.ownDeviceId, into: &buf)
+        FfiConverterSequenceData.write(value.deviceIds, into: &buf)
+        FfiConverterTypeRosterVersion.write(value.projectedFrom, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOwnDeviceFleet_lift(_ buf: RustBuffer) throws -> OwnDeviceFleet {
+    return try FfiConverterTypeOwnDeviceFleet.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOwnDeviceFleet_lower(_ value: OwnDeviceFleet) -> RustBuffer {
+    return FfiConverterTypeOwnDeviceFleet.lower(value)
+}
+
+
 public struct PeerConnectionEvent {
     public var userId: Data
     public var transport: PeerConnectionTransport
@@ -25649,6 +26265,28 @@ public struct RosterUpdateDecision {
      * resolution — a fork is resolved by a person, never by arithmetic.
      */
     public var quarantined: Bool
+    /**
+     * §14.3 applied to the device count the *incoming* document carries —
+     * named for what it measures (a count) rather than for an add, because
+     * this decision is about a document that arrived, not about a device this
+     * user chose to add.
+     *
+     * [`DeviceAddOutcome::Refused`] is exactly the
+     * [`RosterRejection::DeviceCapExceeded`] refusal above — the same
+     * [`core_device_add_outcome`] call decides both, so they cannot drift.
+     *
+     * **[`DeviceAddOutcome::AddedWithWarning`] is not for the contact path.**
+     * The soft cap is advice to a person about their OWN fleet ("you now have
+     * 9 or more devices"), and §2 goal 1 says a person's device count is
+     * invisible to other users — so surfacing it about a *contact* would leak
+     * exactly what the goal protects, from a document that arrived by gossip.
+     * [`MessageStore::apply_contact_roster`](crate::MessageStore::apply_contact_roster)
+     * therefore reports a non-surfacing verdict on that path. The warning
+     * surface belongs to the own-roster ADD path — §9's linking ceremony,
+     * which is WP3's — where the count is the user's own business and there is
+     * a person to tell.
+     */
+    public var deviceCountOutcome: DeviceAddOutcome
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -25660,11 +26298,33 @@ public struct RosterUpdateDecision {
         /**
          * DL-2: once true this stays true. A later, perfectly good roster is not a
          * resolution — a fork is resolved by a person, never by arithmetic.
-         */quarantined: Bool) {
+         */quarantined: Bool, 
+        /**
+         * §14.3 applied to the device count the *incoming* document carries —
+         * named for what it measures (a count) rather than for an add, because
+         * this decision is about a document that arrived, not about a device this
+         * user chose to add.
+         *
+         * [`DeviceAddOutcome::Refused`] is exactly the
+         * [`RosterRejection::DeviceCapExceeded`] refusal above — the same
+         * [`core_device_add_outcome`] call decides both, so they cannot drift.
+         *
+         * **[`DeviceAddOutcome::AddedWithWarning`] is not for the contact path.**
+         * The soft cap is advice to a person about their OWN fleet ("you now have
+         * 9 or more devices"), and §2 goal 1 says a person's device count is
+         * invisible to other users — so surfacing it about a *contact* would leak
+         * exactly what the goal protects, from a document that arrived by gossip.
+         * [`MessageStore::apply_contact_roster`](crate::MessageStore::apply_contact_roster)
+         * therefore reports a non-surfacing verdict on that path. The warning
+         * surface belongs to the own-roster ADD path — §9's linking ceremony,
+         * which is WP3's — where the count is the user's own business and there is
+         * a person to tell.
+         */deviceCountOutcome: DeviceAddOutcome) {
         self.outcome = outcome
         self.reason = reason
         self.rejection = rejection
         self.quarantined = quarantined
+        self.deviceCountOutcome = deviceCountOutcome
     }
 }
 
@@ -25684,6 +26344,9 @@ extension RosterUpdateDecision: Equatable, Hashable {
         if lhs.quarantined != rhs.quarantined {
             return false
         }
+        if lhs.deviceCountOutcome != rhs.deviceCountOutcome {
+            return false
+        }
         return true
     }
 
@@ -25692,6 +26355,7 @@ extension RosterUpdateDecision: Equatable, Hashable {
         hasher.combine(reason)
         hasher.combine(rejection)
         hasher.combine(quarantined)
+        hasher.combine(deviceCountOutcome)
     }
 }
 
@@ -25706,7 +26370,8 @@ public struct FfiConverterTypeRosterUpdateDecision: FfiConverterRustBuffer {
                 outcome: FfiConverterTypeRosterUpdateOutcome.read(from: &buf), 
                 reason: FfiConverterTypeRosterUpdateReason.read(from: &buf), 
                 rejection: FfiConverterOptionTypeRosterRejection.read(from: &buf), 
-                quarantined: FfiConverterBool.read(from: &buf)
+                quarantined: FfiConverterBool.read(from: &buf), 
+                deviceCountOutcome: FfiConverterTypeDeviceAddOutcome.read(from: &buf)
         )
     }
 
@@ -25715,6 +26380,7 @@ public struct FfiConverterTypeRosterUpdateDecision: FfiConverterRustBuffer {
         FfiConverterTypeRosterUpdateReason.write(value.reason, into: &buf)
         FfiConverterOptionTypeRosterRejection.write(value.rejection, into: &buf)
         FfiConverterBool.write(value.quarantined, into: &buf)
+        FfiConverterTypeDeviceAddOutcome.write(value.deviceCountOutcome, into: &buf)
     }
 }
 
@@ -38336,6 +39002,93 @@ public func coreDeviceAddOutcome(resultingDeviceCount: UInt32) -> DeviceAddOutco
 })
 }
 /**
+ * [`core_group_fanout_rows`]'s per-DEVICE twin (`specs/multi-device-v1.md`
+ * §7): one row per entry of `device_ids`, each addressed to that device's own
+ * routing namespace.
+ *
+ * The two functions are deliberately the same shape, because §7 asks for
+ * exactly that -- "mirror the group fan-out machinery, per recipient device"
+ * -- and they differ in exactly the two derivations that make a row findable
+ * and deletable by one device rather than by one person:
+ *
+ * - `msg_id`: [`crate::device_fanout_msg_id`] rather than
+ * [`fanout_msg_id`], a disjoint id space with its own prologue, so a device
+ * row and a group row for the same original can never collide.
+ * - `recipient_hint`: the daily hint of
+ * [`crate::core_device_namespace_id`]`(person_id, device_id)` rather than
+ * of a bare id -- the hint that device polls under
+ * ([`crate::recent_device_hints_for`]) and no one else does.
+ *
+ * `hop_ttl`, `expiry` and `sealed` are copied unchanged, as in the group
+ * case: fan-out changes addressing only, never crypto or hop budget. §6 is
+ * what makes one sealed body legitimate across a person's devices -- the
+ * inbox key is person-scoped, so every row of a fan-out to one person carries
+ * identical bytes and only the addressing differs.
+ *
+ * Pure, undeduplicated, and store-free, for the same reasons its group twin
+ * is: callers re-plan it on retry and the ids converge.
+ *
+ * **What it costs.** Every row carries the whole sealed body — §6 gives the
+ * person one inbox key, so the bytes are identical and only the addressing
+ * differs — which makes the relay cost of one 1:1 message
+ * `fleet_size × sealed_len`, linear in the recipient's device count and paid
+ * out of the family's shared relay budget. That is the price of per-device
+ * deletability, and it is deliberately bounded rather than open-ended:
+ * [`crate::DEVICE_HARD_CAP`] bounds the multiplier and
+ * [`RELAY_MAX_ENVELOPE_SEALED_BYTES`] bounds the body.
+ * `a_max_cap_fanout_fits_the_family_relay_budget` states the worst case
+ * against the two relayd constants mirrored below, so widening either cap has
+ * to be a deliberate edit with the arithmetic in front of it.
+ */
+public func coreDeviceFanoutRows(originalMsgId: Data, personId: Data, deviceIds: [Data], hopTtl: UInt8, expiry: Int64, sealed: Data, envelopeTimestampMs: Int64) -> [CoreGroupFanoutRow] {
+    return try!  FfiConverterSequenceTypeCoreGroupFanoutRow.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_device_fanout_rows(
+        FfiConverterData.lower(originalMsgId),
+        FfiConverterData.lower(personId),
+        FfiConverterSequenceData.lower(deviceIds),
+        FfiConverterUInt8.lower(hopTtl),
+        FfiConverterInt64.lower(expiry),
+        FfiConverterData.lower(sealed),
+        FfiConverterInt64.lower(envelopeTimestampMs),$0
+    )
+})
+}
+/**
+ * The routing namespace one device's relay rows are addressed under (§7):
+ * `BLAKE2b-16(domain || person_id || device_id)`, both inputs length-framed.
+ *
+ * Sixteen bytes, because that is exactly the width
+ * [`compute_recipient_hint`](crate::compute_recipient_hint) already consumes —
+ * a device namespace drops into every existing hint path where a `user_id`
+ * goes, and nothing downstream needs to learn a second shape.
+ *
+ * Three properties earn the hash rather than a plain concatenation:
+ *
+ * * **One-way.** The relay stores `BLAKE2b-8(namespace || day)` and nothing
+ * else. Hashing the person in means a device's daily hints cannot be walked
+ * back to the person they belong to, and two of one person's devices are
+ * not visibly siblings — which a `person_id || device_id` namespace would
+ * have given away to anyone holding either half.
+ * * **Ids only (DL-5).** Both inputs are fixed-width ids. Nothing here has a
+ * field an endpoint fits in, and the derivation forwards no addressing.
+ * * **Unambiguous.** Length framing means no `(person, device)` pair can
+ * collide with another by re-splitting the same bytes.
+ *
+ * [`LEGACY_DEVICE_ID`] — and any absent or malformed device id, which §5 maps
+ * to it — returns `person_id` unchanged: the person namespace, which is
+ * today's hint, unchanged for every v1 peer. Paired with the same fallback in
+ * [`device_fanout_msg_id`](crate::device_fanout_msg_id), so a legacy row's id
+ * and the hint it is found under always agree.
+ */
+public func coreDeviceNamespaceId(personId: Data, deviceId: Data) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_device_namespace_id(
+        FfiConverterData.lower(personId),
+        FfiConverterData.lower(deviceId),$0
+    )
+})
+}
+/**
  * Sign `message` under a device's Ed25519 key in one domain (§3).
  */
 public func coreDeviceSign(domain: DeviceSigningDomain, deviceSignSk: Data, message: Data)throws  -> Data {
@@ -39947,6 +40700,46 @@ public func defaultExpiry(timestampMs: Int64) -> Int64 {
     )
 })
 }
+/**
+ * Deterministic per-device relay-post id for multi-device fan-out
+ * (`specs/multi-device-v1.md` §7): `BLAKE2b-16(prologue || original_msg_id ||
+ * device_id)`, where `prologue` is the fixed ASCII string
+ * `"cruisemesh device fanout v1"`.
+ *
+ * Same construction discipline as [`fanout_msg_id`], and for the same two
+ * reasons one level down:
+ *
+ * - **Distinct per device**: every recipient device gets its own relay row id
+ * for the same logical message, so each row has exactly one true consumer
+ * and ACK-MD-1 ("a device acks only rows in its own
+ * `device_fanout_msg_id` namespace, and only on CONSUMED") has something
+ * concrete to name.
+ * - **Deterministic across calls**: a retried upload, or a sibling muling the
+ * same envelope, re-derives the identical ids and the relay's existing
+ * `ON CONFLICT` dedupe on `msg_id` absorbs the repeat with no server change.
+ *
+ * The prologue differs from the group one deliberately and is not decoration:
+ * a `device_id` and a `member_user_id` are both 16 bytes drawn from the same
+ * derivation, so the domain separator is the *only* thing keeping the two id
+ * spaces disjoint.
+ *
+ * [`LEGACY_DEVICE_ID`](crate::LEGACY_DEVICE_ID) — and any absent or malformed
+ * device id, which §5 maps to it — returns `original_msg_id` unchanged: the
+ * single person-addressed row a v1 sender uploads today, byte for byte. That
+ * fallback is paired with the one in
+ * [`core_device_namespace_id`](crate::core_device_namespace_id), so the id a
+ * legacy row is keyed by and the hint it is found under fall back together
+ * and a mixed fleet can never mint half a legacy row. Refusing to *ack* such
+ * a row is ACK-MD-2's job, not this function's.
+ */
+public func deviceFanoutMsgId(originalMsgId: Data, deviceId: Data) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_device_fanout_msg_id(
+        FfiConverterData.lower(originalMsgId),
+        FfiConverterData.lower(deviceId),$0
+    )
+})
+}
 public func digestIsExpectedChatId(digestChatId: Data, helloUserId: Data?) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_digest_is_expected_chat_id(
@@ -40796,6 +41589,25 @@ public func parseRelaySetupText(text: String)throws  -> RelaySetup {
     return try  FfiConverterTypeRelaySetup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_parse_relay_setup_text(
         FfiConverterString.lower(text),$0
+    )
+})
+}
+/**
+ * [`recent_hints_for`] for one device of a person (§7): the `recipient_hint`s
+ * a still-carriable relay row addressed to that *device* could match.
+ *
+ * A legacy device id — and the absent field §5 maps to it — yields exactly
+ * [`recent_hints_for`]'s person hints, because
+ * [`core_device_namespace_id`](crate::core_device_namespace_id) falls back to
+ * the person namespace there. That is what keeps a mixed fleet's fetch set a
+ * superset of today's: nothing a v1 peer can address stops being fetched.
+ */
+public func recentDeviceHintsFor(personId: Data, deviceId: Data, nowMs: Int64) -> [Data] {
+    return try!  FfiConverterSequenceData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_recent_device_hints_for(
+        FfiConverterData.lower(personId),
+        FfiConverterData.lower(deviceId),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -42130,6 +42942,12 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_device_add_outcome() != 35034) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_fanout_rows() != 29138) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_device_namespace_id() != 10504) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_device_sign() != 951) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -42460,6 +43278,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_default_expiry() != 43648) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_device_fanout_msg_id() != 14616) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_digest_is_expected_chat_id() != 2744) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -42638,6 +43459,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_relay_setup_text() != 37250) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_recent_device_hints_for() != 17789) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_recent_hints_for() != 41465) {
@@ -43054,7 +43878,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 21099) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 49600) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 29083) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
@@ -43198,13 +44022,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 15577) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_outbound_relay_rows() != 40926) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_plan_mesh_meet() != 65521) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 37215) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_record_consumed_hidden_msg_id() != 20035) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 44389) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_relay_ack_ids_with_consumed() != 61550) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_delete_contact() != 60649) {
@@ -43300,7 +44127,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 15933) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 30294) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_ingest_relay_page() != 54199) {
@@ -43432,6 +44259,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_outgoing_receipt_through() != 57876) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_own_device_fleet() != 64083) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_peer_connection_events() != 65461) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -43516,13 +44346,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_cursor() != 29554) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 37028) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 59297) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_push_hints() != 47587) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_push_hints() != 6270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_proxy_hints() != 50484) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_proxy_hints() != 9978) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_self_hints() != 33679) {
@@ -43553,6 +44383,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_set_friend_suggestion_state() != 34158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_set_own_device_fleet() != 41127) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_suppress_shared_requests() != 62070) {
