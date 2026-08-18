@@ -123,6 +123,8 @@ import com.cruisemesh.app.ui.connectionCheckPending
 import com.cruisemesh.app.ui.ChatListLogic
 import com.cruisemesh.app.ui.ChatListScreen
 import com.cruisemesh.app.ui.ChatSummary
+import com.cruisemesh.app.ui.AppearancePreference
+import com.cruisemesh.app.ui.AppearancePreferences
 import com.cruisemesh.app.ui.CruiseMeshTheme
 import com.cruisemesh.app.ui.LocalReachabilityPalette
 import com.cruisemesh.app.ui.InternetDeliveryService
@@ -200,9 +202,17 @@ class MainActivity : ComponentActivity() {
         RelayConfigStore.logSummary(this)
         pendingDeepLink.value = deepLinkFromIntent(intent)
         setContent {
-            CruiseMeshTheme {
+            var appearance by remember {
+                mutableStateOf(AppearancePreferences.load(this@MainActivity))
+            }
+            CruiseMeshTheme(appearance = appearance) {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     CruiseMeshApp(
+                        appearancePreference = appearance,
+                        onAppearancePreferenceChange = { preference ->
+                            AppearancePreferences.save(this@MainActivity, preference)
+                            appearance = preference
+                        },
                         pendingDeepLink = pendingDeepLink.value,
                         onPendingDeepLinkConsumed = { pendingDeepLink.value = null },
                     )
@@ -267,6 +277,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun CruiseMeshApp(
+    appearancePreference: AppearancePreference = AppearancePreference.SYSTEM,
+    onAppearancePreferenceChange: (AppearancePreference) -> Unit = {},
     pendingDeepLink: PendingDeepLink? = null,
     onPendingDeepLinkConsumed: () -> Unit = {},
 ) {
@@ -305,7 +317,14 @@ fun CruiseMeshApp(
         }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
-        composable("settings") { SettingsRoute(identity, navController) }
+        composable("settings") {
+            SettingsRoute(
+                identity = identity,
+                navController = navController,
+                appearancePreference = appearancePreference,
+                onAppearancePreferenceChange = onAppearancePreferenceChange,
+            )
+        }
         composable("connectionDetails") {
             ConnectionDetailsScreen(
                 ownUserId = identity.userId,
@@ -1321,7 +1340,12 @@ private fun SailChecklistRoute(navController: NavHostController) {
 }
 
 @Composable
-private fun SettingsRoute(identity: Identity, navController: NavHostController) {
+private fun SettingsRoute(
+    identity: Identity,
+    navController: NavHostController,
+    appearancePreference: AppearancePreference,
+    onAppearancePreferenceChange: (AppearancePreference) -> Unit,
+) {
     val context = LocalContext.current
     val store = remember { AppStore.get(context) }
     val runtimeStatus by MeshRuntimeStatus.state.collectAsState()
@@ -1348,6 +1372,8 @@ private fun SettingsRoute(identity: Identity, navController: NavHostController) 
         meshEnabled = meshEnabled,
         meshStatus = runtimeStatus.label,
         relayHealth = relayHealth,
+        appearancePreference = appearancePreference,
+        onAppearancePreferenceChange = onAppearancePreferenceChange,
         onShorePass = { navController.navigate("shorePass") },
         onSailChecklist = { navController.navigate("sailChecklist") },
         onConnectionDetails = { navController.navigate("connectionDetails") },

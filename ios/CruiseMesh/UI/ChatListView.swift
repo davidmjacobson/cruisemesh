@@ -68,6 +68,7 @@ private struct MissingConversationView: View {
 struct ChatListView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
+    @Binding var appearance: AppearancePreference
     @ObservedObject private var bluetooth = BluetoothAccess.shared
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
@@ -364,7 +365,11 @@ struct ChatListView: View {
                 MeshStatusSheet(appModel: appModel)
             }
             .sheet(isPresented: $showSettings) {
-                SettingsView(identity: identity, appModel: appModel)
+                SettingsView(
+                    identity: identity,
+                    appModel: appModel,
+                    appearance: $appearance
+                )
             }
             .sheet(isPresented: $showConnectionDetails) {
                 ConnectionDetailsView(appModel: appModel)

@@ -15,6 +15,19 @@ struct CruiseMeshApp: App {
     @StateObject private var appModel: AppModel
     @State private var termsAccepted: Bool
     @State private var onboardingCompleted: Bool
+    @AppStorage(AppearancePreference.storageKey, store: AppDefaults.current)
+    private var appearanceRawValue = AppearancePreference.system.rawValue
+
+    private var appearance: AppearancePreference {
+        AppearancePreference(storedValue: appearanceRawValue)
+    }
+
+    private var appearanceBinding: Binding<AppearancePreference> {
+        Binding(
+            get: { appearance },
+            set: { appearanceRawValue = $0.rawValue }
+        )
+    }
 
     init() {
         _appModel = StateObject(wrappedValue: AppModel())
@@ -36,7 +49,11 @@ struct CruiseMeshApp: App {
                         termsAccepted = true
                     }
                 } else if onboardingCompleted {
-                    ChatListView(identity: appModel.identity, appModel: appModel)
+                    ChatListView(
+                        identity: appModel.identity,
+                        appModel: appModel,
+                        appearance: appearanceBinding
+                    )
                 } else {
                     OnboardingView(identity: appModel.identity, appModel: appModel) {
                         onboardingCompleted = true
@@ -45,6 +62,7 @@ struct CruiseMeshApp: App {
             }
             .environmentObject(appModel)
             .defaultAppStorage(AppDefaults.current)
+            .preferredColorScheme(appearance.colorScheme)
             .onAppear {
                 guard !UITestConfiguration.isEnabled else { return }
                 UNUserNotificationCenter.current().delegate = NotificationDelegate.shared

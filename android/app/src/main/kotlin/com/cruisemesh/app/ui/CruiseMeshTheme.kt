@@ -87,9 +87,10 @@ private val CruiseMeshDarkColors = darkColorScheme(
 
 @Composable
 fun CruiseMeshTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
+    appearance: AppearancePreference = AppearancePreference.SYSTEM,
     content: @Composable () -> Unit
 ) {
+    val darkTheme = appearance.resolvesDark(isSystemInDarkTheme())
     CompositionLocalProvider(
         LocalReachabilityPalette provides if (darkTheme) DarkReachabilityPalette else LightReachabilityPalette,
     ) {
