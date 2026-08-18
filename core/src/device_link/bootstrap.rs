@@ -86,7 +86,18 @@ const LINK_BOOTSTRAP_MAGIC: &[u8; 8] = b"CMBOOT1\0";
 /// understand would import an unauthenticated export while believing itself
 /// safe. So the version moves, and every build refuses the other's bytes
 /// outright. Nothing has shipped, so nothing in the field is stranded by it.
-pub const LINK_BOOTSTRAP_VERSION: u16 = 2;
+///
+/// **Version 3** adds [`SECTION_PROFILE`]: the person's own display name,
+/// photo and photo revision. It is a version bump rather than a skippable
+/// section for the same mechanical reason v2 was, one level down —
+/// [`core_link_bootstrap_verify`] re-serializes [`bootstrap_prefix`] from the
+/// DECODED struct, so a build that skipped a content section it did not
+/// understand would recompute a prefix without it and fail the signature with a
+/// confusing "malformed". Moving the version makes the refusal the intended
+/// one: a v2 build handed a v3 export gets [`CoreError::UnsupportedLink`], which
+/// says "update the app". Multi-device has not shipped, so nothing in the field
+/// is stranded; two debug phones must take the build together.
+pub const LINK_BOOTSTRAP_VERSION: u16 = 3;
 
 /// How long a signed bootstrap stands by default, from the moment it is built.
 /// A ceremony is a person holding two phones; an export that is still valid an
@@ -115,6 +126,10 @@ const SECTION_ROSTER: u8 = 0x02;
 const SECTION_CONTACTS: u8 = 0x03;
 const SECTION_GROUPS: u8 = 0x04;
 const SECTION_HISTORY_HEAD: u8 = 0x05;
+/// The person's own profile (v3). Written last among the *content* sections and
+/// therefore inside the signed prefix — an unsigned name riding an authenticated
+/// export would be a name any relay of the ceremony could rewrite.
+const SECTION_PROFILE: u8 = 0x07;
 /// The authentication trailer (v2). Always last and never skippable: everything
 /// before it is what the signature covers, so its position is load-bearing
 /// rather than tidy, and a decode that did not find one is a decode that found
@@ -145,6 +160,43 @@ pub struct LinkBootstrapPerson {
     pub inbox_agree_sk: Vec<u8>,
 }
 
+/// **The person's own profile, as their other phone already holds it** (§9.3).
+///
+/// A linked device is the same person, so it opens onto their name and their
+/// photo rather than onto an empty "what would you like to go by?" field. Two
+/// doors out of first-run setup — restore a `.cmbak`, or link as a new device —
+/// must not land somebody in two different states, and the restore door has
+/// carried exactly these three values all along
+/// ([`CoreBackupPayload`](crate::CoreBackupPayload)'s `display_name`,
+/// `own_avatar`, `own_avatar_epoch`). The field trio deliberately mirrors it, so
+/// both shells reuse the stores they already write on restore.
+///
+/// Core keeps no profile row: this is a passthrough, exactly like
+/// [`LinkBootstrapPerson`]. The shells own the name and the photo, and this is
+/// the one channel that carries them between two devices of one person.
+///
+/// # Why this is not a privacy widening
+///
+/// It crosses one Noise channel between two phones of the same person, sealed to
+/// it, and it is a person's own name and their own photo — the same SYNC-3
+/// argument the module makes about carrying their contacts. No keys, no
+/// endpoints, no third party. DL-5 is untouched: nothing here describes a
+/// network.
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct LinkBootstrapProfile {
+    /// What this person goes by. `None` on a person who never set one, which
+    /// leaves the new device asking the same question it asks today.
+    pub display_name: Option<String>,
+    /// The profile photo as the backup carries it — a normalized JPEG, empty
+    /// when there is none.
+    pub avatar: Vec<u8>,
+    /// The photo's revision, in the epoch ordering profile sync already uses.
+    /// Carried across rather than re-stamped with "now": a linked device that
+    /// minted a fresher epoch for a photo it did not change would win the
+    /// profile-sync race against its own fleet.
+    pub avatar_epoch: i64,
+}
+
 /// One contact and what this person knows about that contact's devices.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct LinkBootstrapContact {
@@ -170,6 +222,8 @@ pub struct LinkBootstrap {
     pub groups: Vec<Group>,
     /// Recent messages, newest chats and all, as §9.3's "recent history head".
     pub history_head: Vec<StoredMessage>,
+    /// The person's own name and photo (v3). See [`LinkBootstrapProfile`].
+    pub profile: LinkBootstrapProfile,
     /// The Noise handshake hash of the ceremony this export was made for
     /// ([`CoreLinkSummary::channel_binding`](super::ceremony::CoreLinkSummary)).
     /// The new device refuses a bootstrap whose binding is not the one it
@@ -269,6 +323,12 @@ fn bootstrap_prefix(bootstrap: &LinkBootstrap) -> Vec<u8> {
         push_message(&mut history, message);
     }
     push_section(&mut out, SECTION_HISTORY_HEAD, &history);
+
+    let mut profile = Vec::new();
+    push_optional_text(&mut profile, bootstrap.profile.display_name.as_ref());
+    push_bytes(&mut profile, &bootstrap.profile.avatar);
+    profile.extend_from_slice(&bootstrap.profile.avatar_epoch.to_be_bytes());
+    push_section(&mut out, SECTION_PROFILE, &profile);
     out
 }
 
@@ -343,6 +403,7 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<LinkBootstrap, CoreError>
     let mut contacts = Vec::new();
     let mut groups = Vec::new();
     let mut history_head = Vec::new();
+    let mut profile = LinkBootstrapProfile::default();
     let mut auth = None;
     while !reader.done() {
         let tag = reader.u8()?;
@@ -384,6 +445,13 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<LinkBootstrap, CoreError>
                     history_head.push(section.message()?);
                 }
             }
+            SECTION_PROFILE => {
+                profile = LinkBootstrapProfile {
+                    display_name: section.optional_text()?,
+                    avatar: section.bytes_field()?,
+                    avatar_epoch: section.i64()?,
+                };
+            }
             SECTION_AUTH => {
                 auth = Some((
                     section.take(CHANNEL_BINDING_LEN)?.to_vec(),
@@ -412,6 +480,7 @@ pub(crate) fn decode_bootstrap(bytes: &[u8]) -> Result<LinkBootstrap, CoreError>
         contacts,
         groups,
         history_head,
+        profile,
         channel_binding,
         expires_at_ms,
         signer_sign_pk,
@@ -588,6 +657,12 @@ impl MessageStore {
     /// person root SIGNING secret is not read here and never leaves the
     /// encrypted backup (§14.2).
     ///
+    /// `profile` is the person's own name and photo, passed in rather than read
+    /// because core keeps no profile row — the shells own it, exactly as they
+    /// own `identity`. Pass [`LinkBootstrapProfile::default`] only for a person
+    /// who genuinely has neither; an empty one here is what leaves the adopted
+    /// phone asking a person their own name.
+    ///
     /// `history_head_per_chat` bounds the head — pass 0 for
     /// [`LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT`]. Everything older is WP4's
     /// catch-up, not this ceremony's.
@@ -604,6 +679,7 @@ impl MessageStore {
     pub fn build_link_bootstrap(
         &self,
         identity: crate::Identity,
+        profile: LinkBootstrapProfile,
         roster: Roster,
         approving_device_sign_sk: Vec<u8>,
         channel_binding: Vec<u8>,
@@ -679,6 +755,7 @@ impl MessageStore {
             contacts,
             groups,
             history_head,
+            profile,
             channel_binding,
             expires_at_ms,
             signer_sign_pk,
@@ -1083,6 +1160,11 @@ mod tests {
                 payload: b"hi".to_vec(),
                 sender_device_id: crate::LEGACY_DEVICE_ID.to_vec(),
             }],
+            profile: LinkBootstrapProfile {
+                display_name: Some("Ada".to_string()),
+                avatar: vec![0xEE; 24],
+                avatar_epoch: 1_754_000_000_000,
+            },
             channel_binding: BINDING.to_vec(),
             expires_at_ms: EXPIRES_AT_MS,
             signer_sign_pk: SIGNER_PK.to_vec(),
@@ -1108,10 +1190,16 @@ mod tests {
     /// sqlite clone" has to mean in practice for two builds to agree.
     ///
     /// **Edited deliberately for version 2** (the authenticated form): the
-    /// version word moves from `0001` to `0002` and the payload grows by the
+    /// version word moved from `0001` to `0002` and the payload grew by the
     /// [`SECTION_AUTH`] trailer — 32 bytes of channel binding, 8 of expiry, 32
     /// of signer key, 64 of signature, plus the section's own 5-byte header.
-    /// That is the change; anything else that moves this digest is not.
+    ///
+    /// **Edited deliberately again for version 3**: the version word moves to
+    /// `0003` and one [`SECTION_PROFILE`] block joins the signed prefix, between
+    /// the history head and the trailer — the optional-name flag and its framed
+    /// bytes, the framed avatar, and 8 bytes of avatar epoch, plus the section's
+    /// own 5-byte header. That is the change; anything else that moves this
+    /// digest is not.
     #[test]
     fn golden_link_bootstrap_payload() {
         let encoded = encode_bootstrap(&fixture()).unwrap();
@@ -1119,7 +1207,7 @@ mod tests {
         // section's tag and length.
         assert_eq!(
             hex(&encoded[..LINK_BOOTSTRAP_MAGIC.len() + 2 + 8 + 1 + 4]),
-            "434d424f4f54310000020000019\
+            "434d424f4f54310000030000019\
              89e26ce000100000088"
                 .replace(['\\', '\n', ' '], "")
         );
@@ -1141,10 +1229,10 @@ mod tests {
             EXPIRES_AT_MS
         );
         // And the whole payload, by digest, so every later byte is pinned too.
-        assert_eq!(encoded.len(), 962 + 5 + auth_len);
+        assert_eq!(encoded.len(), 1011 + 5 + auth_len);
         assert_eq!(
             digest(&encoded),
-            "312619b63d13ae7a7dc11f02bfdfaf6a7e0b277430cab58164a7104e237beba7"
+            "707910f4556908692725139ae0158f131e511023465a95809dfff783bed8285d"
         );
     }
 
@@ -1152,6 +1240,86 @@ mod tests {
     fn bootstrap_round_trips_every_field() {
         let encoded = encode_bootstrap(&fixture()).unwrap();
         assert_eq!(decode_bootstrap(&encoded).unwrap(), fixture());
+    }
+
+    /// **§9.3, v3: the export carries the person's own name and photo**, so an
+    /// adopted phone opens onto the person it belongs to instead of asking them
+    /// what they would like to go by. And it carries them INSIDE the signature —
+    /// an unsigned name riding an authenticated export would be a name anything
+    /// between the two phones could rewrite.
+    #[test]
+    fn the_export_carries_the_person_profile_and_signs_it() {
+        use crate::device_roster::generate_device_keypair;
+        use crate::identity::generate_identity;
+
+        let identity = generate_identity();
+        let approving = generate_device_keypair();
+        let store = crate::MessageStore::open(":memory:".to_string()).unwrap();
+        let roster = super::super::activation::core_link_genesis_roster(
+            identity.sign_sk.clone(),
+            approving.sign_pk.clone(),
+            approving.agree_pk.clone(),
+        )
+        .unwrap();
+        let profile = LinkBootstrapProfile {
+            display_name: Some("Ada".to_string()),
+            avatar: vec![0xA7; 64],
+            avatar_epoch: 1_754_000_000_000,
+        };
+
+        let now = 1_755_000_000_000_i64;
+        let bootstrap = store
+            .build_link_bootstrap(
+                identity,
+                profile.clone(),
+                roster,
+                approving.sign_sk.clone(),
+                BINDING.to_vec(),
+                0,
+                0,
+                now,
+            )
+            .unwrap();
+        let arrived = decode_bootstrap(&encode_bootstrap(&bootstrap).unwrap()).unwrap();
+        assert_eq!(arrived.profile, profile);
+        assert!(core_link_bootstrap_verify(arrived.clone(), BINDING.to_vec(), now).is_ok());
+
+        for tampered in [
+            LinkBootstrapProfile {
+                display_name: Some("Not Ada".to_string()),
+                ..profile.clone()
+            },
+            LinkBootstrapProfile {
+                avatar: vec![0x00; 64],
+                ..profile.clone()
+            },
+            LinkBootstrapProfile {
+                avatar_epoch: profile.avatar_epoch + 1,
+                ..profile.clone()
+            },
+        ] {
+            let mut forged = arrived.clone();
+            forged.profile = tampered;
+            assert!(
+                core_link_bootstrap_verify(forged, BINDING.to_vec(), now).is_err(),
+                "the profile must be inside the approving device's signature"
+            );
+        }
+    }
+
+    /// A person who never set a name or a photo exports an absent one, and it
+    /// survives the codec as absent rather than as an empty string — the new
+    /// device then asks the question it asks today, which is the honest
+    /// fallback rather than a blank name silently adopted.
+    #[test]
+    fn an_absent_profile_round_trips_as_absent() {
+        let blank = LinkBootstrap {
+            profile: LinkBootstrapProfile::default(),
+            ..fixture()
+        };
+        let arrived = decode_bootstrap(&encode_bootstrap(&blank).unwrap()).unwrap();
+        assert_eq!(arrived.profile, LinkBootstrapProfile::default());
+        assert_eq!(arrived.profile.display_name, None);
     }
 
     /// An export that was never signed must not reach a channel, and an export
@@ -1203,6 +1371,7 @@ mod tests {
         let bootstrap = store
             .build_link_bootstrap(
                 identity.clone(),
+                fixture().profile,
                 roster.clone(),
                 approving.sign_sk.clone(),
                 BINDING.to_vec(),
@@ -1250,6 +1419,7 @@ mod tests {
         assert!(store
             .build_link_bootstrap(
                 identity,
+                LinkBootstrapProfile::default(),
                 roster,
                 sibling.sign_sk.clone(),
                 BINDING.to_vec(),

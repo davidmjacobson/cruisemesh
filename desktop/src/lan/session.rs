@@ -383,6 +383,12 @@ async fn read_frames<R: AsyncRead + Unpin>(
                 )?;
             }
             Frame::TransportProbe { .. } => {}
+            // §10 step 5's own-roster notice. The desktop is not a linked
+            // device yet (WP7): it has no own roster to converge, and no person
+            // identity of its own to run the sender test `encode_own_roster`
+            // requires. Dropped rather than half-handled, because applying a
+            // roster without that test is the one thing that frame forbids.
+            Frame::OwnRoster { .. } => {}
         }
     }
 }

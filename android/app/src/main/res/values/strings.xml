@@ -849,7 +849,7 @@
     <string name="ui_remove_device">Remove</string>
     <string name="ui_remove_device_named">Remove %1$s</string>
     <string name="ui_remove_this_device_question">Remove this device?</string>
-    <string name="ui_remove_device_what_happens">%1$s will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on.</string>
+    <string name="ui_remove_device_what_happens">%1$s stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.</string>
     <string name="ui_remove_device_what_survives">Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it.</string>
     <string name="ui_remove_device_cannot_undo">You cannot undo this. If you use that device again later, set it up as a new device.</string>
     <string name="ui_removing_device">Removing…</string>
@@ -868,6 +868,15 @@
     <string name="ui_remove_device_not_caught_up">This device has not caught up with an earlier change yet. Let it get online, then try again.</string>
     <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.</string>
     <string name="ui_remove_device_failed">Something went wrong and nothing was changed. Try again.</string>
+
+    <!-- What the removed phone itself shows (§10 step 5). It finds out the next
+         time it meets one of the devices that is still yours, and from then on
+         this is the whole app. No button: joining again means a fresh install,
+         so offering one here would offer something that cannot work. -->
+    <string name="ui_this_device_was_removed">This device was removed</string>
+    <string name="ui_this_device_was_removed_detail">This phone was removed from your devices, using another device of yours. It has stopped sending and receiving messages.</string>
+    <string name="ui_this_device_was_removed_elsewhere">Your contacts, groups and messages are still on the devices you kept.</string>
+    <string name="ui_this_device_was_removed_set_up_again">To use this phone again, uninstall CruiseMesh, install it again, and set it up as a new device.</string>
 
     <!-- Restore, which is now two different things (§9's closing paragraph). -->
     <string name="ui_what_is_this_phone">What is this device?</string>

@@ -17,16 +17,28 @@ use cruisemesh_core::{
     core_link_bootstrap_chunks, core_link_bootstrap_decode, core_link_bootstrap_encode,
     core_link_bootstrap_join, core_link_device_offer, core_link_genesis_roster,
     core_link_open_activation_ack, core_link_open_device_offer, core_link_sign_new_device_roster,
-    core_roster_head_hash, generate_device_keypair, generate_identity, Contact,
-    CoreInboundDisposition, CoreLinkActionKind, CoreLinkActivationStage, CoreLinkApprovingDevice,
-    CoreLinkGatedAction, CoreLinkNewDevice, CoreLinkOutcome, CoreRelayEnvelopeDisposition,
-    DeviceKeypair, Group, Identity, LinkBootstrap, MessageStore, Roster, StoredMessage, KIND_TEXT,
-    LEGACY_DEVICE_ID,
+    core_mint_inbox_key, core_revoke_devices_roster, core_roster_head_hash,
+    generate_device_keypair, generate_identity, parse_frame, Contact, CoreInboundDisposition,
+    CoreLinkActionKind, CoreLinkActivationStage, CoreLinkApprovingDevice, CoreLinkGatedAction,
+    CoreLinkNewDevice, CoreLinkOutcome, CoreRelayEnvelopeDisposition, DeviceKeypair, Frame, Group,
+    Identity, LinkBootstrap, LinkBootstrapProfile, MessageStore, RevocationAdoptionOutcome, Roster,
+    StoredMessage, KIND_TEXT, LEGACY_DEVICE_ID,
 };
 
 const NOW: i64 = 1_755_000_000_000;
 /// A stand-in channel binding for the cases that never run a ceremony.
 const BINDING: [u8; 32] = [0x7C; 32];
+
+/// The person's own name and photo, as their first phone holds them. Non-empty
+/// on purpose: §9.3's export is supposed to carry these across, and a fixture
+/// full of defaults could not tell "carried" from "dropped".
+fn person_profile() -> LinkBootstrapProfile {
+    LinkBootstrapProfile {
+        display_name: Some("Ada".to_string()),
+        avatar: vec![0xA7; 32],
+        avatar_epoch: 1_754_000_000_000,
+    }
+}
 
 /// The person as their first phone knows them: an identity, a roster naming
 /// that phone as the approving device, and a store with something in it worth
@@ -331,6 +343,7 @@ fn a_new_device_is_silent_until_it_has_acknowledged_the_roster() {
         .store
         .build_link_bootstrap(
             approving.identity.clone(),
+            person_profile(),
             update.roster.clone(),
             approving.device.sign_sk.clone(),
             binding.clone(),
@@ -641,6 +654,7 @@ fn an_import_refuses_the_wrong_person_and_the_wrong_ceremony() {
         .store
         .build_link_bootstrap(
             approving.identity.clone(),
+            person_profile(),
             update.roster.clone(),
             approving.device.sign_sk.clone(),
             binding.clone(),
@@ -739,6 +753,7 @@ fn a_bootstrap_for_another_device_does_not_activate_this_one() {
         .store
         .build_link_bootstrap(
             approving.identity.clone(),
+            person_profile(),
             update.roster,
             approving.device.sign_sk.clone(),
             BINDING.to_vec(),
@@ -768,4 +783,146 @@ fn a_bootstrap_for_another_device_does_not_activate_this_one() {
         .import_link_bootstrap(forged, intended.sign_pk.clone(), None, NOW)
         .is_err());
     assert!(store.list_contacts().unwrap().is_empty());
+}
+
+/// **§10 step 5, end to end.** A phone that really went through §9.4 — window,
+/// bootstrap, exact-head acknowledgement, activated — is removed on the
+/// approving phone, meets it again, reads the roster that buries it, and stops.
+///
+/// This is the field session's finding written as a test. What was observed was
+/// a removed Pixel 7 still holding the pre-revocation roster and still saying
+/// "Mesh on" four minutes later on the same Wi-Fi as its approver, with no
+/// contacts and no Shore Pass — so neither contact gossip nor a relay refusal
+/// existed to tell it. The notice is the carrier that does.
+///
+/// It also pins the other half of the ceremony this task touched: §9.3 now
+/// carries the person's own name and photo, so the adopted phone knows who it
+/// belongs to instead of asking.
+#[test]
+fn a_removed_device_ejects_itself_when_the_roster_reaches_it() {
+    let approving = approving_device();
+    let newcomer_device = generate_device_keypair();
+    let newcomer_store = MessageStore::open(":memory:".to_string()).unwrap();
+
+    // ---- §9: linked ----------------------------------------------------
+    let update = core_link_sign_new_device_roster(
+        approving.roster.clone(),
+        approving.identity.sign_pk.clone(),
+        approving.device.sign_sk.clone(),
+        newcomer_device.sign_pk.clone(),
+        newcomer_device.agree_pk.clone(),
+    )
+    .unwrap();
+    let bootstrap = approving
+        .store
+        .build_link_bootstrap(
+            approving.identity.clone(),
+            person_profile(),
+            update.roster.clone(),
+            approving.device.sign_sk.clone(),
+            BINDING.to_vec(),
+            0,
+            0,
+            NOW,
+        )
+        .unwrap();
+    newcomer_store
+        .begin_link_activation(BINDING.to_vec(), NOW)
+        .unwrap();
+    let import = newcomer_store
+        .import_link_bootstrap(bootstrap, newcomer_device.sign_pk.clone(), None, NOW + 1)
+        .unwrap();
+    assert_eq!(
+        import.profile,
+        person_profile(),
+        "§9.3 carries the person's own name and photo across, so the adopted phone \
+         never asks a person who they are"
+    );
+    newcomer_store
+        .complete_link_activation(import.roster_head.clone(), NOW + 2)
+        .unwrap();
+    approving
+        .store
+        .adopt_own_roster(
+            update.roster.clone(),
+            approving.identity.sign_pk.clone(),
+            approving.device.device_id.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        newcomer_store.own_device_fleet().unwrap().device_ids.len(),
+        2
+    );
+
+    // ---- §10.1: "Remove device", on the approving phone -----------------
+    let removal = core_revoke_devices_roster(
+        update.roster.clone(),
+        approving.identity.sign_pk.clone(),
+        approving.device.sign_sk.clone(),
+        vec![newcomer_device.device_id.clone()],
+        core_mint_inbox_key(update.roster.inbox_key_generation),
+    )
+    .unwrap();
+    approving
+        .store
+        .adopt_own_roster(
+            removal.roster.clone(),
+            approving.identity.sign_pk.clone(),
+            approving.device.device_id.clone(),
+        )
+        .unwrap();
+
+    // ---- §10 step 5: the two phones meet --------------------------------
+    // The approver pushes what it holds. Only ever on a link that has already
+    // proved it belongs to this person — that test is the shell's, and it is
+    // the whole safety of the frame.
+    let frame = approving.store.own_roster_notice_frame().unwrap().unwrap();
+    let document = match parse_frame(frame).unwrap() {
+        Frame::OwnRoster { document } => document,
+        other => panic!("own roster notice parsed as {other:?}"),
+    };
+    let adoption = newcomer_store
+        .apply_own_roster_notice(
+            document,
+            approving.identity.sign_pk.clone(),
+            newcomer_device.device_id.clone(),
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(adoption.outcome, RevocationAdoptionOutcome::RevokedSelf);
+    assert_eq!(
+        adoption.revoked_device_ids,
+        vec![newcomer_device.device_id.clone()]
+    );
+
+    // ---- Silent again, through the same probe §9.4's window is proven by --
+    assert_eq!(
+        newcomer_store.link_activation().unwrap().stage,
+        CoreLinkActivationStage::Revoked
+    );
+    let silent = probe(
+        &newcomer_store,
+        &approving.identity,
+        &approving.contact,
+        &newcomer_device.device_id,
+    );
+    assert!(!silent.authored, "a removed device authored a message");
+    assert!(
+        silent.acked.is_empty(),
+        "a removed device planned an ack: {:?}",
+        silent.acked
+    );
+    assert_eq!(silent.fetch_hints, 0, "a removed device published hints");
+    assert_eq!(silent.carry_offers, 0, "a removed device offered carry");
+    assert_eq!(silent.spray_lanes, 0, "a removed device sprayed a digest");
+    assert_eq!(silent.upload_rows, 0, "a removed device planned relay rows");
+    // And it no longer reports a fleet it is not in — the exact field symptom.
+    let fleet = newcomer_store.own_device_fleet().unwrap();
+    assert_eq!(fleet.own_device_id, None);
+    assert!(fleet.device_ids.is_empty());
+    assert_eq!(fleet.projected_from, removal.roster.version());
+    assert_eq!(
+        newcomer_store.own_roster().unwrap(),
+        Some(removal.roster.clone())
+    );
 }

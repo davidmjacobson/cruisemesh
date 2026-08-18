@@ -2,6 +2,7 @@ package com.cruisemesh.app.devicelink
 
 import android.Manifest
 import android.content.pm.PackageManager
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
@@ -73,6 +74,10 @@ import uniffi.cruisemesh_core.Identity
  * The code on screen carries ephemeral link material and rendezvous hints only —
  * §9.1's rule, enforced in core, and the reason this screen may show a QR at
  * all. Nothing here reads, renders or logs an identity secret.
+ *
+ * @param onLinked where a phone that was just adopted goes: into the app, never
+ *   back the way it came. See [LinkCompletion] for who this is for and why the
+ *   other endings must not use it.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,6 +86,7 @@ fun AddDeviceScreen(
     role: CoreLinkRole,
     expectedPersonId: ByteArray? = null,
     onBack: () -> Unit,
+    onLinked: () -> Unit = onBack,
 ) {
     val context = LocalContext.current
     val session = remember(identity.userId, role) {
@@ -110,13 +116,27 @@ fun AddDeviceScreen(
     val canApprove = remember(identity.userId) {
         role != CoreLinkRole.APPROVING_DEVICE || session.canSignRoster()
     }
+    // Every way out of this screen, not just the button. A phone that has been
+    // adopted is set up, and the back arrow and the system back gesture must
+    // not be the two doors that land it back on first-run setup -- which is
+    // exactly what the 2026-08-18 two-phone session saw: step 1 again, still
+    // offering "This is another of my devices", then asking a linked person
+    // their own name. [LinkCompletion] decides, once, for all three.
+    val onExit = {
+        // Read before closing: the answer is about the run that just ended, and
+        // nothing a teardown does afterwards may change it.
+        val entersApp = LinkCompletion.entersApp(role, state.step)
+        session.close()
+        if (entersApp) onLinked() else onBack()
+    }
+    BackHandler(onBack = onExit)
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text(stringResource(R.string.ui_add_a_device)) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = onExit) {
                         Icon(
                             Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = stringResource(R.string.ui_back),
@@ -158,10 +178,11 @@ fun AddDeviceScreen(
                     state = state,
                     onAnswer = session::answerDigits,
                     onStop = session::cancel,
-                    onFinish = {
-                        session.close()
-                        onBack()
-                    },
+                    // One ending, two meanings: a phone that was just adopted is
+                    // set up and belongs in the app, and everything else belongs
+                    // back where it came from. Shared with the back arrow and
+                    // the system back gesture so no exit can disagree.
+                    onFinish = onExit,
                 )
             }
         }

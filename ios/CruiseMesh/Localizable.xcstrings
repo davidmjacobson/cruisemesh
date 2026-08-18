@@ -131,6 +131,16 @@
         }
       }
     },
+    "%@ stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
+          }
+        }
+      }
+    },
     "%@ storage is full": {
       "localizations": {
         "en": {
@@ -177,16 +187,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ was reachable · %@"
-          }
-        }
-      }
-    },
-    "%@ will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "%@ will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on."
           }
         }
       }
@@ -3013,6 +3013,16 @@
         }
       }
     },
+    "This device was removed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This device was removed"
+          }
+        }
+      }
+    },
     "This is another of my devices": {
       "localizations": {
         "en": {
@@ -3083,12 +3093,32 @@
         }
       }
     },
+    "This phone was removed from your devices, using another device of yours. It has stopped sending and receiving messages.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone was removed from your devices, using another device of yours. It has stopped sending and receiving messages."
+          }
+        }
+      }
+    },
     "Ticks mean any one of their %lld devices got it.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Ticks mean any one of their %lld devices got it."
+          }
+        }
+      }
+    },
+    "To use this phone again, remove the app, install it again, and set it up as a new device.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "To use this phone again, remove the app, install it again, and set it up as a new device."
           }
         }
       }
@@ -5585,6 +5615,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your contacts will be told as they come back into range. Your other devices catch up the next time they are online."
+          }
+        }
+      }
+    },
+    "Your contacts, groups and messages are still on the devices you kept.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your contacts, groups and messages are still on the devices you kept."
           }
         }
       }

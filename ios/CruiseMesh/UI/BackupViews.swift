@@ -160,7 +160,14 @@ struct BackupExportView: View {
 /// Both branches are core's `CoreRestorePlan`, not this screen's opinion. What
 /// this screen owes is the words and the ordering, and it takes both from there.
 struct BackupRestoreView: View {
+    /// A restore was written and is waiting for the relaunch that installs it.
     var onStaged: () -> Void = {}
+    /// This phone was adopted by another device of the person's, through the
+    /// "Set up as a new device" fork below. Separate from `onStaged` because the
+    /// two land in different places: a staged restore asks for a relaunch before
+    /// it means anything, while an adoption is live the moment the ceremony ends
+    /// and the person belongs in the app (§9's closing paragraph).
+    var onAdopted: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
     @State private var file = Data()
     @State private var fileName = ""
@@ -275,8 +282,13 @@ struct BackupRestoreView: View {
                     identity: IdentityStore.loadOrCreate(),
                     role: .newDevice,
                     expectedPersonId: linkPersonId,
-                    onFinished: {
-                        onStaged()
+                    // A run that did not adopt this phone leaves the restore
+                    // screen exactly as it found it -- `AddDeviceView` pops
+                    // itself and the file the person opened is still there.
+                    // Until this changed, every ending marked first-run setup
+                    // complete, a ceremony that failed included.
+                    onLinked: {
+                        onAdopted()
                         dismiss()
                     }
                 )

@@ -169,20 +169,21 @@
 
 use cruisemesh_core::{
     compute_recipient_hint, core_derive_device_id, core_device_add_outcome,
-    core_device_namespace_id, core_device_stream_id, core_encode_sync_history,
+    core_device_namespace_id, core_device_stream_id, core_encode_roster, core_encode_sync_history,
     core_open_sync_record, core_own_capabilities, core_plan_sync_backfill, core_relay_ack_ids,
     core_roster_validate, core_seal_sync_record, core_should_ack_inbound, core_sign_device_cert,
     core_sign_roster, core_sign_sync_record, core_sync_digest_gaps, decode_extended_message_body,
     device_fanout_msg_id, encode_envelope_frame, encode_message_body, encode_message_body_extended,
-    generate_device_keypair, generate_identity, open_message, seal_message, CarriedEnvelope,
-    Contact, ContactDeviceState, ContactSafetyReason, CoreDeliveryVerdict,
-    CoreDiscoveryPolicyState, CoreInboundDisposition, CoreRelayEnvelopeDisposition,
-    DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceTombstone, ExtendedMessageBody, Identity,
-    InboxKey, IncomingMessageInsertOutcome, MessageArrival, MessageBody, MessageStore,
-    OutboundAuthorDecision, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateOutcome,
-    RosterUpdateReason, StoredMessage, SyncBackfillAction, SyncRecord, SyncRecordKind,
-    CAP_MULTI_DEVICE, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN,
-    DEVICE_SOFT_CAP, KIND_TEXT, LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
+    encode_own_roster, generate_device_keypair, generate_identity, open_message, parse_frame,
+    seal_message, CarriedEnvelope, Contact, ContactDeviceState, ContactSafetyReason,
+    CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreInboundDisposition, CoreLinkActivationStage,
+    CoreLinkGateReason, CoreLinkGatedAction, CoreRelayEnvelopeDisposition, DeviceAddOutcome,
+    DeviceCert, DeviceKeypair, DeviceTombstone, ExtendedMessageBody, Frame, Identity, InboxKey,
+    IncomingMessageInsertOutcome, MessageArrival, MessageBody, MessageStore,
+    OutboundAuthorDecision, OwnDeviceFleet, RevocationAdoptionOutcome, Roster, RosterRejection,
+    RosterUpdateOutcome, RosterUpdateReason, StoredMessage, SyncBackfillAction, SyncRecord,
+    SyncRecordKind, CAP_MULTI_DEVICE, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP,
+    DEVICE_ID_LEN, DEVICE_SOFT_CAP, KIND_TEXT, LEGACY_DEVICE_ID as CORE_LEGACY_DEVICE_ID,
     SYNC_OUTBOUND_DEDUP_WINDOW_MS,
 };
 use ed25519_dalek::SigningKey;
@@ -387,6 +388,22 @@ enum Scenario {
     AddDevice {
         resulting_device_count: u8,
     },
+    /// §10 step 5, WP5 follow-up: the device a roster BURIES meets its fleet
+    /// again and is handed that roster on the link.
+    ///
+    /// The field session that produced this vector is worth restating, because
+    /// the gap it found was a spec gap rather than a slow path: a removed phone
+    /// with no contacts and no Shore Pass sat four minutes on the same Wi-Fi as
+    /// its approver, still holding the pre-revocation roster and still saying
+    /// "Mesh on". Every carrier v1 had was addressed to a set that phone was
+    /// not in, so no amount of waiting would ever have converged it.
+    RevokedDeviceMeetsTheFleet {
+        /// Whether the document on the link really is this person's, signed
+        /// back to their root. `false` is the forgery the frame must refuse:
+        /// the notice is authenticated by the DOCUMENT, never by the link that
+        /// carried it.
+        notice_is_person_signed: bool,
+    },
 }
 
 /// The vocabulary this file's targets and driver results are written in.
@@ -461,6 +478,10 @@ enum Outcome {
     /// revocation, in core reason codes. What a family member reads is WP6's.
     ContactSafetyStateRaised,
     Advertised,
+    /// §10 step 5: the buried device stops. It stores the roster that removed
+    /// it, clears the fleet projection routing and acks read, and shuts the
+    /// §9.4 gate on advertising, authoring and acking alike.
+    RevokedDeviceEjectsItself,
     DeviceAdded,
     DeviceAddedWithWarning,
     DeviceAddRefused,
@@ -969,6 +990,26 @@ const VECTORS: &[Vector] = &[
         target_outcome: Outcome::DeviceAddRefused,
         implemented: true,
     },
+    // §10 step 5. Appended at the end, per this file's rules: the pinned tables
+    // are append-only and nothing above moved.
+    Vector {
+        id: "MD-REVOKE-SELF-EJECTS",
+        scenario: Scenario::RevokedDeviceMeetsTheFleet {
+            notice_is_person_signed: true,
+        },
+        target_outcome: Outcome::RevokedDeviceEjectsItself,
+        implemented: true,
+    },
+    // The discriminator without which the vector above would pass for an
+    // implementation that ejected on any roster-shaped bytes at all.
+    Vector {
+        id: "MD-REVOKE-NOTICE-UNSIGNED-IGNORED",
+        scenario: Scenario::RevokedDeviceMeetsTheFleet {
+            notice_is_person_signed: false,
+        },
+        target_outcome: Outcome::Ignored,
+        implemented: true,
+    },
 ];
 
 /// The one pinned table of every vector's target outcome. Editing any
@@ -1055,6 +1096,8 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
     ("MD-DEVICE-CAP-9", Outcome::DeviceAddedWithWarning),
     ("MD-DEVICE-CAP-16", Outcome::DeviceAddedWithWarning),
     ("MD-DEVICE-CAP-17", Outcome::DeviceAddRefused),
+    ("MD-REVOKE-SELF-EJECTS", Outcome::RevokedDeviceEjectsItself),
+    ("MD-REVOKE-NOTICE-UNSIGNED-IGNORED", Outcome::Ignored),
 ];
 
 /// The pinned map of executed vector id -> what today's core actually does.
@@ -1101,6 +1144,14 @@ const PINNED_TARGETS: &[(&str, Outcome)] = &[
 /// — which stamps no device id at all — delivers exactly as it did before.
 /// `MD-STREAM-AUTHOR-UNLINKED` and `MD-STREAM-LEGACY-ID` are what keep that
 /// honest rather than hopeful.
+///
+/// WP5's follow-up appended `MD-REVOKE-SELF-EJECTS` and
+/// `MD-REVOKE-NOTICE-UNSIGNED-IGNORED` for §10 step 5, and again nothing
+/// already here moved. The claim that goes with them: step 5 only ever fires on
+/// a device a signed roster has BURIED, and no roster in the field has buried
+/// anything, so every peer on today's build behaves exactly as it did — a
+/// device that never linked has no own roster at all and refuses the notice
+/// before any rule is consulted.
 const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ROSTER-GREATER", Outcome::Accepted),
     ("MD-ROSTER-LOWER", Outcome::Ignored),
@@ -1170,6 +1221,8 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-DEVICE-CAP-9", Outcome::DeviceAddedWithWarning),
     ("MD-DEVICE-CAP-16", Outcome::DeviceAddedWithWarning),
     ("MD-DEVICE-CAP-17", Outcome::DeviceAddRefused),
+    ("MD-REVOKE-SELF-EJECTS", Outcome::RevokedDeviceEjectsItself),
+    ("MD-REVOKE-NOTICE-UNSIGNED-IGNORED", Outcome::Ignored),
 ];
 
 /// This person's wire identity (`person_id` in new code, `user_id` today).
@@ -3758,6 +3811,133 @@ fn drive(vector: &Vector) -> Option<Outcome> {
                 "a contact already holding the roster is not told again"
             );
             Outcome::ContactsLearnTheRoster
+        }
+        // §10 step 5, driven on the real store through the real frame: the
+        // approver's roster is encoded with the DL-3 wire codec, framed,
+        // parsed back, and handed to the buried device's own store. Nothing
+        // here is revocation-aware except the document.
+        Scenario::RevokedDeviceMeetsTheFleet {
+            notice_is_person_signed,
+        } => {
+            let (person, _kept, buried, before, after) = revoking_person();
+            let store = MessageStore::open(":memory:".to_string()).expect("in-memory store");
+            store
+                .adopt_own_roster(
+                    before.clone(),
+                    person.sign_pk.clone(),
+                    buried.device_id.clone(),
+                )
+                .expect("the buried device holds the pre-revocation roster");
+            contract_assert!(
+                vector.id,
+                store
+                    .link_gate(CoreLinkGatedAction::Advertise)
+                    .expect("gate")
+                    .allowed,
+                "before the news reaches it, a removed device behaves exactly as it always did"
+            );
+            contract_assert!(
+                vector.id,
+                store.own_device_fleet().expect("fleet").device_ids.len() == 2,
+                "and it still projects the fleet it was in"
+            );
+
+            let announced = if notice_is_person_signed {
+                after.clone()
+            } else {
+                // The best a forger can do: this person's real document, over a
+                // signature that is somebody else's.
+                let stranger = generate_identity();
+                core_sign_roster(after.clone(), stranger.sign_sk).expect("forged roster signs")
+            };
+            let frame = encode_own_roster(core_encode_roster(announced).expect("roster encodes"))
+                .expect("notice frames");
+            let document = match parse_frame(frame).expect("notice parses") {
+                Frame::OwnRoster { document } => document,
+                other => unreachable!("own roster notice parsed as {other:?}"),
+            };
+            // DL-5 on the bytes that really cross the link, not on the type.
+            for needle in [
+                b"http".as_slice(),
+                b"192.168".as_slice(),
+                b"relay".as_slice(),
+            ] {
+                contract_assert!(
+                    vector.id,
+                    !document
+                        .windows(needle.len())
+                        .any(|window| window == needle),
+                    "an own-roster notice carries keys, ids and counters -- never an address"
+                );
+            }
+            let adoption = store
+                .apply_own_roster_notice(
+                    document,
+                    person.sign_pk.clone(),
+                    buried.device_id.clone(),
+                    NOW_MS,
+                )
+                .expect("the notice is judged");
+
+            if !notice_is_person_signed {
+                contract_assert!(
+                    vector.id,
+                    adoption.outcome == RevocationAdoptionOutcome::Refused,
+                    "a roster the person root did not sign buries nobody"
+                );
+                contract_assert!(
+                    vector.id,
+                    store.own_roster().expect("roster").expect("held") == before
+                        && store.own_device_fleet().expect("fleet").device_ids.len() == 2
+                        && store
+                            .link_gate(CoreLinkGatedAction::Advertise)
+                            .expect("gate")
+                            .allowed,
+                    "and it changes nothing at all"
+                );
+                Outcome::Ignored
+            } else {
+                contract_assert!(
+                    vector.id,
+                    adoption.outcome == RevocationAdoptionOutcome::RevokedSelf
+                        && adoption.revoked_device_ids == vec![buried.device_id.clone()],
+                    "the buried device recognises itself in the document"
+                );
+                contract_assert!(
+                    vector.id,
+                    store.own_roster().expect("roster").expect("held") == after,
+                    "it stores the roster that removed it, so a replay is idempotent"
+                );
+                contract_assert!(
+                    vector.id,
+                    store.own_device_fleet().expect("fleet")
+                        == OwnDeviceFleet {
+                            own_device_id: None,
+                            device_ids: Vec::new(),
+                            projected_from: after.version(),
+                        },
+                    "the projection routing and acks read is cleared"
+                );
+                contract_assert!(
+                    vector.id,
+                    store.link_activation().expect("activation").stage
+                        == CoreLinkActivationStage::Revoked,
+                    "and the stage a shell surfaces says so"
+                );
+                for action in [
+                    CoreLinkGatedAction::Advertise,
+                    CoreLinkGatedAction::Author,
+                    CoreLinkGatedAction::Ack,
+                ] {
+                    let verdict = store.link_gate(action).expect("gate");
+                    contract_assert!(
+                        vector.id,
+                        !verdict.allowed && verdict.reason == CoreLinkGateReason::DeviceRevoked,
+                        "a removed device may not {action:?}"
+                    );
+                }
+                Outcome::RevokedDeviceEjectsItself
+            }
         }
         // Still data-only, and each for a mechanism reason rather than a shrug:
         // first-contact anchoring has no second source of truth to check an

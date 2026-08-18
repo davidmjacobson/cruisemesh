@@ -12,6 +12,12 @@ final class LanTransport {
     /// this phone dialed to get there, when there is one worth remembering --
     /// see `LanConnection.advertisedEndpoint`.
     var onAuthenticated: ((String, Data, LanManualEndpoint?) -> Void)?
+    /// A link whose Noise static key is this identity's own agreement key
+    /// (`specs/multi-device-v1.md` §10 step 5). Separate from `onAuthenticated`
+    /// because it is deliberately *not* a peer: the user id on the other end is
+    /// this person's own, and a route to this person leads straight back to this
+    /// phone.
+    var onOwnDeviceAuthenticated: ((String) -> Void)?
     var onDisconnected: ((String) -> Void)?
     var onFrame: ((String, Data) -> Void)?
 
@@ -660,8 +666,24 @@ final class LanTransport {
         }
     }
 
-    fileprivate func trustedUserId(for remoteStaticKey: Data) -> Data? {
-        trustedPeerForStaticKey(remoteStaticKey)
+    /// Who this handshake turned out to be: an accepted contact, a device of this
+    /// person's own, or nobody — in which case the link is refused exactly as it
+    /// always was.
+    ///
+    /// Before §10 step 5 the last two ended the same way — "not an accepted
+    /// contact", socket closed — and that is exactly what left a removed phone
+    /// sitting on the same Wi-Fi as the phone that removed it with no way to be
+    /// told. This person's own agreement key is the one thing that tells them
+    /// apart, and only a device holding this person's own secret can present it.
+    ///
+    /// `trustedPeerForStaticKey` is asked first and unchanged, so the clone
+    /// warning it raises on a key that is ours still happens exactly once, during
+    /// the handshake, whichever way this answers.
+    fileprivate func admit(remoteStaticKey: Data) -> LanAdmission? {
+        if let userId = trustedPeerForStaticKey(remoteStaticKey) { return .contact(userId) }
+        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey)
+        else { return nil }
+        return .ownDevice
     }
 
     /// Last line of defence against dialing this phone's own listener. Every
@@ -698,9 +720,43 @@ final class LanTransport {
         return hosts
     }
 
-    fileprivate func connectionAuthenticated(_ link: LanConnection, userId: Data) {
+    /// Keep `link` as the one live own-device link and close every other.
+    ///
+    /// A contact is bounded to a single link by `hasAuthenticatedLink`; a device
+    /// of this person's own carries no user id, so nothing bounded it at all.
+    /// That matters because the device most motivated to open several is the one
+    /// that was just removed: §10.1 rotates the inbox key, not the LAN Noise
+    /// static, so a removed phone -- or a `.cmbak` clone -- still presents the
+    /// key admitted here, and every link holds one of `maxConnections`. Filling
+    /// the table is the "block" leg of §10's threat model, and refusing the
+    /// handshake used to close it for free.
+    ///
+    /// One link is all §10 step 5 needs, and the newest wins rather than the
+    /// oldest so a half-dead link can never wedge the notice channel shut.
+    private func supersedeOtherOwnDeviceLinks(keeping link: LanConnection) {
+        // Snapshotted: closing a link removes it from `connections`, and the
+        // loop must not be walking the dictionary it is emptying.
+        for other in Array(connections.values) where other !== link && other.isOwnDevice {
+            log.info("Closing an older link to another device of ours")
+            other.close()
+        }
+    }
+
+    fileprivate func connectionAuthenticated(_ link: LanConnection, admission: LanAdmission) {
         guard started, connections[link.address] === link else {
             link.close()
+            return
+        }
+        // A device of this person's own is not a peer and is not filed as one: no
+        // user id, so no route, no entry in the counters that say how many
+        // friends are on this Wi-Fi, no reconnect target and no sweep credit. It
+        // is a link that exists to carry §10 step 5's device list and the HELLOs
+        // that precede it.
+        guard case .contact(let userId) = admission else {
+            log.info("Another device of ours is on this Wi-Fi")
+            supersedeOtherOwnDeviceLinks(keeping: link)
+            onOwnDeviceAuthenticated?(link.address)
+            scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
             return
         }
         log.info("Authenticated CruiseMesh peer over local Wi-Fi")
@@ -1175,6 +1231,11 @@ private final class LanConnection {
     /// The accepted contact this link authenticated as, for the transport's
     /// duplicate-link and unlinked-capable-contact checks.
     private(set) var authenticatedUserId: Data?
+    /// True when this link was admitted as a device of this person's own
+    /// (`LanAdmission.ownDevice`). Such a link is never filed under a user id,
+    /// so this flag is the only handle the transport has for capping it --
+    /// see `LanTransport.supersedeOtherOwnDeviceLinks`.
+    private(set) var isOwnDevice = false
     /// The Noise static key the peer proved it holds, captured as the
     /// handshake finishes so it stays readable after the session is closed.
     private(set) var remoteStaticKey: Data?
@@ -1326,10 +1387,13 @@ private final class LanConnection {
         case .awaitMessage2:
             try noise.readHandshakeMessage(message: packet)
             guard let remoteStatic = noise.remoteStaticKey(),
-                  let userId = owner?.trustedUserId(for: remoteStatic) else {
+                  let admission = owner?.admit(remoteStaticKey: remoteStatic) else {
                 throw LanTransportError.untrustedPeer
             }
-            if owner?.hasAuthenticatedLink(userId: userId) == true {
+            // Only a contact can already have a link: a device of our own is
+            // never filed under a user id, so there is nothing to duplicate.
+            if case .contact(let userId) = admission,
+               owner?.hasAuthenticatedLink(userId: userId) == true {
                 // Election fallbacks and sweeps may dial a contact that
                 // connected to us in the meantime. Close the redundant
                 // socket before it becomes a second live link -- but a sweep
@@ -1343,14 +1407,14 @@ private final class LanConnection {
                 throw LanTransportError.duplicateLink
             }
             try sendPacket(noise.writeHandshakeMessage())
-            try authenticate(userId: userId)
+            try authenticate(admission: admission)
         case .awaitMessage3:
             try noise.readHandshakeMessage(message: packet)
             guard let remoteStatic = noise.remoteStaticKey(),
-                  let userId = owner?.trustedUserId(for: remoteStatic) else {
+                  let admission = owner?.admit(remoteStaticKey: remoteStatic) else {
                 throw LanTransportError.untrustedPeer
             }
-            try authenticate(userId: userId)
+            try authenticate(admission: admission)
         case .transport:
             if let frame = try noise.decryptRecord(record: packet) {
                 owner?.connectionReceivedFrame(self, frame: frame)
@@ -1358,17 +1422,22 @@ private final class LanConnection {
         }
     }
 
-    private func authenticate(userId: Data) throws {
+    private func authenticate(admission: LanAdmission) throws {
         guard noise.isHandshakeFinished() else {
             throw LanTransportError.incompleteHandshake
         }
         phase = .transport
         wasAuthenticated = true
-        authenticatedUserId = userId
+        // Left nil for a device of this person's own: everything that reads it
+        // -- the duplicate-link test, the unlinked-capable-contact count, the
+        // router's user id for an address -- is asking about a peer, and this
+        // link has none.
+        if case .contact(let userId) = admission { authenticatedUserId = userId }
+        isOwnDevice = admission == .ownDevice
         remoteStaticKey = noise.remoteStaticKey()
         setupTimeout?.cancel()
         setupTimeout = nil
-        owner?.connectionAuthenticated(self, userId: userId)
+        owner?.connectionAuthenticated(self, admission: admission)
     }
 
     private func sendPacket(_ packet: Data) throws {
@@ -1400,6 +1469,18 @@ private enum LanTransportError: Error {
     case invalidPacketLength
     case untrustedPeer
     case duplicateLink
+}
+
+/// What a finished Noise handshake turned out to be talking to.
+///
+/// A LAN link is only ever kept for one of these two, and they are kept for
+/// opposite reasons: a contact is a peer and becomes a route, while a device of
+/// this person's own is a transport and must never become one — a route to this
+/// person leads straight back to this phone. Everything else is refused, exactly
+/// as it was before §10 step 5 existed.
+enum LanAdmission: Equatable {
+    case contact(Data)
+    case ownDevice
 }
 
 func trustedLanPeerUserId(contacts: [Contact], remoteStaticKey: Data) -> Data? {

@@ -301,6 +301,7 @@ fn a_months_offline_contact_still_reaches_the_survivors() {
             fleet.person.sign_pk.clone(),
             fleet.sibling.clone(),
             Some(fleet.inbox_key.clone()),
+            NOW,
         )
         .expect("adopt");
     assert_eq!(adoption.outcome, RevocationAdoptionOutcome::Adopted);

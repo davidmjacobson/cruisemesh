@@ -474,6 +474,11 @@ const FRAME_TYPE_DIGEST: u8 = 0x03;
 const FRAME_TYPE_LAN_ENDPOINT: u8 = 0x04;
 const FRAME_TYPE_TRANSPORT_PROBE: u8 = 0x05;
 const FRAME_TYPE_HELLO2: u8 = 0x06;
+/// `specs/multi-device-v1.md` §10 step 5: this person's own signed roster
+/// document, pushed between two devices of ONE person on a link that has
+/// already proved it belongs to that person. See [`encode_own_roster`] for the
+/// rule about which links those are — it is the whole safety of the frame.
+const FRAME_TYPE_OWN_ROSTER: u8 = 0x07;
 
 /// Wire length of a UserID in HELLO2 (BLAKE2b-16 of the signing key,
 /// [`crate::identity`]). Legacy HELLO never hardcoded this because its
@@ -535,11 +540,30 @@ pub const CAP_MULTI_DEVICE: u32 = 1 << 2;
 /// its build never implemented.
 pub const CAP_ROSTER_GOSSIP: u32 = 1 << 3;
 
+/// Capability bit: this client understands [`Frame::OwnRoster`] (frame type
+/// `0x07`), §10 step 5's own-roster notice.
+///
+/// Its own bit, for the reason every bit above got one: a build that predates
+/// the frame refuses the unknown type byte in [`parse_frame`] and both shells
+/// drop an unparseable frame without touching the link, so sending it blind is
+/// *safe* — but it is also pointless, and a peer that cannot read the notice
+/// must not be counted as one that has been told. The bit is what lets a sender
+/// tell "this sibling now knows" from "this sibling could not have heard".
+///
+/// It is not a hidden spray kind and appears in no envelope: the notice is a
+/// link-control frame, so it has no relay row, no `msg_id`, and no DELIVERED
+/// watermark to advance. [`hidden_ack_capability`] therefore never names it.
+pub const CAP_OWN_ROSTER_NOTICE: u32 = 1 << 4;
+
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
 #[uniffi::export]
 pub fn core_own_capabilities() -> u32 {
-    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE | CAP_MULTI_DEVICE | CAP_ROSTER_GOSSIP
+    CAP_ACKS_HIDDEN_KINDS
+        | CAP_RELAY_UPDATE
+        | CAP_MULTI_DEVICE
+        | CAP_ROSTER_GOSSIP
+        | CAP_OWN_ROSTER_NOTICE
 }
 
 /// The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
@@ -1638,6 +1662,20 @@ pub enum Frame {
         user_id: Vec<u8>,
         capabilities: u32,
     },
+    /// **§10 step 5's own-roster notice** (frame type `0x07`): one person's own
+    /// signed roster document, as [`crate::core_encode_roster`] writes it.
+    ///
+    /// The document is the DL-3 document and nothing else — keys, ids, counters
+    /// and one signature. DL-5 keeps an endpoint out of a roster structurally
+    /// (there is no field one fits in), so this frame cannot leak a discovered
+    /// or third-party address however it is routed.
+    ///
+    /// It is plaintext on the link, so **who may be sent one is the whole of its
+    /// safety**: only a peer that has already proved, cryptographically, that it
+    /// holds this person's own agreement secret. See [`encode_own_roster`].
+    OwnRoster {
+        document: Vec<u8>,
+    },
     Envelope {
         msg_id: Vec<u8>,
         hop_ttl: u8,
@@ -1689,6 +1727,45 @@ pub fn encode_hello2(user_id: Vec<u8>, capabilities: u32) -> Result<Vec<u8>, Cor
     out.push(FRAME_TYPE_HELLO2);
     out.extend_from_slice(&user_id);
     out.extend_from_slice(&capabilities.to_le_bytes());
+    Ok(out)
+}
+
+/// Encode an own-roster notice: `0x07 ‖ roster document`
+/// (`specs/multi-device-v1.md` §10 step 5).
+///
+/// # The one rule that makes this frame safe
+///
+/// **Send it only on a link whose remote party has already proved it holds this
+/// person's own agreement secret** — in practice a LAN Noise session whose
+/// remote static key is this identity's `agree_pk` — and refuse it on arrival
+/// under the same test. Both halves, or neither.
+///
+/// The reason is that the body is plaintext and the roster is a private fact:
+/// how many devices this person has and what their keys are. Anyone who passes
+/// the test already holds the person key and therefore already holds everything
+/// the document says; anyone who does not must never be able to elicit it by
+/// claiming this person's `user_id` in a HELLO. BLE HELLO is cleartext and
+/// cannot prove anything, so a BLE meeting never carries this frame — see the
+/// note in §10 of the spec, which records that limitation rather than weakening
+/// the test to cover it.
+///
+/// Gated by [`CAP_OWN_ROSTER_NOTICE`] on the peer's HELLO2, so a build that
+/// predates the frame is never sent one.
+#[uniffi::export]
+pub fn encode_own_roster(document: Vec<u8>) -> Result<Vec<u8>, CoreError> {
+    if document.is_empty() {
+        return Err(CoreError::Malformed(
+            "own roster notice carries no document".to_string(),
+        ));
+    }
+    if document.len() + 1 > MAX_P2P_FRAME_BYTES {
+        return Err(CoreError::Malformed(format!(
+            "own roster notice exceeds {MAX_P2P_FRAME_BYTES}-byte limit"
+        )));
+    }
+    let mut out = Vec::with_capacity(1 + document.len());
+    out.push(FRAME_TYPE_OWN_ROSTER);
+    out.extend_from_slice(&document);
     Ok(out)
 }
 
@@ -2087,6 +2164,20 @@ pub fn parse_frame(bytes: Vec<u8>) -> Result<Frame, CoreError> {
             Ok(Frame::Hello2 {
                 user_id,
                 capabilities: u32::from_le_bytes(caps_bytes),
+            })
+        }
+        FRAME_TYPE_OWN_ROSTER => {
+            if rest.is_empty() {
+                return Err(CoreError::Malformed(
+                    "own roster notice missing document".to_string(),
+                ));
+            }
+            // Deliberately not decoded here. `parse_frame` is the shape layer;
+            // whether these bytes are an acceptable roster is
+            // `MessageStore::apply_own_roster_notice`'s decision, and it is the
+            // one that also knows whose roster this device holds.
+            Ok(Frame::OwnRoster {
+                document: rest.to_vec(),
             })
         }
         FRAME_TYPE_ENVELOPE => {
@@ -3468,6 +3559,50 @@ mod tests {
         let err = parse_frame(vec![0x06, 1, 2, 3]).unwrap_err();
         assert!(matches!(err, CoreError::Malformed(_)));
         assert!(encode_hello2(vec![1_u8; 15], 1).is_err());
+    }
+
+    /// §10 step 5's frame: the body is carried verbatim, an empty one is not a
+    /// frame at either end, and the type byte is the next one after HELLO2 so a
+    /// legacy peer meets it at `parse_frame`'s unknown-type arm.
+    #[test]
+    fn own_roster_notice_round_trips_and_refuses_an_empty_document() {
+        let document = vec![0xA5_u8; 300];
+        let framed = encode_own_roster(document.clone()).unwrap();
+        assert_eq!(framed[0], 0x07);
+        match parse_frame(framed).expect("parses") {
+            Frame::OwnRoster { document: parsed } => assert_eq!(parsed, document),
+            other => panic!("own roster notice parsed as {other:?}"),
+        }
+        assert!(encode_own_roster(Vec::new()).is_err());
+        assert!(matches!(
+            parse_frame(vec![0x07]).unwrap_err(),
+            CoreError::Malformed(_)
+        ));
+        // A body that could never fit on a link is refused before it is built,
+        // not discovered on the way back in.
+        assert!(encode_own_roster(vec![0_u8; MAX_P2P_FRAME_BYTES]).is_err());
+    }
+
+    /// The notice gets its own capability bit, for the reason every bit above
+    /// it did: an advertisement a deployed build made honestly must keep meaning
+    /// what it meant when that build shipped.
+    #[test]
+    fn the_own_roster_notice_has_its_own_capability_bit() {
+        assert_eq!(CAP_OWN_ROSTER_NOTICE, 1 << 4);
+        assert_ne!(core_own_capabilities() & CAP_OWN_ROSTER_NOTICE, 0);
+        for other in [
+            CAP_ACKS_HIDDEN_KINDS,
+            CAP_RELAY_UPDATE,
+            CAP_MULTI_DEVICE,
+            CAP_ROSTER_GOSSIP,
+        ] {
+            assert_ne!(CAP_OWN_ROSTER_NOTICE, other);
+        }
+        // It is a link-control frame, not a hidden spray kind: there is no
+        // envelope, no relay row, and no DELIVERED watermark to advance.
+        for kind in HIDDEN_SPRAY_KINDS {
+            assert_ne!(hidden_ack_capability(kind), Some(CAP_OWN_ROSTER_NOTICE));
+        }
     }
 
     #[test]

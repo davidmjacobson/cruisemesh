@@ -2528,6 +2528,21 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onHello2(address: String, userId: Data, capabilities: UInt32)  -> Bool
     
     /**
+     * A link that proved it belongs to one of THIS person's own devices
+     * (`specs/multi-device-v1.md` §10 step 5), registered so frames can be
+     * written to it and marked so that nothing treats it as a peer.
+     *
+     * Separate from [`Self::on_connected`] because "no user id yet" and "never
+     * a route" are different facts that happen to look alike. The epidemic
+     * fanout floods every link of the first kind — that is what makes gossip
+     * work on a link whose HELLO has not landed — and a device this person
+     * has just removed must not be on the receiving end of that. Nor may it
+     * claim a contact's user id in a HELLO and take over that contact's
+     * route: [`Self::on_hello`] refuses one here.
+     */
+    func onOwnDeviceConnected(address: String, transport: CoreTransport) 
+    
+    /**
      * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
      * asked once for each, for the callers that must hand the whole answer to
      * a plan builder rather than ask envelope by envelope.
@@ -2592,6 +2607,13 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * not-yet-identified link. If the source is identified, exclude all of
      * that user's physical routes so a frame cannot echo through its other
      * BLE role or rotated address.
+     *
+     * A link admitted as one of this person's own devices
+     * ([`Self::on_own_device_connected`]) is in neither set. It has no user
+     * id, but it is not *not yet* identified either — it is a carrier for the
+     * §10 step 5 roster notice and nothing else, so flooding it would hand a
+     * device this person may have just removed a live feed of every envelope
+     * this phone sends or relays.
      */
     func relayRoutes(exceptAddress: String?)  -> [CoreTransportRoute]
     
@@ -2824,6 +2846,27 @@ open func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool 
 }
     
     /**
+     * A link that proved it belongs to one of THIS person's own devices
+     * (`specs/multi-device-v1.md` §10 step 5), registered so frames can be
+     * written to it and marked so that nothing treats it as a peer.
+     *
+     * Separate from [`Self::on_connected`] because "no user id yet" and "never
+     * a route" are different facts that happen to look alike. The epidemic
+     * fanout floods every link of the first kind — that is what makes gossip
+     * work on a link whose HELLO has not landed — and a device this person
+     * has just removed must not be on the receiving end of that. Nor may it
+     * claim a contact's user id in a HELLO and take over that contact's
+     * route: [`Self::on_hello`] refuses one here.
+     */
+open func onOwnDeviceConnected(address: String, transport: CoreTransport) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_own_device_connected(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterTypeCoreTransport.lower(transport),$0
+    )
+}
+}
+    
+    /**
      * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
      * asked once for each, for the callers that must hand the whole answer to
      * a plan builder rather than ask envelope by envelope.
@@ -2923,6 +2966,13 @@ open func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor
      * not-yet-identified link. If the source is identified, exclude all of
      * that user's physical routes so a frame cannot echo through its other
      * BLE role or rotated address.
+     *
+     * A link admitted as one of this person's own devices
+     * ([`Self::on_own_device_connected`]) is in neither set. It has no user
+     * id, but it is not *not yet* identified either — it is a carrier for the
+     * §10 step 5 roster notice and nothing else, so flooding it would hand a
+     * device this person may have just removed a live feed of every envelope
+     * this phone sends or relays.
      */
 open func relayRoutes(exceptAddress: String?) -> [CoreTransportRoute] {
     return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
@@ -4519,14 +4569,16 @@ public protocol MessageStoreProtocol : AnyObject {
      * writers an activation uses, so DL-1 ordering is enforced by the writers
      * rather than restated here.
      *
-     * A device that finds *itself* tombstoned adopts nothing and is told so.
-     * That is not a refusal to obey: the roster is the person's decision and it
-     * stands. It is that a revoked device is not a member of the fleet the
-     * document describes, so it has no fleet projection to write and no sync
-     * context to keep — and [`Self::adopt_own_roster`] would refuse the
-     * document anyway, for the same reason, with a less useful error. What the
-     * shell does with the answer (WP6: stop, say so, offer to re-link with a
-     * fresh key per DL-4) is above this line.
+     * A device that finds *itself* tombstoned adopts nothing — a revoked device
+     * is not a member of the fleet the document describes, so it has no fleet
+     * projection to write and no sync context to keep, and
+     * [`Self::adopt_own_roster`] would refuse the document anyway. What it does
+     * instead is **eject itself** ([`Self::eject_self_from_fleet`], §10 step 5):
+     * the burying roster is stored, the projection is cleared, and the
+     * activation gate goes to [`crate::CoreLinkActivationStage::Revoked`], which
+     * stops this device advertising, authoring and acking. `now_ms` stamps that
+     * transition. What the shell does with the answer (WP6: say so, offer to set
+     * up again under a fresh key per DL-4) is above this line.
      *
      * # The real acceptance rules run here, not a version comparison
      *
@@ -4558,7 +4610,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * stops flowing. `None` is honest when the device never held the key;
      * nothing is touched then.
      */
-    func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?) throws  -> RevocationAdoption
+    func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?, nowMs: Int64) throws  -> RevocationAdoption
     
     /**
      * Persist the frontier after one fetch page, and return what is now
@@ -4721,6 +4773,78 @@ public protocol MessageStoreProtocol : AnyObject {
      * same fail-closed behavior.
      */
     func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, content: FriendDirectoryContent, nowMs: Int64) throws  -> Bool
+    
+    /**
+     * **§10 step 5, the receiving half: how a removed device finds out.**
+     *
+     * `document` is a [`crate::Frame::OwnRoster`] body that arrived on a link
+     * the caller has already proved belongs to this person (see
+     * [`crate::encode_own_roster`] — that test is a precondition, not an
+     * option). `person_root_sign_pk` is this device's OWN identity signing key:
+     * §3 makes the person root the deployed identity key, so the anchor is
+     * already on the phone and no new trust material is introduced.
+     *
+     * # Why a push, and why this is not a tip-off
+     *
+     * §10.1 addresses its gossip to contacts and to *remaining* own devices,
+     * and §11's SYNC-3 seals self-sync to the person's *current* device set.
+     * Every carrier v1 has is therefore addressed to a set the removed device
+     * is not in — [`crate::core_seal_sync_handoff`] refuses a tombstoned
+     * address outright and says so — which is why an honest "I found my old
+     * phone" device otherwise believes itself linked forever, keeps
+     * advertising, and keeps accepting mail.
+     *
+     * A device learns this only from a document signed under the person root
+     * and strictly superseding the one it held, so "you're out" is never a bare
+     * hint a stranger can inject. And it cannot outrun step 1: the inbox key
+     * rotates at the moment of removal, before any meeting, so the fleet's
+     * self-sync channel and its retained backlog are already shut by the time
+     * this runs.
+     *
+     * Step 2 is **not** in that sentence and must not be added to it while it
+     * is unimplemented. Nothing on either shell drives the relay `family_token`
+     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
+     * outside tests — so a removed device still holds a working family relay
+     * credential at the moment this tells it that it is out. That credential
+     * was in its hands all along and the notice grants it nothing new, but
+     * until §10.2 has a driver, "removed" means cut off from the fleet's own
+     * traffic, not cut off from the relay.
+     *
+     * # What it does, in [`core_roster_accept`]'s vocabulary
+     *
+     * The decision is the ordinary one — DL-1 ordering, DL-2's sticky fork
+     * quarantine, DL-4's tombstones, §6's generation floor, §14.2's epoch
+     * authority — run against what this device has stored. Only
+     * [`crate::RosterUpdateOutcome::Accepted`] does anything, and then:
+     *
+     * * the document buries THIS device → it ejects itself
+     * ([`crate::RevocationAdoptionOutcome::RevokedSelf`]);
+     * * the document still lists this device and announces the inbox key
+     * generation this device already holds → ordinary convergence, adopted;
+     * * the document still lists this device but announces a NEWER generation
+     * → nothing is written and
+     * [`crate::RevocationAdoptionOutcome::AwaitingRotationKey`] is returned.
+     * A plaintext link frame carries no key material and never will, so
+     * adopting here would leave a device holding a roster whose sync traffic
+     * it cannot open. §10.1's sealed handoff is what carries that rotation,
+     * and this says so rather than half-applying it.
+     *
+     * [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
+     * this path.
+     *
+     * # What this does *not* converge
+     *
+     * The third arm is not a corner case, and the scope it leaves should be
+     * read exactly: **this converges the removed device, not the rest of the
+     * fleet.** [`crate::core_revoke_devices_roster`] always mints a new inbox
+     * key, so every revocation roster announces a rotated generation, so a
+     * *sibling* that was offline at removal time takes the third arm on every
+     * later meeting and keeps the pre-revocation roster — with the removed
+     * device still in its fleet projection — until §10.1's sealed handoff
+     * reaches it. That handoff rides self-sync, which has no shell transport
+     * yet. WP5's gate is written against the removed device for that reason.
+     */
+    func applyOwnRosterNotice(document: Data, personRootSignPk: Data, ownDeviceId: Data, nowMs: Int64) throws  -> RevocationAdoption
     
     func authorFriendRequest(identity: Identity, contact: Contact, friendCardJson: String, timestampMs: Int64) throws  -> AuthoredEnvelope
     
@@ -4958,6 +5082,12 @@ public protocol MessageStoreProtocol : AnyObject {
      * person root SIGNING secret is not read here and never leaves the
      * encrypted backup (§14.2).
      *
+     * `profile` is the person's own name and photo, passed in rather than read
+     * because core keeps no profile row — the shells own it, exactly as they
+     * own `identity`. Pass [`LinkBootstrapProfile::default`] only for a person
+     * who genuinely has neither; an empty one here is what leaves the adopted
+     * phone asking a person their own name.
+     *
      * `history_head_per_chat` bounds the head — pass 0 for
      * [`LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT`]. Everything older is WP4's
      * catch-up, not this ceremony's.
@@ -4971,7 +5101,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * `lifetime_ms` bounds how long it stands — pass 0 for
      * [`LINK_BOOTSTRAP_DEFAULT_LIFETIME_MS`].
      */
-    func buildLinkBootstrap(identity: Identity, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64) throws  -> LinkBootstrap
+    func buildLinkBootstrap(identity: Identity, profile: LinkBootstrapProfile, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64) throws  -> LinkBootstrap
     
     /**
      * Carried envelopes whose `recipient_hint` matches any of `hints` and
@@ -7186,6 +7316,24 @@ public protocol MessageStoreProtocol : AnyObject {
      */
     func ownRoster() throws  -> Roster?
     
+    /**
+     * **§10 step 5, the sending half.** This person's own roster document, in
+     * the frame [`crate::encode_own_roster`] defines, or `None` when there is
+     * nothing to say.
+     *
+     * `None` on an install that has never linked (no roster), and on one the
+     * gate has silenced — a device that may not advertise may not announce a
+     * roster either, and that includes a device this very mechanism has
+     * ejected. The news travels from the fleet toward the removed device, not
+     * out of it.
+     *
+     * Read [`crate::encode_own_roster`] before calling this: **which links a
+     * notice may be written to is the whole of its safety**, and that rule
+     * lives in the shell that owns the socket, because core cannot see a Noise
+     * static key.
+     */
+    func ownRosterNoticeFrame() throws  -> Data?
+    
     func peerConnectionEvents(userId: Data?, limit: UInt32) throws  -> [PeerConnectionEvent]
     
     func peerConnectionSummaries() throws  -> [PeerConnectionSummary]
@@ -8070,14 +8218,16 @@ open func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Da
      * writers an activation uses, so DL-1 ordering is enforced by the writers
      * rather than restated here.
      *
-     * A device that finds *itself* tombstoned adopts nothing and is told so.
-     * That is not a refusal to obey: the roster is the person's decision and it
-     * stands. It is that a revoked device is not a member of the fleet the
-     * document describes, so it has no fleet projection to write and no sync
-     * context to keep — and [`Self::adopt_own_roster`] would refuse the
-     * document anyway, for the same reason, with a less useful error. What the
-     * shell does with the answer (WP6: stop, say so, offer to re-link with a
-     * fresh key per DL-4) is above this line.
+     * A device that finds *itself* tombstoned adopts nothing — a revoked device
+     * is not a member of the fleet the document describes, so it has no fleet
+     * projection to write and no sync context to keep, and
+     * [`Self::adopt_own_roster`] would refuse the document anyway. What it does
+     * instead is **eject itself** ([`Self::eject_self_from_fleet`], §10 step 5):
+     * the burying roster is stored, the projection is cleared, and the
+     * activation gate goes to [`crate::CoreLinkActivationStage::Revoked`], which
+     * stops this device advertising, authoring and acking. `now_ms` stamps that
+     * transition. What the shell does with the answer (WP6: say so, offer to set
+     * up again under a fresh key per DL-4) is above this line.
      *
      * # The real acceptance rules run here, not a version comparison
      *
@@ -8109,13 +8259,14 @@ open func adoptOwnRoster(roster: Roster, personRootSignPk: Data, ownDeviceId: Da
      * stops flowing. `None` is honest when the device never held the key;
      * nothing is touched then.
      */
-open func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?)throws  -> RevocationAdoption {
+open func adoptRevocationHandoff(sealed: Data, personRootSignPk: Data, ownDevice: DeviceKeypair, supersededInboxKey: InboxKey?, nowMs: Int64)throws  -> RevocationAdoption {
     return try  FfiConverterTypeRevocationAdoption.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_adopt_revocation_handoff(self.uniffiClonePointer(),
         FfiConverterData.lower(sealed),
         FfiConverterData.lower(personRootSignPk),
         FfiConverterTypeDeviceKeypair.lower(ownDevice),
-        FfiConverterOptionTypeInboxKey.lower(supersededInboxKey),$0
+        FfiConverterOptionTypeInboxKey.lower(supersededInboxKey),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -8324,6 +8475,87 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
         FfiConverterData.lower(introducerUserId),
         FfiConverterData.lower(recipientUserId),
         FfiConverterTypeFriendDirectoryContent.lower(content),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * **§10 step 5, the receiving half: how a removed device finds out.**
+     *
+     * `document` is a [`crate::Frame::OwnRoster`] body that arrived on a link
+     * the caller has already proved belongs to this person (see
+     * [`crate::encode_own_roster`] — that test is a precondition, not an
+     * option). `person_root_sign_pk` is this device's OWN identity signing key:
+     * §3 makes the person root the deployed identity key, so the anchor is
+     * already on the phone and no new trust material is introduced.
+     *
+     * # Why a push, and why this is not a tip-off
+     *
+     * §10.1 addresses its gossip to contacts and to *remaining* own devices,
+     * and §11's SYNC-3 seals self-sync to the person's *current* device set.
+     * Every carrier v1 has is therefore addressed to a set the removed device
+     * is not in — [`crate::core_seal_sync_handoff`] refuses a tombstoned
+     * address outright and says so — which is why an honest "I found my old
+     * phone" device otherwise believes itself linked forever, keeps
+     * advertising, and keeps accepting mail.
+     *
+     * A device learns this only from a document signed under the person root
+     * and strictly superseding the one it held, so "you're out" is never a bare
+     * hint a stranger can inject. And it cannot outrun step 1: the inbox key
+     * rotates at the moment of removal, before any meeting, so the fleet's
+     * self-sync channel and its retained backlog are already shut by the time
+     * this runs.
+     *
+     * Step 2 is **not** in that sentence and must not be added to it while it
+     * is unimplemented. Nothing on either shell drives the relay `family_token`
+     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
+     * outside tests — so a removed device still holds a working family relay
+     * credential at the moment this tells it that it is out. That credential
+     * was in its hands all along and the notice grants it nothing new, but
+     * until §10.2 has a driver, "removed" means cut off from the fleet's own
+     * traffic, not cut off from the relay.
+     *
+     * # What it does, in [`core_roster_accept`]'s vocabulary
+     *
+     * The decision is the ordinary one — DL-1 ordering, DL-2's sticky fork
+     * quarantine, DL-4's tombstones, §6's generation floor, §14.2's epoch
+     * authority — run against what this device has stored. Only
+     * [`crate::RosterUpdateOutcome::Accepted`] does anything, and then:
+     *
+     * * the document buries THIS device → it ejects itself
+     * ([`crate::RevocationAdoptionOutcome::RevokedSelf`]);
+     * * the document still lists this device and announces the inbox key
+     * generation this device already holds → ordinary convergence, adopted;
+     * * the document still lists this device but announces a NEWER generation
+     * → nothing is written and
+     * [`crate::RevocationAdoptionOutcome::AwaitingRotationKey`] is returned.
+     * A plaintext link frame carries no key material and never will, so
+     * adopting here would leave a device holding a roster whose sync traffic
+     * it cannot open. §10.1's sealed handoff is what carries that rotation,
+     * and this says so rather than half-applying it.
+     *
+     * [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
+     * this path.
+     *
+     * # What this does *not* converge
+     *
+     * The third arm is not a corner case, and the scope it leaves should be
+     * read exactly: **this converges the removed device, not the rest of the
+     * fleet.** [`crate::core_revoke_devices_roster`] always mints a new inbox
+     * key, so every revocation roster announces a rotated generation, so a
+     * *sibling* that was offline at removal time takes the third arm on every
+     * later meeting and keeps the pre-revocation roster — with the removed
+     * device still in its fleet projection — until §10.1's sealed handoff
+     * reaches it. That handoff rides self-sync, which has no shell transport
+     * yet. WP5's gate is written against the removed device for that reason.
+     */
+open func applyOwnRosterNotice(document: Data, personRootSignPk: Data, ownDeviceId: Data, nowMs: Int64)throws  -> RevocationAdoption {
+    return try  FfiConverterTypeRevocationAdoption.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_apply_own_roster_notice(self.uniffiClonePointer(),
+        FfiConverterData.lower(document),
+        FfiConverterData.lower(personRootSignPk),
+        FfiConverterData.lower(ownDeviceId),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -8688,6 +8920,12 @@ open func blockUser(userId: Data, nowMs: Int64)throws  {try rustCallWithError(Ff
      * person root SIGNING secret is not read here and never leaves the
      * encrypted backup (§14.2).
      *
+     * `profile` is the person's own name and photo, passed in rather than read
+     * because core keeps no profile row — the shells own it, exactly as they
+     * own `identity`. Pass [`LinkBootstrapProfile::default`] only for a person
+     * who genuinely has neither; an empty one here is what leaves the adopted
+     * phone asking a person their own name.
+     *
      * `history_head_per_chat` bounds the head — pass 0 for
      * [`LINK_BOOTSTRAP_HISTORY_HEAD_PER_CHAT`]. Everything older is WP4's
      * catch-up, not this ceremony's.
@@ -8701,10 +8939,11 @@ open func blockUser(userId: Data, nowMs: Int64)throws  {try rustCallWithError(Ff
      * `lifetime_ms` bounds how long it stands — pass 0 for
      * [`LINK_BOOTSTRAP_DEFAULT_LIFETIME_MS`].
      */
-open func buildLinkBootstrap(identity: Identity, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64)throws  -> LinkBootstrap {
+open func buildLinkBootstrap(identity: Identity, profile: LinkBootstrapProfile, roster: Roster, approvingDeviceSignSk: Data, channelBinding: Data, historyHeadPerChat: UInt64, lifetimeMs: Int64, nowMs: Int64)throws  -> LinkBootstrap {
     return try  FfiConverterTypeLinkBootstrap.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_build_link_bootstrap(self.uniffiClonePointer(),
         FfiConverterTypeIdentity.lower(identity),
+        FfiConverterTypeLinkBootstrapProfile.lower(profile),
         FfiConverterTypeRoster.lower(roster),
         FfiConverterData.lower(approvingDeviceSignSk),
         FfiConverterData.lower(channelBinding),
@@ -11914,6 +12153,29 @@ open func ownDeviceFleet()throws  -> OwnDeviceFleet {
 open func ownRoster()throws  -> Roster? {
     return try  FfiConverterOptionTypeRoster.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_own_roster(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * **§10 step 5, the sending half.** This person's own roster document, in
+     * the frame [`crate::encode_own_roster`] defines, or `None` when there is
+     * nothing to say.
+     *
+     * `None` on an install that has never linked (no roster), and on one the
+     * gate has silenced — a device that may not advertise may not announce a
+     * roster either, and that includes a device this very mechanism has
+     * ejected. The news travels from the fleet toward the removed device, not
+     * out of it.
+     *
+     * Read [`crate::encode_own_roster`] before calling this: **which links a
+     * notice may be written to is the whole of its safety**, and that rule
+     * lives in the shell that owns the socket, because core cannot see a Noise
+     * static key.
+     */
+open func ownRosterNoticeFrame()throws  -> Data? {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_own_roster_notice_frame(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -18217,6 +18479,15 @@ public struct CoreLinkBootstrapImport {
      */
     public var person: LinkBootstrapPerson
     /**
+     * The person's own name and photo, straight off the export
+     * ([`LinkBootstrapProfile`](super::bootstrap::LinkBootstrapProfile)). A
+     * passthrough for the same reason `person` is: core keeps no profile row,
+     * and the shell that owns the name is the one that must write it. A shell
+     * that drops this is a shell that asks a person their own name on a phone
+     * that already knows it.
+     */
+    public var profile: LinkBootstrapProfile
+    /**
      * This device's own id, taken from the certificate the roster carries for
      * it — never from the caller.
      */
@@ -18243,6 +18514,14 @@ public struct CoreLinkBootstrapImport {
          * The core does not keep secrets.
          */person: LinkBootstrapPerson, 
         /**
+         * The person's own name and photo, straight off the export
+         * ([`LinkBootstrapProfile`](super::bootstrap::LinkBootstrapProfile)). A
+         * passthrough for the same reason `person` is: core keeps no profile row,
+         * and the shell that owns the name is the one that must write it. A shell
+         * that drops this is a shell that asks a person their own name on a phone
+         * that already knows it.
+         */profile: LinkBootstrapProfile, 
+        /**
          * This device's own id, taken from the certificate the roster carries for
          * it — never from the caller.
          */ownDeviceId: Data, 
@@ -18253,6 +18532,7 @@ public struct CoreLinkBootstrapImport {
          * The WP4 seam, computed from what just landed.
          */catchUp: [CoreLinkCatchUp]) {
         self.person = person
+        self.profile = profile
         self.ownDeviceId = ownDeviceId
         self.rosterHead = rosterHead
         self.contactsImported = contactsImported
@@ -18268,6 +18548,9 @@ public struct CoreLinkBootstrapImport {
 extension CoreLinkBootstrapImport: Equatable, Hashable {
     public static func ==(lhs: CoreLinkBootstrapImport, rhs: CoreLinkBootstrapImport) -> Bool {
         if lhs.person != rhs.person {
+            return false
+        }
+        if lhs.profile != rhs.profile {
             return false
         }
         if lhs.ownDeviceId != rhs.ownDeviceId {
@@ -18296,6 +18579,7 @@ extension CoreLinkBootstrapImport: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(person)
+        hasher.combine(profile)
         hasher.combine(ownDeviceId)
         hasher.combine(rosterHead)
         hasher.combine(contactsImported)
@@ -18315,6 +18599,7 @@ public struct FfiConverterTypeCoreLinkBootstrapImport: FfiConverterRustBuffer {
         return
             try CoreLinkBootstrapImport(
                 person: FfiConverterTypeLinkBootstrapPerson.read(from: &buf), 
+                profile: FfiConverterTypeLinkBootstrapProfile.read(from: &buf), 
                 ownDeviceId: FfiConverterData.read(from: &buf), 
                 rosterHead: FfiConverterData.read(from: &buf), 
                 contactsImported: FfiConverterUInt32.read(from: &buf), 
@@ -18327,6 +18612,7 @@ public struct FfiConverterTypeCoreLinkBootstrapImport: FfiConverterRustBuffer {
 
     public static func write(_ value: CoreLinkBootstrapImport, into buf: inout [UInt8]) {
         FfiConverterTypeLinkBootstrapPerson.write(value.person, into: &buf)
+        FfiConverterTypeLinkBootstrapProfile.write(value.profile, into: &buf)
         FfiConverterData.write(value.ownDeviceId, into: &buf)
         FfiConverterData.write(value.rosterHead, into: &buf)
         FfiConverterUInt32.write(value.contactsImported, into: &buf)
@@ -28179,6 +28465,10 @@ public struct LinkBootstrap {
      */
     public var historyHead: [StoredMessage]
     /**
+     * The person's own name and photo (v3). See [`LinkBootstrapProfile`].
+     */
+    public var profile: LinkBootstrapProfile
+    /**
      * The Noise handshake hash of the ceremony this export was made for
      * ([`CoreLinkSummary::channel_binding`](super::ceremony::CoreLinkSummary)).
      * The new device refuses a bootstrap whose binding is not the one it
@@ -28218,6 +28508,9 @@ public struct LinkBootstrap {
          * Recent messages, newest chats and all, as §9.3's "recent history head".
          */historyHead: [StoredMessage], 
         /**
+         * The person's own name and photo (v3). See [`LinkBootstrapProfile`].
+         */profile: LinkBootstrapProfile, 
+        /**
          * The Noise handshake hash of the ceremony this export was made for
          * ([`CoreLinkSummary::channel_binding`](super::ceremony::CoreLinkSummary)).
          * The new device refuses a bootstrap whose binding is not the one it
@@ -28246,6 +28539,7 @@ public struct LinkBootstrap {
         self.contacts = contacts
         self.groups = groups
         self.historyHead = historyHead
+        self.profile = profile
         self.channelBinding = channelBinding
         self.expiresAtMs = expiresAtMs
         self.signerSignPk = signerSignPk
@@ -28278,6 +28572,9 @@ extension LinkBootstrap: Equatable, Hashable {
         if lhs.historyHead != rhs.historyHead {
             return false
         }
+        if lhs.profile != rhs.profile {
+            return false
+        }
         if lhs.channelBinding != rhs.channelBinding {
             return false
         }
@@ -28301,6 +28598,7 @@ extension LinkBootstrap: Equatable, Hashable {
         hasher.combine(contacts)
         hasher.combine(groups)
         hasher.combine(historyHead)
+        hasher.combine(profile)
         hasher.combine(channelBinding)
         hasher.combine(expiresAtMs)
         hasher.combine(signerSignPk)
@@ -28323,6 +28621,7 @@ public struct FfiConverterTypeLinkBootstrap: FfiConverterRustBuffer {
                 contacts: FfiConverterSequenceTypeLinkBootstrapContact.read(from: &buf), 
                 groups: FfiConverterSequenceTypeGroup.read(from: &buf), 
                 historyHead: FfiConverterSequenceTypeStoredMessage.read(from: &buf), 
+                profile: FfiConverterTypeLinkBootstrapProfile.read(from: &buf), 
                 channelBinding: FfiConverterData.read(from: &buf), 
                 expiresAtMs: FfiConverterInt64.read(from: &buf), 
                 signerSignPk: FfiConverterData.read(from: &buf), 
@@ -28338,6 +28637,7 @@ public struct FfiConverterTypeLinkBootstrap: FfiConverterRustBuffer {
         FfiConverterSequenceTypeLinkBootstrapContact.write(value.contacts, into: &buf)
         FfiConverterSequenceTypeGroup.write(value.groups, into: &buf)
         FfiConverterSequenceTypeStoredMessage.write(value.historyHead, into: &buf)
+        FfiConverterTypeLinkBootstrapProfile.write(value.profile, into: &buf)
         FfiConverterData.write(value.channelBinding, into: &buf)
         FfiConverterInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterData.write(value.signerSignPk, into: &buf)
@@ -28564,6 +28864,132 @@ public func FfiConverterTypeLinkBootstrapPerson_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeLinkBootstrapPerson_lower(_ value: LinkBootstrapPerson) -> RustBuffer {
     return FfiConverterTypeLinkBootstrapPerson.lower(value)
+}
+
+
+/**
+ * **The person's own profile, as their other phone already holds it** (§9.3).
+ *
+ * A linked device is the same person, so it opens onto their name and their
+ * photo rather than onto an empty "what would you like to go by?" field. Two
+ * doors out of first-run setup — restore a `.cmbak`, or link as a new device —
+ * must not land somebody in two different states, and the restore door has
+ * carried exactly these three values all along
+ * ([`CoreBackupPayload`](crate::CoreBackupPayload)'s `display_name`,
+ * `own_avatar`, `own_avatar_epoch`). The field trio deliberately mirrors it, so
+ * both shells reuse the stores they already write on restore.
+ *
+ * Core keeps no profile row: this is a passthrough, exactly like
+ * [`LinkBootstrapPerson`]. The shells own the name and the photo, and this is
+ * the one channel that carries them between two devices of one person.
+ *
+ * # Why this is not a privacy widening
+ *
+ * It crosses one Noise channel between two phones of the same person, sealed to
+ * it, and it is a person's own name and their own photo — the same SYNC-3
+ * argument the module makes about carrying their contacts. No keys, no
+ * endpoints, no third party. DL-5 is untouched: nothing here describes a
+ * network.
+ */
+public struct LinkBootstrapProfile {
+    /**
+     * What this person goes by. `None` on a person who never set one, which
+     * leaves the new device asking the same question it asks today.
+     */
+    public var displayName: String?
+    /**
+     * The profile photo as the backup carries it — a normalized JPEG, empty
+     * when there is none.
+     */
+    public var avatar: Data
+    /**
+     * The photo's revision, in the epoch ordering profile sync already uses.
+     * Carried across rather than re-stamped with "now": a linked device that
+     * minted a fresher epoch for a photo it did not change would win the
+     * profile-sync race against its own fleet.
+     */
+    public var avatarEpoch: Int64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * What this person goes by. `None` on a person who never set one, which
+         * leaves the new device asking the same question it asks today.
+         */displayName: String?, 
+        /**
+         * The profile photo as the backup carries it — a normalized JPEG, empty
+         * when there is none.
+         */avatar: Data, 
+        /**
+         * The photo's revision, in the epoch ordering profile sync already uses.
+         * Carried across rather than re-stamped with "now": a linked device that
+         * minted a fresher epoch for a photo it did not change would win the
+         * profile-sync race against its own fleet.
+         */avatarEpoch: Int64) {
+        self.displayName = displayName
+        self.avatar = avatar
+        self.avatarEpoch = avatarEpoch
+    }
+}
+
+
+
+extension LinkBootstrapProfile: Equatable, Hashable {
+    public static func ==(lhs: LinkBootstrapProfile, rhs: LinkBootstrapProfile) -> Bool {
+        if lhs.displayName != rhs.displayName {
+            return false
+        }
+        if lhs.avatar != rhs.avatar {
+            return false
+        }
+        if lhs.avatarEpoch != rhs.avatarEpoch {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(displayName)
+        hasher.combine(avatar)
+        hasher.combine(avatarEpoch)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLinkBootstrapProfile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LinkBootstrapProfile {
+        return
+            try LinkBootstrapProfile(
+                displayName: FfiConverterOptionString.read(from: &buf), 
+                avatar: FfiConverterData.read(from: &buf), 
+                avatarEpoch: FfiConverterInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LinkBootstrapProfile, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.displayName, into: &buf)
+        FfiConverterData.write(value.avatar, into: &buf)
+        FfiConverterInt64.write(value.avatarEpoch, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapProfile_lift(_ buf: RustBuffer) throws -> LinkBootstrapProfile {
+    return try FfiConverterTypeLinkBootstrapProfile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLinkBootstrapProfile_lower(_ value: LinkBootstrapProfile) -> RustBuffer {
+    return FfiConverterTypeLinkBootstrapProfile.lower(value)
 }
 
 
@@ -38290,6 +38716,23 @@ public enum CoreLinkActivationStage {
      * Both halves done. This device is a device.
      */
     case activated
+    /**
+     * **§10 step 5.** This device read a signed roster of its own person that
+     * tombstones it, and ejected itself: it no longer advertises, authors or
+     * acks, and it holds no fleet projection.
+     *
+     * Terminal. DL-4 says a revoked `device_id` is gone forever, so the only
+     * way out is a fresh ceremony under a fresh device key — which is a fresh
+     * install, not a flag flip. [`MessageStore::begin_link_activation`] and
+     * [`MessageStore::abandon_link_activation`] both refuse from here for that
+     * reason.
+     *
+     * Note what it is NOT: an opinion of this device's about whether it should
+     * still be trusted. It is the person's decision, arriving as a document
+     * signed under their root and strictly superseding the one this device
+     * held. Nothing a stranger can mint reaches this state.
+     */
+    case revoked
 }
 
 
@@ -38310,6 +38753,8 @@ public struct FfiConverterTypeCoreLinkActivationStage: FfiConverterRustBuffer {
         case 3: return .awaitingRosterAck
         
         case 4: return .activated
+        
+        case 5: return .revoked
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -38333,6 +38778,10 @@ public struct FfiConverterTypeCoreLinkActivationStage: FfiConverterRustBuffer {
         
         case .activated:
             writeInt(&buf, Int32(4))
+        
+        
+        case .revoked:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -38383,6 +38832,12 @@ public enum CoreLinkGateReason {
      * §9.4b: the exact roster head has not been acknowledged.
      */
     case rosterAckPending
+    /**
+     * §10 step 5: this device's person removed it, and it has read the signed
+     * roster that says so. Not a window that closes — see
+     * [`CoreLinkActivationStage::Revoked`].
+     */
+    case deviceRevoked
 }
 
 
@@ -38403,6 +38858,8 @@ public struct FfiConverterTypeCoreLinkGateReason: FfiConverterRustBuffer {
         case 3: return .bootstrapPending
         
         case 4: return .rosterAckPending
+        
+        case 5: return .deviceRevoked
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -38426,6 +38883,10 @@ public struct FfiConverterTypeCoreLinkGateReason: FfiConverterRustBuffer {
         
         case .rosterAckPending:
             writeInt(&buf, Int32(4))
+        
+        
+        case .deviceRevoked:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -42222,6 +42683,21 @@ public enum Frame {
      */
     case hello2(userId: Data, capabilities: UInt32
     )
+    /**
+     * **§10 step 5's own-roster notice** (frame type `0x07`): one person's own
+     * signed roster document, as [`crate::core_encode_roster`] writes it.
+     *
+     * The document is the DL-3 document and nothing else — keys, ids, counters
+     * and one signature. DL-5 keeps an endpoint out of a roster structurally
+     * (there is no field one fits in), so this frame cannot leak a discovered
+     * or third-party address however it is routed.
+     *
+     * It is plaintext on the link, so **who may be sent one is the whole of its
+     * safety**: only a peer that has already proved, cryptographically, that it
+     * holds this person's own agreement secret. See [`encode_own_roster`].
+     */
+    case ownRoster(document: Data
+    )
     case envelope(msgId: Data, hopTtl: UInt8, expiry: Int64, recipientHint: Data, sealed: Data
     )
     case digest(chatId: Data, entries: [DigestEntry], recentMsgIds: [Data]
@@ -42249,16 +42725,19 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
         case 2: return .hello2(userId: try FfiConverterData.read(from: &buf), capabilities: try FfiConverterUInt32.read(from: &buf)
         )
         
-        case 3: return .envelope(msgId: try FfiConverterData.read(from: &buf), hopTtl: try FfiConverterUInt8.read(from: &buf), expiry: try FfiConverterInt64.read(from: &buf), recipientHint: try FfiConverterData.read(from: &buf), sealed: try FfiConverterData.read(from: &buf)
+        case 3: return .ownRoster(document: try FfiConverterData.read(from: &buf)
         )
         
-        case 4: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
+        case 4: return .envelope(msgId: try FfiConverterData.read(from: &buf), hopTtl: try FfiConverterUInt8.read(from: &buf), expiry: try FfiConverterInt64.read(from: &buf), recipientHint: try FfiConverterData.read(from: &buf), sealed: try FfiConverterData.read(from: &buf)
         )
         
-        case 5: return .lanEndpoint(instanceToken: try FfiConverterData.read(from: &buf), host: try FfiConverterString.read(from: &buf), port: try FfiConverterUInt16.read(from: &buf)
+        case 5: return .digest(chatId: try FfiConverterData.read(from: &buf), entries: try FfiConverterSequenceTypeDigestEntry.read(from: &buf), recentMsgIds: try FfiConverterSequenceData.read(from: &buf)
         )
         
-        case 6: return .transportProbe(nonce: try FfiConverterUInt64.read(from: &buf), response: try FfiConverterBool.read(from: &buf)
+        case 6: return .lanEndpoint(instanceToken: try FfiConverterData.read(from: &buf), host: try FfiConverterString.read(from: &buf), port: try FfiConverterUInt16.read(from: &buf)
+        )
+        
+        case 7: return .transportProbe(nonce: try FfiConverterUInt64.read(from: &buf), response: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -42280,8 +42759,13 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             FfiConverterUInt32.write(capabilities, into: &buf)
             
         
-        case let .envelope(msgId,hopTtl,expiry,recipientHint,sealed):
+        case let .ownRoster(document):
             writeInt(&buf, Int32(3))
+            FfiConverterData.write(document, into: &buf)
+            
+        
+        case let .envelope(msgId,hopTtl,expiry,recipientHint,sealed):
+            writeInt(&buf, Int32(4))
             FfiConverterData.write(msgId, into: &buf)
             FfiConverterUInt8.write(hopTtl, into: &buf)
             FfiConverterInt64.write(expiry, into: &buf)
@@ -42290,21 +42774,21 @@ public struct FfiConverterTypeFrame: FfiConverterRustBuffer {
             
         
         case let .digest(chatId,entries,recentMsgIds):
-            writeInt(&buf, Int32(4))
+            writeInt(&buf, Int32(5))
             FfiConverterData.write(chatId, into: &buf)
             FfiConverterSequenceTypeDigestEntry.write(entries, into: &buf)
             FfiConverterSequenceData.write(recentMsgIds, into: &buf)
             
         
         case let .lanEndpoint(instanceToken,host,port):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(6))
             FfiConverterData.write(instanceToken, into: &buf)
             FfiConverterString.write(host, into: &buf)
             FfiConverterUInt16.write(port, into: &buf)
             
         
         case let .transportProbe(nonce,response):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(7))
             FfiConverterUInt64.write(nonce, into: &buf)
             FfiConverterBool.write(response, into: &buf)
             
@@ -43136,11 +43620,32 @@ public enum RevocationAdoptionOutcome {
      */
     case notSuperseding
     /**
-     * This device is the one being buried. Nothing is adopted: a tombstoned
-     * device is not a member of the fleet it is being removed from, and
-     * [`MessageStore::adopt_own_roster`] would refuse the document anyway.
+     * This device is the one being buried, and it has ejected itself
+     * ([`MessageStore::eject_self_from_fleet`], §10 step 5): the burying roster
+     * is stored, the fleet projection is cleared, and the activation gate is
+     * [`crate::CoreLinkActivationStage::Revoked`] — so this device no longer
+     * advertises, authors or acks.
+     *
+     * No fleet is *adopted*, because a tombstoned device is not a member of the
+     * fleet the document describes and
+     * [`MessageStore::adopt_own_roster`] refuses it for exactly that reason.
+     * What used to happen here was nothing at all: the outcome was reported and
+     * no byte was written, which left a removed device reporting itself linked
+     * forever.
      */
     case revokedSelf
+    /**
+     * The document supersedes what is held and still lists this device, but it
+     * announces an inbox key generation this device does not hold — so there is
+     * a §10.1 rotation still owed, and nothing was written.
+     *
+     * Only [`MessageStore::apply_own_roster_notice`] returns this: a plaintext
+     * link frame carries a roster and never key material, so a device that
+     * adopted the roster there would hold a fleet whose sync traffic it cannot
+     * open. The sealed handoff is what closes this, and reporting the gap is
+     * better than half-applying it.
+     */
+    case awaitingRotationKey
     /**
      * The acceptance rules refused the document — DL-2's fork quarantine,
      * DL-4's tombstones, §6's generation rule, §14.2's epoch authority.
@@ -43172,9 +43677,11 @@ public struct FfiConverterTypeRevocationAdoptionOutcome: FfiConverterRustBuffer 
         
         case 3: return .revokedSelf
         
-        case 4: return .refused
+        case 4: return .awaitingRotationKey
         
-        case 5: return .forkQuarantined
+        case 5: return .refused
+        
+        case 6: return .forkQuarantined
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -43196,12 +43703,16 @@ public struct FfiConverterTypeRevocationAdoptionOutcome: FfiConverterRustBuffer 
             writeInt(&buf, Int32(3))
         
         
-        case .refused:
+        case .awaitingRotationKey:
             writeInt(&buf, Int32(4))
         
         
-        case .forkQuarantined:
+        case .refused:
             writeInt(&buf, Int32(5))
+        
+        
+        case .forkQuarantined:
+            writeInt(&buf, Int32(6))
         
         }
     }
@@ -53461,6 +53972,36 @@ public func encodeMessageBodyWithReply(body: MessageBody, replyToMsgId: Data)thr
 })
 }
 /**
+ * Encode an own-roster notice: `0x07 ‖ roster document`
+ * (`specs/multi-device-v1.md` §10 step 5).
+ *
+ * # The one rule that makes this frame safe
+ *
+ * **Send it only on a link whose remote party has already proved it holds this
+ * person's own agreement secret** — in practice a LAN Noise session whose
+ * remote static key is this identity's `agree_pk` — and refuse it on arrival
+ * under the same test. Both halves, or neither.
+ *
+ * The reason is that the body is plaintext and the roster is a private fact:
+ * how many devices this person has and what their keys are. Anyone who passes
+ * the test already holds the person key and therefore already holds everything
+ * the document says; anyone who does not must never be able to elicit it by
+ * claiming this person's `user_id` in a HELLO. BLE HELLO is cleartext and
+ * cannot prove anything, so a BLE meeting never carries this frame — see the
+ * note in §10 of the spec, which records that limitation rather than weakening
+ * the test to cover it.
+ *
+ * Gated by [`CAP_OWN_ROSTER_NOTICE`] on the peer's HELLO2, so a build that
+ * predates the frame is never sent one.
+ */
+public func encodeOwnRoster(document: Data)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_encode_own_roster(
+        FfiConverterData.lower(document),$0
+    )
+})
+}
+/**
  * Encode a [`ProfileSyncContent`] to its wire form.
  */
 public func encodeProfileSyncContent(content: ProfileSyncContent)throws  -> Data {
@@ -56125,6 +56666,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_encode_message_body_with_reply() != 53763) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_encode_own_roster() != 60589) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_encode_profile_sync_content() != 47026) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -56617,6 +57161,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello2() != 17439) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_own_device_connected() != 30441) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acked_hidden_kinds() != 7435) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -56632,7 +57179,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_targeted_carried_progress() != 46713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_relay_routes() != 63158) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_relay_routes() != 61710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_route_for() != 36259) {
@@ -56767,7 +57314,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_own_roster() != 39473) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_revocation_handoff() != 38529) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_adopt_revocation_handoff() != 33465) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_fetch_cursor() != 11436) {
@@ -56786,6 +57333,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 12212) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_friend_request() != 47501) {
@@ -56833,7 +57383,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_block_user() != 63065) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_build_link_bootstrap() != 46651) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_build_link_bootstrap() != 47041) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_carried_envelopes_for_hints() != 43270) {
@@ -57269,6 +57819,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_own_roster() != 1875) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_own_roster_notice_frame() != 7895) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_peer_connection_events() != 65461) {

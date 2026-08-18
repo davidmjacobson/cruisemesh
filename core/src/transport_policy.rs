@@ -524,6 +524,18 @@ struct Peer {
     /// hidden kinds. Cleared on a fresh legacy HELLO (new handshake) and
     /// dropped with the peer on disconnect.
     hidden_offered: std::collections::HashSet<Vec<u8>>,
+    /// This link was admitted as one of THIS person's own devices
+    /// (`specs/multi-device-v1.md` §10 step 5), not as somebody's peer.
+    ///
+    /// It carries the roster notice and the HELLOs that precede it, and
+    /// nothing else. A missing `user_id` does not say that on its own —
+    /// [`CoreMeshRouterState::relay_routes`] deliberately floods every *not
+    /// yet* identified link, and "not yet" is exactly what this link never is
+    /// — so the fact is recorded rather than inferred. Two things follow: the
+    /// epidemic fanout skips it, and no HELLO can turn it into a route. Both
+    /// matter for the same reason: after a removal, the device still holding
+    /// this person's agreement key is the device that was removed.
+    own_device: bool,
 }
 
 /// Carry offering is encounter state for an authenticated logical peer, not
@@ -684,17 +696,22 @@ impl CoreMeshRouterState {
     }
 
     pub fn on_connected(&self, address: String, transport: CoreTransport) {
-        self.peers.lock_recoverable().insert(
-            address,
-            Peer {
-                transport,
-                connected_sequence: self.next_connected_sequence.fetch_add(1, Ordering::Relaxed),
-                user_id: None,
-                capabilities: None,
-                last_digest_at_ms: None,
-                hidden_offered: std::collections::HashSet::new(),
-            },
-        );
+        self.insert_peer(address, transport, false);
+    }
+
+    /// A link that proved it belongs to one of THIS person's own devices
+    /// (`specs/multi-device-v1.md` §10 step 5), registered so frames can be
+    /// written to it and marked so that nothing treats it as a peer.
+    ///
+    /// Separate from [`Self::on_connected`] because "no user id yet" and "never
+    /// a route" are different facts that happen to look alike. The epidemic
+    /// fanout floods every link of the first kind — that is what makes gossip
+    /// work on a link whose HELLO has not landed — and a device this person
+    /// has just removed must not be on the receiving end of that. Nor may it
+    /// claim a contact's user id in a HELLO and take over that contact's
+    /// route: [`Self::on_hello`] refuses one here.
+    pub fn on_own_device_connected(&self, address: String, transport: CoreTransport) {
+        self.insert_peer(address, transport, true);
     }
 
     pub fn on_disconnected(&self, address: String) {
@@ -706,6 +723,13 @@ impl CoreMeshRouterState {
         let Some(peer) = peers.get_mut(&address) else {
             return false;
         };
+        // A link admitted as one of this person's own devices is not a route
+        // and cannot become one by saying so. Without this, a removed phone —
+        // which still holds the agreement key that admits it — could name a
+        // contact in a HELLO and win that contact's elected route.
+        if peer.own_device {
+            return false;
+        }
         if peer.user_id.as_ref().is_some_and(|known| *known != user_id) {
             return false;
         }
@@ -733,6 +757,10 @@ impl CoreMeshRouterState {
         let Some(peer) = peers.get_mut(&address) else {
             return false;
         };
+        // Same rule as [`Self::on_hello`], for the same reason.
+        if peer.own_device {
+            return false;
+        }
         if peer.user_id.as_ref().is_some_and(|known| *known != user_id) {
             return false;
         }
@@ -1025,6 +1053,13 @@ impl CoreMeshRouterState {
     /// not-yet-identified link. If the source is identified, exclude all of
     /// that user's physical routes so a frame cannot echo through its other
     /// BLE role or rotated address.
+    ///
+    /// A link admitted as one of this person's own devices
+    /// ([`Self::on_own_device_connected`]) is in neither set. It has no user
+    /// id, but it is not *not yet* identified either — it is a carrier for the
+    /// §10 step 5 roster notice and nothing else, so flooding it would hand a
+    /// device this person may have just removed a live feed of every envelope
+    /// this phone sends or relays.
     pub fn relay_routes(&self, except_address: Option<String>) -> Vec<CoreTransportRoute> {
         let excluded_user = {
             let peers = self.peers.lock_recoverable();
@@ -1043,7 +1078,9 @@ impl CoreMeshRouterState {
         let mut routes: Vec<_> = peers
             .iter()
             .filter(|(address, peer)| {
-                if peer.user_id.is_some() {
+                if peer.own_device {
+                    false
+                } else if peer.user_id.is_some() {
                     selected_addresses.contains(*address)
                 } else {
                     except_address.as_ref() != Some(*address)
@@ -1116,6 +1153,30 @@ impl CoreMeshRouterState {
     pub fn clear(&self) {
         self.peers.lock_recoverable().clear();
         self.logical_carry.lock_recoverable().clear();
+    }
+}
+
+/// The one place a peer row is created, shared by [`CoreMeshRouterState::
+/// on_connected`] and [`CoreMeshRouterState::on_own_device_connected`].
+///
+/// Outside the `#[uniffi::export]` block deliberately: `uniffi` exports every
+/// method in an exported `impl`, `pub` or not, and the frozen mobile ABI must
+/// not grow an entry point that lets a shell mint a peer row of either kind
+/// with the flag of its choosing. The two named doors are the whole surface.
+impl CoreMeshRouterState {
+    fn insert_peer(&self, address: String, transport: CoreTransport, own_device: bool) {
+        self.peers.lock_recoverable().insert(
+            address,
+            Peer {
+                transport,
+                connected_sequence: self.next_connected_sequence.fetch_add(1, Ordering::Relaxed),
+                user_id: None,
+                capabilities: None,
+                last_digest_at_ms: None,
+                hidden_offered: std::collections::HashSet::new(),
+                own_device,
+            },
+        );
     }
 }
 
@@ -2349,6 +2410,54 @@ mod tests {
         assert!(!excluding_alice
             .iter()
             .any(|route| route.address.starts_with("alice-")));
+    }
+
+    /// §10 step 5: the link to a device of this person's own carries the
+    /// roster notice and nothing else. It is not a route, and unlike an
+    /// ordinary unidentified link it is not a flood target either -- the
+    /// device still holding this person's agreement key after a removal is the
+    /// device that was removed, and it must not be fed the person's traffic.
+    #[test]
+    fn relay_plan_skips_a_link_to_one_of_this_persons_own_devices() {
+        let router = CoreMeshRouterState::new();
+        let alice = vec![2; 16];
+        router.on_connected("alice".into(), CoreTransport::Lan);
+        assert!(router.on_hello("alice".into(), alice));
+        router.on_connected("stranger".into(), CoreTransport::Central);
+        router.on_own_device_connected("sibling".into(), CoreTransport::Lan);
+
+        let all = router.relay_routes(None);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|route| route.address == "alice"));
+        // Still flooded: an identified peer's HELLO may simply not have
+        // landed yet, which is the case this arm exists for.
+        assert!(all.iter().any(|route| route.address == "stranger"));
+        assert!(!all.iter().any(|route| route.address == "sibling"));
+
+        // Excluding the own-device link as a source changes nothing: it was
+        // never in the plan.
+        assert_eq!(router.relay_routes(Some("sibling".into())).len(), 2);
+    }
+
+    /// A removed phone still holds the agreement key that admits it as one of
+    /// this person's own devices. Naming a contact in a HELLO must not win it
+    /// that contact's route.
+    #[test]
+    fn an_own_device_link_cannot_become_a_route_by_saying_so() {
+        let router = CoreMeshRouterState::new();
+        let contact = vec![7; 16];
+        router.on_own_device_connected("sibling".into(), CoreTransport::Lan);
+
+        assert!(!router.on_hello("sibling".into(), contact.clone()));
+        assert!(!router.on_hello2("sibling".into(), contact.clone(), 0xffff_ffff));
+        assert!(router.route_for(contact).is_none());
+        assert!(router.selected_identified_routes().is_empty());
+        assert_eq!(router.connected_user_count(), 0);
+        // Still a live transport: the notice has to reach it somehow.
+        assert_eq!(
+            router.transport_for("sibling".into()),
+            Some(CoreTransport::Lan)
+        );
     }
 
     #[test]

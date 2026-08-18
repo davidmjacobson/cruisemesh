@@ -29,7 +29,15 @@ struct AddDeviceView: View {
     let identity: Identity
     let role: CoreLinkRole
     var expectedPersonId: Data?
+    /// Every ending that is not an adoption: a run that was declined, timed out
+    /// or threw, and the approving device's own finish. Not a door into the app —
+    /// see `LinkCompletion` for why the two must not share one callback.
     var onFinished: () -> Void = {}
+    /// Where a phone that was just adopted goes: into the app, never back the way
+    /// it came. Defaults to `onFinished`, so a caller with no separate landing
+    /// place keeps exactly the behaviour it had. Mirrors Android's `onLinked`,
+    /// which defaults to `onBack` for the same reason.
+    var onLinked: () -> Void = {}
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var session: LinkSession
@@ -51,12 +59,14 @@ struct AddDeviceView: View {
         identity: Identity,
         role: CoreLinkRole,
         expectedPersonId: Data? = nil,
-        onFinished: @escaping () -> Void = {}
+        onFinished: @escaping () -> Void = {},
+        onLinked: (() -> Void)? = nil
     ) {
         self.identity = identity
         self.role = role
         self.expectedPersonId = expectedPersonId
         self.onFinished = onFinished
+        self.onLinked = onLinked ?? onFinished
         _session = StateObject(
             wrappedValue: LinkSession(identity: identity, expectedPersonId: expectedPersonId)
         )
@@ -278,7 +288,15 @@ struct AddDeviceView: View {
             if state.step == .done || state.step == .failed {
                 Button("Done") {
                     session.close()
-                    onFinished()
+                    // One button, two meanings: a phone that was just adopted is
+                    // set up and belongs in the app, and everything else --
+                    // including a run that failed, which this same button ends --
+                    // belongs back where it came from.
+                    if LinkCompletion.entersApp(role: role, step: state.step) {
+                        onLinked()
+                    } else {
+                        onFinished()
+                    }
                     dismiss()
                 }
             } else {

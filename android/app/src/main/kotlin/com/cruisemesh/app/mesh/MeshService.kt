@@ -35,10 +35,12 @@ import com.cruisemesh.app.R
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
+import com.cruisemesh.app.devicelink.DeviceRemovalStatus
 import com.cruisemesh.app.devicelink.LinkRadioPlan
 import com.cruisemesh.app.devicelink.RosterGossipSender
 import com.cruisemesh.app.devicelink.LinkRadioStep
 import com.cruisemesh.app.devicelink.LinkVisibility
+import com.cruisemesh.app.identity.DeviceKeyStore
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.TermsAcceptanceStore
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -55,6 +57,7 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionTransport
+import uniffi.cruisemesh_core.RevocationAdoptionOutcome
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.digestIsSharedGroup
 import uniffi.cruisemesh_core.encodeDigest
@@ -596,6 +599,21 @@ class MeshService : Service() {
         identity = loadedIdentity
         MeshRouter.setLocalUserId(loadedIdentity.userId)
         store = AppStore.get(this)
+        // specs/multi-device-v1.md §10 step 5: a device its person removed does
+        // not come back up. Core's gate would refuse everything this service
+        // does anyway, but a foreground notification saying the mesh is running
+        // is its own claim, and the boot receiver and the app both reach here.
+        // One select against a single-row table, on the main thread for the same
+        // reason the link gate is read there.
+        DeviceRemovalStatus.refresh(store)
+        if (DeviceRemovalStatus.removed.value) {
+            MeshRuntimeStatus.markStopped()
+            Log.w(TAG, "This device was removed from its person's devices; stopping mesh service")
+            MeshStartupPreferences.setMeshEnabled(this, false)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         // Spray decisions carry no store of their own, so this is where they
         // find the protocol-event ring. Before the mesh roles come up, so the
         // first reconnect of the session is already recorded.
@@ -681,6 +699,7 @@ class MeshService : Service() {
                 lanEndpointCache.save(networkId, userId, endpoint, LanEndpointProvenance.HINTED)
             },
             onAuthenticated = ::onLanPeerAuthenticated,
+            onOwnDeviceAuthenticated = ::onOwnDeviceLanLink,
             onDisconnected = ::onLanPeerDisconnected,
             onFrameReceived = ::onFrameReceived,
         )
@@ -1086,6 +1105,11 @@ class MeshService : Service() {
             // activating should not have to be restarted to be heard. Off the
             // main thread, so this is where the periodic read belongs.
             LinkVisibility.refresh(store)
+            // And on the same tick, whether this device is still one of its
+            // person's at all: a notice applied in another process (or before
+            // this one started) has to reach the screens without waiting for
+            // the next launch.
+            DeviceRemovalStatus.refresh(store)
             val carried = try {
                 store.carriedLen().toLong()
             } catch (e: CoreException) {
@@ -1263,6 +1287,38 @@ class MeshService : Service() {
         MeshConnectivityStatus.refreshNearbyRoutes()
         if (wasSelected) peerUserId?.let(::scheduleFailoverResume)
         noteLinkChangeAndReevaluate("peripheral central disconnected")
+    }
+
+    /**
+     * A device of this person's own, on this Wi-Fi, on a link that proved it
+     * (`specs/multi-device-v1.md` §10 step 5).
+     *
+     * Registered as a transport so frames can be written to it, and deliberately
+     * **not** as a route: the user id on the other end is this person's own, and
+     * a route to this person would hand this phone's own mail straight back out.
+     *
+     * Registered through [MeshRouter.onOwnDeviceConnected] rather than
+     * [MeshRouter.onConnected], and the difference is load-bearing. Simply
+     * withholding a user id is not enough: core's epidemic fanout floods every
+     * *not yet* identified link on purpose, so an unmarked link would receive
+     * every envelope this phone sends or relays -- a live feed for a device the
+     * person may have just removed. Marked, it is out of the fanout, and a
+     * HELLO naming a contact cannot win it that contact's route either. What is
+     * left is exactly what §10 step 5 needs: frames addressed to this one link.
+     *
+     * The HELLO pair goes out for the same reason it does on a peer link: the
+     * capability bits ride HELLO2, and the roster notice is answered from
+     * [onFrameReceived] once the other end has said what it understands.
+     *
+     * The clone warning is not raised here. It was already raised during the
+     * handshake ([recordOwnIdentityCloneIfAuthenticated], via the trusted-peer
+     * lookup that returned nothing), which is the same evidence one moment
+     * earlier -- raising it again would be one meeting counted twice.
+     */
+    private fun onOwnDeviceLanLink(address: String) {
+        MeshRouter.onOwnDeviceConnected(address, MeshRouterState.Transport.LAN)
+        Log.i(TAG, "Another device of ours authenticated over local Wi-Fi")
+        sendHello(address)
     }
 
     private fun onLanPeerAuthenticated(
@@ -1579,10 +1635,16 @@ class MeshService : Service() {
         when (parsed) {
             is Frame.Hello -> handleHello(address, parsed.userId, identity)
             is Frame.Hello2 -> {
-                if (!noteOwnIdentityHello(address, parsed.userId, identity)) {
+                if (noteOwnIdentityHello(address, parsed.userId, identity)) {
+                    // A device of this person's own, on a link that has proved
+                    // it: §10 step 5's meeting. Here rather than in the legacy
+                    // HELLO branch because the capability bits only ride 0x06.
+                    offerOwnRosterNotice(address, parsed.capabilities, identity)
+                } else {
                     MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
                 }
             }
+            is Frame.OwnRoster -> handleOwnRosterNotice(address, parsed, identity)
             is Frame.Envelope -> envelopeProcessor?.processInboundEnvelope(address, parsed, identity)
             is Frame.Digest -> handleDigest(address, parsed.chatId, parsed.entries, parsed.recentMsgIds, identity)
             is Frame.LanEndpoint -> handleLanEndpointHint(address, parsed)
@@ -1754,25 +1816,148 @@ class MeshService : Service() {
      * `msg_id` suppression above.
      */
     /**
-     * A HELLO claiming our user id is the `.cmbak`-clone meeting. The user id
-     * in the frame is only a claim, so it never records the warning on its
-     * own: the link must be a LAN link whose Noise session key is this
-     * identity's own agreement key, matching the check the LAN handshake path
-     * already makes ([recordOwnIdentityCloneIfAuthenticated]) and the contract
-     * documented on the core store. Any other claim -- a cleartext BLE HELLO,
-     * or a LAN link authenticated as some other peer -- is logged and dropped.
-     * Returns true when the frame was about us and must not become a route.
+     * A HELLO claiming our user id is either the `.cmbak`-clone meeting or one
+     * of this person's own devices, and the frame alone cannot tell: a user id
+     * is a claim, and the proof is the Noise static key the link's peer
+     * actually holds ([ownIdentityLinkIsProven]).
+     *
+     * Whichever it is, it must not become a route -- a route to this person
+     * leads back to this phone -- so this returns true for both and the caller
+     * stops. The clone warning is not recorded here: the LAN handshake raised
+     * it one moment earlier for exactly this link
+     * ([recordOwnIdentityCloneIfAuthenticated]), and raising it again would
+     * count one meeting twice. An unproven claim -- a cleartext BLE HELLO, or a
+     * LAN link authenticated as some other peer -- is logged and dropped.
      */
     private fun noteOwnIdentityHello(address: String, userId: ByteArray, identity: Identity): Boolean {
         if (!userId.contentEquals(identity.userId)) return false
-        val isLanLink = MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
-        val sessionKey = if (isLanLink) lanTransport?.remoteStaticKeyFor(address) else null
-        if (ownIdentityHelloIsAuthenticated(isLanLink, identity.agreePk, sessionKey)) {
-            recordOwnIdentityClone(sessionKey?.let(::peerDeviceIdFor))
-        } else {
+        if (!ownIdentityLinkIsProven(address, identity)) {
             Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")
         }
         return true
+    }
+
+    /**
+     * Whether this link has proved, cryptographically, that the other end holds
+     * this person's own agreement secret.
+     *
+     * The bar the clone warning already used, hoisted so §10 step 5's roster
+     * notice is held to exactly the same one rather than to a second copy of it
+     * that could drift. A cleartext BLE HELLO never clears it.
+     */
+    private fun ownIdentityLinkIsProven(address: String, identity: Identity): Boolean {
+        val isLanLink = MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
+        val sessionKey = if (isLanLink) lanTransport?.remoteStaticKeyFor(address) else null
+        return OwnRosterNoticePolicy.mayCross(isLanLink, identity.agreePk, sessionKey)
+    }
+
+    /**
+     * **§10 step 5, sending.** Push this person's own signed roster at a device
+     * of theirs that has just said hello on a link belonging to them.
+     *
+     * Unrequested, because the device that most needs it is the one that does
+     * not know to ask: a removed phone believes it is still linked, so a
+     * request-shaped exchange would never be started by the only participant
+     * who is wrong. Sent both ways for the same reason, which also settles an
+     * ordinary sibling that is merely behind.
+     *
+     * What it cannot outrun is §10.1's key rotation, which lands at the moment
+     * of removal, long before any meeting: the fleet's own traffic is already
+     * shut to that device when this reaches it. And it hears it from a document
+     * signed under the person root, never from a bare hint. Core refuses to hand
+     * one out at all from a device the gate has silenced, so an ejected phone
+     * does not become an announcer.
+     *
+     * It is not, however, free of disclosure while §10.2 is unimplemented. No
+     * shell drives the relay token rotation yet (see `RemoveDeviceSession`), so
+     * this does tell the holder of a removed phone the moment they were removed
+     * while the shared relay credential that phone already had is still live.
+     * Recorded rather than papered over: the honest fix is shipping §10.2, not
+     * withholding the one signal that stops an honest phone believing it is
+     * still linked.
+     */
+    private fun offerOwnRosterNotice(address: String, capabilities: UInt, identity: Identity) {
+        if (!ownIdentityLinkIsProven(address, identity)) return
+        if (!OwnRosterNoticePolicy.peerReadsNotices(capabilities)) return
+        runOnStoreExecutor("own-roster notice") {
+            val frame = store.ownRosterNoticeFrame() ?: return@runOnStoreExecutor
+            MeshRouter.sendToAddress(address, frame)
+            Log.i(TAG, "Sent our device list to another device of ours on $address")
+        }
+    }
+
+    /**
+     * **§10 step 5, receiving.** A roster of this person's own devices, arriving
+     * from one of them.
+     *
+     * The link test is repeated here and is not a formality: it is what stops a
+     * stranger who claimed our user id in a HELLO from handing us a document at
+     * all. Core then refuses anything the person root did not sign and anything
+     * that does not strictly supersede what this device holds, so the only
+     * document that changes anything here is this person's own, newer than the
+     * one this phone had.
+     *
+     * The outcome worth acting on is [RevocationAdoptionOutcome.REVOKED_SELF]:
+     * core has already stored the burying roster, cleared the fleet projection
+     * and moved the activation stage to revoked, which refuses advertising,
+     * authoring and acking. What is left for the shell is the part core cannot
+     * see — this phone's own radios, and the person looking at it.
+     */
+    private fun handleOwnRosterNotice(address: String, frame: Frame.OwnRoster, identity: Identity) {
+        if (!ownIdentityLinkIsProven(address, identity)) {
+            Log.w(TAG, "Ignoring a device list from a link that has not proved it is ours")
+            return
+        }
+        val ownDeviceId = DeviceKeyStore.load(this)?.deviceId ?: run {
+            // No device key means this install was never part of a roster, so
+            // there is nothing a roster could say about it.
+            Log.i(TAG, "Ignoring a device list on an install that has never linked")
+            return
+        }
+        runOnStoreExecutor("own-roster notice from $address") {
+            val adoption = store.applyOwnRosterNotice(
+                frame.document,
+                identity.signPk,
+                ownDeviceId,
+                System.currentTimeMillis(),
+            )
+            when (adoption.outcome) {
+                RevocationAdoptionOutcome.REVOKED_SELF -> {
+                    Log.w(TAG, "This device was removed from its person's devices; standing down")
+                    DeviceRemovalStatus.markRemoved()
+                    // Takes the radios down through the same path §9.4 uses.
+                    LinkVisibility.refresh(store)
+                    stopBecauseThisDeviceWasRemoved()
+                }
+                RevocationAdoptionOutcome.FORK_QUARANTINED ->
+                    // DL-2: two signed device lists at the same version. Core
+                    // deliberately does not eject on one branch of a fork, so
+                    // this device stays live -- said out loud rather than
+                    // swallowed, because a quarantined phone that was in fact
+                    // removed is the one corner where the symptom survives. A
+                    // surface for it is owed with the rest of §10.4's.
+                    Log.w(TAG, "Two different device lists claim the same version; quarantined")
+                RevocationAdoptionOutcome.ADOPTED ->
+                    Log.i(TAG, "Took a newer device list from another device of ours")
+                else ->
+                    Log.i(TAG, "Device list from $address changed nothing: ${adoption.outcome}")
+            }
+        }
+    }
+
+    /**
+     * A removed device does not keep a foreground service claiming the mesh is
+     * up. Same shape as the Terms gate in [onStartCommand], and the preference
+     * goes with it so nothing -- the boot receiver, the app opening, the system
+     * reviving the service -- brings it back.
+     */
+    private fun stopBecauseThisDeviceWasRemoved() {
+        relayMainHandler.post {
+            MeshStartupPreferences.setMeshEnabled(this, false)
+            MeshRuntimeStatus.markStopped()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
     }
 
     private fun recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: ByteArray) {

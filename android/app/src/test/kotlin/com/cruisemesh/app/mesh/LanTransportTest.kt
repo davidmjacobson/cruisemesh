@@ -84,6 +84,34 @@ class LanTransportTest {
         assertTrue(!ownLanStaticKeyMatches(alice.agreePk, bob.agreePk))
     }
 
+    /**
+     * The three answers a finished handshake can have, and why "not a contact"
+     * is no longer one verdict (`specs/multi-device-v1.md` §10 step 5).
+     *
+     * A device of this person's own is never in their contact list and never
+     * will be, so before this it was refused exactly like a stranger -- which is
+     * why a removed phone could sit on the same Wi-Fi as the phone that removed
+     * it and never be told. It is kept now, with no user id, so nothing treats
+     * it as a peer.
+     */
+    @Test
+    fun `a device of our own is neither a contact nor a stranger`() {
+        val own = contact(1, 7)
+        val friend = contact(2, 8)
+        val stranger = ByteArray(32) { 9 }
+        val contacts = listOf(friend)
+
+        // A friend: a user id, and everything that follows from having one.
+        assertArrayEquals(friend.userId, trustedLanPeerUserId(contacts, friend.agreePk))
+        // Our own device: no user id from the contact list, and the own-key
+        // test is what stops the link being closed as a stranger's.
+        assertNull(trustedLanPeerUserId(contacts, own.agreePk))
+        assertTrue(ownLanStaticKeyMatches(own.agreePk, own.agreePk.copyOf()))
+        // A stranger: neither, and still refused.
+        assertNull(trustedLanPeerUserId(contacts, stranger))
+        assertTrue(!ownLanStaticKeyMatches(own.agreePk, stranger))
+    }
+
     @Test
     fun `own-id HELLO records a clone only when the session key is ours`() {
         val own = contact(1, 7)
@@ -575,6 +603,51 @@ class LanTransportTest {
         links.dial("scan:10.1.0.4")
         assertEquals(1, links.pending())
         assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+    }
+
+    /**
+     * A link to a device of this person's own holds its outbound service key
+     * for the whole life of the link, exactly like a contact's. It earns no
+     * sweep credit -- it is nobody's friend -- but if it never joins the
+     * authenticated set, the automatic-scan gate counts it as an attempt still
+     * in flight forever, and the phone that dialed its own sibling stops
+     * sweeping this subnet for as long as the two stay linked. A family member
+     * joining that Wi-Fi afterwards would never be found by the fallback.
+     */
+    @Test
+    fun `a link to one of our own devices does not wedge the automatic scan gate`() {
+        val links = OutboundLinks()
+        links.dial("scan:10.0.0.2")
+        assertEquals(1, links.pending())
+        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+
+        // The handshake finished and the peer turned out to be our own phone.
+        links.authenticate("scan:10.0.0.2")
+        assertEquals(0, links.pending())
+        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+    }
+
+    /**
+     * §10 step 5's link is capped at one. A removed phone still holds the
+     * agreement key that admits it -- §10.1 rotates the inbox key, never the
+     * LAN Noise static -- and such a link carries no user id, so the
+     * duplicate-link test that bounds a contact to one link cannot see it.
+     * Uncapped, it could take every socket slot and keep the family's real
+     * contacts off this Wi-Fi.
+     */
+    @Test
+    fun `only one link to our own devices survives`() {
+        // Nothing to close on the first one.
+        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(emptySet(), "lan:1"))
+        // The newest wins, so a half-dead link can never wedge the channel.
+        assertEquals(listOf("lan:1"), supersededOwnDeviceLinks(setOf("lan:1"), "lan:2"))
+        // A device that opened a fistful of sockets keeps exactly one.
+        assertEquals(
+            setOf("lan:1", "lan:2", "lan:3"),
+            supersededOwnDeviceLinks(setOf("lan:1", "lan:2", "lan:3"), "lan:4").toSet(),
+        )
+        // Re-registering the live link is not a reason to close it.
+        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(setOf("lan:1"), "lan:1"))
     }
 
     @Test
