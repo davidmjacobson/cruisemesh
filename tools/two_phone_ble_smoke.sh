@@ -61,8 +61,13 @@ while getopts ":a:b:p:o:n:h" opt; do
     esac
 done
 
-PKG=com.cruisemesh.app
-ACTIVITY="$PKG/.MainActivity"
+# Debug builds install as com.cruisemesh.app.debug (applicationIdSuffix) so
+# they can coexist with a Play install. Override PKG=com.cruisemesh.app for a
+# pre-suffix build. The activity CLASS keeps the unsuffixed Kotlin package,
+# so it must be fully qualified — "$PKG/.MainActivity" would resolve to a
+# nonexistent com.cruisemesh.app.debug.MainActivity.
+PKG="${PKG:-com.cruisemesh.app.debug}"
+ACTIVITY="$PKG/com.cruisemesh.app.MainActivity"
 # How long to wait for a receipt to come back over Bluetooth. Generous: a
 # fresh BLE link plus fragment reassembly is seconds, but a re-link after the
 # LAN teardown can take a slow-probe cycle.
