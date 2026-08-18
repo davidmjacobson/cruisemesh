@@ -717,9 +717,14 @@ private struct GroupMessageRow: View {
                                 onStatus: onStatus
                             )
                         }
-                        if isOwn, let tick {
-                            HStack {
-                                Spacer(minLength: 0)
+                        HStack(spacing: 5) {
+                            Spacer(minLength: 0)
+                            Text(timeLabel)
+                                .font(.caption2)
+                                .foregroundStyle(
+                                    (isOwn ? Color.white : Color.primary).opacity(0.7)
+                                )
+                            if isOwn, let tick {
                                 SignalTickView(status: tick, tint: .white)
                             }
                         }
@@ -757,10 +762,6 @@ private struct GroupMessageRow: View {
                             onReact: onReactionDetails
                         )
                     }
-                    Text(timeLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-
                     // Set only for a message spliced in above content already
                     // here (core/src/late_arrival.rs). The bubble keeps the
                     // sender's time; this says when it reached us.
