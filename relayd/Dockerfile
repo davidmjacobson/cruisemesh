@@ -4,6 +4,12 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY core ./core
 COPY relayd ./relayd
+# The workspace manifest names every member, so cargo needs each member's
+# Cargo.toml present even though this stage builds only relayd. The
+# desktop crate joined the workspace after this file was written, which
+# broke the on-box build with "failed to load manifest for workspace
+# member /src/desktop" (found during the 2026-08-18 relay deploy).
+COPY desktop ./desktop
 # FR4: the build context above deliberately does not include `.git`, so
 # `relayd/build.rs`'s `git rev-parse` fallback can't see the real commit
 # from inside this stage. Pass it in explicitly:
