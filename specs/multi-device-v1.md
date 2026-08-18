@@ -349,21 +349,45 @@ On "Remove device" (approving device) or recovery-code override:
    meeting, so the fleet's self-sync channel and retained backlog are
    already shut when the notice arrives.
 
-   **Step 2 is a different matter, and the notice must not be described
-   as though it had landed.** Nothing on either shell drives the relay
-   `family_token` rotation today — no call site reaches
-   `begin_relay_rotation` — so a removed device keeps a working family
-   relay credential until §10.2 has a driver (or WP8 replaces it with
-   per-device capabilities). The notice therefore does tell the holder of
-   that phone the exact moment they were removed, while that credential
-   is still live. It grants no new capability: the token was in that
-   phone's hands the whole time, and burning it needs no invitation. But
-   until step 2 ships, "removed" means "cut off from the fleet's own
-   traffic", not "cut off from the relay", and nothing — spec, doc
-   comment or confirm copy — may promise the second. The removal
-   confirmation deliberately promises only what step 1 and step 5
-   deliver: the device stops staying in step with the others, and stands
-   down the next time it meets one.
+   **Step 2 lands on its own clock, and the notice must not be described
+   as though the two were simultaneous.** Both shells drive the relay
+   `family_token` rotation now: the removal writes the rotation journal
+   as it commits (`begin_relay_rotation`), and the relay sync pass makes
+   the call and commits it (`commit_relay_rotation`) the next time this
+   phone can reach the family relay. A removal with no internet is still
+   a removal — it does not block, fail, or wait — so between the removal
+   and that first reachable pass the removed device keeps a working
+   family relay credential, and a step 5 meeting inside that window
+   (same Wi-Fi, no internet: the ship) tells the holder of that phone the
+   exact moment they were removed while the credential is still live. It
+   grants no new capability: the token was in that phone's hands the
+   whole time, and burning it needs no invitation. So "removed" means cut
+   off from the fleet's own traffic *at once*, and cut off from the relay
+   mailbox *as soon as the rotation lands* — and nothing (spec, doc
+   comment or confirm copy) may collapse the two, in either direction.
+
+   Two costs of step 2 are paid by people who did nothing wrong, and the
+   confirm copy says so rather than discovering them in the field:
+
+   - **A sibling that was not there is locked out of the mailbox.** The
+     replacement member token reaches the person's other devices over
+     §8's Settings stream, which still has no shell transport (the same
+     gap step 5's own note names below). Until it has one, a device that
+     was not the one performing the removal keeps the retired credential
+     and must be handed a fresh `CMRELAY1` setup card from the Shore Pass
+     screen. On the common fleet — two devices, one of them the one being
+     removed — nobody is stranded, because the only survivor is the phone
+     that rotated.
+   - **Contacts are repaired by propagation.** Their friend cards carry
+     the *deposit* attenuation of the retired token, which dies with it.
+     The rotation bumps this device's relay epoch, so the shipped
+     `CAP_RELAY_UPDATE` notice fans the new deposit token out on the same
+     pass; a contact who is offline for months posts into a 401 until it
+     reaches them, and two authoritative rejections mark the endpoint
+     stale so nothing loops on it. Anyone who was given the *member*
+     token — the other people on a shared Shore Pass — is not repaired by
+     that notice at all, because it can only ever carry a deposit
+     credential; their repair is a re-shared setup card too.
 
 Notes on step 3, recorded so the guarantee is not read as stronger than
 it is (WP5):

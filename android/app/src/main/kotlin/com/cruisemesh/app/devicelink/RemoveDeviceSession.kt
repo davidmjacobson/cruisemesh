@@ -4,6 +4,8 @@ import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.identity.DeviceKeyStore
+import com.cruisemesh.app.mesh.RelaySyncEvents
+import com.cruisemesh.app.relay.RelayRotationDriver
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.coreRevokeDevicesRoster
@@ -20,6 +22,12 @@ sealed interface RemoveDeviceResult {
         val contactsTold: Int,
         val siblingsToHandOffTo: Int,
         val unresealableRecords: UInt,
+        /**
+         * §10.2 is owed: this person has a Shore Pass, so the shared relay
+         * credential is queued to be re-keyed on the next pass that reaches the
+         * relay. False on the installs with no pass to rotate.
+         */
+        val relayRotationQueued: Boolean = false,
     ) : RemoveDeviceResult
 
     /** Nothing was changed. [reason] is why, for the shell to word. */
@@ -76,14 +84,21 @@ enum class RemoveDeviceRefusal {
  * 5. [RosterGossipSender] tells the contacts — §10.1 step 4's surface for them
  *    is fed by the roster they now hold, not by a separate notice.
  *
+ * 6. [RelayRotationDriver.begin] writes §10.2's rotation journal — and stops
+ *    there. The relay call itself belongs to the relay pass, which is the only
+ *    place that knows which network to bind to and how fast it may speak; see
+ *    that class for why the removal must not wait on it.
+ *
  * # What it deliberately does not do
  *
- * It does not rotate the shared relay `family_token` (§10.2). That machinery has
- * no driver on either shell yet — no call site anywhere reaches
- * `begin_relay_rotation` — so claiming it here would be claiming a capability
- * that does not exist. The consequence is stated plainly in the confirm copy: a
- * removed phone stops being able to read the fleet's own sync traffic
- * immediately, and loses the relay mailbox when §10.2 ships.
+ * It does not make a network call. A removal that could fail on connectivity
+ * would be one a person has to retry by guessing, and "my phone was stolen" is
+ * not a moment to hand somebody a network error. So the relay `family_token`
+ * rotation is *planned and written down* here and performed by the next relay
+ * pass that can reach the relay — seconds later on a connected phone, whenever
+ * the ship finds internet otherwise. Until it lands the removed device still
+ * holds a working relay credential; the confirm copy says so rather than
+ * promising an instant it cannot deliver.
  *
  * It also does not deliver [uniffi.cruisemesh_core.RevocationCommit.handoffs] to
  * siblings. Those ride self-sync, which has no shell transport yet either;
@@ -170,10 +185,16 @@ class RemoveDeviceSession(context: Context, private val identity: Identity) {
             // crashed before sending is repaired by the next pass instead of
             // leaving contacts silently un-told.
             val told = RosterGossipSender.announceIfOwed(store, identity, nowMs)
+            // §10.2, written down but not performed. The nudge is what makes
+            // the common case feel instant: on a phone that is online the next
+            // pass starts a moment later and the rotation lands with it.
+            val rotationQueued = RelayRotationDriver.forApp(appContext, store).begin(commit)
+            if (rotationQueued) RelaySyncEvents.requestSync()
             RemoveDeviceResult.Removed(
                 contactsTold = told,
                 siblingsToHandOffTo = commit.handoffs.size,
                 unresealableRecords = commit.unresealableRecords,
+                relayRotationQueued = rotationQueued,
             )
         } catch (e: Exception) {
             Log.w(TAG, "removing a device did not finish", e)

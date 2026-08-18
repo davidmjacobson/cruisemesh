@@ -89,12 +89,13 @@ final class DeviceLinkCopyTests: XCTestCase {
         }
     }
 
-    /// The removal confirmation must not promise the removed phone loses the
-    /// family's relay mailbox: §10.2's token rotation has no driver on either
-    /// shell, and a confirmation that overstates what removal does is worse than
-    /// one that says less.
-    func testTheRemovalConfirmationPromisesNothingAboutTheShorePass() {
-        let text = removeDeviceConfirmationText(deviceName: "Old iPad")
+    /// A family with no Shore Pass must not be told they are losing one.
+    ///
+    /// This half of the pin is unchanged by §10.2 landing: the rotation only
+    /// exists where there is a credential to rotate, so on an install with no
+    /// pass the confirmation still promises exactly what §10.1 and step 5 do.
+    func testTheRemovalConfirmationPromisesNothingAboutAPassThatDoesNotExist() {
+        let text = removeDeviceConfirmationText(deviceName: "Old iPad", hasShorePass: false)
         XCTAssertTrue(text.contains("Old iPad"))
         // It must say all three things §10.1 actually produces.
         XCTAssertTrue(text.contains("stops staying in step with your other devices"))
@@ -104,10 +105,25 @@ final class DeviceLinkCopyTests: XCTestCase {
         // at the moment of the tap. Saying otherwise is the promise this
         // confirmation made before there was anything behind it.
         XCTAssertTrue(text.contains("same Wi-Fi"))
-        // And none of the one it does not: §10.2's relay-token rotation has no
-        // driver on either shell.
         for overclaim in ["Shore Pass", "mailbox", "internet delivery"] {
             XCTAssertFalse(text.contains(overclaim), "the confirmation promised \(overclaim)")
         }
+    }
+
+    /// With a pass, the confirmation says the mailbox goes too — and says *when*.
+    ///
+    /// The timing word is the whole point of this test. §10.2's rotation is
+    /// performed by the next relay pass that can reach the relay, not by the
+    /// tap, so a removal made at sea leaves the removed phone holding a working
+    /// credential until the phone finds internet. "As soon as this phone is
+    /// online" is the honest version of that; "now" would not be.
+    func testTheRemovalConfirmationSaysTheMailboxGoesWhenThePhoneIsOnline() {
+        let text = removeDeviceConfirmationText(deviceName: "Old iPad", hasShorePass: true)
+        XCTAssertTrue(text.contains("Old iPad"))
+        XCTAssertTrue(text.contains("stops staying in step with your other devices"))
+        XCTAssertTrue(text.contains("Shore Pass mailbox"))
+        XCTAssertTrue(text.contains("as soon as this phone is online"))
+        XCTAssertTrue(text.contains("same Wi-Fi"))
+        XCTAssertTrue(text.contains("cannot undo this"))
     }
 }

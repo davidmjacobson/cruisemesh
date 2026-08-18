@@ -5,7 +5,16 @@ import os.log
 enum RemoveDeviceResult: Equatable {
     /// The device is buried, the fleet's inbox key is rotated, and contacts have
     /// been told (or the telling is queued).
-    case removed(contactsTold: Int, siblingsToHandOffTo: Int, unresealableRecords: UInt32)
+    ///
+    /// `relayRotationQueued` says §10.2 is owed: this person has a Shore Pass,
+    /// so the shared relay credential is queued to be re-keyed on the next pass
+    /// that reaches the relay. False on the installs with no pass to rotate.
+    case removed(
+        contactsTold: Int,
+        siblingsToHandOffTo: Int,
+        unresealableRecords: UInt32,
+        relayRotationQueued: Bool
+    )
 
     /// Nothing was changed. The reason is for the shell to word.
     case refused(RemoveDeviceRefusal)
@@ -56,14 +65,21 @@ enum RemoveDeviceRefusal: Equatable {
 /// 5. `RosterGossipSender` tells the contacts — §10.1 step 4's surface for them
 ///    is fed by the roster they now hold, not by a separate notice.
 ///
+/// 6. `RelayRotationDriver.begin` writes §10.2's rotation journal — and stops
+///    there. The relay call itself belongs to the relay pass, which is the only
+///    place that knows which network to reach the relay on and how fast it may
+///    speak; see that type for why the removal must not wait on it.
+///
 /// # What it deliberately does not do
 ///
-/// It does not rotate the shared relay `family_token` (§10.2). That machinery has
-/// no driver on either shell yet — no call site anywhere reaches
-/// `begin_relay_rotation` — so claiming it here would be claiming a capability
-/// that does not exist. The confirm copy therefore promises only what actually
-/// happens: a removed phone stops getting new messages and stops being able to
-/// see what the rest of the fleet is doing.
+/// It does not make a network call. A removal that could fail on connectivity
+/// would be one a person has to retry by guessing, and "my phone was stolen" is
+/// not a moment to hand somebody a network error. So the relay `family_token`
+/// rotation is *planned and written down* here and performed by the next relay
+/// pass that can reach the relay — seconds later on a connected phone, whenever
+/// the ship finds internet otherwise. Until it lands the removed device still
+/// holds a working relay credential; the confirm copy says so rather than
+/// promising an instant it cannot deliver.
 ///
 /// It also does not deliver `RevocationCommit.handoffs` to siblings. Those ride
 /// self-sync, which has no shell transport yet either; `revocationHandoffsFor`
@@ -175,10 +191,16 @@ struct RemoveDeviceSession {
                 identity: identity,
                 nowMs: nowMs
             )
+            // §10.2, written down but not performed. The nudge is what makes
+            // the common case feel instant: on a phone that is online the next
+            // pass starts a moment later and the rotation lands with it.
+            let rotationQueued = RelayRotationDriver(store: store).begin(revocation: commit)
+            if rotationQueued { RelaySyncEvents.requestSync() }
             return .removed(
                 contactsTold: told,
                 siblingsToHandOffTo: commit.handoffs.count,
-                unresealableRecords: commit.unresealableRecords
+                unresealableRecords: commit.unresealableRecords,
+                relayRotationQueued: rotationQueued
             )
         } catch {
             log.warning("Removing a device did not finish: \(String(describing: error), privacy: .public)")

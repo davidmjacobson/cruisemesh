@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.DeviceKeyStore
+import com.cruisemesh.app.relay.RelayConfigStore
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -159,6 +160,7 @@ fun YourDevicesScreen(
     removing?.let { item ->
         RemoveDeviceDialog(
             item = item,
+            hasShorePass = RelayConfigStore.load(context) != null,
             onDismiss = { removing = null },
             onConfirm = {
                 removing = null
@@ -387,26 +389,35 @@ private fun RenameDeviceDialog(
 }
 
 /**
- * §10.1 in family words: what the person loses, and what survives.
+ * §10.1 and §10.2 in family words: what the person loses, and what survives.
  *
- * Everything on this dialog is a consequence core will actually produce. It does
- * not promise the removed phone loses its Shore Pass mailbox, because §10.2's
- * relay-token rotation has no driver yet on either shell, and a confirmation
- * that overstates what removal does is worse than one that says less.
+ * Everything on this dialog is a consequence the app will actually produce. The
+ * Shore Pass sentence appears only when there is a pass to lose, and it says
+ * "as soon as this phone is online" rather than "now" because that is the truth:
+ * the mailbox credential is re-keyed by the next relay pass that reaches the
+ * relay, so a removal made at sea is a removal whose relay half is still owed.
+ * A confirmation that overstates what removal does is worse than one that says
+ * less.
  */
 @Composable
 private fun RemoveDeviceDialog(
     item: YourDeviceListItem,
+    hasShorePass: Boolean,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
 ) {
     val name = deviceDisplayName(item)
+    val whatHappens = if (hasShorePass) {
+        stringResource(R.string.ui_remove_device_what_happens_with_pass, name)
+    } else {
+        stringResource(R.string.ui_remove_device_what_happens, name)
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.ui_remove_this_device_question)) },
         text = {
             Column {
-                Text(stringResource(R.string.ui_remove_device_what_happens, name))
+                Text(whatHappens)
                 Text(
                     stringResource(R.string.ui_remove_device_what_survives),
                     modifier = Modifier.padding(top = 12.dp),
@@ -460,6 +471,21 @@ private fun RemovalOutcomeDialog(outcome: RemoveDeviceResult, onDismiss: () -> U
                         is RemoveDeviceResult.Refused -> stringResource(refusalCopy(outcome.reason))
                     },
                 )
+                // §10.2's cost to the devices that were not here. The new
+                // mailbox credential reaches a sibling over the fleet's own
+                // sealed sync, which has no transport on either shell yet, so
+                // until it does the honest instruction is the shipped one: show
+                // them the setup card again. Only worth saying when there is a
+                // sibling to strand and a pass to strand it from.
+                if (outcome is RemoveDeviceResult.Removed &&
+                    outcome.relayRotationQueued &&
+                    outcome.siblingsToHandOffTo > 0
+                ) {
+                    Text(
+                        stringResource(R.string.ui_remove_device_pass_card_again),
+                        modifier = Modifier.padding(top = 12.dp),
+                    )
+                }
                 // Section 10.1 re-seals the retained backlog to the survivors. A
                 // record it could not re-seal is a message that will not arrive,
                 // and counting it and then never saying so left the person with

@@ -237,7 +237,8 @@ struct YourDevicesView: View {
 
     private func removeConfirmationText(_ item: YourDeviceListItem?) -> String {
         removeDeviceConfirmationText(
-            deviceName: item.map(deviceDisplayName) ?? String(localized: "This phone")
+            deviceName: item.map(deviceDisplayName) ?? String(localized: "This phone"),
+            hasShorePass: RelayConfigStore.load() != nil
         )
     }
 
@@ -250,7 +251,7 @@ struct YourDevicesView: View {
 
     private func removalOutcomeDetail(_ outcome: RemoveDeviceResult?) -> String {
         switch outcome {
-        case .removed(_, let siblings, let unresealable):
+        case .removed(_, let siblings, let unresealable, let rotationQueued):
             // §10.1 re-seals the retained backlog to the survivors. A record it
             // could not re-seal is a message that will not arrive, and counting
             // it and then never saying so left the person with a clean "Device
@@ -260,10 +261,21 @@ struct YourDevicesView: View {
                     localized: "A few messages that were still on their way could not be carried over."
                 )
                 : ""
+            // §10.2's cost to the devices that were not here. The new mailbox
+            // credential reaches a sibling over the fleet's own sealed sync,
+            // which has no transport on either shell yet, so until it does the
+            // honest instruction is the shipped one: show them the setup card
+            // again. Only worth saying when there is a sibling to strand and a
+            // pass to strand it from.
+            let passCard = (rotationQueued && siblings > 0)
+                ? "\n\n" + String(
+                    localized: "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them."
+                )
+                : ""
             if siblings > 0 {
                 return String(
                     localized: "Your contacts will be told as they come back into range. Your other devices catch up the next time they are online."
-                ) + lost
+                ) + passCard + lost
             }
             return String(
                 localized: "Your contacts will be told about the change as they come back into range."
@@ -290,23 +302,25 @@ struct YourDevicesView: View {
     }
 }
 
-/// §10.1 in family words: what the person loses, and what survives.
+/// §10.1 and §10.2 in family words: what the person loses, and what survives.
 ///
-/// Everything here is a consequence core will actually produce. It does not
-/// promise the removed phone loses its Shore Pass mailbox, because §10.2's
-/// relay-token rotation has no driver yet on either shell, and a confirmation
-/// that overstates what removal does is worse than one that says less. A free
-/// function so that promise is directly testable rather than reachable only by
-/// tapping through a `Form`.
+/// Everything here is a consequence the app will actually produce. The Shore
+/// Pass sentence appears only when there is a pass to lose, and it says "as soon
+/// as this phone is online" rather than "now" because that is the truth: the
+/// mailbox credential is re-keyed by the next relay pass that reaches the relay,
+/// so a removal made at sea is a removal whose relay half is still owed. A
+/// confirmation that overstates what removal does is worse than one that says
+/// less. A free function so both promises are directly testable rather than
+/// reachable only by tapping through a `Form`.
 ///
 /// The first line names §10 step 5's meeting, because until the removed phone
 /// meets one of the devices that are still this person's it carries on as though
 /// nothing happened — and this tap used to promise otherwise while doing nothing
 /// at all to the other device.
-func removeDeviceConfirmationText(deviceName: String) -> String {
-    let happens = String(
-        localized: "\(deviceName) stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
-    )
+func removeDeviceConfirmationText(deviceName: String, hasShorePass: Bool) -> String {
+    let happens = hasShorePass
+        ? removeDeviceMailboxText(deviceName: deviceName)
+        : removeDeviceQuietText(deviceName: deviceName)
     let survives = String(
         localized: "Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it."
     )
@@ -314,6 +328,24 @@ func removeDeviceConfirmationText(deviceName: String) -> String {
         localized: "You cannot undo this. If you use that device again later, set it up as a new device."
     )
     return "\(happens)\n\n\(survives)\n\n\(undo)"
+}
+
+/// The first sentence when this person has no Shore Pass: §10.1 and step 5, and
+/// nothing at all about a mailbox they do not have.
+private func removeDeviceQuietText(deviceName: String) -> String {
+    String(
+        localized: "\(deviceName) stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
+    )
+}
+
+/// The first sentence when there is a pass to lose: §10.2 takes the family
+/// mailbox away from that phone too, on the first relay pass that can reach the
+/// relay. Two functions rather than one sentence with a branch inside it, so
+/// each wording is one catalog key and each can be read whole.
+private func removeDeviceMailboxText(deviceName: String) -> String {
+    String(
+        localized: "\(deviceName) stops staying in step with your other devices now, and loses your family's Shore Pass mailbox as soon as this phone is online. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
+    )
 }
 
 /// Why a removal was refused, in words that name the next thing to do.

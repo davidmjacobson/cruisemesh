@@ -1311,14 +1311,22 @@ impl MessageStore {
     /// self-sync channel and its retained backlog are already shut by the time
     /// this runs.
     ///
-    /// Step 2 is **not** in that sentence and must not be added to it while it
-    /// is unimplemented. Nothing on either shell drives the relay `family_token`
-    /// rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
-    /// outside tests — so a removed device still holds a working family relay
-    /// credential at the moment this tells it that it is out. That credential
-    /// was in its hands all along and the notice grants it nothing new, but
-    /// until §10.2 has a driver, "removed" means cut off from the fleet's own
-    /// traffic, not cut off from the relay.
+    /// Step 2 joined that sentence with a window rather than a guarantee, and
+    /// the difference belongs where somebody reading this will see it. The
+    /// relay `family_token` rotation has a driver on both shells now: the
+    /// removal writes [`crate::MessageStore::begin_relay_rotation`]'s journal
+    /// row as it commits, and the relay sync pass performs the call and
+    /// commits it. What it cannot promise is *when*, because a removal on a
+    /// ship with no internet is a real removal and may not wait for a network.
+    /// So a removed device keeps a working family relay credential from the
+    /// moment of removal until the removing phone next reaches the relay — and
+    /// a meeting inside that window (same Wi-Fi, no internet, which is
+    /// precisely the ship) tells the holder of that phone they are out while
+    /// the credential is still live. It grants them nothing new; the token was
+    /// in their hands the whole time. But "removed" means cut off from the
+    /// fleet's own traffic *at once* and from the relay mailbox *as soon as the
+    /// rotation lands*, and nothing here or on any surface may collapse those
+    /// two into one.
     ///
     /// # What it does, in [`core_roster_accept`]'s vocabulary
     ///

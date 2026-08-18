@@ -4801,14 +4801,22 @@ public protocol MessageStoreProtocol : AnyObject {
      * self-sync channel and its retained backlog are already shut by the time
      * this runs.
      *
-     * Step 2 is **not** in that sentence and must not be added to it while it
-     * is unimplemented. Nothing on either shell drives the relay `family_token`
-     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
-     * outside tests — so a removed device still holds a working family relay
-     * credential at the moment this tells it that it is out. That credential
-     * was in its hands all along and the notice grants it nothing new, but
-     * until §10.2 has a driver, "removed" means cut off from the fleet's own
-     * traffic, not cut off from the relay.
+     * Step 2 joined that sentence with a window rather than a guarantee, and
+     * the difference belongs where somebody reading this will see it. The
+     * relay `family_token` rotation has a driver on both shells now: the
+     * removal writes [`crate::MessageStore::begin_relay_rotation`]'s journal
+     * row as it commits, and the relay sync pass performs the call and
+     * commits it. What it cannot promise is *when*, because a removal on a
+     * ship with no internet is a real removal and may not wait for a network.
+     * So a removed device keeps a working family relay credential from the
+     * moment of removal until the removing phone next reaches the relay — and
+     * a meeting inside that window (same Wi-Fi, no internet, which is
+     * precisely the ship) tells the holder of that phone they are out while
+     * the credential is still live. It grants them nothing new; the token was
+     * in their hands the whole time. But "removed" means cut off from the
+     * fleet's own traffic *at once* and from the relay mailbox *as soon as the
+     * rotation lands*, and nothing here or on any surface may collapse those
+     * two into one.
      *
      * # What it does, in [`core_roster_accept`]'s vocabulary
      *
@@ -8507,14 +8515,22 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
      * self-sync channel and its retained backlog are already shut by the time
      * this runs.
      *
-     * Step 2 is **not** in that sentence and must not be added to it while it
-     * is unimplemented. Nothing on either shell drives the relay `family_token`
-     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
-     * outside tests — so a removed device still holds a working family relay
-     * credential at the moment this tells it that it is out. That credential
-     * was in its hands all along and the notice grants it nothing new, but
-     * until §10.2 has a driver, "removed" means cut off from the fleet's own
-     * traffic, not cut off from the relay.
+     * Step 2 joined that sentence with a window rather than a guarantee, and
+     * the difference belongs where somebody reading this will see it. The
+     * relay `family_token` rotation has a driver on both shells now: the
+     * removal writes [`crate::MessageStore::begin_relay_rotation`]'s journal
+     * row as it commits, and the relay sync pass performs the call and
+     * commits it. What it cannot promise is *when*, because a removal on a
+     * ship with no internet is a real removal and may not wait for a network.
+     * So a removed device keeps a working family relay credential from the
+     * moment of removal until the removing phone next reaches the relay — and
+     * a meeting inside that window (same Wi-Fi, no internet, which is
+     * precisely the ship) tells the holder of that phone they are out while
+     * the credential is still live. It grants them nothing new; the token was
+     * in their hands the whole time. But "removed" means cut off from the
+     * fleet's own traffic *at once* and from the relay mailbox *as soon as the
+     * rotation lands*, and nothing here or on any surface may collapse those
+     * two into one.
      *
      * # What it does, in [`core_roster_accept`]'s vocabulary
      *
@@ -43605,6 +43621,134 @@ extension RelayMailboxWalkAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a shell should do next when a rotate call did not return a rotation.
+ *
+ * Shared rather than written twice, because both shells drive the same
+ * ceremony against the same server and the interesting cases are the ones
+ * neither would think to write: an old credential that stopped resolving is
+ * *evidence the rotation landed*, not a failure, and a proposed token that
+ * collided has to be replaced rather than retried.
+ */
+
+public enum RelayRotationNextStep {
+    
+    /**
+     * Ask again, presenting the **replacement** credential as both halves.
+     *
+     * The superseded token no longer resolves, and there are only two ways
+     * that happens: the rotation this device asked for landed and its answer
+     * was lost, or the family is gone from this relay entirely. Presenting
+     * the replacement tells those apart — relayd answers `rotated: false`
+     * with the same values for the first, and refuses the second — and it is
+     * the only question a device holding a journal row can ask.
+     */
+    case confirm
+    /**
+     * Try the same call again, no sooner than `delay_ms` from now.
+     */
+    case retry(delayMs: Int64
+    )
+    /**
+     * The proposed replacement is already somebody's credential
+     * (`rotation_token_taken`). Mint another and begin again: retrying this
+     * one converges on nothing.
+     */
+    case remint
+    /**
+     * `rotation_unsupported`: this relay's family token comes from the
+     * operator's static allowlist, so no device can re-key it. Retrying is
+     * pointless forever; the repair is a new setup card from whoever runs the
+     * relay.
+     */
+    case serverManagedToken
+    /**
+     * `rotation_unauthorized`: the family registered a different rotation key
+     * on its first rotation (trust on first rotation) and this person root is
+     * not it. Also pointless to retry — and worth surfacing, because on a
+     * shared Shore Pass it means somebody else is the only one who can evict
+     * a device.
+     */
+    case notTheAuthority
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRelayRotationNextStep: FfiConverterRustBuffer {
+    typealias SwiftType = RelayRotationNextStep
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RelayRotationNextStep {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .confirm
+        
+        case 2: return .retry(delayMs: try FfiConverterInt64.read(from: &buf)
+        )
+        
+        case 3: return .remint
+        
+        case 4: return .serverManagedToken
+        
+        case 5: return .notTheAuthority
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: RelayRotationNextStep, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .confirm:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .retry(delayMs):
+            writeInt(&buf, Int32(2))
+            FfiConverterInt64.write(delayMs, into: &buf)
+            
+        
+        case .remint:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .serverManagedToken:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .notTheAuthority:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationNextStep_lift(_ buf: RustBuffer) throws -> RelayRotationNextStep {
+    return try FfiConverterTypeRelayRotationNextStep.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRelayRotationNextStep_lower(_ value: RelayRotationNextStep) -> RustBuffer {
+    return FfiConverterTypeRelayRotationNextStep.lower(value)
+}
+
+
+
+extension RelayRotationNextStep: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What adopting somebody else's revocation did to this device.
  */
 
@@ -52612,6 +52756,39 @@ public func coreRelayRerunAction(pendingRequested: Bool, canSync: Bool, backoffR
 })
 }
 /**
+ * Read one failed rotate call and say what to do about it (§10.2).
+ *
+ * `http_status` is `0` for a request that produced no HTTP answer at all
+ * (DNS, TLS, timeout, aeroplane mode). That distinction is load-bearing
+ * rather than cosmetic: a call that never landed cost the family's rotation
+ * bucket nothing, so it may be retried in seconds, while an answered one has
+ * already been charged and must not be.
+ *
+ * `relay_code` is relayd's stable machine-readable reason, which wins over
+ * the status for the same reason [`crate::relay_classify_http_error`] lets it
+ * win: a proxy can rewrite a status code, but the JSON body came from relayd.
+ *
+ * `confirming` says which half of the recovery protocol produced this answer.
+ * A `401` on the first ask means "the credential I presented is not this
+ * family's any more", which is exactly what a landed-but-unheard rotation
+ * looks like, so it becomes [`RelayRotationNextStep::Confirm`]. The same
+ * `401` while confirming means neither credential resolves — the family was
+ * deprovisioned, the pass lapsed, or somebody else rotated it — and that is a
+ * [`RelayRotationNextStep::Retry`] rather than a give-up, because a lapsed
+ * pass that gets paid comes back and the rotation is still owed when it does.
+ */
+public func coreRelayRotationNextStep(httpStatus: UInt16, relayCode: String?, retryAfterMs: Int64, confirming: Bool, consecutiveFailures: UInt32) -> RelayRotationNextStep {
+    return try!  FfiConverterTypeRelayRotationNextStep.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_relay_rotation_next_step(
+        FfiConverterUInt16.lower(httpStatus),
+        FfiConverterOptionString.lower(relayCode),
+        FfiConverterInt64.lower(retryAfterMs),
+        FfiConverterBool.lower(confirming),
+        FfiConverterUInt32.lower(consecutiveFailures),$0
+    )
+})
+}
+/**
  * Compare one captured legacy pass against what core would have planned.
  *
  * Pure: no store, no clock, no network. Called after the legacy pass has
@@ -56405,6 +56582,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_rerun_action() != 50476) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_rotation_next_step() != 6801) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_shadow_compare() != 59769) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57335,7 +57515,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 12212) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 43980) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_friend_request() != 47501) {

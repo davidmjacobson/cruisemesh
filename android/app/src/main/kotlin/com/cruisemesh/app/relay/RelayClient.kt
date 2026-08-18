@@ -23,6 +23,7 @@ import uniffi.cruisemesh_core.relayEncodePostEnvelope
 import uniffi.cruisemesh_core.relayEncodePresenceRequest
 import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMaxResponseBytes
+import uniffi.cruisemesh_core.relayRotatePath
 
 private const val CONNECT_TIMEOUT_MS = 10_000
 
@@ -287,6 +288,28 @@ object RelayClient {
                 },
             )
         }
+    }
+
+    /**
+     * §10 step 2: ask the family relay to re-key itself.
+     *
+     * The bearer is a whole credential rather than the saved one because a
+     * rotation is the one call that may be made under *either* of two tokens:
+     * the retired one on the first ask, and the replacement when the first ask
+     * says the retired one is no longer this family's. [RelayRotationDriver]
+     * owns that choice; this only carries it.
+     *
+     * The body is opaque here on purpose. It is signed, and core signs it
+     * (`relayEncodeRotateRequest`) — a shell that assembled these bytes could
+     * get the signed message wrong in a way no test on this side would catch,
+     * and the answer is likewise handed straight back for
+     * `relayDecodeRotateResponse` to check against the token that was asked
+     * for. Mirrors iOS `RelayClient.rotateFamilyToken`.
+     */
+    fun rotateFamilyToken(config: RelayConfig, body: ByteArray, network: Network? = null): ByteArray {
+        val connection = openConnection(buildUrl(config.relayUrl, relayRotatePath()), "POST", config, network)
+        connection.writeJson(String(body, StandardCharsets.UTF_8))
+        return connection.useJsonResponse { it }
     }
 
     /**
