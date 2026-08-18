@@ -1,9 +1,6 @@
 package com.cruisemesh.app.devicelink
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,9 +10,7 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -26,7 +21,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -34,14 +28,15 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -59,42 +54,67 @@ import uniffi.cruisemesh_core.CoreLinkRole
 import uniffi.cruisemesh_core.Identity
 
 /**
- * Internal Tools' device-link runner (`specs/multi-device-v1.md` §13, WP3
- * gate).
+ * §9's ceremony, in the words a family reads (`specs/multi-device-v1.md` §13
+ * WP6).
  *
- * Two dev builds, one ceremony, on the two transports the gate names: Wi‑Fi and
- * relay-only. It is not the family flow. WP6 owns "Your devices", the link and
- * remove journeys, and the words a family reads; what this screen owes is
- * enough surface to run §9 end to end on real hardware and see, plainly, which
- * step it reached and how it ended.
+ * One screen, two ends, and which end this is never asked as a question — it is
+ * decided by the door the person came through:
  *
- * It sits behind the same door as the rollout switches, and for the same
- * reason: a closed-test build is release-signed, and evidence that can only be
- * gathered on a release-signed device has to be reachable on one.
+ * * From **Settings → Your devices → Add a device**, this phone is the one that
+ *   is already set up, so it scans and it holds the confirm ([§9.2]'s "the user
+ *   confirms match on the existing device").
+ * * From **the restore flow's "Set up as a new device"**, this phone is the new
+ *   one, so it shows the code and waits.
+ *
+ * There is no role picker because there is no question: a person holding two
+ * phones already knows which is which, and asking them to say so is the kind of
+ * step that gets answered wrong.
+ *
+ * The code on screen carries ephemeral link material and rendezvous hints only —
+ * §9.1's rule, enforced in core, and the reason this screen may show a QR at
+ * all. Nothing here reads, renders or logs an identity secret.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceLinkTestScreen(identity: Identity, onBack: () -> Unit) {
+fun AddDeviceScreen(
+    identity: Identity,
+    role: CoreLinkRole,
+    expectedPersonId: ByteArray? = null,
+    onBack: () -> Unit,
+) {
     val context = LocalContext.current
-    val session = remember(identity.userId) { LinkDevSession(context, identity) }
+    val session = remember(identity.userId, role) {
+        LinkSession(context, identity, expectedPersonId)
+    }
     DisposableEffect(session) { onDispose { session.close() } }
     val state by session.state.collectAsState()
 
-    var role by remember { mutableStateOf(CoreLinkRole.NEW_DEVICE) }
-    var transport by remember { mutableStateOf(LinkDevTransport.LAN) }
+    var transport by remember { mutableStateOf(LinkTransport.LAN) }
     var scannedCode by remember { mutableStateOf("") }
+    var showHowTheyConnect by remember { mutableStateOf(false) }
     val hasPass = remember { RelayConfigStore.load(context) != null }
-    // §9.3: a phone that already holds someone's contacts and messages cannot
-    // be adopted as a new device -- importing would fold two people's worlds
-    // together with no way back. Read once, before anything starts: the answer
-    // cannot change during a ceremony, and being told this after comparing six
-    // digits with someone is the wrong end of the run to find out.
-    val readiness = remember(identity.userId) { session.importReadiness() }
+    // §9.3: a phone that already holds someone's contacts and messages cannot be
+    // adopted. Read once, before anything starts -- the answer cannot change
+    // during a ceremony, and being told this after comparing six digits with
+    // somebody is the wrong end of the run to find out.
+    val readiness = remember(identity.userId) {
+        if (role == CoreLinkRole.NEW_DEVICE) session.importReadiness() else CoreLinkImportReadiness.READY
+    }
+    // The backstop for the same rule "Your devices" already gates the button on
+    // (§9.5: only the approving device can sign the roster the new one joins).
+    // Asked here as well because this screen is reachable by other routes -- a
+    // saved back stack, a deep link, a future entry point -- and the failure it
+    // prevents happens at the very END of the ceremony, after two people have
+    // compared six digits. Read once, before anything starts, for the same
+    // reason as the readiness check above.
+    val canApprove = remember(identity.userId) {
+        role != CoreLinkRole.APPROVING_DEVICE || session.canSignRoster()
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(stringResource(R.string.ui_link_device_test)) },
+                title = { Text(stringResource(R.string.ui_add_a_device)) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(
@@ -113,20 +133,16 @@ fun DeviceLinkTestScreen(identity: Identity, onBack: () -> Unit) {
                 .verticalScroll(rememberScrollState())
                 .padding(24.dp),
         ) {
-            Text(
-                stringResource(R.string.ui_link_device_test_desc),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            if (state.step == LinkDevStep.IDLE) {
-                SetupControls(
+            if (state.step == LinkStep.IDLE) {
+                BeforeYouStart(
                     role = role,
-                    transport = transport,
-                    hasPass = hasPass,
                     readiness = readiness,
+                    canApprove = canApprove,
+                    transport = transport,
+                    showHowTheyConnect = showHowTheyConnect,
+                    hasPass = hasPass,
                     scannedCode = scannedCode,
-                    onRole = { role = it },
+                    onToggleHowTheyConnect = { showHowTheyConnect = !showHowTheyConnect },
                     onTransport = { transport = it },
                     onScannedCode = { scannedCode = it },
                     onStart = {
@@ -138,12 +154,11 @@ fun DeviceLinkTestScreen(identity: Identity, onBack: () -> Unit) {
                     },
                 )
             } else {
-                RunningCeremony(
+                LinkInProgress(
                     state = state,
                     onAnswer = session::answerDigits,
                     onStop = session::cancel,
-                    onStartOver = {
-                        scannedCode = ""
+                    onFinish = {
                         session.close()
                         onBack()
                     },
@@ -154,81 +169,47 @@ fun DeviceLinkTestScreen(identity: Identity, onBack: () -> Unit) {
 }
 
 @Composable
-private fun SetupControls(
+private fun BeforeYouStart(
     role: CoreLinkRole,
-    transport: LinkDevTransport,
-    hasPass: Boolean,
     readiness: CoreLinkImportReadiness,
+    canApprove: Boolean,
+    transport: LinkTransport,
+    showHowTheyConnect: Boolean,
+    hasPass: Boolean,
     scannedCode: String,
-    onRole: (CoreLinkRole) -> Unit,
-    onTransport: (LinkDevTransport) -> Unit,
+    onToggleHowTheyConnect: () -> Unit,
+    onTransport: (LinkTransport) -> Unit,
     onScannedCode: (String) -> Unit,
     onStart: () -> Unit,
 ) {
     Text(
-        stringResource(R.string.ui_link_device_role),
-        style = MaterialTheme.typography.titleMedium,
-        modifier = Modifier.padding(top = 20.dp),
+        stringResource(
+            when (role) {
+                CoreLinkRole.NEW_DEVICE -> R.string.ui_add_device_new_intro
+                CoreLinkRole.APPROVING_DEVICE -> R.string.ui_add_device_existing_intro
+            },
+        ),
+        style = MaterialTheme.typography.bodyMedium,
     )
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.padding(top = 8.dp),
-    ) {
-        FilterChip(
-            selected = role == CoreLinkRole.NEW_DEVICE,
-            onClick = { onRole(CoreLinkRole.NEW_DEVICE) },
-            label = { Text(stringResource(R.string.ui_link_device_role_new)) },
-        )
-        FilterChip(
-            selected = role == CoreLinkRole.APPROVING_DEVICE,
-            onClick = { onRole(CoreLinkRole.APPROVING_DEVICE) },
-            label = { Text(stringResource(R.string.ui_link_device_role_approving)) },
-        )
-    }
 
-    Text(
-        stringResource(R.string.ui_link_device_how),
-        style = MaterialTheme.typography.titleMedium,
-        modifier = Modifier.padding(top = 20.dp),
-    )
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.padding(top = 8.dp),
-    ) {
-        FilterChip(
-            selected = transport == LinkDevTransport.LAN,
-            onClick = { onTransport(LinkDevTransport.LAN) },
-            label = { Text(stringResource(R.string.ui_link_device_over_wifi)) },
-        )
-        FilterChip(
-            selected = transport == LinkDevTransport.RELAY,
-            enabled = hasPass,
-            onClick = { onTransport(LinkDevTransport.RELAY) },
-            label = { Text(stringResource(R.string.ui_link_device_over_internet)) },
+    val ready = readiness == CoreLinkImportReadiness.READY
+    if (!ready) {
+        Text(
+            stringResource(readinessCopy(readiness)),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.error,
+            modifier = Modifier.padding(top = 20.dp),
         )
     }
-    if (!hasPass) {
+    if (!canApprove) {
         Text(
-            stringResource(R.string.ui_link_device_needs_pass),
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 4.dp),
-        )
-    }
-
-    // Only the NEW-device role imports anything, so only it is refused here.
-    val newDeviceReady = readiness == CoreLinkImportReadiness.READY
-    if (role == CoreLinkRole.NEW_DEVICE && !newDeviceReady) {
-        Text(
-            stringResource(readinessLabel(readiness)),
+            stringResource(R.string.ui_add_a_device_not_the_approver),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(top = 20.dp),
         )
     }
 
-    // The approving device needs the offer before there is anything to drive:
-    // §9.2 starts with a scan, so the code is gathered here rather than mid-run.
     if (role == CoreLinkRole.APPROVING_DEVICE) {
         Text(
             stringResource(R.string.ui_link_device_scan_hint),
@@ -245,43 +226,92 @@ private fun SetupControls(
         )
     }
 
+    // Advanced, and behind a disclosure, because the answer is right by default:
+    // two phones in the same hands are on the same Wi-Fi, and the only reason to
+    // choose otherwise is a person linking a phone that is somewhere else.
+    TextButton(
+        onClick = onToggleHowTheyConnect,
+        modifier = Modifier.padding(top = 12.dp),
+    ) {
+        Text(
+            stringResource(
+                if (showHowTheyConnect) R.string.ui_hide_details else R.string.ui_details,
+            ),
+        )
+    }
+    if (showHowTheyConnect) {
+        Text(
+            stringResource(R.string.ui_link_device_how),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        LinkTransportChoice(
+            transport = transport,
+            hasPass = hasPass,
+            onTransport = onTransport,
+        )
+        if (!hasPass) {
+            Text(
+                stringResource(R.string.ui_link_device_needs_pass),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
+    }
+
     Button(
         onClick = onStart,
         enabled = when (role) {
-            CoreLinkRole.NEW_DEVICE -> newDeviceReady
-            CoreLinkRole.APPROVING_DEVICE -> scannedCode.isNotBlank()
+            CoreLinkRole.NEW_DEVICE -> ready
+            CoreLinkRole.APPROVING_DEVICE -> canApprove && scannedCode.isNotBlank()
         },
         modifier = Modifier.fillMaxWidth().padding(top = 20.dp),
     ) { Text(stringResource(R.string.ui_link_device_start)) }
 }
 
-/**
- * Why this phone cannot be adopted, in a sentence. Never reached for
- * [CoreLinkImportReadiness.READY], which is the case with nothing to say.
- */
-private fun readinessLabel(readiness: CoreLinkImportReadiness): Int = when (readiness) {
-    CoreLinkImportReadiness.READY -> R.string.ui_link_device_needs_fresh_phone
-    CoreLinkImportReadiness.STORE_HOLDS_SOMEONE -> R.string.ui_link_device_needs_fresh_phone
-    CoreLinkImportReadiness.STORE_HOLDS_ANOTHER_PERSON ->
-        R.string.ui_link_device_belongs_to_someone_else
+@Composable
+private fun LinkTransportChoice(
+    transport: LinkTransport,
+    hasPass: Boolean,
+    onTransport: (LinkTransport) -> Unit,
+) {
+    TextButton(onClick = { onTransport(LinkTransport.LAN) }) {
+        Text(
+            stringResource(R.string.ui_link_device_over_wifi),
+            color = if (transport == LinkTransport.LAN) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
+    TextButton(onClick = { onTransport(LinkTransport.RELAY) }, enabled = hasPass) {
+        Text(
+            stringResource(R.string.ui_link_device_over_internet),
+            color = if (transport == LinkTransport.RELAY) {
+                MaterialTheme.colorScheme.primary
+            } else {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            },
+        )
+    }
 }
 
 @Composable
-private fun RunningCeremony(
-    state: LinkDevState,
+private fun LinkInProgress(
+    state: LinkState,
     onAnswer: (Boolean) -> Unit,
     onStop: () -> Unit,
-    onStartOver: () -> Unit,
+    onFinish: () -> Unit,
 ) {
-    val context = LocalContext.current
     Text(
-        stringResource(stepLabel(state.step)),
+        stringResource(stepCopy(state.step)),
         style = MaterialTheme.typography.titleMedium,
-        modifier = Modifier.padding(top = 20.dp),
     )
 
     val qrText = state.qrText
-    if (state.role == CoreLinkRole.NEW_DEVICE && qrText != null && state.step != LinkDevStep.DONE) {
+    if (state.role == CoreLinkRole.NEW_DEVICE && qrText != null && state.step != LinkStep.DONE) {
         val bitmap = remember(qrText) { encodeQrBitmap(qrText) }
         Image(
             bitmap = bitmap,
@@ -294,19 +324,20 @@ private fun RunningCeremony(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 8.dp),
         )
+        // The way through when a camera will not focus, which on an old phone
+        // held at arm's length is not rare. The code is ephemeral link material
+        // and rendezvous hints (§9.1) -- never an identity secret -- so a person
+        // may copy it and paste it into the other phone by any means they like.
+        val context = LocalContext.current
         OutlinedButton(
-            onClick = { copyToClipboard(context, qrText) },
+            onClick = { copyLinkCode(context, qrText) },
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
         ) { Text(stringResource(R.string.ui_link_device_copy_code)) }
     }
 
     val sas = state.sas
-    if (sas != null && state.step == LinkDevStep.COMPARING_DIGITS) {
-        Text(
-            sas,
-            style = MaterialTheme.typography.displaySmall,
-            modifier = Modifier.padding(top = 16.dp),
-        )
+    if (sas != null && state.step == LinkStep.COMPARING_DIGITS) {
+        Text(sas, style = MaterialTheme.typography.displaySmall, modifier = Modifier.padding(top = 16.dp))
         if (state.warnSoftCap) {
             Text(
                 stringResource(R.string.ui_link_device_soft_cap),
@@ -315,8 +346,8 @@ private fun RunningCeremony(
                 modifier = Modifier.padding(top = 8.dp),
             )
         }
-        // §9.2: the buttons exist only on the device that is already part of
-        // this person. The other screen shows the same digits and waits.
+        // §9.2: the buttons exist only on the phone that is already part of this
+        // person. The other screen shows the same digits and waits.
         if (state.confirmHere) {
             Text(
                 stringResource(R.string.ui_link_device_compare),
@@ -335,48 +366,57 @@ private fun RunningCeremony(
         }
     }
 
-    val report = state.report
-    if (report != null) {
+    // What arrived, counted, with nothing a person cannot act on. The device id
+    // and roster head the WP3 runner printed were evidence for a developer
+    // standing over two phones; this is the same run seen by the family.
+    //
+    // Only on the new device. The approving side receives nothing -- it sends --
+    // so its report carries zeroes by construction, and "Brought over 0 contacts
+    // and 0 messages" under a successful link reads as a failure to the one
+    // person who has to trust that it worked.
+    state.report?.takeIf { state.role == CoreLinkRole.NEW_DEVICE }?.let { report ->
         Text(
             stringResource(
-                R.string.ui_link_device_report,
-                report.deviceIdHex,
-                report.rosterHeadHex,
-                report.rosterSeq.toString(),
+                R.string.ui_add_device_brought_over,
                 report.contacts.toString(),
-                report.groups.toString(),
                 report.messages.toString(),
-                report.catchUpChats.toString(),
             ),
-            style = MaterialTheme.typography.bodySmall,
+            style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(top = 16.dp),
         )
+        if (report.catchUpChats > 0) {
+            Text(
+                stringResource(R.string.ui_add_device_older_messages_coming),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp),
+            )
+        }
     }
 
-    outcomeLabel(state.outcome)?.let { label ->
+    val outcomeLabel = outcomeCopy(state.outcome)
+    if (outcomeLabel != null) {
         Text(
-            stringResource(label),
+            stringResource(outcomeLabel),
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(top = 12.dp),
+        )
+    } else if (state.step == LinkStep.FAILED) {
+        // A ceremony that threw rather than ended has no CoreLinkOutcome to
+        // word, and "Stopped" on its own reads as something the person did. The
+        // generic line names the two things that are actually worth trying.
+        Text(
+            stringResource(R.string.ui_link_device_failed_generic),
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(top = 12.dp),
         )
     }
 
-    // Raw, untranslated, and deliberately so: this is the exception text a
-    // developer needs off a phone that failed, not copy anyone should read.
-    state.failure?.let { detail ->
-        Text(
-            detail,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.error,
-            modifier = Modifier.padding(top = 12.dp),
-        )
-    }
-
-    if (state.step == LinkDevStep.DONE || state.step == LinkDevStep.FAILED) {
+    if (state.step == LinkStep.DONE || state.step == LinkStep.FAILED) {
         OutlinedButton(
-            onClick = onStartOver,
+            onClick = onFinish,
             modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
-        ) { Text(stringResource(R.string.ui_link_device_start_over)) }
+        ) { Text(stringResource(R.string.ui_done)) }
     } else {
         OutlinedButton(
             onClick = onStop,
@@ -453,28 +493,40 @@ private fun LinkCodeScanner(onDecoded: (String) -> Unit) {
     )
 }
 
-private fun copyToClipboard(context: Context, text: String) {
-    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+private fun copyLinkCode(context: android.content.Context, code: String) {
+    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+        as android.content.ClipboardManager
     clipboard.setPrimaryClip(
-        ClipData.newPlainText(context.getString(R.string.ui_link_device_code_label), text),
+        android.content.ClipData.newPlainText(
+            context.getString(R.string.ui_link_device_code_label),
+            code,
+        ),
     )
 }
 
-private fun stepLabel(step: LinkDevStep): Int = when (step) {
-    LinkDevStep.IDLE, LinkDevStep.WAITING_FOR_PEER -> R.string.ui_link_device_waiting
-    LinkDevStep.HANDSHAKING -> R.string.ui_link_device_handshaking
-    LinkDevStep.COMPARING_DIGITS -> R.string.ui_link_device_comparing
-    LinkDevStep.CARRYING_BOOTSTRAP -> R.string.ui_link_device_carrying
-    LinkDevStep.ACTIVATING -> R.string.ui_link_device_activating
-    LinkDevStep.DONE -> R.string.ui_link_device_done
-    LinkDevStep.FAILED -> R.string.ui_link_device_stopped
+/** Why this phone cannot be adopted. Never reached for a ready store. */
+internal fun readinessCopy(readiness: CoreLinkImportReadiness): Int = when (readiness) {
+    CoreLinkImportReadiness.READY -> R.string.ui_link_device_needs_fresh_phone
+    CoreLinkImportReadiness.STORE_HOLDS_SOMEONE -> R.string.ui_link_device_needs_fresh_phone
+    CoreLinkImportReadiness.STORE_HOLDS_ANOTHER_PERSON ->
+        R.string.ui_link_device_belongs_to_someone_else
+}
+
+internal fun stepCopy(step: LinkStep): Int = when (step) {
+    LinkStep.IDLE, LinkStep.WAITING_FOR_PEER -> R.string.ui_link_device_waiting
+    LinkStep.HANDSHAKING -> R.string.ui_link_device_handshaking
+    LinkStep.COMPARING_DIGITS -> R.string.ui_link_device_comparing
+    LinkStep.CARRYING_BOOTSTRAP -> R.string.ui_link_device_carrying
+    LinkStep.ACTIVATING -> R.string.ui_link_device_activating
+    LinkStep.DONE -> R.string.ui_link_device_done
+    LinkStep.FAILED -> R.string.ui_link_device_stopped
 }
 
 /**
  * Every ending the core names, said once. `ChannelReady` has no line of its own
- * because the run kept going past it -- the report below is what happened next.
+ * because the run kept going past it — the counts above are what happened next.
  */
-private fun outcomeLabel(outcome: CoreLinkOutcome?): Int? = when (outcome) {
+internal fun outcomeCopy(outcome: CoreLinkOutcome?): Int? = when (outcome) {
     null, CoreLinkOutcome.CHANNEL_READY -> null
     CoreLinkOutcome.DECLINED -> R.string.ui_link_device_outcome_declined
     CoreLinkOutcome.CANCELLED -> R.string.ui_link_device_outcome_cancelled

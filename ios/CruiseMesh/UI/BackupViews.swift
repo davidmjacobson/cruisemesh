@@ -149,6 +149,16 @@ struct BackupExportView: View {
     }
 }
 
+/// Opening a `.cmbak` on a fresh install, which since `specs/multi-device-v1.md`
+/// §9 is a fork rather than one action.
+///
+/// **"Replace this device"** is the old meaning, unchanged, and needs the phone
+/// in the backup switched off — it is the §1 clone if it is not. **"Set up as a
+/// new device"** hands off to §9's ceremony instead, so the person ends with two
+/// phones that stay in step rather than two that fight over one author stream.
+///
+/// Both branches are core's `CoreRestorePlan`, not this screen's opinion. What
+/// this screen owes is the words and the ordering, and it takes both from there.
 struct BackupRestoreView: View {
     var onStaged: () -> Void = {}
     @Environment(\.dismiss) private var dismiss
@@ -162,6 +172,10 @@ struct BackupRestoreView: View {
     @State private var preview: BackupPreview?
     @State private var includeHistory = true
     @State private var includeCourier = false
+    /// Nil until the person picks, which is what keeps the old single-meaning
+    /// Restore button from being reachable before they have.
+    @State private var chosenIntent: CoreRestoreIntent?
+    @State private var linkPersonId: Data?
 
     var body: some View {
         NavigationStack {
@@ -188,19 +202,31 @@ struct BackupRestoreView: View {
                 if let preview {
                     Section("Restore preview") {
                         Text("\(preview.inventory.contactCount) contacts · \(preview.inventory.groupCount) groups")
-                        Toggle("Restore my message history", isOn: $includeHistory)
-                        Text("\(preview.inventory.messageCount) messages · \(formatBackupBytes(preview.inventory.messageBytes))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Toggle("Restore pending deliveries for others", isOn: $includeCourier)
-                        Text("\(preview.inventory.pendingCourierDeliveryCount) encrypted messages · \(formatBackupBytes(preview.inventory.pendingCourierDeliveryBytes))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Button(restoring ? "Restoring…" : "Restore account") { restore() }
-                        .disabled(file.isEmpty || passphrase.isEmpty || restoring)
+                    }
+                    RestoreIntentFork(
+                        plans: preview.plans,
+                        chosen: $chosenIntent,
+                        onSetUpAsNewDevice: { personId in linkPersonId = personId }
+                    )
+                    // What to bring over is a question only replacing asks:
+                    // setting up as a new device takes §9.3's export from the
+                    // other phone, not this file's contents.
+                    if chosenIntent == .replaceThisDevice {
+                        Section {
+                            Toggle("Restore my message history", isOn: $includeHistory)
+                            Text("\(preview.inventory.messageCount) messages · \(formatBackupBytes(preview.inventory.messageBytes))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Toggle("Restore pending deliveries for others", isOn: $includeCourier)
+                            Text("\(preview.inventory.pendingCourierDeliveryCount) encrypted messages · \(formatBackupBytes(preview.inventory.pendingCourierDeliveryBytes))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text("Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Button(restoring ? "Restoring…" : "Restore account") { restore() }
+                            .disabled(file.isEmpty || passphrase.isEmpty || restoring)
+                        }
                     }
                 }
                 if let error { Section { Text(error).foregroundStyle(.red) } }
@@ -222,6 +248,7 @@ struct BackupRestoreView: View {
                     file = try BackupService.readBackupFile(at: url)
                     fileName = url.lastPathComponent
                     preview = nil
+                    chosenIntent = nil
                     error = nil
                 } catch {
                     self.error = backupFailureText(error, fallback: .couldNotReadFile).text
@@ -235,7 +262,30 @@ struct BackupRestoreView: View {
             } message: {
                 Text("Close and reopen CruiseMesh to finish installing the restored account.")
             }
+            // `navigationDestination(isPresented:)` rather than the `item:`
+            // overload, which is iOS 17 and this target is 16.
+            .navigationDestination(isPresented: linkPresented) {
+                // The person id read out of the `.cmbak`, handed to the ceremony
+                // so core can refuse a code shown by anybody else's phone.
+                // `loadOrCreate`, because this is a fresh install being adopted
+                // and it needs keys of its own to talk with. The person root
+                // inside the backup is never adopted here — §14.2 keeps it in the
+                // `.cmbak`, and `LinkSession` says why a linked phone is a reader.
+                AddDeviceView(
+                    identity: IdentityStore.loadOrCreate(),
+                    role: .newDevice,
+                    expectedPersonId: linkPersonId,
+                    onFinished: {
+                        onStaged()
+                        dismiss()
+                    }
+                )
+            }
         }
+    }
+
+    private var linkPresented: Binding<Bool> {
+        Binding(get: { linkPersonId != nil }, set: { if !$0 { linkPersonId = nil } })
     }
 
     private func review() {
@@ -278,6 +328,81 @@ struct BackupRestoreView: View {
                 self.error = backupFailureText(error, fallback: .couldNotRestore).text
             }
             restoring = false
+        }
+    }
+}
+
+/// §9's fork: the two things "restore" can mean, said in family words.
+///
+/// The branches, their order and every consequence stated beside them come from
+/// `core_backup_restore_plans`. In particular "Set up as a new device" is listed
+/// first because core lists it first, and it does so deliberately: it is the
+/// choice that cannot produce §1's clone, and a person who has both phones in
+/// front of them should read it before the one that requires switching the old
+/// one off.
+///
+/// `cloneHazardIfSourceIsLive` is what turns the second branch's warning on. It
+/// is a fact core carries on the plan rather than a rule this screen knows, so a
+/// future intent with different hazards gets the right warning without this file
+/// being edited.
+///
+/// Mirrors Android's `RestoreIntentFork`.
+struct RestoreIntentFork: View {
+    let plans: [CoreRestorePlan]
+    @Binding var chosen: CoreRestoreIntent?
+    var onSetUpAsNewDevice: (Data) -> Void
+
+    var body: some View {
+        if !plans.isEmpty {
+            Section("What is this device?") {
+                ForEach(Array(plans.enumerated()), id: \.offset) { entry in
+                    let plan = entry.element
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button {
+                            chosen = plan.intent
+                            // Routing happens on the tap, not on a second
+                            // confirm: the ceremony is itself a long,
+                            // cancellable, confirmed journey, and a confirm
+                            // before a confirm teaches people to tap through
+                            // both.
+                            if plan.routesToLinkCeremony { onSetUpAsNewDevice(plan.personId) }
+                        } label: {
+                            Text(title(plan.intent))
+                                .fontWeight(chosen == plan.intent ? .bold : .regular)
+                        }
+                        .buttonStyle(.borderless)
+                        Text(detail(plan.intent))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if plan.cloneHazardIfSourceIsLive {
+                            Text("Only do this if the old device is switched off. Two devices using one backup will get out of step.")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+    }
+
+    private func title(_ intent: CoreRestoreIntent) -> String {
+        switch intent {
+        case .linkAsNewDevice: return String(localized: "Set up as a new device")
+        case .replaceThisDevice: return String(localized: "Replace this device")
+        }
+    }
+
+    private func detail(_ intent: CoreRestoreIntent) -> String {
+        switch intent {
+        case .linkAsNewDevice:
+            return String(
+                localized: "This device joins the ones you already use. You will need your other device in front of you."
+            )
+        case .replaceThisDevice:
+            return String(
+                localized: "This device takes over from the one in the backup. Use this when the old one is gone or broken."
+            )
         }
     }
 }

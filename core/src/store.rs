@@ -1182,10 +1182,16 @@ impl MessageStore {
         // that makes a rotation handoff re-issuable.
         conn.execute_batch(crate::revocation::REVOCATION_SCHEMA_SQL)
             .map_err(store_err)?;
+        // DL-3's per-contact ledger of which roster head each contact has been
+        // told about.
+        conn.execute_batch(crate::roster_gossip::ROSTER_GOSSIP_SCHEMA_SQL)
+            .map_err(store_err)?;
         // A roster describes a contact, so it has no business outliving one,
-        // and neither does a safety warning about them.
+        // and neither does a safety warning about them, or a note of what they
+        // were once told about our devices.
         crate::roster_store::sweep_orphaned_persons(&conn)?;
         crate::contact_safety::sweep_orphaned_persons(&conn)?;
+        crate::roster_gossip::sweep_orphaned_persons(&conn)?;
         migrate_delivery_metrics_schema(&conn)?;
         ensure_contact_column(&conn, "relay_token", "TEXT")?;
         ensure_contact_column(&conn, "avatar", "BLOB")?;
@@ -5928,6 +5934,10 @@ impl MessageStore {
         // history, not a reason to keep a deleted person's device list.
         crate::roster_store::delete_person(&tx, &user_id)?;
         crate::contact_safety::delete_person(&tx, &user_id)?;
+        // And so does the note of which of our rosters they were told about
+        // (DL-3): a person who is re-friended later holds nothing, so assuming
+        // they still remember would leave them permanently un-gossiped.
+        crate::roster_gossip::forget_person(&tx, &user_id)?;
         tx.commit().map_err(store_err)?;
         Ok(removed > 0)
     }
@@ -20491,7 +20501,7 @@ mod tests {
                 0,
                 0,
                 16,
-                true,
+                crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                 vec![],
                 None,
             )

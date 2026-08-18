@@ -27,6 +27,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -66,6 +67,8 @@ import com.cruisemesh.app.R
 import com.cruisemesh.app.sail.SailChecklistEvidence
 import uniffi.cruisemesh_core.BackupContentOptions
 import uniffi.cruisemesh_core.BackupInventory
+import uniffi.cruisemesh_core.CoreRestoreIntent
+import uniffi.cruisemesh_core.CoreRestorePlan
 
 /** UI state shared by both flows: nothing running, working, done, or a typed error message. */
 private sealed interface BackupUiState {
@@ -263,10 +266,26 @@ internal fun BackupSavedDialog(onDismiss: () -> Unit) {
  * passphrase, install the identity + message store, then relaunch so
  * everything is re-read from the restored state. Meant for the onboarding
  * "Restore from backup" branch (fresh install, no store open yet).
+ *
+ * Since `specs/multi-device-v1.md` §9, opening a backup is a fork rather than
+ * one action, and the fork is the whole point of WP6's restore work: **"Replace
+ * this device"** is the old meaning, unchanged, and needs the phone in the
+ * backup switched off — it is the §1 clone if it is not. **"Set up as a new
+ * device"** hands off to §9's ceremony instead, so the person ends with two
+ * phones that stay in step rather than two that fight over one author stream.
+ *
+ * Both branches are core's `CoreRestorePlan`, not this screen's opinion. What
+ * this screen owes is the words and the ordering, and it takes both from there.
+ *
+ * @param onSetUpAsNewDevice hands off to §9's ceremony with the person id read
+ *   out of the backup, so the ceremony can refuse a code from anybody else.
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalComposeUiApi::class)
 @Composable
-fun BackupRestoreScreen(onBack: () -> Unit) {
+fun BackupRestoreScreen(
+    onBack: () -> Unit,
+    onSetUpAsNewDevice: (ByteArray) -> Unit = {},
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -277,6 +296,9 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
     var preview by remember { mutableStateOf<BackupPreview?>(null) }
     var includeHistory by remember { mutableStateOf(true) }
     var includeCourier by remember { mutableStateOf(false) }
+    // Null until the person picks, which is what keeps the old single-meaning
+    // Restore button from being reachable before they have.
+    var chosenIntent by remember { mutableStateOf<CoreRestoreIntent?>(null) }
 
     val openDocument = rememberLauncherForActivityResult(
         ActivityResultContracts.OpenDocument(),
@@ -284,6 +306,7 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
         if (uri == null) return@rememberLauncherForActivityResult
         state = BackupUiState.Idle
         preview = null
+        chosenIntent = null
         pickedBytes = null
         pickedName = null
         scope.launch {
@@ -297,7 +320,11 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
     }
 
     val canReview = pickedBytes != null && passphrase.isNotEmpty() && state != BackupUiState.Working
-    val canRestore = preview != null && state != BackupUiState.Working
+    // Replacing is now one of two meanings, so it stays out of reach until the
+    // person has said which one they meant.
+    val canRestore = preview != null &&
+        chosenIntent == CoreRestoreIntent.REPLACE_THIS_DEVICE &&
+        state != BackupUiState.Working
 
     fun restart() {
         val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
@@ -399,31 +426,46 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                 )
-                BackupChoice(
-                    checked = includeHistory,
-                    onCheckedChange = { includeHistory = it },
-                    title = stringResource(R.string.ui_restore_message_history),
-                    detail = stringResource(
-                        R.string.ui_restore_history_summary,
-                        reviewed.inventory.messageCount,
-                        formatBackupBytes(reviewed.inventory.messageBytes),
-                    ),
+
+                Spacer(Modifier.height(16.dp))
+                RestoreIntentFork(
+                    plans = reviewed.plans,
+                    chosen = chosenIntent,
+                    onChoose = { chosenIntent = it },
+                    onSetUpAsNewDevice = onSetUpAsNewDevice,
                 )
-                BackupChoice(
-                    checked = includeCourier,
-                    onCheckedChange = { includeCourier = it },
-                    title = stringResource(R.string.ui_restore_pending_for_others),
-                    detail = stringResource(
-                        R.string.ui_restore_courier_summary,
-                        reviewed.inventory.pendingCourierDeliveryCount,
-                        formatBackupBytes(reviewed.inventory.pendingCourierDeliveryBytes),
-                    ),
-                )
-                Text(
-                    stringResource(R.string.ui_backup_identity_always_restored),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                Spacer(Modifier.height(8.dp))
+
+                // What to bring over is a question only replacing asks: setting
+                // up as a new device takes §9.3's export from the other phone,
+                // not this file's contents.
+                if (chosenIntent == CoreRestoreIntent.REPLACE_THIS_DEVICE) {
+                    BackupChoice(
+                        checked = includeHistory,
+                        onCheckedChange = { includeHistory = it },
+                        title = stringResource(R.string.ui_restore_message_history),
+                        detail = stringResource(
+                            R.string.ui_restore_history_summary,
+                            reviewed.inventory.messageCount,
+                            formatBackupBytes(reviewed.inventory.messageBytes),
+                        ),
+                    )
+                    BackupChoice(
+                        checked = includeCourier,
+                        onCheckedChange = { includeCourier = it },
+                        title = stringResource(R.string.ui_restore_pending_for_others),
+                        detail = stringResource(
+                            R.string.ui_restore_courier_summary,
+                            reviewed.inventory.pendingCourierDeliveryCount,
+                            formatBackupBytes(reviewed.inventory.pendingCourierDeliveryBytes),
+                        ),
+                    )
+                    Text(
+                        stringResource(R.string.ui_backup_identity_always_restored),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 Spacer(Modifier.height(16.dp))
             }
 
@@ -467,6 +509,76 @@ fun BackupRestoreScreen(onBack: () -> Unit) {
                 state = state,
                 workingLabel = "Decrypting and restoring…",
                 doneLabel = "Restored. Restarting…",
+            )
+        }
+    }
+}
+
+/**
+ * §9's fork: the two things "restore" can mean, said in family words.
+ *
+ * The branches, their order and every consequence stated beside them come from
+ * `core_backup_restore_plans`. In particular "Set up as a new device" is listed
+ * first because core lists it first, and it does so deliberately: it is the
+ * choice that cannot produce §1's clone, and a person who has both phones in
+ * front of them should read it before the one that requires switching the old
+ * one off.
+ *
+ * `cloneHazardIfSourceIsLive` is what turns the second branch's warning on. It
+ * is a fact core carries on the plan rather than a rule this screen knows, so a
+ * future intent with different hazards gets the right warning without this file
+ * being edited.
+ */
+@Composable
+internal fun RestoreIntentFork(
+    plans: List<CoreRestorePlan>,
+    chosen: CoreRestoreIntent?,
+    onChoose: (CoreRestoreIntent) -> Unit,
+    onSetUpAsNewDevice: (ByteArray) -> Unit,
+) {
+    if (plans.isEmpty()) return
+    Text(
+        stringResource(R.string.ui_what_is_this_phone),
+        style = MaterialTheme.typography.titleMedium,
+    )
+    for (plan in plans) {
+        val selected = chosen == plan.intent
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = {
+                onChoose(plan.intent)
+                // Routing happens on the tap, not on a second confirm: the
+                // ceremony is itself a long, cancellable, confirmed journey, and
+                // a confirm before a confirm teaches people to tap through both.
+                if (plan.routesToLinkCeremony) onSetUpAsNewDevice(plan.personId)
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                stringResource(
+                    when (plan.intent) {
+                        CoreRestoreIntent.LINK_AS_NEW_DEVICE -> R.string.ui_set_up_as_a_new_device
+                        CoreRestoreIntent.REPLACE_THIS_DEVICE -> R.string.ui_replace_this_device
+                    },
+                ),
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
+            )
+        }
+        Text(
+            stringResource(
+                when (plan.intent) {
+                    CoreRestoreIntent.LINK_AS_NEW_DEVICE -> R.string.ui_set_up_as_a_new_device_detail
+                    CoreRestoreIntent.REPLACE_THIS_DEVICE -> R.string.ui_replace_this_device_detail
+                },
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (plan.cloneHazardIfSourceIsLive) {
+            Text(
+                stringResource(R.string.ui_replace_this_device_turn_the_old_one_off),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
             )
         }
     }

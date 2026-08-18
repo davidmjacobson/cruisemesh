@@ -1082,26 +1082,28 @@ impl MessageStore {
     /// call the ack planner sees an unlinked install with nothing to ack for,
     /// and the gate refuses the paths anyway.
     ///
-    /// # What this call turns on that nothing yet turns off
+    /// # §9 step 5 belongs immediately after this call
     ///
     /// This is the line that first makes a fleet larger than one device real,
-    /// and §9 step 5 — telling the person's CONTACTS about the new roster —
-    /// does not exist. DL-3's send side is owed by WP4 (the own-device sync
-    /// records that carry a roster document) and WP5 (the contact
-    /// notification), and neither has landed.
+    /// and until the person's CONTACTS know it, ACK-MD-2 makes that fleet
+    /// expensive: a contact who has not heard about the roster keeps uploading
+    /// exactly ONE person-addressed relay row, and no member of a multi-device
+    /// fleet may delete it — whichever sibling fetches it first must leave it
+    /// for the others. Those rows churned until their 7-day expiry for as long
+    /// as DL-3's send side did not exist.
     ///
-    /// The consequence is not hypothetical and is worth stating where the
-    /// switch is thrown. A contact who has not heard about the roster keeps
-    /// uploading exactly ONE person-addressed relay row, and ACK-MD-2 forbids a
-    /// multi-device fleet from acking it: whichever sibling fetches it first
-    /// must leave it for the others, and nobody deletes it. Those rows churn
-    /// until their 7-day expiry.
+    /// It exists now. A driver that has just activated a device calls
+    /// [`MessageStore::announce_own_roster`], which seals the roster to every
+    /// contact not already holding this head and queues one envelope each; the
+    /// contact's next fan-out to this person is then per-device, each row with
+    /// exactly one consumer, and the churn stops. The same call is the right
+    /// one after a revocation and after adding a contact — it is idempotent, so
+    /// calling it when nothing is owed authors nothing, and a moment a platform
+    /// forgets is repaired by the next call rather than lost.
     ///
-    /// It is bounded and it is dev-only — linking is behind Internal Tools
-    /// until WP6, so the only fleets in existence are ones being deliberately
-    /// tested — but it is a real cost of activating a device before its
-    /// contacts can be told. `MD-ROSTER-GOSSIP-TO-CONTACTS` in
-    /// `core/tests/multi_device_contract.rs` is the pinned form of this note.
+    /// Both halves are pinned by `MD-ROSTER-GOSSIP-TO-CONTACTS` in
+    /// `core/tests/multi_device_contract.rs`, which asserts the churn before the
+    /// document lands and its absence afterwards.
     pub fn complete_link_activation(
         &self,
         acked_roster_head: Vec<u8>,

@@ -70,6 +70,7 @@ fun OnboardingScreen(
     onRequestNotificationPermission: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
     onRestore: () -> Unit,
+    onSetUpAsAnotherDevice: () -> Unit = {},
     onComplete: () -> Unit,
 ) {
     var page by rememberSaveable { mutableStateOf(0) }
@@ -207,7 +208,10 @@ fun OnboardingScreen(
                                 .padding(24.dp),
                         ) {
                             when (currentPage) {
-                                0 -> WelcomeSlide(onRestore = onRestore)
+                                0 -> WelcomeSlide(
+                                    onRestore = onRestore,
+                                    onSetUpAsAnotherDevice = onSetUpAsAnotherDevice,
+                                )
                                 1 -> DeliverySlide()
                                 2 -> ShorePassSlide()
                                 3 -> PermissionsSlide(
@@ -238,8 +242,18 @@ fun OnboardingScreen(
     }
 }
 
+/**
+ * The first thing a new install says, and both ways out of it.
+ *
+ * There are two of them because there are two people here, not one. "Restore
+ * from a backup" is for someone who saved a file and is coming back. "This is
+ * another of my devices" (`specs/multi-device-v1.md` §9) is for someone who
+ * bought a second phone and never made a backup at all -- the ordinary case,
+ * and one that had no door before: without it, the only way onto a person's
+ * fleet was through a file they were never told to make.
+ */
 @Composable
-private fun WelcomeSlide(onRestore: () -> Unit) {
+private fun WelcomeSlide(onRestore: () -> Unit, onSetUpAsAnotherDevice: () -> Unit) {
     SlideScaffold(
         eyebrow = stringResource(R.string.ui_onboarding_welcome_eyebrow),
         title = stringResource(R.string.ui_onboarding_welcome_title),
@@ -256,6 +270,9 @@ private fun WelcomeSlide(onRestore: () -> Unit) {
             modifier = Modifier.padding(top = 8.dp),
         ) {
             Text(stringResource(R.string.ui_already_set_up_restore_from_a_backup))
+        }
+        TextButton(onClick = onSetUpAsAnotherDevice) {
+            Text(stringResource(R.string.ui_this_is_another_of_my_devices))
         }
     }
 }

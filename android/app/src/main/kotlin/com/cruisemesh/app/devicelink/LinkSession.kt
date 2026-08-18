@@ -30,12 +30,13 @@ import uniffi.cruisemesh_core.coreLinkGenesisRoster
 import uniffi.cruisemesh_core.coreLinkOpenActivationAck
 import uniffi.cruisemesh_core.coreLinkOpenDeviceOffer
 import uniffi.cruisemesh_core.coreLinkSignNewDeviceRoster
+import uniffi.cruisemesh_core.coreRosterDeviceIds
 
-/** Which transport the gate run is exercising (`specs/multi-device-v1.md` §13). */
-internal enum class LinkDevTransport { LAN, RELAY }
+/** How the two phones reach each other (`specs/multi-device-v1.md` §9.2). */
+enum class LinkTransport { LAN, RELAY }
 
 /** How far one run has got. Rendered from string resources, never from here. */
-internal enum class LinkDevStep {
+enum class LinkStep {
     IDLE,
     WAITING_FOR_PEER,
     HANDSHAKING,
@@ -46,8 +47,8 @@ internal enum class LinkDevStep {
     FAILED,
 }
 
-/** What landed, for the person reading the dev screen after a run. */
-internal data class LinkDevReport(
+/** What landed, for the sentence the person reads when the run finishes. */
+data class LinkReport(
     val deviceIdHex: String,
     val rosterHeadHex: String,
     val rosterSeq: ULong,
@@ -57,29 +58,28 @@ internal data class LinkDevReport(
     val catchUpChats: Int,
 )
 
-internal data class LinkDevState(
+data class LinkState(
     val role: CoreLinkRole? = null,
-    val transport: LinkDevTransport? = null,
-    val step: LinkDevStep = LinkDevStep.IDLE,
+    val transport: LinkTransport? = null,
+    val step: LinkStep = LinkStep.IDLE,
     val qrText: String? = null,
     val sas: String? = null,
     val confirmHere: Boolean = false,
     val warnSoftCap: Boolean = false,
     val outcome: CoreLinkOutcome? = null,
-    val report: LinkDevReport? = null,
+    val report: LinkReport? = null,
     /** Raw diagnostic text. Developer-facing, never family-facing copy. */
     val failure: String? = null,
 )
 
 /**
- * One end-to-end run of §9, driven from Internal Tools.
+ * One end-to-end run of §9: the ceremony a family actually performs.
  *
- * This exists for §13's WP3 gate and for nothing else: *link two dev builds end
- * to end on LAN and on relay-only*. It is not the family flow -- WP6 owns
- * "Your devices", the link and remove journeys, and every word a family reads.
- * What it has to be is honest: the same core objects, the same ordering, the
- * same refusals, so that a green run here is evidence about the shipping
- * ceremony rather than about a mock of it.
+ * Built for §13's WP3 gate and promoted, unchanged in substance, to be the
+ * driver behind WP6's "Add a device" — the same core objects, the same
+ * ordering, the same refusals. Nothing about the ceremony was ever
+ * developer-only; only the words were, and those now live in `strings.xml`
+ * beside every other thing a family reads.
  *
  * # What it deliberately does not do
  *
@@ -90,13 +90,23 @@ internal data class LinkDevState(
  * would be inventing the thing the spec spent §3 taking away. Authoring as the
  * person from a second device is WP4's per-device author streams; until then a
  * newly linked phone reads what it was given and stays quiet.
+ *
+ * @param expectedPersonId the person the new device believes it is joining,
+ *   read out of the `.cmbak` the restore flow opened (§9's closing paragraph).
+ *   Core refuses a bootstrap for anybody else. `null` means "whoever adopts
+ *   this factory-fresh phone", which is all the ceremony can promise when no
+ *   backup was opened first.
  */
-internal class LinkDevSession(context: Context, private val identity: Identity) {
+class LinkSession(
+    context: Context,
+    private val identity: Identity,
+    private val expectedPersonId: ByteArray? = null,
+) {
     private val appContext = context.applicationContext
     private val store: MessageStore = AppStore.get(appContext)
 
-    private val _state = MutableStateFlow(LinkDevState())
-    val state: StateFlow<LinkDevState> = _state.asStateFlow()
+    private val _state = MutableStateFlow(LinkState())
+    val state: StateFlow<LinkState> = _state.asStateFlow()
 
     @Volatile
     private var decision = LinkConfirmDecision.WAITING
@@ -113,23 +123,43 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
      * Asked before a ceremony starts rather than after one, because the answer
      * cannot change during it and the alternative is a person holding two
      * phones together, comparing six digits, and only then being told this one
-     * was never eligible. `null` = the caller does not know whose phone this is,
-     * which is the honest answer in a dev harness with no backup open.
+     * was never eligible.
      */
     fun importReadiness(): CoreLinkImportReadiness =
-        runCatching { store.linkImportReadiness(null) }
+        runCatching { store.linkImportReadiness(expectedPersonId) }
             .getOrElse {
                 Log.w(TAG, "could not read link import readiness", it)
                 CoreLinkImportReadiness.STORE_HOLDS_SOMEONE
             }
 
+    /**
+     * Whether this install can finish §9.5 at all: it holds the roster-signing
+     * role, or there is no roster yet and it is about to mint §3's genesis and
+     * become device one.
+     *
+     * The backstop behind "Your devices"' gate on the same rule. Both are here
+     * rather than only there because the signature is the LAST step of the
+     * ceremony: without this, a sibling could be walked through a code, a
+     * camera and six digits and fail after the person had done everything
+     * right. Fails closed -- a store that cannot answer is not one to start a
+     * ceremony on the strength of.
+     */
+    fun canSignRoster(): Boolean = runCatching {
+        val roster = store.ownRoster() ?: return@runCatching true
+        val ownDeviceId = DeviceKeyStore.load(appContext)?.deviceId ?: return@runCatching false
+        roster.approvingDeviceId.contentEquals(ownDeviceId)
+    }.getOrElse {
+        Log.w(TAG, "could not read this device's roster role", it)
+        false
+    }
+
     /** §9.1: mint an offer, show it, and wait to be adopted. */
-    fun startAsNewDevice(transport: LinkDevTransport) {
+    fun startAsNewDevice(transport: LinkTransport) {
         launch(CoreLinkRole.NEW_DEVICE, transport) { runNewDevice(transport) }
     }
 
     /** §9.2: scan an offer and, if the digits match, adopt what showed it. */
-    fun startAsApprovingDevice(qrText: String, transport: LinkDevTransport) {
+    fun startAsApprovingDevice(qrText: String, transport: LinkTransport) {
         launch(CoreLinkRole.APPROVING_DEVICE, transport) { runApprovingDevice(qrText, transport) }
     }
 
@@ -147,14 +177,14 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
         worker?.interrupt()
     }
 
-    private fun launch(role: CoreLinkRole, transport: LinkDevTransport, body: () -> Unit) {
+    private fun launch(role: CoreLinkRole, transport: LinkTransport, body: () -> Unit) {
         if (worker?.isAlive == true) return
         decision = LinkConfirmDecision.WAITING
         cancelRequested = false
-        _state.value = LinkDevState(
+        _state.value = LinkState(
             role = role,
             transport = transport,
-            step = LinkDevStep.WAITING_FOR_PEER,
+            step = LinkStep.WAITING_FOR_PEER,
         )
         worker = Thread {
             try {
@@ -162,7 +192,7 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
             } catch (e: Exception) {
                 Log.w(TAG, "link ceremony failed", e)
                 _state.value = _state.value.copy(
-                    step = LinkDevStep.FAILED,
+                    step = LinkStep.FAILED,
                     failure = e.toString(),
                 )
             }
@@ -173,9 +203,9 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
     // §9.1 + §9.3-§9.4(b): the device being adopted
     // -----------------------------------------------------------------------
 
-    private fun runNewDevice(transport: LinkDevTransport) {
-        val listener = if (transport == LinkDevTransport.LAN) LinkLanListener.open() else null
-        val relayConfig = if (transport == LinkDevTransport.RELAY) requireRelay() else null
+    private fun runNewDevice(transport: LinkTransport) {
+        val listener = if (transport == LinkTransport.LAN) LinkLanListener.open() else null
+        val relayConfig = if (transport == LinkTransport.RELAY) requireRelay() else null
         val newDevice = CoreLinkNewDevice(
             // §9.1 and DL-5: this device's own endpoints, and nothing it has
             // merely observed about anyone else's.
@@ -186,8 +216,8 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
         )
         newDevice.use {
             val wire = when (transport) {
-                LinkDevTransport.LAN -> LinkLanListener.accepting(listener!!)
-                LinkDevTransport.RELAY -> LinkRelayWire(
+                LinkTransport.LAN -> LinkLanListener.accepting(listener!!)
+                LinkTransport.RELAY -> LinkRelayWire(
                     config = relayConfig!!,
                     rendezvousId = newDevice.rendezvousId(),
                     sendLane = CoreLinkLane.TO_APPROVING_DEVICE,
@@ -236,29 +266,45 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
                 throw IOException("this phone did not go quiet in time")
             }
 
-            _state.value = _state.value.copy(step = LinkDevStep.CARRYING_BOOTSTRAP)
+            _state.value = _state.value.copy(step = LinkStep.CARRYING_BOOTSTRAP)
             wire.send(machine.seal(coreLinkDeviceOffer(device.signSk, device.agreePk, binding)))
 
             val bootstrap =
                 coreLinkBootstrapDecode(coreLinkBootstrapJoin(collectBootstrap(machine, wire)))
-            // No expected person id: this is a dev harness on a phone with no
-            // backup open, so the core's factory-fresh rule is the whole check.
-            // The real restore flow (WP6) reads the person id out of the
-            // `.cmbak` and passes it here.
-            val import = store.importLinkBootstrap(bootstrap, device.signPk, null, now())
+            // The person id the restore flow read out of the `.cmbak`, when
+            // there was one: core refuses a bootstrap from anybody else, so a
+            // person who scanned the wrong phone's code is told before their
+            // store is written to rather than afterwards. `null` falls back to
+            // core's factory-fresh rule alone, which is all a phone with no
+            // backup open can check.
+            val import =
+                store.importLinkBootstrap(bootstrap, device.signPk, expectedPersonId, now())
 
-            _state.value = _state.value.copy(step = LinkDevStep.ACTIVATING)
+            _state.value = _state.value.copy(step = LinkStep.ACTIVATING)
             // §9.4(b): the acknowledgement goes out first and the device becomes
             // visible second. The other ordering would make a device visible on
             // the strength of a message that never left.
             wire.send(machine.seal(coreLinkActivationAck(device.signSk, import.rosterHead, binding)))
             store.completeLinkActivation(import.rosterHead, now())
+            store.ownRoster()?.let { rememberRosterSeen(it) }
             // Visible from here, radios included.
             LinkVisibility.refresh(store)
 
+            // The two-phone smoke script's gate for §13 WP6 reads this line and
+            // its twin on the approving device, and compares the heads. A head
+            // is a hash of a public document and a device id is derived from a
+            // public key, so neither is a secret -- but no identity secret, QR
+            // payload or SAS ever appears here, and none may be added.
+            Log.i(
+                TAG,
+                "link complete: role=newDevice deviceId=${hex(import.ownDeviceId)} " +
+                    "rosterHead=${hex(import.rosterHead)} contacts=${import.contactsImported} " +
+                    "messages=${import.messagesImported}",
+            )
+
             _state.value = _state.value.copy(
-                step = LinkDevStep.DONE,
-                report = LinkDevReport(
+                step = LinkStep.DONE,
+                report = LinkReport(
                     deviceIdHex = hex(import.ownDeviceId),
                     rosterHeadHex = hex(import.rosterHead),
                     rosterSeq = bootstrap.roster.seq,
@@ -313,18 +359,18 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
     // §9.2 + §9.3-§9.4(a): the device doing the adopting
     // -----------------------------------------------------------------------
 
-    private fun runApprovingDevice(qrText: String, transport: LinkDevTransport) {
+    private fun runApprovingDevice(qrText: String, transport: LinkTransport) {
         val device = DeviceKeyStore.loadOrCreate(appContext)
         val roster = ownRoster(device)
         val approver = CoreLinkApprovingDevice.scan(qrText, roster.devices.size.toUInt(), null)
         approver.use {
             val rendezvous = approver.rendezvous()
             val wire = when (transport) {
-                LinkDevTransport.LAN -> LinkLanListener.connect(
+                LinkTransport.LAN -> LinkLanListener.connect(
                     rendezvous.lanEndpoints,
                     CONNECT_TIMEOUT_MS,
                 )
-                LinkDevTransport.RELAY -> LinkRelayWire(
+                LinkTransport.RELAY -> LinkRelayWire(
                     config = requireRelay(),
                     rendezvousId = approver.rendezvousId(),
                     sendLane = CoreLinkLane.TO_NEW_DEVICE,
@@ -352,7 +398,7 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
     ) {
         val binding = summary.channelBinding ?: error("a ready channel always has a binding")
 
-        _state.value = _state.value.copy(step = LinkDevStep.CARRYING_BOOTSTRAP)
+        _state.value = _state.value.copy(step = LinkStep.CARRYING_BOOTSTRAP)
         val offer = coreLinkOpenDeviceOffer(machine.open(awaitFrame(wire)), binding)
         val update = coreLinkSignNewDeviceRoster(
             roster,
@@ -380,7 +426,7 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
             wire.send(machine.seal(chunk))
         }
 
-        _state.value = _state.value.copy(step = LinkDevStep.ACTIVATING)
+        _state.value = _state.value.copy(step = LinkStep.ACTIVATING)
         // The acknowledgement must come from the device that made the offer,
         // not merely from some device the roster lists: on a fleet that already
         // has siblings, any of them would otherwise satisfy the check and this
@@ -394,10 +440,37 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
         // The new device has acknowledged the exact head, so this fleet is now
         // two devices and both of them know it.
         store.adoptOwnRoster(update.roster, identity.signPk, device.deviceId)
+        rememberRosterSeen(update.roster)
+
+        // §9.5: "roster gossips to contacts". Fired here, on the approving
+        // device, because this is the line where a fleet larger than one device
+        // becomes real -- and fired ONLY here, not on the new device as well.
+        // The newly adopted phone imported the contact list but not the ledger
+        // of who has already been told, so an announcement from it would seal a
+        // second identical copy of the same document to every contact. One
+        // telling is the whole product of this call.
+        //
+        // Core makes that a rule rather than an arrangement between call sites:
+        // `announce_own_roster` returns the empty shape unless the identity it
+        // is given is the person the roster is about, and a linked sibling signs
+        // its mail with a per-device identity. So a sibling's routine passes --
+        // relay, mesh start -- are already silent, and this remains the only
+        // routine announcer. A sibling that ever does hold the person identity
+        // is a fallback, not a second voice: the ledger makes its copy a no-op
+        // for every contact the approving device has already told.
+        RosterGossipSender.announceIfOwed(store, identity, now())
+
+        // The other half of the smoke script's converge gate: same head, both
+        // phones, written down by each of them independently.
+        Log.i(
+            TAG,
+            "link complete: role=approvingDevice deviceId=${hex(ack.deviceId)} " +
+                "rosterHead=${hex(update.rosterHead)} devices=${update.roster.devices.size}",
+        )
 
         _state.value = _state.value.copy(
-            step = LinkDevStep.DONE,
-            report = LinkDevReport(
+            step = LinkStep.DONE,
+            report = LinkReport(
                 deviceIdHex = hex(ack.deviceId),
                 rosterHeadHex = hex(update.rosterHead),
                 rosterSeq = update.roster.seq,
@@ -423,7 +496,10 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
             identity.signSk,
             device.signPk,
             device.agreePk,
-        ).also { store.adoptOwnRoster(it, identity.signPk, device.deviceId) }
+        ).also {
+            store.adoptOwnRoster(it, identity.signPk, device.deviceId)
+            rememberRosterSeen(it)
+        }
 
     // -----------------------------------------------------------------------
     // Shared plumbing
@@ -442,7 +518,7 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
 
                 override fun onSas(sas: String, confirmHere: Boolean, warnSoftCap: Boolean) {
                     _state.value = _state.value.copy(
-                        step = LinkDevStep.COMPARING_DIGITS,
+                        step = LinkStep.COMPARING_DIGITS,
                         sas = sas,
                         confirmHere = confirmHere,
                         warnSoftCap = warnSoftCap,
@@ -450,8 +526,8 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
                 }
 
                 override fun onProgress(sent: Boolean) {
-                    if (sent && _state.value.step == LinkDevStep.WAITING_FOR_PEER) {
-                        _state.value = _state.value.copy(step = LinkDevStep.HANDSHAKING)
+                    if (sent && _state.value.step == LinkStep.WAITING_FOR_PEER) {
+                        _state.value = _state.value.copy(step = LinkStep.HANDSHAKING)
                     }
                 }
             },
@@ -462,9 +538,9 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
         _state.value = _state.value.copy(
             outcome = summary.outcome,
             step = if (summary.outcome == CoreLinkOutcome.CHANNEL_READY) {
-                LinkDevStep.CARRYING_BOOTSTRAP
+                LinkStep.CARRYING_BOOTSTRAP
             } else {
-                LinkDevStep.FAILED
+                LinkStep.FAILED
             },
         )
         return summary
@@ -488,10 +564,27 @@ internal class LinkDevSession(context: Context, private val identity: Identity) 
         if (ms > 0) Thread.sleep(ms)
     }
 
+    /**
+     * Stamp this phone's private "seen here since" note for every device in a
+     * roster it has just adopted.
+     *
+     * At adoption, never at render: stamping while drawing the list meant "first
+     * seen" was really "first looked at", and merely opening Settings wrote to
+     * disk. A device with no stamp shows no date, which is the honest answer for
+     * one this phone learned about before it kept notes.
+     */
+    private fun rememberRosterSeen(roster: Roster) {
+        DeviceNameStore.rememberRoster(
+            appContext,
+            coreRosterDeviceIds(roster).map(::hex),
+            now(),
+        )
+    }
+
     private fun hex(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
 
     private companion object {
-        const val TAG = "LinkDevSession"
+        const val TAG = "LinkSession"
         const val RECEIVE_WAIT_MS = 1_000L
         const val CONNECT_TIMEOUT_MS = 5_000
 

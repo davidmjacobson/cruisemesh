@@ -115,8 +115,17 @@ object MeshRouter {
     fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
         state.onHello2(address, userId, capabilities)
 
-    /** Whether [address] advertised CAP_ACKS_HIDDEN_KINDS (false = pre-HELLO2 build). */
-    fun peerAcksHiddenKinds(address: String): Boolean = state.peerAcksHiddenKinds(address)
+    /**
+     * Whether [address] advertised the capability bit for this one hidden
+     * spray [kind] -- asked per kind, so a peer that acks four of the five it
+     * knows about keeps the watermark for those four. False for a pre-HELLO2
+     * build, which advertises nothing.
+     */
+    fun peerAcksHiddenKind(address: String, kind: UByte): Boolean =
+        state.peerAcksHiddenKind(address, kind)
+
+    /** Every hidden spray kind [address] will ack, for the plan builder. */
+    fun peerAckedHiddenKinds(address: String): ByteArray = state.peerAckedHiddenKinds(address)
 
     /** Hidden-kind msg_ids already sprayed to [address] this link session. */
     fun hiddenOfferedFor(address: String): List<ByteArray> = state.hiddenOfferedFor(address)

@@ -77,8 +77,8 @@
 //!
 //! # 2. Supersession
 //!
-//! Four kinds carry a whole-state snapshot to one recipient, and every
-//! consumer of the four ignores or overwrites an older generation, so only the
+//! Five kinds carry a whole-state snapshot to one recipient, and every
+//! consumer of the five ignores or overwrites an older generation, so only the
 //! newest queued generation per `(recipient, kind)` can ever inform the
 //! recipient of anything. Authoring a new one retires the queued older ones.
 //! Justification is per kind, checked against what each consumer does — see
@@ -95,7 +95,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::store::store_err;
 use crate::{
     CoreError, OutboundEnvelope, DEFAULT_EXPIRY_MS, KIND_FRIEND_DIRECTORY, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_RELAY_UPDATE, KIND_SYNC_DIGEST, RECEIPT_TYPE_DELIVERED,
+    KIND_PROFILE_SYNC, KIND_RELAY_UPDATE, KIND_ROSTER_GOSSIP, KIND_SYNC_DIGEST,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 /// How long a queued LAN endpoint hint stays deliverable.
@@ -142,6 +143,13 @@ pub const LAN_ENDPOINT_HINT_EXPIRY_MS: i64 = 30 * 60 * 1_000;
 ///   contact who is posting to a dead mailbox; the endpoint it announces stays
 ///   true until the next change. A short expiry would make the repair path
 ///   fail exactly for the contact it is meant to reach — the unreachable one.
+/// * **`KIND_ROSTER_GOSSIP` (21) — unchanged**, and for the same reason as
+///   kind 9 with one extra edge. A roster stays true until the person changes
+///   their devices again, and the contact who most needs it is the one who has
+///   been out of reach longest — ACK-MD-2 says a fleet may not delete the
+///   person-addressed rows that contact keeps uploading, so the churn only ends
+///   when this document lands. Shortening its life would starve the repair
+///   precisely where the cost is being paid.
 ///
 /// * **`KIND_SYNC_HISTORY` (10) through `KIND_SYNC_SETTINGS` (15), and
 ///   `KIND_SYNC_DIGEST` (20) — unchanged.** `specs/multi-device-v1.md` §8's
@@ -182,7 +190,7 @@ pub fn authored_delivery_lifetime_ms(kind: u8) -> i64 {
 /// Whether authoring a new envelope of `kind` to a recipient retires the
 /// older envelopes of the same `(recipient, kind)` still queued for them.
 ///
-/// True for exactly the four kinds that carry a complete snapshot of one piece
+/// True for exactly the five kinds that carry a complete snapshot of one piece
 /// of this device's state to one person, where the consumer's own rule already
 /// makes an older generation a no-op or a regression. Each was checked against
 /// what the receiving side actually does with it:
@@ -205,6 +213,14 @@ pub fn authored_delivery_lifetime_ms(kind: u8) -> i64 {
 ///   when `?4 > relay_epoch`, so a lower-epoch notice is discarded on arrival.
 ///   Keeping the newest queued notice keeps the only one that can move the
 ///   recipient's view of our mailbox.
+/// * **`KIND_ROSTER_GOSSIP` (21).** DL-1 is a monotonicity rule —
+///   `core_roster_accept` ignores a roster at a version at or below the one the
+///   recipient already holds — so an older queued roster is by construction a
+///   document the far side will discard. It is also the shape that matters
+///   most in the field: link a device, remove a device, and link another while
+///   a contact is ashore, and the queue would otherwise hold three rosters of
+///   which exactly one can be believed. Only the newest can change anything, so
+///   only the newest is kept.
 ///
 /// Everything else is false, and two exclusions are worth naming because they
 /// look superficially similar:
@@ -239,6 +255,7 @@ pub fn supersedes_queued_generations(kind: u8) -> bool {
             | KIND_LAN_ENDPOINT_HINT
             | KIND_RELAY_UPDATE
             | KIND_SYNC_DIGEST
+            | KIND_ROSTER_GOSSIP
     )
 }
 
@@ -364,7 +381,7 @@ pub(crate) fn retire_superseded(
     kind: u8,
     lamport: u64,
 ) -> Result<u64, CoreError> {
-    // Pairwise only, and cheaply provable here: for the four supersedable
+    // Pairwise only, and cheaply provable here: for the five supersedable
     // kinds the authoring path sets chat_id = recipient_user_id = the
     // contact's user id. A mismatch means something else authored this row and
     // the statement's assumptions do not hold, so leave it alone.
@@ -668,6 +685,11 @@ mod tests {
                 DEFAULT_EXPIRY_MS,
                 "a stale watermark under-reports; an expired one means no round",
             ),
+            (
+                KIND_ROSTER_GOSSIP,
+                DEFAULT_EXPIRY_MS,
+                "the contact who most needs it is the one out of reach longest",
+            ),
         ];
         for (kind, expected, why) in table {
             assert_eq!(
@@ -764,6 +786,11 @@ mod tests {
                 KIND_SYNC_DIGEST,
                 true,
                 "the one §8 kind that really is a snapshot",
+            ),
+            (
+                KIND_ROSTER_GOSSIP,
+                true,
+                "DL-1 discards every roster below the newest",
             ),
         ];
         for (kind, expected, why) in table {

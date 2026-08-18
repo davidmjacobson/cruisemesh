@@ -41,7 +41,12 @@ final class MeshRouterState {
         core.onHello2(address: address, userId: userId, capabilities: capabilities)
     }
 
-    func peerAcksHiddenKinds(address: String) -> Bool { core.peerAcksHiddenKinds(address: address) }
+    func peerAcksHiddenKind(address: String, kind: UInt8) -> Bool {
+        core.peerAcksHiddenKind(address: address, kind: kind)
+    }
+    func peerAckedHiddenKinds(address: String) -> Data {
+        core.peerAckedHiddenKinds(address: address)
+    }
     func hiddenOfferedFor(address: String) -> [Data] { core.hiddenOfferedFor(address: address) }
     func recordHiddenOffered(address: String, msgIds: [Data]) {
         core.recordHiddenOffered(address: address, msgIds: msgIds)

@@ -235,7 +235,7 @@ fn probe(store: &MessageStore, identity: &Identity, contact: &Contact, device_id
             64 * 1024,
             64 * 1024,
             32,
-            true,
+            cruisemesh_core::HIDDEN_SPRAY_KINDS.to_vec(),
             Vec::new(),
             None,
         )

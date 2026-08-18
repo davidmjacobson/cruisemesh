@@ -8,6 +8,12 @@ import uniffi.cruisemesh_core.MessageStore
 /**
  * §9.4's gate, for the one path core cannot see: this shell's own radios.
  *
+ * The window this closes is opened and closed by [LinkSession]: it runs the
+ * ceremony that puts a device between "the channel is confirmed" and "the roster
+ * head is acknowledged", and calls [refresh] on the far side of activation (and
+ * again from its abandon path when a ceremony does not finish). Read that file
+ * first to see when this object's answer changes; this one only caches it.
+ *
  * A device between "the channel is confirmed" and "the roster head is
  * acknowledged" may not advertise, author, or ack ANYTHING. Core enforces that
  * for everything it holds -- authoring refuses, the ack planner names nothing,

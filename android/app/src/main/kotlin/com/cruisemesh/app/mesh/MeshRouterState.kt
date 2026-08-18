@@ -28,7 +28,9 @@ class MeshRouterState {
     fun onHello(address: String, userId: ByteArray): Boolean = core.onHello(address, userId)
     fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
         core.onHello2(address, userId, capabilities)
-    fun peerAcksHiddenKinds(address: String): Boolean = core.peerAcksHiddenKinds(address)
+    fun peerAcksHiddenKind(address: String, kind: UByte): Boolean =
+        core.peerAcksHiddenKind(address, kind)
+    fun peerAckedHiddenKinds(address: String): ByteArray = core.peerAckedHiddenKinds(address)
     fun hiddenOfferedFor(address: String): List<ByteArray> = core.hiddenOfferedFor(address)
     fun recordHiddenOffered(address: String, msgIds: List<ByteArray>) = core.recordHiddenOffered(address, msgIds)
     fun carriedLaneFor(address: String, nowMs: Long): CoreCarriedLane = core.carriedLaneFor(address, nowMs)

@@ -81,6 +81,16 @@
         }
       }
     },
+    "%@ removed one of their devices. Messages you send from now on will not reach it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ removed one of their devices. Messages you send from now on will not reach it."
+          }
+        }
+      }
+    },
     "%@ sent you a message via %@ · %@": {
       "localizations": {
         "en": {
@@ -97,6 +107,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ sent you a message · %@"
+          }
+        }
+      }
+    },
+    "%@ set up CruiseMesh again from a backup. If they did not do that, check with them another way before you send anything private.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ set up CruiseMesh again from a backup. If they did not do that, check with them another way before you send anything private."
           }
         }
       }
@@ -157,6 +177,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "%@ was reachable · %@"
+          }
+        }
+      }
+    },
+    "%@ will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on."
           }
         }
       }
@@ -505,6 +535,36 @@
         }
       }
     },
+    "A device they have removed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A device they have removed"
+          }
+        }
+      }
+    },
+    "A device this phone does not know": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A device this phone does not know"
+          }
+        }
+      }
+    },
+    "A few messages that were still on their way could not be carried over.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A few messages that were still on their way could not be carried over."
+          }
+        }
+      }
+    },
     "A message has already arrived here without the internet.": {
       "localizations": {
         "en": {
@@ -561,6 +621,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Add a caption or send as-is."
+          }
+        }
+      }
+    },
+    "Add a device": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add a device"
           }
         }
       }
@@ -681,6 +751,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Allowed"
+          }
+        }
+      }
+    },
+    "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else."
+          }
+        }
+      }
+    },
+    "Approves new devices": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Approves new devices"
           }
         }
       }
@@ -915,6 +1005,26 @@
         }
       }
     },
+    "Both phones will get out of step. Use one phone for now. To use both, set the other one up again and choose \"Set up as a new device\".": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Both phones will get out of step. Use one phone for now. To use both, set the other one up again and choose \"Set up as a new device\"."
+          }
+        }
+      }
+    },
+    "Brought over %lld contacts and %lld messages.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Brought over %lld contacts and %lld messages."
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -951,6 +1061,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Check and save"
+          }
+        }
+      }
+    },
+    "Check that both phones show the same numbers, then answer here.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Check that both phones show the same numbers, then answer here."
           }
         }
       }
@@ -1071,6 +1191,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "Close and reopen CruiseMesh to finish installing the restored account."
+          }
+        }
+      }
+    },
+    "Code": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Code"
+          }
+        }
+      }
+    },
+    "Code %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Code %@"
+          }
+        }
+      }
+    },
+    "Compare the numbers": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Compare the numbers"
           }
         }
       }
@@ -1205,6 +1355,26 @@
         }
       }
     },
+    "Copy the code": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copy the code"
+          }
+        }
+      }
+    },
+    "Copying contacts and recent messages…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Copying contacts and recent messages…"
+          }
+        }
+      }
+    },
     "Could not display photo": {
       "localizations": {
         "en": {
@@ -1315,6 +1485,36 @@
         }
       }
     },
+    "Device %lld": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Device %lld"
+          }
+        }
+      }
+    },
+    "Device not removed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Device not removed"
+          }
+        }
+      }
+    },
+    "Device removed": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Device removed"
+          }
+        }
+      }
+    },
     "Diagnostic logging": {
       "localizations": {
         "en": {
@@ -1385,6 +1585,16 @@
         }
       }
     },
+    "Finishing up…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Finishing up…"
+          }
+        }
+      }
+    },
     "Friend": {
       "localizations": {
         "en": {
@@ -1415,6 +1625,16 @@
         }
       }
     },
+    "Get the other device ready first. When it shows a code, point this camera at it. Then check that both screens show the same numbers.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Get the other device ready first. When it shows a code, point this camera at it. Then check that both screens show the same numbers."
+          }
+        }
+      }
+    },
     "Handles arriving messages with the rebuilt shared engine. The old path stays the default; this is for testing only.": {
       "localizations": {
         "en": {
@@ -1431,6 +1651,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Handles catching up with a nearby phone using the rebuilt shared engine. The old path stays the default; this is for testing only."
+          }
+        }
+      }
+    },
+    "Hide details": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hide details"
           }
         }
       }
@@ -1455,12 +1685,42 @@
         }
       }
     },
+    "Hold this up to the other phone.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hold this up to the other phone."
+          }
+        }
+      }
+    },
+    "How should they reach each other?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "How should they reach each other?"
+          }
+        }
+      }
+    },
     "How to fix": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "How to fix"
+          }
+        }
+      }
+    },
+    "I checked, it's them": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "I checked, it's them"
           }
         }
       }
@@ -1525,6 +1785,16 @@
         }
       }
     },
+    "Linked": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Linked"
+          }
+        }
+      }
+    },
     "Listening": {
       "localizations": {
         "en": {
@@ -1561,6 +1831,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Medium pen"
+          }
+        }
+      }
+    },
+    "Name this device": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Name this device"
+          }
+        }
+      }
+    },
+    "Names you give devices stay on this phone. Nobody else sees them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Names you give devices stay on this phone. Nobody else sees them."
           }
         }
       }
@@ -1707,12 +1997,32 @@
         }
       }
     },
+    "Older messages will keep arriving in the background.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Older messages will keep arriving in the background."
+          }
+        }
+      }
+    },
     "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received."
+          }
+        }
+      }
+    },
+    "One of the phones stopped.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "One of the phones stopped."
           }
         }
       }
@@ -1733,6 +2043,56 @@
           "stringUnit": {
             "state": "translated",
             "value": "One Shore Pass covers your whole family. If someone in your family already has one, ask them to share their setup card instead of buying another."
+          }
+        }
+      }
+    },
+    "Only %@ can add a device. Open Your devices there. If that device is lost or broken, contact support.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only %@ can add a device. Open Your devices there. If that device is lost or broken, contact support."
+          }
+        }
+      }
+    },
+    "Only %@ can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only %@ can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own."
+          }
+        }
+      }
+    },
+    "Only do this if the old device is switched off. Two devices using one backup will get out of step.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only do this if the old device is switched off. Two devices using one backup will get out of step."
+          }
+        }
+      }
+    },
+    "Only the device that approves new devices can add one. Open Your devices there.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only the device that approves new devices can add one. Open Your devices there."
+          }
+        }
+      }
+    },
+    "Only the device that approves new devices can remove one. Use that device instead.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Only the device that approves new devices can remove one. Use that device instead."
           }
         }
       }
@@ -1775,6 +2135,26 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "Over Wi-Fi": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Over Wi-Fi"
+          }
+        }
+      }
+    },
+    "Over the internet": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Over the internet"
           }
         }
       }
@@ -1825,6 +2205,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Play voice message"
+          }
+        }
+      }
+    },
+    "Point the camera at the code on the other phone, or paste it below.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Point the camera at the code on the other phone, or paste it below."
           }
         }
       }
@@ -1941,6 +2331,46 @@
         }
       }
     },
+    "Remove": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove"
+          }
+        }
+      }
+    },
+    "Remove this device?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Remove this device?"
+          }
+        }
+      }
+    },
+    "Removing…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Removing…"
+          }
+        }
+      }
+    },
+    "Replace this device": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Replace this device"
+          }
+        }
+      }
+    },
     "Roaming data is controlled by iOS. To prevent roaming charges at sea, turn off Data Roaming in Settings, under Cellular, then Cellular Data Options.": {
       "localizations": {
         "en": {
@@ -1957,6 +2387,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Scan each other's codes in person, before everyone scatters."
+          }
+        }
+      }
+    },
+    "Scan the code": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Scan the code"
+          }
+        }
+      }
+    },
+    "Seen here since %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Seen here since %@"
           }
         }
       }
@@ -2033,12 +2483,52 @@
         }
       }
     },
+    "Sent from": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sent from"
+          }
+        }
+      }
+    },
     "Sent you a message %@": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "Sent you a message %@"
+          }
+        }
+      }
+    },
+    "Set up another phone or tablet as you. You will need both in front of you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up another phone or tablet as you. You will need both in front of you."
+          }
+        }
+      }
+    },
+    "Set up as a new device": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Set up as a new device"
+          }
+        }
+      }
+    },
+    "Setting up a private channel…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Setting up a private channel…"
           }
         }
       }
@@ -2253,6 +2743,66 @@
         }
       }
     },
+    "Show this code to the device you already use. Then check that both screens show the same numbers.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Show this code to the device you already use. Then check that both screens show the same numbers."
+          }
+        }
+      }
+    },
+    "Something about %@'s devices does not add up. Check with them another way before you send anything private.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Something about %@'s devices does not add up. Check with them another way before you send anything private."
+          }
+        }
+      }
+    },
+    "Something went wrong and nothing was changed. Try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Something went wrong and nothing was changed. Try again."
+          }
+        }
+      }
+    },
+    "Start": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start"
+          }
+        }
+      }
+    },
+    "Stop": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stop"
+          }
+        }
+      }
+    },
+    "Stopped": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Stopped"
+          }
+        }
+      }
+    },
     "That voice message is too long to send. Try a shorter one.": {
       "localizations": {
         "en": {
@@ -2263,12 +2813,132 @@
         }
       }
     },
+    "The code had already expired.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The code had already expired."
+          }
+        }
+      }
+    },
+    "The numbers did not match.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The numbers did not match."
+          }
+        }
+      }
+    },
+    "The other device's code": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The other device's code"
+          }
+        }
+      }
+    },
+    "The other phone never answered.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The other phone never answered."
+          }
+        }
+      }
+    },
+    "The other phone sent something unexpected.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The other phone sent something unexpected."
+          }
+        }
+      }
+    },
+    "The phones and tablets signed in as you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The phones and tablets signed in as you."
+          }
+        }
+      }
+    },
+    "The private channel could not be set up.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The private channel could not be set up."
+          }
+        }
+      }
+    },
+    "The setup did not finish. Both phones need to be nearby and awake — try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "The setup did not finish. Both phones need to be nearby and awake — try again."
+          }
+        }
+      }
+    },
+    "Their device %lld": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Their device %lld"
+          }
+        }
+      }
+    },
+    "These are signed in as you. They all get your messages and stay in step with each other.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "These are signed in as you. They all get your messages and stay in step with each other."
+          }
+        }
+      }
+    },
     "These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
             "value": "These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off."
+          }
+        }
+      }
+    },
+    "They are different": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "They are different"
+          }
+        }
+      }
+    },
+    "They match": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "They match"
           }
         }
       }
@@ -2289,6 +2959,136 @@
           "stringUnit": {
             "state": "translated",
             "value": "Thin pen"
+          }
+        }
+      }
+    },
+    "This contact has not told this phone which devices they use.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This contact has not told this phone which devices they use."
+          }
+        }
+      }
+    },
+    "This device approves new devices, so it cannot remove itself.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This device approves new devices, so it cannot remove itself."
+          }
+        }
+      }
+    },
+    "This device has not caught up with an earlier change yet. Let it get online, then try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This device has not caught up with an earlier change yet. Let it get online, then try again."
+          }
+        }
+      }
+    },
+    "This device joins the ones you already use. You will need your other device in front of you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This device joins the ones you already use. You will need your other device in front of you."
+          }
+        }
+      }
+    },
+    "This device takes over from the one in the backup. Use this when the old one is gone or broken.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This device takes over from the one in the backup. Use this when the old one is gone or broken."
+          }
+        }
+      }
+    },
+    "This is another of my devices": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This is another of my devices"
+          }
+        }
+      }
+    },
+    "This is the only device signed in as you. Add another and they will share your contacts, groups and messages.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This is the only device signed in as you. Add another and they will share your contacts, groups and messages."
+          }
+        }
+      }
+    },
+    "This phone": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone"
+          }
+        }
+      }
+    },
+    "This phone already has contacts and messages on it, so it cannot be added as a new phone. To use this phone anyway, remove the app, install it again, and choose \"Set up as a new device\".": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone already has contacts and messages on it, so it cannot be added as a new phone. To use this phone anyway, remove the app, install it again, and choose \"Set up as a new device\"."
+          }
+        }
+      }
+    },
+    "This phone has no pass yet, so it can only link over Wi-Fi.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone has no pass yet, so it can only link over Wi-Fi."
+          }
+        }
+      }
+    },
+    "This phone is already set up for someone else.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone is already set up for someone else."
+          }
+        }
+      }
+    },
+    "This phone is not set up with any other devices yet.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This phone is not set up with any other devices yet."
+          }
+        }
+      }
+    },
+    "Ticks mean any one of their %lld devices got it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Ticks mean any one of their %lld devices got it."
           }
         }
       }
@@ -2319,6 +3119,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Voice messages stop automatically after %lld seconds."
+          }
+        }
+      }
+    },
+    "Waiting for the other phone…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Waiting for the other phone…"
+          }
+        }
+      }
+    },
+    "What is this device?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "What is this device?"
           }
         }
       }
@@ -4639,6 +5459,26 @@
         }
       }
     },
+    "You already have a lot of devices set up.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You already have a lot of devices set up."
+          }
+        }
+      }
+    },
+    "You already have as many devices as you can have.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You already have as many devices as you can have."
+          }
+        }
+      }
+    },
     "You can change these anytime in Settings.": {
       "localizations": {
         "en": {
@@ -4655,6 +5495,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "You can turn these on later in Settings — CruiseMesh just has fewer ways to reach people until you do."
+          }
+        }
+      }
+    },
+    "You cannot remove your only device.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You cannot remove your only device."
+          }
+        }
+      }
+    },
+    "You cannot undo this. If you use that device again later, set it up as a new device.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You cannot undo this. If you use that device again later, set it up as a new device."
           }
         }
       }
@@ -4705,6 +5565,46 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your Shore Pass is suspended"
+          }
+        }
+      }
+    },
+    "Your contacts will be told about the change as they come back into range.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your contacts will be told about the change as they come back into range."
+          }
+        }
+      }
+    },
+    "Your contacts will be told as they come back into range. Your other devices catch up the next time they are online.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your contacts will be told as they come back into range. Your other devices catch up the next time they are online."
+          }
+        }
+      }
+    },
+    "Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it."
+          }
+        }
+      }
+    },
+    "Your devices": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your devices"
           }
         }
       }
@@ -5025,16 +5925,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Another phone is using your CruiseMesh backup"
-          }
-        }
-      }
-    },
-    "Both phones will get out of sync. Use one phone until you can link them.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Both phones will get out of sync. Use one phone until you can link them."
           }
         }
       }

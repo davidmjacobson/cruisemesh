@@ -61,7 +61,7 @@ import com.cruisemesh.app.R
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeveloperSettingsScreen(onBack: () -> Unit, onDeviceLinkTest: () -> Unit = {}) {
+fun DeveloperSettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
 
     Scaffold(
@@ -277,20 +277,11 @@ fun DeveloperSettingsScreen(onBack: () -> Unit, onDeviceLinkTest: () -> Unit = {
                 modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             ) { Text(stringResource(R.string.ui_export_field_metrics)) }
 
-            // The device-link runner (specs/multi-device-v1.md §13, WP3 gate).
-            // A one-shot action rather than a rollout switch: it does not change
-            // how this build behaves, it drives a ceremony between two builds
-            // once, so the Wi-Fi and relay-only legs can be checked before
-            // anyone's second phone depends on them.
-            Text(stringResource(R.string.ui_link_device_test_desc),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 12.dp),
-            )
-            OutlinedButton(
-                onClick = onDeviceLinkTest,
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-            ) { Text(stringResource(R.string.ui_link_device_test)) }
+            // The WP3 device-link runner used to live here. It is gone, and
+            // deliberately not replaced by a shortcut: WP6 moved the whole
+            // ceremony onto Settings → Your devices → Add a device, in family
+            // words, and a second door into it from Internal Tools would be a
+            // second thing to keep in step with the first.
 
             // The way back out, for anyone who would rather not hunt for the
             // version line again. Only offered where it can do anything: a

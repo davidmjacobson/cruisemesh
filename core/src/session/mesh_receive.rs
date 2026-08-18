@@ -78,7 +78,7 @@ use crate::{
     LanEndpointContent, MessageArrival, MessageStore, PendingSharedRequest, SeenIds,
     SharedFriendCard, StoredMessage, SyncDigest, DEVICE_HARD_CAP, KIND_FRIEND_REQUEST,
     KIND_GROUP_INVITE, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE,
-    LEGACY_DEVICE_ID, RECEIPT_TYPE_DELIVERED,
+    KIND_ROSTER_GOSSIP, LEGACY_DEVICE_ID, RECEIPT_TYPE_DELIVERED,
 };
 
 /// What the pairwise-open path found when it asked whether an opened payload
@@ -1062,6 +1062,39 @@ impl MessageStore {
                 // mis-scoped or over-privileged credential update.
                 let _ = self.apply_contact_relay_update(sender_user_id.clone(), content, now_ms);
             }
+            // DL-3's receive side (§4, §9 step 5, §10.1's contact leg). A
+            // roster arrives as ordinary sealed 1:1 mail — relay, LAN, BLE and
+            // carry equally — and is applied through the same
+            // `apply_contact_roster` funnel a link bootstrap and a sibling's
+            // self-sync use, so DL-1's ordering, DL-2's fork quarantine, DL-4's
+            // tombstones and §10.4's changed-safety facts are decided in one
+            // place rather than three.
+            KIND_ROSTER_GOSSIP if pairwise => {
+                let roster = crate::core_decode_roster(body.content.clone())
+                    .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
+                // A person gossips their OWN devices and nobody else's. The
+                // signature chain would already refuse a forged document, but
+                // it would happily accept a *genuine* roster about a third
+                // party replayed by whoever also holds a copy — including a
+                // stale one, which is the shape that matters, since a stale
+                // roster is exactly what still vouches for a device its person
+                // has since buried. Sender-chosen data that will never become
+                // ours: terminal, not retryable.
+                if roster.person_id != sender_user_id {
+                    return Err(DeliveryFailure::Malformed(Some(body.kind)));
+                }
+                self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
+                delivery.persisted = true;
+                // Best-effort in exactly the sense the relay-update arm above
+                // is: "refused" is a legitimate, recorded outcome here — an
+                // idempotent re-gossip, a quarantined fork, a document that
+                // tries to exhume a buried device — and the decision plus any
+                // §10.4 fact it raises are already committed inside that call.
+                // The hidden row stays durable either way, which is what
+                // advances this contact's DELIVERED watermark past a roster
+                // they will otherwise keep re-offering for seven days.
+                let _ = self.apply_contact_roster(roster);
+            }
             KIND_PROFILE_SYNC if pairwise => {
                 let content = decode_profile_sync_content(body.content.clone())
                     .map_err(|_| DeliveryFailure::Malformed(Some(body.kind)))?;
@@ -1945,8 +1978,8 @@ mod delivery_tests {
         LanEndpointContent, MessageArrival, MessageBody, MessageStore, ProfileSyncContent,
         ReceiptContent, RelayUpdateContent, Roster, SeenIds, DEFAULT_HOP_TTL, DEVICE_ID_LEN,
         KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
-        KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, LEGACY_DEVICE_ID, MS_PER_DAY,
-        RECEIPT_TYPE_DELIVERED,
+        KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_ROSTER_GOSSIP, KIND_TEXT, LEGACY_DEVICE_ID,
+        MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
     };
 
     use super::CoreInboundDelivery;
@@ -3224,5 +3257,226 @@ mod delivery_tests {
             .messages_for_chat(friend.person.user_id)
             .unwrap()
             .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // DL-3: a roster arrives as ordinary sealed 1:1 mail
+    // -----------------------------------------------------------------------
+
+    /// A gossip body as the sender's own `author_pairwise_message` builds one:
+    /// the wire `chat_id` is the author's id (DELIVER-01), and the content is
+    /// the roster document. `lamport` is explicit because a person gossips more
+    /// than one roster over a fleet's life and each is its own stream slot.
+    fn gossip_body(sender: &Identity, roster: &Roster, lamport: u64) -> Vec<u8> {
+        encode_message_body(MessageBody {
+            kind: KIND_ROSTER_GOSSIP,
+            chat_id: sender.user_id.clone(),
+            lamport,
+            timestamp: NOW,
+            content: crate::core_encode_roster(roster.clone()).expect("roster document"),
+        })
+        .expect("encode body")
+    }
+
+    /// §9 step 5's receive half: a contact tells us about their devices, and
+    /// the same acceptance rules a link bootstrap runs decide what happens.
+    #[test]
+    fn a_contacts_gossiped_roster_is_applied_through_the_ordinary_inbound_path() {
+        let friend = revoking_friend();
+        let me = generate_identity();
+        let store = store();
+        store
+            .upsert_contact(contact(&friend.person, "Alice"))
+            .unwrap();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            gossip_body(&friend.person, &friend.before, 1),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store
+                .contact_active_device_ids(friend.person.user_id.clone())
+                .unwrap(),
+            vec![
+                friend.kept.device_id.clone(),
+                friend.buried.device_id.clone()
+            ],
+            "the contact's fleet is what they gossiped"
+        );
+        // §2 goal 1: learning a contact's devices is not a safety event.
+        assert!(store.contact_safety_facts(true).unwrap().is_empty());
+
+        // §10.1's contact leg, arriving the same way. DL-4 buries the device
+        // and §10.4 raises exactly one fact for the surface to show.
+        let revocation = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            gossip_body(&friend.person, &friend.after, 2),
+        );
+        assert_eq!(revocation.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store
+                .contact_device_state(
+                    friend.person.user_id.clone(),
+                    friend.buried.device_id.clone()
+                )
+                .unwrap(),
+            crate::ContactDeviceState::Revoked
+        );
+        let facts = store.contact_safety_facts(false).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].device_ids, vec![friend.buried.device_id.clone()]);
+
+        // DL-1: the same document again changes nothing and raises nothing.
+        assert_eq!(
+            deliver_pairwise(
+                &store,
+                &me,
+                &friend.person,
+                gossip_body(&friend.person, &friend.after, 3)
+            )
+            .verdict,
+            CoreDeliveryVerdict::Applied
+        );
+        assert_eq!(store.contact_safety_facts(false).unwrap().len(), 1);
+    }
+
+    /// A roster describes the person who sealed it, or it is nothing.
+    ///
+    /// The document here is genuine and its signature chain verifies — it is
+    /// simply about somebody else. Accepting it would let any contact push a
+    /// third party's roster, and a *stale* one at that, which is exactly the
+    /// document that still vouches for a device its person has since buried.
+    #[test]
+    fn a_roster_gossiped_about_a_third_party_is_refused() {
+        let friend = revoking_friend();
+        let me = generate_identity();
+        let meddler = generate_identity();
+        let store = store();
+        store
+            .upsert_contact(contact(&friend.person, "Alice"))
+            .unwrap();
+        store.upsert_contact(contact(&meddler, "Mallory")).unwrap();
+        // Alice's own revocation has already reached us.
+        deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            gossip_body(&friend.person, &friend.after, 1),
+        );
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &meddler,
+            gossip_body(&meddler, &friend.before, 1),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::DroppedMalformed);
+        assert_eq!(
+            store
+                .contact_device_state(
+                    friend.person.user_id.clone(),
+                    friend.buried.device_id.clone()
+                )
+                .unwrap(),
+            crate::ContactDeviceState::Revoked,
+            "a third party cannot exhume a device its person buried"
+        );
+    }
+
+    /// A stranger's roster is not this device's business, and is refused before
+    /// it can become one.
+    #[test]
+    fn a_roster_gossiped_by_a_stranger_is_unauthorized() {
+        let friend = revoking_friend();
+        let me = generate_identity();
+        let store = store();
+
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &friend.person,
+            gossip_body(&friend.person, &friend.before, 1),
+        );
+        assert_eq!(
+            delivery.verdict,
+            CoreDeliveryVerdict::DroppedUnauthorizedSender
+        );
+        assert!(store
+            .contact_active_device_ids(friend.person.user_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// ACK-MD-1's evidence for a kind that leaves no `msg_id` row of its own: a
+    /// roster this device has applied must let its relay copy be deleted, or a
+    /// document that is already stored is refetched on every poll pass for the
+    /// whole seven days.
+    #[test]
+    fn an_applied_roster_gossip_leaves_evidence_that_acks_its_relay_copy() {
+        let friend = revoking_friend();
+        let me = generate_identity();
+        let store = store();
+        store
+            .upsert_contact(contact(&friend.person, "Alice"))
+            .unwrap();
+
+        let sealed = seal_message(
+            friend.person.clone(),
+            me.agree_pk.clone(),
+            gossip_body(&friend.person, &friend.before, 1),
+        )
+        .expect("seal");
+        let msg_id = generate_msg_id();
+        let frame = encode_envelope_frame(
+            msg_id.clone(),
+            DEFAULT_HOP_TTL,
+            NOW + 7 * MS_PER_DAY,
+            compute_recipient_hint(me.user_id.clone(), NOW),
+            sealed,
+        );
+        let seen = Arc::new(SeenIds::new());
+        let outcome = store
+            .process_inbound_frame(
+                me.clone(),
+                seen.clone(),
+                CoreInboundSource::Relay,
+                frame,
+                NOW,
+            )
+            .expect("inbound");
+        let commit = outcome.commit.expect("commit token");
+        let delivery = store
+            .core_deliver_inbound(
+                me,
+                outcome.delivered_sender.expect("verified sender"),
+                outcome
+                    .delivered_payloads
+                    .first()
+                    .cloned()
+                    .expect("delivered"),
+                commit.clone(),
+                arrival(),
+                discovery(),
+            )
+            .expect("delivery");
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        // The production order: the evidence is written only once the delivery
+        // above has landed (T4-06).
+        assert!(
+            !store
+                .consumed_hidden_msg_id_recorded(msg_id.clone(), NOW)
+                .unwrap(),
+            "nothing may vouch for the row before the delivery it depends on"
+        );
+        store.core_commit_inbound_delivery(seen, commit);
+        assert!(
+            store.consumed_hidden_msg_id_recorded(msg_id, NOW).unwrap(),
+            "a consumed roster gossip vouches for its own relay row"
+        );
     }
 }

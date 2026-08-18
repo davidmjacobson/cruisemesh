@@ -18,6 +18,7 @@
 # Usage:
 #   tools/two_phone_ble_smoke.sh [-a SENDER_SERIAL] [-b PEER_SERIAL]
 #                                [-p PEER_NAME] [-o ARTIFACT_DIR]
+#                                [-n NEW_DEVICE_SERIAL]
 #
 #   -a  serial of the phone under test (the sender; needs the build you are
 #       validating). Defaults to the first of exactly two attached devices.
@@ -25,6 +26,11 @@
 #       not need the new build, because B5 is a bug in the *observer*.
 #   -p  contact name to open on the sender (default: the first chat in the list)
 #   -o  where to write logs and screenshots (default: ./smoke-artifacts/<ts>)
+#   -n  serial of a THIRD, freshly installed handset, to run the WP6 link +
+#       converge pass (section 5). Omit it and that section is skipped. It has
+#       to be freshly installed: a phone that already holds contacts and
+#       messages cannot be adopted as a new device (spec section 9.3), and both
+#       phones in the ordinary rig do.
 #
 # Exit status is 0 only if every gate passes.
 
@@ -41,14 +47,16 @@ PEER_NAME=""
 SENDER=""
 PEER=""
 ARTIFACTS=""
+NEW_DEVICE=""
 
-while getopts ":a:b:p:o:h" opt; do
+while getopts ":a:b:p:o:n:h" opt; do
     case "$opt" in
         a) SENDER="$OPTARG" ;;
         b) PEER="$OPTARG" ;;
         p) PEER_NAME="$OPTARG" ;;
         o) ARTIFACTS="$OPTARG" ;;
-        h) sed -n '2,30p' "$0"; exit 0 ;;
+        n) NEW_DEVICE="$OPTARG" ;;
+        h) sed -n '2,35p' "$0"; exit 0 ;;
         *) echo "unknown option -$OPTARG" >&2; exit 2 ;;
     esac
 done
@@ -65,6 +73,10 @@ DELIVERY_TIMEOUT_S=90
 # rate but above normal churn, so this catches a regression without flaking
 # on a quiet desk or a busy one.
 STATUS_133_PER_MIN_MAX=25
+# How long section 5 waits for a person to drive the ceremony on two handsets:
+# a scan, six digits compared out loud, and a bootstrap on the wire. Generous
+# because the slow part is human.
+LINK_TIMEOUT_S=300
 
 pass_count=0
 fail_count=0
@@ -100,6 +112,17 @@ for serial in "$SENDER" "$PEER"; do
         exit 2
     fi
 done
+
+if [ -n "$NEW_DEVICE" ]; then
+    if ! printf '%s\n' "${DEVICES[@]}" | grep -qx "$NEW_DEVICE"; then
+        echo "error: $NEW_DEVICE is not an attached device in state 'device'" >&2
+        exit 2
+    fi
+    if ! adb -s "$NEW_DEVICE" shell pm path "$PKG" 2>/dev/null | grep -q package:; then
+        echo "error: $PKG is not installed on $NEW_DEVICE" >&2
+        exit 2
+    fi
+fi
 
 ARTIFACTS="${ARTIFACTS:-smoke-artifacts/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$ARTIFACTS"
@@ -333,6 +356,107 @@ if python3 -c "import sys; sys.exit(0 if ${rate} <= ${STATUS_133_PER_MIN_MAX} el
     ok "connect churn within budget (<= ${STATUS_133_PER_MIN_MAX}/min)"
 else
     bad "connect churn ${rate}/min exceeds ${STATUS_133_PER_MIN_MAX}/min -- the central link cap may have regressed"
+fi
+
+# --------------------------------------------------- 5. link + converge (WP6)
+
+# `specs/multi-device-v1.md` §13's WP6 gate: "two-phone smoke script extended
+# with a link + converge pass". Opt-in, and it needs a THIRD handset: §9.3
+# refuses to adopt a phone that already holds somebody, and both phones in the
+# ordinary rig do -- which is the whole point of the four sections above.
+#
+# Same lesson as everywhere else in this file, applied to a new screen: the gate
+# is logcat, never what the UI says. LinkSession writes one "link complete:
+# role=..." line on each phone carrying the device-list head it ended up
+# holding, and the two heads matching IS convergence -- it is the exact value
+# §9.4 makes the new phone acknowledge before it is allowed to speak at all. A
+# head is a hash of a public document and a device id is derived from a public
+# key; no identity secret, QR payload or authentication string is logged, and
+# this gate must never be changed to need one.
+#
+# Driving the ceremony is a person's job and is left that way on purpose. It has
+# a camera, a code held up between two handsets and six digits read out loud;
+# scripting taps through it would be testing uiautomator's aim rather than the
+# ceremony, and the parts that matter here are what the two phones end up
+# holding and whether the contacts were told.
+
+if [ -z "$NEW_DEVICE" ]; then
+    say "5. Link + converge (WP6): skipped"
+    info "pass -n SERIAL with a freshly installed third handset to run it."
+    info "a phone that already holds contacts cannot be adopted (spec §9.3)."
+else
+    say "5. Link + converge (WP6)"
+    adb_a shell svc wifi enable >/dev/null 2>&1
+    adb -s "$NEW_DEVICE" shell svc wifi enable >/dev/null 2>&1
+    adb -s "$NEW_DEVICE" shell input keyevent KEYCODE_WAKEUP >/dev/null 2>&1
+    sleep 5
+    adb_a logcat -c >/dev/null 2>&1
+    adb -s "$NEW_DEVICE" logcat -c >/dev/null 2>&1
+
+    info "drive the ceremony by hand now:"
+    info "  new phone ($NEW_DEVICE): Restore from backup -> Set up as a new device"
+    info "  this phone ($SENDER):    Settings -> Your devices -> Add a device"
+    info "  compare the six digits, then tap 'They match' on THIS phone."
+    info "waiting up to ${LINK_TIMEOUT_S}s for both phones to report a finished link..."
+
+    # The newest completion line from one phone, or empty.
+    link_line_for() {
+        adb -s "$1" logcat -d -s LinkSession 2>/dev/null \
+            | grep -o 'link complete: role=[^ ]* deviceId=[0-9a-f]* rosterHead=[0-9a-f]*.*' \
+            | tail -1
+    }
+    head_of() { printf '%s' "$1" | grep -o 'rosterHead=[0-9a-f]*' | cut -d= -f2; }
+
+    linked=0
+    A_LINE=""
+    N_LINE=""
+    for _ in $(seq 1 "$LINK_TIMEOUT_S"); do
+        A_LINE="$(link_line_for "$SENDER")"
+        N_LINE="$(link_line_for "$NEW_DEVICE")"
+        if [ -n "$A_LINE" ] && [ -n "$N_LINE" ]; then linked=1; break; fi
+        sleep 1
+    done
+
+    screencap "05-existing-phone-after-link"
+    adb -s "$NEW_DEVICE" exec-out screencap -p > "$ARTIFACTS/05-new-phone-after-link.png" 2>/dev/null
+    adb -s "$NEW_DEVICE" logcat -d -v time > "$ARTIFACTS/new-device-logcat.txt" 2>/dev/null
+
+    if [ "$linked" != "1" ]; then
+        bad "the ceremony did not finish on both phones within ${LINK_TIMEOUT_S}s"
+    else
+        A_HEAD="$(head_of "$A_LINE")"
+        N_HEAD="$(head_of "$N_LINE")"
+        info "existing phone: $A_LINE"
+        info "new phone:      $N_LINE"
+        if [ -n "$A_HEAD" ] && [ "$A_HEAD" = "$N_HEAD" ]; then
+            ok "both phones converged on the same device list ($A_HEAD)"
+        else
+            bad "the phones ended on different device lists ($A_HEAD vs $N_HEAD)"
+        fi
+
+        # §9.3: the export really carried something. A ceremony that finishes
+        # onto an empty store is a handshake that worked and a bootstrap that
+        # did not, and the screens look identical.
+        imported="$(printf '%s' "$N_LINE" | grep -o 'contacts=[0-9]*' | cut -d= -f2)"
+        imported="${imported:-0}"
+        if [ "$imported" -gt 0 ]; then
+            ok "the new phone brought over $imported contact(s)"
+        else
+            bad "the new phone finished the ceremony holding no contacts"
+        fi
+
+        # §9.5 / DL-3, which is WP6's own slice: the moment the fleet grew, the
+        # existing phone had to seal the new device list to each contact. This
+        # line is the only proof that happened on real hardware.
+        told="$(adb_a logcat -d -s RosterGossipSender 2>/dev/null \
+            | grep -o 'Told [0-9]* contact' | grep -o '[0-9]*' | sort -n | tail -1)"
+        told="${told:-0}"
+        if [ "$told" -gt 0 ]; then
+            ok "the existing phone told $told contact(s) about the new device"
+        else
+            bad "no contact was told about the new device (the §9.5 gossip never fired)"
+        fi
+    fi
 fi
 
 # ------------------------------------------------------------------ summary

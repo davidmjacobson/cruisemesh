@@ -17,6 +17,13 @@ internal const val KIND_LAN_ENDPOINT_HINT: UByte = 8u
 internal const val KIND_RELAY_UPDATE: UByte = 9u
 internal const val KIND_GROUP_METADATA_UPDATE: UByte = 19u
 
+/**
+ * DL-3's carrier (`specs/multi-device-v1.md` §4, §9 step 5, §10.1's contact
+ * leg): a person's own device list, sealed pairwise to one contact. Mirrors
+ * core's `KIND_ROSTER_GOSSIP`.
+ */
+internal const val KIND_ROSTER_GOSSIP: UByte = 21u
+
 /** `receipt_type` values (DESIGN.md §7.2): delivered = recipient decrypted and stored it, read = recipient viewed the chat. */
 internal const val RECEIPT_TYPE_DELIVERED: UByte = 1u
 internal const val RECEIPT_TYPE_READ: UByte = 2u

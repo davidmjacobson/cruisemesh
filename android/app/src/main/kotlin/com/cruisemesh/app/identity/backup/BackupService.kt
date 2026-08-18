@@ -21,6 +21,7 @@ import java.io.InputStream
 import uniffi.cruisemesh_core.backupMaxFileBytes
 import uniffi.cruisemesh_core.BackupContentOptions
 import uniffi.cruisemesh_core.BackupInventory
+import uniffi.cruisemesh_core.CoreRestorePlan
 import uniffi.cruisemesh_core.inspectRestoredMessageStore
 import uniffi.cruisemesh_core.sanitizeRestoredMessageStoreWithOptions
 
@@ -110,6 +111,11 @@ object BackupService {
             inventory = inventory,
             createdAtMs = payload.createdAtMs,
             sourceVersionCode = payload.srcVersionCode,
+            // §9's closing paragraph: opening a `.cmbak` on a fresh install is
+            // two different intents wearing one word, and the person has to be
+            // the one who picks. Read on the decrypt this screen already
+            // performs, so choosing does not cost a second passphrase entry.
+            plans = BackupCrypto.restorePlans(payload),
         )
     }
 
@@ -332,6 +338,13 @@ data class BackupPreview(
     val inventory: BackupInventory,
     val createdAtMs: Long,
     val sourceVersionCode: Int,
+    /**
+     * §9's "Replace this device" and "Link as new device", in core's order.
+     * Empty is never expected — `core_backup_restore_plans` always returns both
+     * — but a shell that finds it empty falls back to the old single-meaning
+     * restore rather than showing a fork with no branches.
+     */
+    val plans: List<CoreRestorePlan> = emptyList(),
 )
 
 internal class BackupFileTooLargeException : IOException()

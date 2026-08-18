@@ -155,6 +155,8 @@ import uniffi.cruisemesh_core.ComposerReach
 import uniffi.cruisemesh_core.CoreVoiceCaptureState
 import uniffi.cruisemesh_core.ConsumedHiddenLamport
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.ContactDeviceState
+import uniffi.cruisemesh_core.ContactSafetyFact
 import uniffi.cruisemesh_core.MessageArrival
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
@@ -258,6 +260,16 @@ fun ChatScreen(
     var identityCloneWarning by remember(contact.userId) {
         mutableStateOf(runCatching { store.hasIdentityCloneWarning(contact.userId) }.getOrDefault(false))
     }
+    // §10.4: this contact's devices changed under them and nobody has told them
+    // so yet. Read here rather than on a settings screen, for exactly the reason
+    // [IdentityCloneNotice] gives -- the moment that matters is the moment
+    // before somebody types.
+    var safetyFact by remember(contact.userId) {
+        mutableStateOf(
+            runCatching { latestSafetyFact(store.contactSafetyFacts(false), contact.userId) }
+                .getOrNull(),
+        )
+    }
     val shareAvailability = remember(contact.userId, isBlocked) {
         ShareContactPolicy.availability(store.getContactDiscoveryPolicy(contact.userId), isBlocked)
     }
@@ -287,6 +299,9 @@ fun ChatScreen(
         identityCloneWarning = runCatching {
             store.hasIdentityCloneWarning(currentContact.userId)
         }.getOrDefault(false)
+        safetyFact = runCatching {
+            latestSafetyFact(store.contactSafetyFacts(false), currentContact.userId)
+        }.getOrNull()
     }
 
     fun stagePhoto(jpeg: ByteArray?) = stagePhotoOrWarn(context, jpeg) { pendingPhoto = it }
@@ -489,6 +504,27 @@ fun ChatScreen(
         reachabilityDetailsText = reachabilityDetailsText,
         relayCardIsStale = relayCardIsStale,
         identityCloneWarning = identityCloneWarning,
+        safetyFact = safetyFact,
+        onAcknowledgeSafety = {
+            safetyFact?.let { fact ->
+                runCatching {
+                    store.acknowledgeContactSafetyFacts(fact.personUserId, fact.observedSeq)
+                }
+            }
+            safetyFact = null
+        },
+        // DL-2's fork resolution: a person who re-verified out of band says so,
+        // and core stops quarantining this contact's device list. Never resolved
+        // by arithmetic -- there is no path to this call that is not a tap.
+        onCheckedOutOfBand = {
+            safetyFact?.let { fact ->
+                runCatching { store.clearRosterQuarantine(fact.personUserId) }
+                runCatching {
+                    store.acknowledgeContactSafetyFacts(fact.personUserId, fact.observedSeq)
+                }
+            }
+            safetyFact = null
+        },
         composerReach = composerReach,
         isMuted = isMuted,
         onMutedChange = {
@@ -586,6 +622,10 @@ private fun ConversationScreen(
     /** Their friend card's relay endpoint has been written off after rejecting us (core `contact_relay_health`). */
     relayCardIsStale: Boolean = false,
     identityCloneWarning: Boolean = false,
+    /** §10.4: the outstanding changed-safety-state fact for this contact. */
+    safetyFact: ContactSafetyFact? = null,
+    onAcknowledgeSafety: () -> Unit = {},
+    onCheckedOutOfBand: () -> Unit = {},
     composerReach: ComposerReach = ComposerReach.FINE,
     isMuted: Boolean = false,
     onMutedChange: (Boolean) -> Unit = {},
@@ -736,6 +776,14 @@ private fun ConversationScreen(
         belowList = {
             if (identityCloneWarning) {
                 IdentityCloneNotice()
+            }
+            safetyFact?.let { fact ->
+                ContactSafetyNotice(
+                    fact = fact,
+                    contactName = displayName,
+                    onAcknowledge = onAcknowledgeSafety,
+                    onCheckedOutOfBand = onCheckedOutOfBand,
+                )
             }
             ComposerReachNotice(reach = composerReach, contactName = displayName)
 
@@ -920,6 +968,31 @@ private fun ConversationScreen(
         val deliveredViaRoute = deliveredVia
             ?.takeIf { infoIsOwn && currentInfoMessage.lamport <= deliveredThrough }
             ?.let { transportRouteText(it.toInt()) }
+        // §8: per-device detail lives here, on the info sheet, and nowhere a
+        // person reaches without asking for it. The ticks above stay
+        // any-device, which is the whole promise that a contact's device count
+        // is invisible.
+        val activeDeviceIds = remember(contact.userId, store) {
+            runCatching { store?.contactActiveDeviceIds(contact.userId).orEmpty() }
+                .getOrDefault(emptyList())
+        }
+        val senderDeviceState = remember(currentInfoMessage.senderDeviceId, contact.userId, store) {
+            runCatching {
+                store?.contactDeviceState(contact.userId, currentInfoMessage.senderDeviceId)
+                    ?: ContactDeviceState.UNKNOWN
+            }.getOrDefault(ContactDeviceState.UNKNOWN)
+        }
+        val deviceRows = deviceInfoRows(
+            messageDeviceInfoLines(
+                isOwn = infoIsOwn,
+                label = deviceLabelFor(
+                    currentInfoMessage.senderDeviceId,
+                    activeDeviceIds,
+                    senderDeviceState,
+                ),
+                contactDeviceCount = activeDeviceIds.size,
+            ),
+        )
         MessageInfoBottomSheet(
             onDismiss = { host.closeInfo() },
             rows = messageInfoRows(
@@ -934,7 +1007,7 @@ private fun ConversationScreen(
                         null
                     },
                     nowMs = System.currentTimeMillis(),
-                ),
+                ) + deviceRows,
         )
     }
 
@@ -2033,6 +2106,33 @@ fun messageInfoRows(
         statusValue?.let { MessageInfoRow.LabelValue("Status", it) },
         arrivalRow,
     )
+}
+
+/**
+ * [messageDeviceInfoLines]'s output as sheet rows.
+ *
+ * Kept apart from [messageInfoRows] so the mapping stays a pure function of
+ * core facts with no resources in it, and so the words live in `strings.xml`
+ * where every other user-facing string does.
+ */
+@Composable
+internal fun deviceInfoRows(lines: List<DeviceInfoLine>): List<MessageInfoRow> = lines.map { line ->
+    when (line) {
+        is DeviceInfoLine.SentFrom -> MessageInfoRow.LabelValue(
+            stringResource(R.string.ui_sent_from_device),
+            when (val label = line.label) {
+                is DeviceLabel.Numbered ->
+                    stringResource(R.string.ui_their_numbered_device, label.position)
+                DeviceLabel.Removed -> stringResource(R.string.ui_a_device_they_removed)
+                DeviceLabel.Unknown -> stringResource(R.string.ui_a_device_we_dont_know)
+            },
+        )
+        is DeviceInfoLine.AddressedTo -> MessageInfoRow.Sentence(
+            stringResource(R.string.ui_delivered_to_any_of_their_devices, line.deviceCount),
+        )
+        DeviceInfoLine.NoDeviceDetail ->
+            MessageInfoRow.Sentence(stringResource(R.string.ui_no_device_detail_yet))
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

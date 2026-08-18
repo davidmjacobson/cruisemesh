@@ -24,6 +24,7 @@
 //!   directory. The missing piece is narrower than "gossip does not exist" —
 //!   there is no envelope kind that carries the roster *document* itself, so
 //!   there is no end-to-end path to drive. WP4/WP5 own that carrier.
+//!   **WP6 closed it**, see below.
 //! * MD-SEAL-STALE-ROSTER needs §6's inbox key generations. WP2 came and
 //!   went without minting them -- it generalized addressing and acks, not
 //!   sealing -- so this one is WP5's alone now. **WP5 closed it**, see below.
@@ -36,6 +37,7 @@
 //!   person's CONTACTS about the new roster; DL-3's send side does not exist.
 //!   WP4 owns the own-device sync records that would carry it and WP5 owns the
 //!   contact notification, so nothing in WP3 can close it.
+//!   **WP6 closed it**, see below.
 //!
 //!   The consequence is concrete and worth stating rather than implying. WP3
 //!   makes fleets larger than one device real, and ACK-MD-2 forbids such a
@@ -119,6 +121,37 @@
 //! still did not move — §10.4 tells a contact what a roster they RECEIVED
 //! means, which is a different problem from getting the roster to them, and
 //! that carrier is still missing.
+//!
+//! **WP6's carrier slice built it, and moved both DL-3 vectors together.**
+//! `KIND_ROSTER_GOSSIP` is an ordinary sealed 1:1 kind carrying
+//! `core_encode_roster`'s document, authored one copy per contact by
+//! `MessageStore::announce_own_roster` and applied inbound through the same
+//! `apply_contact_roster` funnel every other roster path already used. Both
+//! drivers now run two stores against each other over a real envelope frame:
+//!
+//! * `MD-ROSTER-PAIRWISE-GOSSIP` checks DL-3's two claims where they can
+//!   actually fail — the sealed copy opens for its one recipient and for no
+//!   third party, and the document does not appear anywhere in the frame a
+//!   relay would store.
+//! * `MD-ROSTER-GOSSIP-TO-CONTACTS` drives §9 step 5 and asserts the ACK-MD-2
+//!   cost its own fixture names, on both sides of the moment it closes: before
+//!   the gossip the sending contact plans ONE person-addressed row that the
+//!   receiving fleet refuses to ack, and after it the same message plans one
+//!   row per device, each in that device's namespace, each acked by exactly the
+//!   device that consumed it.
+//!
+//! One thing these vectors do NOT yet pin, and it should be said here rather
+//! than discovered: both drivers run inbound through core's own
+//! `deliver_inbound_body`, but neither shell does. Android and iOS still carry
+//! mirrored `handleIncomingRosterGossip` handlers with their own copy of DL-3's
+//! "the roster must be about its sender" check, because their per-kind delivery
+//! has not moved onto `core_deliver_inbound`. So a vector passing here proves
+//! the rule holds in core, not that a phone applies it — the two mirrored
+//! handlers are what has to keep agreeing until that migration lands, at which
+//! point they and their duplicated check are deleted rather than maintained.
+//!
+//! So the churn window WP3 opened is closed by propagation rather than by
+//! expiry — which is what §9 step 5 always said, and is now what the code does.
 //!
 //! **What "implemented and pinned" does NOT mean here.** The ack vectors below
 //! run the production planner against a fleet of two devices — and the fleet
@@ -339,14 +372,16 @@ enum Scenario {
     },
     CapabilityReservation,
     /// §9 step 5: a device is added to a person's roster, and the person's
-    /// contacts have to be told. `roster_reaches_contacts` is the target, not
-    /// the state of the world -- there is no envelope kind that carries a
-    /// roster document, so today it is false and the rows below churn.
+    /// contacts have to be told. `roster_reaches_contacts` was the target
+    /// rather than the state of the world until WP6's `KIND_ROSTER_GOSSIP`
+    /// carried a roster document to a contact; the driver now asserts it.
     RosterGossipToContacts {
         fleet_size_after_link: u8,
         roster_reaches_contacts: bool,
         /// What an un-updated contact keeps uploading, and what ACK-MD-2
-        /// forbids the fleet from deleting.
+        /// forbids the fleet from deleting -- asserted on the sending side
+        /// before the gossip lands, since that is where the cost is paid and
+        /// where its disappearance is visible.
         person_addressed_rows_churn_until_expiry: bool,
     },
     AddDevice {
@@ -626,6 +661,10 @@ const VECTORS: &[Vector] = &[
         implemented: true,
     },
     // DL-3: a roster is sealed pairwise gossip; no directory sees plaintext.
+    // Driven since WP6's carrier: the document rides a real
+    // `KIND_ROSTER_GOSSIP` envelope, so "pairwise" is checked by opening it
+    // (and failing to, as a third party) and "no plaintext" by searching the
+    // frame a relay would store for the document and finding none of it.
     Vector {
         id: "MD-ROSTER-PAIRWISE-GOSSIP",
         scenario: Scenario::RosterPairwiseGossipNoDirectory {
@@ -637,7 +676,7 @@ const VECTORS: &[Vector] = &[
             uses_directory: false,
         },
         target_outcome: Outcome::PairwiseGossipNoDirectory,
-        implemented: false,
+        implemented: true,
     },
     // DL-5: roster documents carry device keys and tombstones, never
     // third-party endpoints. Be exact about what enforces that, because the
@@ -817,12 +856,13 @@ const VECTORS: &[Vector] = &[
         target_outcome: Outcome::DeferredToSiblingAuthor,
         implemented: true,
     },
-    // §9 step 5, WP5: the person's contacts learn the roster. WP3 built the
-    // ceremony that makes a fleet larger than one device; the send side of
-    // DL-3's gossip is WP4's carrier plus WP5's notification, and neither
-    // exists. Data-only for exactly that reason -- there is nothing to drive,
-    // and a test-only stand-in for a wire format nobody has designed would be
-    // the one thing this ledger exists to prevent.
+    // §9 step 5: the person's contacts learn the roster. WP3 built the ceremony
+    // that makes a fleet larger than one device and WP5 produced the document
+    // and the recipient list; WP6 built the envelope kind that carries one to a
+    // contact, which is what turned this from a plan into a delivery. The
+    // driver runs both ends -- the shipped announcement authors, a second store
+    // applies through the production inbound pair -- and asserts the churn cost
+    // the third field names both before it closes and after.
     Vector {
         id: "MD-ROSTER-GOSSIP-TO-CONTACTS",
         scenario: Scenario::RosterGossipToContacts {
@@ -831,7 +871,7 @@ const VECTORS: &[Vector] = &[
             person_addressed_rows_churn_until_expiry: true,
         },
         target_outcome: Outcome::ContactsLearnTheRoster,
-        implemented: false,
+        implemented: true,
     },
     // §6: stale inbox-key sealing has bounded exposure, not a delivery brick.
     // A months-offline contact seals to the roster it knows -- which still
@@ -1076,6 +1116,10 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
     ("MD-ROSTER-FORK-ROOT-PIERCE", Outcome::Accepted),
     ("MD-ROSTER-TOMBSTONE", Outcome::TombstonePermanent),
     ("MD-ROSTER-RELINK-FRESH-KEY", Outcome::FreshKeyAccepted),
+    (
+        "MD-ROSTER-PAIRWISE-GOSSIP",
+        Outcome::PairwiseGossipNoDirectory,
+    ),
     ("MD-ROSTER-KEYS-NOT-ENDPOINTS", Outcome::KeysOnlyNoEndpoints),
     (
         "MD-RECOVERY-EPOCH-REQUIRES-ROOT",
@@ -1107,6 +1151,10 @@ const PINNED_DRIVER_RESULTS: &[(&str, Outcome)] = &[
         Outcome::SiblingsConvergeBySelfSync,
     ),
     ("MD-SYNC-OUTBOUND-DEDUP", Outcome::DeferredToSiblingAuthor),
+    (
+        "MD-ROSTER-GOSSIP-TO-CONTACTS",
+        Outcome::ContactsLearnTheRoster,
+    ),
     ("MD-SEAL-STALE-ROSTER", Outcome::SurvivingDevicesDeliver),
     (
         "MD-REVOKE-REFUSE-NEW-EVENTS",
@@ -1400,6 +1448,24 @@ const BLE_DAY_MSG_ID: [u8; 16] = [0xB1; 16];
 /// material to seal with, which the label fixtures deliberately do not carry
 /// (a roster never seals anything), so it generates its own.
 fn own_fleet_roster(person: &Identity, fleet: &[DeviceKeypair]) -> Roster {
+    own_fleet_roster_at(
+        person,
+        fleet,
+        RosterVersion {
+            recovery_epoch: 0,
+            seq: 0,
+        },
+    )
+}
+
+/// [`own_fleet_roster`] at a version the caller names, for the vectors whose
+/// fixture pins one. Signed the way `roster_of` signs a contact's document: the
+/// person root at genesis, the approving device once a roster has moved.
+fn own_fleet_roster_at(
+    person: &Identity,
+    fleet: &[DeviceKeypair],
+    version: RosterVersion,
+) -> Roster {
     let certs = fleet
         .iter()
         .enumerate()
@@ -1426,8 +1492,8 @@ fn own_fleet_roster(person: &Identity, fleet: &[DeviceKeypair]) -> Roster {
     core_sign_roster(
         Roster {
             person_id: person.user_id.clone(),
-            recovery_epoch: 0,
-            seq: 0,
+            recovery_epoch: version.recovery_epoch,
+            seq: version.seq,
             devices: certs,
             tombstones: Vec::new(),
             approving_device_id: fleet[0].device_id.clone(),
@@ -1435,9 +1501,28 @@ fn own_fleet_roster(person: &Identity, fleet: &[DeviceKeypair]) -> Roster {
             signer_sign_pk: Vec::new(),
             signature: Vec::new(),
         },
-        person.sign_sk.clone(),
+        if version.seq == 0 {
+            person.sign_sk.clone()
+        } else {
+            fleet[0].sign_sk.clone()
+        },
     )
     .expect("own roster signs")
+}
+
+/// A contact row for a generated person, with their real keys — the only trust
+/// anchor `apply_contact_roster` has (§3: the deployed identity key *is* the
+/// person root, so no new anchor and no re-friending).
+fn person_contact(identity: &Identity, name: &str) -> Contact {
+    Contact {
+        user_id: identity.user_id.clone(),
+        name: name.to_string(),
+        sign_pk: identity.sign_pk.clone(),
+        agree_pk: identity.agree_pk.clone(),
+        relay_url: None,
+        relay_token: None,
+        nickname: None,
+    }
 }
 
 /// The message this device would store for a body it just opened.
@@ -1593,6 +1678,53 @@ fn deliver_from_device(
         )
         .expect("delivery")
         .verdict
+}
+
+/// Run one already-built envelope frame through the production inbound pair,
+/// including the post-delivery commit the shells run — so the ACK-01 /
+/// ACK-MD-1 consumed evidence is written exactly where the field writes it.
+///
+/// Distinct from [`deliver_from_device`], which builds the envelope it
+/// delivers. This one takes a frame some *other* store authored, which is what
+/// makes a two-store vector a wire test rather than a round trip.
+fn deliver_frame(store: &MessageStore, me: &Identity, frame: Vec<u8>) -> CoreDeliveryVerdict {
+    let seen = std::sync::Arc::new(cruisemesh_core::SeenIds::new());
+    let outcome = store
+        .process_inbound_frame(
+            me.clone(),
+            seen.clone(),
+            cruisemesh_core::CoreInboundSource::Relay,
+            frame,
+            NOW_MS,
+        )
+        .expect("inbound");
+    let commit = outcome.commit.expect("commit token");
+    let verdict = store
+        .core_deliver_inbound(
+            me.clone(),
+            outcome.delivered_sender.expect("verified sender"),
+            outcome
+                .delivered_payloads
+                .first()
+                .cloned()
+                .expect("an envelope addressed to us opens"),
+            commit.clone(),
+            MessageArrival {
+                transport: 3,
+                hops_taken: 0,
+                received_at: NOW_MS,
+            },
+            CoreDiscoveryPolicyState {
+                enabled: true,
+                revision: 0,
+            },
+        )
+        .expect("delivery")
+        .verdict;
+    if verdict == CoreDeliveryVerdict::Applied {
+        store.core_commit_inbound_delivery(seen, commit);
+    }
+    verdict
 }
 
 fn relay_item(
@@ -3351,18 +3483,288 @@ fn drive(vector: &Vector) -> Option<Outcome> {
             );
             Outcome::ContactSafetyStateRaised
         }
-        // Still data-only, and each for a mechanism reason rather than a
-        // shrug: DL-3's roster gossip is contact-FACING distribution, and WP5
-        // slice 1 produces the document and the recipient list but there is
-        // still no envelope kind that carries a roster to a contact; and
+        // DL-3, both halves, driven now that a roster has a carrier: the
+        // document is sealed pairwise to one contact, and nothing outside that
+        // seal — no relay, no directory, no third party — can read it.
+        //
+        // The plaintext-absence check below is the one that matters. A roster
+        // travelling as an ordinary envelope means the relay stores bytes it
+        // cannot interpret, and the honest way to assert that is to look for
+        // the document *in* the frame the relay would hold and find none of it.
+        Scenario::RosterPairwiseGossipNoDirectory {
+            version,
+            sealed_pairwise,
+            uses_directory,
+        } => {
+            let alice = generate_identity();
+            let bob = generate_identity();
+            let carol = generate_identity();
+            let fleet = [generate_device_keypair(), generate_device_keypair()];
+            let roster = own_fleet_roster_at(&alice, &fleet, version);
+
+            let alice_store = MessageStore::open(":memory:".to_string()).expect("alice");
+            alice_store
+                .upsert_contact(person_contact(&bob, "Bob"))
+                .expect("bob is a contact");
+            alice_store
+                .adopt_own_roster(
+                    roster.clone(),
+                    alice.sign_pk.clone(),
+                    fleet[0].device_id.clone(),
+                )
+                .expect("alice adopts her own roster");
+            let announcement = alice_store
+                .announce_own_roster(alice.clone(), NOW_MS)
+                .expect("gossip");
+            let envelope = announcement
+                .envelopes
+                .first()
+                .cloned()
+                .expect("one sealed copy per contact");
+
+            let document = cruisemesh_core::core_encode_roster(roster.clone()).expect("document");
+            contract_assert!(
+                vector.id,
+                !envelope
+                    .frame
+                    .windows(document.len())
+                    .any(|window| window == document.as_slice()),
+                "the document a relay would store must not contain the roster in the clear"
+            );
+            contract_assert!(
+                vector.id,
+                sealed_pairwise
+                    && open_message(bob.clone(), envelope.envelope.sealed.clone()).is_ok()
+                    && open_message(carol, envelope.envelope.sealed.clone()).is_err(),
+                "a gossiped roster opens for its one recipient and for nobody else"
+            );
+
+            // No directory: the receiving store's only inputs are the frame and
+            // the contact row it already had. Nothing is looked up anywhere.
+            let bob_store = MessageStore::open(":memory:".to_string()).expect("bob");
+            bob_store
+                .upsert_contact(person_contact(&alice, "Alice"))
+                .expect("alice is a contact");
+            contract_assert!(
+                vector.id,
+                !uses_directory
+                    && deliver_frame(&bob_store, &bob, envelope.frame.clone())
+                        == CoreDeliveryVerdict::Applied
+                    && bob_store
+                        .contact_roster_state(alice.user_id.clone())
+                        .expect("state")
+                        .roster
+                        == Some(roster),
+                "a contact learns a roster from the envelope alone"
+            );
+            Outcome::PairwiseGossipNoDirectory
+        }
+        // §9 step 5, driven end to end. Nothing below is a stand-in: the
+        // document is authored by the shipped announcement, travels as a real
+        // sealed envelope frame, and is applied by the production inbound pair
+        // on a second store that has never been told anything about the
+        // sender's devices.
+        //
+        // The vector's third field is the cost this closes, so it is asserted
+        // where it is paid — BEFORE the gossip lands, on the sending contact's
+        // own relay plan — rather than described.
+        Scenario::RosterGossipToContacts {
+            fleet_size_after_link,
+            roster_reaches_contacts,
+            person_addressed_rows_churn_until_expiry,
+        } => {
+            let alice = generate_identity();
+            let bob = generate_identity();
+            let alice_store = MessageStore::open(":memory:".to_string()).expect("alice");
+            let bob_store = MessageStore::open(":memory:".to_string()).expect("bob");
+            alice_store
+                .upsert_contact(person_contact(&bob, "Bob"))
+                .expect("bob is alice's contact");
+            bob_store
+                .upsert_contact(person_contact(&alice, "Alice"))
+                .expect("alice is bob's contact");
+
+            // §9: Alice links a second device, so her fleet is larger than one.
+            let phone = generate_device_keypair();
+            let tablet = generate_device_keypair();
+            let genesis = cruisemesh_core::core_link_genesis_roster(
+                alice.sign_sk.clone(),
+                phone.sign_pk.clone(),
+                phone.agree_pk.clone(),
+            )
+            .expect("genesis");
+            let linked = cruisemesh_core::core_link_sign_new_device_roster(
+                genesis,
+                alice.sign_pk.clone(),
+                phone.sign_sk.clone(),
+                tablet.sign_pk.clone(),
+                tablet.agree_pk.clone(),
+            )
+            .expect("the approving device signs the new roster")
+            .roster;
+            contract_assert!(
+                vector.id,
+                linked.devices.len() == usize::from(fleet_size_after_link),
+                "the linked fleet must be {fleet_size_after_link} devices, got {}",
+                linked.devices.len()
+            );
+            alice_store
+                .adopt_own_roster(linked, alice.sign_pk.clone(), phone.device_id.clone())
+                .expect("alice adopts her own roster");
+
+            // Before the roster reaches Bob, his mail to Alice is ONE
+            // person-addressed row — and ACK-MD-2 forbids her fleet from
+            // deleting it, so it churns until the relay's 7-day expiry.
+            let mail = bob_store
+                .author_pairwise_message(
+                    bob.clone(),
+                    person_contact(&alice, "Alice"),
+                    KIND_TEXT,
+                    b"we're at the pool".to_vec(),
+                    None,
+                    NOW_MS,
+                )
+                .expect("bob writes to alice");
+            let uninformed = bob_store
+                .core_outbound_relay_rows(mail.envelope.clone(), bob.user_id.clone(), None)
+                .expect("relay plan");
+            contract_assert!(
+                vector.id,
+                person_addressed_rows_churn_until_expiry
+                    && uninformed.len() == 1
+                    && uninformed[0].recipient_hint == mail.envelope.recipient_hint,
+                "a contact who has not heard the roster uploads one person-addressed row, \
+                 got {} row(s)",
+                uninformed.len()
+            );
+            contract_assert!(
+                vector.id,
+                alice_store
+                    .core_relay_ack_ids_with_consumed(
+                        vec![CoreRelayEnvelopeDisposition {
+                            relay_id: 91,
+                            msg_id: mail.envelope.msg_id.clone(),
+                            disposition: CoreInboundDisposition::Consumed,
+                            recipient_hint: uninformed[0].recipient_hint.clone(),
+                        }],
+                        alice.user_id.clone(),
+                        NOW_MS,
+                    )
+                    .expect("ack planner")
+                    .is_empty(),
+                "ACK-MD-2: a multi-device fleet never deletes the person's one shared row"
+            );
+
+            // The carrier. One sealed envelope per contact owed the document.
+            let announcement = alice_store
+                .announce_own_roster(alice.clone(), NOW_MS)
+                .expect("alice tells her contacts");
+            contract_assert!(
+                vector.id,
+                announcement.envelopes.len() == 1
+                    && announcement.envelopes[0].message.chat_id == bob.user_id,
+                "exactly the contacts owed the roster are told, got {} envelope(s)",
+                announcement.envelopes.len()
+            );
+
+            // Bob receives it the way he receives everything else.
+            contract_assert!(
+                vector.id,
+                deliver_frame(&bob_store, &bob, announcement.envelopes[0].frame.clone())
+                    == CoreDeliveryVerdict::Applied,
+                "a contact's roster must be applied"
+            );
+            contract_assert!(
+                vector.id,
+                roster_reaches_contacts
+                    && bob_store
+                        .contact_active_device_ids(alice.user_id.clone())
+                        .expect("alice's devices")
+                        == vec![phone.device_id.clone(), tablet.device_id.clone()],
+                "the contact now holds the person's actual fleet"
+            );
+            // ACK-MD-1's evidence: a roster leaves no `messages` row of its
+            // own, so without this its relay copy is refetched for seven days.
+            contract_assert!(
+                vector.id,
+                bob_store
+                    .consumed_hidden_msg_id_recorded(
+                        announcement.envelopes[0].envelope.msg_id.clone(),
+                        NOW_MS
+                    )
+                    .expect("evidence"),
+                "an applied roster must vouch for the relay row it arrived on"
+            );
+
+            // And the churn window closes: the same message now plans one row
+            // per device, each in that device's own namespace, each with
+            // exactly one true consumer.
+            let informed = bob_store
+                .core_outbound_relay_rows(mail.envelope.clone(), bob.user_id.clone(), None)
+                .expect("relay plan");
+            contract_assert!(
+                vector.id,
+                informed.len() == usize::from(fleet_size_after_link),
+                "an informed contact fans out per device, got {} row(s)",
+                informed.len()
+            );
+            for (row, device) in informed.iter().zip([&phone, &tablet]) {
+                contract_assert!(
+                    vector.id,
+                    row.msg_id
+                        == device_fanout_msg_id(
+                            mail.envelope.msg_id.clone(),
+                            device.device_id.clone()
+                        )
+                        && row.recipient_hint
+                            == compute_recipient_hint(
+                                core_device_namespace_id(
+                                    alice.user_id.clone(),
+                                    device.device_id.clone()
+                                ),
+                                mail.envelope.timestamp,
+                            )
+                        && row.recipient_hint != mail.envelope.recipient_hint,
+                    "each row is addressed to one device's own namespace"
+                );
+            }
+            contract_assert!(
+                vector.id,
+                alice_store
+                    .core_relay_ack_ids_with_consumed(
+                        vec![CoreRelayEnvelopeDisposition {
+                            relay_id: 92,
+                            msg_id: informed[0].msg_id.clone(),
+                            disposition: CoreInboundDisposition::Consumed,
+                            recipient_hint: informed[0].recipient_hint.clone(),
+                        }],
+                        alice.user_id.clone(),
+                        NOW_MS,
+                    )
+                    .expect("ack planner")
+                    == vec![92],
+                "ACK-MD-1: once told, each row has one consumer and is deleted by it"
+            );
+
+            // Idempotent gossip, the send-side twin of DL-1: a contact who
+            // already holds this head is told nothing on the next pass.
+            contract_assert!(
+                vector.id,
+                alice_store
+                    .announce_own_roster(alice, NOW_MS + 60_000)
+                    .expect("second pass")
+                    .envelopes
+                    .is_empty(),
+                "a contact already holding the roster is not told again"
+            );
+            Outcome::ContactsLearnTheRoster
+        }
+        // Still data-only, and each for a mechanism reason rather than a shrug:
         // first-contact anchoring has no second source of truth to check an
-        // adopted epoch against. Root-secret custody is WP3's, since nothing
-        // yet mints or stores a person root separately from the identity key.
-        // There is nothing real to execute.
-        Scenario::RosterPairwiseGossipNoDirectory { .. }
-        | Scenario::RosterGossipToContacts { .. }
-        | Scenario::RosterFirstContactAnchor { .. }
-        | Scenario::RecoveryRootCustody { .. } => {
+        // adopted epoch against, and root-secret custody needs the person root
+        // minted and stored separately from the identity key. There is nothing
+        // real to execute.
+        Scenario::RosterFirstContactAnchor { .. } | Scenario::RecoveryRootCustody { .. } => {
             unreachable!("unimplemented vector ran")
         }
     };
@@ -3689,40 +4091,32 @@ fn unimplemented_vector_ledger_is_deliberate() {
         .filter(|vector| !vector.implemented)
         .map(|vector| vector.id)
         .collect();
-    // Five now: `MD-SYNC-BLE-DAY-CONVERGE` left this list when WP4's SYNC-1
-    // anti-entropy gave it something real to drive, and its departure is the
-    // only *removal* the work package makes. WP4's own three vectors
-    // (`MD-STREAM-AUTHOR-OWN-DEVICE`, `MD-STREAM-AUTHOR-UNLINKED`,
-    // `MD-SYNC-OUTBOUND-DEDUP`) were never on this list: each arrived with its
-    // driver, which is the only way a vector is allowed to arrive implemented.
+    // Two now. `MD-SYNC-BLE-DAY-CONVERGE` left this list when WP4's SYNC-1
+    // anti-entropy gave it something real to drive; §6's stale-roster sealing
+    // left with WP5's rotation; and WP6's carrier took the two DL-3 vectors
+    // together, which is the removal that needs stating rather than assuming.
     //
-    // `MD-ROSTER-PAIRWISE-GOSSIP` deliberately stays, and so does WP3's
-    // `MD-ROSTER-GOSSIP-TO-CONTACTS`. WP4 syncs a person's rosters to that
-    // person's OWN devices; DL-3 and §9 step 5 are about a roster reaching a
-    // *contact* without a directory, which is a different recipient set and a
-    // different rule -- WP4's carrier exists now, but WP5 owns the contact
-    // notification, and flipping either on the strength of self-sync would be
-    // claiming coverage this work package does not have (see this file's
-    // header for what the gap costs while it stands).
+    // Both left for the one reason that had kept them here: no envelope kind
+    // carried a roster document to a CONTACT. WP4's self-sync carried rosters
+    // between one person's own devices and WP5 produced the document and the
+    // recipient list, but neither put a roster on a wire pointed at somebody
+    // else -- so `MD-ROSTER-PAIRWISE-GOSSIP` had no sealed envelope whose
+    // sealing it could check, and `MD-ROSTER-GOSSIP-TO-CONTACTS` had no
+    // delivery to drive. WP6 built `KIND_ROSTER_GOSSIP` and the announcement
+    // that authors one per contact, so both drivers now run the real path
+    // across two stores: one authors, the other applies through the production
+    // inbound pair, and the ACK-MD-2 churn the second vector's fixture names is
+    // asserted on the sending contact's own relay plan before and after.
     //
-    // The rest each wait on a mechanism rather than on effort: first-contact
-    // anchoring needs a second source of truth about a person's epoch, which
-    // WP5's recovery flow does not supply -- the override proves who may climb
-    // an epoch, not where a stranger's epoch had already got to; root-secret
-    // custody needs the person root minted and stored separately from the
-    // identity key, which is WP3's. Driving either today would mean writing a
+    // The two that remain each wait on a mechanism rather than on effort:
+    // first-contact anchoring needs a second source of truth about a person's
+    // epoch, which WP5's recovery flow does not supply -- the override proves
+    // who may climb an epoch, not where a stranger's epoch had already got to;
+    // root-secret custody needs the person root minted and stored separately
+    // from the identity key. Driving either today would mean writing a
     // test-only stand-in and calling it core, which is the one thing this
     // ledger exists to prevent.
-    //
-    // §6's stale-roster sealing left this list with WP5: inbox key rotation is
-    // real now (`core_revoke_devices_roster`), so MD-SEAL-STALE-ROSTER is
-    // driven rather than described.
-    let expected = [
-        "MD-ROSTER-PAIRWISE-GOSSIP",
-        "MD-ROSTER-FIRST-CONTACT-ANCHOR",
-        "MD-RECOVERY-ROOT-CUSTODY",
-        "MD-ROSTER-GOSSIP-TO-CONTACTS",
-    ];
+    let expected = ["MD-ROSTER-FIRST-CONTACT-ANCHOR", "MD-RECOVERY-ROOT-CUSTODY"];
     assert_eq!(
         actual, expected,
         "the data-only WP0 vectors are a pinned ledger"

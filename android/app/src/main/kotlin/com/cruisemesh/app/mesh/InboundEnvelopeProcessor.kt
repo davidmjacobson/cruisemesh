@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
+import com.cruisemesh.app.devicelink.rosterGossipDescribesSender
 import com.cruisemesh.app.friending.FriendDirectorySender
 import com.cruisemesh.app.friending.FriendImportEvents
 import com.cruisemesh.app.friending.FriendRequestSender
@@ -49,6 +50,7 @@ import uniffi.cruisemesh_core.coreCarriedPageMaxRows
 import uniffi.cruisemesh_core.coreContactDisplayName
 import uniffi.cruisemesh_core.coreInboundGate
 import uniffi.cruisemesh_core.coreIsOwnFanoutHint
+import uniffi.cruisemesh_core.coreDecodeRoster
 import uniffi.cruisemesh_core.coreLegacyDeviceId
 import uniffi.cruisemesh_core.corePairwiseSenderAuthorized
 import uniffi.cruisemesh_core.corePeerTransportForArrival
@@ -1062,6 +1064,13 @@ internal class InboundEnvelopeProcessor(
                 body,
                 identity,
             )
+            KIND_ROSTER_GOSSIP -> handleIncomingRosterGossip(
+                address,
+                opened.senderUserId,
+                body,
+                identity,
+                extendedBody.senderDeviceId,
+            )
             else -> Log.i(TAG, "Dropping envelope from $address: unhandled kind=${body.kind}")
         }
         return PairwiseDeliveryResult(body.kind, opened.senderUserId, body.lamport, true)
@@ -1731,6 +1740,98 @@ internal class InboundEnvelopeProcessor(
             RelaySyncEvents.requestSync()
             ChatEvents.notifyChatChanged(senderUserId)
         }
+        acknowledgeHiddenMessage(address, senderUserId, identity, contact)
+    }
+
+    /**
+     * DL-3's receive side: a contact's own device list, arriving as ordinary
+     * sealed 1:1 mail (`specs/multi-device-v1.md` §4, §9 step 5, §10.1).
+     *
+     * Shaped exactly like [handleIncomingRelayUpdate], and for the same
+     * reasons: the hidden row goes in first so this contact's DELIVERED
+     * watermark advances past a document they would otherwise re-offer for a
+     * week, and the decision itself is core's single
+     * `apply_contact_roster` funnel — DL-1 ordering, DL-2 fork quarantine,
+     * DL-4 tombstones and §10.4's changed-safety facts, all decided in one
+     * place. "Refused" is a recorded outcome here, not an error.
+     *
+     * # The one check that is duplicated, and when it stops being
+     *
+     * [rosterGossipDescribesSender] restates a rule core already enforces in
+     * `deliver_inbound_body`'s `KIND_ROSTER_GOSSIP` arm
+     * (`core/src/session/mesh_receive.rs`). It is repeated here only because
+     * this shell has not yet moved its per-kind delivery onto
+     * `core_deliver_inbound`; the moment it does, this handler and the check
+     * with it are deleted, not maintained.
+     *
+     * It cannot simply be dropped in the meantime. `apply_contact_roster` takes
+     * a document and no sender, and verifies it against the person the document
+     * names — so without this, a contact could hand us a *genuine* roster about
+     * a third party, and a stale one at that. A stale roster is exactly the
+     * document that still vouches for a device its person has since buried.
+     */
+    private fun handleIncomingRosterGossip(
+        address: String,
+        senderUserId: ByteArray,
+        body: MessageBody,
+        identity: Identity,
+        senderDeviceId: ByteArray?,
+    ) {
+        val contact = store.getContact(senderUserId) ?: run {
+            Log.i(TAG, "Dropping device list from $address: sender is not a contact")
+            return
+        }
+        val roster = try {
+            coreDecodeRoster(body.content)
+        } catch (e: CoreException) {
+            Log.w(TAG, "Dropping device list from $address: failed to decode (${e.message})")
+            return
+        }
+        if (!rosterGossipDescribesSender(roster.personId, senderUserId)) {
+            Log.w(TAG, "Dropping device list from $address: it is not about the sender")
+            return
+        }
+        // The row is filed so this contact's DELIVERED watermark advances past
+        // the document. A duplicate row is *not* a reason to skip the apply
+        // below: `apply_contact_roster` is idempotent by DL-1 (a roster that is
+        // not newer than the one held is a recorded no-op), and the same
+        // document can legitimately reach us twice with only the second copy
+        // arriving after the store was ready to accept it.
+        store.insertMessage(
+            StoredMessage(
+                chatId = senderUserId,
+                senderUserId = senderUserId,
+                lamport = body.lamport,
+                timestamp = body.timestamp,
+                kind = KIND_ROSTER_GOSSIP,
+                payload = body.content,
+                senderDeviceId = senderDeviceId ?: coreLegacyDeviceId(),
+            ),
+        )
+
+        val decision = try {
+            store.applyContactRoster(roster)
+        } catch (e: CoreException) {
+            // A store failure, not a refusal: refusals come back as an outcome.
+            // The row above still stands, so the sender's watermark advances and
+            // they stop re-spraying the same document.
+            Log.w(TAG, "Could not apply the device list from $address: ${e.message}")
+            null
+        }
+        if (decision != null) {
+            Log.i(
+                TAG,
+                "Device list from ${UserIdHex.encode(senderUserId)}: " +
+                    "${decision.outcome} (${decision.reason})",
+            )
+        }
+        // The chat itself gained a hidden row, and §10.4's banner is read from
+        // the store when a chat opens, so nudge whatever is on screen.
+        ChatEvents.notifyChatChanged(senderUserId)
+        // Ack, exactly as `handleIncomingRelayUpdate` does. Without this the
+        // sender's DELIVERED watermark never moves past the roster, so they
+        // re-offer the same document on every digest for the whole life of the
+        // envelope -- the ACK-MD-2 churn this carrier exists to end.
         acknowledgeHiddenMessage(address, senderUserId, identity, contact)
     }
 
@@ -2631,7 +2732,7 @@ internal class InboundEnvelopeProcessor(
                 ownOutboundBudgetBytes = gate.ownOutboundBudgetBytes,
                 ownReceiptBudgetBytes = gate.ownReceiptBudgetBytes,
                 receiptQueryLimit = RELAY_STORE_BATCH_LIMIT,
-                peerAcksHiddenKinds = MeshRouter.peerAcksHiddenKinds(address),
+                peerAcksHiddenKinds = MeshRouter.peerAckedHiddenKinds(address),
                 hiddenAlreadyOffered = MeshRouter.hiddenOfferedFor(address),
                 carriedCursor = lane.after,
             )

@@ -231,7 +231,7 @@ impl MessageStore {
         } = request;
 
         // 0. HELLO2. Recording the bits here rather than on a separate shell
-        // call is what makes `peer_acks_hidden_kinds` below an observation of
+        // call is what makes `peer_acked_hidden_kinds` below an observation of
         // this encounter instead of a hope about ordering: the identity check
         // inside `on_hello2` still refuses a capability claim that contradicts
         // the link's established user id.
@@ -380,7 +380,7 @@ impl MessageStore {
                 gate.own_outbound_budget_bytes,
                 gate.own_receipt_budget_bytes,
                 RECEIPT_QUERY_LIMIT,
-                router.peer_acks_hidden_kinds(peer_address.clone()),
+                router.peer_acked_hidden_kinds(peer_address.clone()),
                 router.hidden_offered_for(peer_address.clone()),
                 lane.after,
             )?;
@@ -1004,7 +1004,9 @@ mod tests {
         let peer = generate_identity();
         let router = router_for(&peer.user_id);
         let spray = CoreSprayPolicy::new();
-        assert!(!router.peer_acks_hidden_kinds(ADDRESS.to_string()));
+        assert!(router
+            .peer_acked_hidden_kinds(ADDRESS.to_string())
+            .is_empty());
 
         let mut with_caps = request(me.user_id.clone(), peer.user_id.clone(), vec![], true);
         with_caps.peer_capabilities = Some(crate::core_own_capabilities() | (1 << 31));
@@ -1012,7 +1014,7 @@ mod tests {
             .plan_mesh_meet(&router, &spray, &gate(), with_caps)
             .unwrap();
         assert!(
-            router.peer_acks_hidden_kinds(ADDRESS.to_string()),
+            router.peer_acks_hidden_kind(ADDRESS.to_string(), crate::KIND_ROSTER_GOSSIP),
             "an unknown future bit alongside the known ones is stored, not rejected"
         );
 
@@ -1023,7 +1025,7 @@ mod tests {
         store
             .plan_mesh_meet(&router, &spray, &gate(), without)
             .unwrap();
-        assert!(router.peer_acks_hidden_kinds(ADDRESS.to_string()));
+        assert!(router.peer_acks_hidden_kind(ADDRESS.to_string(), crate::KIND_ROSTER_GOSSIP));
     }
 
     #[test]

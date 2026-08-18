@@ -275,7 +275,12 @@ struct ChatListView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Another phone is using your CruiseMesh backup")
                                 .font(.subheadline.weight(.semibold))
-                            Text("Both phones will get out of sync. Use one phone until you can link them.")
+                            // Updated for specs/multi-device-v1.md §9: there is
+                            // now somewhere to send them. Restoring the same
+                            // backup onto a second live phone is the failure this
+                            // warns about, and "Set up as a new device" in the
+                            // restore flow is the way out of it.
+                            Text("Both phones will get out of step. Use one phone for now. To use both, set the other one up again and choose \"Set up as a new device\".")
                                 .font(.caption)
                             Button("This is my only phone") {
                                 do {

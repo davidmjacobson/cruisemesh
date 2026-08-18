@@ -28,6 +28,7 @@
     <string name="ui_all_of_your_contacts_are_already_in_this">All of your contacts are already in this group.</string>
     <string name="ui_all_quiet_on_deck">All quiet on deck</string>
     <string name="ui_already_set_up_restore_from_a_backup">Already set up? Restore from a backup</string>
+    <string name="ui_this_is_another_of_my_devices">This is another of my devices</string>
     <string name="ui_another_friend_also_shows_as">Another friend also shows as %1$s. This card belongs to the one with these safety words:</string>
     <string name="ui_ask_them_to_check_these_words_match_their">Ask them to check these words match their card.</string>
     <string name="ui_ask_them_to_read_their_safety_words_aloud">Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.</string>
@@ -778,12 +779,10 @@
         <item quantity="one">%1$d more tap…</item>
         <item quantity="other">%1$d more taps…</item>
     </plurals>
-    <!-- Device link test (Internal Tools; specs/multi-device-v1.md §13 WP3 gate) -->
-    <string name="ui_link_device_test">Device link test</string>
-    <string name="ui_link_device_test_desc">Links this phone to another one running the same build, over Wi‑Fi or over the internet. For checking the steps before anyone relies on them.</string>
-    <string name="ui_link_device_role">Which phone is this?</string>
-    <string name="ui_link_device_role_new">The new phone</string>
-    <string name="ui_link_device_role_approving">The phone already set up</string>
+    <!-- Adding a phone or tablet (specs/multi-device-v1.md §9, §13 WP6). These
+         started as the WP3 runner's copy and stayed when the ceremony moved onto
+         Settings, because they were already the right words: no roster, no
+         epoch, no certificate — two phones, a code, and six digits to compare. -->
     <string name="ui_link_device_how">How should they reach each other?</string>
     <string name="ui_link_device_over_wifi">Over Wi‑Fi</string>
     <string name="ui_link_device_over_internet">Over the internet</string>
@@ -800,7 +799,7 @@
     <string name="ui_link_device_compare">Check that both phones show the same numbers, then answer here.</string>
     <string name="ui_link_device_numbers_match">They match</string>
     <string name="ui_link_device_numbers_differ">They are different</string>
-    <string name="ui_link_device_soft_cap">This person already has a lot of phones set up.</string>
+    <string name="ui_link_device_soft_cap">You already have a lot of devices set up.</string>
     <string name="ui_link_device_waiting">Waiting for the other phone…</string>
     <string name="ui_link_device_handshaking">Setting up a private channel…</string>
     <string name="ui_link_device_comparing">Compare the numbers</string>
@@ -808,17 +807,90 @@
     <string name="ui_link_device_activating">Finishing up…</string>
     <string name="ui_link_device_done">Linked</string>
     <string name="ui_link_device_stopped">Stopped</string>
-    <string name="ui_link_device_report">Phone %1$s, list %2$s (version %3$s). Brought over: %4$s contacts, %5$s groups, %6$s messages. Older messages still to come in %7$s chats.</string>
     <string name="ui_link_device_outcome_declined">The numbers did not match.</string>
     <string name="ui_link_device_outcome_cancelled">One of the phones stopped.</string>
     <string name="ui_link_device_outcome_timed_out">The other phone never answered.</string>
     <string name="ui_link_device_outcome_expired">The code had already expired.</string>
-    <string name="ui_link_device_outcome_full">This person already has as many phones as they can have.</string>
+    <string name="ui_link_device_outcome_full">You already have as many devices as you can have.</string>
     <string name="ui_link_device_outcome_handshake">The private channel could not be set up.</string>
     <string name="ui_link_device_outcome_unexpected">The other phone sent something unexpected.</string>
+    <string name="ui_link_device_failed_generic">The setup did not finish. Both phones need to be nearby and awake — try again.</string>
     <string name="ui_link_device_needs_pass">This phone has no pass yet, so it can only link over Wi‑Fi.</string>
-    <string name="ui_link_device_needs_fresh_phone">This phone already has contacts and messages on it, so it cannot be added as a new phone. Use one that has just been set up.</string>
+    <string name="ui_link_device_needs_fresh_phone">This phone already has contacts and messages on it, so it cannot be added as a new phone. To use this phone anyway, remove the app, install it again, and choose "Set up as a new device".</string>
     <string name="ui_link_device_belongs_to_someone_else">This phone is already set up for someone else.</string>
+
+    <!-- Your devices (specs/multi-device-v1.md §13 WP6). The list, the two
+         journeys that change it, and what a person actually loses when they
+         remove a phone. No protocol words anywhere: "your devices", "removed",
+         "approves new devices" — never roster, epoch, tombstone or certificate. -->
+    <string name="ui_your_devices">Your devices</string>
+    <string name="ui_your_devices_summary">The phones and tablets signed in as you.</string>
+    <string name="ui_your_devices_intro">These are signed in as you. They all get your messages and stay in step with each other.</string>
+    <string name="ui_your_devices_only_this_one">This is the only device signed in as you. Add another and they will share your contacts, groups and messages.</string>
+    <string name="ui_your_devices_names_are_local">Names you give devices stay on this phone. Nobody else sees them.</string>
+    <string name="ui_this_phone">This phone</string>
+    <string name="ui_device_numbered">Device %1$d</string>
+    <string name="ui_device_approves_new_devices">Approves new devices</string>
+    <string name="ui_device_code">Code %1$s</string>
+    <string name="ui_device_seen_here_since">Seen here since %1$s</string>
+    <string name="ui_name_this_device">Name this device</string>
+    <string name="ui_device_name">Name</string>
+    <string name="ui_rename_device_named">Rename %1$s</string>
+    <string name="ui_add_a_device">Add a device</string>
+    <string name="ui_add_a_device_summary">Set up another phone or tablet as you. You will need both in front of you.</string>
+    <string name="ui_add_device_existing_intro">Get the other device ready first. When it shows a code, point this camera at it. Then check that both screens show the same numbers.</string>
+    <string name="ui_add_device_new_intro">Show this code to the device you already use. Then check that both screens show the same numbers.</string>
+    <string name="ui_add_device_brought_over">Brought over %1$s contacts and %2$s messages.</string>
+    <string name="ui_add_device_older_messages_coming">Older messages will keep arriving in the background.</string>
+
+    <!-- Removing a device (§10.1) in family words: what stops, what stays, and
+         that it cannot be taken back. Nothing here promises more than the app
+         actually does. -->
+    <string name="ui_remove_device">Remove</string>
+    <string name="ui_remove_device_named">Remove %1$s</string>
+    <string name="ui_remove_this_device_question">Remove this device?</string>
+    <string name="ui_remove_device_what_happens">%1$s will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on.</string>
+    <string name="ui_remove_device_what_survives">Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it.</string>
+    <string name="ui_remove_device_cannot_undo">You cannot undo this. If you use that device again later, set it up as a new device.</string>
+    <string name="ui_removing_device">Removing…</string>
+    <string name="ui_device_removed">Device removed</string>
+    <string name="ui_device_removed_detail">Your contacts will be told about the change as they come back into range.</string>
+    <string name="ui_device_removed_others_catch_up">Your contacts will be told as they come back into range. Your other devices catch up the next time they are online.</string>
+    <string name="ui_device_removed_some_messages_lost">A few messages that were still on their way could not be carried over.</string>
+    <string name="ui_device_not_removed">Device not removed</string>
+    <string name="ui_remove_device_no_devices">This phone is not set up with any other devices yet.</string>
+    <string name="ui_remove_device_wrong_phone">Only the device that approves new devices can remove one. Use that device instead.</string>
+    <string name="ui_remove_device_use_the_approver">Only %1$s can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own.</string>
+    <string name="ui_add_a_device_not_the_approver">Only the device that approves new devices can add one. Open Your devices there.</string>
+    <string name="ui_add_a_device_wrong_phone">Only %1$s can add a device. Open Your devices there. If that device is lost or broken, contact support.</string>
+    <string name="ui_remove_device_is_the_approver">This device approves new devices, so it cannot remove itself.</string>
+    <string name="ui_remove_device_last_one">You cannot remove your only device.</string>
+    <string name="ui_remove_device_not_caught_up">This device has not caught up with an earlier change yet. Let it get online, then try again.</string>
+    <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.</string>
+    <string name="ui_remove_device_failed">Something went wrong and nothing was changed. Try again.</string>
+
+    <!-- Restore, which is now two different things (§9's closing paragraph). -->
+    <string name="ui_what_is_this_phone">What is this device?</string>
+    <string name="ui_set_up_as_a_new_device">Set up as a new device</string>
+    <string name="ui_set_up_as_a_new_device_detail">This device joins the ones you already use. You will need your other device in front of you.</string>
+    <string name="ui_replace_this_device">Replace this device</string>
+    <string name="ui_replace_this_device_detail">This device takes over from the one in the backup. Use this when the old one is gone or broken.</string>
+    <string name="ui_replace_this_device_turn_the_old_one_off">Only do this if the old device is switched off. Two devices using one backup will get out of step.</string>
+
+    <!-- When a contact's devices change under them (§10.4). Same treatment as
+         the two-copies warning: a line above the composer, not a dialog. -->
+    <string name="ui_contact_removed_a_device">%1$s removed one of their devices. Messages you send from now on will not reach it.</string>
+    <string name="ui_contact_set_up_again">%1$s set up CruiseMesh again from a backup. If they did not do that, check with them another way before you send anything private.</string>
+    <string name="ui_contact_devices_dont_add_up">Something about %1$s\'s devices does not add up. Check with them another way before you send anything private.</string>
+    <string name="ui_i_checked_its_them">I checked, it\'s them</string>
+
+    <!-- Message info, behind a long press (§8: ticks stay any-device). -->
+    <string name="ui_sent_from_device">Sent from</string>
+    <string name="ui_their_numbered_device">Their device %1$d</string>
+    <string name="ui_a_device_they_removed">A device they have removed</string>
+    <string name="ui_a_device_we_dont_know">A device this phone does not know</string>
+    <string name="ui_delivered_to_any_of_their_devices">Ticks mean any one of their %1$d devices got it.</string>
+    <string name="ui_no_device_detail_yet">This contact has not told this phone which devices they use.</string>
     <string name="ui_relay_migration_canary">Relay migration check</string>
     <string name="ui_relay_migration_canary_desc">On a few internet syncs a day, compares what the rebuilt code would have done and records only where they differ. Nothing extra is sent or received.</string>
     <string name="ui_internet_delivery">Internet delivery</string>
@@ -886,7 +958,10 @@
     <string name="ui_two_copies_of_this_contact_detail">CruiseMesh saw two phones using the same identity. The messages already on this phone were kept. This can happen if they restored a backup onto another phone.</string>
     <string name="ui_two_copies_of_this_contact_banner">CruiseMesh saw two copies of this contact. The messages already on this phone were kept.</string>
     <string name="ui_another_phone_is_using_your_backup">Another phone is using your CruiseMesh backup</string>
-    <string name="ui_another_phone_is_using_your_backup_detail">Both phones will get out of sync. Use one phone until you can link them.</string>
+    <!-- Updated for §9: there is now somewhere to send them. Restoring the same
+         backup onto a second live phone is the failure this warns about, and
+         "Set up as a new device" in the restore flow is the way out of it. -->
+    <string name="ui_another_phone_is_using_your_backup_detail">Both phones will get out of step. Use one phone for now. To use both, set the other one up again and choose "Set up as a new device".</string>
     <string name="ui_this_is_my_only_phone">This is my only phone</string>
     <!-- "Before you sail" checklist: the few things a family should finish
          while they are still together. Every line is plain and literal — the
