@@ -307,6 +307,11 @@
     <string name="ui_sender_id">Sender ID</string>
     <string name="ui_reactions">Reactions</string>
     <string name="ui_cruisemesh_operation">CruiseMesh operation</string>
+    <string name="ui_appearance">Appearance</string>
+    <string name="ui_theme">Theme</string>
+    <string name="ui_theme_system">System</string>
+    <string name="ui_theme_light">Light</string>
+    <string name="ui_theme_dark">Dark</string>
     <string name="ui_privacy">Privacy</string>
     <string name="ui_backup">Backup</string>
     <string name="ui_about_legal">About &amp; legal</string>

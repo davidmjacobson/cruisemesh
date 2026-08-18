@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,6 +28,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -70,6 +73,8 @@ fun SettingsScreen(
     meshEnabled: Boolean,
     meshStatus: String,
     relayHealth: RelayHealth,
+    appearancePreference: AppearancePreference,
+    onAppearancePreferenceChange: (AppearancePreference) -> Unit,
     onShorePass: () -> Unit,
     onSailChecklist: () -> Unit,
     onConnectionDetails: () -> Unit,
@@ -194,6 +199,14 @@ fun SettingsScreen(
                         onClick = onDeveloperSettings,
                     )
                 }
+            }
+
+            SettingsGap()
+            SettingsGroup(stringResource(R.string.ui_appearance)) {
+                AppearanceChoices(
+                    selected = appearancePreference,
+                    onSelected = onAppearancePreferenceChange,
+                )
             }
 
             SettingsGap()
@@ -538,6 +551,44 @@ private fun SettingsSwitch(
         // The whole labeled row is the single switch target. A separate
         // callback here would expose a duplicate, unlabeled control to TalkBack.
         Switch(checked = checked, onCheckedChange = null)
+    }
+}
+
+@Composable
+private fun AppearanceChoices(
+    selected: AppearancePreference,
+    onSelected: (AppearancePreference) -> Unit,
+) {
+    Text(
+        stringResource(R.string.ui_theme),
+        style = MaterialTheme.typography.bodyLarge,
+        modifier = Modifier.padding(bottom = 4.dp),
+    )
+    Column(modifier = Modifier.fillMaxWidth().selectableGroup()) {
+        AppearancePreference.entries.forEach { preference ->
+            val label = stringResource(
+                when (preference) {
+                    AppearancePreference.SYSTEM -> R.string.ui_theme_system
+                    AppearancePreference.LIGHT -> R.string.ui_theme_light
+                    AppearancePreference.DARK -> R.string.ui_theme_dark
+                },
+            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .semantics(mergeDescendants = true) {}
+                    .selectable(
+                        selected = preference == selected,
+                        role = Role.RadioButton,
+                        onClick = { onSelected(preference) },
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = preference == selected, onClick = null)
+                Text(label, modifier = Modifier.padding(start = 12.dp))
+            }
+        }
     }
 }
 

@@ -5,9 +5,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsOff
 import androidx.compose.ui.test.assertIsOn
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isToggleable
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import com.cruisemesh.app.mesh.RelayHealth
@@ -33,6 +35,8 @@ class SettingsUiTest {
                     meshEnabled = enabled,
                     meshStatus = "Mesh running",
                     relayHealth = RelayHealth.NoConfig,
+                    appearancePreference = AppearancePreference.SYSTEM,
+                    onAppearancePreferenceChange = {},
                     onShorePass = {},
                     onSailChecklist = {},
                     onConnectionDetails = {},
@@ -54,5 +58,33 @@ class SettingsUiTest {
         meshToggle.performScrollTo().assertIsOn().performClick()
         meshToggle.assertIsOff()
         assertEquals(1, changes)
+    }
+
+    @Test
+    fun `appearance choice is selected and reports changes`() {
+        var appearance by mutableStateOf(AppearancePreference.SYSTEM)
+
+        compose.setContent {
+            CruiseMeshTheme(appearance = appearance) {
+                SettingsScreen(
+                    meshEnabled = true,
+                    meshStatus = "Mesh running",
+                    relayHealth = RelayHealth.NoConfig,
+                    appearancePreference = appearance,
+                    onAppearancePreferenceChange = { appearance = it },
+                    onShorePass = {},
+                    onSailChecklist = {},
+                    onConnectionDetails = {},
+                    onDeveloperSettings = {},
+                    onBackUp = {},
+                    onMeshEnabledChange = {},
+                    onFriendsOfFriendsChanged = {},
+                    onBack = {},
+                )
+            }
+        }
+
+        compose.onNodeWithText("Dark").performScrollTo().performClick().assertIsSelected()
+        assertEquals(AppearancePreference.DARK, appearance)
     }
 }

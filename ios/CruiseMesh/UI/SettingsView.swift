@@ -4,6 +4,7 @@ import UIKit
 struct SettingsView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
+    @Binding var appearance: AppearancePreference
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
     @Environment(\.dismiss) private var dismiss
@@ -105,6 +106,15 @@ struct SettingsView: View {
                             }
                         }
                     }
+                }
+
+                Section("Appearance") {
+                    Picker("Theme", selection: $appearance) {
+                        ForEach(AppearancePreference.allCases, id: \.self) { preference in
+                            Text(preference.label).tag(preference)
+                        }
+                    }
+                    .pickerStyle(.segmented)
                 }
 
                 Section("Privacy") {
