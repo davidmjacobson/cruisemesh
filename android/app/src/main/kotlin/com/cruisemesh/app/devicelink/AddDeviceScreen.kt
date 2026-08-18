@@ -73,6 +73,10 @@ import uniffi.cruisemesh_core.Identity
  * The code on screen carries ephemeral link material and rendezvous hints only —
  * §9.1's rule, enforced in core, and the reason this screen may show a QR at
  * all. Nothing here reads, renders or logs an identity secret.
+ *
+ * @param onLinked where a phone that was just adopted goes: into the app, never
+ *   back the way it came. See [LinkCompletion] for who this is for and why the
+ *   other endings must not use it.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,6 +85,7 @@ fun AddDeviceScreen(
     role: CoreLinkRole,
     expectedPersonId: ByteArray? = null,
     onBack: () -> Unit,
+    onLinked: () -> Unit = onBack,
 ) {
     val context = LocalContext.current
     val session = remember(identity.userId, role) {
@@ -160,7 +165,10 @@ fun AddDeviceScreen(
                     onStop = session::cancel,
                     onFinish = {
                         session.close()
-                        onBack()
+                        // One button, two meanings: a phone that was just
+                        // adopted is set up and belongs in the app, and
+                        // everything else belongs back where it came from.
+                        if (LinkCompletion.entersApp(role, state.step)) onLinked() else onBack()
                     },
                 )
             }

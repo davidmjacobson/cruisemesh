@@ -84,6 +84,34 @@ class LanTransportTest {
         assertTrue(!ownLanStaticKeyMatches(alice.agreePk, bob.agreePk))
     }
 
+    /**
+     * The three answers a finished handshake can have, and why "not a contact"
+     * is no longer one verdict (`specs/multi-device-v1.md` §10 step 5).
+     *
+     * A device of this person's own is never in their contact list and never
+     * will be, so before this it was refused exactly like a stranger -- which is
+     * why a removed phone could sit on the same Wi-Fi as the phone that removed
+     * it and never be told. It is kept now, with no user id, so nothing treats
+     * it as a peer.
+     */
+    @Test
+    fun `a device of our own is neither a contact nor a stranger`() {
+        val own = contact(1, 7)
+        val friend = contact(2, 8)
+        val stranger = ByteArray(32) { 9 }
+        val contacts = listOf(friend)
+
+        // A friend: a user id, and everything that follows from having one.
+        assertArrayEquals(friend.userId, trustedLanPeerUserId(contacts, friend.agreePk))
+        // Our own device: no user id from the contact list, and the own-key
+        // test is what stops the link being closed as a stranger's.
+        assertNull(trustedLanPeerUserId(contacts, own.agreePk))
+        assertTrue(ownLanStaticKeyMatches(own.agreePk, own.agreePk.copyOf()))
+        // A stranger: neither, and still refused.
+        assertNull(trustedLanPeerUserId(contacts, stranger))
+        assertTrue(!ownLanStaticKeyMatches(own.agreePk, stranger))
+    }
+
     @Test
     fun `own-id HELLO records a clone only when the session key is ours`() {
         val own = contact(1, 7)

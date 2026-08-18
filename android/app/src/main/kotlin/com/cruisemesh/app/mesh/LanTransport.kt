@@ -71,6 +71,13 @@ internal class LanTransport(
         endpoint: LanManualEndpoint?,
         networkId: String?,
     ) -> Unit,
+    /**
+     * A link whose Noise static key is this identity's own agreement key
+     * (`specs/multi-device-v1.md` §10 step 5). Separate from [onAuthenticated]
+     * because it is deliberately *not* a peer: it has this person's user id,
+     * and a route to this person leads straight back to this phone.
+     */
+    private val onOwnDeviceAuthenticated: (address: String) -> Unit,
     private val onDisconnected: (address: String) -> Unit,
     private val onFrameReceived: (address: String, frame: ByteArray) -> Unit,
 ) {
@@ -882,6 +889,26 @@ internal class LanTransport(
         }
     }
 
+    /**
+     * A link that is nobody's contact: either a device of this person's own,
+     * which is kept, or a stranger, which is refused.
+     *
+     * Before §10 step 5 both ended the same way -- "not an accepted contact",
+     * socket closed -- and that is exactly what left a removed phone sitting on
+     * the same Wi-Fi as the phone that removed it with no way to be told. This
+     * person's own agreement key is the one thing that tells the two apart, and
+     * only a device holding this person's own secret can present it.
+     *
+     * Returning null means "kept, with no user id", which everything downstream
+     * reads as "not a peer": no route, no contact bookkeeping, no counters.
+     */
+    private fun acceptOwnDeviceOrRefuse(remoteStaticKey: ByteArray, role: String): ByteArray? {
+        if (!ownLanStaticKeyMatches(identity.agreePk, remoteStaticKey)) {
+            throw IOException("$role is not an accepted contact")
+        }
+        return null
+    }
+
     private fun runConnection(
         socket: Socket,
         initiator: Boolean,
@@ -929,14 +956,15 @@ internal class LanTransport(
                 val remoteStatic = session.remoteStaticKey()
                     ?: throw IOException("LAN responder did not provide a static key")
                 val userId = trustedPeerForStaticKey(remoteStatic)
-                    ?: throw IOException("LAN responder is not an accepted contact")
+                    ?: acceptOwnDeviceOrRefuse(remoteStatic, "LAN responder")
                 if (
+                    userId != null &&
                     expectedUserId != null &&
                     !userId.contentEquals(expectedUserId)
                 ) {
                     throw IOException("LAN responder does not match the BLE endpoint hint")
                 }
-                if (authenticatedUserIds.containsValue(userId.toHex())) {
+                if (userId != null && authenticatedUserIds.containsValue(userId.toHex())) {
                     // Election fallbacks and sweeps may dial a contact that
                     // connected to us in the meantime. Close the redundant
                     // socket before it becomes a second live link -- but a
@@ -958,7 +986,7 @@ internal class LanTransport(
                 val remoteStatic = session.remoteStaticKey()
                     ?: throw IOException("LAN initiator did not provide a static key")
                 trustedPeerForStaticKey(remoteStatic)
-                    ?: throw IOException("LAN initiator is not an accepted contact")
+                    ?: acceptOwnDeviceOrRefuse(remoteStatic, "LAN initiator")
             }
             if (!session.isHandshakeFinished()) {
                 throw IOException("LAN Noise handshake did not finish")
@@ -968,25 +996,32 @@ internal class LanTransport(
             address = "lan:${UUID.randomUUID()}"
             connection = LanConnection(address, socket, output, session)
             connections[address] = connection
-            authenticatedUserIds[address] = trustedUserId.toHex()
-            outboundServiceKey?.let { key ->
-                if (isSingleShotLanConnectKey(key) && advertisedEndpoint != null) {
-                    // A hinted or cached address is dialed once precisely
-                    // because nothing proved it was real. Finishing Noise is
-                    // that proof, so it earns a reconnect target now: a link
-                    // the AP or Doze kills comes back on the backoff timer
-                    // instead of waiting for the next Wi-Fi join. If the
-                    // retry then fails, connectToEndpoints retires the target
-                    // again and the address is back to single-shot.
-                    rememberReconnectTarget(key, listOf(advertisedEndpoint), trustedUserId)
-                } else {
-                    // computeIfPresent keeps this a single atomic step; scan
-                    // and reconnect attempts touch the same key from other
-                    // executor threads and a plain read-modify-write could
-                    // lose a racing update to this reconnect target's
-                    // endpoint list.
-                    reconnectTargets.computeIfPresent(key) { _, target ->
-                        target.copy(expectedUserId = trustedUserId.copyOf())
+            // A device of this person's own is not a peer and is not filed as
+            // one: no user id, so no route, no entry in the counters that say
+            // how many friends are on this Wi-Fi, and nothing keyed to a
+            // contact. It is a link that exists to carry §10 step 5's device
+            // list and the HELLOs that precede it.
+            if (trustedUserId != null) {
+                authenticatedUserIds[address] = trustedUserId.toHex()
+                outboundServiceKey?.let { key ->
+                    if (isSingleShotLanConnectKey(key) && advertisedEndpoint != null) {
+                        // A hinted or cached address is dialed once precisely
+                        // because nothing proved it was real. Finishing Noise is
+                        // that proof, so it earns a reconnect target now: a link
+                        // the AP or Doze kills comes back on the backoff timer
+                        // instead of waiting for the next Wi-Fi join. If the
+                        // retry then fails, connectToEndpoints retires the
+                        // target again and the address is back to single-shot.
+                        rememberReconnectTarget(key, listOf(advertisedEndpoint), trustedUserId)
+                    } else {
+                        // computeIfPresent keeps this a single atomic step; scan
+                        // and reconnect attempts touch the same key from other
+                        // executor threads and a plain read-modify-write could
+                        // lose a racing update to this reconnect target's
+                        // endpoint list.
+                        reconnectTargets.computeIfPresent(key) { _, target ->
+                            target.copy(expectedUserId = trustedUserId.copyOf())
+                        }
                     }
                 }
             }
@@ -996,15 +1031,19 @@ internal class LanTransport(
                     it.port,
                 )
             }
-            onAuthenticated(
-                address,
-                trustedUserId,
-                authenticatedEndpoint,
-                currentNetworkId,
-            )
+            if (trustedUserId != null) {
+                onAuthenticated(
+                    address,
+                    trustedUserId,
+                    authenticatedEndpoint,
+                    currentNetworkId,
+                )
+            } else {
+                onOwnDeviceAuthenticated(address)
+            }
             outboundServiceKey?.let(connectionBackoff::recordSuccess)
             authenticated = true
-            if (outboundServiceKey != null) {
+            if (trustedUserId != null && outboundServiceKey != null) {
                 authenticatedOutboundKeys += outboundServiceKey
                 if (outboundServiceKey.startsWith("scan:")) {
                     // Only an authenticated friend counts as a sweep find --
@@ -1014,7 +1053,14 @@ internal class LanTransport(
                 }
             }
             scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
-            Log.i(TAG, "Authenticated CruiseMesh peer over local Wi-Fi")
+            Log.i(
+                TAG,
+                if (trustedUserId != null) {
+                    "Authenticated CruiseMesh peer over local Wi-Fi"
+                } else {
+                    "Another device of ours is on this Wi-Fi"
+                },
+            )
 
             while (started && !socket.isClosed) {
                 val record = readPacket(input)

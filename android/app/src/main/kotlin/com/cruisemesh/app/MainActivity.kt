@@ -51,6 +51,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.navigation.NavController
+import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -139,6 +140,8 @@ import com.cruisemesh.app.ui.ConnectionDetailsScreen
 import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
 import com.cruisemesh.app.devicelink.AddDeviceScreen
+import com.cruisemesh.app.devicelink.DeviceRemovalStatus
+import com.cruisemesh.app.devicelink.DeviceRemovedScreen
 import com.cruisemesh.app.devicelink.YourDevicesScreen
 import com.cruisemesh.app.ui.DeveloperSettingsScreen
 import com.cruisemesh.app.ui.SettingsScreen
@@ -302,6 +305,26 @@ fun CruiseMeshApp(
         return
     }
 
+    // specs/multi-device-v1.md §10 step 5. Read once at launch, because a device
+    // ejected in a previous process must still know, and watched from there,
+    // because the notice can land while somebody is looking at their chats. The
+    // core stage is the fact; this is the only screen that may be drawn on top
+    // of it, for the reason [DeviceRemovedScreen] states.
+    val deviceRemoved by DeviceRemovalStatus.removed.collectAsState()
+    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { DeviceRemovalStatus.refresh(AppStore.get(context)) }
+    }
+    if (deviceRemoved) {
+        // Core already refuses to advertise, author or ack from this stage and
+        // the service stops itself when the notice lands -- but a service
+        // started before that, or revived by the system since, has to be told
+        // to stay down rather than left running behind a screen that says the
+        // opposite.
+        LaunchedEffect(Unit) { stopMesh(context) }
+        DeviceRemovedScreen()
+        return
+    }
+
     NavHost(
         navController = navController,
         startDestination = if (onboardingCompleted) "home" else "onboarding",
@@ -383,6 +406,26 @@ fun CruiseMeshApp(
                 expectedPersonId = entry.arguments?.getString("person")
                     ?.let { runCatching { UserIdHex.decode(it) }.getOrNull() },
                 onBack = { navController.popOrExit(context) },
+                // A phone that was just adopted holds this person's contacts,
+                // groups and history, so first-run setup has nothing left to
+                // ask it. Popping back instead landed it on the wizard it came
+                // through -- still on step 1, still offering "This is another
+                // of my devices", and still asking a linked person their own
+                // name (two-phone session, 2026-08-18).
+                //
+                // [LinkAdoption] has already made the same fact durable, so
+                // this is the in-memory half plus the navigation. Cleared back
+                // to the graph's start rather than to "onboarding" by name:
+                // the route is also reachable as onboarding -> restore ->
+                // addDevice, and only one of those spellings survives both.
+                onLinked = {
+                    onboardingCompleted = true
+                    navController.navigate("home") {
+                        popUpTo(navController.graph.findStartDestination().id) {
+                            inclusive = true
+                        }
+                    }
+                },
             )
         }
         composable("help") {

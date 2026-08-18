@@ -287,6 +287,11 @@ class LinkSession(
             wire.send(machine.seal(coreLinkActivationAck(device.signSk, import.rosterHead, binding)))
             store.completeLinkActivation(import.rosterHead, now())
             store.ownRoster()?.let { rememberRosterSeen(it) }
+            // Only now, on the far side of the acknowledgement: this phone is a
+            // device of this person, so it takes their name and photo and stops
+            // being a phone that has never been set up. A ceremony that failed
+            // reaches the abandon path below instead and leaves both untouched.
+            LinkAdoption.adopted(appContext, import.profile)
             // Visible from here, radios included.
             LinkVisibility.refresh(store)
 
@@ -414,6 +419,10 @@ class LinkSession(
         // file. 0 = the core's own defaults for head size and lifetime.
         val bootstrap = store.buildLinkBootstrap(
             identity,
+            // The person's own name and photo, so the phone being adopted never
+            // has to ask them who they are (§9.3). Read here, on the device that
+            // has the answer; written on the other side by [LinkAdoption].
+            LinkAdoption.profileOf(appContext),
             update.roster,
             device.signSk,
             binding,
