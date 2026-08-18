@@ -42,7 +42,6 @@ class SettingsUiTest {
                     onYourDevices = {},
                     onConnectionDetails = {},
                     onDeveloperSettings = {},
-                    onYourDevices = {},
                     onBackUp = {},
                     onMeshEnabledChange = {
                         enabled = it
