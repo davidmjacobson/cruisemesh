@@ -137,7 +137,31 @@ internal class LanTransport(
     // still winding down leaves a late per-connection cleanup as a harmless
     // no-op, where a counter would be driven below zero and wedge the gate
     // shut for the life of the process.
+    //
+    // A device of this person's own goes in here too. It is not a contact and
+    // earns no sweep credit, but the key it was dialed at is held for the life
+    // of the link exactly like a contact's, and the automatic-scan gate reads
+    // "outbound keys not yet authenticated" as attempts still in flight.
+    // Leaving it out left that count permanently at one on whichever phone
+    // dialed its sibling, which shut the automatic subnet sweep off for the
+    // life of the link -- so a family member joining that Wi-Fi afterwards was
+    // never swept for.
     private val authenticatedOutboundKeys = ConcurrentHashMap.newKeySet<String>()
+
+    // Addresses of live links admitted as a device of this person's own
+    // (specs/multi-device-v1.md §10 step 5). Capped at one, newest wins.
+    //
+    // Such a link is deliberately never filed under a user id, so the
+    // duplicate-link test that bounds a contact to a single link cannot see it
+    // -- and the device most likely to open several is the one that was just
+    // removed, which still holds this person's agreement key (§10.1 rotates
+    // the inbox key, never the LAN Noise static). Uncapped it could hold every
+    // one of MAX_CONNECTIONS and keep real contacts off this Wi-Fi
+    // indefinitely: the "block" leg of §10's threat model, which refusing the
+    // handshake outright used to close. Newest-wins rather than
+    // refuse-the-newcomer so a half-dead link can never wedge the notice
+    // channel shut.
+    private val ownDeviceLinks = ConcurrentHashMap.newKeySet<String>()
 
     // Consecutive completed sweeps whose verdict was ISOLATION_SUSPECTED. A
     // single congested sweep can look isolated (every probe timing out), so
@@ -909,6 +933,38 @@ internal class LanTransport(
         return null
     }
 
+    /**
+     * Make [address] the one live own-device link, closing any earlier one.
+     *
+     * A contact is bounded to a single link by [authenticatedUserIds]; a device
+     * of this person's own has no user id, so nothing bounded it at all. That
+     * matters because the device most motivated to open several is the one that
+     * was just removed: §10.1 rotates the inbox key, not the LAN Noise static,
+     * so a removed phone -- or a `.cmbak` clone -- still presents the key that
+     * gets admitted here, and every accepted socket holds one of
+     * [MAX_CONNECTIONS]. Filling the table is the "block" leg of §10's threat
+     * model, and it is the one refusing the handshake used to close for free.
+     *
+     * One link is all §10 step 5 needs. The newest wins rather than the oldest
+     * so a half-dead link can never wedge the notice channel shut; closing the
+     * loser lets its own reader thread run the usual teardown (slot released,
+     * router told, address forgotten).
+     */
+    private fun supersedeOtherOwnDeviceLinks(address: String) {
+        val superseded = synchronized(ownDeviceLinks) {
+            val older = supersededOwnDeviceLinks(ownDeviceLinks, address)
+            ownDeviceLinks.clear()
+            ownDeviceLinks += address
+            older
+        }
+        superseded.forEach { older ->
+            connections[older]?.let {
+                Log.i(TAG, "Closing an older link to another device of ours")
+                it.close()
+            }
+        }
+    }
+
     private fun runConnection(
         socket: Socket,
         initiator: Boolean,
@@ -996,6 +1052,7 @@ internal class LanTransport(
             address = "lan:${UUID.randomUUID()}"
             connection = LanConnection(address, socket, output, session)
             connections[address] = connection
+            if (trustedUserId == null) supersedeOtherOwnDeviceLinks(address)
             // A device of this person's own is not a peer and is not filed as
             // one: no user id, so no route, no entry in the counters that say
             // how many friends are on this Wi-Fi, and nothing keyed to a
@@ -1043,9 +1100,15 @@ internal class LanTransport(
             }
             outboundServiceKey?.let(connectionBackoff::recordSuccess)
             authenticated = true
-            if (trustedUserId != null && outboundServiceKey != null) {
+            if (outboundServiceKey != null) {
+                // Every key that reached a finished handshake, contact or own
+                // device alike: the automatic-scan gate reads the outbound keys
+                // NOT in here as attempts still in flight, and an own-device
+                // link holds its key for the whole life of the link. Leaving it
+                // out left that count stuck at one and shut the sweep off for
+                // as long as the two phones stayed linked.
                 authenticatedOutboundKeys += outboundServiceKey
-                if (outboundServiceKey.startsWith("scan:")) {
+                if (trustedUserId != null && outboundServiceKey.startsWith("scan:")) {
                     // Only an authenticated friend counts as a sweep find --
                     // see onScanCompleted. Harmless no-op if the sweep has
                     // already completed or been replaced.
@@ -1098,6 +1161,7 @@ internal class LanTransport(
             address?.let {
                 connections.remove(it, connection)
                 authenticatedUserIds.remove(it)
+                ownDeviceLinks.remove(it)
                 onDisconnected(it)
             }
             sockets.remove(socket)
@@ -1536,6 +1600,7 @@ internal class LanTransport(
         sockets.toList().forEach(Socket::closeQuietly)
         connections.clear()
         authenticatedUserIds.clear()
+        ownDeviceLinks.clear()
         endpointHint = null
         currentNetworkId = null
         ownHostAddresses = null
@@ -1911,6 +1976,23 @@ internal fun pendingLanOutboundAttempts(
     outboundServiceKeys: Set<String>,
     authenticatedOutboundKeys: Set<String>,
 ): Int = outboundServiceKeys.count { it !in authenticatedOutboundKeys }
+
+/**
+ * Which links to a device of this person's own must close when [incoming] is
+ * admitted (`specs/multi-device-v1.md` §10 step 5): every other one, because
+ * one is all the roster notice needs and the socket table has only
+ * `MAX_CONNECTIONS` slots to give.
+ *
+ * The cap is a safety rule, not tidiness. Such a link carries no user id, so
+ * the duplicate-link test that bounds a *contact* to one link cannot see it,
+ * and a removed phone still holds the agreement key that gets admitted here --
+ * §10.1 rotates the inbox key, never the LAN Noise static. Without a cap it
+ * could hold every slot and keep the family's real contacts off this Wi-Fi.
+ */
+internal fun supersededOwnDeviceLinks(
+    liveOwnDeviceLinks: Set<String>,
+    incoming: String,
+): List<String> = liveOwnDeviceLinks.filterNot { it == incoming }
 
 /**
  * The "have I already handled this?" memory the transport keeps for one

@@ -2528,6 +2528,21 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onHello2(address: String, userId: Data, capabilities: UInt32)  -> Bool
     
     /**
+     * A link that proved it belongs to one of THIS person's own devices
+     * (`specs/multi-device-v1.md` §10 step 5), registered so frames can be
+     * written to it and marked so that nothing treats it as a peer.
+     *
+     * Separate from [`Self::on_connected`] because "no user id yet" and "never
+     * a route" are different facts that happen to look alike. The epidemic
+     * fanout floods every link of the first kind — that is what makes gossip
+     * work on a link whose HELLO has not landed — and a device this person
+     * has just removed must not be on the receiving end of that. Nor may it
+     * claim a contact's user id in a HELLO and take over that contact's
+     * route: [`Self::on_hello`] refuses one here.
+     */
+    func onOwnDeviceConnected(address: String, transport: CoreTransport) 
+    
+    /**
      * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
      * asked once for each, for the callers that must hand the whole answer to
      * a plan builder rather than ask envelope by envelope.
@@ -2592,6 +2607,13 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
      * not-yet-identified link. If the source is identified, exclude all of
      * that user's physical routes so a frame cannot echo through its other
      * BLE role or rotated address.
+     *
+     * A link admitted as one of this person's own devices
+     * ([`Self::on_own_device_connected`]) is in neither set. It has no user
+     * id, but it is not *not yet* identified either — it is a carrier for the
+     * §10 step 5 roster notice and nothing else, so flooding it would hand a
+     * device this person may have just removed a live feed of every envelope
+     * this phone sends or relays.
      */
     func relayRoutes(exceptAddress: String?)  -> [CoreTransportRoute]
     
@@ -2824,6 +2846,27 @@ open func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool 
 }
     
     /**
+     * A link that proved it belongs to one of THIS person's own devices
+     * (`specs/multi-device-v1.md` §10 step 5), registered so frames can be
+     * written to it and marked so that nothing treats it as a peer.
+     *
+     * Separate from [`Self::on_connected`] because "no user id yet" and "never
+     * a route" are different facts that happen to look alike. The epidemic
+     * fanout floods every link of the first kind — that is what makes gossip
+     * work on a link whose HELLO has not landed — and a device this person
+     * has just removed must not be on the receiving end of that. Nor may it
+     * claim a contact's user id in a HELLO and take over that contact's
+     * route: [`Self::on_hello`] refuses one here.
+     */
+open func onOwnDeviceConnected(address: String, transport: CoreTransport) {try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_on_own_device_connected(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterTypeCoreTransport.lower(transport),$0
+    )
+}
+}
+    
+    /**
      * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
      * asked once for each, for the callers that must hand the whole answer to
      * a plan builder rather than ask envelope by envelope.
@@ -2923,6 +2966,13 @@ open func recordTargetedCarriedProgress(address: String, next: CoreCarriedCursor
      * not-yet-identified link. If the source is identified, exclude all of
      * that user's physical routes so a frame cannot echo through its other
      * BLE role or rotated address.
+     *
+     * A link admitted as one of this person's own devices
+     * ([`Self::on_own_device_connected`]) is in neither set. It has no user
+     * id, but it is not *not yet* identified either — it is a carrier for the
+     * §10 step 5 roster notice and nothing else, so flooding it would hand a
+     * device this person may have just removed a live feed of every envelope
+     * this phone sends or relays.
      */
 open func relayRoutes(exceptAddress: String?) -> [CoreTransportRoute] {
     return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
@@ -4744,14 +4794,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * phone" device otherwise believes itself linked forever, keeps
      * advertising, and keeps accepting mail.
      *
-     * The notice does not weaken §10's threat model, because it can only be
-     * read *after* the capability is already gone. Step 1 rotates the inbox key
-     * at the moment of removal and step 2 rotates the relay token; both land
-     * before any meeting. So the revoked device learns nothing it can race —
-     * by the time it hears, there is nothing left to run for. And it learns
-     * only from a document signed under the person root and strictly
-     * superseding the one it held, so "you're out" is never a bare hint a
-     * stranger can inject.
+     * A device learns this only from a document signed under the person root
+     * and strictly superseding the one it held, so "you're out" is never a bare
+     * hint a stranger can inject. And it cannot outrun step 1: the inbox key
+     * rotates at the moment of removal, before any meeting, so the fleet's
+     * self-sync channel and its retained backlog are already shut by the time
+     * this runs.
+     *
+     * Step 2 is **not** in that sentence and must not be added to it while it
+     * is unimplemented. Nothing on either shell drives the relay `family_token`
+     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
+     * outside tests — so a removed device still holds a working family relay
+     * credential at the moment this tells it that it is out. That credential
+     * was in its hands all along and the notice grants it nothing new, but
+     * until §10.2 has a driver, "removed" means cut off from the fleet's own
+     * traffic, not cut off from the relay.
      *
      * # What it does, in [`core_roster_accept`]'s vocabulary
      *
@@ -4774,6 +4831,18 @@ public protocol MessageStoreProtocol : AnyObject {
      *
      * [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
      * this path.
+     *
+     * # What this does *not* converge
+     *
+     * The third arm is not a corner case, and the scope it leaves should be
+     * read exactly: **this converges the removed device, not the rest of the
+     * fleet.** [`crate::core_revoke_devices_roster`] always mints a new inbox
+     * key, so every revocation roster announces a rotated generation, so a
+     * *sibling* that was offline at removal time takes the third arm on every
+     * later meeting and keeps the pre-revocation roster — with the removed
+     * device still in its fleet projection — until §10.1's sealed handoff
+     * reaches it. That handoff rides self-sync, which has no shell transport
+     * yet. WP5's gate is written against the removed device for that reason.
      */
     func applyOwnRosterNotice(document: Data, personRootSignPk: Data, ownDeviceId: Data, nowMs: Int64) throws  -> RevocationAdoption
     
@@ -8431,14 +8500,21 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
      * phone" device otherwise believes itself linked forever, keeps
      * advertising, and keeps accepting mail.
      *
-     * The notice does not weaken §10's threat model, because it can only be
-     * read *after* the capability is already gone. Step 1 rotates the inbox key
-     * at the moment of removal and step 2 rotates the relay token; both land
-     * before any meeting. So the revoked device learns nothing it can race —
-     * by the time it hears, there is nothing left to run for. And it learns
-     * only from a document signed under the person root and strictly
-     * superseding the one it held, so "you're out" is never a bare hint a
-     * stranger can inject.
+     * A device learns this only from a document signed under the person root
+     * and strictly superseding the one it held, so "you're out" is never a bare
+     * hint a stranger can inject. And it cannot outrun step 1: the inbox key
+     * rotates at the moment of removal, before any meeting, so the fleet's
+     * self-sync channel and its retained backlog are already shut by the time
+     * this runs.
+     *
+     * Step 2 is **not** in that sentence and must not be added to it while it
+     * is unimplemented. Nothing on either shell drives the relay `family_token`
+     * rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
+     * outside tests — so a removed device still holds a working family relay
+     * credential at the moment this tells it that it is out. That credential
+     * was in its hands all along and the notice grants it nothing new, but
+     * until §10.2 has a driver, "removed" means cut off from the fleet's own
+     * traffic, not cut off from the relay.
      *
      * # What it does, in [`core_roster_accept`]'s vocabulary
      *
@@ -8461,6 +8537,18 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
      *
      * [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
      * this path.
+     *
+     * # What this does *not* converge
+     *
+     * The third arm is not a corner case, and the scope it leaves should be
+     * read exactly: **this converges the removed device, not the rest of the
+     * fleet.** [`crate::core_revoke_devices_roster`] always mints a new inbox
+     * key, so every revocation roster announces a rotated generation, so a
+     * *sibling* that was offline at removal time takes the third arm on every
+     * later meeting and keeps the pre-revocation roster — with the removed
+     * device still in its fleet projection — until §10.1's sealed handoff
+     * reaches it. That handoff rides self-sync, which has no shell transport
+     * yet. WP5's gate is written against the removed device for that reason.
      */
 open func applyOwnRosterNotice(document: Data, personRootSignPk: Data, ownDeviceId: Data, nowMs: Int64)throws  -> RevocationAdoption {
     return try  FfiConverterTypeRevocationAdoption.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -57073,6 +57161,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello2() != 17439) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_own_device_connected() != 30441) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acked_hidden_kinds() != 7435) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57088,7 +57179,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_targeted_carried_progress() != 46713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_relay_routes() != 63158) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_relay_routes() != 61710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_route_for() != 36259) {
@@ -57244,7 +57335,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 49095) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 12212) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_friend_request() != 47501) {

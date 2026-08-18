@@ -1037,11 +1037,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// (`specs/multi-device-v1.md` §10 step 5).
     ///
     /// Registered as a transport so frames can be written to it, and deliberately
-    /// **not** as a route: `MeshRouter.onHello` is never called for it, because
-    /// the user id on the other end is this person's own and a route to this
-    /// person would hand this phone's own mail straight back out. Nothing that
-    /// walks the identified routes — digests, sprays, carry, the nearby list —
-    /// can see this link at all.
+    /// **not** as a route: the user id on the other end is this person's own, and
+    /// a route to this person would hand this phone's own mail straight back out.
+    ///
+    /// Registered through `MeshRouter.onOwnDeviceConnected` rather than
+    /// `MeshRouter.onConnected`, and the difference is load-bearing. Simply
+    /// withholding a user id is not enough: core's epidemic fanout floods every
+    /// *not yet* identified link on purpose, so an unmarked link would receive
+    /// every envelope this phone sends or relays — a live feed for a device the
+    /// person may have just removed. Marked, it is out of the fanout, and a
+    /// HELLO naming a contact cannot win it that contact's route either. What is
+    /// left is exactly what §10 step 5 needs: frames addressed to this one link.
     ///
     /// The HELLO pair goes out for the same reason it does on a peer link: the
     /// capability bits ride HELLO2, and the roster notice is answered from
@@ -1054,7 +1060,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     ///
     /// Mirrors Android's `MeshService.onOwnDeviceLanLink`.
     private func onOwnDeviceLanLink(address: String) {
-        MeshRouter.onConnected(address: address, transport: .lan)
+        MeshRouter.onOwnDeviceConnected(address: address, transport: .lan)
         log.info("Another device of ours authenticated over local Wi-Fi")
         sendHello(address: address)
     }
@@ -1105,12 +1111,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// is wrong. Sent both ways for the same reason, which also settles an
     /// ordinary sibling that is merely behind.
     ///
-    /// Not a tip-off. §10.1's key rotation lands at the moment of removal, long
-    /// before any meeting, so a device only ever hears this once there is nothing
-    /// left for it to race — and it hears it from a document signed under the
-    /// person root, never from a bare hint. Core refuses to hand one out at all
-    /// from a device the gate has silenced, so an ejected phone does not become
-    /// an announcer.
+    /// What it cannot outrun is §10.1's key rotation, which lands at the moment
+    /// of removal, long before any meeting: the fleet's own traffic is already
+    /// shut to that device when this reaches it. And it hears it from a document
+    /// signed under the person root, never from a bare hint. Core refuses to hand
+    /// one out at all from a device the gate has silenced, so an ejected phone
+    /// does not become an announcer.
+    ///
+    /// It is not, however, free of disclosure while §10.2 is unimplemented. No
+    /// shell drives the relay token rotation yet, so this does tell the holder of
+    /// a removed phone the moment they were removed while the shared relay
+    /// credential that phone already had is still live. Recorded rather than
+    /// papered over: the honest fix is shipping §10.2, not withholding the one
+    /// signal that stops an honest phone believing it is still linked.
     ///
     /// Mirrors Android's `MeshService.offerOwnRosterNotice`.
     private func offerOwnRosterNotice(address: String, capabilities: UInt32, identity: Identity) {

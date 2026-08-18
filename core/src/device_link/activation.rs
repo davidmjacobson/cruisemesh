@@ -1304,14 +1304,21 @@ impl MessageStore {
     /// phone" device otherwise believes itself linked forever, keeps
     /// advertising, and keeps accepting mail.
     ///
-    /// The notice does not weaken §10's threat model, because it can only be
-    /// read *after* the capability is already gone. Step 1 rotates the inbox key
-    /// at the moment of removal and step 2 rotates the relay token; both land
-    /// before any meeting. So the revoked device learns nothing it can race —
-    /// by the time it hears, there is nothing left to run for. And it learns
-    /// only from a document signed under the person root and strictly
-    /// superseding the one it held, so "you're out" is never a bare hint a
-    /// stranger can inject.
+    /// A device learns this only from a document signed under the person root
+    /// and strictly superseding the one it held, so "you're out" is never a bare
+    /// hint a stranger can inject. And it cannot outrun step 1: the inbox key
+    /// rotates at the moment of removal, before any meeting, so the fleet's
+    /// self-sync channel and its retained backlog are already shut by the time
+    /// this runs.
+    ///
+    /// Step 2 is **not** in that sentence and must not be added to it while it
+    /// is unimplemented. Nothing on either shell drives the relay `family_token`
+    /// rotation — [`crate::MessageStore::begin_relay_rotation`] has no call site
+    /// outside tests — so a removed device still holds a working family relay
+    /// credential at the moment this tells it that it is out. That credential
+    /// was in its hands all along and the notice grants it nothing new, but
+    /// until §10.2 has a driver, "removed" means cut off from the fleet's own
+    /// traffic, not cut off from the relay.
     ///
     /// # What it does, in [`core_roster_accept`]'s vocabulary
     ///
@@ -1334,6 +1341,18 @@ impl MessageStore {
     ///
     /// [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
     /// this path.
+    ///
+    /// # What this does *not* converge
+    ///
+    /// The third arm is not a corner case, and the scope it leaves should be
+    /// read exactly: **this converges the removed device, not the rest of the
+    /// fleet.** [`crate::core_revoke_devices_roster`] always mints a new inbox
+    /// key, so every revocation roster announces a rotated generation, so a
+    /// *sibling* that was offline at removal time takes the third arm on every
+    /// later meeting and keeps the pre-revocation roster — with the removed
+    /// device still in its fleet projection — until §10.1's sealed handoff
+    /// reaches it. That handoff rides self-sync, which has no shell transport
+    /// yet. WP5's gate is written against the removed device for that reason.
     pub fn apply_own_roster_notice(
         &self,
         document: Vec<u8>,

@@ -720,6 +720,28 @@ final class LanTransport {
         return hosts
     }
 
+    /// Keep `link` as the one live own-device link and close every other.
+    ///
+    /// A contact is bounded to a single link by `hasAuthenticatedLink`; a device
+    /// of this person's own carries no user id, so nothing bounded it at all.
+    /// That matters because the device most motivated to open several is the one
+    /// that was just removed: §10.1 rotates the inbox key, not the LAN Noise
+    /// static, so a removed phone -- or a `.cmbak` clone -- still presents the
+    /// key admitted here, and every link holds one of `maxConnections`. Filling
+    /// the table is the "block" leg of §10's threat model, and refusing the
+    /// handshake used to close it for free.
+    ///
+    /// One link is all §10 step 5 needs, and the newest wins rather than the
+    /// oldest so a half-dead link can never wedge the notice channel shut.
+    private func supersedeOtherOwnDeviceLinks(keeping link: LanConnection) {
+        // Snapshotted: closing a link removes it from `connections`, and the
+        // loop must not be walking the dictionary it is emptying.
+        for other in Array(connections.values) where other !== link && other.isOwnDevice {
+            log.info("Closing an older link to another device of ours")
+            other.close()
+        }
+    }
+
     fileprivate func connectionAuthenticated(_ link: LanConnection, admission: LanAdmission) {
         guard started, connections[link.address] === link else {
             link.close()
@@ -732,6 +754,7 @@ final class LanTransport {
         // that precede it.
         guard case .contact(let userId) = admission else {
             log.info("Another device of ours is on this Wi-Fi")
+            supersedeOtherOwnDeviceLinks(keeping: link)
             onOwnDeviceAuthenticated?(link.address)
             scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
             return
@@ -1208,6 +1231,11 @@ private final class LanConnection {
     /// The accepted contact this link authenticated as, for the transport's
     /// duplicate-link and unlinked-capable-contact checks.
     private(set) var authenticatedUserId: Data?
+    /// True when this link was admitted as a device of this person's own
+    /// (`LanAdmission.ownDevice`). Such a link is never filed under a user id,
+    /// so this flag is the only handle the transport has for capping it --
+    /// see `LanTransport.supersedeOtherOwnDeviceLinks`.
+    private(set) var isOwnDevice = false
     /// The Noise static key the peer proved it holds, captured as the
     /// handshake finishes so it stays readable after the session is closed.
     private(set) var remoteStaticKey: Data?
@@ -1405,6 +1433,7 @@ private final class LanConnection {
         // router's user id for an address -- is asking about a peer, and this
         // link has none.
         if case .contact(let userId) = admission { authenticatedUserId = userId }
+        isOwnDevice = admission == .ownDevice
         remoteStaticKey = noise.remoteStaticKey()
         setupTimeout?.cancel()
         setupTimeout = nil

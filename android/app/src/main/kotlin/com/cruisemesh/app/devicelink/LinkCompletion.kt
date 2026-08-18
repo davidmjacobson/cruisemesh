@@ -8,8 +8,11 @@ import uniffi.cruisemesh_core.CoreLinkRole
  *
  * Both ends of the ceremony share one screen and one "Done" button, and the
  * button is shown for a run that failed as well as one that finished — so the
- * tap alone says nothing about what happened. Getting that wrong is not
- * cosmetic in either direction:
+ * tap alone says nothing about what happened. Neither does the exit taken: the
+ * back arrow and the system back gesture leave the same screen at the same
+ * point, so all three are routed through this one answer rather than letting
+ * two of them quietly mean "not finished". Getting that wrong is not cosmetic
+ * in either direction:
  *
  * * a finished adoption that goes back the way it came lands on the still-live
  *   first-run wizard, which offers "This is another of my devices" again and

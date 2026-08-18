@@ -605,6 +605,51 @@ class LanTransportTest {
         assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
     }
 
+    /**
+     * A link to a device of this person's own holds its outbound service key
+     * for the whole life of the link, exactly like a contact's. It earns no
+     * sweep credit -- it is nobody's friend -- but if it never joins the
+     * authenticated set, the automatic-scan gate counts it as an attempt still
+     * in flight forever, and the phone that dialed its own sibling stops
+     * sweeping this subnet for as long as the two stay linked. A family member
+     * joining that Wi-Fi afterwards would never be found by the fallback.
+     */
+    @Test
+    fun `a link to one of our own devices does not wedge the automatic scan gate`() {
+        val links = OutboundLinks()
+        links.dial("scan:10.0.0.2")
+        assertEquals(1, links.pending())
+        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+
+        // The handshake finished and the peer turned out to be our own phone.
+        links.authenticate("scan:10.0.0.2")
+        assertEquals(0, links.pending())
+        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+    }
+
+    /**
+     * §10 step 5's link is capped at one. A removed phone still holds the
+     * agreement key that admits it -- §10.1 rotates the inbox key, never the
+     * LAN Noise static -- and such a link carries no user id, so the
+     * duplicate-link test that bounds a contact to one link cannot see it.
+     * Uncapped, it could take every socket slot and keep the family's real
+     * contacts off this Wi-Fi.
+     */
+    @Test
+    fun `only one link to our own devices survives`() {
+        // Nothing to close on the first one.
+        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(emptySet(), "lan:1"))
+        // The newest wins, so a half-dead link can never wedge the channel.
+        assertEquals(listOf("lan:1"), supersededOwnDeviceLinks(setOf("lan:1"), "lan:2"))
+        // A device that opened a fistful of sockets keeps exactly one.
+        assertEquals(
+            setOf("lan:1", "lan:2", "lan:3"),
+            supersededOwnDeviceLinks(setOf("lan:1", "lan:2", "lan:3"), "lan:4").toSet(),
+        )
+        // Re-registering the live link is not a reason to close it.
+        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(setOf("lan:1"), "lan:1"))
+    }
+
     @Test
     fun `automatic subnet fallback gate never reads a negative count as busy`() {
         assertTrue(shouldRunAutomaticLanScan(0, -3, 0, 0))

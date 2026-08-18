@@ -29,6 +29,10 @@ final class MeshRouterState {
         core.onConnected(address: address, transport: transport.core)
     }
 
+    func onOwnDeviceConnected(address: String, transport: Transport) {
+        core.onOwnDeviceConnected(address: address, transport: transport.core)
+    }
+
     func onDisconnected(address: String) { core.onDisconnected(address: address) }
 
     @discardableResult

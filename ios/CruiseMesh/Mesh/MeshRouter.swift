@@ -59,6 +59,19 @@ enum MeshRouter {
         state.onConnected(address: address, transport: transport)
     }
 
+    /// A link that proved it belongs to one of *this person's own* devices
+    /// (`specs/multi-device-v1.md` §10 step 5): a transport for the roster
+    /// notice, and never a route.
+    ///
+    /// Distinct from `onConnected` because "no user id yet" and "never a peer"
+    /// are different facts that look alike from here. Core floods every link of
+    /// the first kind — that is what makes gossip work before a HELLO lands —
+    /// and the device still holding this person's agreement key after a removal
+    /// is the device that was removed.
+    static func onOwnDeviceConnected(address: String, transport: MeshRouterState.Transport) {
+        state.onOwnDeviceConnected(address: address, transport: transport)
+    }
+
     static func onDisconnected(address: String) {
         state.onDisconnected(address: address)
     }

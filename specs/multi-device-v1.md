@@ -342,12 +342,28 @@ On "Remove device" (approving device) or recovery-code override:
    clears its fleet projection, stops advertising, authoring and acking,
    and surfaces that it was removed.
 
-   This is not a heads-up a revoked device can race. Steps 1 and 2
-   withdraw its capability at the moment of removal, before any meeting;
-   by the time it hears, there is nothing left to run for. And it hears
-   only from a document signed under the person root that strictly
-   supersedes the one it held, so "you're out" is never a bare hint a
-   stranger can inject or a fork can fake.
+   It hears only from a document signed under the person root that
+   strictly supersedes the one it held, so "you're out" is never a bare
+   hint a stranger can inject or a fork can fake. What it cannot race is
+   step 1: the inbox key rotates at the moment of removal, before any
+   meeting, so the fleet's self-sync channel and retained backlog are
+   already shut when the notice arrives.
+
+   **Step 2 is a different matter, and the notice must not be described
+   as though it had landed.** Nothing on either shell drives the relay
+   `family_token` rotation today — no call site reaches
+   `begin_relay_rotation` — so a removed device keeps a working family
+   relay credential until §10.2 has a driver (or WP8 replaces it with
+   per-device capabilities). The notice therefore does tell the holder of
+   that phone the exact moment they were removed, while that credential
+   is still live. It grants no new capability: the token was in that
+   phone's hands the whole time, and burning it needs no invitation. But
+   until step 2 ships, "removed" means "cut off from the fleet's own
+   traffic", not "cut off from the relay", and nothing — spec, doc
+   comment or confirm copy — may promise the second. The removal
+   confirmation deliberately promises only what step 1 and step 5
+   deliver: the device stops staying in step with the others, and stands
+   down the next time it meets one.
 
 Notes on step 3, recorded so the guarantee is not read as stronger than
 it is (WP5):
@@ -398,6 +414,17 @@ Notes on step 5, for the same reason:
   not adopt it — there would be no key to open the fleet's traffic with.
   Step 1's sealed handoff is what carries that; the notice reports the
   gap instead of half-applying it.
+
+  Read the consequence plainly: **step 5 converges the removed device,
+  not the rest of the fleet.** Every removal mints a new inbox key, so
+  every removal roster announces a rotated generation, so a *sibling*
+  that was offline when the removal happened hits exactly this arm and
+  keeps the pre-revocation roster — and with it the removed device's
+  `device_id` in its own fleet projection — until §10.1's sealed handoff
+  reaches it. That handoff has no shell transport yet (it rides
+  self-sync), so today it does not reach it at all. WP5's gate is
+  written against the removed device for that reason, and a fleet-wide
+  convergence claim would be false.
 - **The stage is terminal.** A device that has ejected itself is not in a
   window that closes: DL-4 buries its `device_id` forever, so the only
   way back is a fresh install under a fresh device key. The §9.4 gate

@@ -24,6 +24,8 @@ class MeshRouterState {
 
     fun setLocalUserId(userId: ByteArray) = core.setLocalUserId(userId)
     fun onConnected(address: String, transport: Transport) = core.onConnected(address, transport.toCore())
+    fun onOwnDeviceConnected(address: String, transport: Transport) =
+        core.onOwnDeviceConnected(address, transport.toCore())
     fun onDisconnected(address: String) = core.onDisconnected(address)
     fun onHello(address: String, userId: ByteArray): Boolean = core.onHello(address, userId)
     fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
