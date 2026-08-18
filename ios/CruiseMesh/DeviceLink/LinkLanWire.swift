@@ -196,9 +196,9 @@ final class LinkLanListener {
             throw LinkWireError.transport("could not listen for the other device (errno \(errno))")
         }
 
-        var bound = sockaddr_in()
+        var boundAddress = sockaddr_in()
         var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let named = withUnsafeMutablePointer(to: &bound) { pointer in
+        let named = withUnsafeMutablePointer(to: &boundAddress) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { raw in
                 getsockname(fd, raw, &length)
             }
@@ -207,7 +207,7 @@ final class LinkLanListener {
             _ = Darwin.close(fd)
             throw LinkWireError.transport("could not read the link socket's port (errno \(errno))")
         }
-        return LinkLanListener(fd: fd, port: UInt16(bigEndian: bound.sin_port))
+        return LinkLanListener(fd: fd, port: UInt16(bigEndian: boundAddress.sin_port))
     }
 
     /// Wait for the approving device to connect, or return nil if nobody came
