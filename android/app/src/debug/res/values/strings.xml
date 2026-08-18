@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only launcher label so the side-by-side debug install (package
+     com.cruisemesh.app.debug) is distinguishable from the Play build. -->
+<resources>
+    <string name="app_name">CruiseMesh Dev</string>
+</resources>

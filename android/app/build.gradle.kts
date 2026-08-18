@@ -93,6 +93,18 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Distinct package so a debug build can sit NEXT TO the Play
+            // install on the same phone instead of demanding an uninstall
+            // (debug/release signatures can never upgrade over each other).
+            // Everything runtime derives the package dynamically
+            // (${applicationId} in the manifest, context.packageName in
+            // code), so this is safe; adb tooling must target
+            // com.cruisemesh.app.debug and the fully qualified activity
+            // class (the Kotlin package does NOT gain the suffix).
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
