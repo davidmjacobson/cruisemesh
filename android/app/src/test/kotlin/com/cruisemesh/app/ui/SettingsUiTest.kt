@@ -41,6 +41,7 @@ class SettingsUiTest {
                     onSailChecklist = {},
                     onConnectionDetails = {},
                     onDeveloperSettings = {},
+                    onYourDevices = {},
                     onBackUp = {},
                     onMeshEnabledChange = {
                         enabled = it

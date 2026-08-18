@@ -36,6 +36,7 @@ import com.cruisemesh.app.chat.ChatEvents
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.devicelink.LinkRadioPlan
+import com.cruisemesh.app.devicelink.RosterGossipSender
 import com.cruisemesh.app.devicelink.LinkRadioStep
 import com.cruisemesh.app.devicelink.LinkVisibility
 import com.cruisemesh.app.identity.IdentityStore
@@ -907,6 +908,18 @@ class MeshService : Service() {
         peripheral.start()
         central.start()
         meshRolesRunning = true
+        // DL-3's third trigger, and the only one that works with no internet at
+        // all. The relay pass fires the same idempotent call, but a person who
+        // adds a friend on a ship with no Wi-Fi and no pass never reaches a
+        // relay pass -- and the friend they just made would never learn which
+        // devices they have. The envelopes this queues ride BLE, LAN and carry
+        // like any other sealed mail. On the install that has never linked a
+        // device, which is nearly the whole fleet, it reads one row and returns.
+        identity?.let { signedInAs ->
+            runCatching {
+                RosterGossipSender.announceIfOwed(AppStore.get(applicationContext), signedInAs)
+            }.onFailure { Log.w(TAG, "could not announce this device list on mesh start", it) }
+        }
         refreshRuntimeState()
         refreshForegroundNotification()
     }
@@ -2296,22 +2309,22 @@ class MeshService : Service() {
             val queuedByLamport = store
                 .outboundEnvelopesAfter(contact.userId, identity.userId, peerHasThrough)
                 .associateBy { it.lamport }
-            // Same once-per-session bound as the core spray plan: a peer
-            // without CAP_ACKS_HIDDEN_KINDS never advances its DELIVERED
-            // watermark past hidden kinds, so this direct re-offer would
-            // repeat them on every digest for the full expiry.
-            val gateHidden = !MeshRouter.peerAcksHiddenKinds(address)
-            val alreadyOffered = if (gateHidden) {
+            // Same once-per-session bound as the core spray plan, and asked
+            // the same way -- per kind. A peer that lacks the bit for a kind
+            // never advances its DELIVERED watermark past that kind, so this
+            // direct re-offer would repeat it on every digest for the full
+            // expiry; a kind the peer does advertise is untouched.
+            val alreadyOffered =
                 MeshRouter.hiddenOfferedFor(address).mapTo(mutableSetOf(), UserIdHex::encode)
-            } else {
-                mutableSetOf()
-            }
             val newlyOffered = mutableListOf<ByteArray>()
             val missing = store.messagesAfter(contact.userId, identity.userId, peerHasThrough)
             for (message in missing) {
                 val outbound = queuedByLamport[message.lamport] ?: backfillOutboundAuthoredEnvelope(identity, contact, message)
                 if (outbound != null) {
-                    if (gateHidden && coreIsHiddenSprayKind(outbound.kind)) {
+                    if (
+                        coreIsHiddenSprayKind(outbound.kind) &&
+                        !MeshRouter.peerAcksHiddenKind(address, outbound.kind)
+                    ) {
                         if (UserIdHex.encode(outbound.msgId) in alreadyOffered) continue
                         newlyOffered += outbound.msgId
                     }

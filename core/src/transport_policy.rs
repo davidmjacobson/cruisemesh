@@ -741,28 +741,47 @@ impl CoreMeshRouterState {
         true
     }
 
-    /// Whether this peer advertised every capability bit that covers a
-    /// hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
-    /// `false` for pre-HELLO2 builds — they process hidden kinds fine but
-    /// never advance their DELIVERED watermark past them, so re-sprays toward
-    /// them are bounded to once per session instead of every digest.
+    /// Whether this peer's DELIVERED watermark can be trusted to advance past
+    /// *this one* hidden spray kind — the bit for the kind
+    /// ([`crate::protocol::hidden_ack_capability`]), and only that bit.
     ///
-    /// T23 made this an *all* bits test rather than a single-bit one. A build
-    /// that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
-    /// still drops a relay-change notice unhandled, so bit 1 alone no longer
-    /// answers "will this peer's watermark advance past every hidden kind I
-    /// might spray". Treating such a peer as not-fully-capable costs it the
-    /// once-per-session bound on kinds 3/5/6/7 too — the same conservative
-    /// path a pre-HELLO2 peer already takes, and the safe direction to err in:
-    /// the envelope is still offered on every fresh link session, and the
-    /// direct and relay paths are untouched.
-    pub fn peer_acks_hidden_kinds(&self, address: String) -> bool {
-        let required = crate::protocol::CAP_ACKS_HIDDEN_KINDS | crate::protocol::CAP_RELAY_UPDATE;
+    /// `false` for pre-HELLO2 builds, which advertise nothing at all: they
+    /// process hidden kinds fine but never move their watermark past them, so
+    /// re-sprays toward them are bounded to once per link session instead of
+    /// once per digest. `true` for any kind that is not a hidden spray kind,
+    /// which every build stores and acks the ordinary way.
+    ///
+    /// Asked per kind rather than as one all-or-nothing mask. T23 wrote the
+    /// mask version because bit 1 alone could not answer "will this peer ack
+    /// kind 9", and that was right — but the fix belongs on the kind, not on
+    /// the peer. Under a mask, adding [`crate::protocol::CAP_ROSTER_GOSSIP`]
+    /// makes every phone in today's fleet read as not-capable and demotes the
+    /// five kinds it *does* ack honestly, on every link, until the whole fleet
+    /// updates. Under this test the deployed fleet's advertisements keep
+    /// meaning what they meant: friend requests, profile syncs, directories and
+    /// relay-change notices stay on the watermark, and only a gossiped roster
+    /// takes the conservative once-per-session path toward a build that
+    /// predates kind 21. The envelope is still offered on every fresh link
+    /// session either way, and the direct and relay paths are untouched.
+    pub fn peer_acks_hidden_kind(&self, address: String, kind: u8) -> bool {
+        let Some(required) = crate::protocol::hidden_ack_capability(kind) else {
+            return true;
+        };
         self.peers
             .lock_recoverable()
             .get(&address)
             .and_then(|peer| peer.capabilities)
             .is_some_and(|caps| caps & required == required)
+    }
+
+    /// Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
+    /// asked once for each, for the callers that must hand the whole answer to
+    /// a plan builder rather than ask envelope by envelope.
+    pub fn peer_acked_hidden_kinds(&self, address: String) -> Vec<u8> {
+        crate::protocol::HIDDEN_SPRAY_KINDS
+            .into_iter()
+            .filter(|kind| self.peer_acks_hidden_kind(address.clone(), *kind))
+            .collect()
     }
 
     pub fn hidden_offered_for(&self, address: String) -> Vec<Vec<u8>> {
@@ -1642,9 +1661,11 @@ mod tests {
         let router = CoreMeshRouterState::new();
         router.on_connected("ble".into(), CoreTransport::Central);
 
-        // Pre-HELLO2 peer: no capabilities recorded, not hidden-kind capable.
+        // Pre-HELLO2 peer: no capabilities recorded, so no hidden kind at all.
         assert!(router.on_hello("ble".into(), vec![1; 16]));
-        assert!(!router.peer_acks_hidden_kinds("ble".into()));
+        assert!(router.peer_acked_hidden_kinds("ble".into()).is_empty());
+        // A kind that is not a hidden spray kind needs no bit from anyone.
+        assert!(router.peer_acks_hidden_kind("ble".into(), crate::KIND_TEXT));
 
         // Offers recorded for the session are returned...
         router.record_hidden_offered("ble".into(), vec![vec![9; 16]]);
@@ -1654,15 +1675,37 @@ mod tests {
         assert!(router.on_hello("ble".into(), vec![1; 16]));
         assert!(router.hidden_offered_for("ble".into()).is_empty());
 
-        // T23: a peer that advertises only the pre-kind-9 bit is truthful
-        // about kinds 3/5/6/7 but still drops a relay-change notice, so it no
-        // longer counts as fully hidden-kind capable.
+        // A peer that advertises only the pre-kind-9 bit is truthful about
+        // kinds 3/5/6/7 and is trusted for exactly those; it still drops a
+        // relay-change notice, so kind 9 is not trusted.
         assert!(router.on_hello2(
             "ble".into(),
             vec![1; 16],
             crate::protocol::CAP_ACKS_HIDDEN_KINDS
         ));
-        assert!(!router.peer_acks_hidden_kinds("ble".into()));
+        assert!(router.peer_acks_hidden_kind("ble".into(), crate::KIND_FRIEND_REQUEST));
+        assert!(!router.peer_acks_hidden_kind("ble".into(), crate::KIND_RELAY_UPDATE));
+        assert!(!router.peer_acks_hidden_kind("ble".into(), crate::KIND_ROSTER_GOSSIP));
+
+        // **The deployed fleet.** Today's phones advertise the two older bits
+        // and mean them; they have never heard of kind 21. They must keep the
+        // watermark for everything they really do ack, and take the
+        // once-per-session bound on the gossiped roster alone.
+        let legacy = crate::protocol::CAP_ACKS_HIDDEN_KINDS
+            | crate::protocol::CAP_RELAY_UPDATE
+            | crate::protocol::CAP_MULTI_DEVICE;
+        assert!(router.on_hello2("ble".into(), vec![1; 16], legacy));
+        assert_eq!(
+            router.peer_acked_hidden_kinds("ble".into()),
+            vec![
+                crate::KIND_FRIEND_REQUEST,
+                crate::KIND_PROFILE_SYNC,
+                crate::KIND_FRIEND_DIRECTORY,
+                crate::KIND_INTRODUCED_FRIEND_REQUEST,
+                crate::KIND_RELAY_UPDATE,
+            ]
+        );
+        assert!(!router.peer_acks_hidden_kind("ble".into(), crate::KIND_ROSTER_GOSSIP));
 
         // HELLO2 sets capabilities; identity consistency still enforced.
         assert!(router.on_hello2(
@@ -1670,7 +1713,10 @@ mod tests {
             vec![1; 16],
             crate::protocol::core_own_capabilities()
         ));
-        assert!(router.peer_acks_hidden_kinds("ble".into()));
+        assert_eq!(
+            router.peer_acked_hidden_kinds("ble".into()).len(),
+            crate::protocol::HIDDEN_SPRAY_KINDS.len()
+        );
         // WPT: unknown capability bits (including reserved CAP_MULTI_DEVICE)
         // are stored, not rejected. Known-bit checks still see the bits they
         // care about.
@@ -1678,13 +1724,16 @@ mod tests {
             | crate::protocol::CAP_MULTI_DEVICE
             | (1 << 31);
         assert!(router.on_hello2("ble".into(), vec![1; 16], future_caps));
-        assert!(router.peer_acks_hidden_kinds("ble".into()));
+        assert_eq!(
+            router.peer_acked_hidden_kinds("ble".into()).len(),
+            crate::protocol::HIDDEN_SPRAY_KINDS.len()
+        );
         assert!(!router.on_hello2("ble".into(), vec![2; 16], 1));
 
         // Disconnect drops the whole peer record, offers included.
         router.on_disconnected("ble".into());
         assert!(router.hidden_offered_for("ble".into()).is_empty());
-        assert!(!router.peer_acks_hidden_kinds("ble".into()));
+        assert!(router.peer_acked_hidden_kinds("ble".into()).is_empty());
     }
 
     #[test]

@@ -143,6 +143,23 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 }
 
+                // specs/multi-device-v1.md §13 WP6. Next to Backup on purpose: a
+                // person opening Settings after losing a phone is looking for one
+                // of these two, and which one they need depends on whether the
+                // phone is gone or merely lost.
+                Section("Your devices") {
+                    NavigationLink {
+                        YourDevicesView(identity: identity)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Your devices")
+                            Text("The phones and tablets signed in as you.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 Section("Backup") {
                     NavigationLink {
                         BackupExportView()

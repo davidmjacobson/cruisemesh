@@ -54,6 +54,11 @@ struct ChatView: View {
     /// rather than on every connectivity tick.
     @State private var addedNearby = false
     @State private var identityCloneWarning = false
+    /// §10.4: this contact's devices changed under them and nobody has told them
+    /// so yet. Read here rather than on a settings screen, for exactly the reason
+    /// `IdentityCloneNotice` gives — the moment that matters is the moment before
+    /// somebody types.
+    @State private var safetyFact: ContactSafetyFact?
 
     private let store = AppStore.get()
     private var sender: RealMeshSender { RealMeshSender(store: store, identity: identity) }
@@ -227,6 +232,14 @@ struct ChatView: View {
 
             if identityCloneWarning {
                 IdentityCloneNotice()
+            }
+            if let safetyFact {
+                ContactSafetyNotice(
+                    fact: safetyFact,
+                    contactName: resolvedName,
+                    onAcknowledge: { acknowledgeSafety(safetyFact) },
+                    onCheckedOutOfBand: { clearSafetyQuarantine(safetyFact) }
+                )
             }
             ComposerReachNotice(reach: composerReachVerdict, contactName: resolvedName)
 
@@ -505,6 +518,29 @@ struct ChatView: View {
         let provenance = try? store.getContactProvenance(userId: contact.userId)
         addedNearby = provenance?.addedNearby ?? false
         identityCloneWarning = (try? store.hasIdentityCloneWarning(userId: contact.userId)) ?? false
+        safetyFact = latestSafetyFact(
+            facts: (try? store.contactSafetyFacts(includeAcknowledged: false)) ?? [],
+            personUserId: contact.userId
+        )
+    }
+
+    /// Put §10.4's banner away. Acknowledging through `observedSeq` acknowledges
+    /// everything at or below it, so a person who dismisses the banner is not
+    /// handed the same contact's older news afterwards.
+    private func acknowledgeSafety(_ fact: ContactSafetyFact) {
+        _ = try? store.acknowledgeContactSafetyFacts(
+            personUserId: fact.personUserId,
+            throughObservedSeq: fact.observedSeq
+        )
+        safetyFact = nil
+    }
+
+    /// DL-2's fork resolution: a person who re-verified out of band says so, and
+    /// core stops quarantining this contact's device list. Never resolved by
+    /// arithmetic — there is no path to this call that is not a tap.
+    private func clearSafetyQuarantine(_ fact: ContactSafetyFact) {
+        _ = try? store.clearRosterQuarantine(personUserId: fact.personUserId)
+        acknowledgeSafety(fact)
     }
 
     private func sendVoice(url: URL, durationMs: Int32) {
@@ -740,6 +776,19 @@ private struct MessageBubbleView: View {
     @State private var showLegend = false
     @State private var showInfo = false
 
+    /// The contact's devices, in their own list's order, read only when the info
+    /// sheet is built. Two store reads per opened sheet and none per bubble.
+    private var contactActiveDeviceIds: [Data] {
+        (try? AppStore.get().contactActiveDeviceIds(personUserId: message.chatId)) ?? []
+    }
+
+    private var contactDeviceState: ContactDeviceState {
+        (try? AppStore.get().contactDeviceState(
+            personUserId: message.chatId,
+            deviceId: message.senderDeviceId
+        )) ?? .unknown
+    }
+
     var body: some View {
         let outboundExpiry = isOwn
             ? ((try? AppStore.get().outboundMessageExpiry(
@@ -869,6 +918,21 @@ private struct MessageBubbleView: View {
                 )),
                 deliveredViaRoute: isOwn ? deliveryConfirmationRoute(for: message) : nil,
                 outboundExpiryMs: outboundExpiry
+            ) + deviceInfoRows(
+                // §8: per-device detail lives here, on the info sheet, and nowhere
+                // a person reaches without asking for it. The ticks above stay
+                // any-device, which is the whole promise that a contact's device
+                // count is invisible. `chatId` is the contact's user id in a 1:1
+                // chat, which is the only kind of chat this bubble is used in.
+                messageDeviceInfoLines(
+                    isOwn: isOwn,
+                    label: deviceLabelFor(
+                        senderDeviceId: message.senderDeviceId,
+                        activeDeviceIds: contactActiveDeviceIds,
+                        state: contactDeviceState
+                    ),
+                    contactDeviceCount: contactActiveDeviceIds.count
+                )
             ))
         }
     }
@@ -1100,6 +1164,39 @@ func messageInfoRows(
     }
 
     return rows
+}
+
+/// `messageDeviceInfoLines`'s output as sheet rows.
+///
+/// Kept apart from `messageInfoRows` so the mapping stays a pure function of core
+/// facts with no store reads in it, and so the words live beside every other
+/// thing a family reads. Mirrors Android's `deviceInfoRows`.
+func deviceInfoRows(_ lines: [DeviceInfoLine]) -> [MessageInfoRow] {
+    lines.map { line in
+        switch line {
+        case .sentFrom(let label):
+            return .labeled(label: String(localized: "Sent from"), value: deviceLabelText(label))
+        case .addressedTo(let deviceCount):
+            return .sentence(
+                String(localized: "Ticks mean any one of their \(deviceCount) devices got it.")
+            )
+        case .noDeviceDetail:
+            return .sentence(
+                String(localized: "This contact has not told this phone which devices they use.")
+            )
+        }
+    }
+}
+
+func deviceLabelText(_ label: DeviceLabel) -> String {
+    switch label {
+    case .numbered(let position):
+        return String(localized: "Their device \(position)")
+    case .removed:
+        return String(localized: "A device they have removed")
+    case .unknown:
+        return String(localized: "A device this phone does not know")
+    }
 }
 
 func groupMessageInfoRows(

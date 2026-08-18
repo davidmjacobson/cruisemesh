@@ -12,6 +12,11 @@ enum ProtocolKind {
     static let attachmentManifest: UInt8 = 16
     static let reaction: UInt8 = 18
     static let groupMetadataUpdate: UInt8 = 19
+
+    /// DL-3's carrier (`specs/multi-device-v1.md` §4, §9 step 5, §10.1's contact
+    /// leg): a person's own device list, sealed pairwise to one contact. Mirrors
+    /// core's `KIND_ROSTER_GOSSIP` and Android's `KIND_ROSTER_GOSSIP`.
+    static let rosterGossip: UInt8 = 21
 }
 
 enum ReceiptType {

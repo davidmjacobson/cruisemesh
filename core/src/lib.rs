@@ -39,6 +39,7 @@ mod relay_setup;
 mod relay_status;
 mod relay_wire;
 mod revocation;
+mod roster_gossip;
 mod roster_store;
 mod sail_checklist;
 mod semantic;
@@ -200,13 +201,13 @@ pub use protocol::{
     FriendDirectoryContent, FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket,
     LanEndpointContent, MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent,
     SuggestedFriendCard, CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_RELAY_UPDATE,
-    DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, KIND_ATTACHMENT_CHUNK,
-    KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST, KIND_GROUP_INVITE,
-    KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT,
-    KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_SYNC_CONTACTS,
-    KIND_SYNC_DIGEST, KIND_SYNC_GROUPS, KIND_SYNC_HISTORY, KIND_SYNC_OWN_ROSTER,
-    KIND_SYNC_SETTINGS, KIND_SYNC_WATERMARK, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
-    RECEIPT_TYPE_READ,
+    CAP_ROSTER_GOSSIP, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, HIDDEN_SPRAY_KINDS,
+    KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
+    KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE,
+    KIND_ROSTER_GOSSIP, KIND_SYNC_CONTACTS, KIND_SYNC_DIGEST, KIND_SYNC_GROUPS, KIND_SYNC_HISTORY,
+    KIND_SYNC_OWN_ROSTER, KIND_SYNC_SETTINGS, KIND_SYNC_WATERMARK, KIND_TEXT, MS_PER_DAY,
+    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 // Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
 // below: no shell composes an event. Core decision points emit them and the
@@ -261,6 +262,7 @@ pub use revocation::{
     PendingRevocation, RevocationAdoption, RevocationAdoptionOutcome, RevocationCommit,
     RevocationHandoff, RevocationPath, RevocationUpdate,
 };
+pub use roster_gossip::RosterGossipAnnouncement;
 pub use roster_store::{ContactDeviceState, ContactRosterState};
 pub use sail_checklist::{
     core_sail_checklist, CoreSailChecklistInput, CoreSailChecklistItem, CoreSailChecklistItemId,

@@ -57,10 +57,14 @@
 //! Everything older than the head arrives later as WP4 self-sync catch-up;
 //! [`bootstrap::core_link_catch_up_plan`] is that seam, marked and stubbed.
 //!
-//! What is NOT here, and is felt from the moment a link completes: §9 step 5's
-//! gossip of the new roster to the person's CONTACTS. WP4 owns the carrier and
-//! WP5 the notification. See [`activation::MessageStore::complete_link_activation`]
-//! and `MD-ROSTER-GOSSIP-TO-CONTACTS` for what it costs meanwhile.
+//! §9 step 5 — gossiping the new roster to the person's CONTACTS — is not in
+//! this module either, and used to be missing outright. WP6 built it as
+//! [`crate::KIND_ROSTER_GOSSIP`] and
+//! [`crate::MessageStore::announce_own_roster`]: one sealed copy per contact
+//! owed the current head, idempotent, so a completed link is a *moment to call
+//! it* rather than a send path of its own. See
+//! [`activation::MessageStore::complete_link_activation`] for where that call
+//! belongs.
 //!
 //! # Dormancy notes: what later work packages must land, and what is untrue
 //! # until they do
@@ -95,16 +99,22 @@
 //!   path, the relay rotation authority) is correct code resting on a premise
 //!   with a dated expiry, and this is that date.
 //!
-//! * **`MD-ROSTER-GOSSIP-TO-CONTACTS` (owed by WP6).** §10.1's contact leg
-//!   produces the sealed document and the exact recipient list
+//! * **`MD-ROSTER-GOSSIP-TO-CONTACTS` — CLOSED by WP6.** §10.1's contact leg
+//!   produced the document and the exact recipient list
 //!   ([`crate::RevocationCommit::roster_document`] and `contact_user_ids`) and
-//!   stops there: **there is no envelope kind that carries a roster to a
-//!   contact**, so the leg is data with no carrier. Until WP6 adds one, a
-//!   contact learns of a revocation only if some other path tells them, and
-//!   §10.4's changed-safety-state surface has nothing to fire on. That
-//!   dependency is carried forward deliberately rather than left implicit,
-//!   because every §10 test that "gossips to contacts" is in fact asserting
-//!   about a list and a blob, not about delivery.
+//!   stopped there, because no envelope kind carried a roster to a contact. WP6
+//!   added [`crate::KIND_ROSTER_GOSSIP`] and
+//!   [`crate::MessageStore::announce_own_roster`], so the leg is a delivery
+//!   rather than a plan: a revocation changes the roster head, and the next
+//!   announcement seals the new document once per contact over whichever of the
+//!   four transports reaches them. §10.4's changed-safety-state facts are
+//!   raised by `apply_contact_roster` at the far end, which is what finally
+//!   gives that surface something to fire on.
+//!
+//!   What is still true and worth keeping: the *timing* is propagation, not
+//!   instant. A contact who is out of reach keeps sealing to the roster they
+//!   hold until the document lands, which is §6's accepted window and not a
+//!   defect of the carrier.
 
 pub mod activation;
 pub mod bootstrap;

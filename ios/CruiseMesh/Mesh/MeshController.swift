@@ -75,6 +75,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
 
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
+    /// Set while `applyLinkVisibility` has taken the mesh down for a §9.4
+    /// pre-activation window, so the allow branch restarts only a mesh this
+    /// ceremony stopped.
+    private var linkSilenced = false
     private var lanTransport: LanTransport?
     private let lanHealth = LanHealthTracker()
     private let store = AppStore.get()
@@ -268,6 +272,36 @@ final class MeshController: ObservableObject, @unchecked Sendable {
 
     func setAppForeground(_ foreground: Bool) {
         meshQueue.async { self.setAppForegroundOnMeshQueue(foreground) }
+    }
+
+    /// §9.4's radio silence, applied and then reported back.
+    ///
+    /// A device between "the channel is confirmed" and "the roster head is
+    /// acknowledged" may not advertise anything, and core cannot enforce that for
+    /// radios it has never heard of. `LinkVisibility` reads the gate; this is the
+    /// hand that turns them off, and `completion` is how the ceremony learns the
+    /// silence is real rather than merely requested.
+    ///
+    /// The whole controller goes down rather than only the two radios, because
+    /// the BLE transport and the LAN transport are built together in
+    /// `startOnMeshQueue` and there is no seam that stops one and keeps the rest.
+    /// That is strictly more silence than §9.4 asks for, which is the safe
+    /// direction — §9.4 forbids acking and authoring over the relay in the same
+    /// breath. `linkSilenced` is what keeps the allow branch from *starting* a
+    /// mesh the person had switched off themselves.
+    func applyLinkVisibility(_ allowed: Bool, completion: @escaping () -> Void) {
+        meshQueue.async {
+            if allowed {
+                if self.linkSilenced {
+                    self.linkSilenced = false
+                    self.startOnMeshQueue()
+                }
+            } else if self.isRunning {
+                self.linkSilenced = true
+                self.stopOnMeshQueue()
+            }
+            completion()
+        }
     }
 
     /// The contact list changed (a contact was deleted, blocked, or
@@ -521,6 +555,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         registerBluetoothAudioObserver()
         startRelayLoop()
         startMeshRoles()
+        // §9.4, for the phone that was killed mid-ceremony: core still refuses
+        // everything it holds, and this is what stops the radios disagreeing
+        // with it. Asked here rather than only from `LinkSession` because a
+        // process that died inside the pre-activation window comes back with the
+        // window still open and no ceremony left to ask on its behalf. Costs one
+        // gate read per mesh start and changes nothing on the overwhelming
+        // majority of installs, which have never linked a device. Mirrors
+        // Android's `MeshService`, which refreshes at start and on its tick.
+        LinkVisibility.refresh(store: store)
         refreshBluetoothAudioState(reason: "mesh start")
         let nearby = MeshRouter.connectedUserCount()
         onMain { MeshRuntimeStatus.shared.markMeshing(nearby: nearby) }
@@ -667,6 +710,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard !meshRolesRunning else { return }
         transport.start()
         meshRolesRunning = true
+        // DL-3's third trigger, and the only one that works with no internet at
+        // all. The relay pass fires the same idempotent call, but a person who
+        // adds a friend on a ship with no Wi-Fi and no pass never reaches a relay
+        // pass — and the friend they just made would never learn which devices
+        // they have. The envelopes this queues ride BLE, LAN and carry like any
+        // other sealed mail. On the install that has never linked a device, which
+        // is nearly the whole fleet, it reads one row and returns. Mirrors
+        // Android's `MeshService.startMeshRoles`.
+        if let identity {
+            RosterGossipSender.announceIfOwed(store: store, identity: identity)
+        }
     }
 
     private func stopMeshRoles() {
@@ -1512,14 +1566,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 afterLamport: peerHasThrough
             )) ?? []
             let byLamport = Dictionary(uniqueKeysWithValues: queued.map { ($0.lamport, $0) })
-            // Same once-per-session bound as the core spray plan: a peer
-            // without CAP_ACKS_HIDDEN_KINDS never advances its DELIVERED
-            // watermark past hidden kinds, so this direct re-offer would
-            // repeat them on every digest for the full expiry.
-            let gateHidden = !MeshRouter.peerAcksHiddenKinds(address: address)
-            let alreadyOffered = gateHidden
-                ? Set(MeshRouter.hiddenOfferedFor(address: address))
-                : Set<Data>()
+            // Same once-per-session bound as the core spray plan, and asked
+            // the same way -- per kind. A peer that lacks the bit for a kind
+            // never advances its DELIVERED watermark past that kind, so this
+            // direct re-offer would repeat it on every digest for the full
+            // expiry; a kind the peer does advertise is untouched.
+            let alreadyOffered = Set(MeshRouter.hiddenOfferedFor(address: address))
             var newlyOffered: [Data] = []
             let missing = (try? store.messagesAfter(
                 chatId: contact.userId,
@@ -1530,7 +1582,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 let outbound = byLamport[message.lamport]
                     ?? backfillOutbound(identity: identity, contact: contact, message: message)
                 if let outbound {
-                    if gateHidden, coreIsHiddenSprayKind(kind: outbound.kind) {
+                    if coreIsHiddenSprayKind(kind: outbound.kind),
+                       !MeshRouter.peerAcksHiddenKind(address: address, kind: outbound.kind) {
                         if alreadyOffered.contains(outbound.msgId) { continue }
                         newlyOffered.append(outbound.msgId)
                     }
@@ -2227,6 +2280,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 senderUserId: opened.senderUserId,
                 body: body,
                 identity: identity
+            )
+        case ProtocolKind.rosterGossip:
+            try handleIncomingRosterGossip(
+                sourceAddress: sourceAddress,
+                senderUserId: opened.senderUserId,
+                body: body,
+                identity: identity,
+                senderDeviceId: extendedBody.senderDeviceId
             )
         case ProtocolKind.groupInvite:
             try handleIncomingGroupInvite(
@@ -3045,6 +3106,93 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             RelaySyncEvents.requestSync()
             ChatEvents.notifyChatChanged(senderUserId)
         }
+        acknowledgeHiddenMessage(
+            sourceAddress: sourceAddress,
+            senderUserId: senderUserId,
+            identity: identity,
+            contact: contact
+        )
+    }
+
+    /// DL-3's receive side: a contact's own device list, arriving as ordinary
+    /// sealed 1:1 mail (`specs/multi-device-v1.md` §4, §9 step 5, §10.1).
+    ///
+    /// Shaped exactly like `handleIncomingRelayUpdate`, and for the same reasons:
+    /// the hidden row goes in first so this contact's DELIVERED watermark
+    /// advances past a document they would otherwise re-offer for a week, and the
+    /// decision itself is core's single `applyContactRoster` funnel — DL-1
+    /// ordering, DL-2 fork quarantine, DL-4 tombstones and §10.4's
+    /// changed-safety facts, all decided in one place. "Refused" is a recorded
+    /// outcome here, not an error.
+    ///
+    /// # The one check that is duplicated, and when it stops being
+    ///
+    /// `rosterGossipDescribesSender` restates a rule core already enforces in
+    /// `deliver_inbound_body`'s `KIND_ROSTER_GOSSIP` arm
+    /// (`core/src/session/mesh_receive.rs`). It is repeated here only because
+    /// this shell has not yet moved its per-kind delivery onto
+    /// `core_deliver_inbound`; the moment it does, this handler and the check
+    /// with it are deleted, not maintained. Android carries the identical
+    /// mirrored handler, and the two go together.
+    ///
+    /// It cannot simply be dropped in the meantime. `applyContactRoster` takes a
+    /// document and no sender, and verifies it against the person the document
+    /// names — so without this, a contact could hand us a *genuine* roster about
+    /// a third party, and a stale one at that. A stale roster is exactly the
+    /// document that still vouches for a device its person has since buried.
+    private func handleIncomingRosterGossip(
+        sourceAddress: String?,
+        senderUserId: Data,
+        body: MessageBody,
+        identity: Identity,
+        senderDeviceId: Data?
+    ) throws {
+        guard let contact = try? store.getContact(userId: senderUserId) else {
+            log.info("Dropping device list from \(sourceAddress ?? "a relay copy", privacy: .public): sender is not a contact")
+            return
+        }
+        guard let roster = try? coreDecodeRoster(bytes: body.content) else {
+            log.warning("Dropping device list: it could not be read")
+            return
+        }
+        guard rosterGossipDescribesSender(
+            rosterPersonId: roster.personId,
+            senderUserId: senderUserId
+        ) else {
+            log.warning("Dropping device list: it is not about the sender")
+            return
+        }
+        // The row is filed so this contact's DELIVERED watermark advances past
+        // the document. A duplicate row is *not* a reason to skip the apply
+        // below: `applyContactRoster` is idempotent by DL-1 (a roster that is
+        // not newer than the one held is a recorded no-op).
+        _ = try store.insertMessage(message: StoredMessage(
+            chatId: senderUserId,
+            senderUserId: senderUserId,
+            lamport: body.lamport,
+            timestamp: body.timestamp,
+            kind: ProtocolKind.rosterGossip,
+            payload: body.content,
+            senderDeviceId: senderDeviceId ?? coreLegacyDeviceId()
+        ))
+
+        // A store failure, not a refusal: refusals come back as an outcome. The
+        // row above still stands, so the sender's watermark advances and they
+        // stop re-spraying the same document.
+        if let decision = try? store.applyContactRoster(incoming: roster) {
+            log.info(
+                "Device list from \(UserIdHex.encode(senderUserId), privacy: .public): \(String(describing: decision.outcome), privacy: .public) (\(String(describing: decision.reason), privacy: .public))"
+            )
+        } else {
+            log.warning("Could not apply the device list from \(UserIdHex.encode(senderUserId), privacy: .public)")
+        }
+        // The chat itself gained a hidden row, and §10.4's banner is read from
+        // the store when a chat opens, so nudge whatever is on screen.
+        ChatEvents.notifyChatChanged(senderUserId)
+        // Ack, exactly as `handleIncomingRelayUpdate` does. Without this the
+        // sender's DELIVERED watermark never moves past the roster, so they
+        // re-offer the same document on every digest for the whole life of the
+        // envelope -- the ACK-MD-2 churn this carrier exists to end.
         acknowledgeHiddenMessage(
             sourceAddress: sourceAddress,
             senderUserId: senderUserId,
@@ -3963,7 +4111,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             ownOutboundBudgetBytes: gate.ownOutboundBudgetBytes,
             ownReceiptBudgetBytes: gate.ownReceiptBudgetBytes,
             receiptQueryLimit: MeshDefaults.relayStoreBatchLimit,
-            peerAcksHiddenKinds: MeshRouter.peerAcksHiddenKinds(address: address),
+            peerAcksHiddenKinds: MeshRouter.peerAckedHiddenKinds(address: address),
             hiddenAlreadyOffered: MeshRouter.hiddenOfferedFor(address: address),
             carriedCursor: lane.after
         ) else {
@@ -4213,6 +4361,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // remember to announce, and none can be missed. Mirrors Android's
         // `RelaySyncEngine.performRelaySyncPass`.
         RelayUpdateSender.announceIfChanged(store: store, identity: identity)
+        // DL-3 / §9.5 / §10.1's contact leg, on the same catch-up footing and for
+        // the same reason: this person's own device list is a fact every contact
+        // has to learn, and core's per-contact ledger makes asking on every pass
+        // cost one query on the install that has nothing to say -- which is
+        // nearly every install. The link and remove journeys fire it at the
+        // moment they change something; this is the repair pass that catches a
+        // contact added since, or a copy that expired unread. Mirrors Android's
+        // `RelaySyncEngine`.
+        RosterGossipSender.announceIfOwed(store: store, identity: identity)
         onMain { MeshRuntimeStatus.shared.markSyncingViaRelay() }
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }

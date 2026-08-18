@@ -322,6 +322,28 @@ enum RelayClient {
         )
     }
 
+    /// Posts a row that is not an envelope this device authored for a contact:
+    /// today, only §9.2's link rendezvous (`LinkRelayWire`), whose two mailboxes
+    /// are derived from the scanned offer's key rather than from anybody's user
+    /// id. Same wire shape as every other post — a rendezvous changes addressing,
+    /// not format — and relayd stays as content-agnostic as §2 promises.
+    static func postRendezvousEnvelope(
+        config: RelayConfig,
+        msgId: Data,
+        recipientHint: Data,
+        sealed: Data,
+        expiryMs: Int64
+    ) throws -> Int64 {
+        try postEnvelope(
+            config: config,
+            msgId: msgId,
+            hopTtl: 0,
+            recipientHint: recipientHint,
+            sealed: sealed,
+            expiryMs: expiryMs
+        )
+    }
+
     static func fetchEnvelopes(config: RelayConfig, hints: [Data], afterId: Int64, limit: Int) throws -> RelayFetchPage {
         let path = try relayBuildFetchPath(hints: hints, afterId: afterId, limit: UInt32(limit))
         let url = try buildURL(config.relayUrl, path: path)

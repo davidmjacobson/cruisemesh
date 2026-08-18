@@ -14,6 +14,7 @@ struct OnboardingView: View {
     @State private var avatarImage = ProfilePhotoStore.loadAvatarImage()
     @State private var photoItem: PhotosPickerItem?
     @State private var showRestore = false
+    @State private var showAddDevice = false
 
     /// Slide count, and the index of the last one. Named rather than inlined
     /// because the page count previously appeared as a bare `4` in three
@@ -113,6 +114,7 @@ struct OnboardingView: View {
                     HStack {
                         backButton
                         restoreButton
+                        anotherDeviceButton
                         Spacer()
                         primaryButton
                     }
@@ -123,6 +125,10 @@ struct OnboardingView: View {
                             backButton
                             Spacer()
                             restoreButton
+                        }
+                        HStack {
+                            Spacer()
+                            anotherDeviceButton
                         }
                     }
                 }
@@ -147,6 +153,16 @@ struct OnboardingView: View {
                 OnboardingStore.markCompleted()
             }
         }
+        .sheet(isPresented: $showAddDevice) {
+            NavigationStack {
+                AddDeviceView(
+                    identity: identity,
+                    role: .newDevice,
+                    expectedPersonId: nil,
+                    onFinished: { OnboardingStore.markCompleted() }
+                )
+            }
+        }
         .accessibilityIdentifier("screen.onboarding")
     }
 
@@ -161,6 +177,24 @@ struct OnboardingView: View {
     private var restoreButton: some View {
         Button("Restore from backup") {
             showRestore = true
+        }
+        .buttonStyle(.borderless)
+    }
+
+    /// The second door out of a new install (`specs/multi-device-v1.md` §9).
+    ///
+    /// There are two because there are two people here, not one. "Restore from
+    /// backup" is for someone who saved a file and is coming back. This is for
+    /// someone who bought a second phone and never made a backup at all — the
+    /// ordinary case, and one that had no door before: without it, the only way
+    /// onto a person's fleet was through a file they were never told to make.
+    ///
+    /// No person id to expect: they have not opened a backup, so the only thing
+    /// this phone knows is that the other one is theirs, and the ceremony's own
+    /// confirm is what checks that.
+    private var anotherDeviceButton: some View {
+        Button("This is another of my devices") {
+            showAddDevice = true
         }
         .buttonStyle(.borderless)
     }

@@ -73,8 +73,17 @@ enum MeshRouter {
         state.onHello2(address: address, userId: userId, capabilities: capabilities)
     }
 
-    static func peerAcksHiddenKinds(address: String) -> Bool {
-        state.peerAcksHiddenKinds(address: address)
+    /// Whether `address` advertised the capability bit for this one hidden
+    /// spray `kind` -- asked per kind, so a peer that acks four of the five it
+    /// knows about keeps the watermark for those four. False for a pre-HELLO2
+    /// build, which advertises nothing.
+    static func peerAcksHiddenKind(address: String, kind: UInt8) -> Bool {
+        state.peerAcksHiddenKind(address: address, kind: kind)
+    }
+
+    /// Every hidden spray kind `address` will ack, for the plan builder.
+    static func peerAckedHiddenKinds(address: String) -> Data {
+        state.peerAckedHiddenKinds(address: address)
     }
 
     static func hiddenOfferedFor(address: String) -> [Data] {

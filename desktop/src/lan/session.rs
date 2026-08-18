@@ -458,7 +458,7 @@ async fn respond_to_digest(
         services
             .hub
             .router
-            .peer_acks_hidden_kinds(address.to_string()),
+            .peer_acked_hidden_kinds(address.to_string()),
         services.hub.router.hidden_offered_for(address.to_string()),
         lane.after,
     )?;

@@ -337,6 +337,8 @@ pub const KIND_RELAY_UPDATE: u8 = 9;
 // | 19     | group metadata update                                          |
 // | 20     | §8 sync **digest** — SYNC-1's watermark exchange, a sync kind   |
 // |        | in every respect but a *record* stream in none                 |
+// | 21     | DL-3 roster gossip — the one roster-carrying kind addressed to  |
+// |        | a CONTACT rather than to a sibling ([`KIND_ROSTER_GOSSIP`])     |
 //
 // So the sync kinds are deliberately *not* one contiguous range any more, and
 // nothing may test for one: [`core_is_sync_record_kind`] is the only membership
@@ -418,6 +420,41 @@ pub const KIND_GROUP_METADATA_UPDATE: u8 = 19;
 /// moment it lands.
 pub const KIND_SYNC_DIGEST: u8 = 20;
 
+/// **DL-3's carrier**: this person's own roster document
+/// ([`crate::core_encode_roster`]), sealed pairwise to one contact.
+///
+/// `specs/multi-device-v1.md` §4 DL-3 says rosters "gossip exactly like other
+/// sealed 1:1 traffic — relay, LAN, BLE, and carry equally, sealed pairwise per
+/// contact", and §9 step 5 says the person's contacts are told when the roster
+/// changes. This is the kind that does it, and it is deliberately **not** one of
+/// §8's sync kinds even though it carries the same document a
+/// [`KIND_SYNC_OWN_ROSTER`] record does:
+///
+/// * the recipient set is the opposite one — contacts, not siblings — so the
+///   SYNC-3 accept rule that admits a sync record from `sender_is_self` alone
+///   would refuse every legitimate copy of this;
+/// * the sealing is pairwise to the contact's own agreement key, never to the
+///   person inbox key, so no third party and no relay ever sees roster
+///   plaintext (DL-3's "the relay never sees roster plaintext"); and
+/// * the payload carries **no secret at all** — a roster is public keys,
+///   counters and tombstones (DL-5) — whereas the sync record beside it ships
+///   inbox key material and must never leave the person boundary.
+///
+/// The public header is unchanged, so a legacy peer sees ordinary 1:1 mail and
+/// declines it — the WPT sealed-body tolerance, which is why the *envelope*
+/// needs no new version. What stops a peer *this* build's age is not an
+/// unhandled-kind arm at all: `deliver_inbound_body`'s roster arm refuses a
+/// gossiped roster whose `person_id` is not the identity that sealed it, which
+/// is DL-3's authorization gate and the reason a genuine roster about a third
+/// party cannot be replayed onto anyone.
+///
+/// What the kind does need is [`CAP_ROSTER_GOSSIP`], for the spray-bounding
+/// reason T23 established for [`KIND_RELAY_UPDATE`]: a build that predates kind
+/// 21 stores no row for it and so never advances its DELIVERED watermark past
+/// it. The bit is asked per kind ([`hidden_ack_capability`]), so that costs such
+/// a peer the once-per-session bound on this kind alone.
+pub const KIND_ROSTER_GOSSIP: u8 = 21;
+
 /// `ReceiptContent.receipt_type` value: recipient's device decrypted and
 /// stored the message (the ✓✓ tick, DESIGN.md §7.2).
 pub const RECEIPT_TYPE_DELIVERED: u8 = 1;
@@ -481,11 +518,28 @@ pub const CAP_RELAY_UPDATE: u32 = 1 << 1;
 /// build has, never a wrong stream and never a dropped message.
 pub const CAP_MULTI_DEVICE: u32 = 1 << 2;
 
+/// Capability bit: this client understands [`KIND_ROSTER_GOSSIP`] and stores
+/// it as a `messages` row on receipt, so its DELIVERED watermark advances past
+/// a roster a contact gossiped (DL-3).
+///
+/// It gets its own bit rather than riding [`CAP_MULTI_DEVICE`] for the reason
+/// T23 wrote down when [`CAP_RELAY_UPDATE`] was split off, and for a second one
+/// specific to this spec. The general reason: a bit that covers a fixed set of
+/// kinds cannot silently grow a member, or a build that advertised it honestly
+/// before the kind existed starts being trusted to ack something it drops
+/// unhandled — which is precisely the mixed-version resend chatter HELLO2 was
+/// introduced to end. The specific one: [`CAP_MULTI_DEVICE`]'s own doc states
+/// exactly what it claims (§5's per-device author streams) and disclaims
+/// everything else, and WP1 shipped it under that promise. Widening the promise
+/// retroactively would make an already-deployed advertisement mean something
+/// its build never implemented.
+pub const CAP_ROSTER_GOSSIP: u32 = 1 << 3;
+
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
 #[uniffi::export]
 pub fn core_own_capabilities() -> u32 {
-    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE | CAP_MULTI_DEVICE
+    CAP_ACKS_HIDDEN_KINDS | CAP_RELAY_UPDATE | CAP_MULTI_DEVICE | CAP_ROSTER_GOSSIP
 }
 
 /// The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
@@ -500,16 +554,52 @@ pub fn core_own_capabilities() -> u32 {
 /// this person's own devices, which are by construction builds that understand
 /// it. SYNC-1's anti-entropy gives own-device traffic its own stop condition
 /// (a sibling's stream watermark), so nothing here needs to bound its re-sends.
+///
+/// [`KIND_ROSTER_GOSSIP`] is present for the mirror-image reason: DL-3 gossip
+/// goes to a *contact*, whose build may predate the kind entirely, and a roster
+/// is re-offered on every link session until that contact's watermark moves
+/// past it. Bounding it is what keeps telling a friend about a new device from
+/// costing a re-spray on every digest for the envelope's full seven days.
+pub const HIDDEN_SPRAY_KINDS: [u8; 6] = [
+    KIND_FRIEND_REQUEST,
+    KIND_PROFILE_SYNC,
+    KIND_FRIEND_DIRECTORY,
+    KIND_INTRODUCED_FRIEND_REQUEST,
+    KIND_RELAY_UPDATE,
+    KIND_ROSTER_GOSSIP,
+];
+
 #[uniffi::export]
 pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
-    matches!(
-        kind,
+    HIDDEN_SPRAY_KINDS.contains(&kind)
+}
+
+/// The capability bit a peer must advertise before its DELIVERED watermark can
+/// be trusted to advance past this hidden spray kind. `None` for every kind
+/// that is not a hidden spray kind — those need no bit, because their rows are
+/// stored by every build and acked by the ordinary watermark.
+///
+/// One bit per kind, mapped here rather than folded into a single all-or-nothing
+/// mask, so an advertisement a deployed build made honestly keeps meaning
+/// exactly what it meant when that build shipped. A phone in the field today
+/// advertises [`CAP_ACKS_HIDDEN_KINDS`] and [`CAP_RELAY_UPDATE`] and means them:
+/// it really does store a friend request, a profile sync and a relay-change
+/// notice, and its watermark really does move past them. It does not know kind
+/// 21. Asking "does this peer ack *everything*?" would answer no and quietly
+/// demote all five older kinds to the once-per-session bound, on every peer in
+/// the fleet, until the whole fleet updated — a real cost paid by traffic the
+/// peer handles perfectly. Asking per kind charges that cost to the one kind
+/// that earns it.
+pub fn hidden_ack_capability(kind: u8) -> Option<u32> {
+    match kind {
+        KIND_RELAY_UPDATE => Some(CAP_RELAY_UPDATE),
+        KIND_ROSTER_GOSSIP => Some(CAP_ROSTER_GOSSIP),
         KIND_FRIEND_REQUEST
-            | KIND_PROFILE_SYNC
-            | KIND_FRIEND_DIRECTORY
-            | KIND_INTRODUCED_FRIEND_REQUEST
-            | KIND_RELAY_UPDATE
-    )
+        | KIND_PROFILE_SYNC
+        | KIND_FRIEND_DIRECTORY
+        | KIND_INTRODUCED_FRIEND_REQUEST => Some(CAP_ACKS_HIDDEN_KINDS),
+        _ => None,
+    }
 }
 
 /// Whether delivering a consumed envelope of this `kind` leaves durable
@@ -543,6 +633,14 @@ pub fn core_is_hidden_spray_kind(kind: u8) -> bool {
 /// through [`crate::MessageStore::core_record_consumed_hidden_msg_id`], the
 /// same evidence route every other row-less kind uses, which is what lets
 /// ACK-MD-1 delete the sibling's fan-out row once this device has it.
+///
+/// [`KIND_ROSTER_GOSSIP`] answers `false` on the same reasoning and takes the
+/// same route. A gossiped roster is not a chat message: what it leaves behind
+/// is a row in `contact_rosters`, keyed by the person it describes rather than
+/// by the envelope that carried it, so there is no `msg_id` to look up
+/// afterwards. Its consumed-hidden evidence is what lets the relay copy of a
+/// roster this device has already applied be deleted instead of refetched on
+/// every poll pass for seven days.
 #[uniffi::export]
 pub fn core_kind_persists_msg_id_row(kind: u8) -> bool {
     matches!(
@@ -1133,6 +1231,15 @@ fn validate_message_body_fields(
         }
         KIND_REACTION if crate::content::decode_reaction_payload(content.to_vec()).is_none() => {
             return Err(CoreError::Malformed("invalid reaction payload".into()));
+        }
+        // DL-3: the body of a roster gossip is a roster document and nothing
+        // else. Checked here, on the same pass as every other structured kind,
+        // so bytes that could never be applied are refused at the codec instead
+        // of being authored, queued, sprayed for a week, and dropped on arrival.
+        // Whether the decoded document may be *believed* is still
+        // `core_roster_accept`'s alone — this only says it is a roster.
+        KIND_ROSTER_GOSSIP => {
+            crate::core_decode_roster(content.to_vec())?;
         }
         _ => {}
     }

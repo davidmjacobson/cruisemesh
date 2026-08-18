@@ -2528,23 +2528,37 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onHello2(address: String, userId: Data, capabilities: UInt32)  -> Bool
     
     /**
-     * Whether this peer advertised every capability bit that covers a
-     * hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
-     * `false` for pre-HELLO2 builds — they process hidden kinds fine but
-     * never advance their DELIVERED watermark past them, so re-sprays toward
-     * them are bounded to once per session instead of every digest.
-     *
-     * T23 made this an *all* bits test rather than a single-bit one. A build
-     * that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
-     * still drops a relay-change notice unhandled, so bit 1 alone no longer
-     * answers "will this peer's watermark advance past every hidden kind I
-     * might spray". Treating such a peer as not-fully-capable costs it the
-     * once-per-session bound on kinds 3/5/6/7 too — the same conservative
-     * path a pre-HELLO2 peer already takes, and the safe direction to err in:
-     * the envelope is still offered on every fresh link session, and the
-     * direct and relay paths are untouched.
+     * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
+     * asked once for each, for the callers that must hand the whole answer to
+     * a plan builder rather than ask envelope by envelope.
      */
-    func peerAcksHiddenKinds(address: String)  -> Bool
+    func peerAckedHiddenKinds(address: String)  -> Data
+    
+    /**
+     * Whether this peer's DELIVERED watermark can be trusted to advance past
+     * *this one* hidden spray kind — the bit for the kind
+     * ([`crate::protocol::hidden_ack_capability`]), and only that bit.
+     *
+     * `false` for pre-HELLO2 builds, which advertise nothing at all: they
+     * process hidden kinds fine but never move their watermark past them, so
+     * re-sprays toward them are bounded to once per link session instead of
+     * once per digest. `true` for any kind that is not a hidden spray kind,
+     * which every build stores and acks the ordinary way.
+     *
+     * Asked per kind rather than as one all-or-nothing mask. T23 wrote the
+     * mask version because bit 1 alone could not answer "will this peer ack
+     * kind 9", and that was right — but the fix belongs on the kind, not on
+     * the peer. Under a mask, adding [`crate::protocol::CAP_ROSTER_GOSSIP`]
+     * makes every phone in today's fleet read as not-capable and demotes the
+     * five kinds it *does* ack honestly, on every link, until the whole fleet
+     * updates. Under this test the deployed fleet's advertisements keep
+     * meaning what they meant: friend requests, profile syncs, directories and
+     * relay-change notices stay on the watermark, and only a gossiped roster
+     * takes the conservative once-per-session path toward a build that
+     * predates kind 21. The envelope is still offered on every fresh link
+     * session either way, and the direct and relay paths are untouched.
+     */
+    func peerAcksHiddenKind(address: String, kind: UInt8)  -> Bool
     
     /**
      * Record what the carried lane just offered down this link: `next` is the
@@ -2810,26 +2824,47 @@ open func onHello2(address: String, userId: Data, capabilities: UInt32) -> Bool 
 }
     
     /**
-     * Whether this peer advertised every capability bit that covers a
-     * hidden spray kind ([`crate::protocol::core_is_hidden_spray_kind`]).
-     * `false` for pre-HELLO2 builds — they process hidden kinds fine but
-     * never advance their DELIVERED watermark past them, so re-sprays toward
-     * them are bounded to once per session instead of every digest.
-     *
-     * T23 made this an *all* bits test rather than a single-bit one. A build
-     * that predates kind 9 truthfully advertises `CAP_ACKS_HIDDEN_KINDS` and
-     * still drops a relay-change notice unhandled, so bit 1 alone no longer
-     * answers "will this peer's watermark advance past every hidden kind I
-     * might spray". Treating such a peer as not-fully-capable costs it the
-     * once-per-session bound on kinds 3/5/6/7 too — the same conservative
-     * path a pre-HELLO2 peer already takes, and the safe direction to err in:
-     * the envelope is still offered on every fresh link session, and the
-     * direct and relay paths are untouched.
+     * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
+     * asked once for each, for the callers that must hand the whole answer to
+     * a plan builder rather than ask envelope by envelope.
      */
-open func peerAcksHiddenKinds(address: String) -> Bool {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_peer_acks_hidden_kinds(self.uniffiClonePointer(),
+open func peerAckedHiddenKinds(address: String) -> Data {
+    return try!  FfiConverterData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_peer_acked_hidden_kinds(self.uniffiClonePointer(),
         FfiConverterString.lower(address),$0
+    )
+})
+}
+    
+    /**
+     * Whether this peer's DELIVERED watermark can be trusted to advance past
+     * *this one* hidden spray kind — the bit for the kind
+     * ([`crate::protocol::hidden_ack_capability`]), and only that bit.
+     *
+     * `false` for pre-HELLO2 builds, which advertise nothing at all: they
+     * process hidden kinds fine but never move their watermark past them, so
+     * re-sprays toward them are bounded to once per link session instead of
+     * once per digest. `true` for any kind that is not a hidden spray kind,
+     * which every build stores and acks the ordinary way.
+     *
+     * Asked per kind rather than as one all-or-nothing mask. T23 wrote the
+     * mask version because bit 1 alone could not answer "will this peer ack
+     * kind 9", and that was right — but the fix belongs on the kind, not on
+     * the peer. Under a mask, adding [`crate::protocol::CAP_ROSTER_GOSSIP`]
+     * makes every phone in today's fleet read as not-capable and demotes the
+     * five kinds it *does* ack honestly, on every link, until the whole fleet
+     * updates. Under this test the deployed fleet's advertisements keep
+     * meaning what they meant: friend requests, profile syncs, directories and
+     * relay-change notices stay on the watermark, and only a gossiped roster
+     * takes the conservative once-per-session path toward a build that
+     * predates kind 21. The envelope is still offered on every fresh link
+     * session either way, and the direct and relay paths are untouched.
+     */
+open func peerAcksHiddenKind(address: String, kind: UInt8) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_peer_acks_hidden_kind(self.uniffiClonePointer(),
+        FfiConverterString.lower(address),
+        FfiConverterUInt8.lower(kind),$0
     )
 })
 }
@@ -4570,6 +4605,50 @@ public protocol MessageStoreProtocol : AnyObject {
     func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, pageFullyProcessed: Bool, nowMs: Int64) throws  -> Int64
     
     /**
+     * **§9 step 5 and §10.1's contact leg: tell the contacts who are owed it.**
+     *
+     * Seals this person's current roster document pairwise to every contact
+     * that has not already been told this exact head, queues one envelope
+     * each, and records what was told. Idempotent: called twice in a row, the
+     * second call authors nothing.
+     *
+     * Call it when a link completes, when a revocation commits, when a contact
+     * is added, and at app start. None of those is a special case here — each
+     * is the same question ("who is owed the roster I hold?") asked at a moment
+     * when the answer may have changed.
+     *
+     * Returns [`RosterGossipAnnouncement::nothing_to_gossip`]'s empty shape on
+     * an install that has never linked a device. That is the overwhelming
+     * majority of the fleet and it is deliberately free: no roster, nothing to
+     * say about one, no envelope, no row.
+     *
+     * "Already told" is not taken as permanent. Nothing ever comes back to say
+     * a contact holds a roster, so a recorded announcement stands only while
+     * the envelope carrying it could still be delivered
+     * ([`announcement_stands_for_ms`]); after that the contact is owed it
+     * again. That is what stops a contact who was out of reach for the whole
+     * window from being marked told forever on the strength of a copy that
+     * expired unread.
+     *
+     * A per-contact failure is not fatal to the pass. If one contact's envelope
+     * cannot be authored — a store error, a contact row that vanished under a
+     * concurrent delete — that contact is counted in
+     * [`RosterGossipAnnouncement::failed`], left unrecorded, and the rest of
+     * the list is still told. Leaving it unrecorded is what makes the next call
+     * retry it; recording it would lose the contact silently.
+     *
+     * It gossips only under the identity the roster is *about*. A linked device
+     * signs its outbound mail with a throwaway per-device identity while the
+     * roster it holds names the person; announcing under that identity would
+     * seal a document about the person to contacts as if a stranger were
+     * vouching for them, and every recipient would refuse it (the receive side
+     * checks exactly this). So a mismatch returns the empty shape: the
+     * approving device does the routine announcing, and the sibling stays
+     * quiet rather than authoring envelopes nobody can accept.
+     */
+    func announceOwnRoster(identity: Identity, nowMs: Int64) throws  -> RosterGossipAnnouncement
+    
+    /**
      * T23: apply a contact's relay-change notice to their stored endpoint.
      *
      * Three rules, all enforced here rather than in either shell, because
@@ -5276,26 +5355,28 @@ public protocol MessageStoreProtocol : AnyObject {
      * call the ack planner sees an unlinked install with nothing to ack for,
      * and the gate refuses the paths anyway.
      *
-     * # What this call turns on that nothing yet turns off
+     * # §9 step 5 belongs immediately after this call
      *
      * This is the line that first makes a fleet larger than one device real,
-     * and §9 step 5 — telling the person's CONTACTS about the new roster —
-     * does not exist. DL-3's send side is owed by WP4 (the own-device sync
-     * records that carry a roster document) and WP5 (the contact
-     * notification), and neither has landed.
+     * and until the person's CONTACTS know it, ACK-MD-2 makes that fleet
+     * expensive: a contact who has not heard about the roster keeps uploading
+     * exactly ONE person-addressed relay row, and no member of a multi-device
+     * fleet may delete it — whichever sibling fetches it first must leave it
+     * for the others. Those rows churned until their 7-day expiry for as long
+     * as DL-3's send side did not exist.
      *
-     * The consequence is not hypothetical and is worth stating where the
-     * switch is thrown. A contact who has not heard about the roster keeps
-     * uploading exactly ONE person-addressed relay row, and ACK-MD-2 forbids a
-     * multi-device fleet from acking it: whichever sibling fetches it first
-     * must leave it for the others, and nobody deletes it. Those rows churn
-     * until their 7-day expiry.
+     * It exists now. A driver that has just activated a device calls
+     * [`MessageStore::announce_own_roster`], which seals the roster to every
+     * contact not already holding this head and queues one envelope each; the
+     * contact's next fan-out to this person is then per-device, each row with
+     * exactly one consumer, and the churn stops. The same call is the right
+     * one after a revocation and after adding a contact — it is idempotent, so
+     * calling it when nothing is owed authors nothing, and a moment a platform
+     * forgets is repaired by the next call rather than lost.
      *
-     * It is bounded and it is dev-only — linking is behind Internal Tools
-     * until WP6, so the only fleets in existence are ones being deliberately
-     * tested — but it is a real cost of activating a device before its
-     * contacts can be told. `MD-ROSTER-GOSSIP-TO-CONTACTS` in
-     * `core/tests/multi_device_contract.rs` is the pinned form of this note.
+     * Both halves are pinned by `MD-ROSTER-GOSSIP-TO-CONTACTS` in
+     * `core/tests/multi_device_contract.rs`, which asserts the churn before the
+     * document lands and its absence afterwards.
      */
     func completeLinkActivation(ackedRosterHead: Data, nowMs: Int64) throws  -> CoreLinkActivation
     
@@ -5557,7 +5638,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
      * nothing here acks.
      */
-    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?) throws  -> CoreDigestSprayPlan
+    func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Data, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?) throws  -> CoreDigestSprayPlan
     
     /**
      * The relay rows one queued 1:1 envelope should be uploaded as
@@ -7684,6 +7765,22 @@ public protocol MessageStoreProtocol : AnyObject {
     func revocationHandoffsFor(siblingDeviceId: Data, ownDevice: DeviceKeypair, inboxKey: InboxKey) throws  -> [RevocationHandoff]
     
     /**
+     * Which contacts are owed the roster this device holds — the read half of
+     * [`Self::announce_own_roster`], for a surface or a test that wants to
+     * know whether anything is outstanding without authoring it.
+     *
+     * Blocked contacts are absent: they are not owed a document they will
+     * never be sent. A contact whose announcement is neither receipt-proven
+     * nor still inside the envelope's lifetime is present again — see
+     * [`announcement_covers`].
+     *
+     * `identity` is taken for the same reason [`Self::announce_own_roster`]
+     * takes it, and answers the same way: empty when this identity is not the
+     * person the roster is about.
+     */
+    func rosterGossipPending(identity: Identity, nowMs: Int64) throws  -> [Data]
+    
+    /**
      * Unread visible messages across every non-self sender stream in a chat,
      * using each stream's persisted local READ watermark.
      */
@@ -8079,6 +8176,57 @@ open func advanceRelaySweepCursor(configKey: String, pageNextCursor: Int64, page
         FfiConverterString.lower(configKey),
         FfiConverterInt64.lower(pageNextCursor),
         FfiConverterBool.lower(pageFullyProcessed),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * **§9 step 5 and §10.1's contact leg: tell the contacts who are owed it.**
+     *
+     * Seals this person's current roster document pairwise to every contact
+     * that has not already been told this exact head, queues one envelope
+     * each, and records what was told. Idempotent: called twice in a row, the
+     * second call authors nothing.
+     *
+     * Call it when a link completes, when a revocation commits, when a contact
+     * is added, and at app start. None of those is a special case here — each
+     * is the same question ("who is owed the roster I hold?") asked at a moment
+     * when the answer may have changed.
+     *
+     * Returns [`RosterGossipAnnouncement::nothing_to_gossip`]'s empty shape on
+     * an install that has never linked a device. That is the overwhelming
+     * majority of the fleet and it is deliberately free: no roster, nothing to
+     * say about one, no envelope, no row.
+     *
+     * "Already told" is not taken as permanent. Nothing ever comes back to say
+     * a contact holds a roster, so a recorded announcement stands only while
+     * the envelope carrying it could still be delivered
+     * ([`announcement_stands_for_ms`]); after that the contact is owed it
+     * again. That is what stops a contact who was out of reach for the whole
+     * window from being marked told forever on the strength of a copy that
+     * expired unread.
+     *
+     * A per-contact failure is not fatal to the pass. If one contact's envelope
+     * cannot be authored — a store error, a contact row that vanished under a
+     * concurrent delete — that contact is counted in
+     * [`RosterGossipAnnouncement::failed`], left unrecorded, and the rest of
+     * the list is still told. Leaving it unrecorded is what makes the next call
+     * retry it; recording it would lose the contact silently.
+     *
+     * It gossips only under the identity the roster is *about*. A linked device
+     * signs its outbound mail with a throwaway per-device identity while the
+     * roster it holds names the person; announcing under that identity would
+     * seal a document about the person to contacts as if a stranger were
+     * vouching for them, and every recipient would refuse it (the receive side
+     * checks exactly this). So a mismatch returns the empty shape: the
+     * approving device does the routine announcing, and the sibling stays
+     * quiet rather than authoring envelopes nobody can accept.
+     */
+open func announceOwnRoster(identity: Identity, nowMs: Int64)throws  -> RosterGossipAnnouncement {
+    return try  FfiConverterTypeRosterGossipAnnouncement.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_announce_own_roster(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -9084,26 +9232,28 @@ open func commitRelayRotation(plan: RelayRotationPlan, nowMs: Int64)throws  -> R
      * call the ack planner sees an unlinked install with nothing to ack for,
      * and the gate refuses the paths anyway.
      *
-     * # What this call turns on that nothing yet turns off
+     * # §9 step 5 belongs immediately after this call
      *
      * This is the line that first makes a fleet larger than one device real,
-     * and §9 step 5 — telling the person's CONTACTS about the new roster —
-     * does not exist. DL-3's send side is owed by WP4 (the own-device sync
-     * records that carry a roster document) and WP5 (the contact
-     * notification), and neither has landed.
+     * and until the person's CONTACTS know it, ACK-MD-2 makes that fleet
+     * expensive: a contact who has not heard about the roster keeps uploading
+     * exactly ONE person-addressed relay row, and no member of a multi-device
+     * fleet may delete it — whichever sibling fetches it first must leave it
+     * for the others. Those rows churned until their 7-day expiry for as long
+     * as DL-3's send side did not exist.
      *
-     * The consequence is not hypothetical and is worth stating where the
-     * switch is thrown. A contact who has not heard about the roster keeps
-     * uploading exactly ONE person-addressed relay row, and ACK-MD-2 forbids a
-     * multi-device fleet from acking it: whichever sibling fetches it first
-     * must leave it for the others, and nobody deletes it. Those rows churn
-     * until their 7-day expiry.
+     * It exists now. A driver that has just activated a device calls
+     * [`MessageStore::announce_own_roster`], which seals the roster to every
+     * contact not already holding this head and queues one envelope each; the
+     * contact's next fan-out to this person is then per-device, each row with
+     * exactly one consumer, and the churn stops. The same call is the right
+     * one after a revocation and after adding a contact — it is idempotent, so
+     * calling it when nothing is owed authors nothing, and a moment a platform
+     * forgets is repaired by the next call rather than lost.
      *
-     * It is bounded and it is dev-only — linking is behind Internal Tools
-     * until WP6, so the only fleets in existence are ones being deliberately
-     * tested — but it is a real cost of activating a device before its
-     * contacts can be told. `MD-ROSTER-GOSSIP-TO-CONTACTS` in
-     * `core/tests/multi_device_contract.rs` is the pinned form of this note.
+     * Both halves are pinned by `MD-ROSTER-GOSSIP-TO-CONTACTS` in
+     * `core/tests/multi_device_contract.rs`, which asserts the churn before the
+     * document lands and its absence afterwards.
      */
 open func completeLinkActivation(ackedRosterHead: Data, nowMs: Int64)throws  -> CoreLinkActivation {
     return try  FfiConverterTypeCoreLinkActivation.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -9478,7 +9628,7 @@ open func coreDigestAdvertisedMsgIds()throws  -> [Data] {
      * digest-proof of receipt ([`Self::core_confirm_carried_deliveries`]);
      * nothing here acks.
      */
-open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Bool, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?)throws  -> CoreDigestSprayPlan {
+open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Data], peerKnownMsgIds: [Data], nowMs: Int64, carriedBudgetBytes: UInt64, ownOutboundBudgetBytes: UInt64, ownReceiptBudgetBytes: UInt64, receiptQueryLimit: UInt64, peerAcksHiddenKinds: Data, hiddenAlreadyOffered: [Data], carriedCursor: CoreCarriedCursor?)throws  -> CoreDigestSprayPlan {
     return try  FfiConverterTypeCoreDigestSprayPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_messagestore_core_digest_spray_plan(self.uniffiClonePointer(),
         FfiConverterData.lower(ownUserId),
@@ -9490,7 +9640,7 @@ open func coreDigestSprayPlan(ownUserId: Data, peerUserId: Data, peerHints: [Dat
         FfiConverterUInt64.lower(ownOutboundBudgetBytes),
         FfiConverterUInt64.lower(ownReceiptBudgetBytes),
         FfiConverterUInt64.lower(receiptQueryLimit),
-        FfiConverterBool.lower(peerAcksHiddenKinds),
+        FfiConverterData.lower(peerAcksHiddenKinds),
         FfiConverterSequenceData.lower(hiddenAlreadyOffered),
         FfiConverterOptionTypeCoreCarriedCursor.lower(carriedCursor),$0
     )
@@ -12629,6 +12779,29 @@ open func revocationHandoffsFor(siblingDeviceId: Data, ownDevice: DeviceKeypair,
         FfiConverterData.lower(siblingDeviceId),
         FfiConverterTypeDeviceKeypair.lower(ownDevice),
         FfiConverterTypeInboxKey.lower(inboxKey),$0
+    )
+})
+}
+    
+    /**
+     * Which contacts are owed the roster this device holds — the read half of
+     * [`Self::announce_own_roster`], for a surface or a test that wants to
+     * know whether anything is outstanding without authoring it.
+     *
+     * Blocked contacts are absent: they are not owed a document they will
+     * never be sent. A contact whose announcement is neither receipt-proven
+     * nor still inside the envelope's lifetime is present again — see
+     * [`announcement_covers`].
+     *
+     * `identity` is taken for the same reason [`Self::announce_own_roster`]
+     * takes it, and answers the same way: empty when this identity is not the
+     * person the roster is about.
+     */
+open func rosterGossipPending(identity: Identity, nowMs: Int64)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_roster_gossip_pending(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity.lower(identity),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -31627,11 +31800,18 @@ public func FfiConverterTypeRevocationAdoption_lower(_ value: RevocationAdoption
  * per surviving sibling, ready for any of the four transports. WP4's carrier
  * already exists, so this leg is executed rather than described.
  * * **Contacts** get `roster_document` sealed pairwise per contact (DL-3), and
- * `contact_user_ids` is exactly who must be told. The bytes and the recipient
- * list are produced here; putting them on a wire is the caller's, and the
- * envelope kind that carries a roster document to a contact is owed by the
- * notification slice. Until it lands this leg is a plan, and saying so in the
- * type is better than a comment nobody reads.
+ * `contact_user_ids` is exactly who must be told. Both were produced here
+ * before anything could carry them. WP6 added [`crate::KIND_ROSTER_GOSSIP`],
+ * so this leg is now executed too: the caller runs
+ * [`MessageStore::announce_own_roster`] once this returns, which seals the
+ * new document to every contact that does not already hold this head.
+ *
+ * The two fields stay, as the plan a caller can read rather than as the
+ * delivery. That is deliberate crash-safety, not duplication: the
+ * announcement re-derives both from the roster this store now holds, so a
+ * revocation that committed and then died before sending anything is
+ * repaired by the next announcement instead of leaving contacts silently
+ * un-told.
  */
 public struct RevocationCommit {
     public var roster: Roster
@@ -32224,6 +32404,163 @@ public func FfiConverterTypeRoster_lift(_ buf: RustBuffer) throws -> Roster {
 #endif
 public func FfiConverterTypeRoster_lower(_ value: Roster) -> RustBuffer {
     return FfiConverterTypeRoster.lower(value)
+}
+
+
+/**
+ * What one [`MessageStore::announce_own_roster`] pass did.
+ */
+public struct RosterGossipAnnouncement {
+    /**
+     * The head every contact in [`Self::envelopes`] is now recorded as having
+     * been told. Empty on an install that has never linked a device — there is
+     * no roster to gossip, so the whole pass is a no-op and every count below
+     * is zero.
+     */
+    public var rosterHead: Data
+    /**
+     * One authored, sealed, durably queued envelope per contact newly told.
+     *
+     * The recipient is `envelope.message.chat_id` — a pairwise authored
+     * message is filed in its recipient's own thread — so a driver never has
+     * to pair this list back up against a contact list it walked separately.
+     * Sending them is the caller's, exactly as for every other authored
+     * envelope: they are already queued, so a send that fails costs a delay
+     * and not a delivery.
+     */
+    public var envelopes: [AuthoredEnvelope]
+    /**
+     * Contacts that already hold this head and were left alone.
+     */
+    public var alreadyCurrent: UInt32
+    /**
+     * Blocked contacts, which are told nothing — not even that this person's
+     * devices changed.
+     */
+    public var skippedBlocked: UInt32
+    /**
+     * Contacts this pass could not author for — a store error, or a contact
+     * row that vanished under a concurrent delete.
+     *
+     * They are left *unrecorded* in the ledger on purpose, so the next pass
+     * asks about them again. A non-zero count is a delay, never a loss, and
+     * it is reported rather than swallowed so a shell can say so if it ever
+     * wants to.
+     */
+    public var failed: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The head every contact in [`Self::envelopes`] is now recorded as having
+         * been told. Empty on an install that has never linked a device — there is
+         * no roster to gossip, so the whole pass is a no-op and every count below
+         * is zero.
+         */rosterHead: Data, 
+        /**
+         * One authored, sealed, durably queued envelope per contact newly told.
+         *
+         * The recipient is `envelope.message.chat_id` — a pairwise authored
+         * message is filed in its recipient's own thread — so a driver never has
+         * to pair this list back up against a contact list it walked separately.
+         * Sending them is the caller's, exactly as for every other authored
+         * envelope: they are already queued, so a send that fails costs a delay
+         * and not a delivery.
+         */envelopes: [AuthoredEnvelope], 
+        /**
+         * Contacts that already hold this head and were left alone.
+         */alreadyCurrent: UInt32, 
+        /**
+         * Blocked contacts, which are told nothing — not even that this person's
+         * devices changed.
+         */skippedBlocked: UInt32, 
+        /**
+         * Contacts this pass could not author for — a store error, or a contact
+         * row that vanished under a concurrent delete.
+         *
+         * They are left *unrecorded* in the ledger on purpose, so the next pass
+         * asks about them again. A non-zero count is a delay, never a loss, and
+         * it is reported rather than swallowed so a shell can say so if it ever
+         * wants to.
+         */failed: UInt32) {
+        self.rosterHead = rosterHead
+        self.envelopes = envelopes
+        self.alreadyCurrent = alreadyCurrent
+        self.skippedBlocked = skippedBlocked
+        self.failed = failed
+    }
+}
+
+
+
+extension RosterGossipAnnouncement: Equatable, Hashable {
+    public static func ==(lhs: RosterGossipAnnouncement, rhs: RosterGossipAnnouncement) -> Bool {
+        if lhs.rosterHead != rhs.rosterHead {
+            return false
+        }
+        if lhs.envelopes != rhs.envelopes {
+            return false
+        }
+        if lhs.alreadyCurrent != rhs.alreadyCurrent {
+            return false
+        }
+        if lhs.skippedBlocked != rhs.skippedBlocked {
+            return false
+        }
+        if lhs.failed != rhs.failed {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rosterHead)
+        hasher.combine(envelopes)
+        hasher.combine(alreadyCurrent)
+        hasher.combine(skippedBlocked)
+        hasher.combine(failed)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRosterGossipAnnouncement: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RosterGossipAnnouncement {
+        return
+            try RosterGossipAnnouncement(
+                rosterHead: FfiConverterData.read(from: &buf), 
+                envelopes: FfiConverterSequenceTypeAuthoredEnvelope.read(from: &buf), 
+                alreadyCurrent: FfiConverterUInt32.read(from: &buf), 
+                skippedBlocked: FfiConverterUInt32.read(from: &buf), 
+                failed: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: RosterGossipAnnouncement, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.rosterHead, into: &buf)
+        FfiConverterSequenceTypeAuthoredEnvelope.write(value.envelopes, into: &buf)
+        FfiConverterUInt32.write(value.alreadyCurrent, into: &buf)
+        FfiConverterUInt32.write(value.skippedBlocked, into: &buf)
+        FfiConverterUInt32.write(value.failed, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterGossipAnnouncement_lift(_ buf: RustBuffer) throws -> RosterGossipAnnouncement {
+    return try FfiConverterTypeRosterGossipAnnouncement.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRosterGossipAnnouncement_lower(_ value: RosterGossipAnnouncement) -> RustBuffer {
+    return FfiConverterTypeRosterGossipAnnouncement.lower(value)
 }
 
 
@@ -50472,20 +50809,6 @@ public func coreInboundGate(isNewMsgId: Bool, hopTtl: UInt8, expiryMs: Int64, no
     )
 })
 }
-/**
- * The sideband kinds that ride `outbound_envelopes` with a `msg_id = NULL`
- * messages row: excluded from digests and recent-msg-id acks, so their only
- * stop condition is the peer's DELIVERED watermark advancing — which never
- * happens against a peer that lacks [`CAP_ACKS_HIDDEN_KINDS`]. The spray
- * plan bounds re-sends of exactly these kinds toward such peers.
- *
- * §8's sync record kinds are deliberately absent, and their absence is a
- * decision rather than an omission: this list is about what a *peer* can be
- * trusted to ack, and a sync record never reaches a peer — it is addressed to
- * this person's own devices, which are by construction builds that understand
- * it. SYNC-1's anti-entropy gives own-device traffic its own stop condition
- * (a sibling's stream watermark), so nothing here needs to bound its re-sends.
- */
 public func coreIsHiddenSprayKind(kind: UInt8) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_is_hidden_spray_kind(
@@ -50570,6 +50893,14 @@ public func coreIsVisibleChatKind(kind: UInt8) -> Bool {
  * through [`crate::MessageStore::core_record_consumed_hidden_msg_id`], the
  * same evidence route every other row-less kind uses, which is what lets
  * ACK-MD-1 delete the sibling's fan-out row once this device has it.
+ *
+ * [`KIND_ROSTER_GOSSIP`] answers `false` on the same reasoning and takes the
+ * same route. A gossiped roster is not a chat message: what it leaves behind
+ * is a row in `contact_rosters`, keyed by the person it describes rather than
+ * by the envelope that carried it, so there is no `msg_id` to look up
+ * afterwards. Its consumed-hidden evidence is what lets the relay copy of a
+ * roster this device has already applied be deleted instead of refetched on
+ * every poll pass for seven days.
  */
 public func coreKindPersistsMsgIdRow(kind: UInt8) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -51161,6 +51492,18 @@ public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> C
  * ([`crate::core_open_sync_record`] is the crypto half of the same rule); this
  * gate makes it unauthorized as well, so the person boundary does not rest on
  * one layer alone.
+ *
+ * [`KIND_ROSTER_GOSSIP`] is the one roster-carrying kind on the ordinary
+ * branch, and deliberately so: DL-3 gossip is a document a *contact* sends
+ * about themselves, so it is admitted from an accepted contact exactly like
+ * their profile or their relay-change notice, and refused from a stranger.
+ * It is emphatically not an onboarding kind — a roster for somebody this
+ * device has not friended has no contact row to be stored against and no
+ * person root to be checked against, so accepting one from a stranger would
+ * be filing an unverifiable document about an unknown person. Which of the
+ * contact's own devices the roster may name is DL-1/DL-2/DL-4's question, not
+ * this one's; the caller checks the narrower rule that a gossiped roster must
+ * describe the person who sealed it before it reaches those rules at all.
  */
 public func corePairwiseSenderAuthorized(kind: UInt8, senderIsContact: Bool, senderIsSelf: Bool) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -55317,7 +55660,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_inbound_gate() != 47063) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_is_hidden_spray_kind() != 7830) {
+    if (uniffi_cruisemesh_core_checksum_func_core_is_hidden_spray_kind() != 52014) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_is_own_fanout_hint() != 52117) {
@@ -55329,7 +55672,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_is_visible_chat_kind() != 47018) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 53968) {
+    if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 54573) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
@@ -55428,7 +55771,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 54640) {
+    if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 20663) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_parse_lan_endpoint() != 56400) {
@@ -56274,7 +56617,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_hello2() != 17439) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kinds() != 45296) {
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acked_hidden_kinds() != 7435) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acks_hidden_kind() != 13571) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_record_carried_progress() != 45270) {
@@ -56430,6 +56776,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_advance_relay_sweep_cursor() != 33864) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_announce_own_roster() != 44394) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 59804) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -56556,7 +56905,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_commit_relay_rotation() != 43704) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_complete_link_activation() != 14897) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_complete_link_activation() != 22252) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_consumed_hidden_lamports() != 35201) {
@@ -56607,7 +56956,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_advertised_msg_ids() != 45681) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 15577) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_core_digest_spray_plan() != 48529) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_core_outbound_relay_rows() != 40926) {
@@ -57043,6 +57392,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_revocation_handoffs_for() != 37109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_roster_gossip_pending() != 12992) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_semantic_unread_count() != 2210) {

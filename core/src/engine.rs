@@ -13,7 +13,8 @@ use crate::{
     CoreCarriedCursor, CoreError, MessageOrigin, MessageStore, OutboundEnvelope,
     OutgoingReceiptEnvelope, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
     KIND_GROUP_INVITE, KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC,
-    KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED,
+    KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_ROSTER_GOSSIP, KIND_TEXT, MS_PER_DAY,
+    RECEIPT_TYPE_DELIVERED,
 };
 
 /// Exact carried+recently-held `msg_id` count advertised in one outgoing
@@ -105,6 +106,18 @@ pub enum CoreInboundDisposition {
 /// ([`crate::core_open_sync_record`] is the crypto half of the same rule); this
 /// gate makes it unauthorized as well, so the person boundary does not rest on
 /// one layer alone.
+///
+/// [`KIND_ROSTER_GOSSIP`] is the one roster-carrying kind on the ordinary
+/// branch, and deliberately so: DL-3 gossip is a document a *contact* sends
+/// about themselves, so it is admitted from an accepted contact exactly like
+/// their profile or their relay-change notice, and refused from a stranger.
+/// It is emphatically not an onboarding kind — a roster for somebody this
+/// device has not friended has no contact row to be stored against and no
+/// person root to be checked against, so accepting one from a stranger would
+/// be filing an unverifiable document about an unknown person. Which of the
+/// contact's own devices the roster may name is DL-1/DL-2/DL-4's question, not
+/// this one's; the caller checks the narrower rule that a gossiped roster must
+/// describe the person who sealed it before it reaches those rules at all.
 #[uniffi::export]
 pub fn core_pairwise_sender_authorized(
     kind: u8,
@@ -125,6 +138,7 @@ pub fn core_pairwise_sender_authorized(
             | KIND_INTRODUCED_FRIEND_REQUEST
             | KIND_LAN_ENDPOINT_HINT
             | KIND_RELAY_UPDATE
+            | KIND_ROSTER_GOSSIP
             | KIND_ATTACHMENT_MANIFEST
             | KIND_REACTION
     );
@@ -762,7 +776,12 @@ impl MessageStore {
         own_outbound_budget_bytes: u64,
         own_receipt_budget_bytes: u64,
         receipt_query_limit: u64,
-        peer_acks_hidden_kinds: bool,
+        // The hidden spray kinds this peer's DELIVERED watermark can be
+        // trusted to advance past (`MeshRouterCore::peer_acked_hidden_kinds`).
+        // A kind absent here is bounded to one offer per link session; a kind
+        // present is governed by the watermark like everything else. Empty for
+        // a pre-HELLO2 peer, which advertises nothing.
+        peer_acks_hidden_kinds: Vec<u8>,
         hidden_already_offered: Vec<Vec<u8>>,
         carried_cursor: Option<CoreCarriedCursor>,
     ) -> Result<CoreDigestSprayPlan, CoreError> {
@@ -808,12 +827,14 @@ impl MessageStore {
             carried_cursor,
         )?;
         let known: HashSet<Vec<u8>> = peer_known_msg_ids.into_iter().collect();
-        // Hidden kinds never advance a non-capable peer's DELIVERED
-        // watermark, so `lamport > delivered_through` re-selects them on
-        // every digest for the full 7-day expiry (the mixed-version resend
-        // chatter). Toward such peers each hidden envelope is offered once
-        // per link session: the shell feeds back what was already offered
-        // and records what this plan newly includes.
+        // A hidden kind never advances the watermark of a peer that does not
+        // advertise the bit for *that kind*, so `lamport > delivered_through`
+        // re-selects it on every digest for the full 7-day expiry (the
+        // mixed-version resend chatter). Toward such a peer each hidden
+        // envelope of that kind is offered once per link session: the shell
+        // feeds back what was already offered and records what this plan newly
+        // includes. Kinds the peer does advertise are untouched.
+        let acked_hidden_kinds: HashSet<u8> = peer_acks_hidden_kinds.into_iter().collect();
         let hidden_offered: HashSet<Vec<u8>> = hidden_already_offered.into_iter().collect();
         let mut offered_hidden_msg_ids = Vec::new();
 
@@ -851,7 +872,7 @@ impl MessageStore {
             let contact_pending: Vec<_> = contact_pending
                 .into_iter()
                 .filter(|envelope| {
-                    if peer_acks_hidden_kinds
+                    if acked_hidden_kinds.contains(&envelope.kind)
                         || !crate::protocol::core_is_hidden_spray_kind(envelope.kind)
                     {
                         return true;
@@ -3232,7 +3253,7 @@ mod tests {
                 15,
                 0,
                 0,
-                true,
+                crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                 vec![],
                 None,
             )
@@ -3307,7 +3328,7 @@ mod tests {
         queue(crate::KIND_FRIEND_REQUEST, 1, 1);
         queue(crate::KIND_TEXT, 2, 2);
 
-        let plan = |acks: bool, offered: Vec<Vec<u8>>| {
+        let plan = |acks: Vec<u8>, offered: Vec<Vec<u8>>| {
             store
                 .core_digest_spray_plan(
                     own_user_id.clone(),
@@ -3328,20 +3349,32 @@ mod tests {
 
         // Legacy peer, first digest of the session: everything goes out and
         // the hidden envelope is reported for the shell to record.
-        let first = plan(false, vec![]);
+        let first = plan(vec![], vec![]);
         assert_eq!(first.own_outbound_frames.len(), 2);
         assert_eq!(first.offered_hidden_msg_ids, vec![vec![1_u8; 16]]);
 
         // Same session, next digest (e.g. the ~3-5 min re-digest): the
         // hidden envelope is suppressed, the visible one still re-sprays.
-        let second = plan(false, first.offered_hidden_msg_ids.clone());
+        let second = plan(vec![], first.offered_hidden_msg_ids.clone());
         assert_eq!(second.own_outbound_frames.len(), 1);
         assert!(second.offered_hidden_msg_ids.is_empty());
 
-        // Capability peer: no gating, nothing to record.
-        let capable = plan(true, vec![]);
+        // A peer that acks this exact kind: no gating, nothing to record.
+        let capable = plan(vec![crate::KIND_FRIEND_REQUEST], vec![]);
         assert_eq!(capable.own_outbound_frames.len(), 2);
         assert!(capable.offered_hidden_msg_ids.is_empty());
+
+        // Per kind, not per peer: a peer that acks every hidden kind *except*
+        // this one is gated on this one alone, and its other kinds keep the
+        // watermark. This is the deployed fleet's case for a gossiped roster,
+        // and the reason the distinction is pinned here.
+        let others: Vec<u8> = crate::HIDDEN_SPRAY_KINDS
+            .into_iter()
+            .filter(|kind| *kind != crate::KIND_FRIEND_REQUEST)
+            .collect();
+        let partial = plan(others, first.offered_hidden_msg_ids.clone());
+        assert_eq!(partial.own_outbound_frames.len(), 1);
+        assert!(partial.offered_hidden_msg_ids.is_empty());
     }
 
     // --- per-encounter foreign-carry budget --------------------------------
@@ -3399,7 +3432,7 @@ mod tests {
                 0,
                 0,
                 0,
-                true,
+                crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                 vec![],
                 None,
             )
@@ -3459,7 +3492,7 @@ mod tests {
                     0,
                     0,
                     0,
-                    true,
+                    crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                     vec![],
                     None,
                 )
@@ -3552,7 +3585,7 @@ mod tests {
                 1024 * 1024,
                 1024,
                 128,
-                true,
+                crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                 vec![],
                 None,
             )
@@ -3584,7 +3617,7 @@ mod tests {
                     0,
                     0,
                     0,
-                    true,
+                    crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                     vec![],
                     None,
                 )
@@ -3653,7 +3686,7 @@ mod tests {
                     0,
                     0,
                     0,
-                    true,
+                    crate::protocol::HIDDEN_SPRAY_KINDS.to_vec(),
                     vec![],
                     cursor,
                 )

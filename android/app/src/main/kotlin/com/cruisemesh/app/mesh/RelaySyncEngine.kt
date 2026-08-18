@@ -19,6 +19,7 @@ import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.relay.RelayPassEngine
 import com.cruisemesh.app.relay.RelayPushClient
 import com.cruisemesh.app.relay.RelayPushSubscription
+import com.cruisemesh.app.devicelink.RosterGossipSender
 import com.cruisemesh.app.relay.RelayUpdateSender
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
@@ -552,6 +553,14 @@ internal class RelaySyncEngine(
         // remember to announce, and none can be missed. `announceIfChanged` is
         // idempotent, so the periodic poll re-entering here costs nothing.
         RelayUpdateSender.announceIfChanged(context, store, identity)
+        // DL-3 / §9.5 / §10.1's contact leg, on the same catch-up footing and
+        // for the same reason: this person's own device list is a fact every
+        // contact has to learn, and core's per-contact ledger makes asking on
+        // every pass cost one query on the install that has nothing to say --
+        // which is nearly every install. The link and remove journeys fire it
+        // at the moment they change something; this is the repair pass that
+        // catches a contact added since, or a copy that expired unread.
+        RosterGossipSender.announceIfOwed(store, identity)
         // Taken *before* the uploads, because that is the moment core plans
         // from: `CoreRelayPassPlan.contacts` is built once at the top of a
         // pass, while both breakers this reads are advanced by the loops below
@@ -735,6 +744,14 @@ internal class RelaySyncEngine(
         val ownEndpointChanged = RelayConfigStore.relayEpoch(context) >
             RelayConfigStore.announcedRelayEpoch(context)
         RelayUpdateSender.announceIfChanged(context, store, identity)
+        // DL-3 / §9.5 / §10.1's contact leg, on the same catch-up footing and
+        // for the same reason: this person's own device list is a fact every
+        // contact has to learn, and core's per-contact ledger makes asking on
+        // every pass cost one query on the install that has nothing to say --
+        // which is nearly every install. The link and remove journeys fire it
+        // at the moment they change something; this is the repair pass that
+        // catches a contact added since, or a copy that expired unread.
+        RosterGossipSender.announceIfOwed(store, identity)
 
         val network = relayBindTarget()
         val plan = CoreRelayPassPlan(

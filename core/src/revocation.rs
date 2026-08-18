@@ -541,11 +541,18 @@ pub struct RevocationHandoff {
 ///   per surviving sibling, ready for any of the four transports. WP4's carrier
 ///   already exists, so this leg is executed rather than described.
 /// * **Contacts** get `roster_document` sealed pairwise per contact (DL-3), and
-///   `contact_user_ids` is exactly who must be told. The bytes and the recipient
-///   list are produced here; putting them on a wire is the caller's, and the
-///   envelope kind that carries a roster document to a contact is owed by the
-///   notification slice. Until it lands this leg is a plan, and saying so in the
-///   type is better than a comment nobody reads.
+///   `contact_user_ids` is exactly who must be told. Both were produced here
+///   before anything could carry them. WP6 added [`crate::KIND_ROSTER_GOSSIP`],
+///   so this leg is now executed too: the caller runs
+///   [`MessageStore::announce_own_roster`] once this returns, which seals the
+///   new document to every contact that does not already hold this head.
+///
+///   The two fields stay, as the plan a caller can read rather than as the
+///   delivery. That is deliberate crash-safety, not duplication: the
+///   announcement re-derives both from the roster this store now holds, so a
+///   revocation that committed and then died before sending anything is
+///   repaired by the next announcement instead of leaving contacts silently
+///   un-told.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct RevocationCommit {
     pub roster: Roster,

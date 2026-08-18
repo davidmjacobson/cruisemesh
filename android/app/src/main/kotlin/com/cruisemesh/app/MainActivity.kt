@@ -138,9 +138,11 @@ import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.ConnectionDetailsScreen
 import com.cruisemesh.app.ui.ShorePassScreen
 import com.cruisemesh.app.ui.HelpSupportScreen
-import com.cruisemesh.app.devicelink.DeviceLinkTestScreen
+import com.cruisemesh.app.devicelink.AddDeviceScreen
+import com.cruisemesh.app.devicelink.YourDevicesScreen
 import com.cruisemesh.app.ui.DeveloperSettingsScreen
 import com.cruisemesh.app.ui.SettingsScreen
+import uniffi.cruisemesh_core.CoreLinkRole
 import uniffi.cruisemesh_core.CoreSailChecklistReport
 import uniffi.cruisemesh_core.CoreSailPermission
 import uniffi.cruisemesh_core.DeepLinkRoute
@@ -308,6 +310,12 @@ fun CruiseMeshApp(
             OnboardingRoute(
                 identity = identity,
                 onRestore = { navController.navigate("restore") },
+                // specs/multi-device-v1.md §9: a person who bought a second
+                // phone and never made a backup needs a door too, and this is
+                // it. No person id to expect -- they have not opened a backup,
+                // so the only thing this phone knows is that the other one is
+                // theirs, and the ceremony's own confirm is what checks that.
+                onSetUpAsAnotherDevice = { navController.navigate("addDevice?role=new") },
             ) {
                 onboardingCompleted = true
                 navController.navigate("home") {
@@ -342,14 +350,38 @@ fun CruiseMeshApp(
         }
         composable("sailChecklist") { SailChecklistRoute(navController) }
         composable("developerSettings") {
-            DeveloperSettingsScreen(
+            DeveloperSettingsScreen(onBack = { navController.popOrExit(context) })
+        }
+        // specs/multi-device-v1.md §13 WP6. "Your devices" is a family surface
+        // in Settings, not an Internal Tools entry: the person who needs it most
+        // is the one whose phone was just stolen.
+        composable("yourDevices") {
+            YourDevicesScreen(
+                identity = identity,
                 onBack = { navController.popOrExit(context) },
-                onDeviceLinkTest = { navController.navigate("deviceLinkTest") },
+                onAddDevice = { navController.navigate("addDevice?role=approving") },
             )
         }
-        composable("deviceLinkTest") {
-            DeviceLinkTestScreen(
+        composable(
+            "addDevice?role={role}&person={person}",
+            arguments = listOf(
+                navArgument("role") { type = NavType.StringType; defaultValue = "approving" },
+                navArgument("person") {
+                    type = NavType.StringType
+                    nullable = true
+                    defaultValue = null
+                },
+            ),
+        ) { entry ->
+            // Which end of §9 this phone is comes from the door it came through
+            // -- Settings means "already set up", the restore fork means "new"
+            // -- so it is never a question put to the person mid-ceremony.
+            val newDevice = entry.arguments?.getString("role") == "new"
+            AddDeviceScreen(
                 identity = identity,
+                role = if (newDevice) CoreLinkRole.NEW_DEVICE else CoreLinkRole.APPROVING_DEVICE,
+                expectedPersonId = entry.arguments?.getString("person")
+                    ?.let { runCatching { UserIdHex.decode(it) }.getOrNull() },
                 onBack = { navController.popOrExit(context) },
             )
         }
@@ -376,7 +408,18 @@ fun CruiseMeshApp(
             )
         }
         composable("backup") { BackupExportScreen(onBack = { navController.popOrExit(context) }) }
-        composable("restore") { BackupRestoreScreen(onBack = { navController.popOrExit(context) }) }
+        composable("restore") {
+            BackupRestoreScreen(
+                onBack = { navController.popOrExit(context) },
+                // §9's second meaning of "restore": this phone joins the person
+                // in the backup instead of becoming them.
+                onSetUpAsNewDevice = { personId ->
+                    navController.navigate(
+                        "addDevice?role=new&person=${UserIdHex.encode(personId)}",
+                    )
+                },
+            )
+        }
         composable("myQr") {
             MyQrScreen(
                 identity,
@@ -441,7 +484,12 @@ fun CruiseMeshApp(
 }
 
 @Composable
-private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplete: () -> Unit) {
+private fun OnboardingRoute(
+    identity: Identity,
+    onRestore: () -> Unit,
+    onSetUpAsAnotherDevice: () -> Unit,
+    onComplete: () -> Unit,
+) {
     val context = LocalContext.current
     val displayId = remember(identity) { formatUserId(identity.userId) }
     // Stored name, not the fallback: onboarding must open with an empty field
@@ -585,6 +633,7 @@ private fun OnboardingRoute(identity: Identity, onRestore: () -> Unit, onComplet
             }
         },
         onRestore = onRestore,
+        onSetUpAsAnotherDevice = onSetUpAsAnotherDevice,
         onComplete = {
             // No silent substitution: OnboardingScreen keeps the final button
             // disabled until a name is entered, so reaching here means the user
@@ -1378,6 +1427,7 @@ private fun SettingsRoute(
         onSailChecklist = { navController.navigate("sailChecklist") },
         onConnectionDetails = { navController.navigate("connectionDetails") },
         onDeveloperSettings = { navController.navigate("developerSettings") },
+        onYourDevices = { navController.navigate("yourDevices") },
         onBackUp = { navController.navigate("backup") },
         onMeshEnabledChange = { enabled ->
             if (enabled) {

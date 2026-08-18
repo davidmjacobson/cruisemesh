@@ -62,7 +62,16 @@ enum BackupService {
         return BackupPreview(
             inventory: inventory,
             createdAtMs: payload.createdAtMs,
-            sourceVersionCode: payload.srcVersionCode
+            sourceVersionCode: payload.srcVersionCode,
+            // §9's closing paragraph: opening a `.cmbak` on a fresh install is two
+            // different intents wearing one word, and the person has to be the one
+            // who picks. Read on the decrypt this screen already performs, so
+            // choosing does not cost a second passphrase entry.
+            //
+            // The list is core's, order included — "Link as new device" is
+            // deliberately first there, and the surface must not reorder a choice
+            // whose ordering is itself the recommendation.
+            plans: restorePlans(payload: payload)
         )
     }
 
@@ -272,6 +281,42 @@ struct BackupPreview: Equatable {
     let inventory: BackupInventory
     let createdAtMs: Int64
     let sourceVersionCode: Int32
+    /// §9's "Replace this device" and "Link as new device", in core's order.
+    /// Empty is never expected — `core_backup_restore_plans` always returns both
+    /// — but a shell that finds it empty falls back to the old single-meaning
+    /// restore rather than showing a fork with no branches.
+    var plans: [CoreRestorePlan] = []
+}
+
+/// §9's two intents, or the one that keeps a restore working if core cannot
+/// produce them.
+///
+/// `core_backup_restore_plans` always returns both, so the fallback is not an
+/// expected state. It exists because the alternative — an empty list — silently
+/// removes every branch from the fork, leaving a person who opened a backup with
+/// a screen that offers nothing and a Restore button that never enables. Seeding
+/// the replace intent degrades to exactly the behaviour restore had before the
+/// fork existed, which is the honest floor: it is the branch that finishes here,
+/// and the one whose hazard the copy already warns about.
+private func restorePlans(payload: BackupPayload) -> [CoreRestorePlan] {
+    if let plans = try? coreBackupRestorePlans(payload: payload), !plans.isEmpty {
+        return plans
+    }
+    // The person id comes out of the identity block the backup already carries;
+    // with neither that nor core's plans there is genuinely nothing to offer.
+    guard let identity = try? decodeIdentityBytes(bytes: payload.identity) else { return [] }
+    return [
+        CoreRestorePlan(
+            intent: .replaceThisDevice,
+            personId: identity.userId,
+            restoresStoredHistory: true,
+            keepsExistingDeviceIdentity: true,
+            mintsNewDeviceKey: false,
+            routesToLinkCeremony: false,
+            carriesRecoveryMaterial: false,
+            cloneHazardIfSourceIsLive: true
+        )
+    ]
 }
 
 enum BackupServiceError: LocalizedError, Equatable {

@@ -79,6 +79,7 @@ fun SettingsScreen(
     onSailChecklist: () -> Unit,
     onConnectionDetails: () -> Unit,
     onDeveloperSettings: () -> Unit,
+    onYourDevices: () -> Unit,
     onBackUp: () -> Unit,
     onMeshEnabledChange: (Boolean) -> Unit,
     onFriendsOfFriendsChanged: (Boolean) -> Unit,
@@ -247,6 +248,19 @@ fun SettingsScreen(
                         // so this nudge takes effect without a restart.
                         RelaySyncEvents.requestSync()
                     },
+                )
+            }
+
+            // specs/multi-device-v1.md §13 WP6. Next to Backup on purpose: a
+            // person opening Settings after losing a phone is looking for one of
+            // these two, and which one they need depends on whether the phone is
+            // gone or merely lost.
+            SettingsGap()
+            SettingsGroup(stringResource(R.string.ui_your_devices)) {
+                SettingsLink(
+                    title = stringResource(R.string.ui_your_devices),
+                    detail = stringResource(R.string.ui_your_devices_summary),
+                    onClick = onYourDevices,
                 )
             }
 
