@@ -298,7 +298,7 @@ struct BackupPreview: Equatable {
 /// the replace intent degrades to exactly the behaviour restore had before the
 /// fork existed, which is the honest floor: it is the branch that finishes here,
 /// and the one whose hazard the copy already warns about.
-private func restorePlans(payload: BackupPayload) -> [CoreRestorePlan] {
+private func restorePlans(payload: CoreBackupPayload) -> [CoreRestorePlan] {
     if let plans = try? coreBackupRestorePlans(payload: payload), !plans.isEmpty {
         return plans
     }
