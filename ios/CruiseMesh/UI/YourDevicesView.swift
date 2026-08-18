@@ -298,9 +298,14 @@ struct YourDevicesView: View {
 /// that overstates what removal does is worse than one that says less. A free
 /// function so that promise is directly testable rather than reachable only by
 /// tapping through a `Form`.
+///
+/// The first line names §10 step 5's meeting, because until the removed phone
+/// meets one of the devices that are still this person's it carries on as though
+/// nothing happened — and this tap used to promise otherwise while doing nothing
+/// at all to the other device.
 func removeDeviceConfirmationText(deviceName: String) -> String {
     let happens = String(
-        localized: "\(deviceName) will no longer stay in step with your other devices, and it will not be able to see what they are doing from now on."
+        localized: "\(deviceName) stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
     )
     let survives = String(
         localized: "Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it."

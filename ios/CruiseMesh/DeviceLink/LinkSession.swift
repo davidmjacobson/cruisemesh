@@ -290,6 +290,11 @@ final class LinkSession: ObservableObject {
             ))
             _ = try store.completeLinkActivation(ackedRosterHead: imported.rosterHead, nowMs: now())
             if let adopted = try? store.ownRoster() { rememberRosterSeen(adopted) }
+            // Only now, on the far side of the acknowledgement: this phone is a
+            // device of this person, so it takes their name and photo and stops
+            // being a phone that has never been set up. A ceremony that failed
+            // reaches `abandonActivation` below instead and leaves both untouched.
+            LinkAdoption.adopted(profile: imported.profile)
             // Visible from here, radios included.
             LinkVisibility.refresh(store: store)
 
@@ -429,6 +434,10 @@ final class LinkSession: ObservableObject {
         // core's own defaults for head size and lifetime.
         let bootstrap = try store.buildLinkBootstrap(
             identity: identity,
+            // The person's own name and photo, so the phone being adopted never
+            // has to ask them who they are (§9.3). Read here, on the device that
+            // has the answer; written on the other side by `LinkAdoption`.
+            profile: LinkAdoption.profileOf(),
             roster: update.roster,
             approvingDeviceSignSk: device.signSk,
             channelBinding: binding,

@@ -174,6 +174,34 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(ownLanStaticKeyMatches(ownAgreePk: alice.agreePk, remoteStaticKey: bob.agreePk))
     }
 
+    /// The three answers a finished handshake can have, and why "not a contact"
+    /// is no longer one verdict (`specs/multi-device-v1.md` §10 step 5).
+    ///
+    /// A device of this person's own is never in their contact list and never
+    /// will be, so before this it was refused exactly like a stranger — which is
+    /// why a removed phone could sit on the same Wi-Fi as the phone that removed
+    /// it and never be told. It is kept now, with no user id, so nothing
+    /// downstream treats it as a peer.
+    func testOwnDeviceIsNeitherAContactNorAStranger() {
+        let own = contact(userByte: 1, agreeByte: 7)
+        let friend = contact(userByte: 2, agreeByte: 8)
+        let stranger = Data(repeating: 9, count: 32)
+        let contacts = [friend]
+
+        // A friend: a user id, and everything that follows from having one.
+        XCTAssertEqual(
+            trustedLanPeerUserId(contacts: contacts, remoteStaticKey: friend.agreePk),
+            friend.userId
+        )
+        // Our own device: no user id from the contact list, and the own-key test
+        // is what stops the link being closed as a stranger's.
+        XCTAssertNil(trustedLanPeerUserId(contacts: contacts, remoteStaticKey: own.agreePk))
+        XCTAssertTrue(ownLanStaticKeyMatches(ownAgreePk: own.agreePk, remoteStaticKey: own.agreePk))
+        // A stranger: neither, and still refused.
+        XCTAssertNil(trustedLanPeerUserId(contacts: contacts, remoteStaticKey: stranger))
+        XCTAssertFalse(ownLanStaticKeyMatches(ownAgreePk: own.agreePk, remoteStaticKey: stranger))
+    }
+
     func testOwnIdentityHelloRecordsCloneOnlyWithOurSessionKey() {
         let own = contact(userByte: 1, agreeByte: 7)
         let other = contact(userByte: 2, agreeByte: 8)

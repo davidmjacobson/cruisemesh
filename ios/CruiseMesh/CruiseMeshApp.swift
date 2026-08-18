@@ -13,6 +13,11 @@ struct CruiseMeshApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var appModel: AppModel
+    /// `specs/multi-device-v1.md` §10 step 5. Watched from the root because the
+    /// notice can land while somebody is looking at their chats, and read once at
+    /// launch (see the `task` below) because a device ejected in a previous run
+    /// must still know.
+    @StateObject private var deviceRemoval = DeviceRemovalStatus.shared
     @State private var termsAccepted: Bool
     @State private var onboardingCompleted: Bool
     @AppStorage(AppearancePreference.storageKey, store: AppDefaults.current)
@@ -48,6 +53,17 @@ struct CruiseMeshApp: App {
                         TermsAcceptanceStore.acceptCurrentVersion()
                         termsAccepted = true
                     }
+                } else if deviceRemoval.removed {
+                    // The core stage is the fact; this is the only screen that
+                    // may be drawn on top of it, for the reason
+                    // `DeviceRemovedView` states. Core already refuses to
+                    // advertise, author or ack from that stage and
+                    // `MeshController` stops itself when the notice lands -- but
+                    // a mesh started before that, or restarted since by a
+                    // background relaunch, has to be told to stay down rather
+                    // than left running behind a screen that says the opposite.
+                    DeviceRemovedView()
+                        .onAppear { appModel.stopMesh() }
                 } else if onboardingCompleted {
                     ChatListView(
                         identity: appModel.identity,
@@ -67,6 +83,17 @@ struct CruiseMeshApp: App {
                 guard !UITestConfiguration.isEnabled else { return }
                 UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
                 MessageNotifier.configureCategories()
+            }
+            .task {
+                // §10 step 5, at launch: a device its person ejected in an
+                // earlier run holds the terminal stage in its store and must
+                // find out again before it draws anything else. Off the main
+                // thread for the same reason every other store read is, even
+                // though this one is a single select against a one-row table.
+                guard !UITestConfiguration.isEnabled else { return }
+                await Task.detached(priority: .utility) {
+                    DeviceRemovalStatus.shared.refresh(store: AppStore.get())
+                }.value
             }
             .onOpenURL { url in
                 // T20: the core owns the routing table so both shells agree,

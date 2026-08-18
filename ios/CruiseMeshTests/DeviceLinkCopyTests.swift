@@ -97,9 +97,13 @@ final class DeviceLinkCopyTests: XCTestCase {
         let text = removeDeviceConfirmationText(deviceName: "Old iPad")
         XCTAssertTrue(text.contains("Old iPad"))
         // It must say all three things §10.1 actually produces.
-        XCTAssertTrue(text.contains("no longer stay in step with your other devices"))
+        XCTAssertTrue(text.contains("stops staying in step with your other devices"))
         XCTAssertTrue(text.contains("stay on your other devices"))
         XCTAssertTrue(text.contains("cannot undo this"))
+        // And §10 step 5: the removed phone goes quiet when the two meet, not
+        // at the moment of the tap. Saying otherwise is the promise this
+        // confirmation made before there was anything behind it.
+        XCTAssertTrue(text.contains("same Wi-Fi"))
         // And none of the one it does not: §10.2's relay-token rotation has no
         // driver on either shell.
         for overclaim in ["Shore Pass", "mailbox", "internet delivery"] {

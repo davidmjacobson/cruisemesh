@@ -15,6 +15,10 @@ struct OnboardingView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showRestore = false
     @State private var showAddDevice = false
+    /// One of §9's two doors adopted this phone onto a person's existing fleet.
+    /// Acted on when the sheet that carried the ceremony has actually gone —
+    /// see `enterTheAppIfThisPhoneWasAdopted`.
+    @State private var adoptedByAnotherDevice = false
 
     /// Slide count, and the index of the last one. Named rather than inlined
     /// because the page count previously appeared as a bare `4` in three
@@ -148,18 +152,29 @@ struct OnboardingView: View {
                 }
             }
         }
-        .sheet(isPresented: $showRestore) {
-            BackupRestoreView {
-                OnboardingStore.markCompleted()
-            }
+        .sheet(isPresented: $showRestore, onDismiss: enterTheAppIfThisPhoneWasAdopted) {
+            BackupRestoreView(
+                onStaged: { OnboardingStore.markCompleted() },
+                onAdopted: { adoptedByAnotherDevice = true }
+            )
         }
-        .sheet(isPresented: $showAddDevice) {
+        .sheet(isPresented: $showAddDevice, onDismiss: {
+            // Tapping Done is not the only way out of a finished ceremony: a
+            // sheet can be swiped away. `LinkAdoption` made this phone set up
+            // durably at the moment the adoption completed, and nothing on this
+            // door writes that flag for any other reason, so it is the same
+            // evidence one tap later. (The restore door is not asked the same
+            // question: a staged restore marks setup complete too, and that one
+            // wants a relaunch rather than the app.)
+            if OnboardingStore.isCompleted() { adoptedByAnotherDevice = true }
+            enterTheAppIfThisPhoneWasAdopted()
+        }) {
             NavigationStack {
                 AddDeviceView(
                     identity: identity,
                     role: .newDevice,
                     expectedPersonId: nil,
-                    onFinished: { OnboardingStore.markCompleted() }
+                    onLinked: { adoptedByAnotherDevice = true }
                 )
             }
         }
@@ -209,6 +224,32 @@ struct OnboardingView: View {
         }
         .buttonStyle(.borderedProminent)
         .disabled(page == lastPage && trimmedName.isEmpty)
+    }
+
+    /// §9's other ending, and §9's closing paragraph: the two doors out of
+    /// first-run setup land a person in the same place.
+    ///
+    /// A phone that was adopted holds this person's contacts, groups and history,
+    /// so this wizard has nothing left to ask it — and asking anyway is what the
+    /// two-phone session on 2026-08-18 saw: back on slide one, still offering the
+    /// door it had just come through, and then asking a linked person their own
+    /// name, which any answer to would have been a second name for one person.
+    ///
+    /// Run from the sheets' `onDismiss` rather than from the callback itself, so
+    /// the ceremony's sheet is already gone before this screen is replaced.
+    private func enterTheAppIfThisPhoneWasAdopted() {
+        // Whatever happened behind the sheet, the profile may have changed under
+        // this screen: an adoption writes the person's own name and photo
+        // (`LinkAdoption`), and a restore writes both as well. Re-read before
+        // anything else, because the one thing the name slide must never do is
+        // show an empty field to somebody who already has a name.
+        displayName = ProfileStore.loadStoredDisplayName()
+        avatarImage = ProfilePhotoStore.loadAvatarImage()
+        guard adoptedByAnotherDevice else { return }
+        adoptedByAnotherDevice = false
+        appModel.displayName = ProfileStore.loadDisplayName()
+        appModel.startMesh()
+        onComplete()
     }
 
     private func complete() {
