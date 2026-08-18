@@ -549,6 +549,21 @@ pub enum CoreLinkActivationStage {
     AwaitingRosterAck,
     /// Both halves done. This device is a device.
     Activated,
+    /// **§10 step 5.** This device read a signed roster of its own person that
+    /// tombstones it, and ejected itself: it no longer advertises, authors or
+    /// acks, and it holds no fleet projection.
+    ///
+    /// Terminal. DL-4 says a revoked `device_id` is gone forever, so the only
+    /// way out is a fresh ceremony under a fresh device key — which is a fresh
+    /// install, not a flag flip. [`MessageStore::begin_link_activation`] and
+    /// [`MessageStore::abandon_link_activation`] both refuse from here for that
+    /// reason.
+    ///
+    /// Note what it is NOT: an opinion of this device's about whether it should
+    /// still be trusted. It is the person's decision, arriving as a document
+    /// signed under their root and strictly superseding the one this device
+    /// held. Nothing a stranger can mint reaches this state.
+    Revoked,
 }
 
 /// The three things §9.4 forbids before activation.
@@ -575,6 +590,10 @@ pub enum CoreLinkGateReason {
     BootstrapPending,
     /// §9.4b: the exact roster head has not been acknowledged.
     RosterAckPending,
+    /// §10 step 5: this device's person removed it, and it has read the signed
+    /// roster that says so. Not a window that closes — see
+    /// [`CoreLinkActivationStage::Revoked`].
+    DeviceRevoked,
 }
 
 /// One gate answer.
@@ -623,6 +642,11 @@ pub fn core_link_activation_gate(
         CoreLinkActivationStage::Activated => (true, CoreLinkGateReason::Activated),
         CoreLinkActivationStage::AwaitingBootstrap => (false, CoreLinkGateReason::BootstrapPending),
         CoreLinkActivationStage::AwaitingRosterAck => (false, CoreLinkGateReason::RosterAckPending),
+        // §10 step 5. All three, not just Advertise: a removed device that
+        // stopped announcing itself but kept authoring, or kept acking, would
+        // still be deleting relay rows and minting signed mail on a person's
+        // behalf after that person removed it.
+        CoreLinkActivationStage::Revoked => (false, CoreLinkGateReason::DeviceRevoked),
     };
     CoreLinkGateVerdict {
         allowed,
@@ -635,13 +659,21 @@ pub fn core_link_activation_gate(
 /// What a refused action looks like to a caller. One sentence, no jargon: the
 /// shells surface their own copy, and this is the log line.
 pub(crate) fn refusal(verdict: CoreLinkGateVerdict) -> CoreError {
+    let action = match verdict.action {
+        CoreLinkGatedAction::Advertise => "appear on the mesh",
+        CoreLinkGatedAction::Author => "send",
+        CoreLinkGatedAction::Ack => "acknowledge mail",
+    };
+    // Two refusals, not one sentence with a wrong word in it: "still being set
+    // up" is a window that closes, and §10's is a door that does not.
+    if verdict.stage == CoreLinkActivationStage::Revoked {
+        return CoreError::Store(format!(
+            "this device was removed from its person's devices and cannot {action} ({:?})",
+            verdict.reason
+        ));
+    }
     CoreError::Store(format!(
-        "this device is still being set up and cannot {} yet ({:?})",
-        match verdict.action {
-            CoreLinkGatedAction::Advertise => "appear on the mesh",
-            CoreLinkGatedAction::Author => "send",
-            CoreLinkGatedAction::Ack => "acknowledge mail",
-        },
+        "this device is still being set up and cannot {action} yet ({:?})",
         verdict.reason
     ))
 }
@@ -676,6 +708,13 @@ pub struct CoreLinkBootstrapImport {
     /// storage, exactly as it persists a generated [`Identity`](crate::Identity).
     /// The core does not keep secrets.
     pub person: super::bootstrap::LinkBootstrapPerson,
+    /// The person's own name and photo, straight off the export
+    /// ([`LinkBootstrapProfile`](super::bootstrap::LinkBootstrapProfile)). A
+    /// passthrough for the same reason `person` is: core keeps no profile row,
+    /// and the shell that owns the name is the one that must write it. A shell
+    /// that drops this is a shell that asks a person their own name on a phone
+    /// that already knows it.
+    pub profile: super::bootstrap::LinkBootstrapProfile,
     /// This device's own id, taken from the certificate the roster carries for
     /// it — never from the caller.
     pub own_device_id: Vec<u8>,
@@ -806,6 +845,17 @@ impl MessageStore {
                     .to_string(),
             ));
         }
+        if current.stage == CoreLinkActivationStage::Revoked {
+            // DL-4: the id this install held is buried forever, and a ceremony
+            // begun on top of this store would run under the device key that id
+            // was derived from. Re-linking this hardware means a fresh install
+            // with a fresh device key, which is a fresh store and therefore no
+            // row here at all.
+            return Err(CoreError::Store(
+                "this device was removed; setting it up again starts from a fresh install"
+                    .to_string(),
+            ));
+        }
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.execute(
             "INSERT INTO device_link_activation
@@ -859,6 +909,16 @@ impl MessageStore {
             CoreLinkActivationStage::Activated => {
                 return Err(CoreError::Store(
                     "this device is linked; removing it is a roster change, not a local reset"
+                        .to_string(),
+                ));
+            }
+            CoreLinkActivationStage::Revoked => {
+                // Not a ceremony that failed — a device that was removed. The
+                // gates it closed are §10's, and giving them back locally would
+                // be this device overruling its person's decision.
+                return Err(CoreError::Store(
+                    "this device was removed from its person's devices; that is not a local state \
+                     to reset"
                         .to_string(),
                 ));
             }
@@ -932,6 +992,7 @@ impl MessageStore {
         })?;
         super::bootstrap::core_link_bootstrap_verify(bootstrap.clone(), recorded_binding, now_ms)?;
         let person = bootstrap.person.clone();
+        let profile = bootstrap.profile.clone();
         // Whose fleet is this, and is this store a phone that may join it?
         if let Some(expected) = &expected_person_id {
             if *expected != person.person_id {
@@ -1059,6 +1120,7 @@ impl MessageStore {
         Ok(CoreLinkBootstrapImport {
             catch_up: super::bootstrap::core_link_catch_up_plan(bootstrap),
             person,
+            profile,
             own_device_id,
             roster_head,
             contacts_imported,
@@ -1196,6 +1258,199 @@ impl MessageStore {
         self.store_own_roster(&roster)?;
         self.project_own_fleet(&roster, &own_device_id)
     }
+
+    /// **§10 step 5, the sending half.** This person's own roster document, in
+    /// the frame [`crate::encode_own_roster`] defines, or `None` when there is
+    /// nothing to say.
+    ///
+    /// `None` on an install that has never linked (no roster), and on one the
+    /// gate has silenced — a device that may not advertise may not announce a
+    /// roster either, and that includes a device this very mechanism has
+    /// ejected. The news travels from the fleet toward the removed device, not
+    /// out of it.
+    ///
+    /// Read [`crate::encode_own_roster`] before calling this: **which links a
+    /// notice may be written to is the whole of its safety**, and that rule
+    /// lives in the shell that owns the socket, because core cannot see a Noise
+    /// static key.
+    pub fn own_roster_notice_frame(&self) -> Result<Option<Vec<u8>>, CoreError> {
+        if !self.link_gate_allows(CoreLinkGatedAction::Advertise)? {
+            return Ok(None);
+        }
+        let Some(roster) = self.own_roster()? else {
+            return Ok(None);
+        };
+        Ok(Some(crate::encode_own_roster(crate::core_encode_roster(
+            roster,
+        )?)?))
+    }
+
+    /// **§10 step 5, the receiving half: how a removed device finds out.**
+    ///
+    /// `document` is a [`crate::Frame::OwnRoster`] body that arrived on a link
+    /// the caller has already proved belongs to this person (see
+    /// [`crate::encode_own_roster`] — that test is a precondition, not an
+    /// option). `person_root_sign_pk` is this device's OWN identity signing key:
+    /// §3 makes the person root the deployed identity key, so the anchor is
+    /// already on the phone and no new trust material is introduced.
+    ///
+    /// # Why a push, and why this is not a tip-off
+    ///
+    /// §10.1 addresses its gossip to contacts and to *remaining* own devices,
+    /// and §11's SYNC-3 seals self-sync to the person's *current* device set.
+    /// Every carrier v1 has is therefore addressed to a set the removed device
+    /// is not in — [`crate::core_seal_sync_handoff`] refuses a tombstoned
+    /// address outright and says so — which is why an honest "I found my old
+    /// phone" device otherwise believes itself linked forever, keeps
+    /// advertising, and keeps accepting mail.
+    ///
+    /// The notice does not weaken §10's threat model, because it can only be
+    /// read *after* the capability is already gone. Step 1 rotates the inbox key
+    /// at the moment of removal and step 2 rotates the relay token; both land
+    /// before any meeting. So the revoked device learns nothing it can race —
+    /// by the time it hears, there is nothing left to run for. And it learns
+    /// only from a document signed under the person root and strictly
+    /// superseding the one it held, so "you're out" is never a bare hint a
+    /// stranger can inject.
+    ///
+    /// # What it does, in [`core_roster_accept`]'s vocabulary
+    ///
+    /// The decision is the ordinary one — DL-1 ordering, DL-2's sticky fork
+    /// quarantine, DL-4's tombstones, §6's generation floor, §14.2's epoch
+    /// authority — run against what this device has stored. Only
+    /// [`crate::RosterUpdateOutcome::Accepted`] does anything, and then:
+    ///
+    /// * the document buries THIS device → it ejects itself
+    ///   ([`crate::RevocationAdoptionOutcome::RevokedSelf`]);
+    /// * the document still lists this device and announces the inbox key
+    ///   generation this device already holds → ordinary convergence, adopted;
+    /// * the document still lists this device but announces a NEWER generation
+    ///   → nothing is written and
+    ///   [`crate::RevocationAdoptionOutcome::AwaitingRotationKey`] is returned.
+    ///   A plaintext link frame carries no key material and never will, so
+    ///   adopting here would leave a device holding a roster whose sync traffic
+    ///   it cannot open. §10.1's sealed handoff is what carries that rotation,
+    ///   and this says so rather than half-applying it.
+    ///
+    /// [`crate::RevocationAdoption::inbox_key`] is therefore always `None` on
+    /// this path.
+    pub fn apply_own_roster_notice(
+        &self,
+        document: Vec<u8>,
+        person_root_sign_pk: Vec<u8>,
+        own_device_id: Vec<u8>,
+        now_ms: i64,
+    ) -> Result<crate::RevocationAdoption, CoreError> {
+        use crate::device_roster::{RosterUpdateOutcome, RosterUpdateReason};
+        use crate::revocation::{core_roster_newly_revoked, RevocationAdoptionOutcome};
+
+        let held = self.own_roster()?.ok_or_else(|| {
+            CoreError::Store(
+                "this device has no roster of its own, so it has no fleet to be removed from"
+                    .to_string(),
+            )
+        })?;
+        // The DL-3 wire codec, not this module's storage codec: a notice
+        // carries exactly the document `KIND_ROSTER_GOSSIP` already puts on a
+        // wire, so one roster has one shape wherever it travels.
+        let incoming = crate::core_decode_roster(document)?;
+        if incoming.person_id != held.person_id {
+            return Err(CoreError::Malformed(
+                "an own-roster notice names a different person".to_string(),
+            ));
+        }
+        let stored_quarantined = {
+            let conn = self.locked_conn();
+            crate::roster_store::load_state(&conn, &held.person_id)?.quarantined
+        };
+        let decision = crate::core_roster_accept(
+            Some(held.clone()),
+            stored_quarantined,
+            incoming.clone(),
+            person_root_sign_pk,
+        );
+        let revoked_device_ids = core_roster_newly_revoked(Some(held.clone()), incoming.clone());
+        let answer = |outcome, reason, revoked_device_ids| crate::RevocationAdoption {
+            outcome,
+            reason,
+            revoked_device_ids,
+            inbox_key: None,
+            resealed_records: 0,
+            unresealable_records: 0,
+        };
+        match decision.outcome {
+            RosterUpdateOutcome::Accepted => {}
+            RosterUpdateOutcome::ForkQuarantined => {
+                {
+                    let conn = self.locked_conn();
+                    crate::roster_store::mark_quarantined(&conn, &held.person_id)?;
+                }
+                // Deliberately fails toward NOT ejecting: DL-2 says a person
+                // resolves a fork, and bricking a device on the strength of one
+                // branch of it would let a fork be weaponised into a remote
+                // stop. The shell surfaces the quarantine instead of swallowing
+                // it — a device left live in this corner is the reported
+                // symptom, and it is the safer half of the trade.
+                return Ok(answer(
+                    RevocationAdoptionOutcome::ForkQuarantined,
+                    decision.reason,
+                    Vec::new(),
+                ));
+            }
+            RosterUpdateOutcome::Ignored => {
+                return Ok(answer(
+                    match decision.reason {
+                        RosterUpdateReason::Rollback | RosterUpdateReason::IdempotentRepeat => {
+                            RevocationAdoptionOutcome::NotSuperseding
+                        }
+                        _ => RevocationAdoptionOutcome::Refused,
+                    },
+                    decision.reason,
+                    Vec::new(),
+                ));
+            }
+        }
+        if incoming
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone.device_id == own_device_id)
+        {
+            self.eject_self_from_fleet(&incoming, &own_device_id, now_ms)?;
+            return Ok(answer(
+                RevocationAdoptionOutcome::RevokedSelf,
+                decision.reason,
+                revoked_device_ids,
+            ));
+        }
+        if !incoming
+            .devices
+            .iter()
+            .any(|cert| cert.device_id() == own_device_id)
+        {
+            // Neither listed nor buried. Not this device's roster to adopt, and
+            // not evidence it was removed either — `adopt_own_roster` refuses
+            // exactly this document, and so does this.
+            return Ok(answer(
+                RevocationAdoptionOutcome::Refused,
+                RosterUpdateReason::Invalid,
+                Vec::new(),
+            ));
+        }
+        if incoming.inbox_key_generation != held.inbox_key_generation {
+            return Ok(answer(
+                RevocationAdoptionOutcome::AwaitingRotationKey,
+                decision.reason,
+                revoked_device_ids,
+            ));
+        }
+        self.store_own_roster(&incoming)?;
+        self.project_own_fleet(&incoming, &own_device_id)?;
+        Ok(answer(
+            RevocationAdoptionOutcome::Adopted,
+            decision.reason,
+            revoked_device_ids,
+        ))
+    }
 }
 
 impl MessageStore {
@@ -1247,6 +1502,104 @@ impl MessageStore {
         Ok(())
     }
 
+    /// **The self-eject.** One device, told by a signed roster of its own person
+    /// that it has been buried, taking itself off the mesh (§10 step 5).
+    ///
+    /// Three writes, and they are one transaction because the intermediate
+    /// states are each worse than either end. A device with the news written
+    /// down but the gate still open keeps advertising under a roster that
+    /// disowns it; a device with the gate shut but its fleet projection intact
+    /// still names siblings whose relay rows it must withhold acks for, out of a
+    /// membership that no longer exists.
+    ///
+    /// 1. **Store the document.** Not through [`Self::adopt_own_roster`], which
+    ///    correctly refuses a roster that does not list this device. Written
+    ///    directly, so the news is durable and DL-1-monotone: the same notice
+    ///    arriving again reads as an idempotent repeat instead of re-running
+    ///    this, and the phone stops reporting a fleet it is not in.
+    /// 2. **Clear the projection.** No `own_device_id`, no siblings — which is
+    ///    [`OwnDeviceFleet::default`]'s shape and passes its validator, since a
+    ///    fleet that names nobody names no self either. Its version is raised to
+    ///    the burying roster's rather than reset, because
+    ///    [`MessageStore::set_own_device_fleet`](crate::MessageStore::set_own_device_fleet)'s
+    ///    DL-1 monotonicity is exactly what stops an old `.cmbak` from
+    ///    resurrecting a fleet a revocation has narrowed — and this is the
+    ///    narrowest one there is. The version is never lowered: if a later
+    ///    projection is somehow already stored, the rows still go, and only the
+    ///    counter stands still.
+    /// 3. **Shut the gate**, by writing [`CoreLinkActivationStage::Revoked`].
+    ///
+    /// The store's own `set_own_device_fleet` is deliberately not called: it
+    /// takes the connection mutex itself, and this has to hold it across all
+    /// three writes for the transaction to mean anything.
+    pub(crate) fn eject_self_from_fleet(
+        &self,
+        roster: &Roster,
+        own_device_id: &[u8],
+        now_ms: i64,
+    ) -> Result<(), CoreError> {
+        let document = encode_roster_document(roster);
+        let version = roster.version();
+        let mut conn = self.locked_conn();
+        let tx = conn.transaction().map_err(store_err)?;
+        tx.execute(
+            "INSERT INTO own_roster (id, document) VALUES (0, ?1)
+             ON CONFLICT(id) DO UPDATE SET document = excluded.document",
+            params![document],
+        )
+        .map_err(store_err)?;
+        let stored: Option<(i64, i64)> = tx
+            .query_row(
+                "SELECT recovery_epoch, seq FROM own_device_fleet_version WHERE id = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(store_err)?;
+        let supersedes = match stored {
+            Some((recovery_epoch, seq)) => {
+                version
+                    > crate::RosterVersion {
+                        recovery_epoch: recovery_epoch as u64,
+                        seq: seq as u64,
+                    }
+            }
+            None => true,
+        };
+        if supersedes {
+            tx.execute(
+                "INSERT INTO own_device_fleet_version (id, recovery_epoch, seq) VALUES (0, ?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET recovery_epoch = excluded.recovery_epoch,
+                                               seq = excluded.seq",
+                params![version.recovery_epoch as i64, version.seq as i64],
+            )
+            .map_err(store_err)?;
+        }
+        tx.execute("DELETE FROM own_device_fleet", [])
+            .map_err(store_err)?;
+        // `own_device_id` is kept: a surface has to be able to say which device
+        // this was, and DL-4 means the id is never reissued to anything else.
+        tx.execute(
+            "INSERT INTO device_link_activation
+                (id, stage, expected_roster_head, own_device_id, channel_binding,
+                 started_at_ms, bootstrap_imported_at_ms, activated_at_ms)
+             VALUES (0, ?1, NULL, ?2, NULL, ?3, 0, 0)
+             ON CONFLICT(id) DO UPDATE SET
+                 stage = excluded.stage,
+                 expected_roster_head = NULL,
+                 own_device_id = excluded.own_device_id,
+                 channel_binding = NULL",
+            params![
+                stage_text(CoreLinkActivationStage::Revoked),
+                own_device_id,
+                now_ms
+            ],
+        )
+        .map_err(store_err)?;
+        tx.commit().map_err(store_err)?;
+        Ok(())
+    }
+
     fn project_own_fleet(&self, roster: &Roster, own_device_id: &[u8]) -> Result<(), CoreError> {
         self.set_own_device_fleet(OwnDeviceFleet {
             own_device_id: Some(own_device_id.to_vec()),
@@ -1266,6 +1619,7 @@ fn stage_text(stage: CoreLinkActivationStage) -> &'static str {
         CoreLinkActivationStage::AwaitingBootstrap => "awaiting_bootstrap",
         CoreLinkActivationStage::AwaitingRosterAck => "awaiting_roster_ack",
         CoreLinkActivationStage::Activated => "activated",
+        CoreLinkActivationStage::Revoked => "revoked",
     }
 }
 
@@ -1277,6 +1631,10 @@ fn stage_from_text(text: &str) -> CoreLinkActivationStage {
         "not_linking" => CoreLinkActivationStage::NotLinking,
         "awaiting_roster_ack" => CoreLinkActivationStage::AwaitingRosterAck,
         "activated" => CoreLinkActivationStage::Activated,
+        "revoked" => CoreLinkActivationStage::Revoked,
+        // Unreadable fails closed onto a silent stage, which is why a downgrade
+        // that cannot spell "revoked" still stops advertising rather than
+        // waking up as an activated device.
         _ => CoreLinkActivationStage::AwaitingBootstrap,
     }
 }
@@ -1982,5 +2340,372 @@ mod tests {
         )
         .unwrap();
         assert_eq!(recovered.inbox_key_generation, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // §10 step 5: how a removed device finds out, and what it does about it
+    // -----------------------------------------------------------------------
+
+    /// One person's fleet, built through the shipped ceremonies so every
+    /// signature is a real one, and the four rosters the notice tests need.
+    struct Fleet {
+        person: crate::Identity,
+        approver: crate::DeviceKeypair,
+        /// The device whose store the tests below are, and the one that gets
+        /// removed.
+        me: crate::DeviceKeypair,
+        /// Approver + me. What this device holds before anything happens.
+        held: Roster,
+        /// Approver + me + a third device: strictly later, still lists me, same
+        /// inbox key generation.
+        grown: Roster,
+        /// The third device revoked: strictly later than `grown`, still lists
+        /// me, and a rotated inbox key generation this device does not hold.
+        rotated: Roster,
+        /// ME revoked. This is the document the field session's removed phone
+        /// never saw.
+        burying: Roster,
+    }
+
+    fn fleet() -> Fleet {
+        let person = generate_identity();
+        let approver = generate_device_keypair();
+        let me = generate_device_keypair();
+        let third = generate_device_keypair();
+        let genesis = core_link_genesis_roster(
+            person.sign_sk.clone(),
+            approver.sign_pk.clone(),
+            approver.agree_pk.clone(),
+        )
+        .unwrap();
+        let held = core_link_sign_new_device_roster(
+            genesis,
+            person.sign_pk.clone(),
+            approver.sign_sk.clone(),
+            me.sign_pk.clone(),
+            me.agree_pk.clone(),
+        )
+        .unwrap()
+        .roster;
+        let grown = core_link_sign_new_device_roster(
+            held.clone(),
+            person.sign_pk.clone(),
+            approver.sign_sk.clone(),
+            third.sign_pk.clone(),
+            third.agree_pk.clone(),
+        )
+        .unwrap()
+        .roster;
+        let rotated = crate::core_revoke_devices_roster(
+            grown.clone(),
+            person.sign_pk.clone(),
+            approver.sign_sk.clone(),
+            vec![third.device_id.clone()],
+            crate::core_mint_inbox_key(grown.inbox_key_generation),
+        )
+        .unwrap()
+        .roster;
+        let burying = crate::core_revoke_devices_roster(
+            held.clone(),
+            person.sign_pk.clone(),
+            approver.sign_sk.clone(),
+            vec![me.device_id.clone()],
+            crate::core_mint_inbox_key(held.inbox_key_generation),
+        )
+        .unwrap()
+        .roster;
+        Fleet {
+            person,
+            approver,
+            me,
+            held,
+            grown,
+            rotated,
+            burying,
+        }
+    }
+
+    /// The removed device's own store, as it stands the moment before the news
+    /// reaches it: holding the pre-revocation roster, projected into a fleet of
+    /// two, and permitted to do everything.
+    fn my_store(fleet: &Fleet) -> MessageStore {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        store
+            .adopt_own_roster(
+                fleet.held.clone(),
+                fleet.person.sign_pk.clone(),
+                fleet.me.device_id.clone(),
+            )
+            .unwrap();
+        store
+    }
+
+    fn notice(roster: &Roster) -> Vec<u8> {
+        crate::core_encode_roster(roster.clone()).unwrap()
+    }
+
+    fn apply(store: &MessageStore, fleet: &Fleet, roster: &Roster) -> crate::RevocationAdoption {
+        store
+            .apply_own_roster_notice(
+                notice(roster),
+                fleet.person.sign_pk.clone(),
+                fleet.me.device_id.clone(),
+                NOW,
+            )
+            .unwrap()
+    }
+
+    /// **The field bug, closed.** A removed phone that meets its approver reads
+    /// a signed roster burying it, and stops: no advertising, no authoring, no
+    /// acking, no fleet, and a stage a shell can surface.
+    #[test]
+    fn a_removed_device_learns_from_a_signed_roster_and_ejects_itself() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+        assert_eq!(store.own_device_fleet().unwrap().device_ids.len(), 2);
+        assert!(
+            store
+                .link_gate(CoreLinkGatedAction::Advertise)
+                .unwrap()
+                .allowed
+        );
+
+        let adoption = apply(&store, &fleet, &fleet.burying);
+        assert_eq!(
+            adoption.outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf
+        );
+        assert_eq!(
+            adoption.revoked_device_ids,
+            vec![fleet.me.device_id.clone()]
+        );
+        // A plaintext link frame carries no key material and never will.
+        assert_eq!(adoption.inbox_key, None);
+
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.burying);
+        assert_eq!(
+            store.own_device_fleet().unwrap(),
+            OwnDeviceFleet {
+                own_device_id: None,
+                device_ids: Vec::new(),
+                projected_from: fleet.burying.version(),
+            }
+        );
+        let activation = store.link_activation().unwrap();
+        assert_eq!(activation.stage, CoreLinkActivationStage::Revoked);
+        assert_eq!(activation.own_device_id, Some(fleet.me.device_id.clone()));
+        for action in [
+            CoreLinkGatedAction::Advertise,
+            CoreLinkGatedAction::Author,
+            CoreLinkGatedAction::Ack,
+        ] {
+            let verdict = store.link_gate(action).unwrap();
+            assert!(!verdict.allowed);
+            assert_eq!(verdict.reason, CoreLinkGateReason::DeviceRevoked);
+        }
+        // DL-4: the way back is a fresh install under a fresh device key.
+        assert!(store.begin_link_activation(BINDING.to_vec(), NOW).is_err());
+        assert!(store.abandon_link_activation(NOW).is_err());
+    }
+
+    /// The notice is authenticated by the document, not by the link: a roster
+    /// this person's root did not vouch for buries nobody, however it arrived.
+    #[test]
+    fn an_own_roster_notice_the_person_root_did_not_sign_changes_nothing() {
+        let fleet = fleet();
+        let stranger = generate_identity();
+        let forged = crate::core_sign_roster(fleet.burying.clone(), stranger.sign_sk).unwrap();
+
+        let store = my_store(&fleet);
+        let adoption = apply(&store, &fleet, &forged);
+        assert_eq!(adoption.outcome, crate::RevocationAdoptionOutcome::Refused);
+        assert_eq!(adoption.reason, crate::RosterUpdateReason::Invalid);
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.held);
+        assert_eq!(store.own_device_fleet().unwrap().device_ids.len(), 2);
+        assert_eq!(
+            store.link_activation().unwrap().stage,
+            CoreLinkActivationStage::NotLinking
+        );
+
+        // The same document under a signature that IS the person's does bury.
+        assert_eq!(
+            apply(&store, &fleet, &fleet.burying).outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf
+        );
+    }
+
+    /// DL-1 through the notice path: the roster this device already holds is
+    /// not news, and a burial replayed at a device that has already ejected is
+    /// idempotent rather than a second ejection.
+    #[test]
+    fn a_stale_or_repeated_own_roster_notice_changes_nothing() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+
+        let repeat = apply(&store, &fleet, &fleet.held);
+        assert_eq!(
+            repeat.outcome,
+            crate::RevocationAdoptionOutcome::NotSuperseding
+        );
+        assert_eq!(repeat.reason, crate::RosterUpdateReason::IdempotentRepeat);
+        assert!(
+            store
+                .link_gate(CoreLinkGatedAction::Author)
+                .unwrap()
+                .allowed
+        );
+
+        assert_eq!(
+            apply(&store, &fleet, &fleet.burying).outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf
+        );
+        // Replayed. The burial is stored, so DL-1 answers before anything is
+        // written a second time, and the stage does not move.
+        let replay = apply(&store, &fleet, &fleet.burying);
+        assert_eq!(
+            replay.outcome,
+            crate::RevocationAdoptionOutcome::NotSuperseding
+        );
+        assert_eq!(
+            store.link_activation().unwrap().stage,
+            CoreLinkActivationStage::Revoked
+        );
+        // And an OLDER roster does not un-bury it.
+        let rollback = apply(&store, &fleet, &fleet.held);
+        assert_eq!(
+            rollback.outcome,
+            crate::RevocationAdoptionOutcome::NotSuperseding
+        );
+        assert_eq!(rollback.reason, crate::RosterUpdateReason::Rollback);
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.burying);
+    }
+
+    /// The same carrier fixes ordinary sibling lag for free: a device that is
+    /// still listed adopts a later roster and re-projects its fleet.
+    #[test]
+    fn an_own_roster_notice_that_still_lists_this_device_converges() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+
+        let adoption = apply(&store, &fleet, &fleet.grown);
+        assert_eq!(adoption.outcome, crate::RevocationAdoptionOutcome::Adopted);
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.grown);
+        let projected = store.own_device_fleet().unwrap();
+        assert_eq!(projected.own_device_id, Some(fleet.me.device_id.clone()));
+        assert_eq!(projected.device_ids.len(), 3);
+        assert_eq!(projected.projected_from, fleet.grown.version());
+        assert!(
+            store
+                .link_gate(CoreLinkGatedAction::Author)
+                .unwrap()
+                .allowed
+        );
+    }
+
+    /// §6: a roster that announces a rotated inbox key is not adopted off a
+    /// plaintext frame, because the frame cannot carry the key. The gap is
+    /// reported instead of half-applied — §10.1's sealed handoff closes it.
+    #[test]
+    fn an_own_roster_notice_announcing_a_rotation_waits_for_its_key() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+        assert_eq!(
+            apply(&store, &fleet, &fleet.grown).outcome,
+            crate::RevocationAdoptionOutcome::Adopted
+        );
+
+        let adoption = apply(&store, &fleet, &fleet.rotated);
+        assert_eq!(
+            adoption.outcome,
+            crate::RevocationAdoptionOutcome::AwaitingRotationKey
+        );
+        assert_eq!(adoption.inbox_key, None);
+        assert_eq!(
+            store.own_roster().unwrap().unwrap(),
+            fleet.grown,
+            "nothing is written: a roster whose sync traffic this device cannot open is not adopted"
+        );
+    }
+
+    /// A roster about somebody else is never this device's news, whatever the
+    /// link claimed.
+    #[test]
+    fn an_own_roster_notice_must_be_about_this_person() {
+        let mine = fleet();
+        let theirs = fleet();
+        let store = my_store(&mine);
+        assert!(store
+            .apply_own_roster_notice(
+                notice(&theirs.burying),
+                mine.person.sign_pk.clone(),
+                mine.me.device_id.clone(),
+                NOW,
+            )
+            .is_err());
+        assert_eq!(store.own_roster().unwrap().unwrap(), mine.held);
+    }
+
+    /// The sending half: what goes out, and the states in which nothing does. A
+    /// removed device never announces — the news travels from the fleet toward
+    /// it, never out of it.
+    #[test]
+    fn the_own_roster_notice_frame_carries_the_document_and_stops_at_the_gate() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+
+        let frame = store.own_roster_notice_frame().unwrap().unwrap();
+        match crate::parse_frame(frame).unwrap() {
+            crate::Frame::OwnRoster { document } => {
+                assert_eq!(crate::core_decode_roster(document).unwrap(), fleet.held);
+            }
+            other => panic!("own roster notice parsed as {other:?}"),
+        }
+
+        // An install that has never linked has no roster to announce.
+        let fresh = MessageStore::open(":memory:".to_string()).unwrap();
+        assert_eq!(fresh.own_roster_notice_frame().unwrap(), None);
+
+        // And a device this mechanism has ejected says nothing at all.
+        assert_eq!(
+            apply(&store, &fleet, &fleet.burying).outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf
+        );
+        assert_eq!(store.own_roster_notice_frame().unwrap(), None);
+
+        // Nor does one still being adopted (§9.4's silence).
+        let adopting = MessageStore::open(":memory:".to_string()).unwrap();
+        adopting
+            .adopt_own_roster(
+                fleet.held.clone(),
+                fleet.person.sign_pk.clone(),
+                fleet.approver.device_id.clone(),
+            )
+            .unwrap();
+        adopting
+            .begin_link_activation(BINDING.to_vec(), NOW)
+            .unwrap();
+        assert_eq!(adopting.own_roster_notice_frame().unwrap(), None);
+    }
+
+    /// DL-5, asserted on the bytes that actually go out rather than inherited
+    /// from the type: an own-roster notice is keys, ids and counters. There is
+    /// no field an endpoint fits in today, and this is what notices it if one
+    /// is ever added.
+    #[test]
+    fn an_own_roster_notice_carries_no_endpoint() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+        let frame = store.own_roster_notice_frame().unwrap().unwrap();
+        for needle in [
+            "http".as_bytes(),
+            "192.168".as_bytes(),
+            ".local".as_bytes(),
+            "relay".as_bytes(),
+        ] {
+            assert!(
+                !frame.windows(needle.len()).any(|window| window == needle),
+                "an own-roster notice must never carry an address"
+            );
+        }
     }
 }

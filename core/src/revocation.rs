@@ -10,6 +10,18 @@
 //! 3. Receivers refuse signatures from a tombstoned `device_id` on newly
 //!    received events.
 //! 4. Contacts get the standard changed-safety-state surface treatment.
+//! 5. The removed device itself converges when it next meets a sibling on a
+//!    link that has proved it belongs to this person, and ejects itself.
+//!
+//! Step 5 is [`MessageStore::eject_self_from_fleet`] plus its two callers —
+//! [`MessageStore::adopt_revocation_handoff`] here and
+//! [`MessageStore::apply_own_roster_notice`] in `device_link::activation`, which
+//! is the carrier that can actually reach a device this roster has buried. It
+//! exists because steps 1 and 2 are the *capability* half: they take away what a
+//! thief could use, and deliberately say nothing to whoever is holding the
+//! phone. That is right for a thief and wrong for the person who found their own
+//! old phone in a drawer — without step 5 that phone believes itself linked
+//! forever, keeps advertising, and keeps accepting mail.
 //!
 //! Step 2 is [`crate::relay_rotation`], which takes this module's
 //! [`RevocationCommit`] as its trigger — a relay credential is rotated because
@@ -582,10 +594,29 @@ pub enum RevocationAdoptionOutcome {
     /// DL-1: the document does not supersede what is stored. Idempotent gossip,
     /// or a replay.
     NotSuperseding,
-    /// This device is the one being buried. Nothing is adopted: a tombstoned
-    /// device is not a member of the fleet it is being removed from, and
-    /// [`MessageStore::adopt_own_roster`] would refuse the document anyway.
+    /// This device is the one being buried, and it has ejected itself
+    /// ([`MessageStore::eject_self_from_fleet`], §10 step 5): the burying roster
+    /// is stored, the fleet projection is cleared, and the activation gate is
+    /// [`crate::CoreLinkActivationStage::Revoked`] — so this device no longer
+    /// advertises, authors or acks.
+    ///
+    /// No fleet is *adopted*, because a tombstoned device is not a member of the
+    /// fleet the document describes and
+    /// [`MessageStore::adopt_own_roster`] refuses it for exactly that reason.
+    /// What used to happen here was nothing at all: the outcome was reported and
+    /// no byte was written, which left a removed device reporting itself linked
+    /// forever.
     RevokedSelf,
+    /// The document supersedes what is held and still lists this device, but it
+    /// announces an inbox key generation this device does not hold — so there is
+    /// a §10.1 rotation still owed, and nothing was written.
+    ///
+    /// Only [`MessageStore::apply_own_roster_notice`] returns this: a plaintext
+    /// link frame carries a roster and never key material, so a device that
+    /// adopted the roster there would hold a fleet whose sync traffic it cannot
+    /// open. The sealed handoff is what closes this, and reporting the gap is
+    /// better than half-applying it.
+    AwaitingRotationKey,
     /// The acceptance rules refused the document — DL-2's fork quarantine,
     /// DL-4's tombstones, §6's generation rule, §14.2's epoch authority.
     /// [`RevocationAdoption::reason`] says which.
@@ -988,14 +1019,16 @@ impl MessageStore {
     /// writers an activation uses, so DL-1 ordering is enforced by the writers
     /// rather than restated here.
     ///
-    /// A device that finds *itself* tombstoned adopts nothing and is told so.
-    /// That is not a refusal to obey: the roster is the person's decision and it
-    /// stands. It is that a revoked device is not a member of the fleet the
-    /// document describes, so it has no fleet projection to write and no sync
-    /// context to keep — and [`Self::adopt_own_roster`] would refuse the
-    /// document anyway, for the same reason, with a less useful error. What the
-    /// shell does with the answer (WP6: stop, say so, offer to re-link with a
-    /// fresh key per DL-4) is above this line.
+    /// A device that finds *itself* tombstoned adopts nothing — a revoked device
+    /// is not a member of the fleet the document describes, so it has no fleet
+    /// projection to write and no sync context to keep, and
+    /// [`Self::adopt_own_roster`] would refuse the document anyway. What it does
+    /// instead is **eject itself** ([`Self::eject_self_from_fleet`], §10 step 5):
+    /// the burying roster is stored, the projection is cleared, and the
+    /// activation gate goes to [`crate::CoreLinkActivationStage::Revoked`], which
+    /// stops this device advertising, authoring and acking. `now_ms` stamps that
+    /// transition. What the shell does with the answer (WP6: say so, offer to set
+    /// up again under a fresh key per DL-4) is above this line.
     ///
     /// # The real acceptance rules run here, not a version comparison
     ///
@@ -1032,6 +1065,7 @@ impl MessageStore {
         person_root_sign_pk: Vec<u8>,
         own_device: DeviceKeypair,
         superseded_inbox_key: Option<InboxKey>,
+        now_ms: i64,
     ) -> Result<RevocationAdoption, CoreError> {
         let held = self.own_roster()?.ok_or_else(|| {
             CoreError::Store(
@@ -1102,6 +1136,13 @@ impl MessageStore {
             .iter()
             .any(|tombstone| tombstone.device_id == own_device.device_id)
         {
+            // §10 step 5. This arm used to return the outcome and write
+            // nothing, which meant a device that had been handed proof of its
+            // own burial went on advertising, authoring and acking exactly as
+            // before. The same writer serves the notice path in
+            // `device_link::activation`, so a device converges identically
+            // however the roster reached it.
+            self.eject_self_from_fleet(&incoming, &own_device.device_id, now_ms)?;
             return Ok(RevocationAdoption {
                 outcome: RevocationAdoptionOutcome::RevokedSelf,
                 reason: decision.reason,
@@ -1910,6 +1951,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 None,
+                NOW,
             )
             .expect("decides")
     }
@@ -2181,6 +2223,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 Some(fleet.inbox_key.clone()),
+                NOW,
             )
             .expect("adopts");
         assert_eq!(adoption.outcome, RevocationAdoptionOutcome::Adopted);
@@ -2206,6 +2249,7 @@ mod tests {
                     fleet.person.sign_pk.clone(),
                     fleet.sibling.clone(),
                     None,
+                    NOW,
                 )
                 .expect("re-offered")
                 .outcome,
@@ -2213,8 +2257,12 @@ mod tests {
         );
     }
 
+    /// §10 step 5, through the sealed-handoff door. The one thing this test
+    /// used to assert — "it keeps the roster it had" — was the bug: a device
+    /// handed proof of its own burial wrote nothing at all and went on
+    /// advertising, authoring and acking. It now ejects itself.
     #[test]
-    fn a_device_that_finds_itself_buried_adopts_nothing() {
+    fn a_device_that_finds_itself_buried_ejects_itself() {
         let fleet = fleet();
         let store = store_for(&fleet, &fleet.approver);
         let update = fleet.revoke_sibling();
@@ -2275,6 +2323,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 None,
+                NOW,
             )
             .expect("reads its own eviction notice");
         assert_eq!(adoption.outcome, RevocationAdoptionOutcome::RevokedSelf);
@@ -2283,9 +2332,49 @@ mod tests {
             vec![fleet.sibling.device_id.clone()]
         );
         assert_eq!(adoption.inbox_key, None);
-        // It keeps the roster it had: a device does not get to adopt a fleet it
-        // is not in, and nothing hands it the rotated key.
-        assert_eq!(buried_store.own_roster().unwrap().unwrap(), fleet.roster);
+        // No fleet is ADOPTED — a device does not join a fleet it is not in,
+        // and nothing hands it the rotated key. What it does instead is write
+        // the burial down and go quiet.
+        assert_eq!(
+            buried_store.own_roster().unwrap().unwrap(),
+            update.roster,
+            "the burying roster is stored, so the phone stops reporting a fleet it is not in"
+        );
+        assert_eq!(
+            buried_store.own_device_fleet().unwrap(),
+            crate::OwnDeviceFleet {
+                own_device_id: None,
+                device_ids: Vec::new(),
+                projected_from: update.roster.version(),
+            },
+            "the projection routing and acks read is cleared, at the burying roster's version"
+        );
+        let activation = buried_store.link_activation().unwrap();
+        assert_eq!(
+            activation.stage,
+            crate::CoreLinkActivationStage::Revoked,
+            "the gate is shut"
+        );
+        assert_eq!(
+            activation.own_device_id,
+            Some(fleet.sibling.device_id.clone()),
+            "a surface has to be able to say which device this was"
+        );
+        for action in [
+            crate::CoreLinkGatedAction::Advertise,
+            crate::CoreLinkGatedAction::Author,
+            crate::CoreLinkGatedAction::Ack,
+        ] {
+            let verdict = buried_store.link_gate(action).unwrap();
+            assert!(!verdict.allowed, "a removed device may not {action:?}");
+            assert_eq!(verdict.reason, crate::CoreLinkGateReason::DeviceRevoked);
+        }
+        // DL-4: the way back is a fresh install under a fresh device key, not a
+        // local reset of the state the person's decision put this device in.
+        assert!(buried_store
+            .begin_link_activation(vec![0x5C; 32], NOW)
+            .is_err());
+        assert!(buried_store.abandon_link_activation(NOW).is_err());
     }
 
     /// The handoff path runs [`core_roster_accept`], not a version
@@ -2323,6 +2412,7 @@ mod tests {
                     fleet.person.sign_pk.clone(),
                     fleet.sibling.clone(),
                     Some(fleet.inbox_key.clone()),
+                    NOW,
                 )
                 .expect("adopts")
                 .outcome,
@@ -2452,6 +2542,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 Some(fleet.inbox_key.clone()),
+                NOW,
             )
             .expect("adopts");
         assert_eq!(adoption.outcome, RevocationAdoptionOutcome::Adopted);
@@ -2549,6 +2640,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 Some(fleet.inbox_key.clone()),
+                NOW,
             )
             .expect("adopts");
         assert_eq!(adoption.outcome, RevocationAdoptionOutcome::Adopted);
@@ -2741,6 +2833,7 @@ mod tests {
                 fleet.person.sign_pk.clone(),
                 fleet.sibling.clone(),
                 Some(fleet.inbox_key.clone()),
+                NOW,
             )
             .expect("adopts");
         assert_eq!(adoption.outcome, RevocationAdoptionOutcome::Adopted);

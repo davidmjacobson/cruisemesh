@@ -280,9 +280,18 @@ Deep-link route `CMLINK1:` (registered alongside the existing
    LAN/BLE/relay, both screens show a short authentication string; the
    user confirms match **on the existing device** (explicit tap).
 3. Approving device streams the **canonical bootstrap** — a versioned
-   export (identity material incl. inbox key, contacts + their rosters,
+   export (identity material incl. inbox key, **the person's own profile:
+   display name, photo, photo revision**, contacts + their rosters,
    group state, recent history head) — NOT a raw sqlite clone; the rest
-   of history arrives as ordinary self-sync catch-up.
+   of history arrives as ordinary self-sync catch-up. The profile is
+   inside the export's signature like everything else, and it is there
+   for the reason the closing paragraph of this section gives: restore
+   and link are two doors out of the same first-run screen, restore has
+   always carried a name and a photo, and landing somebody in two
+   different states depending on which door they used is not a choice
+   worth having. Without it the adopted phone asks a person their own
+   name and stores whatever they type locally, which forks the profile
+   against the rest of their fleet.
 4. **Two-phase activation.** The approving device signs the new roster
    (seq+1) including the new cert. The new device may not advertise,
    author, or ack ANYTHING until it (a) has imported the bootstrap and
@@ -290,6 +299,11 @@ Deep-link route `CMLINK1:` (registered alongside the existing
    device. Until then it is invisible on the mesh.
 5. Roster gossips to contacts per §4; senders start adding a relay row
    and (eventually) hints for the new device as the roster reaches them.
+6. **The adopted device enters the app.** It never re-runs first-run
+   setup, and it is never offered the link door it just came through.
+   Outstanding permission grants are handled exactly the way a restored
+   device handles them — on the home surface, not by putting a wizard
+   back in front of somebody whose phone is already linked.
 
 Restore-from-backup UX changes to match: opening a `.cmbak` on a fresh
 install offers **"Replace this device"** (old semantics, same device
@@ -314,6 +328,26 @@ On "Remove device" (approving device) or recovery-code override:
    received events (already-stored history stays; the stream is sealed
    at its last pre-revocation point).
 4. Contacts get the standard changed-safety-state surface treatment.
+5. **The removed device converges and ejects itself.** Steps 1–4 are
+   addressed to contacts and to *remaining* own devices, so nothing in
+   them ever reaches the device being removed — deliberately, since a
+   thief must not be tipped off. But an honest "I found my old phone in a
+   drawer" device is on the same footing and otherwise believes itself
+   linked forever, keeps advertising, and keeps accepting messages. So:
+   when a removed device next meets a sibling on a link that has already
+   proved it belongs to this person — a LAN Noise session whose remote
+   static key is this person's own agreement key — the sibling pushes the
+   current signed roster (frame `0x07`, gated by `CAP_OWN_ROSTER_NOTICE`
+   on HELLO2). A device that reads a roster tombstoning itself stores it,
+   clears its fleet projection, stops advertising, authoring and acking,
+   and surfaces that it was removed.
+
+   This is not a heads-up a revoked device can race. Steps 1 and 2
+   withdraw its capability at the moment of removal, before any meeting;
+   by the time it hears, there is nothing left to run for. And it hears
+   only from a document signed under the person root that strictly
+   supersedes the one it held, so "you're out" is never a bare hint a
+   stranger can inject or a fork can fake.
 
 Notes on step 3, recorded so the guarantee is not read as stronger than
 it is (WP5):
@@ -342,6 +376,34 @@ it is (WP5):
   non-goal. What the rotation withdraws is the fleet's self-sync channel,
   the retained backlog, and (with step 2) the relay mailbox.
 
+Notes on step 5, for the same reason:
+
+- **A BLE-only meeting does not converge.** BLE HELLO is cleartext and
+  proves nothing about who is on the other end, so it cannot satisfy the
+  test the notice requires and never carries one. That limitation is
+  recorded here rather than fixed by weakening the test: the roster is a
+  private fact about how many devices a person has, and a stranger who
+  claimed this person's `user_id` in a HELLO must not be able to elicit
+  it. Same Wi-Fi is the common family case and is what converges.
+- **A quarantined fork shadows ejection.** A removed device handed a
+  document that forks the roster it holds (DL-2) quarantines instead of
+  ejecting, and stays live. That fails toward not bricking a device on
+  the strength of one branch of a fork — the alternative would make a
+  fork weaponisable into a remote stop — and it leaves the reported
+  symptom intact in that corner. The shell surfaces the quarantine rather
+  than swallowing it.
+- **The notice carries no key material.** It is a plaintext link frame
+  carrying the DL-3 document and nothing else, so a device that is still
+  listed but whose roster announces a *rotated* inbox key generation does
+  not adopt it — there would be no key to open the fleet's traffic with.
+  Step 1's sealed handoff is what carries that; the notice reports the
+  gap instead of half-applying it.
+- **The stage is terminal.** A device that has ejected itself is not in a
+  window that closes: DL-4 buries its `device_id` forever, so the only
+  way back is a fresh install under a fresh device key. The §9.4 gate
+  gains one stage for this, and neither beginning nor abandoning a
+  ceremony can leave it.
+
 Long-term (out of v1, tracked as WP8): per-device opaque fetch/ack
 capabilities in relayd, so one device can be cut without rotating the
 whole family token.
@@ -364,6 +426,14 @@ exists.
   already reserved at `core/src/protocol.rs:350`, next free bit after
   `CAP_ACKS_HIDDEN_KINDS = 1`, `CAP_RELAY_UPDATE = 1 << 1` — WPT shipped
   the reservation, WP1 flips the advertisement).
+- `CAP_ROSTER_GOSSIP = 1 << 3` (kind 21, DL-3) and
+  `CAP_OWN_ROSTER_NOTICE = 1 << 4` (frame `0x07`, §10 step 5) ride the
+  same frame under the same rule: one bit per thing a peer must
+  understand, never a bit that quietly grows a member, so an
+  advertisement a shipped build made honestly keeps meaning what it meant.
+  A build that predates frame `0x07` refuses the unknown type byte in
+  `parse_frame` and both shells drop an unparseable frame without
+  touching the link, so sending it is safe even where it is pointless.
 - Envelope public header unchanged; new fields sealed-body only (§5).
 - **Friend card v4 (`CMFRIEND4`)** adds the roster head (or its hash) so
   new friendships start multi-device-aware. Rollout copies the proven v3
@@ -450,7 +520,9 @@ double-authoring.
 of revoked signatures, contact notification surface.
 *Gate:* mixed-fleet test incl. a months-offline contact sealing to a
 stale roster; revoked device demonstrably loses relay fetch after
-rotation.
+rotation; a revoked device that meets its approver on a LAN self-ejects
+— stops advertising, authoring and acking, and stops reporting a fleet
+it is not in.
 
 **WP6 — Shell UX (Android + iOS, same wave).** "Your devices" list,
 link/remove flows, person-level receipts, Advanced holds per-device
