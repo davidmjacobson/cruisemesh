@@ -103,5 +103,11 @@ struct ReactionPillRow: View {
         }
         .padding(.leading, isOwn ? 0 : 10)
         .padding(.trailing, isOwn ? 10 : 0)
+        // Pull the visible pill halfway over the bubble, then reclaim the
+        // same height from the row so a reaction does not create a dead band
+        // before the next message. Offset preserves the button's hit target.
+        .offset(y: -12)
+        .padding(.bottom, -12)
+        .zIndex(1)
     }
 }

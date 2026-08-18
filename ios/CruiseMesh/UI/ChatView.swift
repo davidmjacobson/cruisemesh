@@ -764,10 +764,19 @@ private struct MessageBubbleView: View {
                         )
                     }
                     content
-                    if let tick {
-                        HStack {
+                    if grouping.showTimestamp || tick != nil {
+                        HStack(spacing: 5) {
                             Spacer(minLength: 0)
-                            SignalTickView(status: tick, tint: isOwn ? .white : .secondary)
+                            if grouping.showTimestamp {
+                                Text(timeLabel)
+                                    .font(.caption2)
+                                    .foregroundStyle(
+                                        (isOwn ? Color.white : Color.primary).opacity(0.7)
+                                    )
+                            }
+                            if let tick {
+                                SignalTickView(status: tick, tint: isOwn ? .white : .secondary)
+                            }
                         }
                     }
                 }
@@ -818,12 +827,6 @@ private struct MessageBubbleView: View {
                     Text("Not delivered")
                         .font(.caption2)
                         .foregroundStyle(.red)
-                }
-
-                if grouping.showTimestamp {
-                    Text(timeLabel)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
 
                 // Set only for a message spliced in above content already

@@ -891,6 +891,7 @@ private fun ConversationScreen(
                             tick = focusedTick,
                             contactColor = if (focusedIsOwn) null else contactColor,
                             shape = focusedShape,
+                            showTimestamp = focusedGrouping.showTimestamp,
                             reactions = focusedReactions,
                             onReact = { emoji ->
                                 toggleReaction(currentFocused.target, emoji)
@@ -1594,7 +1595,7 @@ fun bubbleShapeFor(isOwn: Boolean, grouping: BubbleGrouping): RoundedCornerShape
 )
 
 @Composable
-private fun MessageBubble(
+internal fun MessageBubble(
     message: StoredMessage,
     isFocused: Boolean,
     isOwn: Boolean,
@@ -1693,6 +1694,7 @@ private fun MessageBubble(
                 tick = tick,
                 contactColor = contactColor,
                 shape = shape,
+                showTimestamp = grouping.showTimestamp,
                 reactions = reactions,
                 onReact = onReact,
                 quoted = quoted,
@@ -1721,14 +1723,6 @@ private fun MessageBubble(
                         onLongClick = { onLongPress(target, boundsInRoot) },
                     ),
             )
-            if (grouping.showTimestamp) {
-                Text(
-                    text = formatConversationTimestamp(context, message.timestamp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                )
-            }
             // Only set when this message was spliced in above content that was
             // already here (core/src/late_arrival.rs), which is the one case
             // where its position needs explaining. The bubble keeps the
@@ -1786,6 +1780,7 @@ fun MessageBubbleVisual(
     tick: TickStatus?,
     contactColor: Color?,
     shape: RoundedCornerShape,
+    showTimestamp: Boolean,
     reactions: List<ReactionSummary>,
     onReact: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -1793,6 +1788,7 @@ fun MessageBubbleVisual(
     onQuotedClick: (() -> Unit)? = null,
     bodyActions: MessageBodyActions? = null,
 ) {
+    val context = LocalContext.current
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -1809,6 +1805,7 @@ fun MessageBubbleVisual(
             color = bubbleColor,
             contentColor = contentColor,
             shape = shape,
+            modifier = Modifier.testTag(MESSAGE_BUBBLE_SURFACE_TEST_TAG),
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
                 if (quoted != null) {
@@ -1845,24 +1842,35 @@ fun MessageBubbleVisual(
                         )
                     }
                 }
-                if (tick != null) {
+                if (showTimestamp || tick != null) {
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(top = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.End,
                     ) {
+                        if (showTimestamp) {
+                            Text(
+                                text = formatConversationTimestamp(context, message.timestamp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = contentColor.copy(alpha = 0.7f),
+                            )
+                        }
                         val tint = when (tick) {
                             TickStatus.SENT -> tickBaseColor.copy(alpha = 0.88f)
                             TickStatus.DELIVERED -> tickBaseColor.copy(alpha = 0.74f)
                             TickStatus.READ -> tickBaseColor
+                            null -> tickBaseColor
                         }
-                        SignalTick(
-                            status = tick,
-                            tint = tint,
-                            bubbleColor = bubbleColor,
-                            modifier = Modifier.padding(start = 8.dp, bottom = 2.dp),
-                        )
+                        if (tick != null) {
+                            SignalTick(
+                                status = tick,
+                                tint = tint,
+                                bubbleColor = bubbleColor,
+                                modifier = Modifier.padding(start = 6.dp, bottom = 2.dp),
+                            )
+                        }
                     }
                 }
             }
@@ -1878,6 +1886,8 @@ fun MessageBubbleVisual(
     }
 }
 
+internal const val MESSAGE_BUBBLE_SURFACE_TEST_TAG = "message-bubble-surface"
+
 @OptIn(ExperimentalFoundationApi::class)
 fun Modifier.messageActions(
     onClick: () -> Unit = {},
@@ -1888,24 +1898,25 @@ fun Modifier.messageActions(
 )
 
 /**
- * How far the reaction row is pulled back up under the bubble.
+ * How far the reaction row is pulled back up over the bubble.
  *
  * A chip is a ~24dp pill, but [minimumInteractiveComponentSize] grows its
  * touch target to 48dp, which hangs ~12dp of invisible padding above the
  * pill. Laid out naively that padding reads as a gap, so the chips floated
- * ~15dp below the bubble instead of tucking under its bottom edge. This
- * cancels the top half of that padding; the pill itself is untouched and so
- * is the 48dp target.
+ * ~15dp below the bubble instead of tucking under its bottom edge. The first
+ * 12dp cancels the touch target's invisible top padding; the second
+ * 12dp pulls the visible pill over the bubble, Signal-style. The 48dp target
+ * is still measured; its overlapped upper portion deliberately shares the
+ * bubble's tap-winning area while the rest remains below the edge.
  */
-private val REACTION_ROW_TUCK = 12.dp
+private val REACTION_ROW_TUCK = 24.dp
 
 /**
  * Pull the row up by [amount] *and* shrink the space it claims by the same
  * amount, so tucking the chips under the bubble doesn't leave a dead band
  * before the next message. The bottom edge of the content stays flush with
- * the bottom of the reported bounds, so the whole touch target is still
- * inside them; only transparent padding ends up above the row, overlapping
- * the bubble's own (in-bounds, and therefore tap-winning) area.
+ * the bottom of the reported bounds. Content placed above the row overlaps
+ * the bubble's own in-bounds (and therefore tap-winning) area.
  */
 private fun Modifier.tuckUnderBubble(amount: Dp): Modifier = layout { measurable, constraints ->
     val placeable = measurable.measure(constraints)
