@@ -23,7 +23,7 @@ struct ShorePassView: View {
     @State private var showSetupQR = false
     @State private var showRemoveConfirmation = false
     @State private var showCredentialRefreshConfirmation = false
-    @State private var credentialRefreshMessage: String?
+    @State private var credentialRefreshMessage: LocalizedStringKey?
     @State private var customUrl: String
     @State private var customToken: String
     /// Last health that was an actual answer, so an in-flight re-check keeps
