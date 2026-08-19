@@ -828,6 +828,7 @@
     <string name="ui_your_devices_intro">These are signed in as you. They all get your messages and stay in step with each other.</string>
     <string name="ui_your_devices_only_this_one">This is the only device signed in as you. Add another and they will share your contacts, groups and messages.</string>
     <string name="ui_your_devices_names_are_local">Names you give devices stay on this phone. Nobody else sees them.</string>
+    <string name="ui_your_devices_pass_not_changed">Your family\'s Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass.</string>
     <string name="ui_this_phone">This phone</string>
     <string name="ui_device_numbered">Device %1$d</string>
     <string name="ui_device_approves_new_devices">Approves new devices</string>
@@ -850,6 +851,8 @@
     <string name="ui_remove_device_named">Remove %1$s</string>
     <string name="ui_remove_this_device_question">Remove this device?</string>
     <string name="ui_remove_device_what_happens">%1$s stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.</string>
+    <string name="ui_remove_device_what_happens_with_pass">%1$s stops staying in step with your other devices now, and loses your family\'s Shore Pass mailbox as soon as this phone is online. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.</string>
+    <string name="ui_remove_device_pass_card_again">Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them.</string>
     <string name="ui_remove_device_what_survives">Your contacts, groups and messages stay on your other devices. Messages already on the removed device stay on it.</string>
     <string name="ui_remove_device_cannot_undo">You cannot undo this. If you use that device again later, set it up as a new device.</string>
     <string name="ui_removing_device">Removing…</string>

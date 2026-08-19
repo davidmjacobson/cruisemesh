@@ -131,6 +131,16 @@
         }
       }
     },
+    "%@ stops staying in step with your other devices now, and loses your family's Shore Pass mailbox as soon as this phone is online. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ stops staying in step with your other devices now, and loses your family's Shore Pass mailbox as soon as this phone is online. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed."
+          }
+        }
+      }
+    },
     "%@ stops staying in step with your other devices now. The next time it is on the same Wi-Fi as one of them, it stops sending and receiving messages altogether and says it was removed.": {
       "localizations": {
         "en": {
@@ -5649,6 +5659,16 @@
         }
       }
     },
+    "Your family's Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your family's Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass."
+          }
+        }
+      }
+    },
     "Your family's Shore Pass storage is full": {
       "localizations": {
         "en": {
@@ -5675,6 +5695,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your name"
+          }
+        }
+      }
+    },
+    "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them."
           }
         }
       }

@@ -94,6 +94,19 @@
 //! device that finds a pending rotation is therefore "try the new token; if it
 //! authorizes, the rotation happened".
 //!
+//! # Who runs it, and when
+//!
+//! The removal itself never waits for the relay. `RemoveDeviceSession` plans
+//! the rotation and writes the journal row the moment §10.1 commits, and then
+//! stops: a phone that was removed on a ship with no internet is removed, and
+//! a ceremony that could fail on connectivity would be one a person retries by
+//! guessing. The call itself belongs to whatever already knows how to talk to
+//! the family relay — the relay sync pass, which owns the bind target, the
+//! validated-network rule and the rate-limit window — so both shells drive the
+//! pending row from there, on the same catch-up footing as the roster gossip
+//! and the T23 endpoint notice. [`core_relay_rotation_next_step`] is the
+//! decision procedure they share for an answer that was not a rotation.
+//!
 //! Nothing in this module acks, deletes or dispatches an envelope, so the DTN
 //! ack-safety invariant is untouched. Nothing here puts an endpoint in a
 //! roster or forwards a third party's, so the endpoint-privacy invariant is
@@ -536,6 +549,134 @@ impl MessageStore {
             return Ok(None);
         };
         Ok(decode_relay_credential(&entry.value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Driving the call: what a shell does with an answer that was not a rotation
+// ---------------------------------------------------------------------------
+
+/// The shortest gap between two rotate calls that a family's own rate bucket
+/// will sustain indefinitely.
+///
+/// relayd allows ten `POST /family/rotate` attempts per family per hour
+/// (`DEFAULT_ROTATION_REQUESTS` / `DEFAULT_ROTATION_WINDOW_SECS`), and one
+/// attempt here may cost *two* of them, because a rotation whose answer was
+/// lost is retried as "ask under the old credential, then confirm under the
+/// new one". Fifteen minutes is four attempts an hour, eight calls, which
+/// leaves the bucket room for the ceremony that is actually trying to happen.
+///
+/// The number is deliberately not "as fast as the relay will let us". There is
+/// a specific incident behind that: a rerun loop that ignored `Retry-After`
+/// spent ~290 POSTs a minute of one family's allowance. A rotation is a rare
+/// ceremony whose *remedy* value does not decay by the minute, and a retry
+/// storm on the one route a family needs when a phone is stolen would be the
+/// worst possible place to relearn that lesson.
+pub const RELAY_ROTATION_ANSWERED_RETRY_MS: i64 = 15 * 60 * 1000;
+
+/// The first gap after a call that never reached the relay at all.
+///
+/// Much shorter than [`RELAY_ROTATION_ANSWERED_RETRY_MS`] because a request
+/// that got no answer spent none of the family's rotation allowance, and
+/// because this is the *common* failure: the removal happens on a ship with no
+/// internet, and the rotation should land within a minute of the phone finding
+/// some rather than a quarter of an hour later. Every minute of that gap is a
+/// minute a revoked device can still drain the family mailbox.
+pub const RELAY_ROTATION_UNREACHED_RETRY_MS: i64 = 30 * 1000;
+
+/// The ceiling both ladders climb to. An hour, so a relay that has been
+/// answering `409 rotation_unsupported`-shaped nonsense for a week costs the
+/// family twenty-four calls a day rather than fifteen hundred.
+pub const RELAY_ROTATION_RETRY_CEILING_MS: i64 = 60 * 60 * 1000;
+
+/// What a shell should do next when a rotate call did not return a rotation.
+///
+/// Shared rather than written twice, because both shells drive the same
+/// ceremony against the same server and the interesting cases are the ones
+/// neither would think to write: an old credential that stopped resolving is
+/// *evidence the rotation landed*, not a failure, and a proposed token that
+/// collided has to be replaced rather than retried.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum RelayRotationNextStep {
+    /// Ask again, presenting the **replacement** credential as both halves.
+    ///
+    /// The superseded token no longer resolves, and there are only two ways
+    /// that happens: the rotation this device asked for landed and its answer
+    /// was lost, or the family is gone from this relay entirely. Presenting
+    /// the replacement tells those apart — relayd answers `rotated: false`
+    /// with the same values for the first, and refuses the second — and it is
+    /// the only question a device holding a journal row can ask.
+    Confirm,
+    /// Try the same call again, no sooner than `delay_ms` from now.
+    Retry { delay_ms: i64 },
+    /// The proposed replacement is already somebody's credential
+    /// (`rotation_token_taken`). Mint another and begin again: retrying this
+    /// one converges on nothing.
+    Remint,
+    /// `rotation_unsupported`: this relay's family token comes from the
+    /// operator's static allowlist, so no device can re-key it. Retrying is
+    /// pointless forever; the repair is a new setup card from whoever runs the
+    /// relay.
+    ServerManagedToken,
+    /// `rotation_unauthorized`: the family registered a different rotation key
+    /// on its first rotation (trust on first rotation) and this person root is
+    /// not it. Also pointless to retry — and worth surfacing, because on a
+    /// shared Shore Pass it means somebody else is the only one who can evict
+    /// a device.
+    NotTheAuthority,
+}
+
+/// Read one failed rotate call and say what to do about it (§10.2).
+///
+/// `http_status` is `0` for a request that produced no HTTP answer at all
+/// (DNS, TLS, timeout, aeroplane mode). That distinction is load-bearing
+/// rather than cosmetic: a call that never landed cost the family's rotation
+/// bucket nothing, so it may be retried in seconds, while an answered one has
+/// already been charged and must not be.
+///
+/// `relay_code` is relayd's stable machine-readable reason, which wins over
+/// the status for the same reason [`crate::relay_classify_http_error`] lets it
+/// win: a proxy can rewrite a status code, but the JSON body came from relayd.
+///
+/// `confirming` says which half of the recovery protocol produced this answer.
+/// A `401` on the first ask means "the credential I presented is not this
+/// family's any more", which is exactly what a landed-but-unheard rotation
+/// looks like, so it becomes [`RelayRotationNextStep::Confirm`]. The same
+/// `401` while confirming means neither credential resolves — the family was
+/// deprovisioned, the pass lapsed, or somebody else rotated it — and that is a
+/// [`RelayRotationNextStep::Retry`] rather than a give-up, because a lapsed
+/// pass that gets paid comes back and the rotation is still owed when it does.
+#[uniffi::export]
+pub fn core_relay_rotation_next_step(
+    http_status: u16,
+    relay_code: Option<String>,
+    retry_after_ms: i64,
+    confirming: bool,
+    consecutive_failures: u32,
+) -> RelayRotationNextStep {
+    match relay_code.as_deref() {
+        Some("rotation_unsupported") => return RelayRotationNextStep::ServerManagedToken,
+        Some("rotation_token_taken") => return RelayRotationNextStep::Remint,
+        Some("rotation_unauthorized") => return RelayRotationNextStep::NotTheAuthority,
+        _ => {}
+    }
+    if !confirming && matches!(http_status, 401 | 403) {
+        return RelayRotationNextStep::Confirm;
+    }
+    let base = if http_status == 0 {
+        RELAY_ROTATION_UNREACHED_RETRY_MS
+    } else {
+        RELAY_ROTATION_ANSWERED_RETRY_MS
+    };
+    // Doubling, so a relay that is down stops being asked every ladder step,
+    // and shifted by a bounded amount so the arithmetic cannot overflow on a
+    // device that has been failing for a very long time.
+    let widened = base.saturating_mul(1i64 << consecutive_failures.min(8));
+    RelayRotationNextStep::Retry {
+        delay_ms: widened
+            .min(RELAY_ROTATION_RETRY_CEILING_MS)
+            .max(retry_after_ms)
+            .max(0),
     }
 }
 
@@ -1205,6 +1346,89 @@ mod tests {
             })
             .expect("planted");
         assert!(store.commit_relay_rotation(plan, NOW).is_err());
+    }
+
+    /// The recovery protocol's hinge: an old credential that stopped
+    /// resolving is evidence, not an error.
+    #[test]
+    fn a_credential_that_no_longer_resolves_sends_the_driver_to_confirm() {
+        assert_eq!(
+            core_relay_rotation_next_step(401, None, 0, false, 0),
+            RelayRotationNextStep::Confirm
+        );
+        assert_eq!(
+            core_relay_rotation_next_step(403, None, 0, false, 0),
+            RelayRotationNextStep::Confirm
+        );
+        // The same answer to the confirming call means neither credential is
+        // this family's. That is a wait -- a lapsed pass comes back and the
+        // rotation is still owed when it does -- never a silent give-up.
+        assert!(matches!(
+            core_relay_rotation_next_step(401, None, 0, true, 0),
+            RelayRotationNextStep::Retry { .. }
+        ));
+    }
+
+    #[test]
+    fn relayds_three_stable_rotation_reasons_are_read_rather_than_guessed_from_the_status() {
+        // All three are 403/409, and a driver that read the status alone would
+        // confirm, retry and retry -- none of which is the right move.
+        assert_eq!(
+            core_relay_rotation_next_step(409, Some("rotation_unsupported".into()), 0, false, 0),
+            RelayRotationNextStep::ServerManagedToken
+        );
+        assert_eq!(
+            core_relay_rotation_next_step(409, Some("rotation_token_taken".into()), 0, false, 0),
+            RelayRotationNextStep::Remint
+        );
+        assert_eq!(
+            core_relay_rotation_next_step(403, Some("rotation_unauthorized".into()), 0, false, 0),
+            RelayRotationNextStep::NotTheAuthority
+        );
+    }
+
+    #[test]
+    fn a_call_that_never_reached_the_relay_is_retried_far_sooner_than_one_it_refused() {
+        let unreached = core_relay_rotation_next_step(0, None, 0, false, 0);
+        let refused = core_relay_rotation_next_step(500, None, 0, false, 0);
+        assert_eq!(
+            unreached,
+            RelayRotationNextStep::Retry {
+                delay_ms: RELAY_ROTATION_UNREACHED_RETRY_MS
+            }
+        );
+        assert_eq!(
+            refused,
+            RelayRotationNextStep::Retry {
+                delay_ms: RELAY_ROTATION_ANSWERED_RETRY_MS
+            }
+        );
+        // An answered call has already been charged to a bucket of ten an
+        // hour; an unanswered one has been charged nothing.
+        const { assert!(RELAY_ROTATION_UNREACHED_RETRY_MS * 10 < RELAY_ROTATION_ANSWERED_RETRY_MS) };
+    }
+
+    #[test]
+    fn the_backoff_widens_to_a_ceiling_and_never_undercuts_retry_after() {
+        let delay = |failures, retry_after| match core_relay_rotation_next_step(
+            429,
+            Some("rate_limited".to_string()),
+            retry_after,
+            false,
+            failures,
+        ) {
+            RelayRotationNextStep::Retry { delay_ms } => delay_ms,
+            other => panic!("a 429 is a wait, not {other:?}"),
+        };
+        assert!(delay(1, 0) > delay(0, 0));
+        assert_eq!(delay(30, 0), RELAY_ROTATION_RETRY_CEILING_MS);
+        // The relay's own window wins even over the ceiling: it is the one
+        // party that knows what it will accept, and the storm this codebase
+        // has already paid for came from ignoring exactly this header.
+        assert_eq!(
+            delay(0, RELAY_ROTATION_RETRY_CEILING_MS * 3),
+            RELAY_ROTATION_RETRY_CEILING_MS * 3
+        );
     }
 
     #[test]

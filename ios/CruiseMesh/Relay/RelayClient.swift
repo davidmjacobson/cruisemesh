@@ -437,6 +437,32 @@ enum RelayClient {
         return RelayPresencePage(nowMs: page.nowMs, presence: page.presence)
     }
 
+    /// §10 step 2: ask the family relay to re-key itself.
+    ///
+    /// The bearer is a whole `RelayConfig` rather than the saved one because a
+    /// rotation is the one call that may be made under *either* of two tokens:
+    /// the retired one on the first ask, and the replacement when the first ask
+    /// says the retired one is no longer this family's. `RelayRotationDriver`
+    /// owns that choice; this only carries it.
+    ///
+    /// The body is opaque here on purpose. It is signed, and core signs it
+    /// (`relayEncodeRotateRequest`) — a shell that assembled these bytes could
+    /// get the signed message wrong in a way no test on this side would catch,
+    /// and the answer is handed straight back for `relayDecodeRotateResponse`
+    /// to check against the token that was asked for. Mirrors Android
+    /// `RelayClient.rotateFamilyToken`.
+    static func rotateFamilyToken(config: RelayConfig, body: Data) throws -> Data {
+        let url = try buildURL(config.relayUrl, path: relayRotatePath())
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(&request, config: config)
+        request.httpBody = body
+        let (data, response) = try syncRequest(request)
+        try ensureOK(response, data: data)
+        return data
+    }
+
     private static func postEnvelope(
         config: RelayConfig,
         msgId: Data,

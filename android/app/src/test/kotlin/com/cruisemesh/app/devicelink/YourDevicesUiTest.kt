@@ -226,6 +226,62 @@ class YourDevicesUiTest {
         assertNothingDescribed("Remove This phone")
     }
 
+    /**
+     * §10.2 that could not be done, said out loud.
+     *
+     * The removal confirmation promises the removed phone loses the family's
+     * Shore Pass mailbox. On a relay that will never let this device re-key,
+     * the driver stops asking -- and this screen is the only surface that
+     * admits the promise was not kept, so an app that shows nothing here is an
+     * app that lied.
+     */
+    @Test
+    fun `a rotation the relay refused is admitted on the screen that promised it`() {
+        val phone = id(1)
+        val tablet = id(2)
+        compose.setContent {
+            CruiseMeshTheme {
+                YourDevicesContent(
+                    shape = YourDevicesShape.SEVERAL,
+                    items = items(listOf(phone, tablet), approving = phone, own = phone),
+                    canAddDevice = true,
+                    passRotationBlocked = true,
+                    onAddDevice = {},
+                    onRename = {},
+                    onRemove = {},
+                )
+            }
+        }
+
+        compose.onNodeWithText("can still reach the family mailbox", substring = true)
+            .assertIsDisplayed()
+    }
+
+    /** And absent on every install where it is untrue, which is nearly all. */
+    @Test
+    fun `nothing is said about the pass when the rotation was not refused`() {
+        val phone = id(1)
+        val tablet = id(2)
+        compose.setContent {
+            CruiseMeshTheme {
+                YourDevicesContent(
+                    shape = YourDevicesShape.SEVERAL,
+                    items = items(listOf(phone, tablet), approving = phone, own = phone),
+                    canAddDevice = true,
+                    onAddDevice = {},
+                    onRename = {},
+                    onRemove = {},
+                )
+            }
+        }
+
+        assertEquals(
+            0,
+            compose.onAllNodesWithText("could not be changed", substring = true)
+                .fetchSemanticsNodes().size,
+        )
+    }
+
     /** Asserts nothing on screen carries this description. */
     private fun assertNothingDescribed(label: String) {
         assertEquals(

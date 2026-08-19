@@ -19,6 +19,8 @@ import com.cruisemesh.app.relay.RelayHttpException
 import com.cruisemesh.app.relay.RelayPassEngine
 import com.cruisemesh.app.relay.RelayPushClient
 import com.cruisemesh.app.relay.RelayPushSubscription
+import com.cruisemesh.app.relay.RelayRotationDriver
+import com.cruisemesh.app.relay.RelayRotationOutcome
 import com.cruisemesh.app.devicelink.RosterGossipSender
 import com.cruisemesh.app.relay.RelayUpdateSender
 import uniffi.cruisemesh_core.Contact
@@ -528,7 +530,9 @@ internal class RelaySyncEngine(
         // this device consumed it has nothing left to prove.
         store.pruneExpiredConsumedHiddenMsgIds(now)
         val contacts = store.listContacts()
-        val fallbackConfig = RelayConfigStore.load(context)
+        // Re-read below if §10.2 moves it: a pass that kept using the token the
+        // relay just retired would 401 on every upload and fetch.
+        var fallbackConfig = RelayConfigStore.load(context)
         // Bind this whole pass to a validated network when the default can't be
         // trusted (associated-but-dead Wi‑Fi, no VPN); otherwise null = use the
         // default (normal networks and VPN tunnels route themselves).
@@ -544,6 +548,13 @@ internal class RelaySyncEngine(
         contactRelaySilence.beginPass()
         publishStaleContactRelays()
         backfillOutgoingReceipts(identity, now)
+        // §10.2's driver, before the T23 read below rather than after it.
+        // A rotation that lands adopts a new endpoint, which is an endpoint
+        // change like any other -- and the announce stage that notices one is
+        // the same stage that clears the carried-upload and group fan-out
+        // markers naming the mailbox we just left. Running this first is what
+        // lets a rotation ride out on the pass that performed it.
+        if (rotateFamilyTokenIfOwed(identity)) fallbackConfig = RelayConfigStore.load(context)
         // T23: if our own endpoint changed since the last announcement, queue
         // the notice to every contact *before* this pass uploads, so it rides
         // out in the same sync. This is the single trigger for every way the
@@ -707,7 +718,9 @@ internal class RelaySyncEngine(
         familyBackoffIdentity = identity.userId
         passNowMs = now
         val contacts = store.listContacts()
-        val fallbackConfig = RelayConfigStore.load(context)
+        // Re-read below if §10.2 moves it, for the reason the legacy pass
+        // re-reads it: the plan must not carry a token the relay just retired.
+        var fallbackConfig = RelayConfigStore.load(context)
         contactRelayRejections = store.listContactRelayRejections()
             .associateByTo(mutableMapOf()) { UserIdHex.encode(it.userId) }
         contactRelayUnreachable = store.listContactRelayUnreachable()
@@ -737,6 +750,13 @@ internal class RelaySyncEngine(
         // and read ticks from propagating over the relay while the pass
         // reported a healthy, empty receipt lane.
         backfillOutgoingReceipts(identity, now)
+        // §10.2's driver, before the T23 read below rather than after it.
+        // A rotation that lands adopts a new endpoint, which is an endpoint
+        // change like any other -- and stage 2 is what clears the
+        // carried-upload and group fan-out markers naming the mailbox we just
+        // left. Running this first is what lets a rotation ride out on the
+        // pass that performed it.
+        if (rotateFamilyTokenIfOwed(identity)) fallbackConfig = RelayConfigStore.load(context)
         // Read before the announce, not after: `announceIfChanged` is what
         // *records* the epoch as announced, so asking afterwards always
         // answers "nothing changed" and core's announce stage would be
@@ -1229,6 +1249,42 @@ internal class RelaySyncEngine(
 
         override fun reopenPushSocket(config: RelayConfig) {
             relayPushClient.resubscribe(config)
+        }
+    }
+
+    /**
+     * **§10 step 2, driven from the pass that owns the network.**
+     *
+     * A device removal writes the rotation down and returns immediately; this
+     * is where it actually happens. Here rather than in the removal journey for
+     * the reasons this class exists at all: the bind target that keeps relay
+     * traffic off a dead Wi-Fi and out of a VPN, and the discipline about how
+     * often a family's relay may be spoken to, both live on this side of the
+     * seam. [RelayRotationDriver] paces itself, so a pass that finds a rotation
+     * it may not retry yet costs one query.
+     *
+     * Failure never touches the pass. A rotation is a repair the fleet owes
+     * itself, not a precondition for moving mail, and a relay that refuses to
+     * re-key must not also stop messages being delivered.
+     *
+     * Returns whether this device's saved pass moved, which is the one thing
+     * the rest of the pass has to know: the credential it captured a moment ago
+     * is the one the relay has just retired, so every remaining call would 401
+     * and the pass would end by reporting a Shore Pass failure on the very pass
+     * where the removal worked.
+     */
+    private fun rotateFamilyTokenIfOwed(identity: Identity): Boolean {
+        return try {
+            val driver = RelayRotationDriver.forApp(context, store, relayBindTarget())
+            // Both directions of §10.2's own-device leg, in the order that
+            // matters: a device that was told about a rotation writes it down
+            // before it could waste an attempt asking about one of its own.
+            val adopted = driver.adoptAnnouncedCredential()
+            val rotated = driver.rotateIfPending(identity) is RelayRotationOutcome.Rotated
+            adopted || rotated
+        } catch (e: Exception) {
+            Log.w(TAG, "Relay token rotation did not finish this pass: ${e.message}")
+            false
         }
     }
 

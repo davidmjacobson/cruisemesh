@@ -1868,13 +1868,16 @@ class MeshService : Service() {
      * one out at all from a device the gate has silenced, so an ejected phone
      * does not become an announcer.
      *
-     * It is not, however, free of disclosure while §10.2 is unimplemented. No
-     * shell drives the relay token rotation yet (see `RemoveDeviceSession`), so
-     * this does tell the holder of a removed phone the moment they were removed
-     * while the shared relay credential that phone already had is still live.
-     * Recorded rather than papered over: the honest fix is shipping §10.2, not
-     * withholding the one signal that stops an honest phone believing it is
-     * still linked.
+     * It is not, however, free of disclosure. §10.2's rotation is driven now
+     * (`RelayRotationDriver`), but it lands on the first relay pass that can
+     * reach the relay rather than at the moment of removal — and this notice
+     * crosses only a proven LAN link, which is exactly the situation where
+     * there may be no internet at all. So on a ship it can still tell the
+     * holder of a removed phone the moment they were removed while the shared
+     * relay credential that phone already had is live. Recorded rather than
+     * papered over: the remaining window closes by the rotation landing sooner,
+     * not by withholding the one signal that stops an honest phone believing it
+     * is still linked.
      */
     private fun offerOwnRosterNotice(address: String, capabilities: UInt, identity: Identity) {
         if (!ownIdentityLinkIsProven(address, identity)) return
