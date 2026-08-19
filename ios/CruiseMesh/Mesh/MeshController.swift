@@ -4737,7 +4737,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// The one point where it meets the mesh pipeline is per-envelope
     /// delivery, which goes through `onMeshQueue` so a relay-fetched envelope
     /// is processed under the same serial guarantee a BLE frame gets.
-    private func relaySyncBlocking(identity: Identity, config: RelayConfig?) async {
+    private func relaySyncBlocking(identity: Identity, config capturedConfig: RelayConfig?) async {
         // §10 step 2, before either engine and belonging to neither: a device
         // removal wrote a rotation down and stopped, and this is the first
         // place off the mesh queue that can perform it. Here rather than in the
@@ -4745,7 +4745,16 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         // here rather than in `runRelaySync` because that runs on the mesh queue
         // and this makes a network call. The driver paces itself, so a pass that
         // finds a rotation it may not retry yet costs one query.
-        rotateFamilyTokenIfOwed(identity: identity)
+        //
+        // Re-read when it moves this device's pass: the credential handed to
+        // this pass on the mesh queue is the one the relay has just retired,
+        // and carrying it on would 401 every upload and fetch below, ending the
+        // pass by telling the person their Shore Pass is broken -- on the very
+        // pass where their removal worked.
+        var config = capturedConfig
+        if rotateFamilyTokenIfOwed(identity: identity) {
+            config = RelayConfigStore.load()
+        }
 
         // C2: whole-pass engine selection, read once here at pass start and not
         // consulted again — the flip cannot mix engines within a pass. Default
@@ -5557,13 +5566,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// mail, and a relay that refuses to re-key must not also stop messages
     /// being delivered. Mirrors Android's
     /// `RelaySyncEngine.rotateFamilyTokenIfOwed`.
-    private func rotateFamilyTokenIfOwed(identity: Identity) {
+    ///
+    /// Returns whether this device's saved pass moved, which is the one thing
+    /// the rest of the pass has to know: the credential it captured a moment
+    /// ago is the one the relay has just retired.
+    private func rotateFamilyTokenIfOwed(identity: Identity) -> Bool {
         let driver = RelayRotationDriver()
         // Both directions of §10.2's own-device leg, in the order that matters:
         // a device that was told about a rotation writes it down before it
         // could waste an attempt asking about one of its own.
-        driver.adoptAnnouncedCredential()
-        driver.rotateIfPending(identity: identity)
+        let adopted = driver.adoptAnnouncedCredential()
+        if case .rotated = driver.rotateIfPending(identity: identity) { return true }
+        return adopted
     }
 
     /// The relay sync pass, core engine (C2). Mirrors Android

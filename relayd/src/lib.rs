@@ -2533,11 +2533,26 @@ impl RelayStore {
     /// atomic step is what stops two concurrent rotations from both passing a
     /// check made against a row that then changed underneath them.
     ///
-    /// Registration is trust on first rotation. A family with no key yet
-    /// registers whichever key signs its first rotation validly; from then on
-    /// that key is the only authority, and a presented key that differs is
-    /// refused without its signature being examined. The consequences of that
-    /// are honest and documented on the `rotate_family` handler.
+    /// Registration is trust on first rotation, and **only a call that
+    /// actually re-keys may register**. A family with no key yet registers
+    /// whichever key signs its first *rotation* validly; from then on that key
+    /// is the only authority, and a presented key that differs is refused
+    /// without its signature being examined. The consequences of that are
+    /// honest and documented on the `rotate_family` handler.
+    ///
+    /// The "actually re-keys" half is load-bearing. The `already_rotated`
+    /// branches below change nothing, so a caller that reaches one of them and
+    /// were allowed to register would claim the authority for free: present
+    /// the family's own live token as *both* credentials, sign that, and walk
+    /// away as the family's permanent rotation key having rotated nothing.
+    /// Anyone holding the member token could do it — including the device this
+    /// ceremony exists to evict, which is holding it by definition — and every
+    /// genuine rotation afterwards would be [`FamilyRotation::Unauthorized`],
+    /// leaving §10 step 2 permanently dead for that family. So a `Register`
+    /// verdict on an `already_rotated` call is refused. Nothing legitimate is
+    /// lost: the only honest way to reach these branches is a retry after a
+    /// rotation that landed, and that rotation is exactly what registered the
+    /// key, so the retry arrives on the `Accepted` path.
     ///
     /// Idempotent by construction, because a client that loses the response
     /// must be able to ask again: presenting the *new* token (which is what a
@@ -2597,6 +2612,14 @@ impl RelayStore {
         match check_rotation_authority(row.rotation_pk.as_deref(), &message, authority) {
             RotationAuthorityCheck::Refused => return Ok(FamilyRotation::Unauthorized),
             RotationAuthorityCheck::Accepted => {}
+            // A call that re-keys nothing may not claim the authority. See the
+            // "actually re-keys" paragraph above: this is the difference
+            // between trust-on-first-*rotation* and trust-on-first-*ask*, and
+            // the second one hands the family's rotation key to whoever holds
+            // the member token — the revoked device included.
+            RotationAuthorityCheck::Register if already_rotated => {
+                return Ok(FamilyRotation::Unauthorized);
+            }
             RotationAuthorityCheck::Register => {
                 // Trust on first rotation. Written inside the transaction, so
                 // it lands only if this call goes on to commit — a rotation
@@ -4095,18 +4118,22 @@ struct RotateFamilyResponse {
 /// (they bought the pass, they hand out the cards, they are who a household
 /// asks when a phone is stolen) rather than fighting it.
 ///
-/// *A thief can race trust-on-first-rotation, once.* On the very first
-/// rotation a family ever performs, `rotation_pk` is still NULL and there is
-/// nothing to check the presented key against, so a revoked device holding
-/// the member token could register a key of its own before the owner does and
-/// take the authority permanently. That window is real and is accepted
-/// deliberately, bounded three ways: it exists only for families provisioned
-/// before this shipped, only until their first rotation, and it requires the
-/// hostile device to already hold a live member token. Families provisioned
-/// from here on will register on their first rotation from a device that was
-/// never revoked. The alternative — refusing every legacy family's first
-/// rotation — would leave exactly the families most likely to need a
-/// revocation unable to perform one.
+/// *A thief can race trust-on-first-rotation, once — and only by really
+/// rotating.* On the very first rotation a family ever performs, `rotation_pk`
+/// is still NULL and there is nothing to check the presented key against, so a
+/// revoked device holding the member token could register a key of its own
+/// before the owner does and take the authority permanently. That window is
+/// real and is accepted deliberately, bounded four ways: it exists only for
+/// families provisioned before this shipped, only until their first rotation,
+/// it requires the hostile device to already hold a live member token, and the
+/// only call that can register is one that *moves the family to a new token* —
+/// which is loud, because it locks the owner's other devices out of the
+/// mailbox immediately and they notice. A registration that changed nothing
+/// would be silent, so `rotate_family_token` refuses to register on any
+/// already-rotated call. Families provisioned from here on will register on
+/// their first rotation from a device that was never revoked. The alternative
+/// — refusing every legacy family's first rotation — would leave exactly the
+/// families most likely to need a revocation unable to perform one.
 ///
 /// The replacement is chosen by the client, which is what makes the ceremony
 /// survivable. A server-minted token would exist only in the response, so a
@@ -6538,6 +6565,73 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    /// **Trust on first *rotation*, not on first ask.**
+    ///
+    /// The cheapest possible attack on §10.2, and the one that costs the thief
+    /// nothing: a revoked device holds the family's live member token, so it
+    /// can present that token as *both* credentials, sign that pair with a key
+    /// of its own, and — if the server registered on any valid signature —
+    /// become the family's permanent rotation authority having rotated
+    /// nothing at all. No race, no rotation, and nobody notices, because
+    /// nothing about the family changed. The owner's genuine removal later
+    /// gets `rotation_unauthorized`, the client gives up, and the removed
+    /// phone keeps the mailbox forever.
+    ///
+    /// So a no-op call may not register, and the family stays open to the
+    /// rotation its owner is about to make.
+    #[tokio::test]
+    async fn a_rotation_that_re_keys_nothing_cannot_claim_the_authority() {
+        let app = admin_app();
+        let held = "fam-never-rotated-by-anyone-yet";
+        provision(&app, held, serde_json::json!({})).await;
+
+        // The revoked device, asking to rotate the live token to itself.
+        let response = app
+            .clone()
+            .oneshot(rotate_request_signed_by(held, held, &other_rotation_key()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(response).await["code"], "rotation_unauthorized");
+
+        // And the owner's first real rotation still registers, which is the
+        // half that proves the refusal above cost the family nothing.
+        let new = minted_token("bytheowner");
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request(held, &new))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(rotate_request_signed_by(
+                    &new,
+                    &minted_token("stolenafter"),
+                    &other_rotation_key()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN,
+            "the owner's key is the registered one"
+        );
+        // The legitimate lost-answer retry is untouched: presenting the new
+        // token as both credentials is what a client does when it never heard
+        // the answer, and it is still answered idempotently.
+        let response = app
+            .clone()
+            .oneshot(rotate_request_signed_by(&new, &new, &test_rotation_key()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["family_token"], new);
+        assert_eq!(body["rotated"], false);
     }
 
     /// The threat model in one test: the revoked device replays the member

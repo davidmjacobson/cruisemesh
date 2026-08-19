@@ -5659,6 +5659,16 @@
         }
       }
     },
+    "Your family's Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your family's Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass."
+          }
+        }
+      }
+    },
     "Your family's Shore Pass storage is full": {
       "localizations": {
         "en": {

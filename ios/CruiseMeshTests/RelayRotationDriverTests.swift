@@ -476,6 +476,149 @@ final class RelayRotationDriverTests: XCTestCase {
         XCTAssertTrue(driver.begin(revocation: fleet.revocation))
         XCTAssertEqual(try fleet.store.pendingRelayRotation()?.newToken, first)
     }
+
+    /// The removal happened at sea and the pass changed before the relay was
+    /// ever reachable. The rotation is about a family this device has left, so
+    /// it must be dropped rather than performed: the call would re-key somebody
+    /// else's family, and committing it would write that family's credential
+    /// over the pass this person is actually on.
+    func testARotationPlannedAgainstAPassThisDeviceHasLeftIsDroppedNotPerformed() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let driver = RelayRotationDriver(
+            store: fleet.store,
+            credential: pass,
+            rotate: { _, _ in XCTFail("a pass this device left is never asked"); return Data() },
+            onRotated: {},
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        driver.begin(revocation: fleet.revocation)
+        XCTAssertNotNil(try fleet.store.pendingRelayRotation())
+
+        // Ashore: a setup card for a different family.
+        pass.config = RelayConfig(
+            relayUrl: "https://relay.elsewhere.example",
+            relayToken: "a-different-familys-token"
+        )
+        XCTAssertEqual(driver.rotateIfPending(identity: fleet.identity), .nothingPending)
+        XCTAssertNil(
+            try fleet.store.pendingRelayRotation(),
+            "the stale row does not sit there asking forever"
+        )
+        XCTAssertEqual(pass.config?.relayToken, "a-different-familys-token")
+        XCTAssertEqual(pass.adoptions, 0)
+    }
+
+    /// And the same for a pass the person deliberately removed.
+    func testARotationIsNotPerformedForAPassThePersonHasCleared() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let driver = RelayRotationDriver(
+            store: fleet.store,
+            credential: pass,
+            rotate: { _, _ in XCTFail("no pass, no call"); return Data() },
+            onRotated: {},
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        driver.begin(revocation: fleet.revocation)
+        pass.config = nil
+
+        XCTAssertEqual(driver.rotateIfPending(identity: fleet.identity), .nothingPending)
+        XCTAssertNil(try fleet.store.pendingRelayRotation())
+        XCTAssertNil(pass.config, "a removed Shore Pass is never reinstalled by a rotation")
+    }
+
+    /// The other half of the same reconciliation: a removal made *after* the
+    /// pass changed must plan a rotation of the credential the removed device
+    /// actually holds, not report the stale row as one already queued.
+    func testARemovalAfterThePassChangedRePlansAgainstThePassInUse() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let relay = Relay { _, _ in throw URLError(.notConnectedToInternet) }
+        let driver = RelayRotationDriver(
+            store: fleet.store,
+            credential: pass,
+            rotate: relay.rotate,
+            onRotated: {},
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        driver.begin(revocation: fleet.revocation)
+        let stale = try XCTUnwrap(try fleet.store.pendingRelayRotation()).newToken
+
+        pass.config = RelayConfig(relayUrl: relayUrl, relayToken: "the-token-this-device-now-holds")
+        XCTAssertTrue(driver.begin(revocation: fleet.revocation))
+        let replanned = try XCTUnwrap(try fleet.store.pendingRelayRotation())
+        XCTAssertEqual(replanned.supersededToken, "the-token-this-device-now-holds")
+        XCTAssertNotEqual(replanned.newToken, stale, "a fresh replacement, not the stale one")
+    }
+
+    /// A relay that will never re-key from this device is not just stopped, it
+    /// is *said*. The removal confirmation promised the removed phone loses the
+    /// family mailbox, and a promise the app privately gave up on is worse than
+    /// one it never made.
+    func testARefusalThatCanNeverSucceedIsWrittenDownForTheSurface() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let relay = Relay { _, _ in
+            throw RelayHTTPError(
+                statusCode: 403,
+                relayCode: "rotation_unauthorized",
+                responseBody: "somebody else holds the key"
+            )
+        }
+        var blocked: Bool?
+        let driver = RelayRotationDriver(
+            store: fleet.store,
+            credential: pass,
+            rotate: relay.rotate,
+            onRotated: {},
+            notice: { blocked = $0 },
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        driver.begin(revocation: fleet.revocation)
+        XCTAssertEqual(blocked, false, "planning a rotation is a fresh promise")
+
+        XCTAssertEqual(
+            driver.rotateIfPending(identity: fleet.identity),
+            .gaveUp(.notTheAuthority)
+        )
+        XCTAssertEqual(blocked, true)
+    }
+
+    /// And a rotation that lands takes the note away again.
+    func testARotationThatLandsClearsTheNote() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let store = fleet.store
+        let relay = Relay { [self] _, _ in
+            rotatedBody(token: (try? store.pendingRelayRotation()?.newToken) ?? "")
+        }
+        var blocked: Bool? = true
+        let driver = RelayRotationDriver(
+            store: store,
+            credential: pass,
+            rotate: relay.rotate,
+            onRotated: {},
+            notice: { blocked = $0 },
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        driver.begin(revocation: fleet.revocation)
+        XCTAssertEqual(
+            driver.rotateIfPending(identity: fleet.identity),
+            .rotated(envelopesMoved: 0, alreadyDone: false)
+        )
+        XCTAssertEqual(blocked, false)
+    }
 }
 
 /// How often §10 step 2's rotate call may be made. Plain class, plain test.

@@ -388,6 +388,21 @@ On "Remove device" (approving device) or recovery-code override:
      token — the other people on a shared Shore Pass — is not repaired by
      that notice at all, because it can only ever carry a deposit
      credential; their repair is a re-shared setup card too.
+   - **Two relays refuse the re-key outright, and the app says so.** A
+     family whose token comes from an operator's static allowlist answers
+     `rotation_unsupported`, and a family whose rotation authority is
+     already registered to somebody else's person root — every household
+     after the first, on a shared pass — answers `rotation_unauthorized`.
+     Neither can ever succeed from this device, so the driver stops
+     asking; but the confirmation had already promised the removed phone
+     loses the mailbox, so stopping silently would leave that promise
+     standing and wrong. Both shells therefore record the refusal and say
+     it on Your devices: the pass could not be changed, the removed
+     device can still reach the mailbox, and the repair is a new pass. On
+     a **shared** pass the first household to remove a device also takes
+     the mailbox away from the other holders of that member token, who
+     have no in-app repair either; nothing gates the rotation on the pass
+     being unshared, because no device can tell one from the other.
 
 Notes on step 3, recorded so the guarantee is not read as stronger than
 it is (WP5):

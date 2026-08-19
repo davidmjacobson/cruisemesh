@@ -26,20 +26,32 @@ package com.cruisemesh.app.relay
  * is comfortable with, and it is what stops a rotation that is *owed* from
  * sitting out an hour because of a failure that is no longer true.
  *
+ * ## Two threads, one instance
+ *
+ * The instance is process-wide ([RelayRotationDriver.sharedPacer]) and reached
+ * from two of them: the relay sync thread, which attempts and fails, and
+ * whichever background thread a removal runs on, which resets the ladder. So
+ * every accessor takes the lock. Without it the removal's `onSettled` can go
+ * unseen by the sync thread — a fresh rotation sitting out an hour it never
+ * earned, which is an hour the removed device keeps the family mailbox — and on
+ * a 32-bit ABI a `Long` written by one thread can be read half-updated by the
+ * other. iOS's twin locks for the same reason.
+ *
  * No Android imports, so the policy is a plain unit test.
  */
 class RelayRotationPacer {
 
+    private val lock = Any()
     private var notBeforeMs: Long = 0L
     private var failures: Int = 0
 
     /** Consecutive failed attempts, which is how far up core's ladder we are. */
-    val consecutiveFailures: Int get() = failures
+    val consecutiveFailures: Int get() = synchronized(lock) { failures }
 
     /** When the next attempt becomes allowed. `0` means "right now". */
-    val nextAttemptAtMs: Long get() = notBeforeMs
+    val nextAttemptAtMs: Long get() = synchronized(lock) { notBeforeMs }
 
-    fun mayAttempt(nowMs: Long): Boolean = nowMs >= notBeforeMs
+    fun mayAttempt(nowMs: Long): Boolean = synchronized(lock) { nowMs >= notBeforeMs }
 
     /**
      * Record an attempt that did not end in a committed rotation, and hold the
@@ -50,13 +62,13 @@ class RelayRotationPacer {
      * own rate-limit window is a floor — a second failure inside a long wait
      * must not become permission to ask sooner.
      */
-    fun onFailure(nowMs: Long, delayMs: Long) {
+    fun onFailure(nowMs: Long, delayMs: Long) = synchronized(lock) {
         failures += 1
         notBeforeMs = maxOf(notBeforeMs, nowMs + maxOf(delayMs, 0L))
     }
 
     /** The rotation landed (or there was nothing to do): start clean. */
-    fun onSettled() {
+    fun onSettled() = synchronized(lock) {
         failures = 0
         notBeforeMs = 0L
     }

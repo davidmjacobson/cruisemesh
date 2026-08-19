@@ -184,6 +184,10 @@ struct RelayRotationDriver {
     /// one epoch comparison. A second announcer here would race that comparison
     /// and silently take the marker clearing away from it.
     let onRotated: () -> Void
+    /// Remember, for the surface to read, whether §10.2 is stuck: true when a
+    /// relay has refused this device the rotation for good, false whenever a
+    /// rotation is planned afresh or lands. See `RelayRotationNoticeStore`.
+    let notice: (Bool) -> Void
     let pacer: RelayRotationPacer
     let clock: () -> Int64
 
@@ -192,6 +196,7 @@ struct RelayRotationDriver {
         credential: RelayRotationCredential = SavedRelayCredential(),
         rotate: @escaping (RelayConfig, Data) throws -> Data = RelayClient.rotateFamilyToken,
         onRotated: @escaping () -> Void = RelaySyncEvents.requestSync,
+        notice: @escaping (Bool) -> Void = RelayRotationNoticeStore.setBlocked,
         pacer: RelayRotationPacer = RelayRotationDriver.sharedPacer,
         clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1_000) }
     ) {
@@ -199,6 +204,7 @@ struct RelayRotationDriver {
         self.credential = credential
         self.rotate = rotate
         self.onRotated = onRotated
+        self.notice = notice
         self.pacer = pacer
         self.clock = clock
     }
@@ -217,15 +223,25 @@ struct RelayRotationDriver {
             log.warning("Could not read the pending relay rotation: \(String(describing: error), privacy: .public)")
             return false
         }
-        if alreadyPending != nil {
-            // Deliberately not replaced. A pending row may name a credential
-            // the server has already moved to, and overwriting it would throw
-            // away the only record of that token -- locking the family out of
-            // its own mailbox to lock one thief out. The rotation in flight
-            // retires the same shared token this removal wants retired, so
-            // finishing it is finishing this one too.
-            log.info("A relay rotation is already pending; letting it finish rather than re-minting")
-            return true
+        if let alreadyPending {
+            if describesSavedPass(alreadyPending) {
+                // Deliberately not replaced. A pending row may name a
+                // credential the server has already moved to, and overwriting
+                // it would throw away the only record of that token -- locking
+                // the family out of its own mailbox to lock one thief out. The
+                // rotation in flight retires the same shared token this removal
+                // wants retired, so finishing it is finishing this one too.
+                log.info("A relay rotation is already pending; letting it finish rather than re-minting")
+                return true
+            }
+            // A row about a pass this device no longer has. Keeping it would be
+            // the worse of the two mistakes twice over: this removal would
+            // report a rotation queued and plan nothing, so the token the
+            // removed device actually holds would never be re-keyed. Dropping
+            // it costs nothing that is still reachable -- see
+            // `describesSavedPass`.
+            log.info("Dropping a pending relay rotation that names a pass this device no longer holds")
+            guard abandon() else { return false }
         }
         guard let config = credential.current() else { return false }
         let plan: RelayRotationPlan?
@@ -248,8 +264,11 @@ struct RelayRotationDriver {
         do {
             try store.beginRelayRotation(plan: plan, nowMs: now)
             // A fresh ceremony starts at the bottom of the ladder: whatever an
-            // earlier rotation's failures earned is not this one's to serve.
+            // earlier rotation's failures earned is not this one's to serve --
+            // including an older refusal's notice, which is about a rotation
+            // this one supersedes.
             pacer.onSettled()
+            notice(false)
             log.info("Relay rotation planned; it lands on the next pass that reaches the relay")
             return true
         } catch {
@@ -279,18 +298,23 @@ struct RelayRotationDriver {
     /// removed its Shore Pass must not have one reinstalled by a fleet
     /// announcement, and a phone on a different relay is not the family's to
     /// move.
-    func adoptAnnouncedCredential() {
+    ///
+    /// Returns whether the saved pass moved, so the pass that called this knows
+    /// the credential it is holding is stale.
+    @discardableResult
+    func adoptAnnouncedCredential() -> Bool {
         let announced: RelayEndpoint?
         do {
             announced = try store.relayCredentialSetting()
         } catch {
             log.warning("Could not read the announced relay credential: \(String(describing: error), privacy: .public)")
-            return
+            return false
         }
-        guard let announced, let saved = credential.current() else { return }
-        guard saved.relayUrl == announced.url, saved.relayToken != announced.token else { return }
+        guard let announced, let saved = credential.current() else { return false }
+        guard saved.relayUrl == announced.url, saved.relayToken != announced.token else { return false }
         log.info("Adopting the family relay credential a sibling announced")
         adopt(announced)
+        return true
     }
 
     /// Finish whatever `begin` left owed, if the pacer allows an attempt now.
@@ -304,6 +328,18 @@ struct RelayRotationDriver {
             return .nothingPending
         }
         guard let plan = pending else {
+            pacer.onSettled()
+            return .nothingPending
+        }
+        guard describesSavedPass(plan) else {
+            // The pass moved out from under a rotation that never landed. This
+            // must be dropped rather than performed: the call would re-key a
+            // family this device has left, and committing it would write that
+            // family's credential over the pass the person is actually on --
+            // reinstalling, in the cleared-pass case, a Shore Pass they
+            // deliberately removed.
+            log.info("Abandoning a relay rotation that names a pass this device no longer holds")
+            _ = abandon()
             pacer.onSettled()
             return .nothingPending
         }
@@ -328,6 +364,38 @@ struct RelayRotationDriver {
     private enum Ask {
         case answered(CoreRelayRotation)
         case refused(RelayRotationNextStep)
+    }
+
+    /// Is this journal row still about the pass this device is on?
+    ///
+    /// A rotation is planned at the removal and performed whenever the relay is
+    /// next reachable, which on a ship is days later — and in between, the pass
+    /// itself can change: a new setup card scanned ashore, a backup restored,
+    /// or the pass cleared in Advanced. The row names the family it was planned
+    /// against and nothing reconciles it, so without this check the driver
+    /// would keep asking a relay that is no longer this family's, and a call
+    /// that *succeeded* would write the old family's credential over the
+    /// current one — including reinstalling a pass its person deliberately
+    /// removed. That is exactly the harm `adoptAnnouncedCredential`'s guard
+    /// exists to prevent one function away.
+    ///
+    /// Both tokens count as a match. A rotation whose commit failed after the
+    /// server had already re-keyed leaves this device holding the *replacement*
+    /// with the row still owed, and that row must still be finishable.
+    private func describesSavedPass(_ plan: RelayRotationPlan) -> Bool {
+        guard let saved = credential.current(), saved.relayUrl == plan.relayUrl else { return false }
+        return saved.relayToken == plan.supersededToken || saved.relayToken == plan.newToken
+    }
+
+    /// Clear the journal row, reporting whether it is actually gone.
+    private func abandon() -> Bool {
+        do {
+            _ = try store.abandonRelayRotation()
+            return true
+        } catch {
+            log.warning("Could not clear the relay rotation: \(String(describing: error), privacy: .public)")
+            return false
+        }
     }
 
     private func ask(
@@ -402,6 +470,7 @@ struct RelayRotationDriver {
         }
         adopt(committed.endpoint)
         pacer.onSettled()
+        notice(false)
         log.info(
             """
             Family relay credential rotated (rotated=\(rotation.rotated, privacy: .public), \
@@ -466,11 +535,13 @@ struct RelayRotationDriver {
                 relay credential until the pass is replaced
                 """
             )
-            do {
-                _ = try store.abandonRelayRotation()
-            } catch {
-                log.warning("Could not clear the relay rotation: \(String(describing: error), privacy: .public)")
-            }
+            _ = abandon()
+            // And say so. The removal confirmation promised this person that
+            // the removed phone loses the family mailbox; a promise that
+            // quietly could not be kept is worse than one that was never made,
+            // and only the person can act on it -- the repair is a new pass
+            // from whoever can issue one.
+            notice(true)
             pacer.onSettled()
             return .gaveUp(step)
         }

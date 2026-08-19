@@ -120,18 +120,29 @@ class RelayRotationDriverTest {
                 """"envelopes_moved":$envelopesMoved,"rotated":$rotated}"""
             ).toByteArray()
 
+    /** What the surface would be told: null until the driver says either way. */
+    private class Notice {
+        var blocked: Boolean? = null
+
+        fun record(value: Boolean) {
+            blocked = value
+        }
+    }
+
     private fun driver(
         fleet: Fleet,
         pass: SavedPass,
         relay: Relay,
         pacer: RelayRotationPacer,
         clock: () -> Long,
+        notice: Notice = Notice(),
         onRotated: () -> Unit = {},
     ) = RelayRotationDriver(
         store = fleet.store,
         credential = pass,
         rotate = relay::rotate,
         onRotated = onRotated,
+        notice = notice::record,
         pacer = pacer,
         clock = clock,
     )
@@ -399,5 +410,118 @@ class RelayRotationDriverTest {
 
         assertTrue(driver.begin(fleet.revocation))
         assertEquals(first, fleet.store.pendingRelayRotation()!!.newToken)
+    }
+
+    /**
+     * The removal happened at sea and the pass changed before the relay was
+     * ever reachable. The rotation is about a family this device has left, so
+     * it must be dropped rather than performed: the call would re-key somebody
+     * else's family, and committing it would write that family's credential
+     * over the pass this person is actually on.
+     */
+    @Test
+    fun `a rotation planned against a pass this device has left is dropped, not performed`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val relay = Relay { _, _ -> throw AssertionError("a pass this device left is never asked") }
+        val driver = driver(fleet, pass, relay, RelayRotationPacer(), { NOW })
+
+        driver.begin(fleet.revocation)
+        assertNotNull(fleet.store.pendingRelayRotation())
+
+        // Ashore: a setup card for a different family.
+        pass.config = RelayConfig("https://relay.elsewhere.example", "a-different-familys-token")
+        assertEquals(
+            RelayRotationOutcome.NothingPending,
+            driver.rotateIfPending(fleet.identity),
+        )
+        assertNull("the stale row does not sit there asking forever", fleet.store.pendingRelayRotation())
+        assertEquals("a-different-familys-token", pass.config!!.relayToken)
+        assertEquals("https://relay.elsewhere.example", pass.config!!.relayUrl)
+        assertEquals(0, pass.adoptions)
+    }
+
+    /** And the same for a pass the person deliberately removed. */
+    @Test
+    fun `a rotation is not performed for a pass the person has cleared`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val relay = Relay { _, _ -> throw AssertionError("no pass, no call") }
+        val driver = driver(fleet, pass, relay, RelayRotationPacer(), { NOW })
+
+        driver.begin(fleet.revocation)
+        pass.config = null
+
+        assertEquals(
+            RelayRotationOutcome.NothingPending,
+            driver.rotateIfPending(fleet.identity),
+        )
+        assertNull(fleet.store.pendingRelayRotation())
+        assertNull("a removed Shore Pass is never reinstalled by a rotation", pass.config)
+    }
+
+    /**
+     * The other half of the same reconciliation: a removal made *after* the
+     * pass changed must plan a rotation of the credential the removed device
+     * actually holds, not report the stale row as one already queued.
+     */
+    @Test
+    fun `a removal after the pass changed re-plans against the pass in use`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val relay = Relay { _, _ -> throw IOException("offline") }
+        val driver = driver(fleet, pass, relay, RelayRotationPacer(), { NOW })
+
+        driver.begin(fleet.revocation)
+        val stale = fleet.store.pendingRelayRotation()!!.newToken
+
+        pass.config = RelayConfig(RELAY_URL, "the-token-this-device-now-holds")
+        assertTrue(driver.begin(fleet.revocation))
+        val replanned = fleet.store.pendingRelayRotation()!!
+        assertEquals("the-token-this-device-now-holds", replanned.supersededToken)
+        assertTrue("a fresh replacement, not the stale one", replanned.newToken != stale)
+    }
+
+    /**
+     * A relay that will never re-key from this device is not just stopped, it
+     * is *said*. The removal confirmation promised the removed phone loses the
+     * family mailbox, and a promise the app privately gave up on is worse than
+     * one it never made.
+     */
+    @Test
+    fun `a refusal that can never succeed is written down for the surface`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val relay = Relay { _, _ ->
+            throw RelayHttpException(403, "rotation_unauthorized", "somebody else holds the key")
+        }
+        val notice = Notice()
+        val driver = driver(fleet, pass, relay, RelayRotationPacer(), { NOW }, notice = notice)
+
+        driver.begin(fleet.revocation)
+        assertEquals("planning a rotation is a fresh promise", false, notice.blocked)
+
+        val outcome = driver.rotateIfPending(fleet.identity)
+        assertTrue(outcome is RelayRotationOutcome.GaveUp)
+        assertEquals(
+            RelayRotationNextStep.NotTheAuthority,
+            (outcome as RelayRotationOutcome.GaveUp).step,
+        )
+        assertEquals(true, notice.blocked)
+    }
+
+    /** And a rotation that lands takes the note away again. */
+    @Test
+    fun `a rotation that lands clears the note`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val relay = Relay { _, _ -> rotatedBody(fleet.store.pendingRelayRotation()!!.newToken) }
+        val notice = Notice()
+        notice.blocked = true
+        val driver = driver(fleet, pass, relay, RelayRotationPacer(), { NOW }, notice = notice)
+
+        driver.begin(fleet.revocation)
+        assertTrue(driver.rotateIfPending(fleet.identity) is RelayRotationOutcome.Rotated)
+        assertEquals(false, notice.blocked)
     }
 }

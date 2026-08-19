@@ -828,6 +828,7 @@
     <string name="ui_your_devices_intro">These are signed in as you. They all get your messages and stay in step with each other.</string>
     <string name="ui_your_devices_only_this_one">This is the only device signed in as you. Add another and they will share your contacts, groups and messages.</string>
     <string name="ui_your_devices_names_are_local">Names you give devices stay on this phone. Nobody else sees them.</string>
+    <string name="ui_your_devices_pass_not_changed">Your family\'s Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass.</string>
     <string name="ui_this_phone">This phone</string>
     <string name="ui_device_numbered">Device %1$d</string>
     <string name="ui_device_approves_new_devices">Approves new devices</string>

@@ -58,6 +58,17 @@ struct YourDevicesView: View {
                 Text(introText(shape))
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                // §10.2 that could not be done. The removal confirmation
+                // promises the removed phone loses the family mailbox, and on
+                // the relays that refuse this device the re-key it never will —
+                // so this is the one place that admits it. Read on every
+                // revision, so it appears after the removal that earned it and
+                // goes as soon as a later rotation clears it.
+                if RelayRotationNoticeStore.blocked() {
+                    Text("Your family's Shore Pass could not be changed, so a device you removed can still reach the family mailbox. Contact support for a new pass.")
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                }
             }
 
             if !items.isEmpty {

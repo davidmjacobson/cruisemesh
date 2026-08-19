@@ -41,6 +41,7 @@ import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.R
 import com.cruisemesh.app.identity.DeviceKeyStore
 import com.cruisemesh.app.relay.RelayConfigStore
+import com.cruisemesh.app.relay.RelayRotationNoticeStore
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -138,6 +139,12 @@ fun YourDevicesScreen(
             shape = shape,
             items = items,
             canAddDevice = canAdd,
+            // §10.2 that could not be done. Re-read on every revision so the
+            // note appears after the removal that earned it and disappears the
+            // moment a later rotation clears it.
+            passRotationBlocked = remember(revision) {
+                RelayRotationNoticeStore.blocked(context)
+            },
             modifier = Modifier.padding(innerPadding),
             onAddDevice = onAddDevice,
             onRename = { renaming = it },
@@ -206,6 +213,13 @@ internal fun YourDevicesContent(
     shape: YourDevicesShape,
     items: List<YourDeviceListItem>,
     canAddDevice: Boolean,
+    /**
+     * §10.2 was refused for good on this device, so a removed device may still
+     * reach the family mailbox. See [RelayRotationNoticeStore]: the removal
+     * confirmation promises the mailbox is taken away, and this is the one
+     * place that can admit it was not.
+     */
+    passRotationBlocked: Boolean = false,
     modifier: Modifier = Modifier,
     onAddDevice: () -> Unit,
     onRename: (YourDeviceListItem) -> Unit,
@@ -234,6 +248,15 @@ internal fun YourDevicesContent(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+
+        if (passRotationBlocked) {
+            Text(
+                stringResource(R.string.ui_your_devices_pass_not_changed),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.padding(top = 12.dp),
+            )
+        }
 
         Spacer(Modifier.height(16.dp))
         val rows = items.map { it.row }

@@ -145,6 +145,12 @@ internal class RelayRotationDriver(
      * comparison and silently take the marker clearing away from it.
      */
     private val onRotated: () -> Unit,
+    /**
+     * Remember, for the surface to read, whether §10.2 is stuck: true when a
+     * relay has refused this device the rotation for good, false whenever a
+     * rotation is planned afresh or lands. See [RelayRotationNoticeStore].
+     */
+    private val notice: (Boolean) -> Unit = {},
     private val pacer: RelayRotationPacer = sharedPacer,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -163,7 +169,7 @@ internal class RelayRotationDriver(
             Log.w(TAG, "could not read the pending relay rotation", e)
             return false
         }
-        if (alreadyPending != null) {
+        if (alreadyPending != null && describesSavedPass(alreadyPending)) {
             // Deliberately not replaced. A pending row may name a credential
             // the server has already moved to, and overwriting it would throw
             // away the only record of that token -- locking the family out of
@@ -172,6 +178,16 @@ internal class RelayRotationDriver(
             // finishing it is finishing this one too.
             Log.i(TAG, "A relay rotation is already pending; letting it finish rather than re-minting")
             return true
+        }
+        if (alreadyPending != null) {
+            // A row about a pass this device no longer has. Keeping it would be
+            // the worse of the two mistakes twice over: this removal would
+            // report a rotation queued and plan nothing, so the token the
+            // removed device actually holds would never be re-keyed. Dropping
+            // it costs nothing that is still reachable -- see
+            // [describesSavedPass].
+            Log.i(TAG, "Dropping a pending relay rotation that names a pass this device no longer holds")
+            if (!abandon()) return false
         }
         val config = credential.current() ?: return false
         val plan = try {
@@ -192,8 +208,11 @@ internal class RelayRotationDriver(
         return try {
             store.beginRelayRotation(plan, now)
             // A fresh ceremony starts at the bottom of the ladder: whatever an
-            // earlier rotation's failures earned is not this one's to serve.
+            // earlier rotation's failures earned is not this one's to serve --
+            // including an older refusal's notice, which is about a rotation
+            // this one supersedes.
             pacer.onSettled()
+            notice(false)
             Log.i(TAG, "Relay rotation planned; it lands on the next pass that reaches the relay")
             true
         } catch (e: Exception) {
@@ -224,18 +243,22 @@ internal class RelayRotationDriver(
      * removed its Shore Pass must not have one reinstalled by a fleet
      * announcement, and a phone on a different relay is not the family's to
      * move.
+     *
+     * Returns whether the saved pass moved, so the pass that called this knows
+     * the credential it is holding is stale.
      */
-    fun adoptAnnouncedCredential() {
+    fun adoptAnnouncedCredential(): Boolean {
         val announced = try {
             store.relayCredentialSetting()
         } catch (e: Exception) {
             Log.w(TAG, "could not read the announced relay credential", e)
-            return
-        } ?: return
-        val saved = credential.current() ?: return
-        if (saved.relayUrl != announced.url || saved.relayToken == announced.token) return
+            return false
+        } ?: return false
+        val saved = credential.current() ?: return false
+        if (saved.relayUrl != announced.url || saved.relayToken == announced.token) return false
         Log.i(TAG, "Adopting the family relay credential a sibling announced")
         adopt(RelayConfig(announced.url, announced.token))
+        return true
     }
 
     /** Finish whatever [begin] left owed, if the pacer allows an attempt now. */
@@ -246,6 +269,18 @@ internal class RelayRotationDriver(
             Log.w(TAG, "could not read the pending relay rotation", e)
             return RelayRotationOutcome.NothingPending
         } ?: run {
+            pacer.onSettled()
+            return RelayRotationOutcome.NothingPending
+        }
+        if (!describesSavedPass(plan)) {
+            // The pass moved out from under a rotation that never landed. This
+            // must be dropped rather than performed: the call would re-key a
+            // family this device has left, and committing it would write that
+            // family's credential over the pass the person is actually on --
+            // reinstalling, in the cleared-pass case, a Shore Pass they
+            // deliberately removed.
+            Log.i(TAG, "Abandoning a relay rotation that names a pass this device no longer holds")
+            abandon()
             pacer.onSettled()
             return RelayRotationOutcome.NothingPending
         }
@@ -266,6 +301,39 @@ internal class RelayRotationDriver(
     private sealed interface Ask {
         data class Answered(val rotation: CoreRelayRotation) : Ask
         data class Refused(val step: RelayRotationNextStep) : Ask
+    }
+
+    /**
+     * Is this journal row still about the pass this device is on?
+     *
+     * A rotation is planned at the removal and performed whenever the relay is
+     * next reachable, which on a ship is days later — and in between, the pass
+     * itself can change: a new setup card scanned ashore, a backup restored, or
+     * the pass cleared in Advanced. The row names the family it was planned
+     * against and nothing reconciles it, so without this check the driver would
+     * keep asking a relay that is no longer this family's, and a call that
+     * *succeeded* would write the old family's credential over the current one
+     * — including reinstalling a pass its person deliberately removed. That is
+     * exactly the harm [adoptAnnouncedCredential]'s guard exists to prevent one
+     * function away.
+     *
+     * Both tokens count as a match. A rotation whose commit failed after the
+     * server had already re-keyed leaves this device holding the *replacement*
+     * with the row still owed, and that row must still be finishable.
+     */
+    private fun describesSavedPass(plan: RelayRotationPlan): Boolean {
+        val saved = credential.current() ?: return false
+        if (saved.relayUrl != plan.relayUrl) return false
+        return saved.relayToken == plan.supersededToken || saved.relayToken == plan.newToken
+    }
+
+    /** Clear the journal row, reporting whether it is actually gone. */
+    private fun abandon(): Boolean = try {
+        store.abandonRelayRotation()
+        true
+    } catch (e: Exception) {
+        Log.w(TAG, "could not clear the relay rotation", e)
+        false
     }
 
     private fun ask(
@@ -328,6 +396,7 @@ internal class RelayRotationDriver(
         }
         adopt(RelayConfig(committed.endpoint.url, committed.endpoint.token))
         pacer.onSettled()
+        notice(false)
         Log.i(
             TAG,
             "Family relay credential rotated (rotated=${rotation.rotated}, " +
@@ -393,11 +462,13 @@ internal class RelayRotationDriver(
                     "This relay will not let this device rotate the family token ($step); " +
                         "the removed device keeps its relay credential until the pass is replaced",
                 )
-                try {
-                    store.abandonRelayRotation()
-                } catch (e: Exception) {
-                    Log.w(TAG, "could not clear the relay rotation", e)
-                }
+                abandon()
+                // And say so. The removal confirmation promised this person
+                // that the removed phone loses the family mailbox; a promise
+                // that quietly could not be kept is worse than one that was
+                // never made, and only the person can act on it -- the repair
+                // is a new pass from whoever can issue one.
+                notice(true)
                 pacer.onSettled()
                 RelayRotationOutcome.GaveUp(step)
             }
@@ -440,6 +511,9 @@ internal class RelayRotationDriver(
             credential = SavedRelayCredential(context.applicationContext),
             rotate = { config, body -> RelayClient.rotateFamilyToken(config, body, network) },
             onRotated = RelaySyncEvents::requestSync,
+            notice = { blocked ->
+                RelayRotationNoticeStore.setBlocked(context.applicationContext, blocked)
+            },
         )
     }
 }
