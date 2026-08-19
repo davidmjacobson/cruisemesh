@@ -162,11 +162,13 @@ def main() -> None:
         f"/v1/betaGroups/{group_id}/relationships/builds",
         {"data": [{"type": "builds", "id": build_id}]},
     )
-    print(f"add to '{GROUP_NAME}': HTTP {resp.status_code}")
-    if resp.status_code >= 300:
+    add_status = resp.status_code
+    print(f"add to '{GROUP_NAME}': HTTP {add_status}")
+    if add_status >= 300:
         # 409 on a re-run is expected once the build is already in the group.
-        # Membership GET below is the verdict.
-        print(f"add returned {resp.status_code}: {resp.text[:300]}")
+        # The membership read below is the verdict where the API still allows
+        # it; otherwise this status decides.
+        print(f"add returned {add_status}: {resp.text[:300]}")
 
     resp = api(
         "POST",
@@ -180,15 +182,34 @@ def main() -> None:
 
     # Read the membership back rather than trusting the POST: this is the exact
     # fact the run summary claims, so assert it against App Store Connect.
-    member_of = [
-        g["attributes"]["name"]
-        for g in get_list(f"/v1/builds/{build_id}/betaGroups?limit=200", "build beta groups")
-    ]
-    if GROUP_NAME not in member_of:
-        die(
-            f"'{GROUP_NAME}' is not among the build's beta groups after the add "
-            f"(saw: {member_of or 'none'})."
-        )
+    # App Store Connect stopped allowing this read (observed 2026-08-19 on the
+    # 1.0.23 release: HTTP 403, "The relationship 'betaGroups' does not allow
+    # 'GET_RELATED'. Allowed operations are: CREATE, DELETE") after the add and
+    # the review submission had both succeeded -- so a forbidden read falls
+    # back to the add POST's own verdict instead of failing the distribution.
+    resp = api("GET", f"/v1/builds/{build_id}/betaGroups?limit=200")
+    if resp.status_code == 403:
+        print("membership read-back forbidden by App Store Connect; trusting the add POST")
+        if add_status >= 300 and add_status != 409:
+            die(
+                f"add to '{GROUP_NAME}' returned HTTP {add_status} and the "
+                f"membership cannot be read back to confirm it."
+            )
+    elif resp.status_code >= 300:
+        die(f"build beta groups query HTTP {resp.status_code}: {resp.text[:300]}")
+    else:
+        try:
+            data = resp.json().get("data")
+        except ValueError:
+            die(f"build beta groups query returned non-JSON: {resp.text[:300]}")
+        if not isinstance(data, list):
+            die(f"build beta groups query returned no data list: {resp.text[:300]}")
+        member_of = [g["attributes"]["name"] for g in data]
+        if GROUP_NAME not in member_of:
+            die(
+                f"'{GROUP_NAME}' is not among the build's beta groups after the add "
+                f"(saw: {member_of or 'none'})."
+            )
 
     detail = (api("GET", f"/v1/builds/{build_id}/buildBetaDetail").json().get("data") or {}).get("attributes", {})
     external = detail.get("externalBuildState")
