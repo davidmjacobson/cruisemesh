@@ -610,6 +610,9 @@ pub enum CoreRelayPassOutcome {
     NoConfigs,
     /// The pass was started inside a quiet window it must not spend through.
     RefusedQuietWindow,
+    /// A successful upload could not be recorded durably, so the pass stopped
+    /// before issuing more network work (`MARK-01`).
+    StoreFailed,
 }
 
 /// Why a continuation is worth scheduling. `PROGRESS-01` permits exactly two
@@ -968,6 +971,7 @@ struct PassState {
     rate_limited: bool,
     budget_yield: bool,
     cancelled: bool,
+    store_failed: bool,
     /// The stage an abort, a budget cut or a cancellation interrupted. `None`
     /// while the pass is still walking its stages normally.
     stopped_at: Option<CoreRelayStage>,
@@ -1053,6 +1057,7 @@ impl CoreRelayPass {
                 rate_limited: false,
                 budget_yield: false,
                 cancelled: false,
+                store_failed: false,
                 stopped_at: None,
                 progress: Progress::default(),
                 projection: CoreRelayProjection::default(),
@@ -1352,6 +1357,9 @@ impl PassState {
                 }
                 CoreRelayStage::Announce => {
                     self.run_announce();
+                    if self.store_failed {
+                        continue;
+                    }
                     self.stage = CoreRelayStage::UploadReceipts;
                     self.load_receipt_uploads();
                 }
@@ -1415,7 +1423,9 @@ impl PassState {
                     self.stage = CoreRelayStage::Finish;
                 }
                 CoreRelayStage::Finish => {
-                    let outcome = if self.cancelled {
+                    let outcome = if self.store_failed {
+                        CoreRelayPassOutcome::StoreFailed
+                    } else if self.cancelled {
                         CoreRelayPassOutcome::Cancelled
                     } else if self.rate_limited {
                         CoreRelayPassOutcome::RateLimited
@@ -1495,13 +1505,21 @@ impl PassState {
         // MARK-01: a marker names a mailbox, and this is a different mailbox.
         // The re-offer is wholesale because recipient hints rotate daily and
         // cannot be reversed to a contact, so scoping it is not possible.
-        let cleared = self
-            .store
-            .clear_carried_relay_upload_markers()
-            .unwrap_or_default();
+        let cleared = match self.store.clear_carried_relay_upload_markers() {
+            Ok(cleared) => cleared,
+            Err(_) => {
+                self.fail_store("carried_markers_clear_failed");
+                return;
+            }
+        };
         // The fan-out markers name a mailbox too, and for the same reason.
-        let cleared =
-            cleared.saturating_add(self.store.clear_relay_fanout_markers().unwrap_or_default());
+        let cleared = match self.store.clear_relay_fanout_markers() {
+            Ok(fanout) => cleared.saturating_add(fanout),
+            Err(_) => {
+                self.fail_store("fanout_markers_clear_failed");
+                return;
+            }
+        };
         let at_ms = self.now_ms;
         self.note(
             ProtocolEventDraft::new(
@@ -2529,15 +2547,13 @@ impl PassState {
                 if Some(&upload.endpoint.url) == self.plan.own.as_ref().map(|o| &o.url) {
                     self.own_relay_succeeded = true;
                 }
-                let marked = match upload.lane {
+                let marker_result = match upload.lane {
                     UploadLane::Receipt => {
                         self.receipt_uploads = self.receipt_uploads.saturating_add(1);
-                        self.store
-                            .mark_outgoing_receipt_envelope_relay_posted(
-                                upload.msg_id.clone(),
-                                self.now_ms,
-                            )
-                            .unwrap_or(false)
+                        self.store.mark_outgoing_receipt_envelope_relay_posted(
+                            upload.msg_id.clone(),
+                            self.now_ms,
+                        )
                     }
                     UploadLane::Authored => {
                         self.authored_uploads = self.authored_uploads.saturating_add(1);
@@ -2550,13 +2566,10 @@ impl PassState {
                             // with the remainder instead of re-posting the
                             // rows that already landed.
                             Some(fanout) => self.mark_fanout_row(&upload.endpoint, fanout),
-                            None => self
-                                .store
-                                .mark_outbound_envelope_relay_posted(
-                                    upload.msg_id.clone(),
-                                    self.now_ms,
-                                )
-                                .unwrap_or(false),
+                            None => self.store.mark_outbound_envelope_relay_posted(
+                                upload.msg_id.clone(),
+                                self.now_ms,
+                            ),
                         }
                     }
                     UploadLane::Carried => {
@@ -2565,17 +2578,21 @@ impl PassState {
                         // that earned it, not at the end. A pass that dies
                         // after this point has still recorded the upload, and
                         // the next launch does not re-post the row.
-                        let marked = self
-                            .store
-                            .mark_carried_envelope_relay_uploaded(
-                                upload.msg_id.clone(),
-                                upload.endpoint.url.clone(),
-                            )
-                            .unwrap_or(false);
-                        if marked {
+                        let marked = self.store.mark_carried_envelope_relay_uploaded(
+                            upload.msg_id.clone(),
+                            upload.endpoint.url.clone(),
+                        );
+                        if matches!(marked, Ok(true)) {
                             self.carried_rows_marked = self.carried_rows_marked.saturating_add(1);
                         }
                         marked
+                    }
+                };
+                let marked = match marker_result {
+                    Ok(marked) => marked,
+                    Err(_) => {
+                        self.fail_store("upload_marker_write_failed");
+                        false
                     }
                 };
                 if marked {
@@ -2661,31 +2678,49 @@ impl PassState {
 
     /// Record one landed fan-out row, and stamp the envelope if that was the
     /// last one owed. Returns whether anything durable changed.
-    fn mark_fanout_row(&mut self, endpoint: &RelayEndpoint, fanout: &FanoutRow) -> bool {
+    fn mark_fanout_row(
+        &mut self,
+        endpoint: &RelayEndpoint,
+        fanout: &FanoutRow,
+    ) -> Result<bool, crate::CoreError> {
         let now = self.now_ms;
-        let recorded = self
-            .store
-            .mark_relay_fanout_row_posted(
-                fanout.envelope_msg_id.clone(),
-                fanout.member_user_id.clone(),
-                endpoint.url.clone(),
-                now,
-            )
-            .unwrap_or(false);
+        let recorded = self.store.mark_relay_fanout_row_posted(
+            fanout.envelope_msg_id.clone(),
+            fanout.member_user_id.clone(),
+            endpoint.url.clone(),
+            now,
+        )?;
         let landed = self
             .store
-            .relay_fanout_posted_members(fanout.envelope_msg_id.clone(), endpoint.url.clone())
-            .unwrap_or_default()
+            .relay_fanout_posted_members(fanout.envelope_msg_id.clone(), endpoint.url.clone())?
             .len();
         if landed < fanout.members_owed {
             // Partial. Nothing terminal is written: the remaining members
             // are still eligible next pass, and the ones counted here are not.
-            return recorded;
+            return Ok(recorded);
         }
-        self.store
-            .mark_outbound_envelope_relay_posted(fanout.envelope_msg_id.clone(), now)
-            .unwrap_or(false)
-            || recorded
+        Ok(self
+            .store
+            .mark_outbound_envelope_relay_posted(fanout.envelope_msg_id.clone(), now)?
+            || recorded)
+    }
+
+    /// A successful relay answer is not progress until its durable marker is
+    /// written. Stop immediately on a store error so this pass cannot compound
+    /// an unrecorded success with more uploads or claim completion.
+    fn fail_store(&mut self, outcome: &'static str) {
+        if self.store_failed {
+            return;
+        }
+        self.store_failed = true;
+        self.uploads.clear();
+        self.stopped_at = Some(self.stage);
+        self.stage = CoreRelayStage::Finish;
+        let at_ms = self.now_ms;
+        self.note(
+            ProtocolEventDraft::new(ProtocolEventCode::InvariantViolation, at_ms, outcome)
+                .invariants(&["MARK-01"]),
+        );
     }
 
     fn mark_answered(&mut self, config: usize) {
@@ -3683,6 +3718,7 @@ fn pass_outcome_token(outcome: CoreRelayPassOutcome) -> &'static str {
         CoreRelayPassOutcome::Cancelled => "cancelled",
         CoreRelayPassOutcome::NoConfigs => "no_configs",
         CoreRelayPassOutcome::RefusedQuietWindow => "refused_inside_quiet_window",
+        CoreRelayPassOutcome::StoreFailed => "store_failed",
     }
 }
 

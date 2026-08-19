@@ -7424,6 +7424,17 @@ public protocol MessageStoreProtocol : AnyObject {
     func pendingRelayRotation() throws  -> RelayRotationPlan?
     
     /**
+     * Plan an explicit security refresh of a legacy relay credential.
+     *
+     * Unlike [`core_plan_relay_rotation`], this is not coupled to a device
+     * revocation. It is the opt-in migration path for a Shore Pass whose
+     * member credential may have appeared in older friend cards. The empty
+     * revoked-device list records that distinction while reusing the same
+     * crash-safe journal and propagation machinery.
+     */
+    func planRelayCredentialRefresh(relayUrl: String, currentToken: String, previousRelayEpoch: Int64, nowMs: Int64) throws  -> RelayRotationPlan?
+
+    /**
      * Run one inbound `0x02` envelope through the production disposition and
      * return the bounded work to execute. See the module docs for the ordered
      * steps and the invariants preserved.
@@ -12321,6 +12332,26 @@ open func pendingRelayRotation()throws  -> RelayRotationPlan? {
 })
 }
     
+    /**
+     * Plan an explicit security refresh of a legacy relay credential.
+     *
+     * Unlike [`core_plan_relay_rotation`], this is not coupled to a device
+     * revocation. It is the opt-in migration path for a Shore Pass whose
+     * member credential may have appeared in older friend cards. The empty
+     * revoked-device list records that distinction while reusing the same
+     * crash-safe journal and propagation machinery.
+     */
+open func planRelayCredentialRefresh(relayUrl: String, currentToken: String, previousRelayEpoch: Int64, nowMs: Int64)throws  -> RelayRotationPlan? {
+    return try  FfiConverterOptionTypeRelayRotationPlan.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_messagestore_plan_relay_credential_refresh(self.uniffiClonePointer(),
+        FfiConverterString.lower(relayUrl),
+        FfiConverterString.lower(currentToken),
+        FfiConverterInt64.lower(previousRelayEpoch),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
     /**
      * Run one inbound `0x02` envelope through the production disposition and
      * return the bounded work to execute. See the module docs for the ordered
@@ -40778,6 +40809,11 @@ public enum CoreRelayPassOutcome {
      * The pass was started inside a quiet window it must not spend through.
      */
     case refusedQuietWindow
+    /**
+     * A successful upload could not be recorded durably, so the pass stopped
+     * before issuing more network work (`MARK-01`).
+     */
+    case storeFailed
 }
 
 
@@ -40803,6 +40839,8 @@ public struct FfiConverterTypeCoreRelayPassOutcome: FfiConverterRustBuffer {
         
         case 6: return .refusedQuietWindow
         
+        case 7: return .storeFailed
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -40834,6 +40872,10 @@ public struct FfiConverterTypeCoreRelayPassOutcome: FfiConverterRustBuffer {
         case .refusedQuietWindow:
             writeInt(&buf, Int32(6))
         
+
+        case .storeFailed:
+            writeInt(&buf, Int32(7))
+
         }
     }
 }
@@ -58023,6 +58065,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_pending_relay_rotation() != 50828) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_plan_relay_credential_refresh() != 43795) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_process_inbound_frame() != 43681) {

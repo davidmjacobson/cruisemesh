@@ -53,6 +53,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.cruisemesh.app.R
+import com.cruisemesh.app.AppStore
 import com.cruisemesh.app.mesh.ShorePassHeading
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.RelayHealth
@@ -65,6 +66,7 @@ import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayHttpException
+import com.cruisemesh.app.relay.RelayRotationDriver
 import com.cruisemesh.app.friending.encodeQrBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -111,6 +113,8 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
     var unverifiedSetup by remember { mutableStateOf<RelaySetup?>(null) }
     var setupQrLink by remember { mutableStateOf<String?>(null) }
     var showRemoveConfirmation by remember { mutableStateOf(false) }
+    var showCredentialRefreshConfirmation by remember { mutableStateOf(false) }
+    var credentialRefreshMessage by remember { mutableStateOf<Int?>(null) }
     var customUrl by remember { mutableStateOf(configured?.relayUrl.orEmpty()) }
     var customToken by remember { mutableStateOf(configured?.relayToken.orEmpty()) }
 
@@ -495,6 +499,25 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(top = 8.dp),
                     )
+                    if (configured?.let { relaySetupIsOfficial(it.relayUrl) } == true) {
+                        TextButton(
+                            onClick = { showCredentialRefreshConfirmation = true },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(stringResource(R.string.ui_retire_old_shore_pass_access)) }
+                        Text(
+                            stringResource(R.string.ui_retire_old_shore_pass_access_help),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        credentialRefreshMessage?.let { message ->
+                            Text(
+                                stringResource(message),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
                     TextButton(
                         onClick = { showRemoveConfirmation = true },
                         modifier = Modifier.fillMaxWidth(),
@@ -676,6 +699,35 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
             },
             dismissButton = {
                 TextButton(onClick = { showRemoveConfirmation = false }) { Text(stringResource(R.string.ui_cancel)) }
+            },
+        )
+    }
+
+    if (showCredentialRefreshConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showCredentialRefreshConfirmation = false },
+            title = { Text(stringResource(R.string.ui_retire_old_shore_pass_access_confirm)) },
+            text = { Text(stringResource(R.string.ui_retire_old_shore_pass_access_warning)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val queued = RelayRotationDriver
+                            .forApp(context, AppStore.get(context))
+                            .beginCredentialRefresh()
+                        credentialRefreshMessage = if (queued) {
+                            RelaySyncEvents.requestSync()
+                            R.string.ui_old_shore_pass_access_retirement_queued
+                        } else {
+                            R.string.ui_old_shore_pass_access_retirement_failed
+                        }
+                        showCredentialRefreshConfirmation = false
+                    },
+                ) { Text(stringResource(R.string.ui_retire_old_access)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCredentialRefreshConfirmation = false }) {
+                    Text(stringResource(R.string.ui_cancel))
+                }
             },
         )
     }

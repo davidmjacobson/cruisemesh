@@ -162,6 +162,34 @@ internal class RelayRotationDriver(
      * Shore Pass to rotate, which is most installs.
      */
     fun begin(revocation: RevocationCommit): Boolean {
+        return beginPlanned { config, now ->
+            corePlanRelayRotation(
+                revocation,
+                config.relayUrl,
+                config.relayToken,
+                credential.epoch(),
+                now,
+            )
+        }
+    }
+
+    /**
+     * Opt-in migration for a Shore Pass credential that may have appeared in
+     * an older friend card. It deliberately uses the same durable journal as
+     * device removal, but does not revoke a device or rotate the inbox key.
+     */
+    fun beginCredentialRefresh(): Boolean = beginPlanned { config, now ->
+        store.planRelayCredentialRefresh(
+            config.relayUrl,
+            config.relayToken,
+            credential.epoch(),
+            now,
+        )
+    }
+
+    private fun beginPlanned(
+        planner: (RelayConfig, Long) -> RelayRotationPlan?,
+    ): Boolean {
         val now = clock()
         val alreadyPending = try {
             store.pendingRelayRotation()
@@ -191,13 +219,7 @@ internal class RelayRotationDriver(
         }
         val config = credential.current() ?: return false
         val plan = try {
-            corePlanRelayRotation(
-                revocation,
-                config.relayUrl,
-                config.relayToken,
-                credential.epoch(),
-                now,
-            )
+            planner(config, now)
         } catch (e: Exception) {
             // A deposit-class credential is the only way here: this device
             // cannot fetch its own mail either, so it is misconfigured and

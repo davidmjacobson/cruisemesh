@@ -467,7 +467,8 @@ struct FriendsView: View {
             // sharer, not with the person on the card, so it is never `scanned`.
             scanned: scanned && shared == nil,
             shared: shared,
-            sharedByLabel: shared.map { sharerLabel(for: $0.sharerUserId) }
+            sharedByLabel: shared.map { sharerLabel(for: $0.sharerUserId) },
+            legacyUnverified: !scanned && shared == nil && card.signature == nil
         )
     }
 

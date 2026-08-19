@@ -22,6 +22,8 @@ struct ShorePassView: View {
     @State private var unverifiedSetup: RelaySetup?
     @State private var showSetupQR = false
     @State private var showRemoveConfirmation = false
+    @State private var showCredentialRefreshConfirmation = false
+    @State private var credentialRefreshMessage: String?
     @State private var customUrl: String
     @State private var customToken: String
     /// Last health that was an actual answer, so an in-flight re-check keeps
@@ -207,6 +209,19 @@ struct ShorePassView: View {
                         Text("Share this only with your family’s phones.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if relaySetupIsOfficial(relayUrl: configured.relayUrl) {
+                            Button("Retire old Shore Pass access") {
+                                showCredentialRefreshConfirmation = true
+                            }
+                            Text("Use this if an older CruiseMesh build shared your family’s full mailbox access in friend cards.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if let credentialRefreshMessage {
+                                Text(credentialRefreshMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                         Button("Remove Shore Pass setup", role: .destructive) {
                             showRemoveConfirmation = true
                         }
@@ -318,6 +333,22 @@ struct ShorePassView: View {
             }
         } message: {
             Text("Queued internet delivery will stop until another Shore Pass or custom relay is set up. Nearby delivery still works.")
+        }
+        .confirmationDialog(
+            "Retire old Shore Pass access?",
+            isPresented: $showCredentialRefreshConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Retire old access", role: .destructive) {
+                if RelayRotationDriver().beginCredentialRefresh() {
+                    RelaySyncEvents.requestSync()
+                    credentialRefreshMessage = "Access retirement is queued and will finish when CruiseMesh reaches the relay."
+                } else {
+                    credentialRefreshMessage = "Couldn’t queue access retirement. Try again."
+                }
+            }
+        } message: {
+            Text("This replaces the mailbox credential in older friend cards. Messages stay, and your contacts update automatically. Other people using this Shore Pass may need to scan this phone’s setup card again.")
         }
         .alert("Replace Shore Pass?", isPresented: Binding(
             get: { pending != nil },

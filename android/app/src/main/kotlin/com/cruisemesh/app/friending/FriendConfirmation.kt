@@ -71,6 +71,12 @@ data class FriendPreview(
     val shared: SharedFriendCard? = null,
     /** Who shared it, for the "Shared by ..." line. Never a verified badge. */
     val sharedByName: String? = null,
+    /**
+     * True only for an unsigned legacy card pasted or opened from another app.
+     * A camera scan is protected by co-presence and a shared-contact code is
+     * signed by the known sharer, so neither needs this downgrade warning.
+     */
+    val legacyUnverified: Boolean = false,
 )
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -235,6 +241,26 @@ fun FriendPreviewSheet(
                 )
             }
             FriendIdentityBlock(preview.contact, null)
+            if (preview.legacyUnverified) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            stringResource(R.string.ui_legacy_friend_card_title),
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(stringResource(R.string.ui_legacy_friend_card_body))
+                    }
+                }
+            }
             if (preview.shared != null) {
                 SafetyWordsRow(preview.contact.name, preview.contact.userId)
             }
@@ -242,7 +268,11 @@ fun FriendPreviewSheet(
             Button(onClick = onConfirm, modifier = Modifier.fillMaxWidth()) {
                 Text(
                     stringResource(
-                        if (isUpdate) R.string.ui_update_this_friend else R.string.ui_add_this_friend_60651604,
+                        when {
+                            preview.legacyUnverified -> R.string.ui_add_unverified_friend
+                            isUpdate -> R.string.ui_update_this_friend
+                            else -> R.string.ui_add_this_friend_60651604
+                        },
                     ),
                 )
             }

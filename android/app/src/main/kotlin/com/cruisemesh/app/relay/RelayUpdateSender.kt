@@ -54,8 +54,12 @@ object RelayUpdateSender {
         // the re-offer rides the very sync that detected the change.
         try {
             store.clearCarriedRelayUploadMarkers()
+            store.clearRelayFanoutMarkers()
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to clear carried-upload markers on endpoint change: ${e.message}")
+            // The epoch remains unannounced, so a later pass retries the
+            // entire idempotent clear before queuing any endpoint notices.
+            Log.w(TAG, "Failed to clear relay markers on endpoint change: ${e.message}")
+            return
         }
         queueToAllContacts(context, store, identity, epoch)
         // Which contacts may be introduced to each other is scoped by our own

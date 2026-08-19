@@ -16,6 +16,10 @@ struct FriendPreviewState: Identifiable {
     var shared: SharedFriendCard? = nil
     /// Who passed the card along, for the "Shared by Mom" line.
     var sharedByLabel: String? = nil
+    /// An unsigned legacy card pasted or opened from another app. Camera scans
+    /// have co-presence and shared cards have the known sharer's signature, so
+    /// this flag is deliberately limited to the tamperable text-link path.
+    var legacyUnverified: Bool = false
     var id: String { UserIdHex.encode(contact.userId) }
 }
 
@@ -90,8 +94,23 @@ struct FriendPreviewView: View {
                         .foregroundStyle(.secondary)
                 }
                 FriendIdentityBlock(contact: state.contact)
+                if state.legacyUnverified {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Older, unverified friend card").font(.headline)
+                        Text("This card came from an older CruiseMesh build and is not signed. Confirm it with your friend before adding it, or ask them to share a new card.")
+                            .font(.callout)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .background(.orange.opacity(0.16), in: RoundedRectangle(cornerRadius: 12))
+                }
                 matchNote
-                Button(isUpdate ? "Update this friend" : "Add this friend", action: onConfirm)
+                Button(
+                    state.legacyUnverified
+                        ? "Add unverified friend"
+                        : (isUpdate ? "Update this friend" : "Add this friend"),
+                    action: onConfirm
+                )
                     .buttonStyle(.borderedProminent)
                 Button("Cancel", role: .cancel) { dismiss() }
             }
