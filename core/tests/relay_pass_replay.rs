@@ -1053,6 +1053,53 @@ fn a_marked_carried_row_is_never_reoffered() {
     assert_no_secrets(&store, &run_two.summary);
 }
 
+#[test]
+fn a_marker_write_failure_stops_the_pass_instead_of_claiming_success() {
+    let unique = format!(
+        "cruisemesh-marker-failure-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let path = std::env::temp_dir().join(unique);
+    let store =
+        Arc::new(MessageStore::open(path.to_string_lossy().into_owned()).expect("temporary store"));
+    seed_carried(&store, 2, T0);
+    let pass = CoreRelayPass::new(store.clone(), base_plan(T0), "marker-failure".to_string());
+
+    let action = pass.start(T0);
+    assert!(
+        matches!(&action.kind, CoreRelayActionKind::Http { request } if request.operation == CoreRelayOperation::PostEnvelope),
+        "the first carried upload must be outstanding before the marker store is broken"
+    );
+    rusqlite::Connection::open(&path)
+        .expect("second connection")
+        .execute_batch("DROP TABLE carried_envelopes")
+        .expect("break only the carried marker table");
+
+    let finished = pass.resume_http(CoreRelayHttpResult {
+        pass_id: action.pass_id,
+        action_id: action.action_id,
+        status: 200,
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        error: None,
+        completed_at_ms: T0 + 40,
+    });
+    let CoreRelayActionKind::Finished { summary } = finished.kind else {
+        panic!("a marker failure must stop before another network request")
+    };
+    assert_eq!(summary.outcome, CoreRelayPassOutcome::StoreFailed);
+    assert_eq!(summary.requests_issued, 1);
+    assert_eq!(summary.carried_rows_marked, 0);
+
+    drop(pass);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
 // ---------------------------------------------------------------------------
 // contact-silence-no-proof — SILENCE-01
 // ---------------------------------------------------------------------------

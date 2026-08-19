@@ -141,6 +141,27 @@ final class RelayRotationDriverTests: XCTestCase {
 
     // MARK: - Tests
 
+    func testExplicitCredentialRefreshIsJournaledWithoutAnotherRevocation() throws {
+        let fleet = try Fleet.revoked(nowMs: nowMs)
+        let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
+        let driver = RelayRotationDriver(
+            store: fleet.store,
+            credential: pass,
+            rotate: { _, _ in XCTFail("planning must not touch the network"); return Data() },
+            pacer: RelayRotationPacer(),
+            clock: { self.nowMs }
+        )
+
+        XCTAssertTrue(driver.beginCredentialRefresh())
+        let planned = try XCTUnwrap(try fleet.store.pendingRelayRotation())
+        XCTAssertEqual(planned.supersededToken, oldToken)
+        XCTAssertTrue(planned.revokedDeviceIds.isEmpty)
+        XCTAssertEqual(
+            planned.inboxKeyGeneration,
+            try fleet.store.coreOwnSyncContext()?.inboxKeyGeneration
+        )
+    }
+
     func testTheRotationIsWrittenDownBeforeTheCallAndCommittedOnlyAfterIt() throws {
         let fleet = try Fleet.revoked(nowMs: nowMs)
         let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))

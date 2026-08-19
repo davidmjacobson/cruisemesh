@@ -1623,7 +1623,11 @@ private fun AddFriendRoute(identity: Identity, navController: NavHostController,
                                     relayToken = card.relayToken,
                             )
                             ImportFriendResult.Preview(
-                                FriendPreview(candidate, friendCardMatch(candidate, store.listContacts())),
+                                FriendPreview(
+                                    contact = candidate,
+                                    match = friendCardMatch(candidate, store.listContacts()),
+                                    legacyUnverified = card.signature == null,
+                                ),
                             )
                         }
                     }

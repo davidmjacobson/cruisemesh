@@ -150,6 +150,28 @@ class RelayRotationDriverTest {
     // -- The tests ----------------------------------------------------------
 
     @Test
+    fun `an explicit credential refresh is journaled without another revocation`() {
+        val fleet = Fleet()
+        val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))
+        val driver = driver(
+            fleet,
+            pass,
+            Relay { _, _ -> error("planning must not touch the network") },
+            RelayRotationPacer(),
+            { NOW },
+        )
+
+        assertTrue(driver.beginCredentialRefresh())
+        val planned = fleet.store.pendingRelayRotation() ?: error("refresh was not journaled")
+        assertEquals(OLD_TOKEN, planned.supersededToken)
+        assertTrue(planned.revokedDeviceIds.isEmpty())
+        assertEquals(
+            fleet.store.coreOwnSyncContext()!!.inboxKeyGeneration,
+            planned.inboxKeyGeneration,
+        )
+    }
+
+    @Test
     fun `the rotation is written down before the call and committed only after it`() {
         val fleet = Fleet()
         val pass = SavedPass(RelayConfig(RELAY_URL, OLD_TOKEN))

@@ -34,7 +34,15 @@ enum RelayUpdateSender {
         // moves (apply_contact_relay_update). Runs before this pass's
         // uploads, so the re-offer rides the very sync that detected the
         // change. Mirrors RelayUpdateSender.kt.
-        _ = try? store.clearCarriedRelayUploadMarkers()
+        do {
+            _ = try store.clearCarriedRelayUploadMarkers()
+            _ = try store.clearRelayFanoutMarkers()
+        } catch {
+            // Keep the epoch unannounced so a later pass retries the complete,
+            // idempotent clear before queuing endpoint notices.
+            log.warning("Failed to clear relay markers on endpoint change: \(String(describing: error), privacy: .public)")
+            return
+        }
         queueToAllContacts(store: store, identity: identity, epoch: epoch)
         // Which contacts may be introduced to each other is scoped by our own
         // pass (FriendDirectoryScope), so the pass moving changes every

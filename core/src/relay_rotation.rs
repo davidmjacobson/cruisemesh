@@ -287,6 +287,24 @@ pub fn core_plan_relay_rotation(
     previous_relay_epoch: i64,
     now_ms: i64,
 ) -> Result<Option<RelayRotationPlan>, CoreError> {
+    plan_relay_rotation_for_generation(
+        revocation.inbox_key_generation,
+        revocation.revoked_device_ids,
+        relay_url,
+        current_token,
+        previous_relay_epoch,
+        now_ms,
+    )
+}
+
+fn plan_relay_rotation_for_generation(
+    inbox_key_generation: u64,
+    revoked_device_ids: Vec<Vec<u8>>,
+    relay_url: String,
+    current_token: String,
+    previous_relay_epoch: i64,
+    now_ms: i64,
+) -> Result<Option<RelayRotationPlan>, CoreError> {
     let relay_url = relay_url.trim().to_string();
     let current_token = current_token.trim().to_string();
     if relay_url.is_empty() || current_token.is_empty() {
@@ -309,13 +327,41 @@ pub fn core_plan_relay_rotation(
         // epoch we announced, so two rotations inside one millisecond still
         // order.
         relay_epoch: now_ms.max(previous_relay_epoch.saturating_add(1)),
-        inbox_key_generation: revocation.inbox_key_generation,
-        revoked_device_ids: revocation.revoked_device_ids,
+        inbox_key_generation,
+        revoked_device_ids,
     }))
 }
 
 #[uniffi::export]
 impl MessageStore {
+    /// Plan an explicit security refresh of a legacy relay credential.
+    ///
+    /// Unlike [`core_plan_relay_rotation`], this is not coupled to a device
+    /// revocation. It is the opt-in migration path for a Shore Pass whose
+    /// member credential may have appeared in older friend cards. The empty
+    /// revoked-device list records that distinction while reusing the same
+    /// crash-safe journal and propagation machinery.
+    pub fn plan_relay_credential_refresh(
+        &self,
+        relay_url: String,
+        current_token: String,
+        previous_relay_epoch: i64,
+        now_ms: i64,
+    ) -> Result<Option<RelayRotationPlan>, CoreError> {
+        let generation = self
+            .core_own_sync_context()?
+            .map(|context| context.inbox_key_generation)
+            .unwrap_or_default();
+        plan_relay_rotation_for_generation(
+            generation,
+            Vec::new(),
+            relay_url,
+            current_token,
+            previous_relay_epoch,
+            now_ms,
+        )
+    }
+
     /// **Write the rotation down before performing it** (§10.2, crash safety).
     ///
     /// Must be called before `POST /family/rotate`, and the ordering is the
@@ -893,6 +939,31 @@ mod tests {
             plan.inbox_key_generation,
             fleet.roster.inbox_key_generation + 1
         );
+        assert_eq!(plan.relay_epoch, NOW);
+    }
+
+    #[test]
+    fn an_explicit_legacy_credential_refresh_uses_the_current_generation() {
+        let fleet = fleet();
+        let store = MessageStore::open(":memory:".to_string()).expect("open");
+        store
+            .core_set_own_sync_context(fleet.roster.clone(), fleet.roster.inbox_key_generation)
+            .expect("sync context");
+
+        let plan = store
+            .plan_relay_credential_refresh(
+                RELAY_URL.to_string(),
+                OLD_TOKEN.to_string(),
+                NOW - 1,
+                NOW,
+            )
+            .expect("plan")
+            .expect("configured passes can refresh");
+
+        assert_eq!(plan.superseded_token, OLD_TOKEN);
+        assert_ne!(plan.new_token, OLD_TOKEN);
+        assert_eq!(plan.inbox_key_generation, fleet.roster.inbox_key_generation);
+        assert!(plan.revoked_device_ids.is_empty());
         assert_eq!(plan.relay_epoch, NOW);
     }
 

@@ -6039,6 +6039,106 @@
         }
       }
     },
+    "Access retirement is queued and will finish when CruiseMesh reaches the relay.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Access retirement is queued and will finish when CruiseMesh reaches the relay."
+          }
+        }
+      }
+    },
+    "Add unverified friend": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Add unverified friend"
+          }
+        }
+      }
+    },
+    "Couldn’t queue access retirement. Try again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn’t queue access retirement. Try again."
+          }
+        }
+      }
+    },
+    "Older, unverified friend card": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Older, unverified friend card"
+          }
+        }
+      }
+    },
+    "Retire old access": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retire old access"
+          }
+        }
+      }
+    },
+    "Retire old Shore Pass access": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retire old Shore Pass access"
+          }
+        }
+      }
+    },
+    "Retire old Shore Pass access?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Retire old Shore Pass access?"
+          }
+        }
+      }
+    },
+    "This card came from an older CruiseMesh build and is not signed. Confirm it with your friend before adding it, or ask them to share a new card.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This card came from an older CruiseMesh build and is not signed. Confirm it with your friend before adding it, or ask them to share a new card."
+          }
+        }
+      }
+    },
+    "This replaces the mailbox credential in older friend cards. Messages stay, and your contacts update automatically. Other people using this Shore Pass may need to scan this phone’s setup card again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This replaces the mailbox credential in older friend cards. Messages stay, and your contacts update automatically. Other people using this Shore Pass may need to scan this phone’s setup card again."
+          }
+        }
+      }
+    },
+    "Use this if an older CruiseMesh build shared your family’s full mailbox access in friend cards.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Use this if an older CruiseMesh build shared your family’s full mailbox access in friend cards."
+          }
+        }
+      }
+    },
     "Light": {
       "localizations": {
         "en": {

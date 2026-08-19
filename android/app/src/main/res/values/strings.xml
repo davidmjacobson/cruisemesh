@@ -434,6 +434,13 @@
     <string name="ui_show_setup_qr">Show setup QR</string>
     <string name="ui_remove_shore_pass_setup">Remove Shore Pass setup</string>
     <string name="ui_share_only_with_your_familys_phones">Share this only with your family’s phones.</string>
+    <string name="ui_retire_old_shore_pass_access">Retire old Shore Pass access</string>
+    <string name="ui_retire_old_shore_pass_access_help">Use this if an older CruiseMesh build shared your family’s full mailbox access in friend cards.</string>
+    <string name="ui_retire_old_shore_pass_access_confirm">Retire old Shore Pass access?</string>
+    <string name="ui_retire_old_shore_pass_access_warning">This replaces the mailbox credential in older friend cards. Messages stay, and your contacts update automatically. Other people using this Shore Pass may need to scan this phone’s setup card again.</string>
+    <string name="ui_retire_old_access">Retire old access</string>
+    <string name="ui_old_shore_pass_access_retirement_queued">Access retirement is queued and will finish when CruiseMesh reaches the relay.</string>
+    <string name="ui_old_shore_pass_access_retirement_failed">Couldn’t queue access retirement. Try again.</string>
     <string name="ui_custom_relay">Custom relay</string>
     <string name="ui_for_self_hosted_relays_and_development_most_people">For self-hosted relays and development. Most people should use the setup card above.</string>
     <string name="ui_relay_token">Relay token</string>
@@ -1009,4 +1016,7 @@
         <item quantity="one">%1$d person added</item>
         <item quantity="other">%1$d people added</item>
     </plurals>
+    <string name="ui_legacy_friend_card_title">Older, unverified friend card</string>
+    <string name="ui_legacy_friend_card_body">This card came from an older CruiseMesh build and is not signed. Confirm it with your friend before adding it, or ask them to share a new card.</string>
+    <string name="ui_add_unverified_friend">Add unverified friend</string>
 </resources>

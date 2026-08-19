@@ -215,6 +215,35 @@ struct RelayRotationDriver {
     /// Shore Pass to rotate, which is most installs.
     @discardableResult
     func begin(revocation: RevocationCommit) -> Bool {
+        beginPlanned { config, now in
+            try corePlanRelayRotation(
+                revocation: revocation,
+                relayUrl: config.relayUrl,
+                currentToken: config.relayToken,
+                previousRelayEpoch: self.credential.epoch(),
+                nowMs: now
+            )
+        }
+    }
+
+    /// Opt-in migration for a Shore Pass credential that may have appeared in
+    /// an older friend card. This uses the same crash-safe journal as device
+    /// removal without revoking a device or rotating the inbox key.
+    @discardableResult
+    func beginCredentialRefresh() -> Bool {
+        beginPlanned { config, now in
+            try self.store.planRelayCredentialRefresh(
+                relayUrl: config.relayUrl,
+                currentToken: config.relayToken,
+                previousRelayEpoch: self.credential.epoch(),
+                nowMs: now
+            )
+        }
+    }
+
+    private func beginPlanned(
+        _ planner: (RelayConfig, Int64) throws -> RelayRotationPlan?
+    ) -> Bool {
         let now = clock()
         let alreadyPending: RelayRotationPlan?
         do {
@@ -246,13 +275,7 @@ struct RelayRotationDriver {
         guard let config = credential.current() else { return false }
         let plan: RelayRotationPlan?
         do {
-            plan = try corePlanRelayRotation(
-                revocation: revocation,
-                relayUrl: config.relayUrl,
-                currentToken: config.relayToken,
-                previousRelayEpoch: credential.epoch(),
-                nowMs: now
-            )
+            plan = try planner(config, now)
         } catch {
             // A deposit-class credential is the only way here: this device
             // cannot fetch its own mail either, so it is misconfigured and
