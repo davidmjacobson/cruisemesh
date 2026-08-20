@@ -81,6 +81,17 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertEqual(attemptedFiles, files)
     }
 
+    @MainActor
+    func testSharePreparationDoesNotRunBlockingWorkOnMainThread() async {
+        let result = await DiagnosticsSharePreparation.run {
+            Thread.isMainThread
+                ? .nothingCaptured
+                : .archive(URL(fileURLWithPath: "/prepared-off-main"))
+        }
+
+        XCTAssertEqual(result, .archive(URL(fileURLWithPath: "/prepared-off-main")))
+    }
+
     /// "Delete captured diagnostics" has to take the zip too, or it leaves a
     /// full second copy of everything it claimed to erase.
     func testDeleteRemovesWrittenArchives() throws {

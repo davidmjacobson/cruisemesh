@@ -3653,6 +3653,16 @@
         }
       }
     },
+    "If you're having trouble and you'd like to help the developer investigate, turn this on to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "If you're having trouble and you'd like to help the developer investigate, turn this on to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded."
+          }
+        }
+      }
+    },
     "If your messages are not arriving, ask them to share their friend card again. A card carries the service they used when they shared it.": {
       "localizations": {
         "en": {
@@ -4179,6 +4189,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Photo ready"
+          }
+        }
+      }
+    },
+    "Preparing diagnostics…": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Preparing diagnostics…"
           }
         }
       }
@@ -5241,16 +5261,6 @@
           "stringUnit": {
             "state": "translated",
             "value": "Turn on Bluetooth"
-          }
-        }
-      }
-    },
-    "Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded."
           }
         }
       }
