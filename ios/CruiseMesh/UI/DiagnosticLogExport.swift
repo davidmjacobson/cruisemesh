@@ -198,7 +198,13 @@ enum DiagnosticLogExport {
         let windowStart = Date().addingTimeInterval(-window)
         let start = max(lastArchivedAt ?? windowStart, windowStart)
         let position = store.position(date: start)
-        guard let entries = try? store.getEntries(at: position) else { return }
+        // Ask the log store to filter before it hands entries to our lazy
+        // iterator. Filtering `subsystem` in the loop below made the first
+        // diagnostics share enumerate every framework log emitted by this
+        // process, which can take many seconds even when the resulting
+        // CruiseMesh archive is only a few kilobytes.
+        let predicate = NSPredicate(format: "subsystem == %@", subsystem)
+        guard let entries = try? store.getEntries(at: position, matching: predicate) else { return }
 
         let stamp = ISO8601DateFormatter()
         var records: [(date: Date, line: String)] = []

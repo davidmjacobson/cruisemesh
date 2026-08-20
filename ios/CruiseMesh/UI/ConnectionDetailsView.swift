@@ -553,6 +553,7 @@ struct ConnectionDetailsView: View {
 
     @State private var diagnosticLogging = DiagnosticLogExport.isEnabled
     @State private var hasDiagnosticArchive = DiagnosticLogExport.hasArchive()
+    @State private var isPreparingDiagnosticsShare = false
     @State private var shareFile: ShareableFile?
     @State private var supportMessage: String?
     @State private var shareOutcome = DiagnosticsShareOutcome()
@@ -1080,7 +1081,8 @@ struct ConnectionDetailsView: View {
                             ? String(localized: "Diagnostic logging is on. Reproduce the problem, then return here to share it.")
                             : String(localized: "Diagnostic logging is off. What was already captured is kept until you delete it.")
                     }
-                Text("Turn this on before testing to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.")
+                    .disabled(isPreparingDiagnosticsShare)
+                Text("If you're having trouble and you'd like to help the developer investigate, turn this on to keep the connection log across app restarts. Delivery timings are kept either way. Message content is never recorded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button {
@@ -1091,9 +1093,17 @@ struct ConnectionDetailsView: View {
                     // and the delivery timings all ride the same share sheet.
                     shareEverything()
                 } label: {
-                    Label("Share diagnostics", systemImage: "ladybug")
+                    if isPreparingDiagnosticsShare {
+                        HStack {
+                            ProgressView()
+                            Text("Preparing diagnostics…")
+                        }
+                    } else {
+                        Label("Share diagnostics", systemImage: "ladybug")
+                    }
                 }
                 .frame(minHeight: 44)
+                .disabled(isPreparingDiagnosticsShare)
                 Button(role: .destructive) {
                     deleteEverythingCaptured()
                     supportMessage = String(localized: "Captured diagnostics deleted.")
@@ -1101,7 +1111,7 @@ struct ConnectionDetailsView: View {
                     Label("Delete captured diagnostics", systemImage: "trash")
                 }
                 .frame(minHeight: 44)
-                .disabled(!hasDiagnosticArchive)
+                .disabled(!hasDiagnosticArchive || isPreparingDiagnosticsShare)
                 Button("Clear connection history", role: .destructive) {
                     showClear = true
                 }
@@ -1154,18 +1164,42 @@ struct ConnectionDetailsView: View {
     ///
     /// They go as a single zip rather than as several attachments -- see
     /// `DiagnosticsArchive` for how a list of files loses some of them.
+    @MainActor
     private func shareEverything() {
+        guard !isPreparingDiagnosticsShare else { return }
+        isPreparingDiagnosticsShare = true
+        supportMessage = nil
+
+        Task {
+            let plan = await DiagnosticsSharePreparation.run {
+                Self.prepareDiagnosticsShare()
+            }
+            isPreparingDiagnosticsShare = false
+            applyDiagnosticsSharePlan(plan)
+        }
+    }
+
+    /// The complete blocking export path. This must stay nonisolated so the
+    /// detached preparation task cannot inherit the main actor from the view.
+    nonisolated private static func prepareDiagnosticsShare() -> DiagnosticsSharePlan {
         var urls: [URL] = []
         if let url = DiagnosticLogExport.writeLogFile() { urls.append(url) }
         urls.append(contentsOf: DiagnosticLogExport.metricKitFileURLs())
         if let url = FieldMetricsExport.writeCSVFile() { urls.append(url) }
         if let url = ConflictDiagnosticsExport.writeCSVFile() { urls.append(url) }
         if let url = ProtocolEventExport.writeJSONLFile() { urls.append(url) }
-        hasDiagnosticArchive = !urls.isEmpty
-        let plan = DiagnosticsSharePlan.prepare(
+        return DiagnosticsSharePlan.prepare(
             files: urls,
             name: DiagnosticsArchive.todaysName()
         )
+    }
+
+    @MainActor
+    private func applyDiagnosticsSharePlan(_ plan: DiagnosticsSharePlan) {
+        hasDiagnosticArchive = {
+            if case .nothingCaptured = plan { return false }
+            return true
+        }()
         switch plan {
         case .nothingCaptured:
             supportMessage = String(localized: "No diagnostics captured yet.")

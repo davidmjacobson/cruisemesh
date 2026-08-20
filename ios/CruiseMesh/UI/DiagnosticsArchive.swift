@@ -127,7 +127,7 @@ final class DiagnosticsShareOutcome {
     }
 }
 
-enum DiagnosticsSharePlan: Equatable {
+enum DiagnosticsSharePlan: Equatable, Sendable {
     case nothingCaptured
     case archive(URL)
     case archiveFailed
@@ -145,5 +145,21 @@ enum DiagnosticsSharePlan: Equatable {
         guard !files.isEmpty else { return .nothingCaptured }
         guard let archive = archiveWriter(files, name) else { return .archiveFailed }
         return .archive(archive)
+    }
+}
+
+/// Runs diagnostics collection and ZIP creation away from the main actor.
+///
+/// `OSLogStore` enumeration, SQLite exports, and `NSFileCoordinator` can each
+/// wait on services or locks. Keeping that work behind this small boundary
+/// makes it difficult for a share button to accidentally put it back on the
+/// UI thread.
+enum DiagnosticsSharePreparation {
+    static func run(
+        _ work: @escaping @Sendable () -> DiagnosticsSharePlan
+    ) async -> DiagnosticsSharePlan {
+        await Task.detached(priority: .userInitiated) {
+            work()
+        }.value
     }
 }
