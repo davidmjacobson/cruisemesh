@@ -29,9 +29,11 @@ its neighbors. Do NOT commit — leave changes in the working tree.
 
 phase('Scope')
 const plan = await agent(`${GROUND}
-Produce a precise task map for the five Phase-1 work items (record mux in
+Produce a precise task map for the six Phase-1 work items (record mux in
 core/src/lan_session.rs; CAP_MEDIA_BLOB in core/src/protocol.rs; the
-integration module owed by core/src/media/mod.rs items 1-3 and 5; UniFFI
+manifest codec's rev-2 additions in core/src/media/manifest.rs — kind
+file(3) + filename field + sanitization policy; the integration module owed
+by core/src/media/mod.rs items 1-3 and 5; UniFFI
 exports; BLOB-01 adversarial cases + contract owner flips in
 core/tests/protocol_contract.rs and specs/protocol-contract-v1.md). For each:
 the exact files, functions, and line-anchored insertion points; the existing
@@ -41,9 +43,10 @@ Read code; change nothing.`, {
   label: 'scope', phase: 'Scope', model: 'opus',
   schema: {
     type: 'object',
-    required: ['mux', 'capability', 'blob01_tests', 'integration', 'exports'],
+    required: ['mux', 'capability', 'manifest', 'blob01_tests', 'integration', 'exports'],
     properties: {
       mux: { type: 'string' }, capability: { type: 'string' },
+      manifest: { type: 'string' },
       blob01_tests: { type: 'string' }, integration: { type: 'string' },
       exports: { type: 'string' }, hazards: { type: 'string' },
     },
@@ -70,6 +73,18 @@ core_own_capabilities(), and add a bit-allocation test in the style of
 the_own_roster_notice_has_its_own_capability_bit. Touch ONLY
 core/src/protocol.rs.`,
     { label: 'impl:capability', phase: 'Implement', model: 'opus' }),
+  () => agent(`${GROUND}
+Task map from the scoping pass:\n${plan.manifest}
+Extend the manifest codec in core/src/media/manifest.rs per the spec's
+"Generic files" section: MEDIA_KIND_FILE = 3, a filename field (≤255 bytes,
+required for kind file, optional otherwise), thumbnail absent for files,
+and filename sanitization as pure table-tested policy (no separators, no
+traversal, no leading dots; extension derived from mime, not trusted from
+the name). The wire is dark — change MANIFEST_WIRE_VERSION 1 in place, no
+compat shim. Update the codec's pinned tests. Touch ONLY
+core/src/media/manifest.rs (and a sibling module for sanitization if the
+scope map prefers).`,
+    { label: 'impl:manifest-files', phase: 'Implement', model: 'opus' }),
   () => agent(`${GROUND}
 Task map from the scoping pass:\n${plan.blob01_tests}
 Add adversarial BLOB-01 cases to the spray and carry test suites: prove no

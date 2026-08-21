@@ -8,8 +8,9 @@ concrete protocol, decides the three pieces rev 1 left open (link
 multiplexing, the capability bit, the relayd blob API), and replaces the
 delivery-phase sketch with implementation phases.
 Platforms: Android and iOS, with relayd additions
-Scope: photos at full quality, video clips, and the boundary that keeps both
-out of the delay-tolerant message pipeline
+Scope: photos at full quality, video clips, generic file attachments, and
+the boundary that keeps all of them out of the delay-tolerant message
+pipeline
 
 ## Outcome
 
@@ -102,9 +103,11 @@ bytes, the *conversation* is complete on every device.
 
 Rules:
 
-- The thumbnail is mandatory, generated at send time, and is the only
-  degradation the message plane ever performs. There is no "full quality
-  over the message plane" escape hatch.
+- The thumbnail is mandatory for photos and video, generated at send time,
+  and is the only degradation the message plane ever performs. There is no
+  "full quality over the message plane" escape hatch. A generic file has no
+  thumbnail; its bubble renders from the manifest's filename, type, and
+  size instead.
 - The manifest's digest names the encrypted bytes, so any copy fetched from
   anywhere can be verified before it is shown or stored.
 - Deleting the local original after sending does not invalidate the
@@ -213,9 +216,10 @@ ride the message plane). The body is the versioned manifest codec in
 | `blob_id` (32 bytes) | BLAKE2b-256 of the ciphertext — the blob's permanent name |
 | `blob_key` (32 bytes) | per-blob key; travels only here, inside sealed content |
 | `ciphertext_bytes`, `plaintext_bytes` | exact sizes, so geometry is derivable everywhere |
-| `kind` | photo (1) or video (2) |
+| `kind` | photo (1), video (2), or file (3, new in rev 2) |
 | `mime` (≤128 B), width/height, `duration_ms` | render metadata |
-| `thumbnail` (≤64 KiB) | mandatory; poster frame for video |
+| `filename` (≤255 B, new in rev 2) | the sender's display name for the item; required for kind file, optional otherwise |
+| `thumbnail` (≤64 KiB) | mandatory for photo/video (poster frame for video); absent for file |
 | `caption` (≤4 KiB) | ordinary text |
 
 The encoded manifest is capped at 96 KiB (`MEDIA_MANIFEST_MAX_BYTES`), and a
@@ -236,6 +240,29 @@ ciphertext, verified on completion (`verify_assembled`) and per-chunk on
 arrival (a chunk that fails its AEAD open is rejected and stays missing in
 the bitmap — BLOB-05 at chunk granularity). Blob cap: 128 MiB
 (`MEDIA_BLOB_MAX_BYTES`).
+
+### Generic files (new in rev 2)
+
+Everything below the manifest is content-agnostic — chunking, chunk crypto,
+the pull proof, resume bitmaps, session budgets, the relay blob store, and
+every BLOB invariant apply to a PDF exactly as they apply to a clip. So
+generic file attachments are a manifest-kind, not a new mechanism:
+
+- **Wire.** `kind = 3 (file)` plus the `filename` field, both added to
+  manifest wire v1 *now*, while the codec is dark and nothing has shipped —
+  after Phase 2 ships, additions ride the codec's trailing-extension room
+  instead. Width/height/duration are zero for files; the same 128 MiB blob
+  cap applies.
+- **Receive side.** A completed, verified file lands in the platform's
+  document space (Downloads / the Files app), never the photo library, via
+  the platform's own save mechanism. The manifest filename is display
+  metadata, not a path: it is sanitized before any filesystem use (no
+  separators, no traversal, no leading dots), collisions get a numeric
+  suffix, and the saved file's extension is derived from the manifest mime
+  rather than trusted from the name. CruiseMesh never auto-opens a received
+  file; the bubble offers open-with/share through the platform sheet.
+- **Consent.** Files follow the same cost rules as media — auto-fetch on
+  LAN, size-aware consent on expensive paths. No special case.
 
 ### Capability advertisement (new in rev 2)
 
@@ -378,7 +405,9 @@ the phases below.
 ## UX requirements (family-obvious surface)
 
 - A media message always renders instantly as thumbnail + size; the bubble
-  is never blank and never blocks the conversation.
+  is never blank and never blocks the conversation. A file message renders
+  the same way from filename + type + size, with a document glyph where the
+  thumbnail would be.
 - Pending state is calm and truthful, reusing the connection-details
   vocabulary: "Will download when you're near Dad" / "Waiting for internet" /
   "Tap to download over the internet (34 MB)". Never a warning color for
@@ -422,6 +451,9 @@ The whole of this phase is testable with `cargo test` alone.
   layer, unknown-type behavior pinned by test.
 - `CAP_MEDIA_BLOB = 1 << 5` in `protocol.rs` + `core_own_capabilities()`,
   with the bit-allocation test pattern the existing bits use.
+- The manifest codec's rev-2 additions while the wire is still dark:
+  `kind = file (3)` and the `filename` field, with filename-sanitization
+  policy as pure, table-tested core logic.
 - The integration module the checklist in `core/src/media/mod.rs` owes:
   authoring (seal + manifest encode as a `KIND_ATTACHMENT_MANIFEST` body),
   receive-side manifest recognition opening a `BlobStore` row,
@@ -448,10 +480,14 @@ network.
 - Acceptance: the LAN-media criteria below, applied to photos, including
   the kill-and-resume test and the message-plane-latency courtesy bound.
 
-**Phase 3 — video, resilience, field soak.**
+**Phase 3 — video, generic files, resilience, field soak.**
 
 - Video capture/pick with the clip-length guideline, poster-frame
   thumbnails, duration metadata.
+- Generic files: document pick on send, the file bubble, save-to-Downloads
+  with sanitized names and the platform open-with sheet on receive. Same
+  transfer machinery as photos — this is UX plus the receive-side save
+  path, both shells.
 - Multi-session transfers exercised for real (a 128 MiB clip spans ≥3
   sessions), partial-GC behavior verified, source re-selection after
   network changes.
