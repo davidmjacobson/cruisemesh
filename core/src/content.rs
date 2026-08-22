@@ -2,7 +2,7 @@
 
 use crate::CoreError;
 
-const ATTACHMENT_WIRE_VERSION: u8 = 1;
+pub(crate) const ATTACHMENT_WIRE_VERSION: u8 = 1;
 pub const ATTACHMENT_MAX_BLOB_BYTES: usize = 180 * 1024;
 const REACTION_WIRE_VERSION: u8 = 1;
 const REACTION_MAX_EMOJI_BYTES: usize = 32;
