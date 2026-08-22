@@ -267,13 +267,19 @@ generic file attachments are a manifest-kind, not a new mechanism:
 ### Capability advertisement (new in rev 2)
 
 Allocate HELLO2 capability bit `CAP_MEDIA_BLOB = 1 << 5` in
-`core/src/protocol.rs`, OR'd into `core_own_capabilities()`. It means: this
-device renders media manifests and speaks the LAN pull sub-channel (both
-roles). It gates nothing on the message plane — a manifest is delay-tolerant
-mail like any other and is sent regardless — but a requester only opens a
-pull session against a peer that advertised the bit, and the sender's UI may
-use its absence to explain a contact stuck on an old build. Legacy HELLO
-never grows trailing fields; the bit rides frame 0x06 only.
+`core/src/protocol.rs`. It means: this device renders media manifests and
+speaks the LAN pull sub-channel (both roles). It gates nothing on the message
+plane — a manifest is delay-tolerant mail like any other and is sent
+regardless — but a requester only opens a pull session against a peer that
+advertised the bit, and the sender's UI may use its absence to explain a
+contact stuck on an old build. Legacy HELLO never grows trailing fields; the
+bit rides frame 0x06 only.
+
+The bit is *allocated* in Phase 1 and *advertised* in the phase that ships
+the pull drivers: `core_own_capabilities()` gains it in that PR, not before.
+A bit means "this build does the thing", and a Phase 1 build does not — a
+requester that believed it would spend a session on a peer with nothing to
+answer with.
 
 ### LAN sub-channel: multiplexing (new in rev 2)
 
@@ -294,8 +300,10 @@ emitted between them. That interleaving point *is* the courtesy mechanism —
 the acceptance criterion that a transfer in progress never measurably delays
 the message plane is tested at this layer (mesh records get priority at the
 send queue). A peer that did not advertise `CAP_MEDIA_BLOB` treats record
-type 2 as it treats any unknown type today: reject the record, keep the
-link. Rejected alternative: a second TCP connection with its own handshake —
+type 2 as it treats any unknown type: drop the record, keep the link. That
+is a `None` out of the decoder, not an error — the record is authenticated,
+so an unfamiliar type is a peer on a newer build, and every shell read loop
+treats a decrypt error as fatal and closes the socket. Rejected alternative: a second TCP connection with its own handshake —
 more sockets, a second discovery/firewall story, and nothing the record mux
 doesn't already give.
 
@@ -449,8 +457,9 @@ The whole of this phase is testable with `cargo test` alone.
 - `RECORD_TYPE_BLOB = 2` in `lan_session.rs`: per-type reassemblers,
   independent frame-id spaces, mesh-priority interleaving at the record
   layer, unknown-type behavior pinned by test.
-- `CAP_MEDIA_BLOB = 1 << 5` in `protocol.rs` + `core_own_capabilities()`,
-  with the bit-allocation test pattern the existing bits use.
+- `CAP_MEDIA_BLOB = 1 << 5` allocated in `protocol.rs`, with the
+  bit-allocation test pattern the existing bits use, and *withheld* from
+  `core_own_capabilities()` until Phase 2's drivers ship (above).
 - The manifest codec's rev-2 additions while the wire is still dark:
   `kind = file (3)` and the `filename` field, with filename-sanitization
   policy as pure, table-tested core logic.
@@ -461,7 +470,8 @@ The whole of this phase is testable with `cargo test` alone.
   backup posture for partial transfers decided: metadata backs up, chunk
   files do not), and the blob-transfer consent verdict composed from
   `core_relay_network_permitted` rather than duplicated (LAN is always
-  permitted; relay paths inherit the roaming/constrained verdict).
+  permitted; a relay path inherits the roaming deferral, and a constrained
+  path — an expensive path, not a closed one — is offered with a size).
 - UniFFI exports for all of the above; regenerate bindings.
 - Adversarial BLOB-01 cases in the spray and carry suites; flip BLOB-01 and
   BLOB-03 to core-owned in the protocol contract.
@@ -473,7 +483,9 @@ network.
 - Send path: photo pick, thumbnail generation, manifest authoring, original
   retained as the servable blob.
 - The LAN sub-channel drivers on both shells: socket writes for record type
-  2, chunk-file writes, `take_accepted` drain, serve-side chunk reads.
+  2, chunk-file writes, `take_accepted` drain, serve-side chunk reads. With
+  them, and only with them, `CAP_MEDIA_BLOB` joins
+  `core_own_capabilities()`.
 - Bubble UX: instant thumbnail + size, pending states in the
   connection-details vocabulary, progress, auto-download-on-LAN setting
   (default on). All copy through resources.

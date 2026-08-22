@@ -50,26 +50,27 @@ use cruisemesh_core::media::manifest::{
 use cruisemesh_core::media::store::BlobStore;
 use cruisemesh_core::media::wire::PullFrame;
 use cruisemesh_core::{
-    authored_expiry, compute_recipient_hint, core_contact_relay_unreachable_delta,
-    core_family_relay_backoff_cap_ms, core_family_relay_backoff_delay_ms,
-    core_family_relay_jitter_ms, core_is_hidden_spray_kind, core_kind_persists_msg_id_row,
-    core_own_capabilities, core_relay_ack_ids, core_relay_pass_default_budgets,
-    core_relay_queue_reflects_delivery, core_relay_rerun_action, core_should_ack_inbound,
-    encode_envelope_frame, encode_hello, encode_hello2, encode_message_body, generate_identity,
-    may_start_carried_offer, open_message, parse_frame, relay_classify_http_error,
-    relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
-    relay_frontier_after_completed_sweep, relay_mailbox_walk_action, relay_retry_after_ms,
-    seal_message, CarriedEnvelope, Contact, CoreDeliveryVerdict, CoreDiscoveryPolicyState,
-    CoreFamilyRelayPacer, CoreInboundDisposition, CoreInboundSource, CoreRelayActionKind,
-    CoreRelayEndpointConfig, CoreRelayEnvelopeDisposition, CoreRelayFault,
-    CoreRelayFetchedEnvelope, CoreRelayHttpRequest, CoreRelayHttpResult, CoreRelayOperation,
-    CoreRelayPass, CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan,
-    CoreRelayPassSummary, CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan,
-    CoreSprayPlanShape, CoreSprayPolicy, CoreSprayTrigger, Frame, MessageArrival, MessageBody,
-    MessageStore, RelayMailboxWalkAction, SeenIds, CAP_ACKS_HIDDEN_KINDS,
-    CARRIED_SPRAY_BUDGET_BYTES, DEFAULT_HOP_TTL, FAMILY_RELAY_BACKOFF_BASE_MS,
-    FAMILY_RELAY_JITTER_WINDOW_MS, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT,
-    KIND_RELAY_UPDATE, KIND_TEXT, LINK_BURST_BYTES, MAX_SPRAY_INTERVAL_MS, MS_PER_DAY,
+    authored_expiry, blob_transfer_permitted, compute_recipient_hint,
+    core_contact_relay_unreachable_delta, core_family_relay_backoff_cap_ms,
+    core_family_relay_backoff_delay_ms, core_family_relay_jitter_ms, core_is_hidden_spray_kind,
+    core_kind_persists_msg_id_row, core_own_capabilities, core_relay_ack_ids,
+    core_relay_pass_default_budgets, core_relay_queue_reflects_delivery, core_relay_rerun_action,
+    core_should_ack_inbound, encode_envelope_frame, encode_hello, encode_hello2,
+    encode_message_body, generate_identity, may_start_carried_offer, media_thumbnail_max_bytes,
+    open_message, parse_frame, relay_classify_http_error, relay_cursor_advance, relay_cursor_key,
+    relay_fetch_walk_continues, relay_frontier_after_completed_sweep, relay_mailbox_walk_action,
+    relay_retry_after_ms, seal_message, BlobTransferSource, BlobTransferVerdict, CarriedEnvelope,
+    Contact, CoreDeliveryVerdict, CoreDiscoveryPolicyState, CoreFamilyRelayPacer,
+    CoreInboundDisposition, CoreInboundSource, CoreRelayActionKind, CoreRelayEndpointConfig,
+    CoreRelayEnvelopeDisposition, CoreRelayFault, CoreRelayFetchedEnvelope, CoreRelayHttpRequest,
+    CoreRelayHttpResult, CoreRelayNetworkVerdict, CoreRelayOperation, CoreRelayPass,
+    CoreRelayPassBudgets, CoreRelayPassOutcome, CoreRelayPassPlan, CoreRelayPassSummary,
+    CoreRelayPathState, CoreRelayRerunAction, CoreSprayLanePlan, CoreSprayPlanShape,
+    CoreSprayPolicy, CoreSprayTrigger, Frame, MessageArrival, MessageBody, MessageStore,
+    RelayMailboxWalkAction, SeenIds, CAP_ACKS_HIDDEN_KINDS, CARRIED_SPRAY_BUDGET_BYTES,
+    DEFAULT_HOP_TTL, FAMILY_RELAY_BACKOFF_BASE_MS, FAMILY_RELAY_JITTER_WINDOW_MS,
+    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_TEXT,
+    LINK_BURST_BYTES, MAX_ENVELOPE_SEALED_BYTES, MAX_SPRAY_INTERVAL_MS, MS_PER_DAY,
     OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
 };
 
@@ -322,11 +323,14 @@ const CONTRACT: &[Invariant] = &[
         id: "BLOB-01",
         statement: "Blob bytes never enter an envelope, a carry queue, a spray plan, or a BLE \
                     frame, and no third party stores, forwards, or serves another person's blob.",
-        owner: Owner::Unimplemented {
-            package: "the media integration phase adds blob-flavoured cases to the spray and \
-                      carry suites; today the rule holds only because core/src/media/ is \
-                      reachable from no dispatch, carry, or framing path",
-        },
+        owner: Owner::Core(
+            "core/tests/mesh_sim.rs sends media continuously through real identities, real \
+             sealing, real carry queues and the real spray policy, then scans every byte the \
+             sim ever framed; core/src/framing.rs proves blob bytes are not representable as \
+             BLE fragments at any MTU; core/src/spray_policy.rs charges a maximal manifest as \
+             an ordinary envelope and fits no blob granularity into an encounter budget; \
+             index re-asserts the size gap between a manifest and its blob",
+        ),
     },
     Invariant {
         id: "BLOB-02",
@@ -341,10 +345,10 @@ const CONTRACT: &[Invariant] = &[
         id: "BLOB-03",
         statement: "No blob transfer starts on an expensive or roaming path without an explicit \
                     user action, and no third party is ever asked to move blob bytes.",
-        owner: Owner::Unimplemented {
-            package: "the media integration phase owns the path-cost verdict; the pull-only \
-                      half is already pinned by core/src/media/lan_pull.rs",
-        },
+        owner: Owner::Core(
+            "core/src/media/integration.rs consent-verdict table tests composed over \
+             core_relay_network_permitted + core/src/media/lan_pull.rs pull-only tests",
+        ),
     },
     Invariant {
         id: "BLOB-04",
@@ -2743,8 +2747,8 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
     // owners are plain unit vectors in `core/src/media/` — golden encodings, a
     // driven requester/responder pair over a fake clock, and SQLite budget
     // tests. Writing a JSONL trace for them would be a second statement of the
-    // same behaviour with no field incident behind it. BLOB-01, BLOB-03 and
-    // BLOB-06 are unimplemented besides.
+    // same behaviour with no field incident behind it. BLOB-06 is
+    // unimplemented besides.
     const NO_FIXTURE_NEEDED: &[&str] = &[
         "BLOB-01",
         "BLOB-02",
@@ -2802,11 +2806,58 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
 // The blob plane
 // ---------------------------------------------------------------------------
 //
-// `core/src/media/` is dark: nothing on either shell reaches it and it is
-// exported over no binding. It is declared `pub` so this index can assert the
-// invariants it owns from outside the crate, which is the only way a contract
-// rule and its owner can be checked together while the feature waits for its
-// integration phase.
+// `core/src/media/` is mostly dark still: phase 1 exports the authoring seam,
+// the consent verdict and the filename rule, and nothing else — no shell can
+// reach a chunk, a pull session, or the partial-transfer store. The tree is
+// declared `pub` so this index can assert the invariants it owns from outside
+// the crate, which is the only way a contract rule and its owner can be
+// checked together while the drivers wait for phase 2.
+
+/// The adversarial owners are elsewhere — `core/tests/mesh_sim.rs` drives
+/// continuous media through real carry queues and scans every framed byte,
+/// and `core/src/spray_policy.rs` and `core/src/framing.rs` hold the budget
+/// and BLE halves. This is the pointer: the size gap that makes the rule
+/// enforceable at all.
+#[test]
+fn blob_01_the_message_plane_carries_the_manifest_and_never_the_bytes() {
+    let id = lookup("BLOB-01").id;
+    let key = BlobKey([0x21; 32]);
+    let sealed = seal_blob(&key, &vec![6u8; 4 * 1024 * 1024]).expect("a blob seals");
+
+    let manifest = MediaManifest {
+        blob_id: sealed.id,
+        blob_key: key.clone(),
+        plaintext_bytes: sealed.geometry.plaintext_bytes,
+        kind: MediaKind::Video,
+        mime_type: "video/mp4".into(),
+        width: 1_920,
+        height: 1_080,
+        duration_ms: 30_000,
+        filename: String::new(),
+        // The largest thumbnail the plane will carry: the worst case for the
+        // bound below is the interesting one.
+        thumbnail: vec![0xC3; media_thumbnail_max_bytes() as usize],
+        caption: "the glacier".into(),
+    };
+    let body = encode_media_manifest(&manifest).expect("a manifest encodes");
+
+    contract_assert!(
+        id,
+        body.len() < MAX_ENVELOPE_SEALED_BYTES,
+        "the message plane's half of a media send must stay an ordinary envelope"
+    );
+    contract_assert!(
+        id,
+        sealed.ciphertext.len() > MAX_ENVELOPE_SEALED_BYTES,
+        "and the bytes must not fit in one, so no code path could carry them by accident"
+    );
+    let window = &sealed.ciphertext[..64];
+    contract_assert!(
+        id,
+        !body.windows(window.len()).any(|slice| slice == window),
+        "a manifest names the ciphertext; carrying any of it would be the two planes mixing"
+    );
+}
 
 #[test]
 fn blob_02_a_blob_id_names_the_ciphertext_and_never_the_plaintext() {
@@ -2841,6 +2892,7 @@ fn blob_02_a_blob_id_names_the_ciphertext_and_never_the_plaintext() {
         width: 4_032,
         height: 3_024,
         duration_ms: 0,
+        filename: String::new(),
         thumbnail: vec![0xAB; 1_024],
         caption: "the fjords".into(),
     };
@@ -2861,6 +2913,102 @@ fn blob_02_a_blob_id_names_the_ciphertext_and_never_the_plaintext() {
             .blob_key
             == key,
         "and it must arrive intact for the recipient the manifest was sealed to"
+    );
+
+    // A generic file is a manifest kind, not a second mechanism, so the same
+    // rule has to hold for it: a filename and a mime type on the message
+    // plane, the bytes named rather than carried.
+    let file = MediaManifest {
+        kind: MediaKind::File,
+        mime_type: "application/pdf".into(),
+        width: 0,
+        height: 0,
+        duration_ms: 0,
+        filename: "Itinerary.pdf".into(),
+        thumbnail: Vec::new(),
+        caption: String::new(),
+        ..manifest
+    };
+    let file_body = encode_media_manifest(&file).expect("a file manifest encodes");
+    contract_assert!(
+        id,
+        decode_media_manifest(&file_body).expect("decode") == file,
+        "a file manifest must round trip like any other"
+    );
+    contract_assert!(
+        id,
+        (file_body.len() as u64) < sealed.geometry.ciphertext_bytes / 100,
+        "a file manifest of {} bytes against a {}-byte blob: the message plane must name \
+         the document, never carry it",
+        file_body.len(),
+        sealed.geometry.ciphertext_bytes
+    );
+}
+
+/// The pull-only half — a holder serves only what it holds, only on request,
+/// only to a proven manifest holder — is owned by `core/src/media/lan_pull.rs`
+/// and re-asserted through the budget and verification entries. This is the
+/// consent half: the four rows that decide whether anything starts, in both
+/// directions — nothing starts unattended, and nothing the relay policy left
+/// open becomes unreachable.
+#[test]
+fn blob_03_an_expensive_path_never_starts_a_transfer_on_its_own() {
+    let id = lookup("BLOB-03").id;
+    let bytes = 34_000_000;
+
+    contract_assert!(
+        id,
+        blob_transfer_permitted(
+            BlobTransferSource::Lan,
+            CoreRelayNetworkVerdict::Permitted,
+            false,
+            bytes,
+            true,
+        ) == BlobTransferVerdict::AutoStart,
+        "a LAN transfer spends nothing and may start without being asked about"
+    );
+    contract_assert!(
+        id,
+        blob_transfer_permitted(
+            BlobTransferSource::Relay,
+            CoreRelayNetworkVerdict::Permitted,
+            false,
+            bytes,
+            true,
+        ) == BlobTransferVerdict::AskFirst {
+            ciphertext_bytes: bytes
+        },
+        "an internet transfer must be offered with its size, never started unasked"
+    );
+    contract_assert!(
+        id,
+        blob_transfer_permitted(
+            BlobTransferSource::Relay,
+            CoreRelayNetworkVerdict::DeferredRoaming,
+            true,
+            bytes,
+            true,
+        ) == BlobTransferVerdict::Deferred {
+            network: CoreRelayNetworkVerdict::DeferredRoaming,
+            ciphertext_bytes: bytes,
+        },
+        "and a confirmation cannot buy past a roaming deferral: the only override is the \
+         Advanced roaming toggle, which is already inside the network verdict"
+    );
+    contract_assert!(
+        id,
+        blob_transfer_permitted(
+            BlobTransferSource::Relay,
+            CoreRelayNetworkVerdict::DeferredConstrained,
+            false,
+            bytes,
+            true,
+        ) == BlobTransferVerdict::AskFirst {
+            ciphertext_bytes: bytes
+        },
+        "an expensive path is asked about, not closed off: a constrained path defers the \
+         mailbox's unattended uploads while its sync keeps running, and nothing ever clears \
+         the verdict, so deferring here would strand a photo with nothing to tap"
     );
 }
 
@@ -3004,20 +3152,6 @@ fn blob_05_a_chunk_that_fails_authentication_is_never_progress() {
         "and opening must re-check rather than trust its caller"
     );
 }
-
-#[test]
-#[ignore = "UNIMPLEMENTED: BLOB-01 plane separation has no adversarial owner yet. The media \
-            integration phase adds blob-flavoured cases to the spray and carry suites; today \
-            the rule holds only because core/src/media/ is reachable from no dispatch, carry, \
-            or framing path."]
-fn blob_01_plane_separation_has_no_adversarial_owner_yet() {}
-
-#[test]
-#[ignore = "UNIMPLEMENTED: BLOB-03's consent half has no owner. Phase 1 is LAN-only, so there \
-            is no expensive path for a blob to take; the media integration phase composes the \
-            verdict with the existing roaming deferral. The pull-only half is pinned by \
-            core/src/media/lan_pull.rs."]
-fn blob_03_expensive_path_consent_is_not_built() {}
 
 #[test]
 #[ignore = "UNIMPLEMENTED: BLOB-06 belongs to phase 2 of the media work. No relay blob store \

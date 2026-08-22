@@ -48,9 +48,10 @@
 //!
 //! [`MEDIA_SCHEMA_SQL`] is `CREATE TABLE IF NOT EXISTS`, matching the rest of
 //! the store's migration style, and every function here takes a borrowed
-//! `Connection`. The integration phase applies it to `MessageStore`'s own
-//! connection so this metadata sits in the one database the app already
-//! backs up; this module does not edit `store.rs` while it is dark.
+//! `Connection`. `MessageStore::open` applies it to its own connection, so
+//! this metadata sits in the one database the app already backs up — and a
+//! restore clears `media_blobs`, because the chunk files those rows name
+//! never left the phone the backup came from.
 
 use rusqlite::{params, Connection, OptionalExtension};
 

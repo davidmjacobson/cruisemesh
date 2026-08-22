@@ -24,10 +24,13 @@ mod lan_util;
 mod late_arrival;
 mod limits;
 mod link_detect;
-// The blob plane (specs/media-two-plane.md). Deliberately dark: declared so it
-// compiles and is tested, exported over no binding, reachable from neither
-// shell. Nothing is re-exported at the crate root, which is what keeps the
-// plane separation structural rather than a rule someone has to remember.
+// The blob plane (specs/media-two-plane.md). Mostly dark, and deliberately so:
+// phase 1 exports the authoring seam, and the `pub use media` block below is
+// the whole list of what a shell can reach. Chunk transfer — the pull and
+// serve state machines, the partial-transfer store, the wire frames — is
+// reachable from no dispatch, carry, or framing path and from no binding,
+// which is what keeps the plane separation structural rather than a rule
+// someone has to remember.
 pub mod media;
 mod outbound_retirement;
 mod protocol;
@@ -179,6 +182,16 @@ pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
 };
+// The blob plane's boundary and nothing else of it: what is named here is
+// exactly what crosses UniFFI. The pull and serve state machines, the wire
+// frames and the partial-transfer store stay `media::…`, reachable from the
+// crate and its tests and from no shell.
+pub use media::{
+    blob_transfer_permitted, core_media_manifest_body, core_media_recognize_manifest,
+    core_media_seal_blob, media_blob_max_bytes, media_manifest_kind, media_manifest_max_bytes,
+    media_thumbnail_max_bytes, peer_speaks_blob_plane, sanitize_media_filename, BlobTransferSource,
+    BlobTransferVerdict, CoreMediaKind, CoreMediaManifest, CoreSealedMediaBlob,
+};
 // Plain Rust policy, deliberately not `#[uniffi::export]`: the shells never
 // decide any of this. The store executes it, and `core/tests` asserts it under
 // `QUEUE-01`.
@@ -201,14 +214,14 @@ pub use protocol::{
     verify_introduction_ticket, ExtendedMessageBody, Frame, FriendDirectoryContent,
     FriendDirectoryEntry, IntroducedFriendRequest, IntroductionTicket, LanEndpointContent,
     MessageBody, ProfileSyncContent, ReceiptContent, RelayUpdateContent, SuggestedFriendCard,
-    CAP_ACKS_HIDDEN_KINDS, CAP_MULTI_DEVICE, CAP_OWN_ROSTER_NOTICE, CAP_RELAY_UPDATE,
-    CAP_ROSTER_GOSSIP, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN, HIDDEN_SPRAY_KINDS,
-    KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY, KIND_FRIEND_REQUEST,
-    KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE, KIND_INTRODUCED_FRIEND_REQUEST,
-    KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION, KIND_RECEIPT, KIND_RELAY_UPDATE,
-    KIND_ROSTER_GOSSIP, KIND_SYNC_CONTACTS, KIND_SYNC_DIGEST, KIND_SYNC_GROUPS, KIND_SYNC_HISTORY,
-    KIND_SYNC_OWN_ROSTER, KIND_SYNC_SETTINGS, KIND_SYNC_WATERMARK, KIND_TEXT, MS_PER_DAY,
-    RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    CAP_ACKS_HIDDEN_KINDS, CAP_MEDIA_BLOB, CAP_MULTI_DEVICE, CAP_OWN_ROSTER_NOTICE,
+    CAP_RELAY_UPDATE, CAP_ROSTER_GOSSIP, DEFAULT_EXPIRY_MS, DEFAULT_HOP_TTL, GROUP_ID_LEN,
+    HIDDEN_SPRAY_KINDS, KIND_ATTACHMENT_CHUNK, KIND_ATTACHMENT_MANIFEST, KIND_FRIEND_DIRECTORY,
+    KIND_FRIEND_REQUEST, KIND_GROUP_INVITE, KIND_GROUP_METADATA_UPDATE,
+    KIND_INTRODUCED_FRIEND_REQUEST, KIND_LAN_ENDPOINT_HINT, KIND_PROFILE_SYNC, KIND_REACTION,
+    KIND_RECEIPT, KIND_RELAY_UPDATE, KIND_ROSTER_GOSSIP, KIND_SYNC_CONTACTS, KIND_SYNC_DIGEST,
+    KIND_SYNC_GROUPS, KIND_SYNC_HISTORY, KIND_SYNC_OWN_ROSTER, KIND_SYNC_SETTINGS,
+    KIND_SYNC_WATERMARK, KIND_TEXT, MS_PER_DAY, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
 };
 // Plain Rust, deliberately not `#[uniffi::export]` beyond the store methods
 // below: no shell composes an event. Core decision points emit them and the

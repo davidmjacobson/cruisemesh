@@ -851,6 +851,12 @@ struct Network {
     adjacency: Vec<Vec<usize>>,
     /// Every frame handed onto a link this run -- the flooding-cost metric.
     transmissions: usize,
+    /// The same frames, kept whole. `transmissions` counts airtime; BLOB-01
+    /// needs the bytes themselves, because the question it asks is not "how
+    /// much went out" but "what was in it". Recorded for every lane the
+    /// planner can put on a link -- flood, DIGEST, targeted drain and spray --
+    /// so a scan of this vector is a scan of everything the sim ever framed.
+    framed: Vec<Vec<u8>>,
 }
 
 impl Network {
@@ -859,6 +865,7 @@ impl Network {
             nodes: (0..n).map(|_| SimNode::new()).collect(),
             adjacency: vec![Vec::new(); n],
             transmissions: 0,
+            framed: Vec::new(),
         }
     }
 
@@ -958,6 +965,7 @@ impl Network {
         }
         while let Some((target, frame, from)) = queue.pop_front() {
             self.transmissions += 1;
+            self.framed.push(frame.clone());
             let relay = self.nodes[target].receive(&frame, now);
             if let Some(relayed) = relay {
                 let neighbors = self.adjacency[target].clone();
@@ -1016,9 +1024,11 @@ impl Network {
                         "the planner emitted a frame that is not a DIGEST"
                     );
                     self.transmissions += 1;
+                    self.framed.push(frame.clone());
                 }
                 for frame in outcome.targeted_frames.iter().chain(&outcome.spray_frames) {
                     self.transmissions += 1;
+                    self.framed.push(frame.clone());
                     // Meetings do not cascade floods; the inbound path may
                     // still return a re-flood frame, which we drop.
                     let _ = self.nodes[b].receive(frame, now);
@@ -1263,6 +1273,244 @@ fn repeated_mule_meetings_do_not_resend_known_carried_envelopes() {
     assert_eq!(
         net.transmissions, after_first_meet,
         "second meeting was fully suppressed"
+    );
+}
+
+/// True if `needle` appears anywhere in `haystack`.
+///
+/// The same sliding-window scan `protocol_contract.rs` and `lan_session.rs`
+/// use to assert a secret is not legible in bytes that went somewhere. A
+/// 32-byte window is long enough that a coincidental hit is not a thing that
+/// happens.
+fn contains_window(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Slack for whatever `seal_message` adds to a body -- ephemeral key, nonce,
+/// tag, framing. Deliberately generous: the bound it widens is there to tell
+/// a manifest from a blob, a difference of three orders of magnitude, not to
+/// pin the sealer's exact overhead.
+const SEAL_OVERHEAD_BYTES: usize = 1024;
+
+/// `BLOB-01`, adversarially: a device sends media over and over, the
+/// manifests flood and mule and relay and arrive, and no blob rides with them.
+///
+/// This is the spec's acceptance criterion ("zero blob bytes observable in
+/// any envelope, spray plan, carry queue, or BLE frame under an adversarial
+/// test that sends media continuously") asked of the real machinery rather
+/// than of the design. Everything below is production code: real identities,
+/// real sealing, the real §6.4 codec, real `MessageStore` carry queues, the
+/// real spray policy and a real `seal_blob` over a megabyte of plaintext.
+///
+/// It asks three different questions, because no one of them is sufficient:
+///
+/// 1. **Shape.** Every envelope this mesh ever framed is manifest-shaped: its
+///    sealed body fits the manifest cap. This is the load-bearing one. An
+///    envelope body is *sealed*, so looking inside it cannot tell a manifest
+///    from a blob — but its length can, and length is what a "just inline the
+///    bytes" patch cannot hide.
+/// 2. **Refusal.** A blob offered to the message plane directly is refused by
+///    the codec and reaches no carry queue. That is what makes (1) a rule
+///    rather than an observation about a well-behaved fixture.
+/// 3. **Legibility.** No 32-byte window of blob ciphertext, blob plaintext or
+///    the blob key appears in anything the mesh framed, carried or uploaded.
+///    Deliberately the weakest of the three, and kept for what it does cover:
+///    the *unsealed* surfaces — frame headers, recipient hints, msg_ids,
+///    DIGEST bodies, relay routing metadata — which is where a
+///    derived-from-content identifier would surface.
+///
+/// What is *not* production is the message kind: `SimNode::record_delivery`
+/// synthesizes a `KIND_TEXT` row because the sim seals raw plaintext rather
+/// than an encoded `ExtendedMessageBody` (see `author_and_flood`). That is
+/// immaterial here — the kind byte lives inside the sealed body, so every
+/// frame, carry row and relay row below has exactly the shape a
+/// `KIND_ATTACHMENT_MANIFEST` send produces.
+#[test]
+fn blob_01_media_manifests_mule_while_their_blob_bytes_never_enter_the_mesh() {
+    use cruisemesh_core::media::blob::{generate_blob_key, seal_blob};
+    use cruisemesh_core::media::manifest::{encode_media_manifest, MediaKind, MediaManifest};
+    use cruisemesh_core::media::MEDIA_MANIFEST_MAX_BYTES;
+
+    // An alternating marker no header, digest or ciphertext would produce by
+    // accident, over a plaintext far larger than any envelope.
+    const MARKER: [u8; 2] = [0xB1, 0x0B];
+    let plaintext: Vec<u8> = MARKER.iter().copied().cycle().take(1024 * 1024).collect();
+
+    let mut net = Network::new(4);
+    let mut relay = RelayActor::new();
+    // Relay rows are scanned as they are posted, not only at the end: a row
+    // this node consumes and acks would otherwise leave the mailbox before
+    // anything looked at it.
+    let mut relay_sealed: Vec<Vec<u8>> = Vec::new();
+
+    // Four sends, not one. "Sends media continuously" is the criterion, and a
+    // single pass that happened to leak nothing is not evidence. Each round
+    // mints a fresh blob key, so each round carries its own needles.
+    for round in 0..4_i64 {
+        let now = BASE_NOW + round * 60_000;
+        let key = generate_blob_key();
+        let blob = seal_blob(&key, &plaintext).expect("seal the blob");
+        let body = encode_media_manifest(&MediaManifest {
+            blob_id: blob.id,
+            blob_key: key.clone(),
+            plaintext_bytes: plaintext.len() as u64,
+            kind: MediaKind::Photo,
+            mime_type: "image/jpeg".to_string(),
+            width: 4032,
+            height: 3024,
+            duration_ms: 0,
+            filename: String::new(),
+            thumbnail: vec![0x7A; 2048],
+            caption: "the whole ship at sunset".to_string(),
+        })
+        .expect("encode the manifest body");
+
+        // The message plane, over every lane at once: flooded from 0, muled
+        // 1 -> 2 -> 3 across time gaps, and posted to the relay in parallel
+        // the way a phone with internet does.
+        net.set_edges(&[(0, 1)]);
+        net.author_and_flood(0, 3, &body, DEFAULT_HOP_TTL, now);
+        let sealed = seal_to_person(&net.nodes[0], &net.nodes[3], &body);
+        let envelope = outbound_envelope(&net.nodes[0], &net.nodes[3], sealed, now);
+        relay.post_outbound(&net.nodes[0], envelope);
+        relay_sealed.extend(relay.rows.iter().map(|row| row.sealed.clone()));
+
+        net.set_edges(&[(1, 2)]);
+        net.meet(now + 10_000);
+        net.set_edges(&[(2, 3)]);
+        net.meet(now + 20_000);
+        relay.poll(&mut net.nodes[3], now + 30_000);
+
+        assert!(
+            net.nodes[3].inbox.iter().any(|payload| payload == &body),
+            "round {round}: the manifest must actually arrive -- a plane that \
+             carried nothing at all would pass every assertion below"
+        );
+
+        // (2) The refusal. The adversary's move is not subtlety, it is
+        // sending the blob as mail. Seal the whole ciphertext to the
+        // recipient, frame it exactly as `author_and_flood` frames a message,
+        // and hand it to a mule.
+        let blob_as_mail = encode_envelope_frame(
+            generate_msg_id(),
+            DEFAULT_HOP_TTL,
+            default_expiry(now),
+            compute_recipient_hint(net.nodes[3].user_id(), now),
+            seal_to_person(&net.nodes[0], &net.nodes[3], &blob.ciphertext),
+        );
+        assert!(
+            parse_frame(blob_as_mail.clone()).is_err(),
+            "round {round}: the codec must refuse a blob-sized sealed body"
+        );
+        let carried_before = net.nodes[1].store.carried_len().unwrap();
+        let refused = net.nodes[1].store.process_inbound_frame(
+            net.nodes[1].identity.clone(),
+            net.nodes[1].seen.clone(),
+            CoreInboundSource::Mesh,
+            blob_as_mail,
+            now,
+        );
+        // Rejected, not carried and not re-flooded: the inbound transaction
+        // treats an over-cap body as a header that failed local validation,
+        // which is the same door a corrupt frame comes to.
+        match &refused {
+            Err(_) => {}
+            Ok(outcome) => {
+                assert_eq!(
+                    outcome.disposition,
+                    CoreInboundDisposition::Rejected,
+                    "round {round}: a mule must refuse a blob rather than carry it"
+                );
+                assert!(
+                    outcome.relay_frame.is_none(),
+                    "round {round}: nor reflood it"
+                );
+            }
+        }
+        assert_eq!(
+            net.nodes[1].store.carried_len().unwrap(),
+            carried_before,
+            "round {round}: a refused blob must leave the carry queue untouched"
+        );
+
+        // (1) The shape. Every envelope on the air fits the manifest cap;
+        // nothing blob-shaped was ever framed, at any hop, by any lane.
+        for (index, frame) in net.framed.iter().enumerate() {
+            if let Ok(Frame::Envelope { sealed, .. }) = parse_frame(frame.clone()) {
+                assert!(
+                    sealed.len() <= MEDIA_MANIFEST_MAX_BYTES + SEAL_OVERHEAD_BYTES,
+                    "round {round}: framed envelope {index} carries {} sealed bytes, \
+                     over what the largest manifest could ever seal to",
+                    sealed.len()
+                );
+            }
+        }
+
+        // (3) Four needles, one per way a blob could leak: its ciphertext at two
+        // offsets, its plaintext, and the key that would make any of the
+        // above readable.
+        let needles: [(&str, Vec<u8>); 4] = [
+            ("blob ciphertext (head)", blob.ciphertext[..32].to_vec()),
+            (
+                "blob ciphertext (mid-blob)",
+                blob.ciphertext[500_000..500_032].to_vec(),
+            ),
+            (
+                "blob plaintext",
+                MARKER.iter().copied().cycle().take(32).collect(),
+            ),
+            ("blob key", key.as_bytes().to_vec()),
+        ];
+
+        // Everything the mesh has ever held or said, this round and every
+        // round before it.
+        let mut surfaces: Vec<(String, Vec<u8>)> = net
+            .framed
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| (format!("framed frame {index}"), frame.clone()))
+            .collect();
+        for (index, node) in net.nodes.iter().enumerate() {
+            // No hint filter and no exclusions: the whole carry queue, not
+            // the slice some peer would have been offered.
+            let page = node
+                .store
+                .carried_envelopes_for_peer_sync(
+                    Vec::new(),
+                    Vec::new(),
+                    now,
+                    u64::MAX,
+                    u32::MAX,
+                    None,
+                )
+                .expect("walk the whole carry queue");
+            for row in page.rows {
+                surfaces.push((format!("node {index} carry queue"), row.sealed));
+            }
+        }
+        for (index, sealed) in relay_sealed.iter().enumerate() {
+            surfaces.push((format!("relay row {index}"), sealed.clone()));
+        }
+
+        for (place, bytes) in &surfaces {
+            for (what, needle) in &needles {
+                assert!(
+                    !contains_window(bytes, needle),
+                    "round {round}: {what} is legible in {place}"
+                );
+            }
+        }
+    }
+
+    // The quantitative form of the same claim: four one-megabyte sends, and
+    // the mesh moved less than one of them in total airtime -- thumbnails and
+    // manifests, which is exactly what the message plane is supposed to cost.
+    let framed_bytes: usize = net.framed.iter().map(|frame| frame.len()).sum();
+    assert!(
+        framed_bytes < plaintext.len(),
+        "four 1 MiB media sends put {framed_bytes} bytes on the air; \
+         one blob alone is {}",
+        plaintext.len()
     );
 }
 

@@ -220,4 +220,55 @@ mod tests {
         let reassembler = BleFrameReassembler::new();
         assert!(reassembler.accept(vec![0, 0, 0, 0, 1]).is_none());
     }
+
+    /// `BLOB-01`, the BLE half: blob bytes never become BLE fragments.
+    ///
+    /// The real guard is type-level and lives outside this module -- the pull
+    /// sub-channel rides LAN record type 2 (`lan_session.rs`), and
+    /// [`fragment_ble_frame`] is only ever handed the output of a mesh frame
+    /// encoder. Nothing in `crate::media` produces one, so there is no call
+    /// site that could pass a chunk in.
+    ///
+    /// Unreachability by type is invisible to a test, though, and it is
+    /// exactly what a later "just reuse the BLE writer" patch would delete
+    /// without noticing. So this pins the *size* half, which survives such a
+    /// patch: a blob is not representable as BLE fragments at any MTU, and a
+    /// chunk, though representable, costs an absurdity that would be plain in
+    /// a review of whatever code tried it.
+    #[test]
+    fn blob_01_blob_bytes_are_not_representable_as_ble_fragments() {
+        use crate::media::{MEDIA_BLOB_MAX_BYTES, MEDIA_CHUNK_CIPHERTEXT_BYTES};
+
+        // Every byte the 16-bit fragment count can address, at the largest
+        // attribute value BLE has: nothing bigger is reachable over a GATT
+        // write no matter what MTU is negotiated.
+        let per_fragment = MAX_ATT_VALUE_LEN - FRAGMENT_HEADER_SIZE;
+        let fragment_budget = (MAX_FRAGMENTS * per_fragment) as u64;
+
+        assert!(
+            MEDIA_BLOB_MAX_BYTES > MAX_P2P_FRAME_BYTES as u64,
+            "a blob at the cap must be over the frame limit, not merely near it"
+        );
+        assert!(
+            MEDIA_BLOB_MAX_BYTES > fragment_budget,
+            "a {MEDIA_BLOB_MAX_BYTES}-byte blob must not fit the whole fragment space \
+             ({fragment_budget} bytes)"
+        );
+        // And the frame cap refuses rather than truncating, so a caller that
+        // handed bulk bytes in would get `None`, not a short frame.
+        assert!(fragment_ble_frame(vec![0xB1; MAX_P2P_FRAME_BYTES + 1], 512).is_none());
+
+        // One chunk is the honest exception: at 256 KiB + 16 it is under the
+        // frame cap, so this module would fragment it if it were ever asked
+        // to. What it would cost is the part worth pinning.
+        let chunk_fragments = (MEDIA_CHUNK_CIPHERTEXT_BYTES as usize).div_ceil(per_fragment);
+        assert_eq!(
+            chunk_fragments, 517,
+            "one blob chunk would be 517 GATT writes"
+        );
+        assert!(
+            MEDIA_BLOB_MAX_BYTES.div_ceil(per_fragment as u64) > MAX_FRAGMENTS as u64,
+            "and a whole blob would be more writes than the fragment header can number"
+        );
+    }
 }

@@ -555,8 +555,56 @@ pub const CAP_ROSTER_GOSSIP: u32 = 1 << 3;
 /// watermark to advance. [`hidden_ack_capability`] therefore never names it.
 pub const CAP_OWN_ROSTER_NOTICE: u32 = 1 << 4;
 
+/// Capability bit (`specs/media-two-plane.md`): this device renders media
+/// manifests and speaks the LAN pull sub-channel, in both roles — it will
+/// serve a blob a peer asks it for, and it knows how to ask.
+///
+/// It gates nothing on the message plane. A manifest is delay-tolerant mail
+/// like any other and is sent regardless of what the recipient advertised:
+/// the bit describes who can be *pulled from* right now, not who may be
+/// written to, and a contact who updates next week must still find the
+/// manifest waiting. What the bit decides is the other plane — a requester
+/// only opens a pull session against a peer that advertised it, so a build
+/// that predates the sub-channel is never handed a record type it would
+/// reject.
+///
+/// Its own bit rather than a fold into an older one, for the reason every bit
+/// above it got one: [`CAP_ROSTER_GOSSIP`] and the rest each name a fixed
+/// claim their shipped build really implements, and widening one retroactively
+/// would make a deployed advertisement mean something that build never did.
+///
+/// It is absent from [`hidden_ack_capability`] the way
+/// [`CAP_OWN_ROSTER_NOTICE`] is, though for the opposite reason: not because
+/// there is no envelope, but because [`KIND_ATTACHMENT_MANIFEST`] is an
+/// ordinary *visible* kind. It persists a `msg_id` row
+/// ([`core_kind_persists_msg_id_row`]), so every build's DELIVERED watermark
+/// advances past it on receipt without needing to be trusted to. There is
+/// nothing to bound and so nothing to ack for.
+///
+/// Legacy HELLO (frame 0x03) is untouched and never grows a trailing field —
+/// the bit rides HELLO2's frame 0x06 only.
+///
+/// # Allocated now, advertised with the drivers
+///
+/// The bit is reserved here so nothing else can claim `1 << 5`, and so the
+/// gating helper ([`crate::media::peer_speaks_blob_plane`]) has something to
+/// read. [`core_own_capabilities`] deliberately does not carry it yet: this
+/// build has no pull driver in either shell, so nothing would answer an `Open`
+/// it invited, and a requester would spend a session on a peer that is only
+/// going to drop its records. That is the same failure the "its own bit rather
+/// than a fold into an older one" paragraph above exists to prevent — a
+/// deployed advertisement meaning something the deployed build never did. OR it
+/// into `core_own_capabilities` in the phase that ships the drivers, in that
+/// PR; `the_media_blob_bit_is_allocated_but_not_yet_advertised` is the test
+/// that has to be rewritten to let it through.
+pub const CAP_MEDIA_BLOB: u32 = 1 << 5;
+
 /// The capability bits this build advertises in HELLO2. Both shells call
 /// this instead of hardcoding bits so they can never disagree with core.
+///
+/// Every bit here is a claim about behavior this build actually has. See
+/// [`CAP_MEDIA_BLOB`] for the one that is allocated but withheld until its
+/// drivers ship.
 #[uniffi::export]
 pub fn core_own_capabilities() -> u32 {
     CAP_ACKS_HIDDEN_KINDS
@@ -1248,8 +1296,18 @@ fn validate_message_body_fields(
                 ));
             }
         }
+        // Kind 16 carries two body codecs: the legacy inline attachment, and
+        // the blob plane's media manifest (specs/media-two-plane.md — "no new
+        // wire protocol for the message plane" is paid for here). Either is a
+        // valid body; a body that is neither is still refused. The decoders'
+        // accept sets are disjoint, which is what lets a receiver tell them
+        // apart rather than merely tolerate both — see
+        // [`crate::media::integration::recognize_media_manifest`] and the test
+        // that pins the separation in both directions.
         KIND_ATTACHMENT_MANIFEST => {
-            if crate::content::decode_attachment_payload(content.to_vec()).is_none() {
+            if crate::content::decode_attachment_payload(content.to_vec()).is_none()
+                && crate::media::manifest::decode_media_manifest(content).is_err()
+            {
                 return Err(CoreError::Malformed("invalid attachment payload".into()));
             }
         }
@@ -3595,6 +3653,7 @@ mod tests {
             CAP_RELAY_UPDATE,
             CAP_MULTI_DEVICE,
             CAP_ROSTER_GOSSIP,
+            CAP_MEDIA_BLOB,
         ] {
             assert_ne!(CAP_OWN_ROSTER_NOTICE, other);
         }
@@ -3602,6 +3661,39 @@ mod tests {
         // envelope, no relay row, and no DELIVERED watermark to advance.
         for kind in HIDDEN_SPRAY_KINDS {
             assert_ne!(hidden_ack_capability(kind), Some(CAP_OWN_ROSTER_NOTICE));
+        }
+    }
+
+    /// The media bit gets its own allocation for the same reason, and stays
+    /// out of the ack map: an attachment manifest is a visible kind whose
+    /// watermark advances on every build, so there is nothing to bound.
+    #[test]
+    fn the_media_blob_bit_is_allocated_but_not_yet_advertised() {
+        assert_eq!(CAP_MEDIA_BLOB, 1 << 5);
+        // Reserved, and withheld until a build can honour it. A peer that
+        // believed this build spoke the pull sub-channel would open a session
+        // no shell here can answer, so the advertisement waits for the phase
+        // that ships the drivers — see the constant's docs. Flipping this
+        // assertion is the deliberate act that turns the plane on.
+        assert_eq!(
+            core_own_capabilities() & CAP_MEDIA_BLOB,
+            0,
+            "the blob bit is advertised before any shell can serve a pull"
+        );
+        for other in [
+            CAP_ACKS_HIDDEN_KINDS,
+            CAP_RELAY_UPDATE,
+            CAP_MULTI_DEVICE,
+            CAP_ROSTER_GOSSIP,
+            CAP_OWN_ROSTER_NOTICE,
+        ] {
+            assert_ne!(CAP_MEDIA_BLOB, other);
+        }
+        // The manifest persists a msg_id row like any chat message, so no peer
+        // has to be trusted to ack it and the bit names no spray kind.
+        assert!(core_kind_persists_msg_id_row(KIND_ATTACHMENT_MANIFEST));
+        for kind in HIDDEN_SPRAY_KINDS {
+            assert_ne!(hidden_ack_capability(kind), Some(CAP_MEDIA_BLOB));
         }
     }
 
