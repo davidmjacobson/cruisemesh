@@ -782,8 +782,10 @@ pub(crate) fn pack_device_ids(ids: &[Vec<u8>]) -> Vec<u8> {
 
 pub(crate) fn unpack_device_ids(bytes: &[u8]) -> Vec<Vec<u8>> {
     bytes
-        .chunks_exact(DEVICE_ID_LEN)
-        .map(<[u8]>::to_vec)
+        .as_chunks::<DEVICE_ID_LEN>()
+        .0
+        .iter()
+        .map(|id| id.to_vec())
         .collect()
 }
 
