@@ -50,7 +50,24 @@ use super::blob::{BlobGeometry, BlobId, BlobKey, BLOB_ID_LEN, BLOB_KEY_LEN};
 use super::filename::MAX_FILENAME_BYTES;
 use super::{MediaError, MEDIA_MANIFEST_MAX_BYTES, MEDIA_THUMBNAIL_MAX_BYTES};
 
-const MANIFEST_WIRE_VERSION: u8 = 1;
+/// Deliberately **not** 1.
+///
+/// Kind 16 carries two body codecs (see [`super::integration`]), and telling
+/// them apart has to be structural rather than statistical. With both codecs
+/// opening on a version byte of 1, disjointness rested on the *rest* of the
+/// body: a manifest's blob id would have to happen to spell a valid mime
+/// length, duration, blob length and caption for the legacy attachment decoder
+/// to accept it. A digest essentially never does — but "essentially never" is
+/// a grindable property, not a guarantee, and a sender who ground one would
+/// have a single body that old builds render as an inline attachment and new
+/// builds treat as a manifest.
+///
+/// Taking the next version instead makes the first byte alone decide, for
+/// every body either codec will ever emit or accept. It costs nothing: this
+/// wire is dark, no build has ever authored a manifest, and version 1 was
+/// never spent on one. `the_two_kind_16_codecs_never_accept_each_other` pins
+/// the separation and the ground-collision shape it replaces.
+pub(crate) const MANIFEST_WIRE_VERSION: u8 = 2;
 const MEDIA_KIND_PHOTO: u8 = 1;
 const MEDIA_KIND_VIDEO: u8 = 2;
 const MEDIA_KIND_FILE: u8 = 3;
@@ -396,7 +413,7 @@ mod tests {
         assert_eq!(
             hex,
             concat!(
-                "0102",
+                "0202",
                 "0101010101010101010101010101010101010101010101010101010101010101",
                 "0202020202020202020202020202020202020202020202020202020202020202",
                 "0000000000100000",
@@ -438,7 +455,7 @@ mod tests {
         assert_eq!(
             hex,
             concat!(
-                "0103",
+                "0203",
                 "0303030303030303030303030303030303030303030303030303030303030303",
                 "0404040404040404040404040404040404040404040404040404040404040404",
                 "0000000000001000",
@@ -564,9 +581,14 @@ mod tests {
     fn decoding_is_strict_about_versions_kinds_and_trailing_bytes() {
         let good = encode_media_manifest(&sample_manifest()).unwrap();
 
-        let mut wrong_version = good.clone();
-        wrong_version[0] = 2;
-        assert!(decode_media_manifest(&wrong_version).is_err());
+        // 1 is the legacy inline attachment's version and 3 is the next one to
+        // allocate. Neither is a manifest, and the version byte is the only
+        // thing separating the two kind-16 codecs, so both are rejections.
+        for version in [0u8, 1, 3, 255] {
+            let mut wrong_version = good.clone();
+            wrong_version[0] = version;
+            assert!(decode_media_manifest(&wrong_version).is_err());
+        }
 
         let mut wrong_kind = good.clone();
         wrong_kind[1] = 9;

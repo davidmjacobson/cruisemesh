@@ -17,14 +17,25 @@
 //! attachment ([`crate::content`]) and is now also the manifest's kind, which
 //! is what the spec's "no new wire protocol for the message plane" rule costs:
 //! one kind, two body codecs, told apart by the bodies themselves rather than
-//! by a discriminator neither shipped build would understand. Both open with a
-//! version byte and a small type byte, so the telling-apart is done by trying
-//! the strict codec first — the manifest's header is fixed-width, its geometry
-//! is validated, its thumbnail rules are enforced and it refuses trailing
-//! bytes, where the attachment decoder reads a length prefix out of what would
-//! be the first two bytes of a blob id and requires UTF-8 after it. A digest
-//! is essentially never that. `the_two_kind_16_codecs_never_accept_each_other`
-//! pins the separation in both directions.
+//! by a discriminator neither shipped build would understand.
+//!
+//! Both open with a version byte, and that byte is what tells them apart:
+//! the attachment codec is version 1 and only version 1, and the manifest
+//! codec is version 2 and only version 2
+//! ([`super::manifest::MANIFEST_WIRE_VERSION`] carries the reasoning). So the
+//! accept sets are disjoint structurally — for every body either codec will
+//! ever emit or accept, at the first byte, with nothing to grind.
+//!
+//! The alternative was to keep both at version 1 and rely on the rest of the
+//! body: a manifest's blob id would have to happen to spell a valid mime
+//! length, duration, blob length and caption before the attachment decoder
+//! accepted it, which a digest essentially never does. "Essentially never" is
+//! a statistical property of a *random* digest, though, and a blob id is
+//! something a sender can grind: one ground collision is one body that old
+//! builds render as an inline attachment and new builds treat as a manifest.
+//! Spending the next version byte was cheaper than reasoning about that.
+//! `the_two_kind_16_codecs_never_accept_each_other` pins the separation in
+//! both directions, including a hand-built body of exactly that shape.
 //!
 //! # Consent is composed, not restated
 //!
@@ -41,9 +52,11 @@
 
 use crate::CoreRelayNetworkVerdict;
 
+use super::bitmap::ChunkBitmap;
 use super::blob::{generate_blob_key, seal_blob, BlobId, BlobKey, SealedBlob};
+use super::lan_pull::{ServeBudgets, ServePlan};
 use super::manifest::{decode_media_manifest, encode_media_manifest, MediaManifest};
-use super::store::{BlobRecord, BlobStore};
+use super::store::{BlobOrigin, BlobRecord, BlobStore};
 use super::MediaError;
 
 /// The message kind a manifest rides. Named here so integration code does not
@@ -109,6 +122,10 @@ pub fn chunk_file_name(blob_id: &BlobId) -> String {
 /// Open (or re-attach to) the row a recognized manifest needs before any chunk
 /// can be recorded. Idempotent, because a manifest can be delivered twice and
 /// an app can restart mid-transfer; both resume the existing bitmap.
+///
+/// The row is [`BlobOrigin::Received`], which is what stops a finished
+/// download from turning this device into a second source for someone else's
+/// blob — see [`servable_plan`] and `BLOB-01`.
 pub fn begin_media_transfer(
     store: &BlobStore<'_>,
     manifest: &MediaManifest,
@@ -119,8 +136,67 @@ pub fn begin_media_transfer(
         &manifest.blob_id,
         &geometry,
         &chunk_file_name(&manifest.blob_id),
+        BlobOrigin::Received,
         now_ms,
     )
+}
+
+/// Open the row for a blob this device *authored*: the sender's own copy, the
+/// one it may serve.
+///
+/// The authoring side needs a row too — the responder answers a fetch out of
+/// the same bitmap and geometry a downloader is tracked by — but it is the one
+/// origin that may be offered onward, so it gets its own entry point rather
+/// than an origin argument on the receive one. Two doors, each with the origin
+/// baked in, is harder to walk through the wrong way than one door with a flag.
+pub fn begin_authored_media_blob(
+    store: &BlobStore<'_>,
+    sealed: &SealedBlob,
+    now_ms: i64,
+) -> Result<BlobRecord, MediaError> {
+    store.begin(
+        &sealed.id,
+        &sealed.geometry,
+        &chunk_file_name(&sealed.id),
+        BlobOrigin::AuthoredHere,
+        now_ms,
+    )
+}
+
+/// The plan a responder would serve this blob under, or `None` if it must not
+/// be served at all.
+///
+/// This is `BLOB-01`'s second clause where it can be enforced: *no third party
+/// stores, forwards, or serves another person's blob*. A completed download
+/// holds every chunk and verifies against the manifest, so nothing about the
+/// bitmap distinguishes it from the sender's own copy — only its origin does.
+/// Without this gate, the first person to finish a photo becomes a second
+/// source for it, every later recipient can pull from them, and v1's
+/// two-sources rule becomes "whoever has opened it", which is exactly the
+/// third-party carry the spec lists as a non-goal.
+///
+/// A blob is servable when it was authored here **and** at least one chunk is
+/// present. Anything else is `None`, and the responder never opens a session
+/// for it in the first place; [`super::lan_pull::ServeSession`] refuses a
+/// received-origin plan a second time, so a caller that builds one by hand
+/// still cannot serve it.
+pub fn servable_plan(
+    record: &BlobRecord,
+    blob_key: &BlobKey,
+    held: ChunkBitmap,
+    budgets: ServeBudgets,
+) -> Option<ServePlan> {
+    if record.origin != BlobOrigin::AuthoredHere || held.present_count() == 0 {
+        return None;
+    }
+    Some(ServePlan {
+        blob_id: record.blob_id,
+        blob_key: blob_key.clone(),
+        geometry: record.geometry,
+        origin: record.origin,
+        held,
+        budgets,
+    })
 }
 
 /// Where a recipient would fetch the bytes from.
@@ -233,9 +309,11 @@ mod tests {
     use super::*;
     use crate::content::{
         decode_attachment_payload, encode_attachment_payload, AttachmentMediaType,
-        CoreAttachmentPayload,
+        CoreAttachmentPayload, ATTACHMENT_WIRE_VERSION,
     };
-    use crate::media::manifest::{sample_file_manifest, sample_manifest, MediaKind};
+    use crate::media::manifest::{
+        sample_file_manifest, sample_manifest, MediaKind, MANIFEST_WIRE_VERSION,
+    };
     use crate::protocol::{core_own_capabilities, CAP_MEDIA_BLOB};
     use crate::{
         core_relay_network_permitted, decode_message_body, encode_message_body, CoreRelayRoaming,
@@ -346,7 +424,58 @@ mod tests {
                 recognize_media_manifest(MEDIA_MANIFEST_KIND, &body),
                 Some(manifest)
             );
+            assert_eq!(
+                body[0], MANIFEST_WIRE_VERSION,
+                "the version byte is what makes the two codecs disjoint"
+            );
         }
+
+        assert_ne!(
+            MANIFEST_WIRE_VERSION, ATTACHMENT_WIRE_VERSION,
+            "one kind, two codecs: their version bytes are the whole separation"
+        );
+    }
+
+    #[test]
+    fn a_ground_blob_id_cannot_make_one_body_both_codecs_accept() {
+        // The adversarial shape the version bump exists to close. Every field
+        // the legacy attachment decoder reads after its own two-byte header
+        // lands inside the blob id here, so this digest is one a sender could
+        // grind: an empty mime, a four-byte inline blob, an empty caption, and
+        // trailing bytes the attachment codec permits by design.
+        let mut ground = [0x00u8; 32];
+        ground[6..10].copy_from_slice(&4u32.to_be_bytes()); // inline blob length
+        ground[14..16].copy_from_slice(&0u16.to_be_bytes()); // caption length
+        let manifest = MediaManifest {
+            // Kind 1 is Photo here and Image there: the second byte collides
+            // too, which is the point.
+            blob_id: BlobId(ground),
+            ..sample_manifest()
+        };
+        let body = media_manifest_body(&manifest).unwrap();
+
+        assert!(
+            decode_attachment_payload(body.clone()).is_none(),
+            "a ground blob id must not make a manifest readable as an attachment"
+        );
+        assert_eq!(
+            recognize_media_manifest(MEDIA_MANIFEST_KIND, &body),
+            Some(manifest)
+        );
+
+        // And the version byte is load-bearing rather than incidental: the
+        // same bytes under the attachment's version *are* accepted by it, so
+        // nothing but that byte was standing between these two codecs.
+        let mut collided = body;
+        collided[0] = ATTACHMENT_WIRE_VERSION;
+        assert!(
+            decode_attachment_payload(collided.clone()).is_some(),
+            "the shape really is a valid attachment; only the version separates them"
+        );
+        assert!(
+            recognize_media_manifest(MEDIA_MANIFEST_KIND, &collided).is_none(),
+            "and that body is not a manifest"
+        );
     }
 
     #[test]
@@ -372,12 +501,71 @@ mod tests {
         assert_eq!(record.geometry, manifest.geometry().unwrap());
         assert_eq!(record.chunk_file, chunk_file_name(&manifest.blob_id));
         assert!(record.manifest_unread, "nobody has opened the chat yet");
+        assert_eq!(
+            record.origin,
+            BlobOrigin::Received,
+            "mail from someone else is someone else's blob"
+        );
 
         store.record_chunk(&manifest.blob_id, 1, 1_100).unwrap();
         // A redelivered manifest, or a restart: a resume, never a reset.
         let again = begin_media_transfer(&store, &manifest, 2_000).unwrap();
         assert_eq!(again.chunks_present, 1);
         assert_eq!(again.chunk_file, record.chunk_file);
+    }
+
+    #[test]
+    fn only_a_blob_this_device_authored_is_ever_servable() {
+        // BLOB-01's second clause at the seam that decides it. The two rows
+        // are otherwise identical — same geometry, same chunk file rule, and
+        // the received one is *complete* — so origin is the whole difference
+        // between a source and a reader.
+        let db = Connection::open_in_memory().unwrap();
+        let store = BlobStore::open(&db).unwrap();
+        let bytes = vec![3u8; 700_000];
+        let authored = seal_media_blob(&bytes).unwrap();
+        let manifest = manifest_for(&authored);
+
+        let mine = begin_authored_media_blob(&store, &authored.sealed, 1_000).unwrap();
+        assert_eq!(mine.origin, BlobOrigin::AuthoredHere);
+        let mut held = ChunkBitmap::empty(mine.geometry.chunk_count).unwrap();
+        for index in 0..mine.geometry.chunk_count {
+            held.set(index);
+        }
+        assert!(
+            servable_plan(&mine, &authored.key, held.clone(), ServeBudgets::default()).is_some(),
+            "the sender serves its own copy"
+        );
+
+        // The same bytes as a completed download on a second device.
+        let other_db = Connection::open_in_memory().unwrap();
+        let other = BlobStore::open(&other_db).unwrap();
+        let downloaded = begin_media_transfer(&other, &manifest, 1_000).unwrap();
+        for index in 0..downloaded.geometry.chunk_count {
+            other.record_chunk(&manifest.blob_id, index, 1_100).unwrap();
+        }
+        other.mark_verified(&manifest.blob_id, 1_200).unwrap();
+        let finished = other.record(&manifest.blob_id).unwrap().unwrap();
+        assert!(finished.complete && finished.verified);
+        assert!(
+            servable_plan(
+                &finished,
+                &manifest.blob_key,
+                held.clone(),
+                ServeBudgets::default()
+            )
+            .is_none(),
+            "a completed download must not become a second source"
+        );
+
+        // Nor does re-opening the row with the authoring door change it: the
+        // origin a row was created with is the origin it keeps.
+        begin_authored_media_blob(&other, &authored.sealed, 2_000).unwrap();
+        let reopened = other.record(&manifest.blob_id).unwrap().unwrap();
+        assert_eq!(reopened.origin, BlobOrigin::Received);
+        assert!(
+            servable_plan(&reopened, &manifest.blob_key, held, ServeBudgets::default()).is_none()
+        );
     }
 
     #[test]

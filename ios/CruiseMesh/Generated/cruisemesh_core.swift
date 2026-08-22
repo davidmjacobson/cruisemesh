@@ -4258,6 +4258,11 @@ public func FfiConverterTypeCoreSprayPolicy_lower(_ value: CoreSprayPolicy) -> U
 public protocol LanNoiseSessionProtocol : AnyObject {
     
     /**
+     * Whether this session will currently accept blob records.
+     */
+    func acceptsBlobRecords()  -> Bool
+    
+    /**
      * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
      * after the final record, or `None` while a multi-record frame is still
      * being assembled. This is the message plane only: a blob record is
@@ -4270,6 +4275,10 @@ public protocol LanNoiseSessionProtocol : AnyObject {
     /**
      * Decrypt one Noise record from either plane, naming the plane a
      * completed frame came from.
+     *
+     * The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+     * (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+     * is skipped the way an unknown record type is.
      */
     func decryptRecordTyped(record: Data) throws  -> LanRecord?
     
@@ -4302,6 +4311,27 @@ public protocol LanNoiseSessionProtocol : AnyObject {
      * 3, immediately before the session enters transport mode.
      */
     func remoteStaticKey()  -> Data?
+    
+    /**
+     * Record what the peer advertised in its HELLO2, once the shell has read
+     * it. Until this is called the session accepts message-plane records
+     * only.
+     *
+     * Authenticating the link is not the same as agreeing to a second one.
+     * The blob lane carries its own reassembler with its own
+     * [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+     * authenticated peer would let a contact who never claimed the blob plane
+     * open a second megabyte of reassembly on every link — capability for
+     * something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+     * does, and it is the same bit
+     * ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+     * consults before it opens a pull session, so both directions agree on
+     * one gate.
+     *
+     * Idempotent, and safe to call again if a peer re-advertises: the flag
+     * tracks the latest HELLO2 rather than accumulating.
+     */
+    func setPeerCapabilities(capabilities: UInt32) throws 
     
     /**
      * Produce the next Noise XX handshake message. Callers follow the
@@ -4376,6 +4406,16 @@ public convenience init(initiator: Bool, localPrivateKey: Data)throws  {
 
     
     /**
+     * Whether this session will currently accept blob records.
+     */
+open func acceptsBlobRecords() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_accepts_blob_records(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
      * after the final record, or `None` while a multi-record frame is still
      * being assembled. This is the message plane only: a blob record is
@@ -4394,6 +4434,10 @@ open func decryptRecord(record: Data)throws  -> Data? {
     /**
      * Decrypt one Noise record from either plane, naming the plane a
      * completed frame came from.
+     *
+     * The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+     * (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+     * is skipped the way an unknown record type is.
      */
 open func decryptRecordTyped(record: Data)throws  -> LanRecord? {
     return try  FfiConverterOptionTypeLanRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -4458,6 +4502,32 @@ open func remoteStaticKey() -> Data? {
     uniffi_cruisemesh_core_fn_method_lannoisesession_remote_static_key(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Record what the peer advertised in its HELLO2, once the shell has read
+     * it. Until this is called the session accepts message-plane records
+     * only.
+     *
+     * Authenticating the link is not the same as agreeing to a second one.
+     * The blob lane carries its own reassembler with its own
+     * [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+     * authenticated peer would let a contact who never claimed the blob plane
+     * open a second megabyte of reassembly on every link — capability for
+     * something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+     * does, and it is the same bit
+     * ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+     * consults before it opens a pull session, so both directions agree on
+     * one gate.
+     *
+     * Idempotent, and safe to call again if a peer re-advertises: the flag
+     * tracks the latest HELLO2 rather than accumulating.
+     */
+open func setPeerCapabilities(capabilities: UInt32)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_set_peer_capabilities(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(capabilities),$0
+    )
+}
 }
     
     /**
@@ -25652,6 +25722,9 @@ public func FfiConverterTypeCoreSailPermissionRow_lower(_ value: CoreSailPermiss
  * The ciphertext crosses whole. That is honest for phase 1, where the caller
  * already holds the plaintext in memory to hand it here; a driver that seals
  * a 128 MiB clip streams instead, and that is phase 2's boundary to design.
+ * Until it does, [`crate::media::media_authoring_max_bytes`] — not the
+ * protocol cap — is what a picker checks, because the several transient
+ * copies this shape costs are what a phone runs out of memory over.
  */
 public struct CoreSealedMediaBlob {
     public var blobId: Data
@@ -55466,8 +55539,20 @@ public func mayStartCarriedOffer(activeOffers: UInt32) -> Bool {
 })
 }
 /**
- * See [`MEDIA_BLOB_MAX_BYTES`]. A picker checks against this before it asks
- * core to seal anything.
+ * See [`MEDIA_AUTHORING_MAX_BYTES`]. A picker checks against this before it
+ * reads a file in and asks core to seal it.
+ */
+public func mediaAuthoringMaxBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_authoring_max_bytes($0
+    )
+})
+}
+/**
+ * See [`MEDIA_BLOB_MAX_BYTES`]. The *protocol* cap: the largest blob a
+ * manifest may describe or a transfer may move. It is not the bound a picker
+ * checks — that is [`media_authoring_max_bytes`], which is smaller because
+ * this phase's boundary copies whole buffers.
  */
 public func mediaBlobMaxBytes() -> UInt64 {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
@@ -57838,7 +57923,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_may_start_carried_offer() != 61552) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_media_blob_max_bytes() != 2264) {
+    if (uniffi_cruisemesh_core_checksum_func_media_authoring_max_bytes() != 64152) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_blob_max_bytes() != 52749) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_media_manifest_kind() != 33839) {
@@ -58372,10 +58460,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_quiet_rounds() != 64566) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_accepts_blob_records() != 22133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 61860) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record_typed() != 61728) {
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record_typed() != 4136) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_encrypt_blob_record() != 484) {
@@ -58391,6 +58482,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_remote_static_key() != 43732) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_set_peer_capabilities() != 25489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {

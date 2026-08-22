@@ -85,6 +85,9 @@ pub struct CoreMediaManifest {
 /// The ciphertext crosses whole. That is honest for phase 1, where the caller
 /// already holds the plaintext in memory to hand it here; a driver that seals
 /// a 128 MiB clip streams instead, and that is phase 2's boundary to design.
+/// Until it does, [`crate::media::media_authoring_max_bytes`] — not the
+/// protocol cap — is what a picker checks, because the several transient
+/// copies this shape costs are what a phone runs out of memory over.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct CoreSealedMediaBlob {
     pub blob_id: Vec<u8>,
@@ -173,7 +176,10 @@ fn manifest_into(manifest: MediaManifest) -> CoreMediaManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::{media_blob_max_bytes, media_thumbnail_max_bytes, MEDIA_BLOB_MAX_BYTES};
+    use crate::media::{
+        media_authoring_max_bytes, media_blob_max_bytes, media_thumbnail_max_bytes,
+        MEDIA_AUTHORING_MAX_BYTES, MEDIA_BLOB_MAX_BYTES,
+    };
     use crate::{decode_message_body, encode_message_body, MessageBody};
 
     fn photo(sealed: &CoreSealedMediaBlob) -> CoreMediaManifest {
@@ -274,10 +280,30 @@ mod tests {
     #[test]
     fn the_exported_sizes_are_the_constants_and_not_a_second_copy() {
         assert_eq!(media_blob_max_bytes(), MEDIA_BLOB_MAX_BYTES);
+        assert_eq!(media_authoring_max_bytes(), MEDIA_AUTHORING_MAX_BYTES);
         assert_eq!(
             media_thumbnail_max_bytes() as usize,
             crate::media::MEDIA_THUMBNAIL_MAX_BYTES
         );
         assert_eq!(media_manifest_kind(), crate::KIND_ATTACHMENT_MANIFEST);
+    }
+
+    #[test]
+    fn the_authoring_bound_never_exceeds_what_the_protocol_allows() {
+        // Two different bounds with two different owners: the wire's, and this
+        // boundary's. `core_media_seal_blob` carries whole buffers in both
+        // directions, so the boundary's has to be the smaller of the two — an
+        // authoring ceiling above the protocol cap would be a shell told to
+        // offer a file no manifest could ever name, and one raised to meet the
+        // protocol cap without a streaming FFI behind it would be an Android
+        // OOM instead of a refusal.
+        assert!(
+            media_authoring_max_bytes() <= media_blob_max_bytes(),
+            "the whole-buffer boundary cannot carry more than the plane will name"
+        );
+        assert!(
+            media_authoring_max_bytes() > 0,
+            "a shell needs some bound it can actually author under"
+        );
     }
 }

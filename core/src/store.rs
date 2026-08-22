@@ -2083,15 +2083,20 @@ fn sanitize_restore_contents(
     // have.
     tx.execute("DELETE FROM own_revocation", [])
         .map_err(store_err)?;
-    // The blob plane's backup posture, decided here: metadata backs up,
-    // chunk files do not. A `media_blobs` row is a claim about a file on
-    // disk — "these chunks of this blob are already present" — and the file
-    // belongs to the phone the backup came from. A restored install that kept
-    // the row would report bytes present for a file that does not exist,
-    // charge them to its partial-transfer budget, and resume a transfer that
-    // can never complete. The manifests survive in message history, which is
-    // what a restored device actually needs: it re-opens each row from the
-    // manifest and pulls the bytes again.
+    // The blob plane's backup posture, decided here: a partial transfer does
+    // not back up at all — not its chunk files, and not its metadata either.
+    // This function runs on the export path as well as the restore path, so
+    // the rows are gone from the `.cmbak` itself rather than merely dropped on
+    // the way back in.
+    //
+    // A `media_blobs` row is a claim about a file on disk — "these chunks of
+    // this blob are already present" — and the file belongs to the phone the
+    // backup came from. Carrying the row without the file is carrying a
+    // bitmap that dangles: the restored install would report bytes present for
+    // a file that does not exist, charge them to its partial-transfer budget,
+    // and resume a transfer that can never complete. The manifests survive in
+    // message history, which is what a restored device actually needs: it
+    // re-opens each row from the manifest and pulls the bytes again.
     tx.execute("DELETE FROM media_blobs", [])
         .map_err(store_err)?;
 
@@ -16543,6 +16548,20 @@ mod tests {
         assert_eq!(report.removed_expired_delivery_count, 1);
         assert_eq!(report.removed_connection_event_count, 2);
 
+        // The blob plane's posture, asserted on the exported file before
+        // anything restores it: `media_blobs` is empty in the `.cmbak` itself,
+        // not merely emptied on the way back in. Read with a bare connection
+        // so nothing in `MessageStore::open` can be what makes it true.
+        let snapshot = Connection::open(&path).unwrap();
+        let exported_blobs: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            exported_blobs, 0,
+            "a partial transfer must not leave the phone it started on"
+        );
+        drop(snapshot);
+
         let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
         assert!(restored
             .messages_for_chat(b"alice-id".to_vec())
@@ -16574,9 +16593,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transient, (0, 0, None));
-        // Blob-plane metadata rides the backup and is cleared on the way in:
-        // the chunk files it names never left the other phone, so a surviving
-        // row would claim bytes this device does not have.
+        // And it is still empty after a restore, which is the same fact from
+        // the other end: the chunk files these rows name never left the other
+        // phone, so a surviving row would claim bytes this device lacks.
         let tracked_blobs: i64 = conn
             .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
             .unwrap();
@@ -16648,6 +16667,19 @@ mod tests {
                     now_ms,
                 )
                 .unwrap();
+            // Partial blob transfers are neither content nor cargo, so no
+            // option keeps them — asserted on the exported file, before any
+            // restore, because the export is where they are dropped.
+            let snapshot = Connection::open(&path).unwrap();
+            let exported_blobs: i64 = snapshot
+                .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                exported_blobs, 0,
+                "include_history={include_history} include_courier={include_courier}"
+            );
+            drop(snapshot);
+
             let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
             assert_eq!(
                 !restored
@@ -16668,9 +16700,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(authored_high, 8);
-            // Partial blob transfers are not content and are not cargo: no
-            // option keeps them, because the chunk files they name stayed on
-            // the other phone.
+            // And nothing puts them back on the way in either.
             let tracked_blobs: i64 = conn
                 .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
                 .unwrap();

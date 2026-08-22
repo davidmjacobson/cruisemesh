@@ -49,9 +49,17 @@
 //! [`MEDIA_SCHEMA_SQL`] is `CREATE TABLE IF NOT EXISTS`, matching the rest of
 //! the store's migration style, and every function here takes a borrowed
 //! `Connection`. `MessageStore::open` applies it to its own connection, so
-//! this metadata sits in the one database the app already backs up — and a
-//! restore clears `media_blobs`, because the chunk files those rows name
-//! never left the phone the backup came from.
+//! this metadata sits in the one database the app already backs up.
+//!
+//! It does not ride the backup, though. `sanitize_restore_contents` in
+//! `core/src/store.rs` runs on the **export** path as well as the restore
+//! path, so `media_blobs` is already empty in the `.cmbak` — neither the
+//! chunk files nor the rows that name them travel. That is the whole posture,
+//! and it is the right one: a row says "these chunks of this blob are already
+//! on disk", the file it means stayed on the other phone, and a restored
+//! bitmap would dangle over bytes that do not exist — charged to the partial
+//! budget, resuming a transfer that can never finish. What a restored device
+//! needs is the manifests, and those are ordinary message history.
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -70,6 +78,7 @@ CREATE TABLE IF NOT EXISTS media_blobs (
     verified INTEGER NOT NULL DEFAULT 0,
     transfer_active INTEGER NOT NULL DEFAULT 0,
     manifest_unread INTEGER NOT NULL DEFAULT 1,
+    origin INTEGER NOT NULL DEFAULT 0,
     chunk_file TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL,
     last_used_at_ms INTEGER NOT NULL
@@ -77,6 +86,48 @@ CREATE TABLE IF NOT EXISTS media_blobs (
 CREATE INDEX IF NOT EXISTS idx_media_blobs_lru
     ON media_blobs(verified, transfer_active, manifest_unread, last_used_at_ms);
 ";
+
+/// Whose blob this is.
+///
+/// `BLOB-01`'s second clause — "no third party stores, forwards, or serves
+/// another person's blob" — needs the store to be able to tell the two apart,
+/// because holding a complete blob and being allowed to *offer* it are
+/// different facts. A recipient who finishes a download holds every chunk; if
+/// that alone made it servable, the recipient would become a second source and
+/// the spec's two-sources rule (the sender's phone, and later the relay blob
+/// store) would quietly become "however many people have opened the photo".
+/// That is the v1 non-goal, arrived at by accident.
+///
+/// So origin is recorded when the row is opened and never changes. It is not a
+/// permission that can be granted later: the phase that studies consented
+/// mule-assist is the phase that gets to add one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobOrigin {
+    /// This device sealed these bytes. The only origin that may be served.
+    AuthoredHere,
+    /// These bytes were fetched from someone else. Readable here, never
+    /// offered onward.
+    Received,
+}
+
+impl BlobOrigin {
+    fn as_i64(self) -> i64 {
+        match self {
+            BlobOrigin::Received => 0,
+            BlobOrigin::AuthoredHere => 1,
+        }
+    }
+
+    fn from_i64(value: i64) -> Self {
+        // Anything but the authored marker reads as received: the fail-safe
+        // direction is the one that serves nothing.
+        if value == 1 {
+            BlobOrigin::AuthoredHere
+        } else {
+            BlobOrigin::Received
+        }
+    }
+}
 
 /// One tracked blob.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +140,7 @@ pub struct BlobRecord {
     pub verified: bool,
     pub transfer_active: bool,
     pub manifest_unread: bool,
+    pub origin: BlobOrigin,
     pub chunk_file: String,
     pub created_at_ms: i64,
     pub last_used_at_ms: i64,
@@ -148,11 +200,16 @@ impl<'a> BlobStore<'a> {
     /// Start (or re-attach to) a transfer. Idempotent: a second call for a
     /// blob already tracked returns the existing row untouched, so a restart
     /// mid-transfer resumes rather than resetting a bitmap.
+    ///
+    /// `origin` is settled here and only here. A row that already exists keeps
+    /// the origin it was opened with, so a later call cannot promote a
+    /// received blob into a servable one — see [`BlobOrigin`].
     pub fn begin(
         &self,
         blob_id: &BlobId,
         geometry: &BlobGeometry,
         chunk_file: &str,
+        origin: BlobOrigin,
         now_ms: i64,
     ) -> Result<BlobRecord, MediaError> {
         if let Some(existing) = self.record(blob_id)? {
@@ -167,15 +224,16 @@ impl<'a> BlobStore<'a> {
         self.conn
             .execute(
                 "INSERT INTO media_blobs (blob_id, plaintext_bytes, ciphertext_bytes, chunk_count, \
-                 bitmap, bytes_present, verified, transfer_active, manifest_unread, chunk_file, \
-                 created_at_ms, last_used_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 1, ?6, ?7, ?7)",
+                 bitmap, bytes_present, verified, transfer_active, manifest_unread, origin, \
+                 chunk_file, created_at_ms, last_used_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 1, ?6, ?7, ?8, ?8)",
                 params![
                     blob_id.as_bytes().to_vec(),
                     geometry.plaintext_bytes as i64,
                     geometry.ciphertext_bytes as i64,
                     geometry.chunk_count as i64,
                     bitmap.as_bytes().to_vec(),
+                    origin.as_i64(),
                     chunk_file,
                     now_ms,
                 ],
@@ -189,7 +247,7 @@ impl<'a> BlobStore<'a> {
         self.conn
             .query_row(
                 "SELECT plaintext_bytes, bitmap, bytes_present, verified, transfer_active, \
-                 manifest_unread, chunk_file, created_at_ms, last_used_at_ms \
+                 manifest_unread, chunk_file, created_at_ms, last_used_at_ms, origin \
                  FROM media_blobs WHERE blob_id = ?1",
                 params![blob_id.as_bytes().to_vec()],
                 |row| {
@@ -203,6 +261,7 @@ impl<'a> BlobStore<'a> {
                         row.get::<_, String>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -220,6 +279,7 @@ impl<'a> BlobStore<'a> {
                     verified: row.3 != 0,
                     transfer_active: row.4 != 0,
                     manifest_unread: row.5 != 0,
+                    origin: BlobOrigin::from_i64(row.9),
                     chunk_file: row.6,
                     created_at_ms: row.7,
                     last_used_at_ms: row.8,
@@ -581,7 +641,13 @@ mod tests {
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(1);
         store
-            .begin(&id, &geometry(4), "blob-1.part", 1_000)
+            .begin(
+                &id,
+                &geometry(4),
+                "blob-1.part",
+                BlobOrigin::Received,
+                1_000,
+            )
             .unwrap();
         store.record_chunk(&id, 0, 1_100).unwrap();
         store.record_chunk(&id, 2, 1_200).unwrap();
@@ -603,7 +669,13 @@ mod tests {
 
         // And beginning again is a resume, not a reset.
         let again = reopened
-            .begin(&id, &geometry(4), "blob-1.part", 2_000)
+            .begin(
+                &id,
+                &geometry(4),
+                "blob-1.part",
+                BlobOrigin::Received,
+                2_000,
+            )
             .unwrap();
         assert_eq!(again.chunks_present, 2);
     }
@@ -614,7 +686,9 @@ mod tests {
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(2);
         let geo = geometry(3);
-        store.begin(&id, &geo, "blob-2.part", 10).unwrap();
+        store
+            .begin(&id, &geo, "blob-2.part", BlobOrigin::Received, 10)
+            .unwrap();
 
         let first = store.record_chunk(&id, 1, 20).unwrap();
         assert!(first.newly_present);
@@ -631,7 +705,9 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(3);
-        store.begin(&id, &geometry(2), "blob-3.part", 10).unwrap();
+        store
+            .begin(&id, &geometry(2), "blob-3.part", BlobOrigin::Received, 10)
+            .unwrap();
         store.record_chunk(&id, 0, 20).unwrap();
         store.record_chunk(&id, 1, 30).unwrap();
         store.mark_verified(&id, 40).unwrap();
@@ -649,7 +725,9 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(4);
-        store.begin(&id, &geometry(3), "blob-4.part", 10).unwrap();
+        store
+            .begin(&id, &geometry(3), "blob-4.part", BlobOrigin::Received, 10)
+            .unwrap();
         for index in 0..3 {
             store.record_chunk(&id, index, 20).unwrap();
         }
@@ -664,7 +742,9 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(5);
-        store.begin(&id, &geometry(2), "blob-5.part", 10).unwrap();
+        store
+            .begin(&id, &geometry(2), "blob-5.part", BlobOrigin::Received, 10)
+            .unwrap();
         store.record_chunk(&id, 0, 20).unwrap();
         assert!(store.mark_verified(&id, 30).is_err());
     }
@@ -674,7 +754,9 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(6);
-        store.begin(&id, &geometry(1), "blob-6.part", 10).unwrap();
+        store
+            .begin(&id, &geometry(1), "blob-6.part", BlobOrigin::Received, 10)
+            .unwrap();
         store.record_chunk(&id, 0, 20).unwrap();
         assert!(store.charged_bytes().unwrap() > 0);
         store.mark_verified(&id, 30).unwrap();
@@ -694,6 +776,7 @@ mod tests {
                     &id,
                     &geometry(1),
                     &format!("blob-{seed}.part"),
+                    BlobOrigin::Received,
                     1_000 + i64::from(seed),
                 )
                 .unwrap();
@@ -798,8 +881,12 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         let id = blob_id(7);
-        store.begin(&id, &geometry(2), "blob-7.part", 10).unwrap();
-        assert!(store.begin(&id, &geometry(3), "blob-7.part", 20).is_err());
+        store
+            .begin(&id, &geometry(2), "blob-7.part", BlobOrigin::Received, 10)
+            .unwrap();
+        assert!(store
+            .begin(&id, &geometry(3), "blob-7.part", BlobOrigin::Received, 20)
+            .is_err());
     }
 
     #[test]
@@ -810,7 +897,13 @@ mod tests {
         let db = conn();
         let store = BlobStore::open(&db).unwrap();
         store
-            .begin(&sealed.id, &sealed.geometry, "fjords.part", 10)
+            .begin(
+                &sealed.id,
+                &sealed.geometry,
+                "fjords.part",
+                BlobOrigin::AuthoredHere,
+                10,
+            )
             .unwrap();
         let columns: Vec<String> = db
             .prepare("SELECT * FROM media_blobs")

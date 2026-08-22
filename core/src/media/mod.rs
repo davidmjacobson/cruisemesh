@@ -71,12 +71,17 @@
 //! 2. ~~Receiving~~ — [`integration::recognize_media_manifest`] tells a
 //!    manifest from a legacy inline attachment under the same kind, and
 //!    [`integration::begin_media_transfer`] opens the [`store::BlobStore`]
-//!    row.
+//!    row — as [`store::BlobOrigin::Received`], which is what keeps a
+//!    finished download from becoming a second source
+//!    ([`integration::servable_plan`], `BLOB-01`).
 //! 3. ~~Persistence~~ — [`store::MEDIA_SCHEMA_SQL`] is applied on
 //!    `MessageStore`'s connection, and the backup posture is decided:
-//!    **metadata backs up, chunk files do not**, so a restore clears
-//!    `media_blobs` rather than resuming against files that stayed on the
-//!    other phone.
+//!    **partial transfers do not back up at all** — not the chunk files, and
+//!    not the metadata either. The sanitizer runs on the *export* path as
+//!    well as the restore path, so `media_blobs` is empty in the `.cmbak`
+//!    itself. A row is a claim about a file that never left the other phone,
+//!    and the manifests in message history are all a restored device needs to
+//!    open the rows again and re-pull the bytes.
 //! 4. Drivers: the LAN bulk sub-channel on both shells — a socket, chunk file
 //!    writes, and the `take_accepted` drain — plus chunk file deletion, which
 //!    this module only ever *plans*. Core names the file
@@ -120,7 +125,28 @@ pub use integration::{
 
 /// Largest blob the plane will name, seal, or fetch. The spec's v1 sizing:
 /// "covers phone video clips; not a movie service".
+///
+/// This is the *protocol* cap — what a manifest may describe and what a
+/// transfer may move — and it is not what a phase-1 shell may hand to
+/// [`ffi::core_media_seal_blob`]. That bound is
+/// [`MEDIA_AUTHORING_MAX_BYTES`], and it is smaller.
 pub const MEDIA_BLOB_MAX_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Largest blob a shell may author through the phase-1 UniFFI boundary.
+///
+/// [`ffi::core_media_seal_blob`] takes a whole `Vec<u8>` in and hands a whole
+/// `Vec<u8>` back, so a seal costs several transient copies of the original on
+/// the way across JNA and the Swift bridge. At the protocol cap that is most of
+/// a gigabyte of peak footprint for one photo, which is an Android OOM long
+/// before it is a refused manifest — a boundary that advertises a capability it
+/// cannot carry.
+///
+/// So the plane exports two numbers and says which is which. This one is the
+/// bound a picker checks before it reads a file into memory; it is a property
+/// of the *boundary*, not of the wire, and phase 2's streaming/driver FFI is
+/// what lifts it. Raising it here without changing that boundary is the bug
+/// this constant exists to name.
+pub const MEDIA_AUTHORING_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Plaintext bytes per chunk. The spec's LAN chunk size, chosen small enough
 /// to interleave with the mesh traffic sharing the same link.
@@ -152,17 +178,27 @@ pub const MEDIA_MANIFEST_MAX_BYTES: usize = 96 * 1024;
 pub const MEDIA_PARTIAL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 // UniFFI carries functions, not constants, so the bounds a shell can actually
-// violate get accessors. These three are exactly the ones an authoring shell
-// can walk into: an original too large to name, a thumbnail too large to
-// carry, and a body the codec would refuse. The chunk geometry and the
-// partial-transfer budget are deliberately absent — they belong to the
-// drivers and the Advanced screen, and neither exists yet.
+// violate get accessors. These four are exactly the ones an authoring shell
+// can walk into: an original too large for the boundary, an original too large
+// to name at all, a thumbnail too large to carry, and a body the codec would
+// refuse. The chunk geometry and the partial-transfer budget are deliberately
+// absent — they belong to the drivers and the Advanced screen, and neither
+// exists yet.
 
-/// See [`MEDIA_BLOB_MAX_BYTES`]. A picker checks against this before it asks
-/// core to seal anything.
+/// See [`MEDIA_BLOB_MAX_BYTES`]. The *protocol* cap: the largest blob a
+/// manifest may describe or a transfer may move. It is not the bound a picker
+/// checks — that is [`media_authoring_max_bytes`], which is smaller because
+/// this phase's boundary copies whole buffers.
 #[uniffi::export]
 pub fn media_blob_max_bytes() -> u64 {
     MEDIA_BLOB_MAX_BYTES
+}
+
+/// See [`MEDIA_AUTHORING_MAX_BYTES`]. A picker checks against this before it
+/// reads a file in and asks core to seal it.
+#[uniffi::export]
+pub fn media_authoring_max_bytes() -> u64 {
+    MEDIA_AUTHORING_MAX_BYTES
 }
 
 /// See [`MEDIA_THUMBNAIL_MAX_BYTES`]. The bound a shell's thumbnail encoder

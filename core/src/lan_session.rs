@@ -102,6 +102,9 @@ struct SessionInner {
     next_outbound_blob_frame_id: u32,
     inbound: Option<InboundFrame>,
     inbound_blob: Option<InboundFrame>,
+    /// Whether this peer advertised `CAP_MEDIA_BLOB` in its HELLO2. False
+    /// until a shell says otherwise — see [`LanNoiseSession::set_peer_capabilities`].
+    peer_speaks_blob_plane: bool,
 }
 
 struct InboundFrame {
@@ -147,6 +150,7 @@ impl LanNoiseSession {
                 next_outbound_blob_frame_id: 0,
                 inbound: None,
                 inbound_blob: None,
+                peer_speaks_blob_plane: false,
             }),
         })
     }
@@ -245,8 +249,43 @@ impl LanNoiseSession {
 
     /// Decrypt one Noise record from either plane, naming the plane a
     /// completed frame came from.
+    ///
+    /// The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+    /// (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+    /// is skipped the way an unknown record type is.
     pub fn decrypt_record_typed(&self, record: Vec<u8>) -> Result<Option<LanRecord>, CoreError> {
-        self.decrypt_typed(record, true)
+        let accept_blob = self.lock()?.peer_speaks_blob_plane;
+        self.decrypt_typed(record, accept_blob)
+    }
+
+    /// Record what the peer advertised in its HELLO2, once the shell has read
+    /// it. Until this is called the session accepts message-plane records
+    /// only.
+    ///
+    /// Authenticating the link is not the same as agreeing to a second one.
+    /// The blob lane carries its own reassembler with its own
+    /// [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+    /// authenticated peer would let a contact who never claimed the blob plane
+    /// open a second megabyte of reassembly on every link — capability for
+    /// something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+    /// does, and it is the same bit
+    /// ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+    /// consults before it opens a pull session, so both directions agree on
+    /// one gate.
+    ///
+    /// Idempotent, and safe to call again if a peer re-advertises: the flag
+    /// tracks the latest HELLO2 rather than accumulating.
+    pub fn set_peer_capabilities(&self, capabilities: u32) -> Result<(), CoreError> {
+        self.lock()?.peer_speaks_blob_plane = crate::media::peer_speaks_blob_plane(capabilities);
+        Ok(())
+    }
+
+    /// Whether this session will currently accept blob records.
+    pub fn accepts_blob_records(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.peer_speaks_blob_plane)
+            .unwrap_or(false)
     }
 }
 
@@ -338,9 +377,11 @@ impl LanNoiseSession {
             RECORD_TYPE_BLOB if accept_blob => {}
             // A type this session does not speak is *skipped*, not failed. The
             // record is authenticated, so an unfamiliar type means a peer on a
-            // newer build rather than an attacker, and the two ways to reach
+            // newer build rather than an attacker, and the three ways to reach
             // here are exactly that: a blob record at a build without the blob
-            // plane, and a type some later version allocates. An error here
+            // plane, a blob record from a peer that never advertised
+            // `CAP_MEDIA_BLOB` (`accept_blob` is false, so it opens no lane),
+            // and a type some later version allocates. An error here
             // would read as fatal to every shell's read loop — each one
             // propagates a decrypt failure and drops the socket — turning
             // "reject the record, keep the link" into a message-plane outage
@@ -440,7 +481,22 @@ mod tests {
         (secret.to_bytes(), public.to_bytes())
     }
 
+    /// A handshaken pair that has also exchanged HELLO2 capabilities naming
+    /// the blob plane — the state a link is in before any blob record is
+    /// legitimately on it.
     fn connected_pair() -> (LanNoiseSession, LanNoiseSession) {
+        let (initiator, responder) = handshaken_pair();
+        initiator
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        responder
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        (initiator, responder)
+    }
+
+    /// The handshake alone: no capabilities have been exchanged yet.
+    fn handshaken_pair() -> (LanNoiseSession, LanNoiseSession) {
         let (initiator_sk, initiator_pk) = key(7);
         let (responder_sk, responder_pk) = key(11);
         let initiator = LanNoiseSession::new(true, initiator_sk.to_vec()).unwrap();
@@ -665,6 +721,59 @@ mod tests {
         assert_eq!(
             responder.decrypt_record(records[0].clone()).unwrap(),
             Some(b"and again".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_blob_record_from_a_peer_that_never_advertised_the_bit_is_skipped() {
+        // Authenticating the link is not agreeing to a second plane on it. A
+        // contact whose HELLO2 never carried CAP_MEDIA_BLOB must not be able
+        // to open the blob reassembler — that lane holds its own megabyte of
+        // buffer, and the requester side already refuses to open a pull
+        // session against a peer without the bit, so the accept side has to
+        // agree or the gate is one-sided.
+        let (initiator, responder) = handshaken_pair();
+        assert!(!responder.accepts_blob_records());
+
+        let head = seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, b"still ");
+        let blob = initiator
+            .encrypt_blob_record(b"unadvertised".to_vec())
+            .unwrap();
+        let tail = seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, b"talking");
+
+        assert_eq!(responder.decrypt_record_typed(head).unwrap(), None);
+        assert_eq!(
+            responder.decrypt_record_typed(blob[0].clone()).unwrap(),
+            None,
+            "the blob lane stays shut, and the record is skipped rather than fatal"
+        );
+        assert_eq!(
+            responder.decrypt_record_typed(tail).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_FRAME,
+                frame: b"still talking".to_vec(),
+            }),
+            "and the message plane is undisturbed"
+        );
+
+        // Capabilities a peer does advertise, minus the blob bit, are still no.
+        responder
+            .set_peer_capabilities(!crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        assert!(!responder.accepts_blob_records());
+
+        // And once HELLO2 does carry it, the same session opens the lane.
+        responder
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        assert!(responder.accepts_blob_records());
+        let allowed = initiator.encrypt_blob_record(b"welcome".to_vec()).unwrap();
+        assert_eq!(
+            responder.decrypt_record_typed(allowed[0].clone()).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_BLOB,
+                frame: b"welcome".to_vec(),
+            })
         );
     }
 

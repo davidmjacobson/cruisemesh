@@ -514,7 +514,7 @@ pub const CAP_RELAY_UPDATE: u32 = 1 << 1;
 /// keeps each of a person's devices on its own stream, and maps an absent
 /// field onto `LEGACY_DEVICE_ID`. It does NOT claim per-device relay fan-out
 /// or the ACK-MD rules; those are WP2's, and nothing a peer does with this bit
-/// may assume them. Legacy HELLO (frame 0x03) is untouched and never grows a
+/// may assume them. Legacy HELLO (frame 0x01) is untouched and never grows a
 /// field — the bit rides HELLO2's frame 0x06 only.
 ///
 /// The claim is about the store's stream model, which every path shares. A
@@ -581,7 +581,7 @@ pub const CAP_OWN_ROSTER_NOTICE: u32 = 1 << 4;
 /// advances past it on receipt without needing to be trusted to. There is
 /// nothing to bound and so nothing to ack for.
 ///
-/// Legacy HELLO (frame 0x03) is untouched and never grows a trailing field —
+/// Legacy HELLO (frame 0x01) is untouched and never grows a trailing field —
 /// the bit rides HELLO2's frame 0x06 only.
 ///
 /// # Allocated now, advertised with the drivers

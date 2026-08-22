@@ -70,7 +70,7 @@ of it: the gap is now countable.
 | `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession and expiry tests (#283); index re-asserts that a delivered watermark shrinks both readers of the queue |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 | `DEDUP-01` | A relay mailbox is keyed on `(family_token, msg_id)` by content: it keeps the first stored ciphertext and never overwrites it, an identical re-post is an idempotent dedupe, and a same-id post carrying different immutable content is a distinct reported conflict — never a success that retires the sender's retry state. | core | server enforcement in `relayd/src/lib.rs` (`insert_envelope` and `insert_envelope_with_quota` resolve a same-id re-post by comparing sealed bytes; the differing-content case returns the additive 409 `msg_id_conflict` and leaves the stored row untouched) with `relayd/tests/e2e_mailbox.rs` conflict + dedupe e2e; sender classification in `core/src/relay_status.rs` (`relay_classify_http_error` → `CoreRelayFault::MsgIdConflict`) and `core/src/session/relay_pass.rs` (a conflict is per-envelope, never reaches `apply_success`, so the row stays queued); `core/tests/relay_pass_replay.rs` drives a real pass and proves the outbound row is not marked posted |
-| `BLOB-01` | Plane separation. Blob bytes never enter an envelope, a carry queue, a digest spray plan, or any BLE frame. Only manifests and thumbnails cross the message plane, and no third party ever stores, forwards, or serves another person's blob. | core | `core/tests/mesh_sim.rs` sends media continuously through real identities, real sealing, real `MessageStore` carry queues and the real spray policy, then scans every byte the sim ever framed; `core/src/framing.rs` pins that blob bytes are not representable as BLE fragments at any MTU; `core/src/spray_policy.rs` charges a maximal manifest as an ordinary envelope and fits no blob granularity into an encounter budget; index re-asserts the size gap between a manifest and its blob |
+| `BLOB-01` | Plane separation. Blob bytes never enter an envelope, a carry queue, a digest spray plan, or any BLE frame. Only manifests and thumbnails cross the message plane, and no third party ever stores, forwards, or serves another person's blob. | core | `core/tests/mesh_sim.rs` sends media continuously through real identities, real sealing, real `MessageStore` carry queues and the real spray policy, then scans every byte the sim ever framed; `core/src/framing.rs` pins that blob bytes are not representable as BLE fragments at any MTU; `core/src/spray_policy.rs` charges a maximal manifest as an ordinary envelope and fits no blob granularity into an encounter budget. The second clause is owned separately: a blob row records whether it was authored here or received (`BlobOrigin` in `core/src/media/store.rs`), `servable_plan` in `core/src/media/integration.rs` refuses a received-origin blob and `ServeSession` in `core/src/media/lan_pull.rs` refuses one at `Open`, with `only_a_blob_this_device_authored_is_ever_servable` and `a_received_blob_is_never_served_onward_however_complete_it_is` proving a completed, verified download is never servable; index re-asserts the size gap between a manifest and its blob, and that a completed download is refused exactly as an absent one is |
 | `BLOB-02` | Ciphertext addressing. The wire and any store see encrypted bytes only; a blob id is the digest of the ciphertext; the blob key exists only inside sealed message content. | core | `core/src/media/blob.rs` encrypt-then-name, determinism and wrong-key tests; `core/src/media/manifest.rs` seals a manifest through `seal_message` unchanged; `core/src/media/store.rs` holds no column that could carry key material; index re-asserts that the id names ciphertext and not plaintext |
 | `BLOB-03` | Pull with consent. No blob transfer starts on an expensive or roaming path without an explicit user action, and no third party is ever asked to move blob bytes. | core | `core/src/media/integration.rs` composes the path-cost verdict over `core_relay_network_permitted` rather than duplicating it, with a consent table and a whole-matrix assertion in both directions: nothing on the relay starts unattended or past the roaming deferral, and every path the relay has not closed stays offerable. The pull-only half — a device serves only what it holds, only on request, only to a proven manifest holder — is pinned by `core/src/media/lan_pull.rs`. Index re-asserts the four rows that decide whether anything starts |
 | `BLOB-04` | Bounded everywhere on the device. The partial-transfer byte budget, its eviction rule, and each pull session's request, chunk, byte and deadline budgets are enforced; a transfer terminates or defers inside declared budgets like every other pass, and a spent budget resumes from the bitmap rather than restarting. | core | `core/src/media/store.rs` budget and LRU eviction tests (including the rows eviction may never take) and `core/src/media/lan_pull.rs` budget/deadline tests on both roles; index re-asserts a requester and a responder each stopping inside their declared budgets |
@@ -664,6 +664,30 @@ shows that no blob granularity fits an encounter budget at all; and the BLE
 fragmenter is pinned as unable to represent a blob at any MTU. What the
 drivers owe is to keep that true — the suites are already there to fail when
 one does not.
+
+The second clause — no third party stores, forwards, or *serves* another
+person's blob — needs its own enforcement, because holding a blob and being
+allowed to offer it are different facts and nothing about the bytes tells them
+apart. A recipient who finishes a download holds every chunk the sender holds,
+under the key the manifest gave it. If that alone made the blob servable, the
+first person to open a photo would become a second source for it, every later
+recipient could pull from them, and v1's two sources (the sender's phone, and
+later the relay blob store) would quietly become "whoever has opened it" —
+third-party serving arrived at by accident rather than by decision.
+
+So a tracked blob records where it came from. `BlobOrigin` in
+`core/src/media/store.rs` is written when the row is opened and never changes:
+the receive path opens rows as received, the authoring path opens its own. The
+serve side refuses anything else — `servable_plan` in
+`core/src/media/integration.rs` declines to build a plan for a received blob at
+all, and `ServeSession` refuses one at `Open` with the same `NotHeld` a device
+holding none of the blob gives, so a requester learns nothing about what this
+device has downloaded. `only_a_blob_this_device_authored_is_ever_servable`
+drives it through a real store and
+`a_received_blob_is_never_served_onward_however_complete_it_is` drives both
+roles across the wire, each on a download that is complete and verified — the
+only case where origin is the whole difference. A consented mule-assist mode
+would be a deliberate change here, which is where the study of one belongs.
 
 #### `BLOB-02` — encrypted before it is named
 

@@ -209,7 +209,11 @@ A media send authors one ordinary sealed message of kind
 `KIND_ATTACHMENT_MANIFEST` (16, allocated since the media-readiness work;
 kind 17 `KIND_ATTACHMENT_CHUNK` stays reserved and unused — chunks never
 ride the message plane). The body is the versioned manifest codec in
-`core/src/media/manifest.rs` (`MANIFEST_WIRE_VERSION = 1`):
+`core/src/media/manifest.rs` (`MANIFEST_WIRE_VERSION = 2`, deliberately not
+1: kind 16 carries two body codecs, and spending the next version byte is
+what makes the legacy inline attachment and the manifest disjoint
+structurally rather than statistically — a blob id can be ground until the
+rest of the body reads as an attachment, a version byte cannot):
 
 | Field | Meaning |
 |---|---|
@@ -281,6 +285,32 @@ A bit means "this build does the thing", and a Phase 1 build does not — a
 requester that believed it would spend a session on a peer with nothing to
 answer with.
 
+#### Compatibility with older builds
+
+A manifest delivered to a build that predates this work is **lost, not
+delayed**. The new `KIND_ATTACHMENT_MANIFEST` body fails the shipped inline
+attachment decoder, and the shipped receive path treats that as
+`DroppedMalformed`: terminal, recorded in the dedupe set, and silent on both
+ends — no error to the sender, no placeholder to the recipient, and no second
+chance when the recipient updates, because the message will not be redelivered.
+
+That is accepted rather than fixed. The fix would have to live in decoders
+that are already on people's phones, and there is no way to reach them; a
+"manifest fallback" body those builds could read would have to be an inline
+attachment, which is the whole thing this design exists to stop sending.
+
+The mitigation is therefore entirely send-side, and it belongs to Phase 2 —
+the phase that first authors a manifest. The composer offers media into a
+conversation only once every one of the contact's devices has advertised
+`CAP_MEDIA_BLOB`; otherwise the media option is unavailable and the surface
+says plainly that the other person's app is too old, in the ordinary "ask
+them to update" vocabulary rather than in protocol terms. Copy through
+resources, as always.
+
+Until Phase 2 ships, nothing in the app authors a manifest at all, so no
+manifest can be delivered to anyone and the exposure is zero. The gate has to
+land in the same PR series as the send path, not after it.
+
 ### LAN sub-channel: multiplexing (new in rev 2)
 
 The pull conversation rides the *existing* authenticated LAN link — the
@@ -303,7 +333,16 @@ send queue). A peer that did not advertise `CAP_MEDIA_BLOB` treats record
 type 2 as it treats any unknown type: drop the record, keep the link. That
 is a `None` out of the decoder, not an error — the record is authenticated,
 so an unfamiliar type is a peer on a newer build, and every shell read loop
-treats a decrypt error as fatal and closes the socket. Rejected alternative: a second TCP connection with its own handshake —
+treats a decrypt error as fatal and closes the socket.
+
+The gate runs in both directions, and on both sides of one link. A session
+accepts record type 2 only once the shell has told it the peer's HELLO2
+capabilities include `CAP_MEDIA_BLOB` (`set_peer_capabilities` on
+`LanNoiseSession`; the default is closed). Authenticating the link is not the
+same as agreeing to a second plane on it: the blob lane carries its own
+reassembler with its own frame buffer, and a contact who never claimed the
+blob plane must not be able to open one. A blob record from such a peer is
+skipped exactly like an unknown type — the link survives. Rejected alternative: a second TCP connection with its own handshake —
 more sockets, a second discovery/firewall story, and nothing the record mux
 doesn't already give.
 
@@ -482,6 +521,13 @@ network.
 
 - Send path: photo pick, thumbnail generation, manifest authoring, original
   retained as the servable blob.
+- The send-side capability gate, in this same series: the composer offers
+  media into a conversation only once every one of the contact's devices has
+  advertised `CAP_MEDIA_BLOB`, and says plainly that their app is too old
+  otherwise (copy through resources). A manifest delivered to an older build
+  is lost permanently, not delayed — see "Compatibility with older builds" —
+  so this gate is what keeps the loss mode unreachable, and it cannot land
+  after the send path.
 - The LAN sub-channel drivers on both shells: socket writes for record type
   2, chunk-file writes, `take_accepted` drain, serve-side chunk reads. With
   them, and only with them, `CAP_MEDIA_BLOB` joins
