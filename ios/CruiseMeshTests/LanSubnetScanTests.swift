@@ -70,37 +70,92 @@ final class LanSubnetScanTests: XCTestCase {
 
     func testAutomaticScanLonelinessGateMatchesAndroid() {
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 1, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 1, unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
         ))
     }
 
     func testUnlinkedCapableContactKeepsSweepGateOpenDespiteLiveLinks() {
         // One connected family member must not stop discovery of the rest.
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 1, unlinkedOwnDevices: 0
         ))
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 3, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 2
+            peerLinks: 3, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 2, unlinkedOwnDevices: 0
         ))
         // But in-flight work still defers, links or not.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 1, unlinkedOwnDevices: 0
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 7, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 7, unlinkedCapableContacts: 1, unlinkedOwnDevices: 0
         ))
         // Everyone capable is linked: nothing left to sweep for.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
+        ))
+    }
+
+    func testLinkToOneOfThisPersonsOwnDevicesNeverCountsAsCompany() {
+        // The field case, on the approving phone: its only live LAN link was to
+        // the device it had just removed. That link carries no contact's mail
+        // and, having no route, sat outside the LAN heartbeat -- so a half-open
+        // one used to read as "not lonely" and shut discovery off for the whole
+        // Wi-Fi join. The transport passes peer links only, so the gate here
+        // sees zero.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
+        ))
+        // A negative miscount slows discovery, never disables it.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: -1, pendingOutboundAttempts: -3, scanRemaining: 0,
+            unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
+        ))
+    }
+
+    func testSiblingWithNoLinkKeepsTheSweepGateOpen() {
+        // A device of this person's own shares their user id, so it has no
+        // contact row and can never appear in unlinkedCapableContacts. Without
+        // a motive of its own, mDNS is the only channel between two phones of
+        // one person -- and one stale mDNS record is all the field failure was.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, unlinkedOwnDevices: 1
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, unlinkedOwnDevices: 0
+        ))
+        // In-flight work still defers.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 2, scanRemaining: 0,
+            unlinkedCapableContacts: 0, unlinkedOwnDevices: 1
+        ))
+    }
+
+    /// The field loop: a Bonjour-derived endpoint at an address that never
+    /// answered (a link-local IPv6 one, which no other phone can dial), retried
+    /// every retry period for as long as the phone stayed on the Wi-Fi.
+    func testAddressThatNeverAnsweredStopsBeingRetried() {
+        XCTAssertFalse(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: false, consecutiveFailures: 1
+        ))
+        XCTAssertTrue(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: false, consecutiveFailures: 6
+        ))
+        // An address a handshake proved is never retired by failure count:
+        // ordinary contact LAN delivery has to survive a sleeping peer.
+        XCTAssertFalse(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: true, consecutiveFailures: 60
         ))
     }
 
@@ -133,10 +188,11 @@ final class LanSubnetScanTests: XCTestCase {
         XCTAssertEqual(motivating, 0)
         // A live link plus no motivating contact means no sweep at all.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1,
+            peerLinks: 1,
             pendingOutboundAttempts: 0,
             scanRemaining: 0,
-            unlinkedCapableContacts: motivating
+            unlinkedCapableContacts: motivating,
+            unlinkedOwnDevices: 0
         ))
     }
 

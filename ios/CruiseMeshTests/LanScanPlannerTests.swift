@@ -123,6 +123,35 @@ final class LanScanPlannerTests: XCTestCase {
         XCTAssertNil(planner.takeDueScan(nowMs: 10 * 60 * minute))
     }
 
+    /// The field failure's shape, at the planner: the approving phone had one
+    /// endpoint it kept dialing and never reached, and it ran no sweep for 26
+    /// minutes. Whatever else was wrong, the planner itself must never be the
+    /// thing that wedges -- a peer that never answers, and a sweep that comes
+    /// back empty enough to look like client isolation, must both leave the
+    /// cheap /24 tier on its flat cadence indefinitely.
+    func testAnEndpointThatNeverAnswersCannotStopTheLocalSweepCadence() {
+        let planner = LanScanPlanner()
+        planner.onNetworkJoined(nowMs: 0)
+        XCTAssertEqual(planner.takeDueScan(nowMs: 0), .local24)
+        planner.onScanCompleted(.local24, nowMs: 0, foundPeer: false)
+
+        // Worst case for the expensive tier: every probe timed out, so it is
+        // pushed to its four-hour cap. The /24 tier is deliberately untouched.
+        planner.onIsolationSuspected(nowMs: 0)
+
+        var now: Int64 = 0
+        for _ in 0..<12 {
+            now += 5 * minute
+            XCTAssertEqual(
+                planner.takeDueScan(nowMs: now),
+                .local24,
+                "no sweep was due at \(now / minute) minutes into the network join"
+            )
+            // The sweep finds nobody, over and over, exactly as the field one did.
+            planner.onScanCompleted(.local24, nowMs: now, foundPeer: false)
+        }
+    }
+
     func testPeerEvidenceStopsRewindingTheScheduleOnceItsPerNetworkBudgetIsSpent() {
         let budget = 3
         let planner = LanScanPlanner(

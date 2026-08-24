@@ -81,6 +81,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private var linkSilenced = false
     private var lanTransport: LanTransport?
     private let lanHealth = LanHealthTracker()
+    /// §10 step 5's re-offer bookkeeping; see `OwnRosterNoticeSchedule`.
+    private let ownRosterNoticeSchedule = OwnRosterNoticeSchedule()
     private let store = AppStore.get()
 
     /// The core encounter planner's driver, used only when
@@ -503,6 +505,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 let wasSelected = MeshRouter.isSelectedRoute(address: address)
                 self.recordPeerDisconnected(address: address)
                 self.lanHealth.remove(address: address)
+                self.ownRosterNoticeSchedule.forget(address: address)
                 LanTransportDiagnostics.shared.disconnected(address: address)
                 MeshRouter.onDisconnected(address: address)
                 if wasSelected, let peerUserId {
@@ -602,6 +605,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lanHealthTimer?.cancel()
         lanHealthTimer = nil
         lanHealth.clear()
+        ownRosterNoticeSchedule.clear()
         // A debounced failover resume can still be queued on meshQueue. Its
         // block re-checks `isRunning` (already false above) before doing any
         // work, so it cannot outlive this; clearing the armed windows just
@@ -831,7 +835,14 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             if noteOwnIdentityHello(address: address, userId: userId, identity: identity) {
                 // A device of this person's own, on a link that has proved it:
                 // §10 step 5's meeting. Here rather than in the legacy HELLO
-                // case because the capability bits only ride 0x06.
+                // case because the capability bits only ride 0x06. Remembered
+                // as well as acted on: the meeting is the only moment those
+                // bits cross the wire, and `probeLanLinks` re-offers on this
+                // link long after it.
+                ownRosterNoticeSchedule.noteHello2(
+                    address: address,
+                    capabilities: capabilities
+                )
                 offerOwnRosterNotice(
                     address: address,
                     capabilities: capabilities,
@@ -954,9 +965,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard lanTransport != nil else { return }
         Task.detached(priority: .utility) { [weak self] in
             let capable = MeshController.lanCapableContacts()
+            let siblings = MeshController.ownRosterSiblingCount()
             guard let self else { return }
-            self.meshQueue.async { self.lanTransport?.updateLanCapableContacts(capable) }
+            self.meshQueue.async {
+                self.lanTransport?.updateLanCapableContacts(capable)
+                // The LAN transport's other sweep motive. A sibling shares this
+                // person's user id, so it has no contact row and can never
+                // appear in `capable` however long it waits.
+                let linked = MeshRouter.ownDeviceLinks().count
+                self.lanTransport?.updateUnlinkedOwnDevices(max(0, siblings - linked))
+            }
         }
+    }
+
+    /// How many devices this person's own roster lists besides this one.
+    private static func ownRosterSiblingCount() -> Int {
+        guard let fleet = try? AppStore.get().ownDeviceFleet() else { return 0 }
+        return max(0, fleet.deviceIds.count - (fleet.ownDeviceId == nil ? 0 : 1))
     }
 
     private static func lanCapableContacts() -> [Data: Int64] {
@@ -1008,28 +1033,67 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     }
 
     private func probeLanLinks() {
-        let routes = MeshRouter.identifiedRoutes().filter { $0.transport == .lan }
-        guard !routes.isEmpty else { return }
+        var addresses = MeshRouter.identifiedRoutes()
+            .filter { $0.transport == .lan }
+            .map(\.address)
+        // A link to one of this person's own devices is never a route, so it
+        // was in none of the accessors this loop used to read -- and a link
+        // nothing probes is a link nothing closes. A half-open one held its
+        // connection, carried no frames, and (being live) told the LAN
+        // transport it had company, for the whole Wi-Fi join. That is the
+        // state an approving phone sat in for 26 minutes while the device it
+        // had removed waited to be told.
+        addresses.append(contentsOf: MeshRouter.ownDeviceLinks()
+            .filter { $0.transport == .lan }
+            .map { $0.address })
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        for route in routes {
+        for address in addresses {
             switch lanHealth.next(
-                address: route.address,
+                address: address,
                 nowMs: now,
                 nonce: UInt64.random(in: 1...UInt64.max)
             ) {
             case .send(let nonce):
                 _ = MeshRouter.sendToAddress(
-                    address: route.address,
+                    address: address,
                     frame: encodeTransportProbe(nonce: nonce, response: false)
                 )
             case .wait:
                 break
             case .close:
-                lanTransport?.closeConnection(address: route.address)
+                lanTransport?.closeConnection(address: address)
                 LanTransportDiagnostics.shared.probeFailed(
                     "The encrypted LAN link stopped responding and was reconnected"
                 )
             }
+        }
+        reofferOwnRosterNotices()
+    }
+
+    /// **§10 step 5, level-triggered.** Re-offer this person's roster on every
+    /// live own-device link that is due one.
+    ///
+    /// The notice shipped edge-triggered on an inbound HELLO2 and nothing else,
+    /// so a removal that happened while a sibling link was *already up* was
+    /// never announced on it. Nothing else in either shell pushed one: no
+    /// roster-change hook, no periodic re-offer, and HELLO is sent only when a
+    /// link is established. See `OwnRosterNoticeSchedule` for why this is a
+    /// timer rather than an event.
+    ///
+    /// Mirrors Android's `MeshService.reofferOwnRosterNotices`.
+    private func reofferOwnRosterNotices() {
+        guard let identity else { return }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
+        for link in MeshRouter.ownDeviceLinks() where link.transport == .lan {
+            guard let capabilities = ownRosterNoticeSchedule.dueCapabilities(
+                address: link.address,
+                nowMs: nowMs
+            ) else { continue }
+            offerOwnRosterNotice(
+                address: link.address,
+                capabilities: capabilities,
+                identity: identity
+            )
         }
     }
 
@@ -1144,6 +1208,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         guard let frame = encoded else { return }
         MeshRouter.sendToAddress(address: address, frame: frame)
+        ownRosterNoticeSchedule.noteOffered(
+            address: address,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
         log.info("Sent our device list to another device of ours on \(address, privacy: .public)")
     }
 
