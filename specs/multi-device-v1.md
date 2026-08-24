@@ -349,6 +349,35 @@ On "Remove device" (approving device) or recovery-code override:
    meeting, so the fleet's self-sync channel and retained backlog are
    already shut when the notice arrives.
 
+   **The push is level-triggered, not edge-triggered — the meeting is
+   not the only moment it may happen.** The first build made the offer at
+   the instant a HELLO2 landed on an own-device link and at no other, and
+   a 2026-08-24 two-phone capture showed what that costs: the two phones
+   had already met, the removal happened seconds later on a link that was
+   already up, and there was no second HELLO to carry it. The removed
+   phone held the roster that still listed it through 26 minutes on the
+   same Wi-Fi, a force-stop of both apps, and a reboot. So a live
+   own-device link is re-offered the current roster on a timer
+   (`core_own_roster_notice_reoffer_due`, one minute) for as long as it
+   lasts. That is safe to do bluntly because the frame is idempotent in
+   both directions — the sender rebuilds it from its store, and the
+   receiver refuses anything that does not strictly supersede what it
+   holds — and it is deliberately a timer rather than a roster-changed
+   event, because the mechanism has to work on the phone that is *wrong*
+   and must not depend on any event having been delivered anywhere.
+
+   **And something has to go looking for the link in the first place.**
+   A device of this person's own shares their user id, so it has no
+   contact row: the LAN transport's automatic subnet sweep was motivated
+   only by unlinked *contacts*, and a live own-device link counted toward
+   the "this phone has company" test that suppresses the sweep — while
+   being, uniquely, the one kind of link no heartbeat ever probed, so a
+   half-open one could suppress it for a whole Wi-Fi join. Both are
+   corrected: own-device links are heartbeated like any other LAN link
+   and closed when they stop answering, they no longer count as company,
+   and a roster device this phone has no own-device link to is a sweep
+   motive in its own right (`core_lan_scan_gate_open`).
+
    **Step 2 lands on its own clock, and the notice must not be described
    as though the two were simultaneous.** Both shells drive the relay
    `family_token` rotation now: the removal writes the rotation journal

@@ -422,6 +422,100 @@ pub fn lan_endpoint_host_is_local(host: String) -> bool {
     crate::protocol::is_local_lan_host(&host)
 }
 
+/// Whether a host is worth *publishing as this phone's own address*, which is
+/// stricter than [`lan_endpoint_host_is_local`].
+///
+/// An IPv6 link-local address is a local address, and both shells will happily
+/// pick one up out of the platform's link properties when the Wi-Fi join has
+/// not produced an IPv4 address yet. Advertising it is still wrong: `fe80::/10`
+/// is only reachable with the *dialer's* scope id, and the scope id a phone
+/// reads off its own interface means nothing on the phone that receives it. The
+/// address goes into mDNS and into endpoint hints all the same, where it
+/// becomes a target that can never answer -- observed in the field as a phone
+/// retrying one dead `fe80::…` address for half an hour while the peer it was
+/// looking for sat on the same Wi-Fi.
+///
+/// So: a phone advertises an address a stranger to its interface list can dial,
+/// or it advertises nothing and lets discovery do the work.
+#[uniffi::export]
+pub fn core_lan_host_is_reachable_endpoint(host: String) -> bool {
+    crate::protocol::is_reachable_lan_host(&host)
+}
+
+/// Whether the LAN transport's periodic check may claim a sweep from its scan
+/// planner.
+///
+/// The shells owned a copy of this each and it drifted into the multi-device
+/// bug it now names: a sweep was worthwhile "while the transport has no links
+/// at all", and both shells counted *every* live connection, including a link
+/// to one of this person's own devices. Such a link is not a friend on this
+/// Wi-Fi -- it carries no contact's mail, wins no route, and (having no route)
+/// sat outside the LAN heartbeat entirely -- so one that had quietly died still
+/// read as company and shut discovery off for the whole Wi-Fi join. The phone
+/// that had just removed another device spent 26 minutes in exactly that state.
+///
+/// `peer_links` is therefore links to *contacts* only. The two escapes are the
+/// people this phone still owes a search:
+///
+/// - `unlinked_capable_contacts`: a contact that has recently demonstrated LAN
+///   support and has no authenticated LAN link (see
+///   [`crate::lan_capability_motivates_scan`]'s shell mirrors) -- one connected
+///   family member must not stop discovery of the rest.
+/// - `unlinked_own_devices`: a device this person's own roster lists that is
+///   not on an own-device link right now. It is what makes a phone go looking
+///   for its sibling at all, and mDNS was the only channel that ever did.
+///
+/// In-flight work (pending outbound attempts, a running sweep) always defers.
+/// The counts are unsigned on purpose: a shell that ever computes one of them
+/// negative must clamp it to zero on the way in, which slows discovery down
+/// rather than disabling it.
+#[uniffi::export]
+pub fn core_lan_scan_gate_open(
+    peer_links: u32,
+    unlinked_capable_contacts: u32,
+    unlinked_own_devices: u32,
+    pending_outbound_attempts: u32,
+    scan_remaining: u32,
+) -> bool {
+    (peer_links == 0 || unlinked_capable_contacts > 0 || unlinked_own_devices > 0)
+        && pending_outbound_attempts == 0
+        && scan_remaining == 0
+}
+
+/// How many consecutive failures a LAN reconnect target that has never once
+/// completed a Noise handshake survives before it is dropped.
+///
+/// Matched to `CoreReconnectBackoffTracker`'s own failure budget: by the time
+/// the backoff has given up on an address, the address has had every chance
+/// this phone can give it.
+pub const LAN_RECONNECT_UNPROVEN_FAILURE_CEILING: u32 = 6;
+
+/// Whether a LAN reconnect target should be forgotten rather than retried
+/// again.
+///
+/// A target created from this phone's own discovery (an mDNS resolution, a
+/// subnet-sweep hit) is kept across failures on purpose: the address is one
+/// this phone observed, and a peer that went to sleep comes back at it. What
+/// shipped had no ceiling on that at all, and the backoff underneath it decays
+/// to a permanent slow probe rather than a refusal, so a single stale mDNS
+/// record became a dial at a dead address every sixty seconds for as long as
+/// the phone stayed on the Wi-Fi -- the exact loop the field capture shows the
+/// approving phone stuck in, in place of the search that would have found the
+/// device it had removed.
+///
+/// An address that has *proved* itself (`ever_authenticated`) keeps its target
+/// regardless: that is an ordinary contact link waiting out a sleeping peer,
+/// and nothing here may make one harder to re-establish. Only the unproven kind
+/// is retired, and retiring it loses nothing -- a fresh discovery or a sweep
+/// re-creates the target the moment there is anything real to reach.
+#[uniffi::export]
+pub fn core_lan_reconnect_target_is_exhausted(
+    ever_authenticated: bool,
+    consecutive_failures: u32,
+) -> bool {
+    !ever_authenticated && consecutive_failures >= LAN_RECONNECT_UNPROVEN_FAILURE_CEILING
+}
+
 #[uniffi::export]
 pub fn should_resend_lan_endpoint(
     previous_signature: Option<String>,
@@ -938,6 +1032,70 @@ mod tests {
             lan_endpoint_cache_decode(promoted).map(|it| it.provenance),
             Some(LanEndpointProvenance::Authenticated)
         );
+    }
+
+    #[test]
+    fn a_link_to_one_of_this_persons_own_devices_never_shuts_the_sweep_off() {
+        // The field case: an approver whose only live LAN link was to the phone
+        // it had just removed. That link is not a friend on this Wi-Fi, so it
+        // is not counted as one, and the sweep that would have re-found the
+        // removed phone stays available.
+        assert!(core_lan_scan_gate_open(0, 0, 0, 0, 0));
+        // ... whereas a real contact link with nobody else owed a search does
+        // stop it, exactly as before.
+        assert!(!core_lan_scan_gate_open(1, 0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_sibling_this_phone_is_not_linked_to_motivates_a_sweep() {
+        assert!(core_lan_scan_gate_open(3, 0, 1, 0, 0));
+        assert!(!core_lan_scan_gate_open(3, 0, 0, 0, 0));
+        // Contacts still motivate one on their own.
+        assert!(core_lan_scan_gate_open(3, 2, 0, 0, 0));
+    }
+
+    #[test]
+    fn in_flight_work_always_defers_the_sweep() {
+        assert!(!core_lan_scan_gate_open(0, 5, 5, 1, 0));
+        assert!(!core_lan_scan_gate_open(0, 5, 5, 0, 12));
+    }
+
+    #[test]
+    fn only_an_address_another_phone_can_dial_is_advertisable() {
+        assert!(core_lan_host_is_reachable_endpoint("192.168.86.20".into()));
+        assert!(core_lan_host_is_reachable_endpoint("fd00::1".into()));
+        // The field's dead target: link-local, with and without the scope id
+        // that makes it dialable only on the phone that read it.
+        assert!(!core_lan_host_is_reachable_endpoint("fe80::c88e:1".into()));
+        assert!(!core_lan_host_is_reachable_endpoint(
+            "fe80::c88e:1%wlan0".into()
+        ));
+        // Still a *local* host, so an arriving hint carrying one is not refused
+        // outright -- the two rules are deliberately different.
+        assert!(lan_endpoint_host_is_local("fe80::c88e:1%wlan0".into()));
+        assert!(!core_lan_host_is_reachable_endpoint("93.184.216.34".into()));
+        assert!(!core_lan_host_is_reachable_endpoint("peer.local".into()));
+    }
+
+    #[test]
+    fn an_address_that_never_answered_stops_being_retried() {
+        // The field's loop: an mDNS-derived target at a dead link-local
+        // address, retried forever because nothing ever retired it.
+        assert!(!core_lan_reconnect_target_is_exhausted(false, 0));
+        assert!(!core_lan_reconnect_target_is_exhausted(
+            false,
+            LAN_RECONNECT_UNPROVEN_FAILURE_CEILING - 1
+        ));
+        assert!(core_lan_reconnect_target_is_exhausted(
+            false,
+            LAN_RECONNECT_UNPROVEN_FAILURE_CEILING
+        ));
+        // An address a contact link once authenticated at is never retired by
+        // failure count -- ordinary LAN delivery must survive a sleeping peer.
+        assert!(!core_lan_reconnect_target_is_exhausted(
+            true,
+            LAN_RECONNECT_UNPROVEN_FAILURE_CEILING * 10
+        ));
     }
 
     #[test]
