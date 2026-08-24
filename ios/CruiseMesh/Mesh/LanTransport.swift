@@ -62,17 +62,20 @@ final class LanTransport {
     /// evidence is recent (`lanCapabilityMotivatesScan`), so a contact who is
     /// ashore does not keep this phone sweeping the subnet forever.
     private var lanCapableContacts: [Data: Int64] = [:]
-    /// How many devices this person's own roster lists that are not on an
-    /// own-device link right now, pushed in by MeshController
-    /// (`updateUnlinkedOwnDevices`).
+    /// Whether this phone is inside the bounded window during which it looks
+    /// for one of this person's own devices, pushed in by MeshController
+    /// (`updateOwnDeviceSearchLive`); see `OwnDeviceSearchWindow`.
     ///
     /// A sibling shares this person's user id, so it has no contact row and can
     /// never appear in `lanCapableContacts` however long it waits. Without a
     /// motive of its own a phone whose only missing peer is its other phone
     /// never sweeps for it, leaving mDNS as the single channel between two
     /// devices of one person -- which is the state the field capture caught
-    /// failing, on the phone that had just removed the other.
-    private var unlinkedOwnDevices = 0
+    /// failing, on the phone that had just removed the other. Bounded, because
+    /// a second phone that is switched off or left at home is missing forever:
+    /// an unbounded motive would sweep the subnet every five minutes on every
+    /// Wi-Fi this person joins, on battery, for the life of every join.
+    private var ownDeviceSearchLive = false
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
@@ -89,6 +92,10 @@ final class LanTransport {
     private var runningScan: RunningScan?
     private var scanConnections: [UUID: NWConnection] = [:]
     private var automaticScanWorkItem: DispatchWorkItem?
+    /// Set when the listener had to settle for a port other than
+    /// `lanDefaultTcpPort()`; see `scheduleDefaultPortRebind`.
+    private var listeningOnFallbackPort = false
+    private var defaultPortRebindWorkItem: DispatchWorkItem?
     /// Consecutive completed sweeps whose verdict was `.isolationSuspected`.
     /// A single congested sweep can look isolated (every probe timing out),
     /// so the planner is only told to back off to its cap once the verdict
@@ -133,10 +140,10 @@ final class LanTransport {
         }
     }
 
-    /// The sweep's other motive; see `unlinkedOwnDevices`.
-    func updateUnlinkedOwnDevices(_ count: Int) {
+    /// The sweep's other motive; see `ownDeviceSearchLive`.
+    func updateOwnDeviceSearchLive(_ live: Bool) {
         queue.async { [weak self] in
-            self?.unlinkedOwnDevices = max(0, count)
+            self?.ownDeviceSearchLive = live
         }
     }
 
@@ -168,6 +175,9 @@ final class LanTransport {
             wifiPathMonitor = nil
             automaticScanWorkItem?.cancel()
             automaticScanWorkItem = nil
+            defaultPortRebindWorkItem?.cancel()
+            defaultPortRebindWorkItem = nil
+            listeningOnFallbackPort = false
             cancelRunningScan(updateDiagnostics: false)
             scanPlanner.onNetworkLost()
             consecutiveIsolationVerdicts = 0
@@ -267,6 +277,67 @@ final class LanTransport {
         queue.sync { connections[address]?.remoteStaticKey }
     }
 
+    /// **The listener is on a fallback port, so no other phone's sweep can see
+    /// it.** A subnet sweep probes `lanDefaultTcpPort()` and nothing else, so a
+    /// phone that lost the default port is findable only through Bonjour --
+    /// exactly the single-channel fragility the field capture turned into
+    /// twenty-six minutes of silence. The port is normally held by this app's
+    /// own previous process (force-stop then relaunch is the field sequence),
+    /// so it frees itself within seconds. Mirrors Android's
+    /// `scheduleDefaultPortRebind`.
+    private func scheduleDefaultPortRebind() {
+        guard started, listeningOnFallbackPort, defaultPortRebindWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.defaultPortRebindWorkItem = nil
+            self.probeDefaultPort()
+        }
+        defaultPortRebindWorkItem = work
+        queue.asyncAfter(deadline: .now() + Self.defaultPortRebindInterval, execute: work)
+    }
+
+    /// Try to take the default port with a second listener while the fallback
+    /// one keeps serving, and adopt it only once it is actually ready.
+    ///
+    /// Deliberately not "cancel the working listener and re-open": on a port
+    /// some *other* app holds permanently that would drop this phone's
+    /// advertisement every retry period, forever, to no purpose.
+    private func probeDefaultPort() {
+        guard started, listeningOnFallbackPort, let current = listener,
+              let port = NWEndpoint.Port(rawValue: lanDefaultTcpPort()),
+              let probe = try? NWListener(using: lanParameters(), on: port)
+        else {
+            scheduleDefaultPortRebind()
+            return
+        }
+        // A probe must not serve: anything that arrives before the swap belongs
+        // to no session and is refused.
+        probe.newConnectionHandler = { connection in connection.cancel() }
+        probe.stateUpdateHandler = { [weak self, weak probe] state in
+            self?.queue.async {
+                guard let self, let probe else { return }
+                switch state {
+                case .ready:
+                    probe.cancel()
+                    guard self.started, self.listener === current else { return }
+                    self.log.info("The usual local Wi-Fi port is free again; moving the listener back")
+                    current.cancel()
+                    self.listener = nil
+                    self.startListener(preferDefaultPort: true)
+                case .failed, .waiting:
+                    // Still occupied (address-in-use surfaces as either).
+                    probe.cancel()
+                    self.scheduleDefaultPortRebind()
+                default:
+                    // Including `.cancelled`, which is how the successful path
+                    // above ends: nothing left to retry.
+                    break
+                }
+            }
+        }
+        probe.start(queue: queue)
+    }
+
     private func startListener(preferDefaultPort: Bool) {
         guard started else { return }
         do {
@@ -324,6 +395,8 @@ final class LanTransport {
             listenerWaitingSinceMs = nil
             clearPermissionWarningIfNeeded()
             if let port = failedListener.port {
+                listeningOnFallbackPort = port.rawValue != lanDefaultTcpPort()
+                if listeningOnFallbackPort { scheduleDefaultPortRebind() }
                 log.info("Listening for CruiseMesh LAN peers on TCP \(port.rawValue)")
                 if let network = localWifiIPv4Network() {
                     networkBecameAvailable(network)
@@ -1133,7 +1206,7 @@ final class LanTransport {
             pendingOutboundAttempts: pendingOutbound,
             scanRemaining: runningScan?.remaining ?? 0,
             unlinkedCapableContacts: motivating,
-            unlinkedOwnDevices: unlinkedOwnDevices
+            ownDeviceSearchLive: ownDeviceSearchLive
         ), let breadth = scanPlanner.takeDueScan(nowMs: nowMs) {
             log.info("Starting automatic local Wi-Fi fallback search (\(String(describing: breadth)))")
             _ = startSubnetScan(breadth, network: network, automatic: true)
@@ -1249,6 +1322,11 @@ final class LanTransport {
     // recheck will usually find nothing due yet.
     private static let escalateAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
     private static let automaticScanRetryInterval: DispatchTimeInterval = .seconds(5 * 60)
+
+    /// How often a listener stuck on a fallback port checks whether the default
+    /// one has come free; see `scheduleDefaultPortRebind`. Matches Android's
+    /// `DEFAULT_PORT_REBIND_RETRY_MS`.
+    private static let defaultPortRebindInterval: DispatchTimeInterval = .seconds(60)
     /// How long the tie-break loser waits for the elected side's connection
     /// before initiating anyway -- covers the winner's worst case (connect
     /// plus handshake timeouts) with margin.
@@ -1727,12 +1805,12 @@ func shouldRunAutomaticLanScan(
     pendingOutboundAttempts: Int,
     scanRemaining: Int,
     unlinkedCapableContacts: Int,
-    unlinkedOwnDevices: Int
+    ownDeviceSearchLive: Bool
 ) -> Bool {
     coreLanScanGateOpen(
         peerLinks: UInt32(max(0, peerLinks)),
         unlinkedCapableContacts: UInt32(max(0, unlinkedCapableContacts)),
-        unlinkedOwnDevices: UInt32(max(0, unlinkedOwnDevices)),
+        ownDeviceSearchLive: ownDeviceSearchLive,
         pendingOutboundAttempts: UInt32(max(0, pendingOutboundAttempts)),
         scanRemaining: UInt32(max(0, scanRemaining))
     )

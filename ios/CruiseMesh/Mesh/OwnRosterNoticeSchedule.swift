@@ -38,26 +38,62 @@ final class OwnRosterNoticeSchedule {
 
     private var links: [String: LinkState] = [:]
 
+    /// HELLO2 nudges already spent per own-device link. A link with no entry in
+    /// `links` has never heard the peer's HELLO2, so it can never become
+    /// eligible for a notice; see `claimHello2Nudge`.
+    private var hello2Nudges: [String: Int] = [:]
+
+    /// How many HELLO2 nudges one own-device link is worth.
+    static let nudgeLimit = 6
+
     /// A HELLO2 landed on an own-device link, carrying what that phone can read.
     func noteHello2(address: String, capabilities: UInt32) {
         let lastOfferedAtMs = links[address]?.lastOfferedAtMs
         links[address] = LinkState(capabilities: capabilities, lastOfferedAtMs: lastOfferedAtMs)
+        hello2Nudges.removeValue(forKey: address)
     }
 
-    /// A notice was written to `address`.
+    /// A notice actually reached the wire on `address`.
+    ///
+    /// Called only for a write the router accepted. A send that failed has told
+    /// this link nothing, and booking it as delivered sits the link out another
+    /// whole interval — on a half-open own-device link, exactly the state the
+    /// heartbeat exists to catch.
     func noteOffered(address: String, nowMs: Int64) {
         guard var state = links[address] else { return }
         state.lastOfferedAtMs = nowMs
         links[address] = state
     }
 
+    /// Whether this tick may re-send our HELLO2 to `address`, spending one of a
+    /// small budget.
+    ///
+    /// The re-offer is level-triggered, but its precondition — what the peer
+    /// says it can read — still crosses the wire exactly once per link, on a
+    /// single frame at establishment. A HELLO2 lost to a reordering leaves the
+    /// link permanently ineligible for a notice: the same "one delivered event"
+    /// failure the level-trigger was added to remove. So the tick nudges.
+    ///
+    /// False once the peer's HELLO2 has arrived (nothing left to shake loose) or
+    /// once the budget is spent (a peer that will not answer must not be sent a
+    /// frame every tick for the life of the link).
+    func claimHello2Nudge(address: String) -> Bool {
+        guard links[address] == nil else { return false }
+        let spent = hello2Nudges[address] ?? 0
+        guard spent < Self.nudgeLimit else { return false }
+        hello2Nudges[address] = spent + 1
+        return true
+    }
+
     /// The link closed; nothing is owed to it.
     func forget(address: String) {
         links.removeValue(forKey: address)
+        hello2Nudges.removeValue(forKey: address)
     }
 
     func clear() {
         links.removeAll()
+        hello2Nudges.removeAll()
     }
 
     /// The capability bits to re-offer with, or nil when this link is not due

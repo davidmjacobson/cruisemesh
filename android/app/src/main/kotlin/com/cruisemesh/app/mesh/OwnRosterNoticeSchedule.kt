@@ -42,29 +42,70 @@ internal class OwnRosterNoticeSchedule {
 
     private val links = mutableMapOf<String, LinkState>()
 
+    /**
+     * HELLO2 nudges already spent per own-device link. A link with no entry in
+     * [links] has never heard the peer's HELLO2, so it can never become
+     * eligible for a notice; see [claimHello2Nudge].
+     */
+    private val hello2Nudges = mutableMapOf<String, Int>()
+
     /** A HELLO2 landed on an own-device link, carrying what that phone can read. */
     @Synchronized
     fun noteHello2(address: String, capabilities: UInt) {
         val existing = links[address]
         links[address] = LinkState(capabilities, existing?.lastOfferedAtMs)
+        hello2Nudges.remove(address)
     }
 
-    /** A notice was written to [address]. */
+    /**
+     * A notice actually reached the wire on [address].
+     *
+     * Called only for a write the router accepted. A send that failed has told
+     * this link nothing, and booking it as delivered sits the link out another
+     * whole interval — on a half-open own-device link, exactly the state the
+     * heartbeat exists to catch.
+     */
     @Synchronized
     fun noteOffered(address: String, nowMs: Long) {
         val existing = links[address] ?: return
         links[address] = existing.copy(lastOfferedAtMs = nowMs)
     }
 
+    /**
+     * Whether this tick may re-send our HELLO2 to [address], spending one of a
+     * small budget.
+     *
+     * The re-offer is level-triggered, but its precondition — what the peer
+     * says it can read — still crosses the wire exactly once per link, on a
+     * single frame at establishment. A HELLO2 lost to a reordering, or one that
+     * arrived before this process had loaded its identity, leaves the link
+     * permanently ineligible for a notice: the same "one delivered event"
+     * failure the level-trigger was added to remove. So the tick nudges.
+     *
+     * False once the peer's HELLO2 has arrived (nothing left to shake loose) or
+     * once the budget is spent (a peer that will not answer must not be sent a
+     * frame every tick for the life of the link).
+     */
+    @Synchronized
+    fun claimHello2Nudge(address: String): Boolean {
+        if (links.containsKey(address)) return false
+        val spent = hello2Nudges[address] ?: 0
+        if (spent >= NUDGE_LIMIT) return false
+        hello2Nudges[address] = spent + 1
+        return true
+    }
+
     /** The link closed; nothing is owed to it. */
     @Synchronized
     fun forget(address: String) {
         links.remove(address)
+        hello2Nudges.remove(address)
     }
 
     @Synchronized
     fun clear() {
         links.clear()
+        hello2Nudges.clear()
     }
 
     /**
@@ -77,5 +118,10 @@ internal class OwnRosterNoticeSchedule {
         if (!OwnRosterNoticePolicy.peerReadsNotices(state.capabilities)) return null
         if (!coreOwnRosterNoticeReofferDue(state.lastOfferedAtMs, nowMs)) return null
         return state.capabilities
+    }
+
+    companion object {
+        /** How many HELLO2 nudges one own-device link is worth. */
+        const val NUDGE_LIMIT = 6
     }
 }

@@ -461,9 +461,19 @@ pub fn core_lan_host_is_reachable_endpoint(host: String) -> bool {
 ///   support and has no authenticated LAN link (see
 ///   [`crate::lan_capability_motivates_scan`]'s shell mirrors) -- one connected
 ///   family member must not stop discovery of the rest.
-/// - `unlinked_own_devices`: a device this person's own roster lists that is
-///   not on an own-device link right now. It is what makes a phone go looking
-///   for its sibling at all, and mDNS was the only channel that ever did.
+/// - `own_device_search_live`: this phone is inside a bounded window during
+///   which it is looking for one of this person's own devices
+///   ([`core_lan_own_device_search_since`]). It is what makes a phone go
+///   looking for its sibling at all, and mDNS was the only channel that ever
+///   did.
+///
+/// Note that the second escape is a *bounded* one and the first is a *decayed*
+/// one, and that neither is a bare count of who is missing. Both motives are
+/// satisfied by an absence, and an absence never ends by itself: a contact who
+/// went ashore, or a tablet left at home, would otherwise keep this phone
+/// sweeping the /24 every five minutes on every Wi-Fi it ever joins. The
+/// contact side decays (its shell mirrors only count a contact whose LAN
+/// evidence is recent); the own-device side is time-boxed per reason to search.
 ///
 /// In-flight work (pending outbound attempts, a running sweep) always defers.
 /// The counts are unsigned on purpose: a shell that ever computes one of them
@@ -473,13 +483,78 @@ pub fn core_lan_host_is_reachable_endpoint(host: String) -> bool {
 pub fn core_lan_scan_gate_open(
     peer_links: u32,
     unlinked_capable_contacts: u32,
-    unlinked_own_devices: u32,
+    own_device_search_live: bool,
     pending_outbound_attempts: u32,
     scan_remaining: u32,
 ) -> bool {
-    (peer_links == 0 || unlinked_capable_contacts > 0 || unlinked_own_devices > 0)
+    (peer_links == 0 || unlinked_capable_contacts > 0 || own_device_search_live)
         && pending_outbound_attempts == 0
         && scan_remaining == 0
+}
+
+/// How long a phone goes on sweeping the subnet for one of this person's own
+/// devices once it has a reason to.
+///
+/// Long enough for several cheap `/24` sweeps and the expensive tier they arm
+/// (the planner's local cadence is five minutes), short enough that it is a
+/// search rather than a standing condition.
+pub const LAN_OWN_DEVICE_SEARCH_WINDOW_MS: i64 = 15 * 60_000;
+
+/// [`LAN_OWN_DEVICE_SEARCH_WINDOW_MS`], for the shells.
+#[uniffi::export]
+pub fn core_lan_own_device_search_window_ms() -> i64 {
+    LAN_OWN_DEVICE_SEARCH_WINDOW_MS
+}
+
+/// When this phone's search for one of its own devices started, or `None` when
+/// it is not searching. Feeds [`core_lan_scan_gate_open`]'s
+/// `own_device_search_live`.
+///
+/// **Why this is a window and not "is a sibling missing".** The obvious rule --
+/// sweep while the roster lists a device this phone has no link to -- never
+/// stops being true. A second device that is switched off, left at home, or
+/// simply out of the house is missing forever, so the gate would stand open
+/// forever and the planner would hand out a `/24` sweep on its flat five-minute
+/// cadence for the whole life of every Wi-Fi join, on battery, for exactly the
+/// multi-device households this mechanism was added for. It is also not even
+/// satisfiable for a person with three devices, because the transport keeps at
+/// most one own-device link at a time. So the motive is bounded, in the same
+/// spirit as the contact side's recency decay: a *reason* to search opens a
+/// window, and the window closes.
+///
+/// The reasons, all of which mean "something about this person's fleet just
+/// changed, and a link may be findable that was not before":
+///
+/// - `unlinked_own_devices` rose above `previous_unlinked_own_devices` -- a
+///   sibling appeared on the roster, or an own-device link dropped. (The shells
+///   also reset both across a network change, so joining a Wi-Fi re-arms.)
+/// - `roster_changed` -- this person's device roster is not the one last
+///   observed. This is the arm that matters on the phone that performed a
+///   *removal*: the removed device leaves its roster immediately, so its
+///   shortfall is zero and it would otherwise have no motive at all to go
+///   looking for the phone it must still hand §10 step 5's notice to.
+///
+/// A backwards clock jump re-arms rather than expiring: the failure worth
+/// avoiding is a phone that stops looking.
+#[uniffi::export]
+pub fn core_lan_own_device_search_since(
+    previous_since_ms: Option<i64>,
+    roster_changed: bool,
+    unlinked_own_devices: u32,
+    previous_unlinked_own_devices: u32,
+    now_ms: i64,
+) -> Option<i64> {
+    if roster_changed || unlinked_own_devices > previous_unlinked_own_devices {
+        return Some(now_ms);
+    }
+    let since = previous_since_ms?;
+    if now_ms < since {
+        return Some(now_ms);
+    }
+    if now_ms.saturating_sub(since) >= LAN_OWN_DEVICE_SEARCH_WINDOW_MS {
+        return None;
+    }
+    Some(since)
 }
 
 /// How many consecutive failures a LAN reconnect target that has never once
@@ -508,6 +583,14 @@ pub const LAN_RECONNECT_UNPROVEN_FAILURE_CEILING: u32 = 6;
 /// and nothing here may make one harder to re-establish. Only the unproven kind
 /// is retired, and retiring it loses nothing -- a fresh discovery or a sweep
 /// re-creates the target the moment there is anything real to reach.
+///
+/// A link to one of this person's *own* devices proves its address the same
+/// way, which is deliberate and worth naming: a removed device still presents
+/// the agreement key that admits it (§10.1 rotates the inbox key, not the LAN
+/// Noise static), so once it has handshaked, the honest phone keeps dialing it
+/// for the rest of the network join. That is the point -- §10 step 5's notice
+/// is what the fleet is trying to hand it -- but the same standing dial is a
+/// presence signal that outlives the revocation, and it is accepted knowingly.
 #[uniffi::export]
 pub fn core_lan_reconnect_target_is_exhausted(
     ever_authenticated: bool,
@@ -1040,24 +1123,105 @@ mod tests {
         // it had just removed. That link is not a friend on this Wi-Fi, so it
         // is not counted as one, and the sweep that would have re-found the
         // removed phone stays available.
-        assert!(core_lan_scan_gate_open(0, 0, 0, 0, 0));
+        assert!(core_lan_scan_gate_open(0, 0, false, 0, 0));
         // ... whereas a real contact link with nobody else owed a search does
         // stop it, exactly as before.
-        assert!(!core_lan_scan_gate_open(1, 0, 0, 0, 0));
+        assert!(!core_lan_scan_gate_open(1, 0, false, 0, 0));
     }
 
     #[test]
     fn a_sibling_this_phone_is_not_linked_to_motivates_a_sweep() {
-        assert!(core_lan_scan_gate_open(3, 0, 1, 0, 0));
-        assert!(!core_lan_scan_gate_open(3, 0, 0, 0, 0));
+        assert!(core_lan_scan_gate_open(3, 0, true, 0, 0));
+        assert!(!core_lan_scan_gate_open(3, 0, false, 0, 0));
         // Contacts still motivate one on their own.
-        assert!(core_lan_scan_gate_open(3, 2, 0, 0, 0));
+        assert!(core_lan_scan_gate_open(3, 2, false, 0, 0));
     }
 
     #[test]
     fn in_flight_work_always_defers_the_sweep() {
-        assert!(!core_lan_scan_gate_open(0, 5, 5, 1, 0));
-        assert!(!core_lan_scan_gate_open(0, 5, 5, 0, 12));
+        assert!(!core_lan_scan_gate_open(0, 5, true, 1, 0));
+        assert!(!core_lan_scan_gate_open(0, 5, true, 0, 12));
+    }
+
+    /// The motive that goes looking for a sibling has to stop, exactly as the
+    /// contact-side motive decays. A second phone that is switched off or left
+    /// at home is missing forever; unbounded, it would sweep the /24 every five
+    /// minutes on every Wi-Fi this person ever joins, on battery, for the whole
+    /// life of each join.
+    #[test]
+    fn the_search_for_a_sibling_runs_out() {
+        let window = LAN_OWN_DEVICE_SEARCH_WINDOW_MS;
+        // A sibling that was not missing a moment ago now is: start searching.
+        let armed = core_lan_own_device_search_since(None, false, 1, 0, 1_000);
+        assert_eq!(armed, Some(1_000));
+        // It stays armed for the window, unchanged, however long the sibling
+        // stays missing...
+        assert_eq!(
+            core_lan_own_device_search_since(armed, false, 1, 1, 1_000 + window - 1),
+            Some(1_000)
+        );
+        // ... and then stops. This is the finding: nothing else ever stopped it.
+        assert_eq!(
+            core_lan_own_device_search_since(armed, false, 1, 1, 1_000 + window),
+            None
+        );
+        // And having stopped, a still-missing sibling does not restart it.
+        assert_eq!(
+            core_lan_own_device_search_since(None, false, 1, 1, 1_000 + window * 4),
+            None
+        );
+        // A gate fed the expired window is a gate that lets one contact link
+        // shut the sweep off again, which is the whole point of stopping.
+        assert!(!core_lan_scan_gate_open(1, 0, false, 0, 0));
+    }
+
+    /// A person with three devices can never have every sibling linked -- the
+    /// transport keeps one own-device link at a time -- so a bare "is a sibling
+    /// missing" motive is not merely long-lived there, it is permanent.
+    #[test]
+    fn a_three_device_person_does_not_sweep_forever() {
+        let window = LAN_OWN_DEVICE_SEARCH_WINDOW_MS;
+        let armed = core_lan_own_device_search_since(None, false, 2, 0, 0);
+        assert_eq!(armed, Some(0));
+        // One of the two is linked; the other never can be. Still bounded.
+        assert_eq!(
+            core_lan_own_device_search_since(armed, false, 1, 2, window - 1),
+            Some(0)
+        );
+        assert_eq!(
+            core_lan_own_device_search_since(armed, false, 1, 1, window),
+            None
+        );
+    }
+
+    /// The phone that performed a removal drops the removed device from its own
+    /// roster at once, so its shortfall is zero -- it would have no motive to go
+    /// looking for the device it must still hand the notice to. The roster
+    /// change itself is the motive.
+    #[test]
+    fn a_removal_sends_the_approving_phone_looking() {
+        let armed = core_lan_own_device_search_since(None, true, 0, 0, 5_000);
+        assert_eq!(armed, Some(5_000));
+        assert!(core_lan_scan_gate_open(1, 0, armed.is_some(), 0, 0));
+        // Bounded like every other reason to search.
+        assert_eq!(
+            core_lan_own_device_search_since(
+                armed,
+                false,
+                0,
+                0,
+                5_000 + LAN_OWN_DEVICE_SEARCH_WINDOW_MS
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_backwards_clock_restarts_the_search_rather_than_ending_it() {
+        assert_eq!(
+            core_lan_own_device_search_since(Some(10_000), false, 1, 1, 4),
+            Some(4)
+        );
     }
 
     #[test]

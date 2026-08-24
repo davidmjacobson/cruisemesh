@@ -364,7 +364,23 @@ On "Remove device" (approving device) or recovery-code override:
    receiver refuses anything that does not strictly supersede what it
    holds — and it is deliberately a timer rather than a roster-changed
    event, because the mechanism has to work on the phone that is *wrong*
-   and must not depend on any event having been delivered anywhere.
+   and must not depend on any event having been delivered anywhere. The
+   one event it did still depend on — the peer's HELLO2, which carries
+   the capability bit and crosses the wire once per link — is nudged: an
+   own-device link that has not produced one gets our HELLO2 re-sent a
+   bounded number of times.
+
+   *This widens the §10.1/§10.2 window, and the trade is owned here
+   rather than left in a code comment.* The notice tells the holder of a
+   removed phone that they are out, while §10.2's relay-`family_token`
+   rotation lands only on the first pass that reaches the relay — and
+   LAN-with-no-internet is precisely where that gap is widest.
+   Edge-triggered, reaching it took a fresh HELLO2 and was the exception;
+   level-triggered it is the ordinary case, within about a minute, for as
+   long as the link lasts. Accepted deliberately: an honest removed
+   device has to converge offline, and this is the only thing that makes
+   the phone that is wrong right. The window closes by the rotation
+   landing sooner, never by withholding the notice.
 
    **And something has to go looking for the link in the first place.**
    A device of this person's own shares their user id, so it has no
@@ -375,8 +391,34 @@ On "Remove device" (approving device) or recovery-code override:
    half-open one could suppress it for a whole Wi-Fi join. Both are
    corrected: own-device links are heartbeated like any other LAN link
    and closed when they stop answering, they no longer count as company,
-   and a roster device this phone has no own-device link to is a sweep
-   motive in its own right (`core_lan_scan_gate_open`).
+   and this phone searches for its own devices as a motive in its own
+   right (`core_lan_scan_gate_open`).
+
+   That search is **bounded**, in the same spirit as the contact-side
+   motive's recency decay (`lan_capability_motivates_scan`). "A roster
+   device I have no link to" never stops being true — a second phone
+   switched off, or left at home, is missing forever, and a person with
+   three devices can never have them all linked, since the transport
+   keeps one own-device link at a time. Left unbounded it would sweep the
+   `/24` every five minutes on every Wi-Fi the person ever joins, on
+   battery, for the life of each join. So a *reason* opens a window
+   (`core_lan_own_device_search_since`, fifteen minutes) and the window
+   closes. The reasons are: joining a Wi-Fi network, a roster device
+   becoming unlinked, and **this person's roster changing at all** — that
+   last one is what sends the *approving* phone looking, since a removal
+   drops the removed device from its roster immediately and would
+   otherwise leave the phone holding the signed document with no motive
+   to go and find its recipient.
+
+   **On iOS both halves run only while the app is on screen.** Android
+   drives them from its foreground service; iOS drives them from the LAN
+   health loop, which stops when backgrounded — as does the LAN
+   transport's discovery. So "the removed device learns within minutes,
+   surviving restart and reboot" is unqualified on Android and means
+   "within minutes of either phone being opened" on iOS. That is a
+   platform limit rather than a design choice, and it is why the notice
+   is idempotent and re-offered rather than sent once: whenever the app
+   does come forward, the next tick carries it.
 
    **Step 2 lands on its own clock, and the notice must not be described
    as though the two were simultaneous.** Both shells drive the relay

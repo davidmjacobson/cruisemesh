@@ -51688,6 +51688,58 @@ public func coreLanNetworkIdForIpv4(address: String) -> String? {
 })
 }
 /**
+ * When this phone's search for one of its own devices started, or `None` when
+ * it is not searching. Feeds [`core_lan_scan_gate_open`]'s
+ * `own_device_search_live`.
+ *
+ * **Why this is a window and not "is a sibling missing".** The obvious rule --
+ * sweep while the roster lists a device this phone has no link to -- never
+ * stops being true. A second device that is switched off, left at home, or
+ * simply out of the house is missing forever, so the gate would stand open
+ * forever and the planner would hand out a `/24` sweep on its flat five-minute
+ * cadence for the whole life of every Wi-Fi join, on battery, for exactly the
+ * multi-device households this mechanism was added for. It is also not even
+ * satisfiable for a person with three devices, because the transport keeps at
+ * most one own-device link at a time. So the motive is bounded, in the same
+ * spirit as the contact side's recency decay: a *reason* to search opens a
+ * window, and the window closes.
+ *
+ * The reasons, all of which mean "something about this person's fleet just
+ * changed, and a link may be findable that was not before":
+ *
+ * - `unlinked_own_devices` rose above `previous_unlinked_own_devices` -- a
+ * sibling appeared on the roster, or an own-device link dropped. (The shells
+ * also reset both across a network change, so joining a Wi-Fi re-arms.)
+ * - `roster_changed` -- this person's device roster is not the one last
+ * observed. This is the arm that matters on the phone that performed a
+ * *removal*: the removed device leaves its roster immediately, so its
+ * shortfall is zero and it would otherwise have no motive at all to go
+ * looking for the phone it must still hand §10 step 5's notice to.
+ *
+ * A backwards clock jump re-arms rather than expiring: the failure worth
+ * avoiding is a phone that stops looking.
+ */
+public func coreLanOwnDeviceSearchSince(previousSinceMs: Int64?, rosterChanged: Bool, unlinkedOwnDevices: UInt32, previousUnlinkedOwnDevices: UInt32, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_own_device_search_since(
+        FfiConverterOptionInt64.lower(previousSinceMs),
+        FfiConverterBool.lower(rosterChanged),
+        FfiConverterUInt32.lower(unlinkedOwnDevices),
+        FfiConverterUInt32.lower(previousUnlinkedOwnDevices),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * [`LAN_OWN_DEVICE_SEARCH_WINDOW_MS`], for the shells.
+ */
+public func coreLanOwnDeviceSearchWindowMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_own_device_search_window_ms($0
+    )
+})
+}
+/**
  * Whether a LAN reconnect target should be forgotten rather than retried
  * again.
  *
@@ -51706,6 +51758,14 @@ public func coreLanNetworkIdForIpv4(address: String) -> String? {
  * and nothing here may make one harder to re-establish. Only the unproven kind
  * is retired, and retiring it loses nothing -- a fresh discovery or a sweep
  * re-creates the target the moment there is anything real to reach.
+ *
+ * A link to one of this person's *own* devices proves its address the same
+ * way, which is deliberate and worth naming: a removed device still presents
+ * the agreement key that admits it (§10.1 rotates the inbox key, not the LAN
+ * Noise static), so once it has handshaked, the honest phone keeps dialing it
+ * for the rest of the network join. That is the point -- §10 step 5's notice
+ * is what the fleet is trying to hand it -- but the same standing dial is a
+ * presence signal that outlives the revocation, and it is accepted knowingly.
  */
 public func coreLanReconnectTargetIsExhausted(everAuthenticated: Bool, consecutiveFailures: UInt32) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -51735,21 +51795,31 @@ public func coreLanReconnectTargetIsExhausted(everAuthenticated: Bool, consecuti
  * support and has no authenticated LAN link (see
  * [`crate::lan_capability_motivates_scan`]'s shell mirrors) -- one connected
  * family member must not stop discovery of the rest.
- * - `unlinked_own_devices`: a device this person's own roster lists that is
- * not on an own-device link right now. It is what makes a phone go looking
- * for its sibling at all, and mDNS was the only channel that ever did.
+ * - `own_device_search_live`: this phone is inside a bounded window during
+ * which it is looking for one of this person's own devices
+ * ([`core_lan_own_device_search_since`]). It is what makes a phone go
+ * looking for its sibling at all, and mDNS was the only channel that ever
+ * did.
+ *
+ * Note that the second escape is a *bounded* one and the first is a *decayed*
+ * one, and that neither is a bare count of who is missing. Both motives are
+ * satisfied by an absence, and an absence never ends by itself: a contact who
+ * went ashore, or a tablet left at home, would otherwise keep this phone
+ * sweeping the /24 every five minutes on every Wi-Fi it ever joins. The
+ * contact side decays (its shell mirrors only count a contact whose LAN
+ * evidence is recent); the own-device side is time-boxed per reason to search.
  *
  * In-flight work (pending outbound attempts, a running sweep) always defers.
  * The counts are unsigned on purpose: a shell that ever computes one of them
  * negative must clamp it to zero on the way in, which slows discovery down
  * rather than disabling it.
  */
-public func coreLanScanGateOpen(peerLinks: UInt32, unlinkedCapableContacts: UInt32, unlinkedOwnDevices: UInt32, pendingOutboundAttempts: UInt32, scanRemaining: UInt32) -> Bool {
+public func coreLanScanGateOpen(peerLinks: UInt32, unlinkedCapableContacts: UInt32, ownDeviceSearchLive: Bool, pendingOutboundAttempts: UInt32, scanRemaining: UInt32) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_lan_scan_gate_open(
         FfiConverterUInt32.lower(peerLinks),
         FfiConverterUInt32.lower(unlinkedCapableContacts),
-        FfiConverterUInt32.lower(unlinkedOwnDevices),
+        FfiConverterBool.lower(ownDeviceSearchLive),
         FfiConverterUInt32.lower(pendingOutboundAttempts),
         FfiConverterUInt32.lower(scanRemaining),$0
     )
@@ -52323,6 +52393,18 @@ public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> C
  * document per minute per own-device link and needs no event plumbing to reach
  * it — which also means it survives an app restart, a reboot, and a roster
  * change this process never saw.
+ *
+ * **The trade this widens, stated plainly.** A notice tells the holder of a
+ * removed phone that they were removed, and §10.2's relay-`family_token`
+ * rotation lands only on the first pass that reaches the relay — so there is a
+ * window in which a removed device knows it is out while the family credential
+ * it already holds is still live, and LAN-with-no-internet is exactly where
+ * that window is widest. Edge-triggered, reaching that window needed a fresh
+ * HELLO2; level-triggered it is the ordinary case, within a minute, for as
+ * long as the link lasts. Accepted deliberately — an honest removed device has
+ * to converge offline, and nothing else makes the phone that is *wrong* right
+ * — but it is a widening rather than a neutral change, and §10 step 5 records
+ * it as one.
  *
  * `None` means never offered on this link, which is always due.
  */
@@ -56619,10 +56701,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_ipv4() != 24186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_lan_reconnect_target_is_exhausted() != 64694) {
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_own_device_search_since() != 4996) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_lan_scan_gate_open() != 27348) {
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_own_device_search_window_ms() != 41871) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_reconnect_target_is_exhausted() != 48660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_scan_gate_open() != 1449) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_last_visible_message() != 29515) {
@@ -56715,7 +56803,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_due() != 64067) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_due() != 22705) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_interval_ms() != 4136) {

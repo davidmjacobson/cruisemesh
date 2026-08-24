@@ -83,6 +83,8 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     private let lanHealth = LanHealthTracker()
     /// §10 step 5's re-offer bookkeeping; see `OwnRosterNoticeSchedule`.
     private let ownRosterNoticeSchedule = OwnRosterNoticeSchedule()
+    /// §10 step 5's sweep motive; see `OwnDeviceSearchWindow`.
+    private let ownDeviceSearchWindow = OwnDeviceSearchWindow()
     private let store = AppStore.get()
 
     /// The core encounter planner's driver, used only when
@@ -413,6 +415,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self.currentLanEndpoint = endpoint
                 self.currentLanInstanceToken = instanceToken
                 self.currentLanNetworkId = networkId
+                // A new Wi-Fi is a fresh reason to look for a device of this
+                // person's own: every peer on it has to be found again from
+                // nothing, and the shortfall this phone was carrying is not
+                // itself news.
+                self.ownDeviceSearchWindow.rearm(nowMs: Int64(Date().timeIntervalSince1970 * 1_000))
+                lan.updateOwnDeviceSearchLive(true)
                 for contact in (try? self.store.listContacts()) ?? [] {
                     // This phone's own address on the network it just joined
                     // is what lets the cache throw out an unproven entry that
@@ -606,6 +614,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         lanHealthTimer = nil
         lanHealth.clear()
         ownRosterNoticeSchedule.clear()
+        ownDeviceSearchWindow.clear()
         // A debounced failover resume can still be queued on meshQueue. Its
         // block re-checks `isRunning` (already false above) before doing any
         // work, so it cannot outlive this; clearing the armed windows just
@@ -965,23 +974,39 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         guard lanTransport != nil else { return }
         Task.detached(priority: .utility) { [weak self] in
             let capable = MeshController.lanCapableContacts()
-            let siblings = MeshController.ownRosterSiblingCount()
+            let roster = MeshController.ownRoster()
             guard let self else { return }
             self.meshQueue.async {
                 self.lanTransport?.updateLanCapableContacts(capable)
                 // The LAN transport's other sweep motive. A sibling shares this
                 // person's user id, so it has no contact row and can never
-                // appear in `capable` however long it waits.
+                // appear in `capable` however long it waits -- and the motive is
+                // a bounded window rather than the bare shortfall, because a
+                // sibling that is switched off is missing forever. The roster is
+                // fingerprinted rather than counted because a *removal* lowers
+                // the shortfall: the phone holding the signed news for a removed
+                // device would otherwise have no motive to go looking for it.
                 let linked = MeshRouter.ownDeviceLinks().count
-                self.lanTransport?.updateUnlinkedOwnDevices(max(0, siblings - linked))
+                self.ownDeviceSearchWindow.observe(
+                    rosterFingerprint: roster.fingerprint,
+                    unlinkedOwnDevices: max(0, roster.siblings - linked),
+                    nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
+                self.lanTransport?.updateOwnDeviceSearchLive(self.ownDeviceSearchWindow.isLive)
             }
         }
     }
 
-    /// How many devices this person's own roster lists besides this one.
-    private static func ownRosterSiblingCount() -> Int {
-        guard let fleet = try? AppStore.get().ownDeviceFleet() else { return 0 }
-        return max(0, fleet.deviceIds.count - (fleet.ownDeviceId == nil ? 0 : 1))
+    /// This person's device roster: how many devices it lists besides this one,
+    /// and an identity for the roster itself. See `OwnDeviceSearchWindow`.
+    private static func ownRoster() -> (siblings: Int, fingerprint: String) {
+        guard let fleet = try? AppStore.get().ownDeviceFleet() else {
+            return (0, ownRosterFingerprint(deviceIds: []))
+        }
+        return (
+            max(0, fleet.deviceIds.count - (fleet.ownDeviceId == nil ? 0 : 1)),
+            ownRosterFingerprint(deviceIds: fleet.deviceIds)
+        )
     }
 
     private static func lanCapableContacts() -> [Data: Int64] {
@@ -1021,6 +1046,18 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// returns (no timer) when backgrounded; fires an immediate catch-up
     /// probe before arming the repeating timer whenever this runs while
     /// foregrounded, so a foreground return doesn't wait out a stale 30s.
+    ///
+    /// **§10 step 5 rides this loop, and inherits the foreground gate — a
+    /// platform difference, not an oversight.** Android's equivalent runs
+    /// under a foreground service, so its own-device heartbeat and its roster
+    /// re-offer keep going with the app off screen; here they converge only
+    /// while CruiseMesh is on screen. That is what iOS allows: the LAN
+    /// transport suspends discovery when backgrounded anyway
+    /// (`LanTransport.setForegroundActive`), so a background re-offer would
+    /// have no link to write to and a background probe nothing live to probe.
+    /// `specs/multi-device-v1.md` §10 step 5 states it too; anyone reading the
+    /// convergence claim should read it as "within minutes of either phone
+    /// being opened" on this platform.
     private func startLanHealthLoop() {
         lanHealthTimer?.cancel()
         lanHealthTimer = nil
@@ -1033,19 +1070,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     }
 
     private func probeLanLinks() {
-        var addresses = MeshRouter.identifiedRoutes()
-            .filter { $0.transport == .lan }
-            .map(\.address)
+        let ownDeviceLinks = MeshRouter.ownDeviceLinks()
         // A link to one of this person's own devices is never a route, so it
-        // was in none of the accessors this loop used to read -- and a link
-        // nothing probes is a link nothing closes. A half-open one held its
-        // connection, carried no frames, and (being live) told the LAN
-        // transport it had company, for the whole Wi-Fi join. That is the
-        // state an approving phone sat in for 26 minutes while the device it
-        // had removed waited to be told.
-        addresses.append(contentsOf: MeshRouter.ownDeviceLinks()
-            .filter { $0.transport == .lan }
-            .map { $0.address })
+        // was in none of the accessors this loop used to read -- see
+        // `lanHealthProbeAddresses`, which is where that selection now lives so
+        // a test can hold it in place.
+        let addresses = lanHealthProbeAddresses(
+            identifiedRoutes: MeshRouter.identifiedRoutes(),
+            ownDeviceLinks: ownDeviceLinks
+        )
         let now = Int64(Date().timeIntervalSince1970 * 1_000)
         for address in addresses {
             switch lanHealth.next(
@@ -1067,33 +1100,43 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 )
             }
         }
-        reofferOwnRosterNotices()
+        reofferOwnRosterNotices(ownDeviceLinks: ownDeviceLinks)
     }
 
     /// **§10 step 5, level-triggered.** Re-offer this person's roster on every
-    /// live own-device link that is due one.
+    /// live own-device link that is due one, and nudge any link whose peer
+    /// HELLO2 never arrived.
     ///
     /// The notice shipped edge-triggered on an inbound HELLO2 and nothing else,
     /// so a removal that happened while a sibling link was *already up* was
     /// never announced on it. Nothing else in either shell pushed one: no
     /// roster-change hook, no periodic re-offer, and HELLO is sent only when a
     /// link is established. See `OwnRosterNoticeSchedule` for why this is a
-    /// timer rather than an event.
+    /// timer rather than an event, and `ownRosterNoticeTargets` /
+    /// `ownDeviceLinksAwaitingHello2` for the selection this delegates.
     ///
     /// Mirrors Android's `MeshService.reofferOwnRosterNotices`.
-    private func reofferOwnRosterNotices() {
+    private func reofferOwnRosterNotices(
+        ownDeviceLinks: [(transport: MeshRouterState.Transport, address: String)]
+    ) {
         guard let identity else { return }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1_000)
-        for link in MeshRouter.ownDeviceLinks() where link.transport == .lan {
-            guard let capabilities = ownRosterNoticeSchedule.dueCapabilities(
-                address: link.address,
-                nowMs: nowMs
-            ) else { continue }
+        for target in ownRosterNoticeTargets(
+            ownDeviceLinks: ownDeviceLinks,
+            schedule: ownRosterNoticeSchedule,
+            nowMs: nowMs
+        ) {
             offerOwnRosterNotice(
-                address: link.address,
-                capabilities: capabilities,
+                address: target.address,
+                capabilities: target.capabilities,
                 identity: identity
             )
+        }
+        for address in ownDeviceLinksAwaitingHello2(
+            ownDeviceLinks: ownDeviceLinks,
+            schedule: ownRosterNoticeSchedule
+        ) {
+            sendHello(address: address)
         }
     }
 
@@ -1207,7 +1250,11 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             return
         }
         guard let frame = encoded else { return }
-        MeshRouter.sendToAddress(address: address, frame: frame)
+        // The timer only restarts for a write the router accepted: a send that
+        // never left this phone has told the link nothing, and booking it as
+        // delivered would sit a half-open own-device link out another full
+        // interval.
+        guard MeshRouter.sendToAddress(address: address, frame: frame) else { return }
         ownRosterNoticeSchedule.noteOffered(
             address: address,
             nowMs: Int64(Date().timeIntervalSince1970 * 1_000)

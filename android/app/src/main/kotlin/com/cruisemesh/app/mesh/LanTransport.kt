@@ -3,6 +3,7 @@ package com.cruisemesh.app.mesh
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -34,6 +35,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -63,16 +65,20 @@ internal class LanTransport(
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
     private val unlinkedCapableContacts: () -> Int,
     /**
-     * How many devices this person's own roster lists that are not on an
-     * own-device link right now (`specs/multi-device-v1.md` §10 step 5).
+     * Whether this phone is inside the bounded window during which it looks
+     * for one of this person's own devices (`specs/multi-device-v1.md` §10
+     * step 5). [OwnDeviceSearchWindow] keeps it; core defines the window.
      *
      * A sibling shares this person's user id, so it has no contact row and
      * cannot appear in [unlinkedCapableContacts] however hard it looks for us.
      * Without a motive of its own a phone whose only missing peer is its other
      * phone never sweeps, and mDNS is left as the sole channel between them --
-     * which is precisely the state the field capture caught.
+     * which is precisely the state the field capture caught. Bounded, because
+     * a second phone that is switched off or left at home is missing forever:
+     * an unbounded motive would sweep the subnet every five minutes on every
+     * Wi-Fi this person joins, on battery, for the life of every join.
      */
-    private val unlinkedOwnDevices: () -> Int,
+    private val ownDeviceSearchLive: () -> Boolean,
     private val onNetworkReady: (Frame.LanEndpoint, networkId: String?) -> Unit,
     private val onEndpointObserved: (
         userId: ByteArray,
@@ -248,7 +254,7 @@ internal class LanTransport(
                 ),
                 scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
                 unlinkedCapableContacts = unlinkedCapableContacts(),
-                unlinkedOwnDevices = unlinkedOwnDevices(),
+                ownDeviceSearchLive = ownDeviceSearchLive(),
             )
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
@@ -264,14 +270,8 @@ internal class LanTransport(
     private var listeningOnFallbackPort = false
 
     private val defaultPortRebindRunnable = Runnable {
-        val network = wifiNetwork
-        if (!started || network == null || !listeningOnFallbackPort) return@Runnable
-        if (defaultLanPortIsFree()) {
-            Log.i(TAG, "The usual local Wi-Fi port is free again; moving the listener back")
-            restartNetworkSession(network)
-        } else {
-            scheduleDefaultPortRebind()
-        }
+        if (!started || wifiNetwork == null || !listeningOnFallbackPort) return@Runnable
+        probeDefaultLanPort()
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -282,6 +282,20 @@ internal class LanTransport(
                 if (wifiNetwork != null) return@post
                 wifiNetwork = network
                 restartNetworkSession(network)
+            }
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            // The session's endpoint hint is computed once, at the moment the
+            // network became available -- which on a join whose DHCPv4 lease
+            // has not landed yet is before this phone has any address another
+            // phone could dial. [localEndpoint] refuses to publish an
+            // unreachable one, so without this the phone would advertise
+            // nothing for the whole join and never repair it. Addresses
+            // arriving later is exactly what this callback reports.
+            mainHandler.post {
+                if (!started || wifiNetwork != network) return@post
+                republishLocalEndpoint(network)
             }
         }
 
@@ -690,28 +704,7 @@ internal class LanTransport(
         listeningOnFallbackPort = listener.localPort != lanDefaultTcpPort().toInt()
         acceptExecutor.execute { acceptLoop(listener) }
 
-        // The opaque token is also the cross-platform connection-election
-        // value. Publishing it as the service name lets Apple Bonjour choose
-        // the same single initiator without exposing an identity.
-        requestedServiceName = instanceToken
-        registeredServiceName = requestedServiceName
-        val serviceInfo = NsdServiceInfo().apply {
-            serviceName = requestedServiceName
-            serviceType = lanServiceType()
-            port = listener.localPort
-            setAttribute(TXT_VERSION, "1")
-            setAttribute(TXT_INSTANCE, instanceToken)
-            if (supportsNetworkScopedServiceInfo()) {
-                setNetworkCompat(this, network)
-            }
-        }
-        val registration = makeRegistrationListener()
-        registrationListener = registration
-        try {
-            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registration)
-        } catch (error: RuntimeException) {
-            Log.w(TAG, "Unable to advertise LAN transport", error)
-        }
+        advertiseListener(network, listener.localPort)
 
         val discovery = makeDiscoveryListener()
         discoveryListener = discovery
@@ -751,6 +744,63 @@ internal class LanTransport(
         if (listeningOnFallbackPort) scheduleDefaultPortRebind()
     }
 
+    /** Publishes this listener over mDNS. Also used when the port moves. */
+    private fun advertiseListener(network: Network, port: Int) {
+        // The opaque token is also the cross-platform connection-election
+        // value. Publishing it as the service name lets Apple Bonjour choose
+        // the same single initiator without exposing an identity.
+        requestedServiceName = instanceToken
+        registeredServiceName = requestedServiceName
+        val serviceInfo = NsdServiceInfo().apply {
+            serviceName = requestedServiceName
+            serviceType = lanServiceType()
+            this.port = port
+            setAttribute(TXT_VERSION, "1")
+            setAttribute(TXT_INSTANCE, instanceToken)
+            if (supportsNetworkScopedServiceInfo()) {
+                setNetworkCompat(this, network)
+            }
+        }
+        val registration = makeRegistrationListener()
+        registrationListener = registration
+        try {
+            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registration)
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Unable to advertise LAN transport", error)
+        }
+    }
+
+    /**
+     * Re-publish this phone's own address when it has changed -- including from
+     * "nothing publishable" to a real one.
+     *
+     * [localEndpoint] refuses to advertise an address no other phone could dial,
+     * and on a Wi-Fi join whose DHCPv4 lease has not landed there is no such
+     * address yet. The session's hint was computed once, so refusing would have
+     * meant publishing nothing for the whole join; this is the repair, driven by
+     * the link-properties callback that reports the address arriving.
+     */
+    private fun republishLocalEndpoint(network: Network) {
+        val port = serverSocket?.localPort ?: return
+        val endpoint = localEndpoint(network, port) ?: return
+        val existing = endpointHint
+        if (existing != null && existing.host == endpoint.host && existing.port.toInt() == endpoint.port) {
+            return
+        }
+        currentNetworkId = lanNetworkId(connectivityManager, network)
+        val hint = Frame.LanEndpoint(
+            instanceToken = instanceTokenBytes.copyOf(),
+            host = endpoint.host,
+            port = endpoint.port.toUShort(),
+        )
+        endpointHint = hint
+        ownHostAddresses = null
+        ownHostAddressesAtMs = 0L
+        LanTransportDiagnostics.listening(endpoint.display)
+        Log.i(TAG, "This phone's local Wi-Fi address is now ${endpoint.display}")
+        onNetworkReady(hint, currentNetworkId)
+    }
+
     /**
      * A listener that had to settle for a fallback port is not merely untidy:
      * a subnet sweep probes [lanDefaultTcpPort] and nothing else, so this
@@ -759,22 +809,83 @@ internal class LanTransport(
      * the field capture is what one stale mDNS record does to that.
      *
      * The port is usually taken by this app's own previous process during a
-     * restart, so it frees itself within seconds. Re-taking it means
-     * re-advertising, which is what [restartNetworkSession] does.
+     * restart, so it frees itself within seconds. The probe is a bind -- a
+     * blocking syscall -- so it runs off the main looper, and the move itself
+     * ([moveListenerToDefaultPort]) replaces only the listener: every
+     * established link survives it.
      */
     private fun scheduleDefaultPortRebind() {
         mainHandler.removeCallbacks(defaultPortRebindRunnable)
         mainHandler.postDelayed(defaultPortRebindRunnable, DEFAULT_PORT_REBIND_RETRY_MS)
     }
 
-    private fun defaultLanPortIsFree(): Boolean = try {
-        ServerSocket().use { probe ->
-            probe.reuseAddress = true
-            probe.bind(InetSocketAddress(lanDefaultTcpPort().toInt()))
+    private fun probeDefaultLanPort() {
+        // Not [acceptExecutor]: that single thread is inside a blocking
+        // accept() for the life of the listener, so anything queued behind it
+        // would never run.
+        try {
+            connectionExecutor.execute {
+                val free = try {
+                    ServerSocket().use { probe ->
+                        probe.reuseAddress = true
+                        probe.bind(InetSocketAddress(lanDefaultTcpPort().toInt()))
+                    }
+                    true
+                } catch (_: IOException) {
+                    false
+                }
+                mainHandler.post {
+                    if (!started || wifiNetwork == null || !listeningOnFallbackPort) return@post
+                    if (free) moveListenerToDefaultPort() else scheduleDefaultPortRebind()
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // Shutting down with the service; nothing left to move.
         }
-        true
-    } catch (_: IOException) {
-        false
+    }
+
+    /**
+     * Move the listener back to the default port without disturbing anything
+     * else about the session.
+     *
+     * Deliberately not a [restartNetworkSession]: that tears down every live
+     * LAN socket, forgets the reconnect targets and the proven-address set, and
+     * re-runs discovery. Losing a family member's established link is far too
+     * much to pay for a tidier port, and on a port that a *different* app holds
+     * this would repeat every retry period.
+     */
+    private fun moveListenerToDefaultPort() {
+        val network = wifiNetwork ?: return
+        val previous = serverSocket
+        val listener = openListener() ?: run {
+            scheduleDefaultPortRebind()
+            return
+        }
+        if (listener.localPort != lanDefaultTcpPort().toInt()) {
+            // Something took the port between the probe and here. Moving to a
+            // *different* fallback port buys nothing, so keep the one that is
+            // already serving and try again later.
+            listener.closeQuietly()
+            scheduleDefaultPortRebind()
+            return
+        }
+        serverSocket = listener
+        listeningOnFallbackPort = false
+        // Closing the old socket ends its accept loop; links it already
+        // produced are untouched.
+        previous?.closeQuietly()
+        acceptExecutor.execute { acceptLoop(listener) }
+        registrationListener?.let(::unregisterService)
+        registrationListener = null
+        advertiseListener(network, listener.localPort)
+        endpointHint = endpointHint?.let { hint ->
+            Frame.LanEndpoint(
+                instanceToken = hint.instanceToken,
+                host = hint.host,
+                port = listener.localPort.toUShort(),
+            )
+        }
+        endpointHint?.let { onNetworkReady(it, currentNetworkId) }
     }
 
     private fun openListener(): ServerSocket? {
@@ -2248,11 +2359,11 @@ internal fun shouldRunAutomaticLanScan(
     pendingOutboundAttempts: Int,
     scanRemaining: Int,
     unlinkedCapableContacts: Int,
-    unlinkedOwnDevices: Int,
+    ownDeviceSearchLive: Boolean,
 ): Boolean = coreLanScanGateOpen(
     peerLinks = peerLinks.coerceAtLeast(0).toUInt(),
     unlinkedCapableContacts = unlinkedCapableContacts.coerceAtLeast(0).toUInt(),
-    unlinkedOwnDevices = unlinkedOwnDevices.coerceAtLeast(0).toUInt(),
+    ownDeviceSearchLive = ownDeviceSearchLive,
     pendingOutboundAttempts = pendingOutboundAttempts.coerceAtLeast(0).toUInt(),
     scanRemaining = scanRemaining.coerceAtLeast(0).toUInt(),
 )

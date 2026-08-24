@@ -761,6 +761,18 @@ pub fn core_own_roster_notice_reoffer_interval_ms() -> i64 {
 /// it — which also means it survives an app restart, a reboot, and a roster
 /// change this process never saw.
 ///
+/// **The trade this widens, stated plainly.** A notice tells the holder of a
+/// removed phone that they were removed, and §10.2's relay-`family_token`
+/// rotation lands only on the first pass that reaches the relay — so there is a
+/// window in which a removed device knows it is out while the family credential
+/// it already holds is still live, and LAN-with-no-internet is exactly where
+/// that window is widest. Edge-triggered, reaching that window needed a fresh
+/// HELLO2; level-triggered it is the ordinary case, within a minute, for as
+/// long as the link lasts. Accepted deliberately — an honest removed device has
+/// to converge offline, and nothing else makes the phone that is *wrong* right
+/// — but it is a widening rather than a neutral change, and §10 step 5 records
+/// it as one.
+///
 /// `None` means never offered on this link, which is always due.
 #[uniffi::export]
 pub fn core_own_roster_notice_reoffer_due(last_offered_at_ms: Option<i64>, now_ms: i64) -> bool {
