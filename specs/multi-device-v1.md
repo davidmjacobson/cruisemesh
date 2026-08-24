@@ -335,12 +335,60 @@ On "Remove device" (approving device) or recovery-code override:
    drawer" device is on the same footing and otherwise believes itself
    linked forever, keeps advertising, and keeps accepting messages. So:
    when a removed device next meets a sibling on a link that has already
-   proved it belongs to this person — a LAN Noise session whose remote
-   static key is this person's own agreement key — the sibling pushes the
-   current signed roster (frame `0x07`, gated by `CAP_OWN_ROSTER_NOTICE`
-   on HELLO2). A device that reads a roster tombstoning itself stores it,
+   proved it belongs to this person, the sibling pushes the current
+   signed roster (frame `0x07`, gated by `CAP_OWN_ROSTER_NOTICE` on
+   HELLO2). A device that reads a roster tombstoning itself stores it,
    clears its fleet projection, stops advertising, authoring and acking,
    and surfaces that it was removed.
+
+   **What "proved it belongs to this person" means, and what it must
+   never mean.** The admission test is a *roster proof*: on a finished
+   LAN Noise session each side signs that session's transcript hash with
+   its device signing key (`core_own_device_lan_proof`) and checks the
+   other's against the roster it holds (`core_own_device_lan_proof_open`,
+   both `devices` and `tombstones`). Binding to the transcript is what
+   makes it unreplayable across sessions and unforwardable by a machine
+   in the middle. The initiator proves first and a responder that cannot
+   verify closes without answering, so a stranger who dials us learns
+   nothing Noise XX message 2 did not already hand it.
+
+   It must never be "the peer's Noise static key is this person's own
+   agreement key". That is a **clone** test, not a sibling test, and the
+   first build shipped it. §9's ceremony deliberately gives a linked
+   device keys of its own and withholds the person root secret (§3), so
+   two genuine siblings share no private key at all: the test admitted a
+   `.cmbak` restore and refused every real sibling, in both roles, before
+   any removal and independent of address family. A 2026-08-24 two-phone
+   capture is the record — 25 refusals across 15 minutes on one `/24`, an
+   own-device link that never came up once, and a removed phone that
+   never learned. The clone arm is *kept* alongside the roster proof,
+   because such a device already holds everything a roster could tell it;
+   it is simply not the whole test.
+
+   Three consequences follow, and each is load-bearing:
+
+   - **A tombstoned device is admitted on purpose.** The device that most
+     needs the notice is the removed one, so refusing its proof would
+     slam the only door the notice can come through. It gains no
+     capability by it: a link with no user id is not a route, and §10.1
+     rotated the inbox key at the moment of removal, long before this
+     meeting. Tombstones deliberately keep no key (DL-4), so the prover
+     carries its `device_sign_pk` in the payload and the verifier
+     *derives* the device id from it rather than reading a claim —
+     without that the approver could not verify the very device it must
+     notify, and the exchange would work in one direction only.
+   - **A sibling's HELLO does not carry this person's user id.** A linked
+     device derives its user id from its own signing key, so anything
+     that recognises siblings by comparing user ids sees a stranger and
+     the capability bits that gate the notice never register. The link,
+     not the frame, is what says whose device this is.
+   - **A linked device cannot check a roster against its own identity
+     key.** `Identity.sign_pk` is the person root only on the *original*
+     device. Everywhere else the anchor is recovered from the roster the
+     device already holds (`core_roster_person_root_sign_pk`), which is
+     pinned by the same `person_id` binding the argument would have been
+     checked against. Without that, the removed device would read the
+     document burying it, check it against the wrong key, and stay live.
 
    It hears only from a document signed under the person root that
    strictly supersedes the one it held, so "you're out" is never a bare

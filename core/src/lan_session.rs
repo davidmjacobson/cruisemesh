@@ -63,6 +63,11 @@ struct SessionInner {
     handshake: Option<HandshakeState>,
     transport: Option<TransportState>,
     remote_static: Option<Vec<u8>>,
+    /// Noise's own transcript hash, captured the instant the handshake
+    /// finishes. See [`LanNoiseSession::handshake_hash`] for why it is taken
+    /// here rather than asked for later: `snow` exposes it on the handshake
+    /// state, and `promote_if_finished` consumes that state.
+    handshake_hash: Option<Vec<u8>>,
     next_outbound_frame_id: u32,
     inbound: Option<InboundFrame>,
 }
@@ -106,6 +111,7 @@ impl LanNoiseSession {
                 handshake: Some(handshake),
                 transport: None,
                 remote_static: None,
+                handshake_hash: None,
                 next_outbound_frame_id: 0,
                 inbound: None,
             }),
@@ -176,6 +182,20 @@ impl LanNoiseSession {
                 .and_then(|handshake| handshake.get_remote_static())
                 .map(ToOwned::to_owned)
         })
+    }
+
+    /// Noise's transcript hash for this session, once the handshake has
+    /// finished. `None` before that.
+    ///
+    /// This is the value a proof-of-siblinghood signature is bound to
+    /// (`specs/multi-device-v1.md` §10 step 5). Both ends of one handshake
+    /// compute the identical hash, and it commits to both ephemeral keys and
+    /// both static keys — so a signature over it is worthless on any other
+    /// session, cannot be replayed from a recorded one, and cannot be relayed
+    /// by a machine in the middle: it only verifies on the session whose
+    /// transcript it names.
+    pub fn handshake_hash(&self) -> Option<Vec<u8>> {
+        self.inner.lock().ok()?.handshake_hash.clone()
     }
 
     /// Encrypt one complete CruiseMesh protocol frame into one or more Noise
@@ -314,6 +334,10 @@ fn promote_if_finished(inner: &mut SessionInner) -> Result<(), CoreError> {
         .take()
         .ok_or_else(|| CoreError::Crypto("LAN handshake state disappeared".to_string()))?;
     inner.remote_static = handshake.get_remote_static().map(ToOwned::to_owned);
+    // Taken before the handshake state is consumed: `snow` publishes the
+    // transcript hash on `HandshakeState` alone, and `into_transport_mode`
+    // eats it.
+    inner.handshake_hash = Some(handshake.get_handshake_hash().to_vec());
     inner.transport = Some(handshake.into_transport_mode().map_err(noise_error)?);
     Ok(())
 }
@@ -395,6 +419,32 @@ mod tests {
         let last = record.len() - 1;
         record[last] ^= 1;
         assert!(responder.decrypt_record(record).is_err());
+    }
+
+    /// What the own-device proof is bound to: one value, agreed by both ends
+    /// of one handshake and by nothing else.
+    #[test]
+    fn handshake_hash_is_shared_by_both_ends_and_unique_to_a_session() {
+        let (initiator, responder) = connected_pair();
+        let hash = initiator.handshake_hash().expect("finished handshake");
+        assert_eq!(hash.len(), 32);
+        assert_eq!(responder.handshake_hash(), Some(hash.clone()));
+
+        let (again, _) = connected_pair();
+        assert_ne!(
+            again.handshake_hash(),
+            Some(hash),
+            "ephemeral keys make every session's transcript its own"
+        );
+    }
+
+    #[test]
+    fn handshake_hash_is_absent_until_the_handshake_finishes() {
+        let (secret, _) = key(5);
+        let session = LanNoiseSession::new(true, secret.to_vec()).unwrap();
+        assert_eq!(session.handshake_hash(), None);
+        let _ = session.write_handshake_message().unwrap();
+        assert_eq!(session.handshake_hash(), None);
     }
 
     #[test]

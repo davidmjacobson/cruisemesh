@@ -1350,6 +1350,21 @@ impl MessageStore {
     /// §3 makes the person root the deployed identity key, so the anchor is
     /// already on the phone and no new trust material is introduced.
     ///
+    /// **On a §9-linked device that sentence is false, and this call repairs
+    /// it.** The ceremony gives a new device keys of its own and withholds the
+    /// person root secret (§3); neither shell persists the person material the
+    /// bootstrap carries, so a linked device's `Identity.sign_pk` is a key of
+    /// its own and derives to a different person id entirely. Handed that, the
+    /// anchor check would refuse every roster the person ever signed — and the
+    /// device this call exists for is exactly a linked one. So the argument is
+    /// verified against the stored roster's `person_id` and, when it does not
+    /// belong to this person, the true anchor is recovered from the roster this
+    /// device already holds ([`crate::core_roster_person_root_sign_pk`]). That
+    /// is no weaker: the stored roster was validated against the anchor when it
+    /// was imported, and `person_id` is `derive_user_id` of the anchor, so the
+    /// recovered key is pinned by the same binding the argument would have been
+    /// checked against.
+    ///
     /// # Why a push, and why this is not a tip-off
     ///
     /// §10.1 addresses its gossip to contacts and to *remaining* own devices,
@@ -1446,11 +1461,28 @@ impl MessageStore {
             let conn = self.locked_conn();
             crate::roster_store::load_state(&conn, &held.person_id)?.quarantined
         };
+        // The anchor. The caller's key is used when it really is this person's
+        // root -- the original device, where `Identity` IS the person -- and
+        // otherwise the one the held roster is rooted in. See this method's
+        // doc comment: on a §9-linked device the caller has no way to know the
+        // person root, and refusing here would strand exactly the device §10
+        // step 5 exists to reach.
+        let anchor =
+            if crate::identity::derive_user_id(&person_root_sign_pk).to_vec() == held.person_id {
+                person_root_sign_pk
+            } else {
+                crate::core_roster_person_root_sign_pk(held.clone()).ok_or_else(|| {
+                    CoreError::Store(
+                        "this device's roster names no person root to check a notice against"
+                            .to_string(),
+                    )
+                })?
+            };
         let decision = crate::core_roster_accept(
             Some(held.clone()),
             stored_quarantined,
             incoming.clone(),
-            person_root_sign_pk,
+            anchor,
         );
         let revoked_device_ids = core_roster_newly_revoked(Some(held.clone()), incoming.clone());
         let answer = |outcome, reason, revoked_device_ids| crate::RevocationAdoption {
@@ -2589,6 +2621,95 @@ mod tests {
         // DL-4: the way back is a fresh install under a fresh device key.
         assert!(store.begin_link_activation(BINDING.to_vec(), NOW).is_err());
         assert!(store.abandon_link_activation(NOW).is_err());
+    }
+
+    /// **The 2026-08-24 field case, at the last gate that would still have
+    /// stopped it.**
+    ///
+    /// Every other test here hands this call `fleet.person.sign_pk` — the true
+    /// person root — because the original device's `Identity` *is* the person.
+    /// A §9-linked device is not that device. The ceremony gives it keys of its
+    /// own and withholds the person root secret, and neither shell persists the
+    /// person material the bootstrap carries, so what the shell actually passes
+    /// is `Identity.sign_pk`: a key of the phone's own, deriving to a different
+    /// person id entirely.
+    ///
+    /// Handed that, the anchor check refused every roster the person ever
+    /// signed — and the device this call exists for is exactly a linked one. So
+    /// the removed phone would have read the document that buries it, checked it
+    /// against the wrong key, and stayed live. This pins the recovery: the
+    /// anchor comes from the roster the device already holds, and the burial
+    /// lands.
+    #[test]
+    fn a_linked_device_converges_though_its_identity_is_not_the_person_root() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+
+        // What §9 actually leaves on a linked phone: an identity of its own.
+        let linked_shell_identity = generate_identity();
+        assert_ne!(linked_shell_identity.sign_pk, fleet.person.sign_pk);
+        assert_ne!(linked_shell_identity.user_id, fleet.held.person_id);
+
+        let adoption = store
+            .apply_own_roster_notice(
+                notice(&fleet.burying),
+                linked_shell_identity.sign_pk.clone(),
+                fleet.me.device_id.clone(),
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(
+            adoption.outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf,
+            "a linked device must converge on the key it actually holds"
+        );
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.burying);
+        assert!(store.own_device_fleet().unwrap().device_ids.is_empty());
+        assert!(
+            !store
+                .link_gate(CoreLinkGatedAction::Advertise)
+                .unwrap()
+                .allowed
+        );
+    }
+
+    /// The recovery above must not become a way in. A stranger's roster is still
+    /// refused when the caller's key is a linked device's own — the anchor is
+    /// taken from the *held* roster's person id, which no outsider can move.
+    #[test]
+    fn a_linked_devices_anchor_recovery_still_refuses_a_forged_roster() {
+        let fleet = fleet();
+        let stranger = generate_identity();
+        let forged = crate::core_sign_roster(fleet.burying.clone(), stranger.sign_sk).unwrap();
+        let store = my_store(&fleet);
+
+        let adoption = store
+            .apply_own_roster_notice(
+                notice(&forged),
+                generate_identity().sign_pk,
+                fleet.me.device_id.clone(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(adoption.outcome, crate::RevocationAdoptionOutcome::Refused);
+        assert_eq!(adoption.reason, crate::RosterUpdateReason::Invalid);
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.held);
+    }
+
+    /// The anchor a roster is rooted in is recoverable from the roster itself,
+    /// which is what makes the repair above sound: `person_id` is
+    /// `derive_user_id` of the person root, so a key inside the document that
+    /// derives to it *is* the root and nothing else can be.
+    #[test]
+    fn a_roster_names_the_person_root_it_is_rooted_in() {
+        let fleet = fleet();
+        for roster in [&fleet.held, &fleet.grown, &fleet.rotated, &fleet.burying] {
+            assert_eq!(
+                crate::core_roster_person_root_sign_pk(roster.clone()),
+                Some(fleet.person.sign_pk.clone()),
+            );
+        }
     }
 
     /// The notice is authenticated by the document, not by the link: a roster

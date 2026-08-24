@@ -6,6 +6,16 @@ import os.log
 /// Rust-backed Noise XX session. Only accepted contacts become mesh links.
 final class LanTransport {
     typealias TrustedPeerLookup = (Data) -> Data?
+    /// This device's own §10 step 5 proof for a finished LAN Noise session:
+    /// `coreOwnDeviceLanProof` over the session's transcript hash, signed with
+    /// this device's roster signing key.
+    ///
+    /// Nil on an install that holds no device key — one that has never been part
+    /// of a fleet, and so has no sibling to recognise. See `admit`.
+    typealias OwnDeviceProofMint = (Data) -> Data?
+    /// The peer's proof, checked against the roster this phone holds. Nil for
+    /// anything that is not one of this person's devices, live or tombstoned.
+    typealias OwnDeviceProofOpen = (Data, Data) -> CoreLanOwnDeviceProof?
 
     var onNetworkReady: ((LanManualEndpoint, Data, String?) -> Void)?
     /// A link finished the Noise handshake. The third argument is the address
@@ -25,6 +35,8 @@ final class LanTransport {
     private let queue = DispatchQueue(label: "com.cruisemesh.lan", qos: .utility)
     private let identity: Identity
     private let trustedPeerForStaticKey: TrustedPeerLookup
+    private let ownDeviceLanProof: OwnDeviceProofMint
+    private let openOwnDeviceLanProof: OwnDeviceProofOpen
     private let diagnostics = LanTransportDiagnostics.shared
     private let scanPlanner = LanScanPlanner()
     private let instanceToken: Data
@@ -110,9 +122,16 @@ final class LanTransport {
     private var listenerWaitingSinceMs: Int64?
     private var permissionWarningActive = false
 
-    init(identity: Identity, trustedPeerForStaticKey: @escaping TrustedPeerLookup) {
+    init(
+        identity: Identity,
+        trustedPeerForStaticKey: @escaping TrustedPeerLookup,
+        ownDeviceLanProof: @escaping OwnDeviceProofMint,
+        openOwnDeviceLanProof: @escaping OwnDeviceProofOpen
+    ) {
         self.identity = identity
         self.trustedPeerForStaticKey = trustedPeerForStaticKey
+        self.ownDeviceLanProof = ownDeviceLanProof
+        self.openOwnDeviceLanProof = openOwnDeviceLanProof
         var uuid = UUID().uuid
         let token = withUnsafeBytes(of: &uuid) { Data($0.prefix(8)) }
         instanceToken = token
@@ -806,24 +825,75 @@ final class LanTransport {
         }
     }
 
-    /// Who this handshake turned out to be: an accepted contact, a device of this
-    /// person's own, or nobody — in which case the link is refused exactly as it
-    /// always was.
+    /// What the two static keys settle on their own: an accepted contact, a clone
+    /// of this identity, or a peer that must now prove itself.
     ///
-    /// Before §10 step 5 the last two ended the same way — "not an accepted
-    /// contact", socket closed — and that is exactly what left a removed phone
-    /// sitting on the same Wi-Fi as the phone that removed it with no way to be
-    /// told. This person's own agreement key is the one thing that tells them
-    /// apart, and only a device holding this person's own secret can present it.
+    /// # Why the agreement key cannot be the whole test
+    ///
+    /// The first build asked one question of a non-contact: is the peer's Noise
+    /// static this identity's own agreement key? That admits a *clone* — a
+    /// `.cmbak` restore running this person's identity — and it admits nothing
+    /// else, because §9's link ceremony deliberately withholds the person root
+    /// secret and gives a new device keys of its own. Two genuine siblings
+    /// therefore share no private key at all, and the test refused both of them,
+    /// in both roles. A 2026-08-24 two-phone capture is the record of it: 25
+    /// refusals across 15 minutes on one `/24`, an own-device link that never
+    /// came up once, and a removed phone that never learned.
+    ///
+    /// # What replaces it
+    ///
+    /// The roster, which is the document that actually says who is whose. Each
+    /// side signs this session's Noise transcript hash with its device signing
+    /// key (`coreOwnDeviceLanProof`) and checks the other's against the roster it
+    /// holds (`coreOwnDeviceLanProofOpen`) — see `LanConnection.receivePacket`,
+    /// which drives the exchange. Bound to the transcript, so a recorded proof is
+    /// worthless on the next session and no machine in the middle can forward
+    /// one.
     ///
     /// `trustedPeerForStaticKey` is asked first and unchanged, so the clone
     /// warning it raises on a key that is ours still happens exactly once, during
     /// the handshake, whichever way this answers.
-    fileprivate func admit(remoteStaticKey: Data) -> LanAdmission? {
+    fileprivate func admit(remoteStaticKey: Data) -> LanHandshakeVerdict {
         if let userId = trustedPeerForStaticKey(remoteStaticKey) { return .contact(userId) }
-        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey)
-        else { return nil }
-        return .ownDevice
+        if ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) {
+            return .clone
+        }
+        return .proveOwnDevice
+    }
+
+    /// S3: name the peer a handshake refused, so a field capture can tell the
+    /// sibling from the neighbour's phone. Mirrors the endpoint Android puts in
+    /// its `"$role is not an accepted contact ($peerEndpoint)"` message.
+    fileprivate func logRefusedPeer(_ endpoint: String) {
+        log.debug("LAN peer is not an accepted contact (\(endpoint, privacy: .public))")
+    }
+
+    /// This device's proof for one finished session, or nil if it has no device
+    /// key to sign with.
+    fileprivate func mintOwnDeviceProof(handshakeHash: Data) -> Data? {
+        ownDeviceLanProof(handshakeHash)
+    }
+
+    /// Which of this person's devices the far end just proved it is, checked
+    /// against the roster this phone holds. Nil for everyone else.
+    ///
+    /// Both halves of the roster count, live devices and tombstones alike. A
+    /// removed device MUST still be admitted or the notice that exists to tell it
+    /// can never arrive; it gains nothing by it (no user id, so no route, no
+    /// contact bookkeeping, no counters — and §10.1 rotated the inbox key at the
+    /// moment of removal, long before this meeting).
+    fileprivate func openOwnDeviceProof(handshakeHash: Data, payload: Data) -> Data? {
+        openOwnDeviceLanProof(handshakeHash, payload)?.deviceId
+    }
+
+    /// Which of this person's own devices the peer on `address` proved it is
+    /// (§10 step 5), or nil if this link is a contact's, a clone's, or gone.
+    ///
+    /// This is the handle §10 step 5's roster notice is gated on: a link that
+    /// answers here has produced a signature over this session's Noise transcript
+    /// with a device signing key the roster names.
+    func ownDeviceId(address: String) -> Data? {
+        queue.sync { connections[address]?.ownDeviceId }
     }
 
     /// Last line of defence against dialing this phone's own listener. Every
@@ -899,7 +969,12 @@ final class LanTransport {
         // exists to carry §10 step 5's device list and the HELLOs that precede
         // it.
         guard case .contact(let userId) = admission else {
-            log.info("Another device of ours is on this Wi-Fi")
+            // Named, because until this line landed the only positive signal an
+            // own-device link had ever produced in a field log was "Closing an
+            // older link", which needs two of them. A device id is derived from
+            // a public key; no secret, endpoint or user id appears here.
+            let who = link.ownDeviceId.map { "device \(lanHex($0))" } ?? "our own key"
+            log.info("Another device of ours is on this Wi-Fi (\(who, privacy: .public))")
             supersedeOtherOwnDeviceLinks(keeping: link)
             // A sibling answering a sweep probe proves discovery works on this
             // network exactly as a contact does, so it must not leave the
@@ -1374,8 +1449,17 @@ private final class LanConnection {
         case awaitMessage1
         case awaitMessage2
         case awaitMessage3
+        /// The Noise handshake is finished but the peer is neither a contact nor
+        /// a clone, so it owes a §10 step 5 roster proof before this link counts
+        /// as anything. See `LanTransport.admit`.
+        case awaitOwnDeviceProof
         case transport
     }
+
+    /// How many Noise records the own-device proof exchange will read before
+    /// giving up. A proof always arrives as one; the slack is for a peer that
+    /// sends an empty frame first, not for one that streams.
+    static let maxOwnDeviceProofRecords = 4
 
     let address: String
     let serviceKey: String?
@@ -1394,6 +1478,18 @@ private final class LanConnection {
     /// Only that sweep may be credited with what this handshake finds -- see
     /// `LanTransport.markSweepFoundFriend`.
     let scanGeneration: UUID?
+
+    /// Who is on the far end of this socket, for a refusal log line (S3).
+    ///
+    /// The resolved path where the connection actually landed, falling back to
+    /// the endpoint it was created for. An accepted link's remote endpoint
+    /// carries the peer's ephemeral source port, which is useless for dialing
+    /// but is exactly what makes one refusal distinguishable from another in a
+    /// field capture.
+    var peerEndpointDescription: String {
+        String(describing: connection.currentPath?.remoteEndpoint ?? connection.endpoint)
+    }
+
     private(set) var wasAuthenticated = false
     /// The accepted contact this link authenticated as, for the transport's
     /// duplicate-link and unlinked-capable-contact checks.
@@ -1403,6 +1499,10 @@ private final class LanConnection {
     /// so this flag is the only handle the transport has for capping it --
     /// see `LanTransport.supersedeOtherOwnDeviceLinks`.
     private(set) var isOwnDevice = false
+    /// Which of this person's devices the far end proved it is, when the §10
+    /// step 5 roster proof named one. Nil both for a contact link and for the
+    /// clone case, which proves an identity rather than a device.
+    private(set) var ownDeviceId: Data?
     /// The Noise static key the peer proved it holds, captured as the
     /// handshake finishes so it stays readable after the session is closed.
     private(set) var remoteStaticKey: Data?
@@ -1422,6 +1522,12 @@ private final class LanConnection {
     private var receiveBuffer = Data()
     private var closed = false
     private var setupTimeout: DispatchWorkItem?
+    /// The responder's own proof, minted before the peer's is read and sent only
+    /// once that one verifies. Nil on the initiator, which has already sent its
+    /// own — the order is deliberately asymmetric so a stranger that dials us
+    /// learns nothing by asking.
+    private var pendingOwnDeviceProof: Data?
+    private var ownDeviceProofRecords = 0
 
     init(
         address: String,
@@ -1554,12 +1660,12 @@ private final class LanConnection {
         case .awaitMessage2:
             try noise.readHandshakeMessage(message: packet)
             guard let remoteStatic = noise.remoteStaticKey(),
-                  let admission = owner?.admit(remoteStaticKey: remoteStatic) else {
-                throw LanTransportError.untrustedPeer
+                  let verdict = owner?.admit(remoteStaticKey: remoteStatic) else {
+                throw refusal()
             }
             // Only a contact can already have a link: a device of our own is
             // never filed under a user id, so there is nothing to duplicate.
-            if case .contact(let userId) = admission,
+            if case .contact(let userId) = verdict,
                owner?.hasAuthenticatedLink(userId: userId) == true {
                 // Election fallbacks and sweeps may dial a contact that
                 // connected to us in the meantime. Close the redundant
@@ -1573,20 +1679,90 @@ private final class LanConnection {
                 abortedDuplicateLink = true
                 throw LanTransportError.duplicateLink
             }
+            // Message 3. The own-device proof is bound to this session's
+            // transcript hash, which is not final until this has gone out -- so
+            // unlike the contact arm, the handshake finishes before the
+            // admission question is answered. That costs nothing: Noise XX
+            // message 2 already hands our static key to anyone who dials us, so
+            // a stranger we dial learns nothing here it could not have had by
+            // dialing us instead.
             try sendPacket(noise.writeHandshakeMessage())
-            try authenticate(admission: admission)
+            switch verdict {
+            case .contact(let userId): try authenticate(admission: .contact(userId))
+            case .clone: try authenticate(admission: .ownDevice(deviceId: nil))
+            case .proveOwnDevice:
+                // The initiator proves first, and a responder that cannot
+                // verify it closes without answering.
+                try sendPacket(encryptedOwnDeviceProof())
+                phase = .awaitOwnDeviceProof
+            }
         case .awaitMessage3:
             try noise.readHandshakeMessage(message: packet)
             guard let remoteStatic = noise.remoteStaticKey(),
-                  let admission = owner?.admit(remoteStaticKey: remoteStatic) else {
-                throw LanTransportError.untrustedPeer
+                  let verdict = owner?.admit(remoteStaticKey: remoteStatic) else {
+                throw refusal()
             }
-            try authenticate(admission: admission)
+            switch verdict {
+            case .contact(let userId): try authenticate(admission: .contact(userId))
+            case .clone: try authenticate(admission: .ownDevice(deviceId: nil))
+            case .proveOwnDevice:
+                // Minted before the peer's is read, so a phone with no device
+                // key of its own refuses here rather than verifying a proof it
+                // could never answer.
+                pendingOwnDeviceProof = try encryptedOwnDeviceProof()
+                phase = .awaitOwnDeviceProof
+            }
+        case .awaitOwnDeviceProof:
+            // Bounded, because this is the one read a *stranger* can make this
+            // phone wait on: a proof is a hundred-odd bytes and always arrives
+            // as one record, so a peer still feeding partial records is
+            // stalling rather than proving. The setup timeout caps the wall
+            // clock alongside this.
+            ownDeviceProofRecords += 1
+            guard ownDeviceProofRecords <= LanConnection.maxOwnDeviceProofRecords else {
+                throw refusal()
+            }
+            guard let payload = try noise.decryptRecord(record: packet) else { return }
+            guard let hash = noise.handshakeHash(),
+                  let deviceId = owner?.openOwnDeviceProof(handshakeHash: hash, payload: payload)
+            else {
+                throw refusal()
+            }
+            if let ours = pendingOwnDeviceProof {
+                pendingOwnDeviceProof = nil
+                try sendPacket(ours)
+            }
+            try authenticate(admission: .ownDevice(deviceId: deviceId))
         case .transport:
             if let frame = try noise.decryptRecord(record: packet) {
                 owner?.connectionReceivedFrame(self, frame: frame)
             }
         }
+    }
+
+    /// This device's §10 step 5 proof for this session, already sealed into a
+    /// Noise record. Throws if there is no device key to sign with.
+    private func encryptedOwnDeviceProof() throws -> Data {
+        guard noise.isHandshakeFinished(),
+              let hash = noise.handshakeHash(),
+              let proof = owner?.mintOwnDeviceProof(handshakeHash: hash) else {
+            throw refusal()
+        }
+        // A proof is one record; `encryptFrame` returns a list because a general
+        // frame need not be, and a proof that somehow was not is not a proof.
+        let records = try noise.encryptFrame(frame: proof)
+        guard records.count == 1, let record = records.first else { throw refusal() }
+        return record
+    }
+
+    /// S3: the address is in the message, so a field log attributes each refusal
+    /// instead of leaving the sibling and the neighbour's phone
+    /// indistinguishable. The 2026-08-24 capture could not tell 25 refusals of a
+    /// sibling from 25 refusals of an unrelated household device, and that
+    /// ambiguity cost a whole investigation cycle.
+    private func refusal() -> LanTransportError {
+        owner?.logRefusedPeer(peerEndpointDescription)
+        return LanTransportError.untrustedPeer
     }
 
     private func authenticate(admission: LanAdmission) throws {
@@ -1600,7 +1776,10 @@ private final class LanConnection {
         // router's user id for an address -- is asking about a peer, and this
         // link has none.
         if case .contact(let userId) = admission { authenticatedUserId = userId }
-        isOwnDevice = admission == .ownDevice
+        if case .ownDevice(let deviceId) = admission {
+            isOwnDevice = true
+            ownDeviceId = deviceId
+        }
         remoteStaticKey = noise.remoteStaticKey()
         setupTimeout?.cancel()
         setupTimeout = nil
@@ -1631,6 +1810,12 @@ private enum LanWire {
     static let maxPacketSize = 65_535
 }
 
+/// Lowercase hex, for log lines that name a device by its id. Ids are derived
+/// from public keys, so this never renders a secret.
+private func lanHex(_ data: Data) -> String {
+    data.map { String(format: "%02x", $0) }.joined()
+}
+
 private enum LanTransportError: Error {
     case incompleteHandshake
     case invalidPacketLength
@@ -1647,7 +1832,28 @@ private enum LanTransportError: Error {
 /// as it was before §10 step 5 existed.
 enum LanAdmission: Equatable {
     case contact(Data)
-    case ownDevice
+    /// A device of this person's own. `deviceId` is *which* one, when the §10
+    /// step 5 roster proof named it; nil for the clone case, which proves an
+    /// identity rather than a device.
+    case ownDevice(deviceId: Data?)
+}
+
+/// What the static keys alone can settle about a finished handshake, before any
+/// §10 step 5 proof is exchanged.
+///
+/// The third case is the one that matters: it is not a refusal. A peer that is
+/// neither a contact nor a clone used to be hung up on here, and that single
+/// decision is why a removed phone could sit on the same Wi-Fi as the phone that
+/// removed it for 22 minutes without being told. Mirrors Android's
+/// `LanTransport.acceptOwnDeviceOrRefuse`.
+enum LanHandshakeVerdict: Equatable {
+    case contact(Data)
+    /// The peer's Noise static *is* this identity's own agreement key, so it
+    /// holds this person's identity outright — a `.cmbak` restore.
+    case clone
+    /// Nobody the keys can name. Owed a roster proof, and refused if it cannot
+    /// produce one.
+    case proveOwnDevice
 }
 
 func trustedLanPeerUserId(contacts: [Contact], remoteStaticKey: Data) -> Data? {

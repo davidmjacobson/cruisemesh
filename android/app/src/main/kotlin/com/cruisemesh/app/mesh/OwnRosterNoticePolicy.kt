@@ -10,12 +10,28 @@ package com.cruisemesh.app.mesh
  * `encode_own_roster` rather than leaving it to a call site. Core cannot enforce
  * it: a Noise static key is a thing this shell holds and core has never seen.
  *
- * The bar is the one the clone guard already uses: a LAN link whose Noise
- * session key is this identity's own agreement key. Only a device holding this
- * person's own secret can present that, which is exactly the set the notice is
- * for. A cleartext BLE HELLO cannot clear it and is not meant to — a removed
- * device that only ever meets its fleet over BLE does not converge, and the spec
- * records that rather than weakening the test.
+ * The bar is what the LAN transport established during the handshake, and it has
+ * two arms:
+ *
+ * - **A roster proof.** The peer signed this session's Noise transcript hash with
+ *   a device signing key this person's roster names
+ *   (`core_own_device_lan_proof_open`), live or tombstoned. Every genuine sibling
+ *   takes this arm.
+ * - **The clone test.** The peer's Noise session key *is* this identity's own
+ *   agreement key, so it holds this person's identity outright — a `.cmbak`
+ *   restore. Kept, because such a device already holds everything a roster could
+ *   tell it.
+ *
+ * **The clone test alone used to be the whole bar, and that was a defect.** §9's
+ * ceremony gives a linked device keys of its own and withholds the person root
+ * secret, so two genuine siblings share no private key at all: the test admitted
+ * the clone case and refused every real sibling, in both roles. A 2026-08-24
+ * two-phone capture is the record of it — 25 refusals across 15 minutes on one
+ * `/24`, no own-device link ever formed, and a removed phone that never learned.
+ *
+ * A cleartext BLE HELLO clears neither arm and is not meant to — a removed device
+ * that only ever meets its fleet over BLE does not converge, and the spec records
+ * that rather than weakening the test.
  *
  * Enforced on **both** directions. On send, or a stranger who claims our user id
  * in a HELLO could ask us how many devices we have and what their keys are. On
@@ -37,12 +53,24 @@ internal object OwnRosterNoticePolicy {
     /**
      * Whether a notice may cross this link at all — the test that must pass
      * before one is written to it, and again before one read from it is opened.
+     *
+     * @param provenOwnDeviceId which of this person's devices the far end proved
+     *   it is during the handshake, or null if it proved no such thing. Not a
+     *   claim off the wire: the transport hands over only what
+     *   `core_own_device_lan_proof_open` returned for *this* session's
+     *   transcript, so a value here is a signature this person's roster vouches
+     *   for and nothing weaker.
      */
     fun mayCross(
         isLanLink: Boolean,
         ownAgreePk: ByteArray,
         sessionRemoteStaticKey: ByteArray?,
-    ): Boolean = ownIdentityHelloIsAuthenticated(isLanLink, ownAgreePk, sessionRemoteStaticKey)
+        provenOwnDeviceId: ByteArray?,
+    ): Boolean {
+        if (!isLanLink) return false
+        if (provenOwnDeviceId != null) return true
+        return ownIdentityHelloIsAuthenticated(true, ownAgreePk, sessionRemoteStaticKey)
+    }
 
     /**
      * Whether this peer's HELLO2 said it understands the frame.

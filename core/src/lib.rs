@@ -126,13 +126,15 @@ pub use device_link::restore::{
 pub use device_roster::{
     core_decode_device_keypair, core_decode_roster, core_derive_device_id, core_device_add_outcome,
     core_device_namespace_id, core_device_sign, core_device_stream_id, core_device_verify,
-    core_encode_device_keypair, core_encode_roster, core_legacy_device_id, core_own_identity_peer,
-    core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_validate,
-    core_sign_device_cert, core_sign_roster, core_verify_device_cert, generate_device_keypair,
-    CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain,
-    DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
-    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
-    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
+    core_encode_device_keypair, core_encode_roster, core_legacy_device_id,
+    core_own_device_lan_proof, core_own_device_lan_proof_open, core_own_identity_peer,
+    core_roster_accept, core_roster_device_ids, core_roster_head_hash,
+    core_roster_person_root_sign_pk, core_roster_validate, core_sign_device_cert, core_sign_roster,
+    core_verify_device_cert, generate_device_keypair, CoreLanOwnDeviceProof, CoreOwnIdentityPeer,
+    DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain, DeviceTombstone,
+    OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision, RosterUpdateOutcome,
+    RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP,
+    DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
     ROSTER_MAX_VERSION_JUMP,
 };
 pub use engine::{

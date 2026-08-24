@@ -400,6 +400,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 }
                 self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
                 return nil
+            },
+            ownDeviceLanProof: { [weak self] handshakeHash in
+                self?.ownDeviceLanProof(handshakeHash: handshakeHash)
+            },
+            openOwnDeviceLanProof: { [weak self] handshakeHash, payload in
+                self?.openOwnDeviceLanProof(handshakeHash: handshakeHash, payload: payload)
             }
         )
         lanTransport = lan
@@ -1172,40 +1178,105 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         sendHello(address: address)
     }
 
-    /// A HELLO claiming our user id is either the `.cmbak`-clone meeting or one
-    /// of this person's own devices, and the frame alone cannot tell: a user id
-    /// is a claim, and the proof is the Noise static key the link's peer actually
-    /// holds (`ownIdentityLinkIsProven`).
+    /// Whether this HELLO came from this person rather than from a peer — in
+    /// which case it must not become a route, because a route to this person
+    /// leads back to this phone.
     ///
-    /// Whichever it is, it must not become a route — a route to this person leads
-    /// back to this phone — so this returns true for both and the caller stops.
+    /// Two ways that can be true, and **the second one is why the 2026-08-24
+    /// field failure survived every other repair.**
+    ///
+    /// - *The link proved it* (`ownIdentityLinkIsProven`). This is the sibling
+    ///   case, and it is the only one that ever happens between two devices §9
+    ///   linked. The old test could not see it: it asked whether the HELLO
+    ///   *claimed our user id*, and a linked device has a user id of its own —
+    ///   derived from its own signing key, because the ceremony never hands over
+    ///   the person's. So a sibling's HELLO2 read as a stranger's, the roster
+    ///   notice schedule never learned its capability bits, and
+    ///   `dueCapabilities` returned nil forever.
+    /// - *The frame claims our user id*, proven or not. That is the
+    ///   `.cmbak`-clone meeting, or somebody asserting our identity on a
+    ///   cleartext BLE HELLO. Both must be kept off the router; only the first is
+    ///   believed anywhere else, and `ownIdentityLinkIsProven` separates them.
+    ///
     /// The clone warning is not recorded here: the LAN handshake raised it one
     /// moment earlier for exactly this link
     /// (`recordOwnIdentityCloneIfAuthenticated`), and raising it again would
-    /// count one meeting twice. An unproven claim — a cleartext BLE HELLO, or a
-    /// LAN link authenticated as some other peer — is logged and dropped.
+    /// count one meeting twice.
+    ///
+    /// Mirrors Android's `MeshService.noteOwnIdentityHello`.
     @discardableResult
     private func noteOwnIdentityHello(address: String, userId: Data, identity: Identity) -> Bool {
+        if ownIdentityLinkIsProven(address: address, identity: identity) { return true }
         guard userId == identity.userId else { return false }
-        if !ownIdentityLinkIsProven(address: address, identity: identity) {
-            log.warning("Ignoring unauthenticated HELLO that claims our identity")
-        }
+        log.warning("Ignoring unauthenticated HELLO that claims our identity")
         return true
     }
 
-    /// Whether this link has proved, cryptographically, that the other end holds
-    /// this person's own agreement secret.
+    /// This device's §10 step 5 proof for one finished LAN Noise session: a
+    /// signature over that session's transcript hash under this device's roster
+    /// signing key.
     ///
-    /// The bar the clone warning already used, hoisted so §10 step 5's roster
-    /// notice is held to exactly the same one rather than to a second copy of it
-    /// that could drift. A cleartext BLE HELLO never clears it.
+    /// Nil on an install that has never linked — no device key means no
+    /// certificate in anybody's roster, so there is no sibling that could
+    /// recognise this phone and nothing a proof could assert.
+    ///
+    /// Mirrors Android's `MeshService.ownDeviceLanProof`.
+    private func ownDeviceLanProof(handshakeHash: Data) -> Data? {
+        guard let device = DeviceKeyStore.load() else { return nil }
+        do {
+            return try coreOwnDeviceLanProof(
+                deviceSignSk: device.signSk,
+                handshakeHash: handshakeHash
+            )
+        } catch {
+            log.warning("Could not sign this phone's own-device proof")
+            return nil
+        }
+    }
+
+    /// Which of this person's devices the far end of a LAN session just proved it
+    /// is, checked against the roster this phone holds.
+    ///
+    /// Nil for everything else, which is the overwhelming majority of what dials
+    /// a phone on a shared Wi-Fi. The roster is the only place the answer comes
+    /// from and it names nobody but this person's own devices, live and buried —
+    /// a tombstoned one answers here on purpose, because it is the device the
+    /// notice exists for.
+    ///
+    /// Mirrors Android's `MeshService.openOwnDeviceLanProof`.
+    private func openOwnDeviceLanProof(
+        handshakeHash: Data,
+        payload: Data
+    ) -> CoreLanOwnDeviceProof? {
+        guard let roster = try? store.ownRoster() else { return nil }
+        return coreOwnDeviceLanProofOpen(
+            roster: roster,
+            handshakeHash: handshakeHash,
+            payload: payload
+        )
+    }
+
+    /// Whether this link has proved, cryptographically, that the other end is
+    /// this person's — either one of their devices or a clone of their identity.
+    ///
+    /// **This used to ask only the clone question**, and that is the second half
+    /// of the 2026-08-24 field failure. Even with the transport's admission gate
+    /// repaired, a sibling link would have been admitted and then found
+    /// ineligible here, because a §9-linked device holds an agreement key of its
+    /// own and can never present ours. The notice would have crossed no link at
+    /// all, for exactly the reason it crossed none before.
+    ///
+    /// So the bar is what the transport actually established: a LAN link it
+    /// admitted as one of this person's own, by roster proof or by the clone
+    /// test, and nothing else. A cleartext BLE HELLO still never clears it.
     private func ownIdentityLinkIsProven(address: String, identity: Identity) -> Bool {
         let isLanLink = MeshRouter.transportFor(address: address) == .lan
-        let sessionKey = isLanLink ? lanTransport?.remoteStaticKey(address: address) : nil
+        let transport = isLanLink ? lanTransport : nil
         return OwnRosterNoticePolicy.mayCross(
             isLanLink: isLanLink,
             ownAgreePk: identity.agreePk,
-            sessionRemoteStaticKey: sessionKey
+            sessionRemoteStaticKey: transport?.remoteStaticKey(address: address),
+            provenOwnDeviceId: transport?.ownDeviceId(address: address)
         )
     }
 

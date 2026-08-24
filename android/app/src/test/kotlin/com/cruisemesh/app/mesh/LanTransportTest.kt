@@ -273,6 +273,42 @@ class LanTransportTest {
         assertEquals(listOf(self, peer), remoteLanEndpoints(null, listOf(self, peer)))
     }
 
+    /**
+     * IPv4 is dialed before anything else (S1).
+     *
+     * `NsdServiceInfo.hostAddresses` comes back unsorted, and a phone that
+     * publishes both an IPv4 address and a Wi-Fi link-local IPv6 one can hand
+     * either first. A 2026-08-24 field log recorded the cost: the resolver named
+     * `192.168.86.37:45892` and the very next line was an `ECONNREFUSED` against
+     * a `fe80::` address, which read as an address-family bug and sent a whole
+     * investigation after one that was not there.
+     *
+     * This does not decide reachability -- every CruiseMesh listener binds the
+     * wildcard, so a peer reachable at all is reachable on IPv4. It decides
+     * which attempt pays the latency, and it keeps the log honest.
+     */
+    @Test
+    fun `resolved addresses are dialed IPv4 first, stably within each family`() {
+        val v4 = InetSocketAddress("192.168.86.37", 45_892)
+        val v4Second = InetSocketAddress("192.168.86.38", 45_892)
+        val linkLocal = InetSocketAddress("fe80::c88e:72ff:feba:12c9", 45_892)
+        val globalV6 = InetSocketAddress("2001:db8::1", 45_892)
+
+        assertEquals(
+            listOf(v4, linkLocal),
+            orderedLanDialCandidates(listOf(linkLocal, v4)),
+        )
+        // Stable within each family: nothing else about the platform's
+        // ordering changes.
+        assertEquals(
+            listOf(v4, v4Second, linkLocal, globalV6),
+            orderedLanDialCandidates(listOf(linkLocal, v4, globalV6, v4Second)),
+        )
+        // Nothing to reorder is not an error.
+        assertEquals(emptyList<InetSocketAddress>(), orderedLanDialCandidates(emptyList()))
+        assertEquals(listOf(linkLocal), orderedLanDialCandidates(listOf(linkLocal)))
+    }
+
     @Test
     fun `a remembered target that now points at this phone is dropped, not dialed`() {
         // The field failure: the phone restarts as it joins a Wi-Fi network,
