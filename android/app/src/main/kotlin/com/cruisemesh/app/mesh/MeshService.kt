@@ -365,6 +365,17 @@ class MeshService : Service() {
      * time so an entry going stale needs no refresh at all.
      */
     @Volatile private var lanCapableContacts: Map<String, Long> = emptyMap()
+
+    /**
+     * How many devices this person's own roster lists besides this one, cached
+     * for the same reason [lanCapableContacts] is: the LAN transport's
+     * automatic-scan gate asks for it on the main handler every few seconds.
+     * Refreshed off the main thread by [refreshLanCapableContacts].
+     */
+    @Volatile private var ownRosterSiblingCount: Int = 0
+
+    /** §10 step 5's re-offer bookkeeping; see [OwnRosterNoticeSchedule]. */
+    private val ownRosterNoticeSchedule = OwnRosterNoticeSchedule()
     private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
@@ -691,6 +702,7 @@ class MeshService : Service() {
                     }
             },
             unlinkedCapableContacts = ::countUnlinkedCapableContacts,
+            unlinkedOwnDevices = ::countUnlinkedOwnDevices,
             onNetworkReady = ::onLanNetworkReady,
             onEndpointObserved = { userId, endpoint, networkId ->
                 // An address the contact hinted at, already checked against
@@ -838,6 +850,7 @@ class MeshService : Service() {
         // way, so there is nothing to await synchronously here.
         storeExecutor.shutdown()
         lanHealthTracker.clear()
+        ownRosterNoticeSchedule.clear()
         RelaySyncEvents.unregister()
         LinkVisibility.unregister()
         stopMeshRoles()
@@ -1387,6 +1400,7 @@ class MeshService : Service() {
     }
 
     private fun onLanPeerDisconnected(address: String) {
+        ownRosterNoticeSchedule.forget(address)
         val peerUserId = MeshRouter.userIdFor(address)
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
@@ -1639,6 +1653,10 @@ class MeshService : Service() {
                     // A device of this person's own, on a link that has proved
                     // it: §10 step 5's meeting. Here rather than in the legacy
                     // HELLO branch because the capability bits only ride 0x06.
+                    // Remembered as well as acted on: the meeting is the only
+                    // moment those bits cross the wire, and [checkLanHealth]
+                    // re-offers on this link long after it.
+                    ownRosterNoticeSchedule.noteHello2(address, parsed.capabilities)
                     offerOwnRosterNotice(address, parsed.capabilities, identity)
                 } else {
                     MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
@@ -1739,10 +1757,25 @@ class MeshService : Service() {
     }
 
     /**
-     * Rebuilds [lanCapableContacts] off the main thread. Called whenever a
-     * peer demonstrates LAN support and on the periodic LAN health tick, so
-     * a deleted or blocked contact drops out of the sweep gate without any
-     * extra plumbing from the screens that delete or block.
+     * The LAN transport's other sweep motive: how many devices this person's
+     * own roster lists that are not on an own-device link right now.
+     *
+     * A sibling shares this person's user id, so it has no contact row and can
+     * never show up in [countUnlinkedCapableContacts] however long it waits.
+     * Without a motive of its own, a phone whose only missing peer is its
+     * other phone never sweeps for it -- leaving mDNS as the single channel
+     * between two devices of one person, which is what the field capture
+     * caught failing.
+     */
+    private fun countUnlinkedOwnDevices(): Int =
+        (ownRosterSiblingCount - MeshRouter.ownDeviceLinks().size).coerceAtLeast(0)
+
+    /**
+     * Rebuilds [lanCapableContacts] and [ownRosterSiblingCount] off the main
+     * thread. Called whenever a peer demonstrates LAN support and on the
+     * periodic LAN health tick, so a deleted or blocked contact drops out of
+     * the sweep gate without any extra plumbing from the screens that delete
+     * or block -- and so does a device this person has just removed.
      */
     private fun refreshLanCapableContacts() {
         runOnStoreExecutor("lan capability cache") {
@@ -1756,16 +1789,35 @@ class MeshService : Service() {
                         ?.let { userIdHex to it }
                 }
                 .toMap()
+            ownRosterSiblingCount = runCatching {
+                val fleet = store.ownDeviceFleet()
+                (fleet.deviceIds.size - if (fleet.ownDeviceId != null) 1 else 0).coerceAtLeast(0)
+            }.getOrDefault(0)
         }
     }
 
     private fun checkLanHealth() {
         refreshLanCapableContacts()
-        for (route in MeshRouter.identifiedRoutes()) {
-            if (route.transport != MeshRouterState.Transport.LAN) continue
-            when (val decision = nextLanHealthDecision(route.address)) {
+        val lanAddresses = MeshRouter.identifiedRoutes()
+            .asSequence()
+            .filter { it.transport == MeshRouterState.Transport.LAN }
+            .map { it.address }
+            .toMutableList()
+        // A link to one of this person's own devices is never a route, so it
+        // was in none of the accessors this loop used to read -- and a link
+        // nothing probes is a link nothing closes. Established links run with
+        // no socket read timeout, so a half-open one held its socket, carried
+        // no frames, and (being a live connection) told the LAN transport it
+        // had company, for the whole Wi-Fi join. That is the state an
+        // approving phone sat in for 26 minutes while the device it had
+        // removed waited to be told.
+        MeshRouter.ownDeviceLinks()
+            .filter { (transport, _) -> transport == MeshRouterState.Transport.LAN }
+            .mapTo(lanAddresses) { (_, address) -> address }
+        for (address in lanAddresses) {
+            when (val decision = nextLanHealthDecision(address)) {
                 is LanHealthTracker.Decision.Send -> MeshRouter.sendToAddress(
-                    route.address,
+                    address,
                     encodeTransportProbe(decision.nonce, response = false),
                 )
                 LanHealthTracker.Decision.Wait -> Unit
@@ -1773,9 +1825,31 @@ class MeshService : Service() {
                     LanTransportDiagnostics.probeFailed(
                         "Encrypted LAN heartbeat timed out; reconnecting",
                     )
-                    lanTransport?.closeLink(route.address)
+                    lanTransport?.closeLink(address)
                 }
             }
+        }
+        reofferOwnRosterNotices()
+    }
+
+    /**
+     * **§10 step 5, level-triggered.** Re-offer this person's roster on every
+     * live own-device link that is due one.
+     *
+     * The notice shipped edge-triggered on an inbound HELLO2 and nothing else,
+     * so a removal that happened while a sibling link was *already up* was
+     * never announced on it. Nothing else in either shell pushed one: no
+     * roster-change hook, no periodic re-offer, and HELLO is sent only when a
+     * link is established. See [OwnRosterNoticeSchedule] for why this is a
+     * timer rather than an event.
+     */
+    private fun reofferOwnRosterNotices() {
+        val identity = this.identity ?: return
+        val nowMs = System.currentTimeMillis()
+        for ((transport, address) in MeshRouter.ownDeviceLinks()) {
+            if (transport != MeshRouterState.Transport.LAN) continue
+            val capabilities = ownRosterNoticeSchedule.dueCapabilities(address, nowMs) ?: continue
+            offerOwnRosterNotice(address, capabilities, identity)
         }
     }
 
@@ -1885,6 +1959,7 @@ class MeshService : Service() {
         runOnStoreExecutor("own-roster notice") {
             val frame = store.ownRosterNoticeFrame() ?: return@runOnStoreExecutor
             MeshRouter.sendToAddress(address, frame)
+            ownRosterNoticeSchedule.noteOffered(address, System.currentTimeMillis())
             Log.i(TAG, "Sent our device list to another device of ours on $address")
         }
     }

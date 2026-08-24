@@ -42,6 +42,9 @@ import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanNoiseSession
+import uniffi.cruisemesh_core.coreLanHostIsReachableEndpoint
+import uniffi.cruisemesh_core.coreLanReconnectTargetIsExhausted
+import uniffi.cruisemesh_core.coreLanScanGateOpen
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import uniffi.cruisemesh_core.lanHostsAreSameAddress
 import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
@@ -59,6 +62,17 @@ internal class LanTransport(
     private val identity: Identity,
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
     private val unlinkedCapableContacts: () -> Int,
+    /**
+     * How many devices this person's own roster lists that are not on an
+     * own-device link right now (`specs/multi-device-v1.md` §10 step 5).
+     *
+     * A sibling shares this person's user id, so it has no contact row and
+     * cannot appear in [unlinkedCapableContacts] however hard it looks for us.
+     * Without a motive of its own a phone whose only missing peer is its other
+     * phone never sweeps, and mDNS is left as the sole channel between them --
+     * which is precisely the state the field capture caught.
+     */
+    private val unlinkedOwnDevices: () -> Int,
     private val onNetworkReady: (Frame.LanEndpoint, networkId: String?) -> Unit,
     private val onEndpointObserved: (
         userId: ByteArray,
@@ -163,6 +177,11 @@ internal class LanTransport(
     // channel shut.
     private val ownDeviceLinks = ConcurrentHashMap.newKeySet<String>()
 
+    // Connection keys whose address has completed a Noise handshake at least
+    // once on this network join. Only such a key's reconnect target survives
+    // an unbounded run of failures; see [retireExhaustedReconnectTarget].
+    private val provenReconnectKeys = ConcurrentHashMap.newKeySet<String>()
+
     // Consecutive completed sweeps whose verdict was ISOLATION_SUSPECTED. A
     // single congested sweep can look isolated (every probe timing out), so
     // the planner is only told to back off to its cap once the verdict
@@ -218,13 +237,18 @@ internal class LanTransport(
         if (!started || wifiNetwork == null) return@Runnable
         if (
             shouldRunAutomaticLanScan(
-                activeConnections = connections.size,
+                // Own-device links are subtracted deliberately: one is not a
+                // friend on this Wi-Fi, and being route-less it also sat
+                // outside checkLanHealth until this change, so a half-open one
+                // could read as company for the whole Wi-Fi join.
+                peerLinks = connections.size - ownDeviceLinks.size,
                 pendingOutboundAttempts = pendingLanOutboundAttempts(
                     outboundServiceKeys,
                     authenticatedOutboundKeys,
                 ),
                 scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
                 unlinkedCapableContacts = unlinkedCapableContacts(),
+                unlinkedOwnDevices = unlinkedOwnDevices(),
             )
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
@@ -233,6 +257,21 @@ internal class LanTransport(
             }
         }
         scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
+    }
+
+    // Set when [openListener] could not take the default TCP port. Main
+    // handler only, alongside the rest of the per-network session state.
+    private var listeningOnFallbackPort = false
+
+    private val defaultPortRebindRunnable = Runnable {
+        val network = wifiNetwork
+        if (!started || network == null || !listeningOnFallbackPort) return@Runnable
+        if (defaultLanPortIsFree()) {
+            Log.i(TAG, "The usual local Wi-Fi port is free again; moving the listener back")
+            restartNetworkSession(network)
+        } else {
+            scheduleDefaultPortRebind()
+        }
     }
 
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
@@ -648,6 +687,7 @@ internal class LanTransport(
 
         val listener = openListener() ?: return
         serverSocket = listener
+        listeningOnFallbackPort = listener.localPort != lanDefaultTcpPort().toInt()
         acceptExecutor.execute { acceptLoop(listener) }
 
         // The opaque token is also the cross-platform connection-election
@@ -708,6 +748,33 @@ internal class LanTransport(
         scanPlanner.onNetworkJoined(System.currentTimeMillis())
         LanTransportDiagnostics.networkJoined()
         scheduleAutomaticSubnetScan(AUTO_SCAN_INITIAL_DELAY_MS)
+        if (listeningOnFallbackPort) scheduleDefaultPortRebind()
+    }
+
+    /**
+     * A listener that had to settle for a fallback port is not merely untidy:
+     * a subnet sweep probes [lanDefaultTcpPort] and nothing else, so this
+     * phone is invisible to every other phone's fallback search for as long as
+     * it stays there -- mDNS becomes the only channel that can find it, and
+     * the field capture is what one stale mDNS record does to that.
+     *
+     * The port is usually taken by this app's own previous process during a
+     * restart, so it frees itself within seconds. Re-taking it means
+     * re-advertising, which is what [restartNetworkSession] does.
+     */
+    private fun scheduleDefaultPortRebind() {
+        mainHandler.removeCallbacks(defaultPortRebindRunnable)
+        mainHandler.postDelayed(defaultPortRebindRunnable, DEFAULT_PORT_REBIND_RETRY_MS)
+    }
+
+    private fun defaultLanPortIsFree(): Boolean = try {
+        ServerSocket().use { probe ->
+            probe.reuseAddress = true
+            probe.bind(InetSocketAddress(lanDefaultTcpPort().toInt()))
+        }
+        true
+    } catch (_: IOException) {
+        false
     }
 
     private fun openListener(): ServerSocket? {
@@ -874,6 +941,7 @@ internal class LanTransport(
                     // answer, so it is unproven again -- retire it rather than
                     // let one good handshake license a standing probe.
                     if (isSingleShotLanConnectKey(key)) reconnectTargets.remove(key)
+                    retireExhaustedReconnectTarget(key)
                     scheduleReconnect(key)
                     // A failed direct connect is exactly when a fallback
                     // sweep becomes worth checking promptly, instead of
@@ -1098,7 +1166,12 @@ internal class LanTransport(
             } else {
                 onOwnDeviceAuthenticated(address)
             }
-            outboundServiceKey?.let(connectionBackoff::recordSuccess)
+            outboundServiceKey?.let {
+                connectionBackoff.recordSuccess(it)
+                // Proof this address is real, which is what buys its reconnect
+                // target the right to be retried without a ceiling.
+                provenReconnectKeys += it
+            }
             authenticated = true
             if (outboundServiceKey != null) {
                 // Every key that reached a finished handshake, contact or own
@@ -1108,10 +1181,15 @@ internal class LanTransport(
                 // out left that count stuck at one and shut the sweep off for
                 // as long as the two phones stayed linked.
                 authenticatedOutboundKeys += outboundServiceKey
-                if (trustedUserId != null && outboundServiceKey.startsWith("scan:")) {
-                    // Only an authenticated friend counts as a sweep find --
-                    // see onScanCompleted. Harmless no-op if the sweep has
-                    // already completed or been replaced.
+                if (outboundServiceKey.startsWith("scan:")) {
+                    // A completed handshake -- a friend, or one of this
+                    // person's own devices -- is what counts as a sweep find;
+                    // a bare TCP connect to some unrelated service still does
+                    // not (see onScanCompleted). A sibling answering proves
+                    // discovery works on this network exactly as a contact
+                    // does, so it must not leave the expensive full tier
+                    // armed. Harmless no-op if the sweep has already completed
+                    // or been replaced.
                     markSweepFoundFriend(sweep)
                 }
             }
@@ -1182,6 +1260,7 @@ internal class LanTransport(
                     reconnectTargets.remove(it)
                 } else if (shouldRetainLanReconnectTarget(it, authenticated)) {
                     connectionBackoff.recordFailure(it, System.currentTimeMillis())
+                    retireExhaustedReconnectTarget(it)
                     scheduleReconnect(it)
                 } else {
                     reconnectTargets.remove(it)
@@ -1254,6 +1333,32 @@ internal class LanTransport(
             },
             delayMs,
         )
+    }
+
+    /**
+     * Drop a reconnect target whose address has failed often enough, and has
+     * never once answered, that retrying it is only costing battery.
+     *
+     * The rule is core's ([coreLanReconnectTargetIsExhausted]); this supplies
+     * the two facts. Nothing here can strand a working link: a key that
+     * completed a handshake is in [provenReconnectKeys] and keeps its target
+     * forever, and an unproven address that is genuinely there is re-created
+     * as a target by the next mDNS resolution or sweep hit.
+     */
+    private fun retireExhaustedReconnectTarget(serviceKey: String) {
+        if (
+            !coreLanReconnectTargetIsExhausted(
+                everAuthenticated = serviceKey in provenReconnectKeys,
+                consecutiveFailures = connectionBackoff.failureCount(serviceKey)
+                    .coerceAtLeast(0)
+                    .toUInt(),
+            )
+        ) {
+            return
+        }
+        if (reconnectTargets.remove(serviceKey) != null) {
+            Log.i(TAG, "Giving up on a local Wi-Fi address that never answered")
+        }
     }
 
     private fun rememberReconnectTarget(
@@ -1571,6 +1676,8 @@ internal class LanTransport(
 
     private fun teardownNetworkSession() {
         mainHandler.removeCallbacks(automaticScanRunnable)
+        mainHandler.removeCallbacks(defaultPortRebindRunnable)
+        listeningOnFallbackPort = false
         scanPlanner.onNetworkLost()
         scanBuildGate.reset {
             runningSweep = null
@@ -1593,6 +1700,7 @@ internal class LanTransport(
         electionFallbackKeys.clear()
         consecutiveIsolationVerdicts.set(0)
         authenticatedOutboundKeys.clear()
+        provenReconnectKeys.clear()
         reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
@@ -1682,13 +1790,31 @@ internal class LanTransport(
         return lanHostIsOwnDevice(ownLanHostAddresses(), remoteHost)
     }
 
+    /**
+     * The address this phone publishes as its own -- in mDNS, in the endpoint
+     * hint, and as the self-address filter every dial is checked against.
+     *
+     * IPv4 first, then any other address another phone could actually dial.
+     * The old fallback was "whatever is left", which on a Wi-Fi join that has
+     * not produced an IPv4 address yet is an `fe80::/10` link-local one. That
+     * is a local address but not a reachable one: it resolves only against the
+     * *dialer's* scope id, so publishing it hands every peer a target that can
+     * never answer. One of those was observed in the field being retried for
+     * half an hour while the phone it belonged to sat on the same Wi-Fi.
+     *
+     * Publishing nothing is the honest alternative: discovery still runs, and
+     * the next link-property change re-runs this with a real address.
+     */
     private fun localEndpoint(network: Network, port: Int): LanManualEndpoint? {
         val addresses = connectivityManager.getLinkProperties(network)
             ?.linkAddresses
             ?.map { it.address }
             ?.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress }
             .orEmpty()
-        val address = addresses.firstOrNull { it is Inet4Address } ?: addresses.firstOrNull()
+        val address = addresses.firstOrNull { it is Inet4Address }
+            ?: addresses.firstOrNull { candidate ->
+                candidate.hostAddress?.let(::coreLanHostIsReachableEndpoint) == true
+            }
         return address?.hostAddress?.let { LanManualEndpoint(it, port) }
     }
 
@@ -1864,6 +1990,14 @@ internal class LanTransport(
         // so this recheck will usually find nothing due yet.
         private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
+
+        // How often a listener that had to settle for a fallback port checks
+        // whether the default one has come free. See [openListener]: a phone
+        // on a fallback port is invisible to every other phone's subnet
+        // sweep, which probes the default port and nothing else, so this is
+        // not a cosmetic tidy-up -- it is the difference between being
+        // findable on this Wi-Fi and being findable only through mDNS.
+        private const val DEFAULT_PORT_REBIND_RETRY_MS = 60_000L
         private const val MAX_PACKET_SIZE = 65_535
         private fun writePacket(output: DataOutputStream, bytes: ByteArray) {
             require(bytes.isNotEmpty() && bytes.size <= MAX_PACKET_SIZE)
@@ -2102,23 +2236,26 @@ internal fun lanCapabilityMotivatesScan(
 internal const val LAN_CAPABILITY_RECENCY_WINDOW_MS = 14L * 24 * 60 * 60 * 1_000
 
 /**
- * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
- * is worthwhile while the transport has no links at all, OR while some
- * contact that has recently demonstrated LAN support still has no
- * authenticated LAN link ([lanCapabilityMotivatesScan]) -- one connected
- * family member must not stop discovery of the rest.
- * In-flight work (pending outbound attempts, a running sweep) always defers.
+ * Whether the periodic check may claim a scan from [LanScanPlanner].
+ *
+ * The rule itself is core's ([uniffi.cruisemesh_core.coreLanScanGateOpen]) --
+ * both shells owned a copy each, and the copies drifted into the multi-device
+ * bug the core doc now names. This is the counting: negatives clamped to zero
+ * so a miscount slows discovery down instead of disabling it.
  */
 internal fun shouldRunAutomaticLanScan(
-    activeConnections: Int,
+    peerLinks: Int,
     pendingOutboundAttempts: Int,
     scanRemaining: Int,
     unlinkedCapableContacts: Int,
-): Boolean = (activeConnections == 0 || unlinkedCapableContacts > 0) &&
-    // <= 0, not == 0: a caller that ever miscounts in-flight work low must
-    // slow discovery down, never disable it.
-    pendingOutboundAttempts <= 0 &&
-    scanRemaining <= 0
+    unlinkedOwnDevices: Int,
+): Boolean = coreLanScanGateOpen(
+    peerLinks = peerLinks.coerceAtLeast(0).toUInt(),
+    unlinkedCapableContacts = unlinkedCapableContacts.coerceAtLeast(0).toUInt(),
+    unlinkedOwnDevices = unlinkedOwnDevices.coerceAtLeast(0).toUInt(),
+    pendingOutboundAttempts = pendingOutboundAttempts.coerceAtLeast(0).toUInt(),
+    scanRemaining = scanRemaining.coerceAtLeast(0).toUInt(),
+)
 
 /**
  * Whether a closed link's reconnect target survives the close.

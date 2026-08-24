@@ -8,6 +8,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.coreLanReconnectTargetIsExhausted
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 import uniffi.cruisemesh_core.lanServiceType
@@ -355,32 +356,99 @@ class LanTransportTest {
 
     @Test
     fun `automatic subnet fallback runs only while LAN discovery is idle`() {
-        assertTrue(shouldRunAutomaticLanScan(0, 0, 0, 0))
-        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0))
-        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0, 0))
-        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, 0, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 1, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 12, 0, 0))
     }
 
     @Test
     fun `automatic subnet fallback gate rejects when every busy signal is set`() {
-        assertTrue(!shouldRunAutomaticLanScan(2, 3, 41, 0))
+        assertTrue(!shouldRunAutomaticLanScan(2, 3, 41, 0, 0))
     }
 
     @Test
     fun `automatic subnet fallback gate treats one remaining scan host as busy`() {
-        assertTrue(!shouldRunAutomaticLanScan(0, 0, 1, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, 0, 1, 0, 0))
     }
 
     @Test
     fun `an unlinked LAN-capable contact keeps the sweep gate open despite live links`() {
         // One connected family member must not stop discovery of the rest.
-        assertTrue(shouldRunAutomaticLanScan(1, 0, 0, 1))
-        assertTrue(shouldRunAutomaticLanScan(3, 0, 0, 2))
+        assertTrue(shouldRunAutomaticLanScan(1, 0, 0, 1, 0))
+        assertTrue(shouldRunAutomaticLanScan(3, 0, 0, 2, 0))
         // But in-flight work still defers, links or not.
-        assertTrue(!shouldRunAutomaticLanScan(1, 1, 0, 1))
-        assertTrue(!shouldRunAutomaticLanScan(1, 0, 7, 1))
+        assertTrue(!shouldRunAutomaticLanScan(1, 1, 0, 1, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 7, 1, 0))
         // Everyone capable is linked: nothing left to sweep for.
-        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, 0, 0))
+    }
+
+    @Test
+    fun `a link to one of this person's own devices never counts as company`() {
+        // The field case, on the approving phone: its only live LAN link was
+        // to the device it had just removed. That link carries no contact's
+        // mail and, having no route, sat outside the LAN heartbeat -- so a
+        // half-open one used to read as "not lonely" and shut discovery off
+        // for the whole Wi-Fi join. The transport subtracts own-device links
+        // from the count it passes, so the gate here sees zero peers.
+        assertTrue(shouldRunAutomaticLanScan(0, 0, 0, 0, 0))
+        // A negative miscount slows discovery, never disables it.
+        assertTrue(shouldRunAutomaticLanScan(-1, 0, 0, 0, 0))
+    }
+
+    @Test
+    fun `a sibling this phone has no link to keeps the sweep gate open`() {
+        // A device of this person's own shares their user id, so it has no
+        // contact row and can never appear in unlinkedCapableContacts. Without
+        // a motive of its own, mDNS is the only channel between two phones of
+        // one person -- and one stale mDNS record is all the field failure was.
+        assertTrue(shouldRunAutomaticLanScan(4, 0, 0, 0, 1))
+        assertTrue(!shouldRunAutomaticLanScan(4, 0, 0, 0, 0))
+        // In-flight work still defers.
+        assertTrue(!shouldRunAutomaticLanScan(4, 2, 0, 0, 1))
+    }
+
+    /**
+     * The field loop: an mDNS-derived target at an address that never answered
+     * (a link-local IPv6 one, which no other phone can dial), retried every
+     * backoff period for as long as the phone stayed on the Wi-Fi. Nothing
+     * retired it -- `shouldRetainLanReconnectTarget` keeps a self-discovered
+     * key through any number of failures, and the backoff underneath decays to
+     * a slow probe rather than a refusal.
+     */
+    @Test
+    fun `a local Wi-Fi address that never answered stops being retried`() {
+        val backoff = ReconnectBackoffTracker()
+        val key = "nsd:a-phone-of-ours"
+        var now = 0L
+        var retired = false
+        repeat(12) {
+            now += 60_000
+            backoff.recordFailure(key, now)
+            // The transport keeps the target only while core says the address
+            // is still worth another attempt.
+            if (
+                coreLanReconnectTargetIsExhausted(
+                    everAuthenticated = false,
+                    consecutiveFailures = backoff.failureCount(key).toUInt(),
+                )
+            ) {
+                retired = true
+            }
+        }
+        assertTrue("a dead address was retried forever", retired)
+
+        // An address a handshake proved is never retired by failure count:
+        // ordinary contact LAN delivery has to survive a sleeping peer.
+        val proven = "nsd:a-friends-phone"
+        repeat(30) { backoff.recordFailure(proven, ++now) }
+        assertTrue(
+            !coreLanReconnectTargetIsExhausted(
+                everAuthenticated = true,
+                consecutiveFailures = backoff.failureCount(proven).toUInt(),
+            ),
+        )
     }
 
     @Test
@@ -405,6 +473,7 @@ class LanTransportTest {
             shouldRunAutomaticLanScan(
                 0,
                 pendingLanOutboundAttempts(emptySet(), setOf("scan:10.0.0.2")),
+                0,
                 0,
                 0,
             ),
@@ -441,7 +510,7 @@ class LanTransportTest {
 
         assertEquals(0, motivating)
         // A live link plus no motivating contact means no sweep at all.
-        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, motivating))
+        assertTrue(!shouldRunAutomaticLanScan(1, 0, 0, motivating, 0))
     }
 
     @Test
@@ -597,12 +666,12 @@ class LanTransportTest {
         // Joining the next network: nothing is in flight, so the periodic
         // check must be free to sweep again.
         assertEquals(0, links.pending())
-        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0, 0))
 
         // And the gate still defers while a fresh attempt really is pending.
         links.dial("scan:10.1.0.4")
         assertEquals(1, links.pending())
-        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0, 0))
     }
 
     /**
@@ -619,12 +688,12 @@ class LanTransportTest {
         val links = OutboundLinks()
         links.dial("scan:10.0.0.2")
         assertEquals(1, links.pending())
-        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+        assertTrue(!shouldRunAutomaticLanScan(0, links.pending(), 0, 0, 0))
 
         // The handshake finished and the peer turned out to be our own phone.
         links.authenticate("scan:10.0.0.2")
         assertEquals(0, links.pending())
-        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, links.pending(), 0, 0, 0))
     }
 
     /**
@@ -652,8 +721,8 @@ class LanTransportTest {
 
     @Test
     fun `automatic subnet fallback gate never reads a negative count as busy`() {
-        assertTrue(shouldRunAutomaticLanScan(0, -3, 0, 0))
-        assertTrue(shouldRunAutomaticLanScan(0, 0, -1, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, -3, 0, 0, 0))
+        assertTrue(shouldRunAutomaticLanScan(0, 0, -1, 0, 0))
     }
 
     @Test
