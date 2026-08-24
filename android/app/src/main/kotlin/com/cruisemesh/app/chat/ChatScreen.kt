@@ -84,6 +84,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.luminance
@@ -1865,7 +1866,13 @@ fun MessageBubbleVisual(
     val bubbleColor = if (isOwn) {
         MaterialTheme.colorScheme.primary
     } else {
-        contactColor?.copy(alpha = 0.24f) ?: MaterialTheme.colorScheme.surfaceVariant
+        // Flattened to an opaque color: a translucent tint reads fine over
+        // the chat background, but the focus overlay draws a moved copy of
+        // the bubble above the scrim, and the dimmed list bleeds through a
+        // see-through fill. compositeOver keeps the in-list pixels identical
+        // (and gives luminance() the true color below).
+        contactColor?.copy(alpha = 0.24f)?.compositeOver(MaterialTheme.colorScheme.background)
+            ?: MaterialTheme.colorScheme.surfaceVariant
     }
     val contentColor = if (isOwn) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
     val tickBaseColor = if (bubbleColor.luminance() > 0.5f) Color.Black else Color.White

@@ -830,9 +830,19 @@ private struct MessageBubbleView: View {
                     }
                 }
                 .padding(10)
+                // The contact tint is translucent, which reads fine over the
+                // chat background but turns see-through in the lifted
+                // context-menu preview (it renders on a clear backdrop, so
+                // neighbouring bubbles bleed through the reacted message).
+                // Compositing the tint over the system background keeps the
+                // in-list color identical and makes the preview opaque.
                 .background(
                     bubbleShape
-                        .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
+                        .fill(Color(.systemBackground))
+                        .overlay(
+                            bubbleShape
+                                .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
+                        )
                 )
                 .foregroundStyle(isOwn ? Color.white : Color.primary)
                 // Restrict the system targeted preview to the actual bubble.
