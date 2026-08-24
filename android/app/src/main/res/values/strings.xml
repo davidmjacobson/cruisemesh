@@ -875,7 +875,7 @@
     <string name="ui_remove_device_is_the_approver">This device approves new devices, so it cannot remove itself.</string>
     <string name="ui_remove_device_last_one">You cannot remove your only device.</string>
     <string name="ui_remove_device_not_caught_up">This device has not caught up with an earlier change yet. Let it get online, then try again.</string>
-    <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.</string>
+    <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Open Troubleshooting &amp; diagnostics and share diagnostics before removing anything else.</string>
     <string name="ui_remove_device_failed">Something went wrong and nothing was changed. Try again.</string>
 
     <!-- What the removed phone itself shows (§10 step 5). It finds out the next

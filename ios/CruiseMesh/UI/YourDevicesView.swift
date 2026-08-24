@@ -373,7 +373,7 @@ func removeRefusalText(_ reason: RemoveDeviceRefusal) -> String {
         )
     case .earlierRemovalUnfinished:
         return String(
-            localized: "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else."
+            localized: "An earlier removal on this device was interrupted and has not finished. Open Troubleshooting & diagnostics and share diagnostics before removing anything else."
         )
     case .coreRefused:
         return String(localized: "Something went wrong and nothing was changed. Try again.")

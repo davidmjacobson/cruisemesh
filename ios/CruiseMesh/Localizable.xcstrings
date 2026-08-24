@@ -765,12 +765,12 @@
         }
       }
     },
-    "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.": {
+    "An earlier removal on this device was interrupted and has not finished. Open Troubleshooting & diagnostics and share diagnostics before removing anything else.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else."
+            "value": "An earlier removal on this device was interrupted and has not finished. Open Troubleshooting & diagnostics and share diagnostics before removing anything else."
           }
         }
       }
