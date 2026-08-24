@@ -62,9 +62,29 @@ final class LanTransport {
     /// evidence is recent (`lanCapabilityMotivatesScan`), so a contact who is
     /// ashore does not keep this phone sweeping the subnet forever.
     private var lanCapableContacts: [Data: Int64] = [:]
+    /// Whether this phone is inside the bounded window during which it looks
+    /// for one of this person's own devices, pushed in by MeshController
+    /// (`updateOwnDeviceSearchLive`); see `OwnDeviceSearchWindow`.
+    ///
+    /// A sibling shares this person's user id, so it has no contact row and can
+    /// never appear in `lanCapableContacts` however long it waits. Without a
+    /// motive of its own a phone whose only missing peer is its other phone
+    /// never sweeps for it, leaving mDNS as the single channel between two
+    /// devices of one person -- which is the state the field capture caught
+    /// failing, on the phone that had just removed the other. Bounded, because
+    /// a second phone that is switched off or left at home is missing forever:
+    /// an unbounded motive would sweep the subnet every five minutes on every
+    /// Wi-Fi this person joins, on battery, for the life of every join.
+    private var ownDeviceSearchLive = false
     private var bonjourServiceKeys = Set<String>()
     private var outboundAddresses: [String: String] = [:]
     private var reconnectAttempts: [String: Int] = [:]
+    /// Unclamped consecutive failure counts per service key, and the keys whose
+    /// address has ever completed a Noise handshake on this network join.
+    /// Together they answer `coreLanReconnectTargetIsExhausted`: see
+    /// `retireExhaustedRetryEndpoint`.
+    private var reconnectFailures: [String: UInt32] = [:]
+    private var provenServiceKeys = Set<String>()
 
     /// Cache for `ownHostAddresses()`.
     private var cachedOwnHostAddresses: Set<String>?
@@ -72,6 +92,10 @@ final class LanTransport {
     private var runningScan: RunningScan?
     private var scanConnections: [UUID: NWConnection] = [:]
     private var automaticScanWorkItem: DispatchWorkItem?
+    /// Set when the listener had to settle for a port other than
+    /// `lanDefaultTcpPort()`; see `scheduleDefaultPortRebind`.
+    private var listeningOnFallbackPort = false
+    private var defaultPortRebindWorkItem: DispatchWorkItem?
     /// Consecutive completed sweeps whose verdict was `.isolationSuspected`.
     /// A single congested sweep can look isolated (every probe timing out),
     /// so the planner is only told to back off to its cap once the verdict
@@ -116,6 +140,13 @@ final class LanTransport {
         }
     }
 
+    /// The sweep's other motive; see `ownDeviceSearchLive`.
+    func updateOwnDeviceSearchLive(_ live: Bool) {
+        queue.async { [weak self] in
+            self?.ownDeviceSearchLive = live
+        }
+    }
+
     func setForegroundActive(_ active: Bool) {
         queue.async { [weak self] in
             guard let self else { return }
@@ -144,6 +175,9 @@ final class LanTransport {
             wifiPathMonitor = nil
             automaticScanWorkItem?.cancel()
             automaticScanWorkItem = nil
+            defaultPortRebindWorkItem?.cancel()
+            defaultPortRebindWorkItem = nil
+            listeningOnFallbackPort = false
             cancelRunningScan(updateDiagnostics: false)
             scanPlanner.onNetworkLost()
             consecutiveIsolationVerdicts = 0
@@ -156,6 +190,8 @@ final class LanTransport {
             bonjourServiceKeys.removeAll()
             outboundAddresses.removeAll()
             reconnectAttempts.removeAll()
+            reconnectFailures.removeAll()
+            provenServiceKeys.removeAll()
             browserWaitingSinceMs = nil
             listenerWaitingSinceMs = nil
             permissionWarningActive = false
@@ -241,6 +277,67 @@ final class LanTransport {
         queue.sync { connections[address]?.remoteStaticKey }
     }
 
+    /// **The listener is on a fallback port, so no other phone's sweep can see
+    /// it.** A subnet sweep probes `lanDefaultTcpPort()` and nothing else, so a
+    /// phone that lost the default port is findable only through Bonjour --
+    /// exactly the single-channel fragility the field capture turned into
+    /// twenty-six minutes of silence. The port is normally held by this app's
+    /// own previous process (force-stop then relaunch is the field sequence),
+    /// so it frees itself within seconds. Mirrors Android's
+    /// `scheduleDefaultPortRebind`.
+    private func scheduleDefaultPortRebind() {
+        guard started, listeningOnFallbackPort, defaultPortRebindWorkItem == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.defaultPortRebindWorkItem = nil
+            self.probeDefaultPort()
+        }
+        defaultPortRebindWorkItem = work
+        queue.asyncAfter(deadline: .now() + Self.defaultPortRebindInterval, execute: work)
+    }
+
+    /// Try to take the default port with a second listener while the fallback
+    /// one keeps serving, and adopt it only once it is actually ready.
+    ///
+    /// Deliberately not "cancel the working listener and re-open": on a port
+    /// some *other* app holds permanently that would drop this phone's
+    /// advertisement every retry period, forever, to no purpose.
+    private func probeDefaultPort() {
+        guard started, listeningOnFallbackPort, let current = listener,
+              let port = NWEndpoint.Port(rawValue: lanDefaultTcpPort()),
+              let probe = try? NWListener(using: lanParameters(), on: port)
+        else {
+            scheduleDefaultPortRebind()
+            return
+        }
+        // A probe must not serve: anything that arrives before the swap belongs
+        // to no session and is refused.
+        probe.newConnectionHandler = { connection in connection.cancel() }
+        probe.stateUpdateHandler = { [weak self, weak probe] state in
+            self?.queue.async {
+                guard let self, let probe else { return }
+                switch state {
+                case .ready:
+                    probe.cancel()
+                    guard self.started, self.listener === current else { return }
+                    self.log.info("The usual local Wi-Fi port is free again; moving the listener back")
+                    current.cancel()
+                    self.listener = nil
+                    self.startListener(preferDefaultPort: true)
+                case .failed, .waiting:
+                    // Still occupied (address-in-use surfaces as either).
+                    probe.cancel()
+                    self.scheduleDefaultPortRebind()
+                default:
+                    // Including `.cancelled`, which is how the successful path
+                    // above ends: nothing left to retry.
+                    break
+                }
+            }
+        }
+        probe.start(queue: queue)
+    }
+
     private func startListener(preferDefaultPort: Bool) {
         guard started else { return }
         do {
@@ -298,6 +395,8 @@ final class LanTransport {
             listenerWaitingSinceMs = nil
             clearPermissionWarningIfNeeded()
             if let port = failedListener.port {
+                listeningOnFallbackPort = port.rawValue != lanDefaultTcpPort()
+                if listeningOnFallbackPort { scheduleDefaultPortRebind() }
                 log.info("Listening for CruiseMesh LAN peers on TCP \(port.rawValue)")
                 if let network = localWifiIPv4Network() {
                     networkBecameAvailable(network)
@@ -438,6 +537,8 @@ final class LanTransport {
         bonjourServiceKeys.removeAll()
         outboundAddresses.removeAll()
         reconnectAttempts.removeAll()
+        reconnectFailures.removeAll()
+        provenServiceKeys.removeAll()
         let active = Array(connections.values)
         connections.removeAll()
         for link in active {
@@ -536,9 +637,48 @@ final class LanTransport {
         log.info("Forgetting the oldest tracked local Wi-Fi peer to make room (\(shortened, privacy: .public))")
     }
 
+    /// Drop a retry endpoint whose address has failed often enough, and has
+    /// never once answered, that dialing it again is only costing battery.
+    ///
+    /// The rule is core's (`coreLanReconnectTargetIsExhausted`); this supplies
+    /// the two facts and returns whether the endpoint was retired.
+    ///
+    /// What shipped had no ceiling on a Bonjour-derived endpoint at all, and
+    /// the delay table underneath it caps rather than gives up -- so one stale
+    /// mDNS record became a dial at a dead address every retry period for as
+    /// long as the phone stayed on the Wi-Fi. That is the loop the field
+    /// capture shows the approving phone stuck in, in place of the search that
+    /// would have found the device it had removed.
+    ///
+    /// Nothing here can strand a working link: a key whose address completed a
+    /// handshake is in `provenServiceKeys` and keeps its endpoint, and an
+    /// unproven address that is genuinely there is re-created as an endpoint by
+    /// the next Bonjour resolution or sweep hit.
+    private func retireExhaustedRetryEndpoint(
+        _ serviceKey: String,
+        wasAuthenticated: Bool
+    ) -> Bool {
+        guard !wasAuthenticated else {
+            reconnectFailures[serviceKey] = 0
+            return false
+        }
+        let failures = (reconnectFailures[serviceKey] ?? 0) + 1
+        reconnectFailures[serviceKey] = failures
+        guard coreLanReconnectTargetIsExhausted(
+            everAuthenticated: provenServiceKeys.contains(serviceKey),
+            consecutiveFailures: failures
+        ) else { return false }
+        discoveredEndpoints.removeValue(forKey: serviceKey)
+        reconnectAttempts.removeValue(forKey: serviceKey)
+        reconnectFailures.removeValue(forKey: serviceKey)
+        log.info("Giving up on a local Wi-Fi address that never answered")
+        return true
+    }
+
     /// Credits the sweep that dialed `link` with having found a friend on
-    /// this LAN. Only an authenticated friend -- or one the sweep discovered
-    /// is already linked -- counts; see `scanCandidateCompleted`.
+    /// this LAN. Only a completed handshake -- a friend, one of this person's
+    /// own devices, or a friend the sweep discovered is already linked --
+    /// counts; see `scanCandidateCompleted`.
     fileprivate func markSweepFoundFriend(dialedBy link: LanConnection) {
         markSweepFoundFriend(scanGeneration: link.scanGeneration)
     }
@@ -747,14 +887,25 @@ final class LanTransport {
             link.close()
             return
         }
+        if let serviceKey = link.serviceKey {
+            // Proof this address is real, which is what buys its retry endpoint
+            // the right to be dialed again without a ceiling.
+            provenServiceKeys.insert(serviceKey)
+            reconnectFailures[serviceKey] = 0
+        }
         // A device of this person's own is not a peer and is not filed as one: no
         // user id, so no route, no entry in the counters that say how many
-        // friends are on this Wi-Fi, no reconnect target and no sweep credit. It
-        // is a link that exists to carry §10 step 5's device list and the HELLOs
-        // that precede it.
+        // friends are on this Wi-Fi, and no reconnect target. It is a link that
+        // exists to carry §10 step 5's device list and the HELLOs that precede
+        // it.
         guard case .contact(let userId) = admission else {
             log.info("Another device of ours is on this Wi-Fi")
             supersedeOtherOwnDeviceLinks(keeping: link)
+            // A sibling answering a sweep probe proves discovery works on this
+            // network exactly as a contact does, so it must not leave the
+            // expensive full-subnet tier armed. (A bare TCP connect still does
+            // not count -- that is `LanConnection`'s handshake, not this.)
+            markSweepFoundFriend(dialedBy: link)
             onOwnDeviceAuthenticated?(link.address)
             scheduleAutomaticScan(after: Self.automaticScanRetryInterval)
             return
@@ -817,6 +968,11 @@ final class LanTransport {
                     serviceKey,
                     reason: "The discovered TCP service was not an accepted CruiseMesh friend"
                 )
+            } else if retireExhaustedRetryEndpoint(serviceKey, wasAuthenticated: link.wasAuthenticated) {
+                // Retired: an address that has failed this many times and never
+                // once answered is only costing battery. A fresh Bonjour
+                // resolution or sweep hit re-creates the endpoint the moment
+                // there is anything real to reach.
             } else {
                 let attempt = reconnectAttempts[serviceKey, default: 0]
                 reconnectAttempts[serviceKey] = min(attempt + 1, Self.reconnectDelays.count - 1)
@@ -1040,11 +1196,17 @@ final class LanTransport {
             !linked.contains(userId)
                 && lanCapabilityMotivatesScan(lastSupportedAtMs: lastSupportedAtMs, nowMs: nowMs)
         }.count
+        // Own-device links are subtracted deliberately: one is not a friend on
+        // this Wi-Fi, and being route-less it also sat outside the LAN
+        // heartbeat until this change, so a half-open one could read as company
+        // for the whole Wi-Fi join.
+        let peerLinks = connections.values.filter { !$0.isOwnDevice }.count
         if shouldRunAutomaticLanScan(
-            activeConnections: connections.count,
+            peerLinks: peerLinks,
             pendingOutboundAttempts: pendingOutbound,
             scanRemaining: runningScan?.remaining ?? 0,
-            unlinkedCapableContacts: motivating
+            unlinkedCapableContacts: motivating,
+            ownDeviceSearchLive: ownDeviceSearchLive
         ), let breadth = scanPlanner.takeDueScan(nowMs: nowMs) {
             log.info("Starting automatic local Wi-Fi fallback search (\(String(describing: breadth)))")
             _ = startSubnetScan(breadth, network: network, automatic: true)
@@ -1160,6 +1322,11 @@ final class LanTransport {
     // recheck will usually find nothing due yet.
     private static let escalateAutomaticScanDelay: DispatchTimeInterval = .seconds(2)
     private static let automaticScanRetryInterval: DispatchTimeInterval = .seconds(5 * 60)
+
+    /// How often a listener stuck on a fallback port checks whether the default
+    /// one has come free; see `scheduleDefaultPortRebind`. Matches Android's
+    /// `DEFAULT_PORT_REBIND_RETRY_MS`.
+    private static let defaultPortRebindInterval: DispatchTimeInterval = .seconds(60)
     /// How long the tie-break loser waits for the elected side's connection
     /// before initiating anyway -- covers the winner's worst case (connect
     /// plus handshake timeouts) with margin.
@@ -1627,21 +1794,26 @@ func lanCapabilityMotivatesScan(
 /// Two weeks; see `lanCapabilityMotivatesScan`.
 let lanCapabilityRecencyWindowMs: Int64 = 14 * 24 * 60 * 60 * 1_000
 
-/// Whether the periodic check may claim a scan from `LanScanPlanner`. A scan
-/// is worthwhile while the transport has no links at all, OR while some
-/// contact that has recently demonstrated LAN support still has no
-/// authenticated LAN link (`lanCapabilityMotivatesScan`) -- one connected
-/// family member must not stop discovery of the rest.
-/// In-flight work (pending outbound attempts, a running sweep) always defers.
+/// Whether the periodic check may claim a scan from `LanScanPlanner`.
+///
+/// The rule itself is core's (`coreLanScanGateOpen`) -- both shells owned a
+/// copy each, and the copies drifted into the multi-device bug the core doc now
+/// names. This is the counting: negatives clamped to zero so a miscount slows
+/// discovery down instead of disabling it.
 func shouldRunAutomaticLanScan(
-    activeConnections: Int,
+    peerLinks: Int,
     pendingOutboundAttempts: Int,
     scanRemaining: Int,
-    unlinkedCapableContacts: Int
+    unlinkedCapableContacts: Int,
+    ownDeviceSearchLive: Bool
 ) -> Bool {
-    (activeConnections == 0 || unlinkedCapableContacts > 0) &&
-        pendingOutboundAttempts == 0 &&
-        scanRemaining == 0
+    coreLanScanGateOpen(
+        peerLinks: UInt32(max(0, peerLinks)),
+        unlinkedCapableContacts: UInt32(max(0, unlinkedCapableContacts)),
+        ownDeviceSearchLive: ownDeviceSearchLive,
+        pendingOutboundAttempts: UInt32(max(0, pendingOutboundAttempts)),
+        scanRemaining: UInt32(max(0, scanRemaining))
+    )
 }
 
 /// FI7: whether an `NWError` matches one of the documented signals for a

@@ -97,10 +97,11 @@ pub use deep_link::{deep_link_route, DeepLinkRoute};
 pub use device_link::activation::{
     core_link_activation_ack, core_link_activation_gate, core_link_device_offer,
     core_link_genesis_roster, core_link_open_activation_ack, core_link_open_device_offer,
-    core_link_recovery_roster, core_link_sign_new_device_roster, CoreLinkActivation,
-    CoreLinkActivationStage, CoreLinkBootstrapImport, CoreLinkGateReason, CoreLinkGateVerdict,
-    CoreLinkGatedAction, CoreLinkImportReadiness, LinkActivationAck, LinkDeviceOffer,
-    LinkRosterUpdate,
+    core_link_recovery_roster, core_link_sign_new_device_roster,
+    core_own_roster_notice_reoffer_due, core_own_roster_notice_reoffer_interval_ms,
+    CoreLinkActivation, CoreLinkActivationStage, CoreLinkBootstrapImport, CoreLinkGateReason,
+    CoreLinkGateVerdict, CoreLinkGatedAction, CoreLinkImportReadiness, LinkActivationAck,
+    LinkDeviceOffer, LinkRosterUpdate,
 };
 pub use device_link::bootstrap::{
     core_link_bootstrap_chunks, core_link_bootstrap_decode, core_link_bootstrap_encode,
@@ -166,11 +167,14 @@ pub use lan_session::{
     LAN_DEFAULT_TCP_PORT, LAN_MAX_FRAME_SIZE, LAN_SERVICE_TYPE,
 };
 pub use lan_util::{
-    core_format_lan_endpoint, core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
-    core_make_lan_endpoint_link, core_parse_lan_endpoint, core_parse_lan_endpoint_link,
-    core_subnet_24_hosts, lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local,
-    lan_hosts_are_same_address, lan_hosts_share_local_network, should_resend_lan_endpoint,
-    CoreLanEndpoint,
+    core_format_lan_endpoint, core_lan_host_is_reachable_endpoint,
+    core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
+    core_lan_own_device_search_since, core_lan_own_device_search_window_ms,
+    core_lan_reconnect_target_is_exhausted, core_lan_scan_gate_open, core_make_lan_endpoint_link,
+    core_parse_lan_endpoint, core_parse_lan_endpoint_link, core_subnet_24_hosts,
+    lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local, lan_hosts_are_same_address,
+    lan_hosts_share_local_network, should_resend_lan_endpoint, CoreLanEndpoint,
+    LAN_OWN_DEVICE_SEARCH_WINDOW_MS,
 };
 pub use late_arrival::{
     core_late_arrival_flags, late_arrival_flags, LateArrivalInput, LATE_ARRIVAL_MIN_DELAY_MS,

@@ -728,6 +728,62 @@ pub struct CoreLinkBootstrapImport {
     pub catch_up: Vec<super::bootstrap::CoreLinkCatchUp>,
 }
 
+/// How often a live own-device link is re-offered §10 step 5's roster.
+///
+/// See [`core_own_roster_notice_reoffer_due`]. Small because the document is
+/// small and the link is a LAN socket to the person's own phone; long enough
+/// that it is a heartbeat rather than chatter.
+pub const OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS: i64 = 60_000;
+
+/// [`OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS`], for the shells (a `const` does
+/// not cross the binding; a function does).
+#[uniffi::export]
+pub fn core_own_roster_notice_reoffer_interval_ms() -> i64 {
+    OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+}
+
+/// **§10 step 5, the part that was missing.** Whether an own-device link that
+/// has already been offered this person's roster is owed it again.
+///
+/// The notice shipped edge-triggered: built and pushed at the instant a HELLO2
+/// arrived on an own-device link, and at no other moment in either shell. So a
+/// removal that happened while such a link was *already up* was never announced
+/// on it — no new HELLO, no new offer, and the removed phone kept believing it
+/// was linked for as long as the link lasted. In the field that was 26 minutes,
+/// two force-stops and a reboot.
+///
+/// Making it level-triggered is what fixes that, and it is safe to do bluntly
+/// because the frame is idempotent in both directions: the sender's copy is
+/// rebuilt from the store every time, and
+/// [`MessageStore::apply_own_roster_notice`] refuses anything that does not
+/// strictly supersede what the receiver holds. Re-offering costs one signed
+/// document per minute per own-device link and needs no event plumbing to reach
+/// it — which also means it survives an app restart, a reboot, and a roster
+/// change this process never saw.
+///
+/// **The trade this widens, stated plainly.** A notice tells the holder of a
+/// removed phone that they were removed, and §10.2's relay-`family_token`
+/// rotation lands only on the first pass that reaches the relay — so there is a
+/// window in which a removed device knows it is out while the family credential
+/// it already holds is still live, and LAN-with-no-internet is exactly where
+/// that window is widest. Edge-triggered, reaching that window needed a fresh
+/// HELLO2; level-triggered it is the ordinary case, within a minute, for as
+/// long as the link lasts. Accepted deliberately — an honest removed device has
+/// to converge offline, and nothing else makes the phone that is *wrong* right
+/// — but it is a widening rather than a neutral change, and §10 step 5 records
+/// it as one.
+///
+/// `None` means never offered on this link, which is always due.
+#[uniffi::export]
+pub fn core_own_roster_notice_reoffer_due(last_offered_at_ms: Option<i64>, now_ms: i64) -> bool {
+    let Some(last) = last_offered_at_ms else {
+        return true;
+    };
+    // Saturating, and a clock that jumped backwards is due rather than stuck:
+    // the notice is idempotent, so the failure worth avoiding is silence.
+    now_ms < last || now_ms.saturating_sub(last) >= OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+}
+
 #[uniffi::export]
 impl MessageStore {
     /// This device's activation record (§9.4). A store that has never begun a
@@ -2670,6 +2726,28 @@ mod tests {
             )
             .is_err());
         assert_eq!(store.own_roster().unwrap().unwrap(), mine.held);
+    }
+
+    /// §10 step 5 has to be level-triggered, not edge-triggered: the removal
+    /// the field missed happened while the own-device link was already up, so
+    /// the one HELLO2 that would have carried the notice had come and gone.
+    #[test]
+    fn a_live_own_device_link_is_re_offered_the_roster_on_a_timer() {
+        // Never offered on this link: due immediately.
+        assert!(core_own_roster_notice_reoffer_due(None, 0));
+        // Just offered: not again yet.
+        assert!(!core_own_roster_notice_reoffer_due(Some(1_000), 1_001));
+        assert!(!core_own_roster_notice_reoffer_due(
+            Some(1_000),
+            1_000 + OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS - 1
+        ));
+        assert!(core_own_roster_notice_reoffer_due(
+            Some(1_000),
+            1_000 + OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+        ));
+        // A clock that jumped backwards is due rather than wedged shut: the
+        // frame is idempotent, so silence is the only failure worth avoiding.
+        assert!(core_own_roster_notice_reoffer_due(Some(1_000), 4));
     }
 
     /// The sending half: what goes out, and the states in which nothing does. A
