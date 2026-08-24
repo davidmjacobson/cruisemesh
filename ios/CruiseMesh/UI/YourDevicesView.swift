@@ -85,7 +85,6 @@ struct YourDevicesView: View {
                                 rows: items.map(\.row),
                                 row: item.row
                             ),
-                            approverName: approverName,
                             onRename: {
                                 renameText = item.name
                                 renaming = item
@@ -374,26 +373,22 @@ func removeRefusalText(_ reason: RemoveDeviceRefusal) -> String {
         )
     case .earlierRemovalUnfinished:
         return String(
-            localized: "An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else."
+            localized: "An earlier removal on this device was interrupted and has not finished. Open Troubleshooting & diagnostics and share diagnostics before removing anything else."
         )
     case .coreRefused:
         return String(localized: "Something went wrong and nothing was changed. Try again.")
     }
 }
 
-/// Why Remove is missing from a row, for a surface that wants to say so.
 /// Why Remove is missing from a row, in words that name the next thing to do.
 ///
-/// `.notTheApprovingDevice` is the one that needs more than a rule stated back at
-/// the person: it says which device can do it, and what to do when that device is
-/// the one that is gone — which is the situation they are usually in when they
-/// came looking for Remove in the first place.
-func removeBlockText(_ block: RemoveDeviceBlock, approverName: String) -> String {
+/// `.notTheApprovingDevice` deliberately says nothing here: on a non-approving
+/// phone it applies to every row at once, and the page-level line where Add a
+/// device would have been already names the approver and the recovery path.
+func removeBlockText(_ block: RemoveDeviceBlock) -> String? {
     switch block {
     case .notTheApprovingDevice:
-        return String(
-            localized: "Only \(approverName) can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own."
-        )
+        return nil
     case .isTheApprovingDevice:
         return String(localized: "This device approves new devices, so it cannot remove itself.")
     case .lastDevice:
@@ -401,10 +396,13 @@ func removeBlockText(_ block: RemoveDeviceBlock, approverName: String) -> String
     }
 }
 
-/// Why **Add a device** is not on offer here, naming the phone that can.
+/// One sentence for the whole page when this is not the approving phone.
+/// "Restore your backup" is the real recovery path when the approving phone is
+/// gone (core device_link/restore.rs) — support holds no lever over a device
+/// roster and must not be offered.
 func addDeviceWithheldText(approverName: String) -> String {
     String(
-        localized: "Only \(approverName) can add a device. Open Your devices there. If that device is lost or broken, contact support."
+        localized: "Only \(approverName) can add or remove devices. If that phone is lost or broken, restore your backup on a new phone to take its place."
     )
 }
 
@@ -417,7 +415,6 @@ func deviceDisplayName(_ item: YourDeviceListItem) -> String {
 private struct DeviceRow: View {
     let item: YourDeviceListItem
     let blocked: RemoveDeviceBlock?
-    let approverName: String
     var onRename: () -> Void
     var onRemove: () -> Void
 
@@ -451,8 +448,8 @@ private struct DeviceRow: View {
             .buttonStyle(.borderless)
             .font(.callout)
             .padding(.top, 2)
-            if !item.row.removable, let blocked {
-                Text(removeBlockText(blocked, approverName: approverName))
+            if !item.row.removable, let blocked, let blockedText = removeBlockText(blocked) {
+                Text(blockedText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
