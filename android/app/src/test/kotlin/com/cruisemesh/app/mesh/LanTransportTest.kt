@@ -273,6 +273,42 @@ class LanTransportTest {
         assertEquals(listOf(self, peer), remoteLanEndpoints(null, listOf(self, peer)))
     }
 
+    /**
+     * IPv4 is dialed before anything else (S1).
+     *
+     * `NsdServiceInfo.hostAddresses` comes back unsorted, and a phone that
+     * publishes both an IPv4 address and a Wi-Fi link-local IPv6 one can hand
+     * either first. A 2026-08-24 field log recorded the cost: the resolver named
+     * `192.168.86.37:45892` and the very next line was an `ECONNREFUSED` against
+     * a `fe80::` address, which read as an address-family bug and sent a whole
+     * investigation after one that was not there.
+     *
+     * This does not decide reachability -- every CruiseMesh listener binds the
+     * wildcard, so a peer reachable at all is reachable on IPv4. It decides
+     * which attempt pays the latency, and it keeps the log honest.
+     */
+    @Test
+    fun `resolved addresses are dialed IPv4 first, stably within each family`() {
+        val v4 = InetSocketAddress("192.168.86.37", 45_892)
+        val v4Second = InetSocketAddress("192.168.86.38", 45_892)
+        val linkLocal = InetSocketAddress("fe80::c88e:72ff:feba:12c9", 45_892)
+        val globalV6 = InetSocketAddress("2001:db8::1", 45_892)
+
+        assertEquals(
+            listOf(v4, linkLocal),
+            orderedLanDialCandidates(listOf(linkLocal, v4)),
+        )
+        // Stable within each family: nothing else about the platform's
+        // ordering changes.
+        assertEquals(
+            listOf(v4, v4Second, linkLocal, globalV6),
+            orderedLanDialCandidates(listOf(linkLocal, v4, globalV6, v4Second)),
+        )
+        // Nothing to reorder is not an error.
+        assertEquals(emptyList<InetSocketAddress>(), orderedLanDialCandidates(emptyList()))
+        assertEquals(listOf(linkLocal), orderedLanDialCandidates(listOf(linkLocal)))
+    }
+
     @Test
     fun `a remembered target that now points at this phone is dropped, not dialed`() {
         // The field failure: the phone restarts as it joins a Wi-Fi network,
@@ -699,27 +735,150 @@ class LanTransportTest {
     }
 
     /**
-     * §10 step 5's link is capped at one. A removed phone still holds the
-     * agreement key that admits it -- §10.1 rotates the inbox key, never the
-     * LAN Noise static -- and such a link carries no user id, so the
-     * duplicate-link test that bounds a contact to one link cannot see it.
-     * Uncapped, it could take every socket slot and keep the family's real
-     * contacts off this Wi-Fi.
+     * §10 step 5's link is capped. A removed phone still holds the agreement
+     * key that reaches this arm -- §10.1 rotates the inbox key, never the LAN
+     * Noise static -- and such a link carries no user id, so the duplicate-link
+     * test that bounds a contact to one link cannot see it. Uncapped, it could
+     * take every socket slot and keep the family's real contacts off this
+     * Wi-Fi.
      */
     @Test
     fun `only one link to our own devices survives`() {
+        val live = OwnDeviceLinkStanding(revoked = false, prevails = null)
         // Nothing to close on the first one.
-        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(emptySet(), "lan:1"))
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(emptyList()),
+            ownDeviceLinkDecision(emptyMap(), "lan:1", live),
+        )
         // The newest wins, so a half-dead link can never wedge the channel.
-        assertEquals(listOf("lan:1"), supersededOwnDeviceLinks(setOf("lan:1"), "lan:2"))
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(listOf("lan:1")),
+            ownDeviceLinkDecision(mapOf("lan:1" to live), "lan:2", live),
+        )
         // A device that opened a fistful of sockets keeps exactly one.
         assertEquals(
             setOf("lan:1", "lan:2", "lan:3"),
-            supersededOwnDeviceLinks(setOf("lan:1", "lan:2", "lan:3"), "lan:4").toSet(),
+            (
+                ownDeviceLinkDecision(
+                    mapOf("lan:1" to live, "lan:2" to live, "lan:3" to live),
+                    "lan:4",
+                    live,
+                ) as OwnDeviceLinkDecision.Admit
+                ).superseded.toSet(),
         )
         // Re-registering the live link is not a reason to close it.
-        assertEquals(emptyList<String>(), supersededOwnDeviceLinks(setOf("lan:1"), "lan:1"))
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(emptyList()),
+            ownDeviceLinkDecision(mapOf("lan:1" to live), "lan:1", live),
+        )
     }
+
+    /**
+     * **The flap this fix would otherwise have shipped.**
+     *
+     * Take 4's logs show the shape exactly: the P7 waits out the tie-break,
+     * logs "Tie-break peer never connected; initiating ourselves", and dials --
+     * while the P10P is separately dialing it by sweep. Two handshakes finish in
+     * opposite orders on the two hosts, so plain newest-wins has each phone keep
+     * a different socket and close the one the other kept. Both die, both
+     * rediscover, and the pair flaps: in a field log that reads as "the link
+     * forms and immediately drops", which is very hard to tell from the bug just
+     * fixed. That code had never once run to completion before this change,
+     * because the old gate admitted nobody.
+     *
+     * The rule is settled by the keys, so both phones reach the same answer
+     * about the same socket with no extra message.
+     */
+    @Test
+    fun `a simultaneous cross-connect keeps one socket, and both phones pick the same one`() {
+        val lower = ByteArray(32) { 0x11 }
+        val higher = ByteArray(32) { 0x22 }
+
+        // On the phone with the lower key: it keeps what it dialed.
+        assertEquals(
+            true,
+            ownDeviceLinkPrevails(ownAgreePk = lower, remoteStaticKey = higher, initiator = true),
+        )
+        assertEquals(
+            false,
+            ownDeviceLinkPrevails(ownAgreePk = lower, remoteStaticKey = higher, initiator = false),
+        )
+        // On the phone with the higher key: it keeps what it answered. Same
+        // socket, agreed without a message.
+        assertEquals(
+            false,
+            ownDeviceLinkPrevails(ownAgreePk = higher, remoteStaticKey = lower, initiator = true),
+        )
+        assertEquals(
+            true,
+            ownDeviceLinkPrevails(ownAgreePk = higher, remoteStaticKey = lower, initiator = false),
+        )
+
+        // And the loser steps aside instead of closing the winner.
+        val winner = OwnDeviceLinkStanding(revoked = false, prevails = true)
+        val loser = OwnDeviceLinkStanding(revoked = false, prevails = false)
+        assertEquals(
+            OwnDeviceLinkDecision.Refuse,
+            ownDeviceLinkDecision(mapOf("lan:winner" to winner), "lan:loser", loser),
+        )
+        // Whichever order the two finish in.
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(listOf("lan:loser")),
+            ownDeviceLinkDecision(mapOf("lan:loser" to loser), "lan:winner", winner),
+        )
+    }
+
+    /**
+     * Two installs of one identity have nothing to tell their ends apart -- the
+     * remote Noise static IS this phone's own key -- so the clone case falls
+     * back to newest-wins exactly as it always did.
+     */
+    @Test
+    fun `a clone link has no tie-break and keeps the newest`() {
+        val ours = ByteArray(32) { 0x33 }
+        assertEquals(
+            null,
+            ownDeviceLinkPrevails(ownAgreePk = ours, remoteStaticKey = ours, initiator = true),
+        )
+        val clone = OwnDeviceLinkStanding(revoked = false, prevails = null)
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(listOf("lan:old")),
+            ownDeviceLinkDecision(mapOf("lan:old" to clone), "lan:new", clone),
+        )
+    }
+
+    /**
+     * **WP5's thief, denied the starve.** A removed phone is admitted on
+     * purpose -- it is who the notice is for -- but it must not be able to take
+     * the one slot on every reconnect and close the link that carries roster
+     * convergence between the devices that remain. A revoked link and a live
+     * sibling's therefore do not compete: each supersedes only its own kind, and
+     * two links is still a cap.
+     */
+    @Test
+    fun `a revoked device cannot close the link to a live sibling`() {
+        val sibling = OwnDeviceLinkStanding(revoked = false, prevails = null)
+        val removed = OwnDeviceLinkStanding(revoked = true, prevails = null)
+
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(emptyList()),
+            ownDeviceLinkDecision(mapOf("lan:sibling" to sibling), "lan:removed", removed),
+        )
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(emptyList()),
+            ownDeviceLinkDecision(mapOf("lan:removed" to removed), "lan:sibling", sibling),
+        )
+        // A removed phone reconnecting in a loop still holds exactly one slot.
+        assertEquals(
+            OwnDeviceLinkDecision.Admit(listOf("lan:removed")),
+            ownDeviceLinkDecision(
+                mapOf("lan:sibling" to sibling, "lan:removed" to removed),
+                "lan:removed-again",
+                removed,
+            ),
+        )
+    }
+
 
     @Test
     fun `automatic subnet fallback gate never reads a negative count as busy`() {
