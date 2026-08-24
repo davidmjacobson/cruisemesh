@@ -2057,22 +2057,12 @@
         }
       }
     },
-    "Only %@ can add a device. Open Your devices there. If that device is lost or broken, contact support.": {
+    "Only %@ can add or remove devices. If that phone is lost or broken, restore your backup on a new phone to take its place.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Only %@ can add a device. Open Your devices there. If that device is lost or broken, contact support."
-          }
-        }
-      }
-    },
-    "Only %@ can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own.": {
-      "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "Only %@ can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own."
+            "value": "Only %@ can add or remove devices. If that phone is lost or broken, restore your backup on a new phone to take its place."
           }
         }
       }
