@@ -47,6 +47,7 @@ import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreLanOwnDeviceProof
+import uniffi.cruisemesh_core.CoreLanProofRole
 import uniffi.cruisemesh_core.CoreOwnIdentityPeer
 import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.CoreSprayTrigger
@@ -58,6 +59,7 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionTransport
+import uniffi.cruisemesh_core.Roster
 import uniffi.cruisemesh_core.RevocationAdoptionOutcome
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.digestIsSharedGroup
@@ -67,6 +69,7 @@ import uniffi.cruisemesh_core.coreOwnCapabilities
 import uniffi.cruisemesh_core.coreOwnDeviceLanProof
 import uniffi.cruisemesh_core.coreOwnDeviceLanProofOpen
 import uniffi.cruisemesh_core.coreOwnIdentityPeer
+import uniffi.cruisemesh_core.coreRosterNamesASibling
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeHello2
 import uniffi.cruisemesh_core.encodeLanEndpoint
@@ -1965,13 +1968,30 @@ class MeshService : Service() {
      * recognise this phone and nothing a proof could assert. Refusing to mint
      * one there is not a degradation: it is the honest answer.
      *
+     * **Null also on a phone whose roster names no device but itself**, which
+     * is most phones. A proof is this device's stable signing public key with a
+     * signature attached, and the initiator puts it in front of a host it
+     * dialed before that host has proved anything — so a phone sweeping a
+     * ship's /24 would hand a durable identifier to whatever answered on the
+     * port. A solo phone gains nothing for it: with nobody in its roster to
+     * recognise, the only proof it could ever open is its own coming back, and
+     * `core_own_device_lan_proof_open` refuses that. So the key stays off the
+     * wire until this person actually has a fleet, which is exactly when §10
+     * step 5 has work to do.
+     *
      * Runs on the LAN handshake thread, which is where [LanTransport] needs the
      * answer. The keystore unwrap is the same one [handleOwnRosterNotice]
-     * already does off the main thread, and it touches no SQLite at all.
+     * already does off the main thread; the roster read is the same single-row
+     * lookup [openOwnDeviceLanProof] makes on that thread.
      */
-    private fun ownDeviceLanProof(handshakeHash: ByteArray): ByteArray? {
+    private fun ownDeviceLanProof(
+        handshakeHash: ByteArray,
+        role: CoreLanProofRole,
+    ): ByteArray? {
         val device = DeviceKeyStore.load(this) ?: return null
-        return runCatching { coreOwnDeviceLanProof(device.signSk, handshakeHash) }
+        val roster = ownRosterOrNull() ?: return null
+        if (!coreRosterNamesASibling(roster, device.deviceId)) return null
+        return runCatching { coreOwnDeviceLanProof(device.signSk, handshakeHash, role) }
             .onFailure { Log.w(TAG, "Could not sign this phone's own-device proof", it) }
             .getOrNull()
     }
@@ -1990,6 +2010,13 @@ class MeshService : Service() {
      * [uniffi.cruisemesh_core.CoreLanOwnDeviceProof.revoked]. It is the device
      * the notice exists for.
      *
+     * `peerRole` is the end the peer speaks from, and this device's own id goes
+     * in beside it. Together they are what stops a host this phone dialed from
+     * decrypting the proof it was just sent, re-encrypting it under its own
+     * sending key, and handing it back: both ends of one Noise session share a
+     * transcript hash, so without them that reflection verifies, names this
+     * phone, and is found in this phone's own roster.
+     *
      * One indexed read against a single-row table, on the handshake thread, for
      * exactly the same reason `trustedPeerForStaticKey` reads `listContacts`
      * there: the answer gates the socket, and deferring it to the store
@@ -1999,12 +2026,23 @@ class MeshService : Service() {
     private fun openOwnDeviceLanProof(
         handshakeHash: ByteArray,
         payload: ByteArray,
+        peerRole: CoreLanProofRole,
     ): CoreLanOwnDeviceProof? {
-        val roster = runCatching { store.ownRoster() }
-            .onFailure { Log.w(TAG, "Could not read this person's device list", it) }
-            .getOrNull() ?: return null
-        return coreOwnDeviceLanProofOpen(roster, handshakeHash, payload)
+        val roster = ownRosterOrNull() ?: return null
+        return coreOwnDeviceLanProofOpen(
+            roster,
+            handshakeHash,
+            payload,
+            peerRole,
+            DeviceKeyStore.load(this)?.deviceId ?: ByteArray(0),
+        )
     }
+
+    /** This person's device list, or null when it cannot be read. */
+    private fun ownRosterOrNull(): Roster? =
+        runCatching { store.ownRoster() }
+            .onFailure { Log.w(TAG, "Could not read this person's device list", it) }
+            .getOrNull()
 
     /**
      * Whether this link has proved, cryptographically, that the other end is

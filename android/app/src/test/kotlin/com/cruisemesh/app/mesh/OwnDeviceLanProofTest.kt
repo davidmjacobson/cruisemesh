@@ -1,11 +1,17 @@
 package com.cruisemesh.app.mesh
 
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.CoreLanOwnDeviceProof
+import uniffi.cruisemesh_core.CoreLanProofRole
+import uniffi.cruisemesh_core.DeviceKeypair
+import uniffi.cruisemesh_core.LanNoiseSession
 import uniffi.cruisemesh_core.Roster
 import uniffi.cruisemesh_core.coreLinkGenesisRoster
 import uniffi.cruisemesh_core.coreLinkSignNewDeviceRoster
@@ -13,6 +19,7 @@ import uniffi.cruisemesh_core.coreMintInboxKey
 import uniffi.cruisemesh_core.coreOwnDeviceLanProof
 import uniffi.cruisemesh_core.coreOwnDeviceLanProofOpen
 import uniffi.cruisemesh_core.coreRevokeDevicesRoster
+import uniffi.cruisemesh_core.coreRosterNamesASibling
 import uniffi.cruisemesh_core.generateDeviceKeypair
 import uniffi.cruisemesh_core.generateIdentity
 
@@ -32,6 +39,10 @@ import uniffi.cruisemesh_core.generateIdentity
  * withholds the person root secret, so it refused every real sibling, in both
  * roles — 25 refusals across 15 minutes on one `/24`, no own-device link ever
  * formed, and a removed phone that never learned it was removed.
+ *
+ * The second half of this file drives the exchange itself over two real Noise
+ * sessions: who writes first, what a stranger gets for asking, and what happens
+ * when the far end simply hands our own proof back to us.
  */
 class OwnDeviceLanProofTest {
 
@@ -48,6 +59,9 @@ class OwnDeviceLanProofTest {
         /** The phone that gets removed -- the P7, which stayed wedged. */
         val sibling = generateDeviceKeypair()
 
+        /** The genesis roster: the approver alone, before anything was linked. */
+        val approverAlone: Roster
+
         /** Both devices live: what each side held before the removal. */
         val bothLive: Roster
 
@@ -59,13 +73,13 @@ class OwnDeviceLanProofTest {
         val afterRemoval: Roster
 
         init {
-            val genesis = coreLinkGenesisRoster(
+            approverAlone = coreLinkGenesisRoster(
                 person.signSk,
                 approver.signPk,
                 approver.agreePk,
             )
             bothLive = coreLinkSignNewDeviceRoster(
-                genesis,
+                approverAlone,
                 person.signPk,
                 approver.signSk,
                 sibling.signPk,
@@ -83,6 +97,13 @@ class OwnDeviceLanProofTest {
 
     /** Stands in for a Noise transcript hash; two distinct values are two sessions. */
     private fun transcript(byte: Int) = ByteArray(32) { byte.toByte() }
+
+    /** A proof from one device, for one session, minted for one end of it. */
+    private fun proof(
+        device: DeviceKeypair,
+        session: ByteArray,
+        role: CoreLanProofRole,
+    ): ByteArray = coreOwnDeviceLanProof(device.signSk, session, role)
 
     /**
      * **The fact the bug rested on.** Nothing in the ceremony gives the new
@@ -116,20 +137,27 @@ class OwnDeviceLanProofTest {
         val fleet = Fleet()
         val session = transcript(0xA1)
 
+        // The sibling dialed, so it proves as the initiator and the approver
+        // opens that proof expecting exactly that end.
         assertEquals(
             fleet.sibling.deviceId.toList(),
             coreOwnDeviceLanProofOpen(
                 fleet.bothLive,
                 session,
-                coreOwnDeviceLanProof(fleet.sibling.signSk, session),
+                proof(fleet.sibling, session, CoreLanProofRole.INITIATOR),
+                CoreLanProofRole.INITIATOR,
+                fleet.approver.deviceId,
             ).deviceIdOrFail().toList(),
         )
+        // And the answer, coming back the other way on the same session.
         assertEquals(
             fleet.approver.deviceId.toList(),
             coreOwnDeviceLanProofOpen(
                 fleet.bothLive,
                 session,
-                coreOwnDeviceLanProof(fleet.approver.signSk, session),
+                proof(fleet.approver, session, CoreLanProofRole.RESPONDER),
+                CoreLanProofRole.RESPONDER,
+                fleet.sibling.deviceId,
             ).deviceIdOrFail().toList(),
         )
     }
@@ -159,7 +187,9 @@ class OwnDeviceLanProofTest {
         val fromRemoved = coreOwnDeviceLanProofOpen(
             fleet.afterRemoval,
             session,
-            coreOwnDeviceLanProof(fleet.sibling.signSk, session),
+            proof(fleet.sibling, session, CoreLanProofRole.INITIATOR),
+            CoreLanProofRole.INITIATOR,
+            fleet.approver.deviceId,
         )
         assertEquals(fleet.sibling.deviceId.toList(), fromRemoved.deviceIdOrFail().toList())
         assertTrue("the approver must know this is the removed device", fromRemoved!!.revoked)
@@ -169,7 +199,9 @@ class OwnDeviceLanProofTest {
         val fromApprover = coreOwnDeviceLanProofOpen(
             fleet.bothLive,
             session,
-            coreOwnDeviceLanProof(fleet.approver.signSk, session),
+            proof(fleet.approver, session, CoreLanProofRole.RESPONDER),
+            CoreLanProofRole.RESPONDER,
+            fleet.sibling.deviceId,
         )
         assertEquals(fleet.approver.deviceId.toList(), fromApprover.deviceIdOrFail().toList())
         assertTrue("the approver is not revoked", !fromApprover!!.revoked)
@@ -188,7 +220,9 @@ class OwnDeviceLanProofTest {
         val proven = coreOwnDeviceLanProofOpen(
             fleet.afterRemoval,
             session,
-            coreOwnDeviceLanProof(fleet.sibling.signSk, session),
+            proof(fleet.sibling, session, CoreLanProofRole.INITIATOR),
+            CoreLanProofRole.INITIATOR,
+            fleet.approver.deviceId,
         ).deviceIdOrFail()
 
         assertTrue(
@@ -212,7 +246,9 @@ class OwnDeviceLanProofTest {
             coreOwnDeviceLanProofOpen(
                 fleet.bothLive,
                 session,
-                coreOwnDeviceLanProof(stranger.signSk, session),
+                proof(stranger, session, CoreLanProofRole.INITIATOR),
+                CoreLanProofRole.INITIATOR,
+                fleet.approver.deviceId,
             ),
         )
         assertTrue(
@@ -233,15 +269,23 @@ class OwnDeviceLanProofTest {
     @Test
     fun `a proof recorded from one session does not open on another`() {
         val fleet = Fleet()
-        val recorded = coreOwnDeviceLanProof(fleet.sibling.signSk, transcript(0xE5))
-        assertNull(coreOwnDeviceLanProofOpen(fleet.bothLive, transcript(0xE6), recorded))
+        val recorded = proof(fleet.sibling, transcript(0xE5), CoreLanProofRole.INITIATOR)
+        assertNull(
+            coreOwnDeviceLanProofOpen(
+                fleet.bothLive,
+                transcript(0xE6),
+                recorded,
+                CoreLanProofRole.INITIATOR,
+                fleet.approver.deviceId,
+            ),
+        )
     }
 
     @Test
     fun `a truncated or padded proof is refused rather than interpreted`() {
         val fleet = Fleet()
         val session = transcript(0xF7)
-        val good = coreOwnDeviceLanProof(fleet.sibling.signSk, session)
+        val good = proof(fleet.sibling, session, CoreLanProofRole.INITIATOR)
         for (spoiled in listOf(
             ByteArray(0),
             good.copyOf(good.size - 1),
@@ -249,8 +293,241 @@ class OwnDeviceLanProofTest {
             good.copyOf().also { it[0] = (it[0].toInt() xor 0xff).toByte() },
             good.copyOf().also { it[it.size - 1] = (it[it.size - 1].toInt() xor 1).toByte() },
         )) {
-            assertNull(coreOwnDeviceLanProofOpen(fleet.bothLive, session, spoiled))
+            assertNull(
+                coreOwnDeviceLanProofOpen(
+                    fleet.bothLive,
+                    session,
+                    spoiled,
+                    CoreLanProofRole.INITIATOR,
+                    fleet.approver.deviceId,
+                ),
+            )
         }
+    }
+
+    /**
+     * **The gate on ever putting this phone's signing key on the wire.**
+     *
+     * The initiator proves before the host it dialed has proved anything, so a
+     * phone sweeping a ship's `/24` would otherwise hand a stable identifier to
+     * every host that answers on the port. A phone whose roster names only
+     * itself has nothing to gain for it — there is nobody it could recognise —
+     * so it mints nothing. The moment a second device is linked, and ever after
+     * it is buried, there is somebody to name.
+     */
+    @Test
+    fun `only a phone whose roster names another device puts a proof on the wire`() {
+        val fleet = Fleet()
+        assertTrue(
+            "a phone that has never linked has no sibling to prove to",
+            !coreRosterNamesASibling(fleet.approverAlone, fleet.approver.deviceId),
+        )
+        assertTrue(coreRosterNamesASibling(fleet.bothLive, fleet.approver.deviceId))
+        assertTrue(coreRosterNamesASibling(fleet.bothLive, fleet.sibling.deviceId))
+        assertTrue(
+            "a grave is somebody to name -- it is who the notice is for",
+            coreRosterNamesASibling(fleet.afterRemoval, fleet.approver.deviceId),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // The exchange itself, over two real Noise sessions
+    // -----------------------------------------------------------------------
+
+    /**
+     * Two `LanNoiseSession`s wired to each other through queues instead of a
+     * socket: everything [exchangeOwnDeviceProof] touches, with none of the
+     * NSD, threading, or Android plumbing around it.
+     */
+    private class SessionPair {
+        private val initiatorIdentity = generateIdentity()
+        private val responderIdentity = generateIdentity()
+        val initiator = LanNoiseSession(true, initiatorIdentity.agreeSk)
+        val responder = LanNoiseSession(false, responderIdentity.agreeSk)
+        val toInitiator: BlockingQueue<ByteArray> = ArrayBlockingQueue(8)
+        val toResponder: BlockingQueue<ByteArray> = ArrayBlockingQueue(8)
+
+        init {
+            responder.readHandshakeMessage(initiator.writeHandshakeMessage())
+            initiator.readHandshakeMessage(responder.writeHandshakeMessage())
+            responder.readHandshakeMessage(initiator.writeHandshakeMessage())
+            check(initiator.isHandshakeFinished() && responder.isHandshakeFinished())
+        }
+
+        /** The transcript hash both ends agree on, which is what a proof signs. */
+        fun session(): ByteArray = initiator.handshakeHash()!!
+
+        fun channel(initiatorSide: Boolean) = QueueChannel(
+            session = if (initiatorSide) initiator else responder,
+            outbox = if (initiatorSide) toResponder else toInitiator,
+            inbox = if (initiatorSide) toInitiator else toResponder,
+        )
+    }
+
+    /**
+     * The transport's socket channel, minus the socket. The record bound and
+     * the "a partial record is not a proof" behaviour are the shipped ones:
+     * `decryptRecord` answers null until a frame is whole.
+     */
+    private class QueueChannel(
+        private val session: LanNoiseSession,
+        private val outbox: BlockingQueue<ByteArray>,
+        private val inbox: BlockingQueue<ByteArray>,
+    ) : OwnDeviceProofChannel {
+        override fun send(proof: ByteArray) {
+            session.encryptFrame(proof).forEach(outbox::put)
+        }
+
+        override fun receive(): ByteArray? {
+            repeat(4) {
+                val record = inbox.poll(5, TimeUnit.SECONDS) ?: return null
+                session.decryptRecord(record)?.let { return it }
+            }
+            return null
+        }
+    }
+
+    /**
+     * Run the dialing half on its own thread, because the exchange is genuinely
+     * two-sided: the initiator blocks on an answer the responder only sends
+     * after verifying.
+     */
+    private fun <T> onAnotherThread(work: () -> T): () -> T {
+        var result: Result<T>? = null
+        val thread = Thread { result = runCatching(work) }
+        thread.start()
+        return {
+            thread.join(20_000)
+            result!!.getOrThrow()
+        }
+    }
+
+    /** Both ends of a genuine sibling meeting, driven end to end. */
+    @Test
+    fun `the exchange names each device to the other`() {
+        val fleet = Fleet()
+        val wire = SessionPair()
+        val session = wire.session()
+        assertEquals(session.toList(), wire.responder.handshakeHash()!!.toList())
+
+        val dialing = onAnotherThread {
+            exchangeOwnDeviceProof(
+                initiator = true,
+                channel = wire.channel(initiatorSide = true),
+                mint = { role -> proof(fleet.sibling, session, role) },
+                open = { payload, peerRole ->
+                    coreOwnDeviceLanProofOpen(
+                        fleet.bothLive,
+                        session,
+                        payload,
+                        peerRole,
+                        fleet.sibling.deviceId,
+                    )
+                },
+            )
+        }
+        val answering = exchangeOwnDeviceProof(
+            initiator = false,
+            channel = wire.channel(initiatorSide = false),
+            mint = { role -> proof(fleet.approver, session, role) },
+            open = { payload, peerRole ->
+                coreOwnDeviceLanProofOpen(
+                    fleet.afterRemoval,
+                    session,
+                    payload,
+                    peerRole,
+                    fleet.approver.deviceId,
+                )
+            },
+        )
+
+        assertEquals(fleet.sibling.deviceId.toList(), answering?.deviceId?.toList())
+        assertTrue("the approver knows which phone it removed", answering!!.revoked)
+        assertEquals(fleet.approver.deviceId.toList(), dialing()?.deviceId?.toList())
+    }
+
+    /**
+     * **A stranger that dials us is told nothing.** The responder reads first
+     * and answers only once the proof verifies, so a phone that dials a
+     * CruiseMesh listener with a key nobody's roster names gets a closed socket
+     * and not one byte of this device's signing key.
+     */
+    @Test
+    fun `a responder that cannot verify the peer never answers`() {
+        val fleet = Fleet()
+        val stranger = generateDeviceKeypair()
+        val wire = SessionPair()
+        val session = wire.session()
+
+        val dialing = onAnotherThread {
+            exchangeOwnDeviceProof(
+                initiator = true,
+                channel = wire.channel(initiatorSide = true),
+                mint = { role -> proof(stranger, session, role) },
+                open = { _, _ -> null },
+            )
+        }
+        val answering = exchangeOwnDeviceProof(
+            initiator = false,
+            channel = wire.channel(initiatorSide = false),
+            mint = { role -> proof(fleet.approver, session, role) },
+            open = { payload, peerRole ->
+                coreOwnDeviceLanProofOpen(
+                    fleet.bothLive,
+                    session,
+                    payload,
+                    peerRole,
+                    fleet.approver.deviceId,
+                )
+            },
+        )
+
+        assertNull("a stranger is refused", answering)
+        assertTrue("and nothing was written back to it", wire.toInitiator.isEmpty())
+        assertNull(dialing())
+    }
+
+    /**
+     * **The reflection.** A host that answers a dial holds the session
+     * legitimately: it can decrypt the proof this phone sends, re-encrypt that
+     * same plaintext under its own sending key, and return it. Both ends of one
+     * handshake share a transcript hash, so the signature still verifies — and
+     * it names this very phone, which this phone's own roster of course lists.
+     *
+     * Refused because the proof was minted for the *dialing* end and is opened
+     * as the answer, and refused again because it derives to this device.
+     */
+    @Test
+    fun `a host that hands our own proof back is not admitted as a sibling`() {
+        val fleet = Fleet()
+        val wire = SessionPair()
+        val session = wire.session()
+
+        val dialing = onAnotherThread {
+            exchangeOwnDeviceProof(
+                initiator = true,
+                channel = wire.channel(initiatorSide = true),
+                mint = { role -> proof(fleet.approver, session, role) },
+                open = { payload, peerRole ->
+                    coreOwnDeviceLanProofOpen(
+                        fleet.bothLive,
+                        session,
+                        payload,
+                        peerRole,
+                        fleet.approver.deviceId,
+                    )
+                },
+            )
+        }
+
+        // The far end, doing the only thing it can: reading what it was handed
+        // and handing it straight back.
+        val farEnd = wire.channel(initiatorSide = false)
+        val received = farEnd.receive()
+        assertTrue("the far end really did get our proof", received != null)
+        farEnd.send(received!!)
+
+        assertNull("and it buys nothing", dialing())
     }
 
     private fun CoreLanOwnDeviceProof?.deviceIdOrFail(): ByteArray =

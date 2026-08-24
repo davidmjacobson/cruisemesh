@@ -38819,6 +38819,93 @@ extension CoreLanHealthAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which end of a LAN Noise session minted a proof.
+ *
+ * **The reason a proof cannot be symmetric.** Both ends of one handshake
+ * compute the identical transcript hash, so a signature over the hash alone
+ * says only "somebody on this session is a device of this person's" — never
+ * which somebody. A host we dial holds the session legitimately: it can
+ * decrypt the proof we send it, re-encrypt that same plaintext under its own
+ * sending key, and hand it straight back. Opened against our own roster, our
+ * own proof names our own device id, which our own roster of course lists, so
+ * an arbitrary machine on the Wi-Fi would be admitted as a device of ours.
+ *
+ * Naming the end inside the signed bytes closes it: each side signs its own
+ * role and opens only a proof signed for the *other* one, so a reflected copy
+ * verifies against nothing.
+ */
+
+public enum CoreLanProofRole {
+    
+    /**
+     * The end that dialed, and that proves first.
+     */
+    case initiator
+    /**
+     * The end that answered, and that proves only once the initiator's proof
+     * has verified.
+     */
+    case responder
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanProofRole: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanProofRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanProofRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .initiator
+        
+        case 2: return .responder
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLanProofRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .initiator:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .responder:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanProofRole_lift(_ buf: RustBuffer) throws -> CoreLanProofRole {
+    return try FfiConverterTypeCoreLanProofRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanProofRole_lower(_ value: CoreLanProofRole) -> RustBuffer {
+    return FfiConverterTypeCoreLanProofRole.lower(value)
+}
+
+
+
+extension CoreLanProofRole: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What an action asks of the shell.
  */
 
@@ -52557,12 +52644,17 @@ public func coreOwnCapabilities() -> UInt32 {
  * withholds the person root secret (§3), so two genuine siblings share no
  * private key at all — which is exactly why comparing agreement keys could
  * only ever recognise a clone.
+ *
+ * `role` is which end of the session this device is speaking from, and it is
+ * signed along with the transcript. See [`CoreLanProofRole`]: without it the
+ * two ends mint interchangeable proofs and a peer can simply return ours.
  */
-public func coreOwnDeviceLanProof(deviceSignSk: Data, handshakeHash: Data)throws  -> Data {
+public func coreOwnDeviceLanProof(deviceSignSk: Data, handshakeHash: Data, role: CoreLanProofRole)throws  -> Data {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_core_own_device_lan_proof(
         FfiConverterData.lower(deviceSignSk),
-        FfiConverterData.lower(handshakeHash),$0
+        FfiConverterData.lower(handshakeHash),
+        FfiConverterTypeCoreLanProofRole.lower(role),$0
     )
 })
 }
@@ -52579,13 +52671,23 @@ public func coreOwnDeviceLanProof(deviceSignSk: Data, handshakeHash: Data)throws
  *
  * Both `devices` and `tombstones` count. See [`CoreLanOwnDeviceProof::revoked`]
  * for why the buried half is not an oversight.
+ *
+ * `peer_role` is the end the *peer* speaks from — the opposite of this
+ * device's — and a proof signed for any other end does not verify here. That
+ * is what stops a host we dialed from handing our own proof back to us
+ * ([`CoreLanProofRole`]). `own_device_id` is the belt to that pair of braces:
+ * a proof that derives to this very device is refused outright, however it was
+ * signed. Pass an empty `own_device_id` only from a caller that has no device
+ * of its own — which is a caller that can mint no proof either.
  */
-public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, payload: Data) -> CoreLanOwnDeviceProof? {
+public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, payload: Data, peerRole: CoreLanProofRole, ownDeviceId: Data) -> CoreLanOwnDeviceProof? {
     return try!  FfiConverterOptionTypeCoreLanOwnDeviceProof.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_own_device_lan_proof_open(
         FfiConverterTypeRoster.lower(roster),
         FfiConverterData.lower(handshakeHash),
-        FfiConverterData.lower(payload),$0
+        FfiConverterData.lower(payload),
+        FfiConverterTypeCoreLanProofRole.lower(peerRole),
+        FfiConverterData.lower(ownDeviceId),$0
     )
 })
 }
@@ -53471,6 +53573,29 @@ public func coreRosterHeadHash(roster: Roster) -> Data {
     return try!  FfiConverterData.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_roster_head_hash(
         FfiConverterTypeRoster.lower(roster),$0
+    )
+})
+}
+/**
+ * Whether this roster names any device other than `own_device_id` — live or
+ * buried.
+ *
+ * The gate on ever minting a proof. A phone whose roster names only itself has
+ * no sibling that could recognise it and nobody it could recognise, so a proof
+ * it sent could only ever be reflected back at it; all it would achieve is
+ * handing this phone's stable device signing key to whatever answered the
+ * port. Solo installs are the overwhelming majority, so this keeps the key off
+ * the wire for almost everyone — and it is free for the fleet the feature
+ * exists for, where the roster names two.
+ *
+ * Tombstones count: after a removal the approver's roster lists one live
+ * device and one grave, and the grave is precisely who the notice is for.
+ */
+public func coreRosterNamesASibling(roster: Roster, ownDeviceId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_names_a_sibling(
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(ownDeviceId),$0
     )
 })
 }
@@ -57076,10 +57201,10 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof() != 28951) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof() != 6942) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof_open() != 39434) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof_open() != 63639) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
@@ -57209,6 +57334,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_head_hash() != 1927) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_names_a_sibling() != 27520) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_newly_revoked() != 31535) {

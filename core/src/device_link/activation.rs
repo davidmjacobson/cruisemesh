@@ -1467,6 +1467,15 @@ impl MessageStore {
         // doc comment: on a §9-linked device the caller has no way to know the
         // person root, and refusing here would strand exactly the device §10
         // step 5 exists to reach.
+        //
+        // Read the fallback as *ignoring* the argument, not as repairing it.
+        // It cannot tell a §9-linked device's own key from a key the shell got
+        // wrong, so it does not try: when the argument is not this person's
+        // root the held roster decides alone, and `person_id` is what pins it.
+        // That is the same binding the argument would have been checked
+        // against, so nothing is loosened -- but a caller that passes the wrong
+        // key gets a correct answer rather than a complaint, and any future
+        // reader chasing a key mix-up should start here rather than end here.
         let anchor =
             if crate::identity::derive_user_id(&person_root_sign_pk).to_vec() == held.person_id {
                 person_root_sign_pk

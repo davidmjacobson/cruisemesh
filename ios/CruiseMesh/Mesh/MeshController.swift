@@ -401,11 +401,15 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
                 return nil
             },
-            ownDeviceLanProof: { [weak self] handshakeHash in
-                self?.ownDeviceLanProof(handshakeHash: handshakeHash)
+            ownDeviceLanProof: { [weak self] handshakeHash, role in
+                self?.ownDeviceLanProof(handshakeHash: handshakeHash, role: role)
             },
-            openOwnDeviceLanProof: { [weak self] handshakeHash, payload in
-                self?.openOwnDeviceLanProof(handshakeHash: handshakeHash, payload: payload)
+            openOwnDeviceLanProof: { [weak self] handshakeHash, payload, peerRole in
+                self?.openOwnDeviceLanProof(
+                    handshakeHash: handshakeHash,
+                    payload: payload,
+                    peerRole: peerRole
+                )
             }
         )
         lanTransport = lan
@@ -1220,13 +1224,28 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// certificate in anybody's roster, so there is no sibling that could
     /// recognise this phone and nothing a proof could assert.
     ///
+    /// **Nil also on a phone whose roster names no device but itself**, which is
+    /// most phones. A proof is this device's stable signing public key with a
+    /// signature attached, and the initiator puts it in front of a host it dialed
+    /// before that host has proved anything — so a phone sweeping a ship's `/24`
+    /// would hand a durable identifier to whatever answered on the port. A solo
+    /// phone gains nothing for it: with nobody in its roster to recognise, the
+    /// only proof it could ever open is its own coming back, and
+    /// `coreOwnDeviceLanProofOpen` refuses that. So the key stays off the wire
+    /// until this person actually has a fleet.
+    ///
     /// Mirrors Android's `MeshService.ownDeviceLanProof`.
-    private func ownDeviceLanProof(handshakeHash: Data) -> Data? {
-        guard let device = DeviceKeyStore.load() else { return nil }
+    private func ownDeviceLanProof(handshakeHash: Data, role: CoreLanProofRole) -> Data? {
+        guard let device = DeviceKeyStore.load(),
+              let roster = try? store.ownRoster(),
+              coreRosterNamesASibling(roster: roster, ownDeviceId: device.deviceId) else {
+            return nil
+        }
         do {
             return try coreOwnDeviceLanProof(
                 deviceSignSk: device.signSk,
-                handshakeHash: handshakeHash
+                handshakeHash: handshakeHash,
+                role: role
             )
         } catch {
             log.warning("Could not sign this phone's own-device proof")
@@ -1243,16 +1262,26 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// a tombstoned one answers here on purpose, because it is the device the
     /// notice exists for.
     ///
+    /// `peerRole` is the end the peer speaks from, and this device's own id goes
+    /// in beside it. Together they are what stops a host this phone dialed from
+    /// decrypting the proof it was just sent, re-encrypting it under its own
+    /// sending key, and handing it back: both ends of one Noise session share a
+    /// transcript hash, so without them that reflection verifies, names this
+    /// phone, and is found in this phone's own roster.
+    ///
     /// Mirrors Android's `MeshService.openOwnDeviceLanProof`.
     private func openOwnDeviceLanProof(
         handshakeHash: Data,
-        payload: Data
+        payload: Data,
+        peerRole: CoreLanProofRole
     ) -> CoreLanOwnDeviceProof? {
         guard let roster = try? store.ownRoster() else { return nil }
         return coreOwnDeviceLanProofOpen(
             roster: roster,
             handshakeHash: handshakeHash,
-            payload: payload
+            payload: payload,
+            peerRole: peerRole,
+            ownDeviceId: DeviceKeyStore.load()?.deviceId ?? Data()
         )
     }
 

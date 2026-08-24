@@ -352,6 +352,38 @@ On "Remove device" (approving device) or recovery-code override:
    verify closes without answering, so a stranger who dials us learns
    nothing Noise XX message 2 did not already hand it.
 
+   **A proof names the end it was made for, and a device is not its own
+   sibling.** Both ends of one handshake compute the identical transcript
+   hash, so a signature over the hash alone says only "somebody on this
+   session is a device of this person's". A host we dial holds the
+   session legitimately: it can decrypt the proof we send, re-encrypt
+   that same plaintext under its own sending key, and return it — and
+   opened against our own roster that reflection verifies, names us, and
+   is found. So the signed bytes carry a role tag (`CoreLanProofRole`),
+   each side opens only a proof made for the *other* end, and a proof
+   deriving to this device's own id is refused outright.
+
+   **A phone with no fleet mints nothing.** A proof is a stable device
+   signing key with a signature attached, and the initiator puts it in
+   front of a host it dialed before that host has proved anything — so a
+   subnet sweep on a shared network would otherwise hand a durable
+   identifier to every host answering the port. A roster naming no device
+   but this one has nobody to recognise and nobody who could recognise
+   it, so no proof is minted at all (`core_roster_names_a_sibling`). The
+   disclosure is confined to phones that genuinely have a sibling to
+   find, which is exactly when this step has work to do.
+
+   **One own-device link per standing, and cross-connects are settled by
+   the keys.** Two phones that dial each other at once finish their
+   handshakes in opposite orders on the two hosts, so "newest wins" has
+   each keep a different socket and close the one the other kept — both
+   die and the pair flaps. The link dialed by the phone with the lower
+   Noise static key survives; both ends compute that from what they
+   already hold, with no extra message. A revoked device's link and a
+   live sibling's never compete for the same slot either, so a removed
+   phone reconnecting in a loop cannot starve the link that carries
+   roster convergence between the devices that remain.
+
    It must never be "the peer's Noise static key is this person's own
    agreement key". That is a **clone** test, not a sibling test, and the
    first build shipped it. §9's ceremony deliberately gives a linked

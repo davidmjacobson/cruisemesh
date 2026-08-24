@@ -1643,6 +1643,71 @@ const LAN_OWN_DEVICE_PROOF_MAGIC: &[u8; 8] = b"CMLANOD1";
 /// and there is no field an endpoint would fit in.
 const LAN_OWN_DEVICE_PROOF_LEN: usize = LAN_OWN_DEVICE_PROOF_MAGIC.len() + KEY_LEN + SIGNATURE_LEN;
 
+/// Which end of a LAN Noise session minted a proof.
+///
+/// **The reason a proof cannot be symmetric.** Both ends of one handshake
+/// compute the identical transcript hash, so a signature over the hash alone
+/// says only "somebody on this session is a device of this person's" — never
+/// which somebody. A host we dial holds the session legitimately: it can
+/// decrypt the proof we send it, re-encrypt that same plaintext under its own
+/// sending key, and hand it straight back. Opened against our own roster, our
+/// own proof names our own device id, which our own roster of course lists, so
+/// an arbitrary machine on the Wi-Fi would be admitted as a device of ours.
+///
+/// Naming the end inside the signed bytes closes it: each side signs its own
+/// role and opens only a proof signed for the *other* one, so a reflected copy
+/// verifies against nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreLanProofRole {
+    /// The end that dialed, and that proves first.
+    Initiator,
+    /// The end that answered, and that proves only once the initiator's proof
+    /// has verified.
+    Responder,
+}
+
+/// The byte that rides inside the signed message. Non-zero and distinct, so a
+/// zero-filled or truncated buffer names no role at all.
+fn lan_proof_role_tag(role: CoreLanProofRole) -> u8 {
+    match role {
+        CoreLanProofRole::Initiator => 0x01,
+        CoreLanProofRole::Responder => 0x02,
+    }
+}
+
+/// What a proof signs: the role byte, then this session's transcript hash.
+fn lan_proof_signed_message(role: CoreLanProofRole, handshake_hash: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(1 + handshake_hash.len());
+    message.push(lan_proof_role_tag(role));
+    message.extend_from_slice(handshake_hash);
+    message
+}
+
+/// Whether this roster names any device other than `own_device_id` — live or
+/// buried.
+///
+/// The gate on ever minting a proof. A phone whose roster names only itself has
+/// no sibling that could recognise it and nobody it could recognise, so a proof
+/// it sent could only ever be reflected back at it; all it would achieve is
+/// handing this phone's stable device signing key to whatever answered the
+/// port. Solo installs are the overwhelming majority, so this keeps the key off
+/// the wire for almost everyone — and it is free for the fleet the feature
+/// exists for, where the roster names two.
+///
+/// Tombstones count: after a removal the approver's roster lists one live
+/// device and one grave, and the grave is precisely who the notice is for.
+#[uniffi::export]
+pub fn core_roster_names_a_sibling(roster: Roster, own_device_id: Vec<u8>) -> bool {
+    roster
+        .devices
+        .iter()
+        .any(|cert| cert.device_id() != own_device_id)
+        || roster
+            .tombstones
+            .iter()
+            .any(|tombstone| tombstone.device_id != own_device_id)
+}
+
 /// Who a verified [own-device LAN proof](core_own_device_lan_proof) named.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct CoreLanOwnDeviceProof {
@@ -1678,10 +1743,15 @@ pub struct CoreLanOwnDeviceProof {
 /// withholds the person root secret (§3), so two genuine siblings share no
 /// private key at all — which is exactly why comparing agreement keys could
 /// only ever recognise a clone.
+///
+/// `role` is which end of the session this device is speaking from, and it is
+/// signed along with the transcript. See [`CoreLanProofRole`]: without it the
+/// two ends mint interchangeable proofs and a peer can simply return ours.
 #[uniffi::export]
 pub fn core_own_device_lan_proof(
     device_sign_sk: Vec<u8>,
     handshake_hash: Vec<u8>,
+    role: CoreLanProofRole,
 ) -> Result<Vec<u8>, CoreError> {
     if handshake_hash.is_empty() {
         return Err(CoreError::Malformed(
@@ -1692,7 +1762,7 @@ pub fn core_own_device_lan_proof(
     let signature = signing_key
         .sign(&domain_signed_bytes(
             DeviceSigningDomain::LanOwnDeviceProof,
-            &handshake_hash,
+            &lan_proof_signed_message(role, &handshake_hash),
         ))
         .to_bytes();
     let mut payload = Vec::with_capacity(LAN_OWN_DEVICE_PROOF_LEN);
@@ -1714,11 +1784,21 @@ pub fn core_own_device_lan_proof(
 ///
 /// Both `devices` and `tombstones` count. See [`CoreLanOwnDeviceProof::revoked`]
 /// for why the buried half is not an oversight.
+///
+/// `peer_role` is the end the *peer* speaks from — the opposite of this
+/// device's — and a proof signed for any other end does not verify here. That
+/// is what stops a host we dialed from handing our own proof back to us
+/// ([`CoreLanProofRole`]). `own_device_id` is the belt to that pair of braces:
+/// a proof that derives to this very device is refused outright, however it was
+/// signed. Pass an empty `own_device_id` only from a caller that has no device
+/// of its own — which is a caller that can mint no proof either.
 #[uniffi::export]
 pub fn core_own_device_lan_proof_open(
     roster: Roster,
     handshake_hash: Vec<u8>,
     payload: Vec<u8>,
+    peer_role: CoreLanProofRole,
+    own_device_id: Vec<u8>,
 ) -> Option<CoreLanOwnDeviceProof> {
     if handshake_hash.is_empty() || payload.len() != LAN_OWN_DEVICE_PROOF_LEN {
         return None;
@@ -1731,13 +1811,18 @@ pub fn core_own_device_lan_proof_open(
     core_device_verify(
         DeviceSigningDomain::LanOwnDeviceProof,
         device_sign_pk.to_vec(),
-        handshake_hash,
+        lan_proof_signed_message(peer_role, &handshake_hash),
         signature.to_vec(),
     )
     .ok()?;
     // Derived, never read off the wire: a payload naming somebody else's id
     // alongside its own key would otherwise be admitted as them.
     let device_id = derive_user_id(device_sign_pk).to_vec();
+    // This device is not its own sibling. A proof that names it did not come
+    // from the far end however convincingly it verifies -- it came back.
+    if !own_device_id.is_empty() && device_id == own_device_id {
+        return None;
+    }
     if roster
         .devices
         .iter()
@@ -3315,6 +3400,11 @@ mod tests {
         core_sign_roster(roster, DEVICE_A_SK.to_vec()).expect("fixed-key roster signs")
     }
 
+    /// Shorthand: this device's proof for one session, in one role.
+    fn proof(sk: &[u8; 32], session: &[u8], role: CoreLanProofRole) -> Vec<u8> {
+        core_own_device_lan_proof(sk.to_vec(), session.to_vec(), role).expect("signs")
+    }
+
     /// The field case, both directions.
     ///
     /// Two devices linked by §9's ceremony hold different agreement keys —
@@ -3331,20 +3421,33 @@ mod tests {
         let roster = two_device_roster();
         let session = transcript(0xA1);
 
-        let from_sibling =
-            core_own_device_lan_proof(DEVICE_B_SK.to_vec(), session.clone()).expect("signs");
+        // The sibling dialed, so it proves as the initiator and the approver
+        // opens it expecting exactly that end.
+        let from_sibling = proof(&DEVICE_B_SK, &session, CoreLanProofRole::Initiator);
         assert_eq!(
-            core_own_device_lan_proof_open(roster.clone(), session.clone(), from_sibling),
+            core_own_device_lan_proof_open(
+                roster.clone(),
+                session.clone(),
+                from_sibling,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
             Some(CoreLanOwnDeviceProof {
                 device_id: sibling_cert().device_id(),
                 revoked: false,
             })
         );
 
-        let from_approver =
-            core_own_device_lan_proof(DEVICE_A_SK.to_vec(), session.clone()).expect("signs");
+        // And the answer coming back the other way on the same session.
+        let from_approver = proof(&DEVICE_A_SK, &session, CoreLanProofRole::Responder);
         assert_eq!(
-            core_own_device_lan_proof_open(roster, session, from_approver),
+            core_own_device_lan_proof_open(
+                roster,
+                session,
+                from_approver,
+                CoreLanProofRole::Responder,
+                sibling_cert().device_id(),
+            ),
             Some(CoreLanOwnDeviceProof {
                 device_id: approving_cert().device_id(),
                 revoked: false,
@@ -3368,10 +3471,15 @@ mod tests {
 
         // The approver, verifying the phone it removed. Admitted, and told
         // that it is the removed one.
-        let from_removed =
-            core_own_device_lan_proof(DEVICE_B_SK.to_vec(), session.clone()).expect("signs");
+        let from_removed = proof(&DEVICE_B_SK, &session, CoreLanProofRole::Initiator);
         assert_eq!(
-            core_own_device_lan_proof_open(approver_roster, session.clone(), from_removed),
+            core_own_device_lan_proof_open(
+                approver_roster,
+                session.clone(),
+                from_removed,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
             Some(CoreLanOwnDeviceProof {
                 device_id: sibling_cert().device_id(),
                 revoked: true,
@@ -3380,10 +3488,15 @@ mod tests {
 
         // The removed phone, verifying the approver against the stale roster
         // it still believes. It has not been told yet -- that is the point.
-        let from_approver =
-            core_own_device_lan_proof(DEVICE_A_SK.to_vec(), session.clone()).expect("signs");
+        let from_approver = proof(&DEVICE_A_SK, &session, CoreLanProofRole::Responder);
         assert_eq!(
-            core_own_device_lan_proof_open(removed_roster, session, from_approver),
+            core_own_device_lan_proof_open(
+                removed_roster,
+                session,
+                from_approver,
+                CoreLanProofRole::Responder,
+                sibling_cert().device_id(),
+            ),
             Some(CoreLanOwnDeviceProof {
                 device_id: approving_cert().device_id(),
                 revoked: false,
@@ -3391,13 +3504,80 @@ mod tests {
         );
     }
 
+    /// **The reflection.** A host on the Wi-Fi that answers a dial completes
+    /// Noise with a key of its own choosing and then holds the session
+    /// legitimately: it can decrypt the proof this phone sends, re-encrypt the
+    /// identical plaintext under its own sending key, and hand it straight
+    /// back. Both ends of one handshake compute the same transcript hash, so
+    /// that signature still verifies — and it names this very phone, which this
+    /// phone's own roster of course lists.
+    ///
+    /// Refused twice over: the roles differ (an initiator's proof is not a
+    /// responder's), and a proof that derives to this device is not a sibling's
+    /// however it was signed.
+    #[test]
+    fn own_device_lan_proof_refuses_our_own_proof_handed_back_to_us() {
+        let session = transcript(0x11);
+        let ours = proof(&DEVICE_A_SK, &session, CoreLanProofRole::Initiator);
+
+        // What the far end returns, verbatim, opened as the answer we expect.
+        assert_eq!(
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                session.clone(),
+                ours.clone(),
+                CoreLanProofRole::Responder,
+                approving_cert().device_id(),
+            ),
+            None,
+            "a reflected proof was minted for the other end and must not open"
+        );
+
+        // And with the role check disarmed -- a later protocol change, a caller
+        // that passes the wrong end -- the id check still refuses it.
+        assert_eq!(
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                session,
+                ours,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
+            None,
+            "this device is not its own sibling"
+        );
+    }
+
+    /// The same, from the responder's chair: a proof minted for the dialing end
+    /// does not open as the answer.
+    #[test]
+    fn own_device_lan_proof_refuses_a_proof_minted_for_the_other_end() {
+        let session = transcript(0x12);
+        let sibling_as_initiator = proof(&DEVICE_B_SK, &session, CoreLanProofRole::Initiator);
+        assert_eq!(
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                session,
+                sibling_as_initiator,
+                CoreLanProofRole::Responder,
+                approving_cert().device_id(),
+            ),
+            None
+        );
+    }
+
     #[test]
     fn own_device_lan_proof_refuses_a_device_this_roster_never_heard_of() {
         let session = transcript(0xC3);
-        let stranger =
-            core_own_device_lan_proof(STRANGER_SK.to_vec(), session.clone()).expect("signs");
+        let stranger = proof(&STRANGER_SK, &session, CoreLanProofRole::Initiator);
         assert_eq!(
-            core_own_device_lan_proof_open(two_device_roster(), session, stranger),
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                session,
+                stranger,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
             None
         );
     }
@@ -3406,10 +3586,15 @@ mod tests {
     /// transcript hash it signed names a conversation this one is not.
     #[test]
     fn own_device_lan_proof_refuses_a_replayed_transcript() {
-        let recorded =
-            core_own_device_lan_proof(DEVICE_B_SK.to_vec(), transcript(0xD4)).expect("signs");
+        let recorded = proof(&DEVICE_B_SK, &transcript(0xD4), CoreLanProofRole::Initiator);
         assert_eq!(
-            core_own_device_lan_proof_open(two_device_roster(), transcript(0xD5), recorded),
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                transcript(0xD5),
+                recorded,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
             None
         );
     }
@@ -3422,14 +3607,20 @@ mod tests {
         let elsewhere = core_device_sign(
             DeviceSigningDomain::SyncRecord,
             DEVICE_B_SK.to_vec(),
-            session.clone(),
+            lan_proof_signed_message(CoreLanProofRole::Initiator, &session),
         )
         .expect("signs");
         let mut payload = LAN_OWN_DEVICE_PROOF_MAGIC.to_vec();
         payload.extend_from_slice(&sign_pk(&DEVICE_B_SK));
         payload.extend_from_slice(&elsewhere);
         assert_eq!(
-            core_own_device_lan_proof_open(two_device_roster(), session, payload),
+            core_own_device_lan_proof_open(
+                two_device_roster(),
+                session,
+                payload,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            ),
             None
         );
     }
@@ -3437,10 +3628,19 @@ mod tests {
     #[test]
     fn own_device_lan_proof_refuses_malformed_payloads() {
         let session = transcript(0xF7);
-        let good = core_own_device_lan_proof(DEVICE_B_SK.to_vec(), session.clone()).expect("signs");
+        let good = proof(&DEVICE_B_SK, &session, CoreLanProofRole::Initiator);
         assert_eq!(good.len(), LAN_OWN_DEVICE_PROOF_LEN);
 
         let roster = two_device_roster();
+        let open = |payload: Vec<u8>, hash: Vec<u8>| {
+            core_own_device_lan_proof_open(
+                roster.clone(),
+                hash,
+                payload,
+                CoreLanProofRole::Initiator,
+                approving_cert().device_id(),
+            )
+        };
         for spoiled in [
             Vec::new(),
             good[..good.len() - 1].to_vec(),
@@ -3459,17 +3659,52 @@ mod tests {
                 tampered
             },
         ] {
-            assert_eq!(
-                core_own_device_lan_proof_open(roster.clone(), session.clone(), spoiled),
-                None
-            );
+            assert_eq!(open(spoiled, session.clone()), None);
         }
 
         // And an unfinished handshake cannot mint or open one.
-        assert!(core_own_device_lan_proof(DEVICE_B_SK.to_vec(), Vec::new()).is_err());
-        assert_eq!(
-            core_own_device_lan_proof_open(roster, Vec::new(), good),
-            None
-        );
+        assert!(core_own_device_lan_proof(
+            DEVICE_B_SK.to_vec(),
+            Vec::new(),
+            CoreLanProofRole::Initiator
+        )
+        .is_err());
+        assert_eq!(open(good, Vec::new()), None);
+    }
+
+    /// The gate on ever putting a device signing key on the wire.
+    ///
+    /// A phone whose roster names only itself has no sibling to recognise and
+    /// none that could recognise it, so a proof from it could only ever come
+    /// back reflected -- all it would achieve is handing a stable identifier to
+    /// whatever answered the port on a shared Wi-Fi. A fleet phone, live or
+    /// bereaved, always has somebody to name.
+    #[test]
+    fn only_a_roster_with_a_sibling_in_it_is_worth_proving_to() {
+        let solo = core_sign_roster(
+            unsigned_roster(1, 7, vec![approving_cert()], Vec::new()),
+            DEVICE_A_SK.to_vec(),
+        )
+        .expect("fixed-key roster signs");
+        assert!(!core_roster_names_a_sibling(
+            solo,
+            approving_cert().device_id()
+        ));
+
+        assert!(core_roster_names_a_sibling(
+            two_device_roster(),
+            approving_cert().device_id()
+        ));
+        // After the removal the only other name in the document is a grave,
+        // and that grave is exactly who the notice is for.
+        assert!(core_roster_names_a_sibling(
+            roster_after_removing_the_sibling(),
+            approving_cert().device_id()
+        ));
+        // The removed phone, on the roster it still believes.
+        assert!(core_roster_names_a_sibling(
+            two_device_roster(),
+            sibling_cert().device_id()
+        ));
     }
 }
