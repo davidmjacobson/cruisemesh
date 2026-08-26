@@ -11,6 +11,7 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.StoredMessage
+import uniffi.cruisemesh_core.coreLegacyDeviceId
 import uniffi.cruisemesh_core.createGroup
 import uniffi.cruisemesh_core.generateIdentity
 
@@ -126,6 +127,7 @@ object PlayListingSeed {
                 timestamp = timestamp,
                 kind = KIND_TEXT,
                 payload = text.toByteArray(Charsets.UTF_8),
+                senderDeviceId = coreLegacyDeviceId(),
             ),
         )
     }
