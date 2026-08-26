@@ -5814,7 +5814,7 @@ mod tests {
                     "msg_id": encode_base64_field(&sample_msg_id(msg_byte)),
                     "hop_ttl": 3,
                     "recipient_hint": encode_base64_field(&sample_hint(1)),
-                    "sealed": encode_base64_field(&vec![7u8; 48]),
+                    "sealed": encode_base64_field(&[7u8; 48]),
                     "expiry_ms": expiry_ms,
                 })
                 .to_string(),
