@@ -692,14 +692,20 @@ internal class RelaySyncEngine(
      * a continuation.
      *
      * Off by default. [RelayEngineSettings.passEngine] selects it, and until
-     * canary evidence says otherwise the answer is the legacy engine. The
-     * remaining known gap is named here rather than left for someone to find
-     * by flipping it: a group-addressed row is posted as one row to one
-     * mailbox instead of being fanned out per member, so a group's mail would
-     * not arrive. It is recorded as an open divergence in
-     * `specs/protocol-contract-v1.md` §5.2.
+     * canary evidence says otherwise the answer is the legacy engine — a
+     * default that quietly moved with a release would make "roll back" mean
+     * "ship again".
      *
-     * What used to sit beside it, and no longer does: an ingested page now
+     * The gap that used to be named here is closed. Core's upload planning
+     * decomposes a group-addressed authored row into one row per member,
+     * picks the single destination mailbox with `core_group_fanout_relay_target`
+     * (so a member resting for silence contributes no fallback), and stamps
+     * `relay_posted_at` only once every member the envelope owes has landed —
+     * remembering per member which ones did, so a partial fan-out resumes with
+     * the remainder rather than re-posting the set, which is one step past what
+     * this pass does. `FANOUT-01` in `specs/protocol-contract-v1.md` pins it.
+     *
+     * What else used to sit beside it, and no longer does: an ingested page now
      * reaches [processRelayEnvelope] through [projector], so it raises the
      * same notification the legacy walk raises; a presence answer now reaches
      * [MeshConnectivityStatus] the same way; and a contact endpoint resting

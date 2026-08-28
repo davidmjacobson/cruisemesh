@@ -13,8 +13,7 @@ name: iOS release
 # releases even when the build was fine. Nothing here touches Apple's portal at
 # release time.
 #
-# Gated on IOS_ENABLED (secrets present) so this is a no-op-safe smoke build in
-# forks / before secrets exist. Required secrets:
+# Required secrets:
 #   IOS_DIST_CERT_P12_B64      base64 of the distribution .p12
 #   IOS_DIST_CERT_PASSWORD     .p12 password
 #   IOS_PROVISION_PROFILE_B64  base64 of the App Store .mobileprovision
@@ -25,24 +24,120 @@ name: iOS release
 # provisioningProfiles entry in ios/ExportOptions-AppStoreConnect.plist.
 # CFBundleVersion is stamped to epoch seconds (monotonic, above existing
 # TestFlight builds); CFBundleShortVersionString comes from the tag.
+#
+# DISTRIBUTING IS NOT OPTIONAL ON A TAG. Pushing the tag *is* the request to
+# ship, so a tag run with a signing or App Store Connect secret missing fails
+# immediately and names the secret, instead of quietly degrading to an
+# unsigned smoke build and reporting success -- a green release that reached
+# no tester is the worst outcome this workflow has. The archive-only mode
+# still exists, but you have to ask for it: run the workflow manually from the
+# Actions tab with `distribute: no`.
 
 on:
   push:
     tags:
       - "ios-v*"
+  workflow_dispatch:
+    inputs:
+      distribute:
+        description: "Sign and upload to TestFlight? 'no' = build + archive + verify only."
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
 
 jobs:
   release:
     runs-on: macos-latest
     env:
-      # Secrets can't be used in step `if:` directly; surface presence as a flag.
-      IOS_ENABLED: ${{ secrets.IOS_DIST_CERT_P12_B64 != '' && secrets.ASC_API_KEY_P8 != '' }}
+      # The one switch every signing/upload step gates on. A tag push is, by
+      # definition, a request to distribute; a manual run is a rehearsal unless
+      # it explicitly says otherwise. Nothing here reads secret presence: a
+      # missing secret must fail the run (see "Assert release mode"), never
+      # quietly turn distribution off.
+      DISTRIBUTE: ${{ github.event_name == 'push' && 'yes' || inputs.distribute }}
       # Plain-text record of what this run produced, uploaded as a run artifact
       # at the end. tools/testflight_distribute.py appends the App Store Connect
       # identifiers it resolves to the same file (it reads this variable itself).
       CRUISEMESH_PROVENANCE_FILE: ${{ github.workspace }}/release-provenance.txt
     steps:
       - uses: actions/checkout@v7
+
+      # --- Release intent ---------------------------------------------------
+      # Decide, before a single minute of macOS runner time is spent, whether
+      # this run ships. If it does, every credential it will need must already
+      # be present: discovering a missing key at the export step is discovering
+      # it after the release has been announced. If it does not ship, say so
+      # loudly and in the run summary, so a rehearsal can never be mistaken for
+      # a delivered build.
+      - name: Assert release mode and signing secrets
+        env:
+          IOS_DIST_CERT_P12_B64: ${{ secrets.IOS_DIST_CERT_P12_B64 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISION_PROFILE_B64: ${{ secrets.IOS_PROVISION_PROFILE_B64 }}
+          ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
+          ASC_API_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          set -eo pipefail
+          if [ "$DISTRIBUTE" != "yes" ]; then
+            echo "::warning title=Build only::This run will NOT sign and will NOT upload to TestFlight."
+            {
+              echo "## Build only — nothing was delivered"
+              echo
+              echo "This run was started with \`distribute: no\`, so it builds,"
+              echo "archives and verifies, then stops. Push an \`ios-v*\` tag to"
+              echo "actually release."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "ERROR: asked to distribute from '$GITHUB_REF' (ref type '$GITHUB_REF_TYPE')." >&2
+            echo "A shipped build must come from an 'ios-v*' tag so the release names" >&2
+            echo "one immutable commit. Push a tag, or re-run with distribute: no." >&2
+            exit 1
+          fi
+
+          missing=""
+          for name in \
+            IOS_DIST_CERT_P12_B64 \
+            IOS_DIST_CERT_PASSWORD \
+            IOS_PROVISION_PROFILE_B64 \
+            ASC_API_KEY_ID \
+            ASC_API_ISSUER_ID \
+            ASC_API_KEY_P8
+          do
+            eval "value=\${$name}"
+            if [ -z "$value" ]; then
+              missing="$missing $name"
+            fi
+          done
+
+          if [ -n "$missing" ]; then
+            {
+              echo "ERROR: this run was asked to ship to TestFlight, but the"
+              echo "repository is missing the secrets it needs:"
+              for name in $missing; do
+                echo "  - $name"
+              done
+              echo
+              echo "Set them under Settings -> Secrets and variables -> Actions and"
+              echo "re-tag. Failing here is deliberate: archiving unsigned and"
+              echo "reporting success would announce a release nobody can install."
+            } >&2
+            exit 1
+          fi
+          echo "Distribution enabled: all signing and App Store Connect secrets are present."
+
+      # A tag is only worth anything if it names exactly one commit forever.
+      # Fetch it back from the origin and compare: a tag deleted and re-pushed
+      # elsewhere, or an old run re-run after the tag moved, fails here.
+      - name: Assert the release tag pins this commit
+        if: github.ref_type == 'tag'
+        run: bash tools/assert_release_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
 
       # --- Release provenance ---------------------------------------------
       # Records what this run shipped: tag, commit, version, the checksum of the
@@ -138,6 +233,14 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Last moment before anything shippable exists, and before the deliberate
+      # version stamp below edits Info.plist. core/build-ios.sh regenerates the
+      # checked-in Swift bindings, so this also fails a release whose committed
+      # bindings were stale -- the exact drift that makes the app fatalError on
+      # launch. The xcframework it writes is the one expected output.
+      - name: Assert the working tree matches the commit being released
+        run: bash tools/assert_clean_tree.sh ios/CruiseMesh/Frameworks/
+
       - name: Generate Xcode project
         working-directory: ios
         run: xcodegen generate
@@ -198,7 +301,7 @@ jobs:
             ios/build/CruiseMesh.xcarchive/Products/Applications/CruiseMesh.app
 
       - name: Import signing certificate and profile
-        if: env.IOS_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         env:
           IOS_DIST_CERT_P12_B64: ${{ secrets.IOS_DIST_CERT_P12_B64 }}
           IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
@@ -224,7 +327,7 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Write App Store Connect API key
-        if: env.IOS_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         env:
           ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
           ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
@@ -234,7 +337,7 @@ jobs:
           printf '%s' "$ASC_API_KEY_P8" > "$HOME/private_keys/AuthKey_${ASC_API_KEY_ID}.p8"
 
       - name: Export (manual-signed) and upload to TestFlight
-        if: env.IOS_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         working-directory: ios
         env:
           ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
@@ -257,7 +360,7 @@ jobs:
       # altool sent. Runs even if the upload step failed, so a failed run still
       # says what it built.
       - name: Record IPA checksum
-        if: always() && env.IOS_ENABLED == 'true'
+        if: always() && env.DISTRIBUTE == 'yes'
         continue-on-error: true
         run: |
           path="ios/build/export/CruiseMesh.ipa"
@@ -291,7 +394,7 @@ jobs:
       # (PEP 668), so a bare pip install now dies with
       # "error: externally-managed-environment" before the script ever runs.
       - name: Distribute to the TestFlight beta group
-        if: env.IOS_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         continue-on-error: true
         env:
           ASC_API_KEY_ID: ${{ secrets.ASC_API_KEY_ID }}
@@ -317,9 +420,21 @@ jobs:
             exit 1
           fi
 
+      # The counterpart to the loud failure above: when a run legitimately does
+      # not ship, it says so in the log and in the run summary. A skipped upload
+      # is a state someone chose, never one nobody noticed.
       - name: Note skipped publish
-        if: env.IOS_ENABLED != 'true'
-        run: echo "Signing secrets not set — built + archived only; skipped signing/upload."
+        if: env.DISTRIBUTE != 'yes'
+        run: |
+          echo "::notice title=Nothing delivered::Built, archived and verified only; not signed, not uploaded."
+          {
+            echo "### Nothing was delivered"
+            echo
+            echo "The app was built, archived unsigned and checked for its privacy"
+            echo "manifest. It was not signed, not uploaded to App Store Connect and"
+            echo "not distributed to any tester."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up secrets from runner
         if: always()
