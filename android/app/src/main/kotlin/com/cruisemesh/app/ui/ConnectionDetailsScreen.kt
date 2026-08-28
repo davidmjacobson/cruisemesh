@@ -1441,6 +1441,8 @@ private fun howToFixTextId(reason: CoreHealthReason): Int? = when (reason) {
     CoreHealthReason.OWN_SETUP_REJECTED -> R.string.ui_how_to_fix_setup_rejected
     CoreHealthReason.STORAGE_FULL -> R.string.ui_how_to_fix_storage_full
     CoreHealthReason.PASS_EXPIRED -> R.string.ui_how_to_fix_pass_expired
+    CoreHealthReason.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_how_to_fix_pass_expired_still_receiving
     CoreHealthReason.PASS_SUSPENDED -> R.string.ui_how_to_fix_pass_suspended
     else -> null
 }
@@ -1609,6 +1611,8 @@ private fun relayEvidenceId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_shore_pass_state_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_shore_pass_state_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_shore_pass_state_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_shore_pass_state_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_shore_pass_state_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_shore_pass_state_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_shore_pass_state_storage_full
@@ -1623,6 +1627,8 @@ private fun relayRowStateId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_path_shore_pass_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_path_shore_pass_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_path_shore_pass_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_path_shore_pass_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_path_shore_pass_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_path_shore_pass_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_path_shore_pass_storage_full

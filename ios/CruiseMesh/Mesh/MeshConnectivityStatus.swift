@@ -18,6 +18,11 @@ enum RelayHealth: Equatable {
     case noConfig
     case failing(lastAttemptMs: Int64)
     case expired(lastAttemptMs: Int64)
+    /// The pass has lapsed but the service is still inside its read-only grace
+    /// window: envelopes already queued for us keep arriving and keep being
+    /// acked, and only new posts are refused. Distinct from `.expired` because
+    /// the two states look different to the person holding the phone.
+    case expiredReadOnly(lastAttemptMs: Int64)
     case suspended(lastAttemptMs: Int64)
     /// The relay answered but rejected our own saved family token (HTTP 401/403).
     case tokenRejected(lastAttemptMs: Int64)
@@ -61,6 +66,7 @@ enum RelayHealth: Equatable {
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
         case .expired: return .expired(lastAttemptMs: nowMs)
+        case .expiredReadOnly: return .expiredReadOnly(lastAttemptMs: nowMs)
         case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         case .failing: return .failing(lastAttemptMs: nowMs)
