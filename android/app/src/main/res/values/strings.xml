@@ -79,6 +79,8 @@
     <string name="ui_delete_captured_diagnostics">Delete captured diagnostics</string>
     <string name="ui_diagnostics_deleted">Captured diagnostics deleted.</string>
     <string name="ui_diagnostics_shared">Diagnostics shared.</string>
+    <string name="ui_diagnostics_saved">Diagnostics saved to the location you chose. Nothing was sent anywhere.</string>
+    <string name="ui_diagnostics_save_failed">Could not save the diagnostics file. If a file was created, it may be incomplete. Try again, or choose a different place to save.</string>
     <string name="ui_rebuilt_internet_sync">Rebuilt internet sync</string>
     <string name="ui_rebuilt_internet_sync_desc">Sends and receives over the internet using the rebuilt code. Leave this off unless you have been asked to turn it on for testing. It applies from the next sync.</string>
     <string name="ui_rebuilt_message_handling">Rebuilt message handling</string>
@@ -742,6 +744,7 @@
     <string name="ui_peer_activity_disconnected_no_path">%1$s disconnected · %2$s</string>
     <string name="ui_unnamed_friend">Friend</string>
     <string name="ui_share_diagnostics">Share diagnostics</string>
+    <string name="ui_save_diagnostics_to_device">Save to device</string>
     <string name="ui_show_less">Show less</string>
     <string name="ui_clear_connection_history">Clear connection history</string>
     <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.</string>
