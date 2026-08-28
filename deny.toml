@@ -1,12 +1,48 @@
+# cargo-deny configuration. This file is the executable half of the dependency
+# and license policy written in SECURITY.md ("Dependency, advisory and license
+# policy"); the two are meant to say the same thing, and a change to either is
+# incomplete until it is a change to both.
+#
+# Enforced by .github/workflows/dependency-audit.yml on every pull request,
+# every push to master, and daily -- the daily run is what catches an advisory
+# published against code nobody touched that week.
+
 [advisories]
+# cargo-deny has no severity threshold and this project does not want one:
+# every advisory that applies to the dependency graph fails the check, critical
+# to low alike. Severity governs how long an exception may stand, not whether
+# one is needed. See SECURITY.md.
+
+# A yanked crate version is a supply-chain signal in its own right -- the
+# author withdrew it -- so treat it as a failure rather than a warning.
+yanked = "deny"
+
+# Report unmaintained crates wherever they appear, including deep in the
+# transitive graph. "workspace" would only look at direct dependencies, and
+# every unmaintained crate this project has had to reason about arrived
+# transitively. Stated explicitly because cargo-deny's default for this has
+# moved between releases, and the policy should not move with it.
+unmaintained = "all"
+
+# Exceptions. Each carries the advisory id and a written reason; SECURITY.md
+# requires that reason to say why the risk is accepted and when the exception
+# is next reviewed. The structured form makes the justification data rather
+# than a comment that can drift away from the entry it explains.
 ignore = [
-    # Unmaintained-crate notices, not vulnerabilities. Both arrive as
-    # transitive dependencies; replacing them is upstream's call.
-    "RUSTSEC-2025-0141", # bincode 1.x unmaintained
-    "RUSTSEC-2024-0436", # paste unmaintained
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
 ]
 
 [licenses]
+# The allowlist. Anything not on it fails the build, which is the point: adding
+# a license is a deliberate pull request against this list, not something that
+# arrives with a transitive dependency bump. Kept identical to the list in
+# SECURITY.md.
+#
+# The project itself ships under AGPL-3.0-or-later. The two copyleft entries
+# below (LGPL-2.1-or-later, MPL-2.0) are library- and file-scoped and are
+# compatible with shipping a store binary; stronger copyleft arriving inside a
+# dependency is a decision for a human, so it is deliberately absent.
 allow = [
     "AGPL-3.0-or-later",
     "Apache-2.0",
@@ -27,9 +63,24 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
+# Duplicate versions are a tidiness and binary-size matter, not a security one,
+# and the graph carries plenty of them for reasons outside this project's
+# control (windows-sys, rand and thiserror each appear in two major versions).
+# Warn, so the list stays visible in the log, and do not fail a release over
+# it. This is the one place the config is deliberately softer than "everything
+# is an error", and SECURITY.md says so too.
 multiple-versions = "warn"
 wildcards = "deny"
 # Workspace-internal path dependencies carry no version requirement; they are
 # not wildcards in the supply-chain sense.
 allow-wildcard-paths = true
 deny = []
+
+[sources]
+# Every dependency comes from crates.io. A git dependency, or a crate from some
+# other registry, is code with no published provenance and no advisory database
+# behind it, so it fails the check rather than arriving unnoticed in a lockfile
+# diff. Pulling one in on purpose means editing this section in the same PR.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

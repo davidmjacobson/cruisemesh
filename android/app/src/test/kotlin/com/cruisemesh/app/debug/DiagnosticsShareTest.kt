@@ -1,9 +1,11 @@
 package com.cruisemesh.app.debug
 
 import java.io.File
+import java.time.LocalDateTime
 import java.util.zip.ZipFile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -75,5 +77,64 @@ class DiagnosticsShareTest {
 
         assertTrue(DiagnosticsShare.writeArchive(emptyList(), dest) != null)
         ZipFile(dest).use { zip -> assertTrue(zip.entries().toList().isEmpty()) }
+    }
+
+    /**
+     * The name offered to the document picker. Spaces are the thing to avoid:
+     * a saved file gets typed into a shell or pasted into a mail client, and
+     * both of those break a name at the first one.
+     */
+    @Test
+    fun `the suggested save name is stamped, unspaced, and keeps the extension`() {
+        val name = DiagnosticsShare.saveFileName(
+            "cruisemesh-diagnostics-2026-08-27.zip",
+            LocalDateTime.of(2026, 8, 27, 14, 32, 5),
+        )
+
+        assertEquals("cruisemesh-diagnostics-20260827-143205.zip", name)
+        assertFalse(name.contains(' '))
+    }
+
+    /**
+     * A full device makes zipping fail and the log goes alone; proposing that
+     * as a .zip would produce a file no one can open.
+     */
+    @Test
+    fun `the suggested save name follows the payload, not the zip`() {
+        assertEquals(
+            "cruisemesh-diagnostics-20260101-000000.txt",
+            DiagnosticsShare.saveFileName(
+                "cruisemesh-log.txt",
+                LocalDateTime.of(2026, 1, 1, 0, 0, 0),
+            ),
+        )
+    }
+
+    /** An extensionless payload must not be proposed with a trailing dot. */
+    @Test
+    fun `a payload with no extension yields a name with no extension`() {
+        assertEquals(
+            "cruisemesh-diagnostics-20260101-000000",
+            DiagnosticsShare.saveFileName("capture", LocalDateTime.of(2026, 1, 1, 0, 0, 0)),
+        )
+    }
+
+    /**
+     * Two saves in one afternoon is the normal case while working a problem.
+     * Second-level stamping is what keeps the picker from silently renaming
+     * the newer one and the older one getting sent instead.
+     */
+    @Test
+    fun `two saves in the same day get different names`() {
+        val morning = DiagnosticsShare.saveFileName(
+            "diagnostics.zip",
+            LocalDateTime.of(2026, 8, 27, 9, 15, 0),
+        )
+        val evening = DiagnosticsShare.saveFileName(
+            "diagnostics.zip",
+            LocalDateTime.of(2026, 8, 27, 21, 15, 0),
+        )
+
+        assertNotEquals(morning, evening)
     }
 }

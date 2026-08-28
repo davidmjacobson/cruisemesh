@@ -289,6 +289,10 @@ fun BackupRestoreScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
+    // The name is not the same fact as "a file has been opened": it can be
+    // absent for a file that opened perfectly well, because supplying it is the
+    // document provider's business and some providers decline. The bytes are
+    // what say a file was picked.
     var pickedName by remember { mutableStateOf<String?>(null) }
     var pickedBytes by remember { mutableStateOf<ByteArray?>(null) }
     var passphrase by remember { mutableStateOf("") }
@@ -311,8 +315,13 @@ fun BackupRestoreScreen(
         pickedName = null
         scope.launch {
             try {
-                pickedBytes = withContext(Dispatchers.IO) { BackupService.readBytes(context, uri) }
-                pickedName = withContext(Dispatchers.IO) { BackupService.displayName(context, uri) }
+                // Both off the main thread, and both in one hop, so the caption
+                // never flashes the generic wording on its way to the real name.
+                val (bytes, name) = withContext(Dispatchers.IO) {
+                    BackupService.readBytes(context, uri) to BackupService.displayName(context, uri)
+                }
+                pickedBytes = bytes
+                pickedName = name
             } catch (e: Exception) {
                 state = BackupUiState.Error(backupFailureText(e, R.string.ui_couldn_t_read_that_file))
             }
@@ -366,13 +375,17 @@ fun BackupRestoreScreen(
             ) {
                 Text(
                     stringResource(
-                        if (pickedName == null) R.string.ui_choose_backup_file else R.string.ui_choose_different_file,
+                        if (pickedBytes == null) {
+                            R.string.ui_choose_backup_file
+                        } else {
+                            R.string.ui_choose_different_file
+                        },
                     ),
                 )
             }
-            pickedName?.let {
+            if (pickedBytes != null) {
                 Text(
-                    it,
+                    pickedName ?: stringResource(R.string.ui_backup_file_selected),
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier.padding(top = 8.dp),
