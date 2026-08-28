@@ -16,7 +16,26 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- In-chat voice messages (DESIGN.md §8, specs/voice-messages.md) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <!-- Internet relay flush (DESIGN.md §9), best-effort only -->
+    <!-- Internet relay flush (DESIGN.md §9), best-effort only.
+
+         INTERNET also carries the same-LAN transport today. Local network
+         protection (Android 16) gates outgoing TCP to a local address, UDP in
+         either direction, and NsdManager/mDNS behind ACCESS_LOCAL_NETWORK — but
+         at targetSdk 36 that grant is implicit from INTERNET, and the platform
+         docs are explicit that the permission must NOT be declared or requested
+         yet. There is deliberately no ACCESS_LOCAL_NETWORK and no
+         NEARBY_WIFI_DEVICES here: the app calls none of the Wi-Fi APIs
+         NEARBY_WIFI_DEVICES gates (no WifiManager scan, no Wi-Fi Direct, Aware,
+         or RTT), and a permission we never exercise is a review flag.
+
+         Raising targetSdk to 37 (Android 17) makes the protection mandatory,
+         and it is the one bump that breaks LAN delivery *silently* — a missing
+         grant surfaces as TCP timeouts and EPERM, not as a permission error.
+         Whoever raises the target must declare ACCESS_LOCAL_NETWORK here AND
+         request it at runtime before the transport starts. See
+         specs/same-lan-transport.md "Platform privacy and permissions" for the
+         sourced detail and for the adb recipe that reproduces the restriction
+         on a target-36 build today. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Lets relay sync request and bind to a validated network (e.g. cellular)
