@@ -462,11 +462,24 @@ impl ChatService {
             // a scalar group watermark in the Windows shell.
             return Ok(false);
         };
+        // A plain MAX, matching iOS `ChatReadMarker` and Android
+        // `PeerStreamWatermark`. A receipt answers "how far through this
+        // peer's stream have I actually got?", and that stream can hold
+        // lamports this device will never have a row for -- most of all a
+        // front gap, where the authoring lamport ratchet restarts a sender
+        // above 1 after a chat wipe or a backup restore and the lamports
+        // below the new base never existed for anyone.
+        // `highest_contiguous_lamport` stops at the first missing lamport, so
+        // in that state it reports 0 forever and this shell would never send
+        // a read receipt for that peer at all. Gap detection still belongs to
+        // `chat_digest`, which keeps the contiguous count so genuinely lost
+        // messages are still spotted and re-requested.
         let through = self
             .bootstrap
             .store()
-            .highest_contiguous_lamport(contact.user_id.clone(), contact.user_id.clone())?;
+            .highest_lamport(contact.user_id.clone(), contact.user_id.clone())?;
         if through == 0 {
+            // Nothing held from this peer, so there is nothing to acknowledge.
             return Ok(false);
         }
         let authored = self.bootstrap.store().author_receipt(
@@ -1523,6 +1536,70 @@ mod tests {
             conversation.messages[1].kind,
             MessageKind::UnsupportedAttachment
         ));
+    }
+
+    #[tokio::test]
+    async fn read_receipt_is_sent_across_a_front_gap_in_the_peer_stream() {
+        let (_temp, bootstrap, service, contact, _friend) = service();
+        let store = bootstrap.store();
+        // The peer wiped its chat history, so its authoring ratchet restarted
+        // above 1: lamports 1 and 2 never existed for anyone, and this device
+        // holds every message the peer ever sent. A contiguous count reports 0
+        // here forever; the max is the honest watermark.
+        for lamport in 3..=4 {
+            store
+                .insert_message(StoredMessage {
+                    chat_id: contact.user_id.clone(),
+                    sender_user_id: contact.user_id.clone(),
+                    lamport,
+                    timestamp: lamport as i64,
+                    kind: KIND_TEXT,
+                    payload: b"after the wipe".to_vec(),
+                    sender_device_id: cruisemesh_core::LEGACY_DEVICE_ID.to_vec(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(contact.user_id.clone(), contact.user_id.clone())
+                .unwrap(),
+            0
+        );
+
+        assert!(service
+            .mark_read(&person_id(&contact.user_id))
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    contact.user_id.clone(),
+                    contact.user_id.clone(),
+                    RECEIPT_TYPE_READ
+                )
+                .unwrap(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_read_is_a_no_op_when_nothing_is_held_from_the_peer() {
+        let (_temp, bootstrap, service, contact, _friend) = service();
+        assert!(!service
+            .mark_read(&person_id(&contact.user_id))
+            .await
+            .unwrap());
+        assert_eq!(
+            bootstrap
+                .store()
+                .outgoing_receipt_through(
+                    contact.user_id.clone(),
+                    contact.user_id.clone(),
+                    RECEIPT_TYPE_READ
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
