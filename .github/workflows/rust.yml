@@ -153,6 +153,14 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew :app:testDebugUnitTest --rerun-tasks
+      # A green run here is not evidence on its own: the screenshot plugin only
+      # collects previews annotated @PreviewTest, and when a version bump
+      # introduced that rule this step kept passing while rendering zero of the
+      # 14 previews. :app:verifyScreenshotPreviewsCollected is wired as a
+      # finalizer of the validate task, so it runs whether or not it is named
+      # here and fails unless the count in the result XML matches the previews
+      # and reference images on disk. Do not "fix" a failure from it by touching
+      # the count it reports.
       - name: Validate critical-screen screenshots
         working-directory: android
         run: ./gradlew :app:validateDebugScreenshotTest
@@ -161,7 +169,11 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: android-screenshot-differences
-          path: android/app/build/reports/screenshotTest/
+          # The result XML rides along: how many previews were compared is the
+          # first thing to read when this gate misbehaves.
+          path: |
+            android/app/build/reports/screenshotTest/
+            android/app/build/test-results/validateDebugScreenshotTest/
           if-no-files-found: ignore
       - name: gradlew :app:lintRelease
         working-directory: android
