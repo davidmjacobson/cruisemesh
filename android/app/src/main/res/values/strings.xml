@@ -814,6 +814,10 @@
     <string name="ui_link_device_activating">Finishing up…</string>
     <string name="ui_link_device_done">Linked</string>
     <string name="ui_link_device_stopped">Stopped</string>
+    <!-- The way back into a run that ended without linking. The code that was
+         on screen is dead by then, so this starts a fresh one rather than
+         resuming anything. -->
+    <string name="ui_link_device_start_again">Start again</string>
     <string name="ui_link_device_outcome_declined">The numbers did not match.</string>
     <string name="ui_link_device_outcome_cancelled">One of the phones stopped.</string>
     <string name="ui_link_device_outcome_timed_out">The other phone never answered.</string>
