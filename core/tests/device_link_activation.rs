@@ -17,7 +17,8 @@ use cruisemesh_core::{
     core_link_bootstrap_chunks, core_link_bootstrap_decode, core_link_bootstrap_encode,
     core_link_bootstrap_join, core_link_device_offer, core_link_genesis_roster,
     core_link_open_activation_ack, core_link_open_device_offer, core_link_sign_new_device_roster,
-    core_mint_inbox_key, core_revoke_devices_roster, core_roster_head_hash,
+    core_mint_inbox_key, core_own_roster_notice_reoffer_due,
+    core_own_roster_notice_reoffer_interval_ms, core_revoke_devices_roster, core_roster_head_hash,
     generate_device_keypair, generate_identity, parse_frame, Contact, CoreInboundDisposition,
     CoreLinkActionKind, CoreLinkActivationStage, CoreLinkApprovingDevice, CoreLinkGatedAction,
     CoreLinkNewDevice, CoreLinkOutcome, CoreRelayEnvelopeDisposition, DeviceKeypair, Frame, Group,
@@ -925,4 +926,150 @@ fn a_removed_device_ejects_itself_when_the_roster_reaches_it() {
         newcomer_store.own_roster().unwrap(),
         Some(removal.roster.clone())
     );
+}
+/// **§10 step 5, the field sequence.** The two phones meet FIRST, and the
+/// removal happens afterwards, on a link that is already up.
+///
+/// This is the ordering the 2026-08-24 rig capture caught, and the one the
+/// shipped build could not survive. The notice was edge-triggered on an inbound
+/// HELLO2 and nothing else: one offer per link, at the instant the link came
+/// up. A removal a few seconds later had no carrier at all — no new HELLO, no
+/// roster-change hook, no re-offer — so the removed phone kept the roster that
+/// still listed it through 26 minutes on the same Wi-Fi, a force-stop of both
+/// apps, and a reboot.
+///
+/// What makes it converge is the re-offer, on the cadence
+/// [`core_own_roster_notice_reoffer_due`] defines. This walks it: the meeting's
+/// offer (which changes nothing, because nothing has changed yet), the removal,
+/// the interval passing, and the re-offer that buries the device. Nothing here
+/// depends on the removed phone being told to ask, or on the approver having
+/// received any event — which is the whole point, since the phone that is wrong
+/// is the one that cannot know to ask.
+#[test]
+fn a_removal_after_the_meeting_still_reaches_a_link_that_is_already_up() {
+    let approving = approving_device();
+    let newcomer_device = generate_device_keypair();
+    let newcomer_store = MessageStore::open(":memory:".to_string()).unwrap();
+
+    let update = core_link_sign_new_device_roster(
+        approving.roster.clone(),
+        approving.identity.sign_pk.clone(),
+        approving.device.sign_sk.clone(),
+        newcomer_device.sign_pk.clone(),
+        newcomer_device.agree_pk.clone(),
+    )
+    .unwrap();
+    let bootstrap = approving
+        .store
+        .build_link_bootstrap(
+            approving.identity.clone(),
+            person_profile(),
+            update.roster.clone(),
+            approving.device.sign_sk.clone(),
+            BINDING.to_vec(),
+            0,
+            0,
+            NOW,
+        )
+        .unwrap();
+    newcomer_store
+        .begin_link_activation(BINDING.to_vec(), NOW)
+        .unwrap();
+    let import = newcomer_store
+        .import_link_bootstrap(bootstrap, newcomer_device.sign_pk.clone(), None, NOW + 1)
+        .unwrap();
+    newcomer_store
+        .complete_link_activation(import.roster_head.clone(), NOW + 2)
+        .unwrap();
+    approving
+        .store
+        .adopt_own_roster(
+            update.roster.clone(),
+            approving.identity.sign_pk.clone(),
+            approving.device.device_id.clone(),
+        )
+        .unwrap();
+
+    // ---- The meeting, BEFORE the removal -------------------------------
+    // The one offer the shipped build made. It carries the roster that still
+    // lists the newcomer, so it changes nothing on either side.
+    let met_at = NOW + 3;
+    let offered =
+        |store: &MessageStore| match parse_frame(store.own_roster_notice_frame().unwrap().unwrap())
+            .unwrap()
+        {
+            Frame::OwnRoster { document } => document,
+            other => panic!("own roster notice parsed as {other:?}"),
+        };
+    let first = newcomer_store
+        .apply_own_roster_notice(
+            offered(&approving.store),
+            approving.identity.sign_pk.clone(),
+            newcomer_device.device_id.clone(),
+            met_at,
+        )
+        .unwrap();
+    assert_eq!(first.outcome, RevocationAdoptionOutcome::NotSuperseding);
+    assert_eq!(
+        newcomer_store.own_device_fleet().unwrap().device_ids.len(),
+        2,
+        "the meeting itself must not change a roster that has not changed"
+    );
+
+    // ---- §10.1: the removal, on a link that is already up ---------------
+    let removal = core_revoke_devices_roster(
+        update.roster.clone(),
+        approving.identity.sign_pk.clone(),
+        approving.device.sign_sk.clone(),
+        vec![newcomer_device.device_id.clone()],
+        core_mint_inbox_key(update.roster.inbox_key_generation),
+    )
+    .unwrap();
+    approving
+        .store
+        .adopt_own_roster(
+            removal.roster.clone(),
+            approving.identity.sign_pk.clone(),
+            approving.device.device_id.clone(),
+        )
+        .unwrap();
+
+    // Nothing has happened on the wire. Edge-triggered, this is where the
+    // field capture stops and the removed phone stays linked forever.
+    assert!(
+        !core_own_roster_notice_reoffer_due(Some(met_at), met_at + 5_000),
+        "a re-offer five seconds after the last one would be chatter"
+    );
+    assert_eq!(
+        newcomer_store.own_device_fleet().unwrap().device_ids.len(),
+        2
+    );
+
+    // ---- The re-offer, on core's cadence --------------------------------
+    let reoffer_at = met_at + core_own_roster_notice_reoffer_interval_ms();
+    assert!(core_own_roster_notice_reoffer_due(Some(met_at), reoffer_at));
+    let adoption = newcomer_store
+        .apply_own_roster_notice(
+            offered(&approving.store),
+            approving.identity.sign_pk.clone(),
+            newcomer_device.device_id.clone(),
+            reoffer_at,
+        )
+        .unwrap();
+    assert_eq!(adoption.outcome, RevocationAdoptionOutcome::RevokedSelf);
+    assert_eq!(
+        adoption.revoked_device_ids,
+        vec![newcomer_device.device_id.clone()]
+    );
+    assert_eq!(
+        newcomer_store.link_activation().unwrap().stage,
+        CoreLinkActivationStage::Revoked
+    );
+    let fleet = newcomer_store.own_device_fleet().unwrap();
+    assert_eq!(fleet.own_device_id, None);
+    assert!(fleet.device_ids.is_empty());
+
+    // And the removed device does not become an announcer of its own burial:
+    // the news travels from the fleet toward it, never out of it.
+    assert_eq!(newcomer_store.own_roster_notice_frame().unwrap(), None);
 }

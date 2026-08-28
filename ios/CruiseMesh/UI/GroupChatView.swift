@@ -730,9 +730,17 @@ private struct GroupMessageRow: View {
                         }
                     }
                         .padding(10)
+                        // Same as ChatView: composite the translucent contact
+                        // tint over the system background so the lifted
+                        // context-menu preview is opaque instead of letting
+                        // neighbouring bubbles bleed through.
                         .background(
                             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
+                                .fill(Color(.systemBackground))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                        .fill(isOwn ? Color.accentColor : contactColor.opacity(0.24))
+                                )
                         )
                         .foregroundStyle(isOwn ? Color.white : Color.primary)
                         .contentShape(

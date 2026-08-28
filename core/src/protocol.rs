@@ -2090,6 +2090,27 @@ pub(crate) fn is_local_lan_host(host: &str) -> bool {
     }
 }
 
+/// [`is_local_lan_host`], minus the addresses that are local but that nobody
+/// else can dial: IPv6 link-local.
+///
+/// An `fe80::/10` address only resolves against the *dialer's* scope id, and
+/// the scope a phone reads off its own interface means nothing to the phone it
+/// hands the address to. Still accepted as an incoming hint -- shipped builds
+/// emit one and refusing it would drop an otherwise good frame -- but refused
+/// as something this phone chooses to publish about itself. See
+/// [`crate::core_lan_host_is_reachable_endpoint`].
+pub(crate) fn is_reachable_lan_host(host: &str) -> bool {
+    if !is_local_lan_host(host) {
+        return false;
+    }
+    let literal = host.split_once('%').map_or(host, |(literal, _)| literal);
+    match literal.parse::<IpAddr>() {
+        Ok(IpAddr::V6(addr)) => !is_ipv6_link_local(addr),
+        Ok(IpAddr::V4(_)) => true,
+        Err(_) => false,
+    }
+}
+
 fn is_local_ipv4(addr: Ipv4Addr) -> bool {
     let octets = addr.octets();
     // 10/8, 172.16/12, 192.168/16.

@@ -97,10 +97,11 @@ pub use deep_link::{deep_link_route, DeepLinkRoute};
 pub use device_link::activation::{
     core_link_activation_ack, core_link_activation_gate, core_link_device_offer,
     core_link_genesis_roster, core_link_open_activation_ack, core_link_open_device_offer,
-    core_link_recovery_roster, core_link_sign_new_device_roster, CoreLinkActivation,
-    CoreLinkActivationStage, CoreLinkBootstrapImport, CoreLinkGateReason, CoreLinkGateVerdict,
-    CoreLinkGatedAction, CoreLinkImportReadiness, LinkActivationAck, LinkDeviceOffer,
-    LinkRosterUpdate,
+    core_link_recovery_roster, core_link_sign_new_device_roster,
+    core_own_roster_notice_reoffer_due, core_own_roster_notice_reoffer_interval_ms,
+    CoreLinkActivation, CoreLinkActivationStage, CoreLinkBootstrapImport, CoreLinkGateReason,
+    CoreLinkGateVerdict, CoreLinkGatedAction, CoreLinkImportReadiness, LinkActivationAck,
+    LinkDeviceOffer, LinkRosterUpdate,
 };
 pub use device_link::bootstrap::{
     core_link_bootstrap_chunks, core_link_bootstrap_decode, core_link_bootstrap_encode,
@@ -125,9 +126,11 @@ pub use device_link::restore::{
 pub use device_roster::{
     core_decode_device_keypair, core_decode_roster, core_derive_device_id, core_device_add_outcome,
     core_device_namespace_id, core_device_sign, core_device_stream_id, core_device_verify,
-    core_encode_device_keypair, core_encode_roster, core_legacy_device_id, core_own_identity_peer,
-    core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_validate,
-    core_sign_device_cert, core_sign_roster, core_verify_device_cert, generate_device_keypair,
+    core_encode_device_keypair, core_encode_roster, core_legacy_device_id,
+    core_own_device_lan_proof, core_own_device_lan_proof_open, core_own_identity_peer,
+    core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_names_a_sibling,
+    core_roster_person_root_sign_pk, core_roster_validate, core_sign_device_cert, core_sign_roster,
+    core_verify_device_cert, generate_device_keypair, CoreLanOwnDeviceProof, CoreLanProofRole,
     CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain,
     DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
     RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
@@ -166,11 +169,14 @@ pub use lan_session::{
     LAN_DEFAULT_TCP_PORT, LAN_MAX_FRAME_SIZE, LAN_SERVICE_TYPE,
 };
 pub use lan_util::{
-    core_format_lan_endpoint, core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
-    core_make_lan_endpoint_link, core_parse_lan_endpoint, core_parse_lan_endpoint_link,
-    core_subnet_24_hosts, lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local,
-    lan_hosts_are_same_address, lan_hosts_share_local_network, should_resend_lan_endpoint,
-    CoreLanEndpoint,
+    core_format_lan_endpoint, core_lan_host_is_reachable_endpoint,
+    core_lan_network_id_for_components, core_lan_network_id_for_ipv4,
+    core_lan_own_device_search_since, core_lan_own_device_search_window_ms,
+    core_lan_reconnect_target_is_exhausted, core_lan_scan_gate_open, core_make_lan_endpoint_link,
+    core_parse_lan_endpoint, core_parse_lan_endpoint_link, core_subnet_24_hosts,
+    lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local, lan_hosts_are_same_address,
+    lan_hosts_share_local_network, should_resend_lan_endpoint, CoreLanEndpoint,
+    LAN_OWN_DEVICE_SEARCH_WINDOW_MS,
 };
 pub use late_arrival::{
     core_late_arrival_flags, late_arrival_flags, LateArrivalInput, LATE_ARRIVAL_MIN_DELAY_MS,

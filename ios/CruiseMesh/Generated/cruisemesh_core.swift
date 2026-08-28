@@ -2543,6 +2543,25 @@ public protocol CoreMeshRouterStateProtocol : AnyObject {
     func onOwnDeviceConnected(address: String, transport: CoreTransport) 
     
     /**
+     * Every live link admitted as one of THIS person's own devices
+     * ([`Self::on_own_device_connected`]), address-sorted.
+     *
+     * Such a link is deliberately absent from [`Self::identified_routes`] --
+     * it has no user id and never becomes a route -- and that absence is what
+     * left it outside every periodic pass the shells run over their links. A
+     * link nothing probes is a link nothing closes: a half-open one held its
+     * socket for the whole Wi-Fi join, carried no frames, and (being a live
+     * connection) told the LAN transport it was not lonely enough to search.
+     * That is the state an approver sat in while it failed to tell a phone it
+     * had removed.
+     *
+     * So the shells get a way to name these links: to heartbeat them like any
+     * other LAN link, and to re-offer §10 step 5's roster on them rather than
+     * only at the instant a HELLO2 arrives.
+     */
+    func ownDeviceLinks()  -> [CoreTransportRoute]
+    
+    /**
      * Every hidden spray kind this peer will ack — [`Self::peer_acks_hidden_kind`]
      * asked once for each, for the callers that must hand the whole answer to
      * a plan builder rather than ask envelope by envelope.
@@ -2864,6 +2883,30 @@ open func onOwnDeviceConnected(address: String, transport: CoreTransport) {try! 
         FfiConverterTypeCoreTransport.lower(transport),$0
     )
 }
+}
+    
+    /**
+     * Every live link admitted as one of THIS person's own devices
+     * ([`Self::on_own_device_connected`]), address-sorted.
+     *
+     * Such a link is deliberately absent from [`Self::identified_routes`] --
+     * it has no user id and never becomes a route -- and that absence is what
+     * left it outside every periodic pass the shells run over their links. A
+     * link nothing probes is a link nothing closes: a half-open one held its
+     * socket for the whole Wi-Fi join, carried no frames, and (being a live
+     * connection) told the LAN transport it was not lonely enough to search.
+     * That is the state an approver sat in while it failed to tell a phone it
+     * had removed.
+     *
+     * So the shells get a way to name these links: to heartbeat them like any
+     * other LAN link, and to re-offer §10 step 5's roster on them rather than
+     * only at the instant a HELLO2 arrives.
+     */
+open func ownDeviceLinks() -> [CoreTransportRoute] {
+    return try!  FfiConverterSequenceTypeCoreTransportRoute.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_coremeshrouterstate_own_device_links(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -4271,6 +4314,20 @@ public protocol LanNoiseSessionProtocol : AnyObject {
      */
     func encryptFrame(frame: Data) throws  -> [Data]
     
+    /**
+     * Noise's transcript hash for this session, once the handshake has
+     * finished. `None` before that.
+     *
+     * This is the value a proof-of-siblinghood signature is bound to
+     * (`specs/multi-device-v1.md` §10 step 5). Both ends of one handshake
+     * compute the identical hash, and it commits to both ephemeral keys and
+     * both static keys — so a signature over it is worthless on any other
+     * session, cannot be replayed from a recorded one, and cannot be relayed
+     * by a machine in the middle: it only verifies on the session whose
+     * transcript it names.
+     */
+    func handshakeHash()  -> Data?
+    
     func isHandshakeFinished()  -> Bool
     
     /**
@@ -4381,6 +4438,25 @@ open func encryptFrame(frame: Data)throws  -> [Data] {
     return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_lannoisesession_encrypt_frame(self.uniffiClonePointer(),
         FfiConverterData.lower(frame),$0
+    )
+})
+}
+    
+    /**
+     * Noise's transcript hash for this session, once the handshake has
+     * finished. `None` before that.
+     *
+     * This is the value a proof-of-siblinghood signature is bound to
+     * (`specs/multi-device-v1.md` §10 step 5). Both ends of one handshake
+     * compute the identical hash, and it commits to both ephemeral keys and
+     * both static keys — so a signature over it is worthless on any other
+     * session, cannot be replayed from a recorded one, and cannot be relayed
+     * by a machine in the middle: it only verifies on the session whose
+     * transcript it names.
+     */
+open func handshakeHash() -> Data? {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_handshake_hash(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -4783,6 +4859,21 @@ public protocol MessageStoreProtocol : AnyObject {
      * option). `person_root_sign_pk` is this device's OWN identity signing key:
      * §3 makes the person root the deployed identity key, so the anchor is
      * already on the phone and no new trust material is introduced.
+     *
+     * **On a §9-linked device that sentence is false, and this call repairs
+     * it.** The ceremony gives a new device keys of its own and withholds the
+     * person root secret (§3); neither shell persists the person material the
+     * bootstrap carries, so a linked device's `Identity.sign_pk` is a key of
+     * its own and derives to a different person id entirely. Handed that, the
+     * anchor check would refuse every roster the person ever signed — and the
+     * device this call exists for is exactly a linked one. So the argument is
+     * verified against the stored roster's `person_id` and, when it does not
+     * belong to this person, the true anchor is recovered from the roster this
+     * device already holds ([`crate::core_roster_person_root_sign_pk`]). That
+     * is no weaker: the stored roster was validated against the anchor when it
+     * was imported, and `person_id` is `derive_user_id` of the anchor, so the
+     * recovered key is pinned by the same binding the argument would have been
+     * checked against.
      *
      * # Why a push, and why this is not a tip-off
      *
@@ -7433,7 +7524,7 @@ public protocol MessageStoreProtocol : AnyObject {
      * crash-safe journal and propagation machinery.
      */
     func planRelayCredentialRefresh(relayUrl: String, currentToken: String, previousRelayEpoch: Int64, nowMs: Int64) throws  -> RelayRotationPlan?
-
+    
     /**
      * Run one inbound `0x02` envelope through the production disposition and
      * return the bounded work to execute. See the module docs for the ordered
@@ -8508,6 +8599,21 @@ open func applyFriendDirectory(introducerUserId: Data, recipientUserId: Data, co
      * option). `person_root_sign_pk` is this device's OWN identity signing key:
      * §3 makes the person root the deployed identity key, so the anchor is
      * already on the phone and no new trust material is introduced.
+     *
+     * **On a §9-linked device that sentence is false, and this call repairs
+     * it.** The ceremony gives a new device keys of its own and withholds the
+     * person root secret (§3); neither shell persists the person material the
+     * bootstrap carries, so a linked device's `Identity.sign_pk` is a key of
+     * its own and derives to a different person id entirely. Handed that, the
+     * anchor check would refuse every roster the person ever signed — and the
+     * device this call exists for is exactly a linked one. So the argument is
+     * verified against the stored roster's `person_id` and, when it does not
+     * belong to this person, the true anchor is recovered from the roster this
+     * device already holds ([`crate::core_roster_person_root_sign_pk`]). That
+     * is no weaker: the stored roster was validated against the anchor when it
+     * was imported, and `person_id` is `derive_user_id` of the anchor, so the
+     * recovered key is pinned by the same binding the argument would have been
+     * checked against.
      *
      * # Why a push, and why this is not a tip-off
      *
@@ -12351,7 +12457,7 @@ open func planRelayCredentialRefresh(relayUrl: String, currentToken: String, pre
     )
 })
 }
-
+    
     /**
      * Run one inbound `0x02` envelope through the production disposition and
      * return the bounded work to execute. See the module docs for the ordered
@@ -18268,6 +18374,107 @@ public func FfiConverterTypeCoreLanHealthDecision_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeCoreLanHealthDecision_lower(_ value: CoreLanHealthDecision) -> RustBuffer {
     return FfiConverterTypeCoreLanHealthDecision.lower(value)
+}
+
+
+/**
+ * Who a verified [own-device LAN proof](core_own_device_lan_proof) named.
+ */
+public struct CoreLanOwnDeviceProof {
+    /**
+     * The 16-byte id of the device that signed, derived from the signing key
+     * in the payload — never taken from the payload as a claim.
+     */
+    public var deviceId: Data
+    /**
+     * True when the verifying roster has already tombstoned that device.
+     *
+     * **Accepted on purpose, and the whole point of §10 step 5.** The device
+     * that most needs to be told it was removed is the removed one; refusing
+     * its proof would slam the only door the notice can come through. It buys
+     * no capability by being admitted: a link with no user id is not a route
+     * (§10 step 5's "not a peer"), the inbox key rotated at the moment of
+     * removal (§10.1), and the roster it is about to be handed is the document
+     * that ejects it. Surfaced as a flag so a caller can *say* which case it
+     * admitted rather than having to work it out again.
+     */
+    public var revoked: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The 16-byte id of the device that signed, derived from the signing key
+         * in the payload — never taken from the payload as a claim.
+         */deviceId: Data, 
+        /**
+         * True when the verifying roster has already tombstoned that device.
+         *
+         * **Accepted on purpose, and the whole point of §10 step 5.** The device
+         * that most needs to be told it was removed is the removed one; refusing
+         * its proof would slam the only door the notice can come through. It buys
+         * no capability by being admitted: a link with no user id is not a route
+         * (§10 step 5's "not a peer"), the inbox key rotated at the moment of
+         * removal (§10.1), and the roster it is about to be handed is the document
+         * that ejects it. Surfaced as a flag so a caller can *say* which case it
+         * admitted rather than having to work it out again.
+         */revoked: Bool) {
+        self.deviceId = deviceId
+        self.revoked = revoked
+    }
+}
+
+
+
+extension CoreLanOwnDeviceProof: Equatable, Hashable {
+    public static func ==(lhs: CoreLanOwnDeviceProof, rhs: CoreLanOwnDeviceProof) -> Bool {
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.revoked != rhs.revoked {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(deviceId)
+        hasher.combine(revoked)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanOwnDeviceProof: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanOwnDeviceProof {
+        return
+            try CoreLanOwnDeviceProof(
+                deviceId: FfiConverterData.read(from: &buf), 
+                revoked: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreLanOwnDeviceProof, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.deviceId, into: &buf)
+        FfiConverterBool.write(value.revoked, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanOwnDeviceProof_lift(_ buf: RustBuffer) throws -> CoreLanOwnDeviceProof {
+    return try FfiConverterTypeCoreLanOwnDeviceProof.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanOwnDeviceProof_lower(_ value: CoreLanOwnDeviceProof) -> RustBuffer {
+    return FfiConverterTypeCoreLanOwnDeviceProof.lower(value)
 }
 
 
@@ -38612,6 +38819,93 @@ extension CoreLanHealthAction: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Which end of a LAN Noise session minted a proof.
+ *
+ * **The reason a proof cannot be symmetric.** Both ends of one handshake
+ * compute the identical transcript hash, so a signature over the hash alone
+ * says only "somebody on this session is a device of this person's" — never
+ * which somebody. A host we dial holds the session legitimately: it can
+ * decrypt the proof we send it, re-encrypt that same plaintext under its own
+ * sending key, and hand it straight back. Opened against our own roster, our
+ * own proof names our own device id, which our own roster of course lists, so
+ * an arbitrary machine on the Wi-Fi would be admitted as a device of ours.
+ *
+ * Naming the end inside the signed bytes closes it: each side signs its own
+ * role and opens only a proof signed for the *other* one, so a reflected copy
+ * verifies against nothing.
+ */
+
+public enum CoreLanProofRole {
+    
+    /**
+     * The end that dialed, and that proves first.
+     */
+    case initiator
+    /**
+     * The end that answered, and that proves only once the initiator's proof
+     * has verified.
+     */
+    case responder
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreLanProofRole: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanProofRole
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreLanProofRole {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .initiator
+        
+        case 2: return .responder
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreLanProofRole, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .initiator:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .responder:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanProofRole_lift(_ buf: RustBuffer) throws -> CoreLanProofRole {
+    return try FfiConverterTypeCoreLanProofRole.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreLanProofRole_lower(_ value: CoreLanProofRole) -> RustBuffer {
+    return FfiConverterTypeCoreLanProofRole.lower(value)
+}
+
+
+
+extension CoreLanProofRole: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What an action asks of the shell.
  */
 
@@ -40840,7 +41134,7 @@ public struct FfiConverterTypeCoreRelayPassOutcome: FfiConverterRustBuffer {
         case 6: return .refusedQuietWindow
         
         case 7: return .storeFailed
-
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -40872,10 +41166,10 @@ public struct FfiConverterTypeCoreRelayPassOutcome: FfiConverterRustBuffer {
         case .refusedQuietWindow:
             writeInt(&buf, Int32(6))
         
-
+        
         case .storeFailed:
             writeInt(&buf, Int32(7))
-
+        
         }
     }
 }
@@ -42638,6 +42932,12 @@ public enum DeviceSigningDomain {
      * (`device_link::bootstrap`).
      */
     case deviceLinkBootstrap
+    /**
+     * §10 step 5's proof that the far end of a LAN Noise session is a device
+     * of this person's own, signed over that session's transcript hash
+     * ([`core_own_device_lan_proof`]).
+     */
+    case lanOwnDeviceProof
 }
 
 
@@ -42662,6 +42962,8 @@ public struct FfiConverterTypeDeviceSigningDomain: FfiConverterRustBuffer {
         case 5: return .deviceLinkActivation
         
         case 6: return .deviceLinkBootstrap
+        
+        case 7: return .lanOwnDeviceProof
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -42693,6 +42995,10 @@ public struct FfiConverterTypeDeviceSigningDomain: FfiConverterRustBuffer {
         
         case .deviceLinkBootstrap:
             writeInt(&buf, Int32(6))
+        
+        
+        case .lanOwnDeviceProof:
+            writeInt(&buf, Int32(7))
         
         }
     }
@@ -47290,6 +47596,30 @@ fileprivate struct FfiConverterOptionTypeCoreLanEndpointIntent: FfiConverterRust
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreLanOwnDeviceProof: FfiConverterRustBuffer {
+    typealias SwiftType = CoreLanOwnDeviceProof?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreLanOwnDeviceProof.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreLanOwnDeviceProof.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreLinkSummary: FfiConverterRustBuffer {
     typealias SwiftType = CoreLinkSummary?
 
@@ -51606,6 +51936,30 @@ public func coreKindPersistsMsgIdRow(kind: UInt8) -> Bool {
     )
 })
 }
+/**
+ * Whether a host is worth *publishing as this phone's own address*, which is
+ * stricter than [`lan_endpoint_host_is_local`].
+ *
+ * An IPv6 link-local address is a local address, and both shells will happily
+ * pick one up out of the platform's link properties when the Wi-Fi join has
+ * not produced an IPv4 address yet. Advertising it is still wrong: `fe80::/10`
+ * is only reachable with the *dialer's* scope id, and the scope id a phone
+ * reads off its own interface means nothing on the phone that receives it. The
+ * address goes into mDNS and into endpoint hints all the same, where it
+ * becomes a target that can never answer -- observed in the field as a phone
+ * retrying one dead `fe80::…` address for half an hour while the peer it was
+ * looking for sat on the same Wi-Fi.
+ *
+ * So: a phone advertises an address a stranger to its interface list can dial,
+ * or it advertises nothing and lets discovery do the work.
+ */
+public func coreLanHostIsReachableEndpoint(host: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_host_is_reachable_endpoint(
+        FfiConverterString.lower(host),$0
+    )
+})
+}
 public func coreLanNetworkIdForComponents(components: [String]) -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_lan_network_id_for_components(
@@ -51617,6 +51971,144 @@ public func coreLanNetworkIdForIpv4(address: String) -> String? {
     return try!  FfiConverterOptionString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_core_lan_network_id_for_ipv4(
         FfiConverterString.lower(address),$0
+    )
+})
+}
+/**
+ * When this phone's search for one of its own devices started, or `None` when
+ * it is not searching. Feeds [`core_lan_scan_gate_open`]'s
+ * `own_device_search_live`.
+ *
+ * **Why this is a window and not "is a sibling missing".** The obvious rule --
+ * sweep while the roster lists a device this phone has no link to -- never
+ * stops being true. A second device that is switched off, left at home, or
+ * simply out of the house is missing forever, so the gate would stand open
+ * forever and the planner would hand out a `/24` sweep on its flat five-minute
+ * cadence for the whole life of every Wi-Fi join, on battery, for exactly the
+ * multi-device households this mechanism was added for. It is also not even
+ * satisfiable for a person with three devices, because the transport keeps at
+ * most one own-device link at a time. So the motive is bounded, in the same
+ * spirit as the contact side's recency decay: a *reason* to search opens a
+ * window, and the window closes.
+ *
+ * The reasons, all of which mean "something about this person's fleet just
+ * changed, and a link may be findable that was not before":
+ *
+ * - `unlinked_own_devices` rose above `previous_unlinked_own_devices` -- a
+ * sibling appeared on the roster, or an own-device link dropped. (The shells
+ * also reset both across a network change, so joining a Wi-Fi re-arms.)
+ * - `roster_changed` -- this person's device roster is not the one last
+ * observed. This is the arm that matters on the phone that performed a
+ * *removal*: the removed device leaves its roster immediately, so its
+ * shortfall is zero and it would otherwise have no motive at all to go
+ * looking for the phone it must still hand §10 step 5's notice to.
+ *
+ * A backwards clock jump re-arms rather than expiring: the failure worth
+ * avoiding is a phone that stops looking.
+ */
+public func coreLanOwnDeviceSearchSince(previousSinceMs: Int64?, rosterChanged: Bool, unlinkedOwnDevices: UInt32, previousUnlinkedOwnDevices: UInt32, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_own_device_search_since(
+        FfiConverterOptionInt64.lower(previousSinceMs),
+        FfiConverterBool.lower(rosterChanged),
+        FfiConverterUInt32.lower(unlinkedOwnDevices),
+        FfiConverterUInt32.lower(previousUnlinkedOwnDevices),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * [`LAN_OWN_DEVICE_SEARCH_WINDOW_MS`], for the shells.
+ */
+public func coreLanOwnDeviceSearchWindowMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_own_device_search_window_ms($0
+    )
+})
+}
+/**
+ * Whether a LAN reconnect target should be forgotten rather than retried
+ * again.
+ *
+ * A target created from this phone's own discovery (an mDNS resolution, a
+ * subnet-sweep hit) is kept across failures on purpose: the address is one
+ * this phone observed, and a peer that went to sleep comes back at it. What
+ * shipped had no ceiling on that at all, and the backoff underneath it decays
+ * to a permanent slow probe rather than a refusal, so a single stale mDNS
+ * record became a dial at a dead address every sixty seconds for as long as
+ * the phone stayed on the Wi-Fi -- the exact loop the field capture shows the
+ * approving phone stuck in, in place of the search that would have found the
+ * device it had removed.
+ *
+ * An address that has *proved* itself (`ever_authenticated`) keeps its target
+ * regardless: that is an ordinary contact link waiting out a sleeping peer,
+ * and nothing here may make one harder to re-establish. Only the unproven kind
+ * is retired, and retiring it loses nothing -- a fresh discovery or a sweep
+ * re-creates the target the moment there is anything real to reach.
+ *
+ * A link to one of this person's *own* devices proves its address the same
+ * way, which is deliberate and worth naming: a removed device still presents
+ * the agreement key that admits it (§10.1 rotates the inbox key, not the LAN
+ * Noise static), so once it has handshaked, the honest phone keeps dialing it
+ * for the rest of the network join. That is the point -- §10 step 5's notice
+ * is what the fleet is trying to hand it -- but the same standing dial is a
+ * presence signal that outlives the revocation, and it is accepted knowingly.
+ */
+public func coreLanReconnectTargetIsExhausted(everAuthenticated: Bool, consecutiveFailures: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_reconnect_target_is_exhausted(
+        FfiConverterBool.lower(everAuthenticated),
+        FfiConverterUInt32.lower(consecutiveFailures),$0
+    )
+})
+}
+/**
+ * Whether the LAN transport's periodic check may claim a sweep from its scan
+ * planner.
+ *
+ * The shells owned a copy of this each and it drifted into the multi-device
+ * bug it now names: a sweep was worthwhile "while the transport has no links
+ * at all", and both shells counted *every* live connection, including a link
+ * to one of this person's own devices. Such a link is not a friend on this
+ * Wi-Fi -- it carries no contact's mail, wins no route, and (having no route)
+ * sat outside the LAN heartbeat entirely -- so one that had quietly died still
+ * read as company and shut discovery off for the whole Wi-Fi join. The phone
+ * that had just removed another device spent 26 minutes in exactly that state.
+ *
+ * `peer_links` is therefore links to *contacts* only. The two escapes are the
+ * people this phone still owes a search:
+ *
+ * - `unlinked_capable_contacts`: a contact that has recently demonstrated LAN
+ * support and has no authenticated LAN link (see
+ * [`crate::lan_capability_motivates_scan`]'s shell mirrors) -- one connected
+ * family member must not stop discovery of the rest.
+ * - `own_device_search_live`: this phone is inside a bounded window during
+ * which it is looking for one of this person's own devices
+ * ([`core_lan_own_device_search_since`]). It is what makes a phone go
+ * looking for its sibling at all, and mDNS was the only channel that ever
+ * did.
+ *
+ * Note that the second escape is a *bounded* one and the first is a *decayed*
+ * one, and that neither is a bare count of who is missing. Both motives are
+ * satisfied by an absence, and an absence never ends by itself: a contact who
+ * went ashore, or a tablet left at home, would otherwise keep this phone
+ * sweeping the /24 every five minutes on every Wi-Fi it ever joins. The
+ * contact side decays (its shell mirrors only count a contact whose LAN
+ * evidence is recent); the own-device side is time-boxed per reason to search.
+ *
+ * In-flight work (pending outbound attempts, a running sweep) always defers.
+ * The counts are unsigned on purpose: a shell that ever computes one of them
+ * negative must clamp it to zero on the way in, which slows discovery down
+ * rather than disabling it.
+ */
+public func coreLanScanGateOpen(peerLinks: UInt32, unlinkedCapableContacts: UInt32, ownDeviceSearchLive: Bool, pendingOutboundAttempts: UInt32, scanRemaining: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_lan_scan_gate_open(
+        FfiConverterUInt32.lower(peerLinks),
+        FfiConverterUInt32.lower(unlinkedCapableContacts),
+        FfiConverterBool.lower(ownDeviceSearchLive),
+        FfiConverterUInt32.lower(pendingOutboundAttempts),
+        FfiConverterUInt32.lower(scanRemaining),$0
     )
 })
 }
@@ -52136,6 +52628,70 @@ public func coreOwnCapabilities() -> UInt32 {
 })
 }
 /**
+ * Sign this device's claim to be one of `roster`'s devices, bound to one LAN
+ * Noise session (§10 step 5).
+ *
+ * `handshake_hash` is [`crate::lan_session::LanNoiseSession::handshake_hash`]:
+ * Noise's transcript hash, which commits to both ephemeral keys and both
+ * static keys and is identical on the two ends of one handshake and on no
+ * other. Signing it is therefore not replayable — a recorded proof is
+ * worthless on the next session, and a machine in the middle cannot forward
+ * one, because the transcript it names is not the transcript it is speaking
+ * on.
+ *
+ * The device signing key is used rather than the person agreement key
+ * deliberately. §9's ceremony gives a linked device its *own* keys and
+ * withholds the person root secret (§3), so two genuine siblings share no
+ * private key at all — which is exactly why comparing agreement keys could
+ * only ever recognise a clone.
+ *
+ * `role` is which end of the session this device is speaking from, and it is
+ * signed along with the transcript. See [`CoreLanProofRole`]: without it the
+ * two ends mint interchangeable proofs and a peer can simply return ours.
+ */
+public func coreOwnDeviceLanProof(deviceSignSk: Data, handshakeHash: Data, role: CoreLanProofRole)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_own_device_lan_proof(
+        FfiConverterData.lower(deviceSignSk),
+        FfiConverterData.lower(handshakeHash),
+        FfiConverterTypeCoreLanProofRole.lower(role),$0
+    )
+})
+}
+/**
+ * Check a peer's proof against the roster this device holds, and say which of
+ * this person's devices it is.
+ *
+ * `None` for anything that is not a device of this person's: a malformed
+ * payload, a signature that does not cover *this* session's transcript, or a
+ * signing key whose device id this roster has never heard of. A stranger on
+ * the same Wi-Fi cannot produce one, and neither can a contact — the roster is
+ * the only place the answer comes from, and it lists nobody but this person's
+ * own devices, live and buried.
+ *
+ * Both `devices` and `tombstones` count. See [`CoreLanOwnDeviceProof::revoked`]
+ * for why the buried half is not an oversight.
+ *
+ * `peer_role` is the end the *peer* speaks from — the opposite of this
+ * device's — and a proof signed for any other end does not verify here. That
+ * is what stops a host we dialed from handing our own proof back to us
+ * ([`CoreLanProofRole`]). `own_device_id` is the belt to that pair of braces:
+ * a proof that derives to this very device is refused outright, however it was
+ * signed. Pass an empty `own_device_id` only from a caller that has no device
+ * of its own — which is a caller that can mint no proof either.
+ */
+public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, payload: Data, peerRole: CoreLanProofRole, ownDeviceId: Data) -> CoreLanOwnDeviceProof? {
+    return try!  FfiConverterOptionTypeCoreLanOwnDeviceProof.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_own_device_lan_proof_open(
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(handshakeHash),
+        FfiConverterData.lower(payload),
+        FfiConverterTypeCoreLanProofRole.lower(peerRole),
+        FfiConverterData.lower(ownDeviceId),$0
+    )
+})
+}
+/**
  * Classify a peer that just presented this person's own identity
  * (`specs/multi-device-v1.md` §1, §6).
  *
@@ -52166,6 +52722,58 @@ public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> C
     uniffi_cruisemesh_core_fn_func_core_own_identity_peer(
         FfiConverterTypeOwnDeviceFleet.lower(fleet),
         FfiConverterOptionData.lower(peerDeviceId),$0
+    )
+})
+}
+/**
+ * **§10 step 5, the part that was missing.** Whether an own-device link that
+ * has already been offered this person's roster is owed it again.
+ *
+ * The notice shipped edge-triggered: built and pushed at the instant a HELLO2
+ * arrived on an own-device link, and at no other moment in either shell. So a
+ * removal that happened while such a link was *already up* was never announced
+ * on it — no new HELLO, no new offer, and the removed phone kept believing it
+ * was linked for as long as the link lasted. In the field that was 26 minutes,
+ * two force-stops and a reboot.
+ *
+ * Making it level-triggered is what fixes that, and it is safe to do bluntly
+ * because the frame is idempotent in both directions: the sender's copy is
+ * rebuilt from the store every time, and
+ * [`MessageStore::apply_own_roster_notice`] refuses anything that does not
+ * strictly supersede what the receiver holds. Re-offering costs one signed
+ * document per minute per own-device link and needs no event plumbing to reach
+ * it — which also means it survives an app restart, a reboot, and a roster
+ * change this process never saw.
+ *
+ * **The trade this widens, stated plainly.** A notice tells the holder of a
+ * removed phone that they were removed, and §10.2's relay-`family_token`
+ * rotation lands only on the first pass that reaches the relay — so there is a
+ * window in which a removed device knows it is out while the family credential
+ * it already holds is still live, and LAN-with-no-internet is exactly where
+ * that window is widest. Edge-triggered, reaching that window needed a fresh
+ * HELLO2; level-triggered it is the ordinary case, within a minute, for as
+ * long as the link lasts. Accepted deliberately — an honest removed device has
+ * to converge offline, and nothing else makes the phone that is *wrong* right
+ * — but it is a widening rather than a neutral change, and §10 step 5 records
+ * it as one.
+ *
+ * `None` means never offered on this link, which is always due.
+ */
+public func coreOwnRosterNoticeReofferDue(lastOfferedAtMs: Int64?, nowMs: Int64) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_own_roster_notice_reoffer_due(
+        FfiConverterOptionInt64.lower(lastOfferedAtMs),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
+ * [`OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS`], for the shells (a `const` does
+ * not cross the binding; a function does).
+ */
+public func coreOwnRosterNoticeReofferIntervalMs() -> Int64 {
+    return try!  FfiConverterInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_own_roster_notice_reoffer_interval_ms($0
     )
 })
 }
@@ -52969,6 +53577,29 @@ public func coreRosterHeadHash(roster: Roster) -> Data {
 })
 }
 /**
+ * Whether this roster names any device other than `own_device_id` — live or
+ * buried.
+ *
+ * The gate on ever minting a proof. A phone whose roster names only itself has
+ * no sibling that could recognise it and nobody it could recognise, so a proof
+ * it sent could only ever be reflected back at it; all it would achieve is
+ * handing this phone's stable device signing key to whatever answered the
+ * port. Solo installs are the overwhelming majority, so this keeps the key off
+ * the wire for almost everyone — and it is free for the fleet the feature
+ * exists for, where the roster names two.
+ *
+ * Tombstones count: after a removal the approver's roster lists one live
+ * device and one grave, and the grave is precisely who the notice is for.
+ */
+public func coreRosterNamesASibling(roster: Roster, ownDeviceId: Data) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_names_a_sibling(
+        FfiConverterTypeRoster.lower(roster),
+        FfiConverterData.lower(ownDeviceId),$0
+    )
+})
+}
+/**
  * The device ids `current` buries that `previous` had not (§10.4's fact,
  * without §10.4's surface).
  *
@@ -52985,6 +53616,33 @@ public func coreRosterNewlyRevoked(previous: Roster?, current: Roster) -> [Data]
     uniffi_cruisemesh_core_fn_func_core_roster_newly_revoked(
         FfiConverterOptionTypeRoster.lower(previous),
         FfiConverterTypeRoster.lower(current),$0
+    )
+})
+}
+/**
+ * The person root signing key `roster` is rooted in, recovered from the
+ * document itself.
+ *
+ * §3 makes the person root the deployed Ed25519 identity key, and `person_id`
+ * is `derive_user_id` of it — so any key inside a roster that derives to that
+ * roster's `person_id` *is* the anchor, and nothing else can be. Genesis and
+ * recovery rosters carry it as `signer_sign_pk`; every later roster carries it
+ * as the `signer_sign_pk` of the certificates the root itself signed.
+ *
+ * This is a *recovery*, not a trust decision: it is only sound about a roster
+ * that has already been validated and stored, and the caller must treat it as
+ * the anchor for that person and no other. What it buys is a device that can
+ * check its person's signatures without holding its person's identity key —
+ * which is every device §9's ceremony ever links, since that ceremony
+ * deliberately gives a new device keys of its own.
+ *
+ * `None` when the roster contains no such key, which a validated roster never
+ * does (`core_roster_validate` requires a chain to the root).
+ */
+public func coreRosterPersonRootSignPk(roster: Roster) -> Data? {
+    return try!  FfiConverterOptionData.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_roster_person_root_sign_pk(
+        FfiConverterTypeRoster.lower(roster),$0
     )
 })
 }
@@ -56435,10 +57093,25 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_kind_persists_msg_id_row() != 54573) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_host_is_reachable_endpoint() != 40510) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_components() != 6078) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_lan_network_id_for_ipv4() != 24186) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_own_device_search_since() != 4996) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_own_device_search_window_ms() != 41871) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_reconnect_target_is_exhausted() != 48660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_lan_scan_gate_open() != 1449) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_last_visible_message() != 29515) {
@@ -56528,7 +57201,19 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof() != 6942) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof_open() != 63639) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_due() != 22705) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_interval_ms() != 4136) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_pairwise_sender_authorized() != 20663) {
@@ -56651,7 +57336,13 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_roster_head_hash() != 1927) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_names_a_sibling() != 27520) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_newly_revoked() != 31535) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_roster_person_root_sign_pk() != 2539) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_roster_safety_changes() != 36307) {
@@ -57386,6 +58077,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_on_own_device_connected() != 30441) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_own_device_links() != 56579) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_coremeshrouterstate_peer_acked_hidden_kinds() != 7435) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57509,6 +58203,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_encrypt_frame() != 54052) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_handshake_hash() != 16438) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_is_handshake_finished() != 36518) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57557,7 +58254,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_friend_directory() != 32757) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 43980) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_own_roster_notice() != 60577) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_author_friend_request() != 47501) {

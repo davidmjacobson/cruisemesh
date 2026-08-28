@@ -19,7 +19,7 @@ androidxTestOrchestrator = "1.6.1"
 robolectric = "4.16.1"
 # alpha10+ exposes @PreviewTest but is compiled against Kotlin newer than this
 # project's 2.0.21 toolchain. alpha09 is the compatible AGP 8.6 generation.
-screenshot = "0.0.1-alpha09"
+screenshot = "0.0.1-alpha16"
 
 [libraries]
 core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
