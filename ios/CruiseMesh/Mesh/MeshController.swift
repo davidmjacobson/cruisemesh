@@ -3335,6 +3335,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 ackedSenderUserId: senderUserId,
                 throughLamport: through
             )
+        } else {
+            // The relay handed this over, so there is no link to answer on --
+            // send to whichever link currently reaches them, exactly as the
+            // chat-message and hidden-kind paths above do. Without this the
+            // sender's tick for a friend request that arrived over the
+            // internet waited on the durable receipt envelope even when both
+            // phones were on the same Wi-Fi.
+            sendReceiptToContact(
+                identity: identity,
+                contact: contact,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
         }
         if !wasKnown {
             FriendDirectorySender.queueToAllContacts(store: store, identity: identity)
