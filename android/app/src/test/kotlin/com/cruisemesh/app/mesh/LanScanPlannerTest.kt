@@ -158,6 +158,38 @@ class LanScanPlannerTest {
         assertNull(planner.takeDueScan(10 * 60 * minute))
     }
 
+    /**
+     * The field failure's shape, at the planner: the approving phone had one
+     * endpoint it kept dialing and never reached, and it ran no sweep for 26
+     * minutes. Whatever else was wrong, the planner itself must never be the
+     * thing that wedges -- a peer that never answers, and a sweep that comes
+     * back empty enough to look like client isolation, must both leave the
+     * cheap /24 tier on its flat cadence indefinitely.
+     */
+    @Test
+    fun anEndpointThatNeverAnswersCannotStopTheLocalSweepCadence() {
+        val planner = LanScanPlanner()
+        planner.onNetworkJoined(0)
+        assertEquals(LanScanBreadth.LOCAL_24, planner.takeDueScan(0))
+        planner.onScanCompleted(LanScanBreadth.LOCAL_24, 0, foundPeer = false)
+
+        // Worst case for the expensive tier: every probe timed out, so it is
+        // pushed to its four-hour cap. The /24 tier is deliberately untouched.
+        planner.onIsolationSuspected(0)
+
+        var now = 0L
+        repeat(12) {
+            now += 5 * minute
+            assertEquals(
+                "no sweep was due at ${now / minute} minutes into the network join",
+                LanScanBreadth.LOCAL_24,
+                planner.takeDueScan(now),
+            )
+            // The sweep finds nobody, over and over, exactly as the field one did.
+            planner.onScanCompleted(LanScanBreadth.LOCAL_24, now, foundPeer = false)
+        }
+    }
+
     @Test
     fun peerEvidenceStopsRewindingTheScheduleOnceItsPerNetworkBudgetIsSpent() {
         val budget = 3

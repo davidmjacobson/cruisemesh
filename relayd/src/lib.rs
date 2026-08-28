@@ -249,6 +249,15 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `DEFAULT_EXPIRY_MS`) is honored when tighter; this caps the rest.
 pub const MAX_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
+/// Retention ceiling for a row posted with a *deposit* credential. A friend
+/// card only ever needs the honest client's 7-day envelope life (core's
+/// `DEFAULT_EXPIRY_MS`); one extra day absorbs clock skew. Without this, a
+/// leaked card could park quota-filling rows for the full member-class
+/// [`MAX_RETENTION_MS`] (30 days), turning the family's self-healing
+/// week-long storage squeeze into a month-long one. Member-class posts keep
+/// the 30-day ceiling.
+pub const MAX_DEPOSIT_RETENTION_MS: i64 = 8 * 24 * 60 * 60 * 1000;
+
 /// FR7: default cadence for the background maintenance task
 /// (`spawn_prune_task`) that prunes expired rows and reclaims disk
 /// independent of any client traffic.
@@ -3305,7 +3314,18 @@ async fn post_envelope(
     let insert_hint = recipient_hint.clone();
     let insert_sealed = sealed.clone();
     let hop_ttl = request.hop_ttl;
-    let expiry_ms_req = request.expiry_ms;
+    // A deposit credential's rows live at most MAX_DEPOSIT_RETENTION_MS: the
+    // honest client always asks for 7 days, so only an abuser loses anything,
+    // and what they lose is the ability to occupy family quota for the full
+    // member-class 30-day ceiling. Clamped here rather than in the store so
+    // the store keeps one retention rule and the class stays an HTTP-layer
+    // concern.
+    let expiry_ms_req = match access.class {
+        TokenClass::Deposit => request
+            .expiry_ms
+            .min(now.saturating_add(MAX_DEPOSIT_RETENTION_MS)),
+        TokenClass::Member => request.expiry_ms,
+    };
     // Per-family quota override (hosted families) falls back to the server
     // default inside `authorize_family`; FR8 keeps the write off the reactor.
     let family_quota_bytes = access.quota_bytes;
@@ -3366,7 +3386,7 @@ async fn post_envelope(
         hop_ttl: request.hop_ttl,
         recipient_hint: encode_base64_field(&recipient_hint),
         sealed: encode_base64_field(&sealed),
-        expiry_ms: RelayStore::effective_expiry(now, request.expiry_ms),
+        expiry_ms: RelayStore::effective_expiry(now, expiry_ms_req),
         created_at_ms: now,
     };
     // Fan-out for live WS subscribers. Lagging peers are dropped (module docs).
@@ -5781,6 +5801,81 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(body_json(response).await["code"], "family_expired");
+    }
+
+    fn envelope_request_with_expiry(token: &str, msg_byte: u8, expiry_ms: i64) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/envelopes")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "msg_id": encode_base64_field(&sample_msg_id(msg_byte)),
+                    "hop_ttl": 3,
+                    "recipient_hint": encode_base64_field(&sample_hint(1)),
+                    "sealed": encode_base64_field(&[7u8; 48]),
+                    "expiry_ms": expiry_ms,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deposit_post_expiry_is_clamped_to_the_deposit_ceiling() {
+        let app = test_app();
+        let deposit = deposit_token_for("family-a");
+        let far_future = now_ms() + 2 * MAX_RETENTION_MS;
+
+        // A deposit post asking for the far future is stored, but lives at
+        // most MAX_DEPOSIT_RETENTION_MS — a leaked friend card cannot park
+        // quota-filling rows for the member-class 30-day ceiling.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request_with_expiry(&deposit, 1, far_future))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        // The same request over the member token keeps the 30-day ceiling.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request_with_expiry("family-a", 2, far_future))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        let response = app
+            .clone()
+            .oneshot(fetch_request("family-a"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let page = body_json(response).await;
+        let envelopes = page["envelopes"].as_array().unwrap();
+        assert_eq!(envelopes.len(), 2);
+        // Re-read the clock after the posts so the bound is conservative:
+        // each row's expiry was clamped against a `now` at or before this one.
+        let latest_now = now_ms();
+        for envelope in envelopes {
+            let expiry = envelope["expiry_ms"].as_i64().unwrap();
+            let msg_id = envelope["msg_id"].as_str().unwrap().to_string();
+            if msg_id == encode_base64_field(&sample_msg_id(1)) {
+                assert!(
+                    expiry <= latest_now + MAX_DEPOSIT_RETENTION_MS,
+                    "deposit-posted row outlives the deposit ceiling: {expiry}"
+                );
+            } else {
+                assert!(
+                    expiry > latest_now + MAX_DEPOSIT_RETENTION_MS,
+                    "member-posted row was wrongly clamped to the deposit ceiling: {expiry}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

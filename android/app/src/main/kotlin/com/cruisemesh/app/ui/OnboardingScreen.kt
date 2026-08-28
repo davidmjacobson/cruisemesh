@@ -14,8 +14,10 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
@@ -90,8 +92,11 @@ fun OnboardingScreen(
                         .fillMaxWidth()
                         // The activity draws edge to edge and Scaffold does not
                         // inset a custom bottom bar, so without this the buttons
-                        // sit underneath the system navigation bar.
-                        .windowInsetsPadding(WindowInsets.navigationBars)
+                        // sit underneath the system navigation bar. The ime
+                        // union keeps the bar above the keyboard, which also
+                        // shrinks the Scaffold content so the focused display
+                        // name field scrolls into view instead of being covered.
+                        .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                         .padding(horizontal = 20.dp, vertical = 16.dp),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically,
@@ -362,33 +367,14 @@ private fun PermissionsSlide(
             }
         }
 
-        val items = listOf(
-            PermissionItem(
-                title = stringResource(R.string.ui_onboarding_permission_nearby_title),
-                detail = stringResource(R.string.ui_onboarding_permission_nearby_detail),
-                enabled = meshPermissionsGranted,
-                required = true,
-            ),
-            PermissionItem(
-                title = stringResource(R.string.ui_onboarding_permission_notifications_title),
-                detail = stringResource(R.string.ui_onboarding_permission_notifications_detail),
-                enabled = notificationPermissionGranted,
-            ),
-            PermissionItem(
-                title = stringResource(R.string.ui_onboarding_permission_background_title),
-                detail = stringResource(R.string.ui_onboarding_permission_background_detail),
-                enabled = batteryExemptionGranted,
-                required = false,
-            ),
-        )
-        items.forEach { item -> PermissionStatusCard(item) }
-
+        // The buttons come before the explainer cards: the slide's content is
+        // taller than the viewport at large font scale, and a scrolled-away
+        // grant button reads as "this step has nothing to do" — testers tapped
+        // Next and finished onboarding with no permissions granted.
         Button(
             onClick = onRequestMeshPermissions,
             enabled = !meshPermissionsGranted,
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 18.dp),
+            modifier = Modifier.fillMaxWidth(),
         ) {
             Text(
                 stringResource(
@@ -427,6 +413,27 @@ private fun PermissionsSlide(
                 ),
             )
         }
+
+        val items = listOf(
+            PermissionItem(
+                title = stringResource(R.string.ui_onboarding_permission_nearby_title),
+                detail = stringResource(R.string.ui_onboarding_permission_nearby_detail),
+                enabled = meshPermissionsGranted,
+                required = true,
+            ),
+            PermissionItem(
+                title = stringResource(R.string.ui_onboarding_permission_notifications_title),
+                detail = stringResource(R.string.ui_onboarding_permission_notifications_detail),
+                enabled = notificationPermissionGranted,
+            ),
+            PermissionItem(
+                title = stringResource(R.string.ui_onboarding_permission_background_title),
+                detail = stringResource(R.string.ui_onboarding_permission_background_detail),
+                enabled = batteryExemptionGranted,
+                required = false,
+            ),
+        )
+        items.forEach { item -> PermissionStatusCard(item) }
 
         Text(
             text = stringResource(
@@ -480,6 +487,7 @@ private fun ProfileSlide(
             } else {
                 null
             },
+            nameFirst = true,
             // Says why the button below is disabled; without it a blank field
             // and a dead button is a dead end.
             helperText = stringResource(R.string.ui_onboarding_profile_photo_helper),

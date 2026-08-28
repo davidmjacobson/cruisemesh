@@ -269,7 +269,6 @@ internal fun YourDevicesContent(
                 // a person looking for the button read a missing control as a
                 // fault in the app rather than a rule about which phone to use.
                 blocked = removeBlockedReason(rows, item.row),
-                approverName = approverName,
                 onRename = { onRename(item) },
                 onRemove = { onRemove(item) },
             )
@@ -299,8 +298,13 @@ internal fun YourDevicesContent(
                 modifier = Modifier.padding(top = 8.dp),
             )
         } else {
+            // One sentence for the whole page: the per-row texts stay silent
+            // about the approver rule so it is not repeated under every row.
+            // "Restore your backup" is the real recovery path when the
+            // approving phone is gone (core device_link/restore.rs) — support
+            // holds no lever over a device roster and must not be offered.
             Text(
-                stringResource(R.string.ui_add_a_device_wrong_phone, approverName),
+                stringResource(R.string.ui_only_approver_manages_devices, approverName),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -312,7 +316,6 @@ internal fun YourDevicesContent(
 private fun DeviceRow(
     item: YourDeviceListItem,
     blocked: RemoveDeviceBlock?,
-    approverName: String,
     onRename: () -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -355,11 +358,13 @@ private fun DeviceRow(
             }
         }
         if (!item.row.removable && blocked != null) {
-            Text(
-                removeBlockText(blocked, approverName),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            removeBlockText(blocked)?.let { text ->
+                Text(
+                    text,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -367,16 +372,14 @@ private fun DeviceRow(
 /**
  * Why Remove is missing from a row, in words that name the next thing to do.
  *
- * [RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE] is the one that needs more than
- * a rule stated back at the person: it says which device can do it, and what to
- * do when that device is the one that is gone -- which is the situation they
- * are usually in when they came looking for Remove in the first place.
+ * [RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE] deliberately says nothing here:
+ * on a non-approving phone it applies to every row at once, and the page-level
+ * line under the device list already names the approver and the recovery path.
  */
 @Composable
-private fun removeBlockText(block: RemoveDeviceBlock, approverName: String): String =
+private fun removeBlockText(block: RemoveDeviceBlock): String? =
     when (block) {
-        RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE ->
-            stringResource(R.string.ui_remove_device_use_the_approver, approverName)
+        RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE -> null
         else -> stringResource(removeBlockCopy(block))
     }
 
@@ -538,7 +541,7 @@ internal fun refusalCopy(reason: RemoveDeviceRefusal): Int = when (reason) {
 
 /** Why Remove is missing from a row, for a surface that wants to say so. */
 internal fun removeBlockCopy(block: RemoveDeviceBlock): Int = when (block) {
-    RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE -> R.string.ui_remove_device_use_the_approver
+    RemoveDeviceBlock.NOT_THE_APPROVING_DEVICE -> R.string.ui_only_approver_manages_devices
     RemoveDeviceBlock.IS_THE_APPROVING_DEVICE -> R.string.ui_remove_device_is_the_approver
     RemoveDeviceBlock.LAST_DEVICE -> R.string.ui_remove_device_last_one
 }

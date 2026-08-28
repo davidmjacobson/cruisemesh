@@ -32,17 +32,40 @@ fun LocalProfileEditor(
     modifier: Modifier = Modifier,
     helperText: String? = null,
     nameError: String? = null,
+    // Onboarding requires the name to proceed, and at large font scale the
+    // slide's viewport ends before the avatar block — a trailing field leaves
+    // the user staring at a disabled Next button with the reason off-screen.
+    // The profile screen keeps the avatar-first layout.
+    nameFirst: Boolean = false,
 ) {
+    val nameField: @Composable (topPadding: Int) -> Unit = { topPadding ->
+        OutlinedTextField(
+            value = displayName,
+            onValueChange = onDisplayNameChange,
+            label = { Text(stringResource(R.string.ui_display_name)) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = topPadding.dp),
+            singleLine = true,
+            isError = nameError != null,
+            supportingText = nameError?.let { error -> { Text(error) } },
+        )
+    }
     Column(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
+        if (nameFirst) {
+            nameField(0)
+        }
+
         AvatarBadge(
             userId = userId,
             name = displayName,
             displayId = displayId,
             size = 108.dp,
             photoPath = avatarPath,
+            modifier = if (nameFirst) Modifier.padding(top = 16.dp) else Modifier,
         )
 
         Row(
@@ -71,17 +94,9 @@ fun LocalProfileEditor(
             }
         }
 
-        OutlinedTextField(
-            value = displayName,
-            onValueChange = onDisplayNameChange,
-            label = { Text(stringResource(R.string.ui_display_name)) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 12.dp),
-            singleLine = true,
-            isError = nameError != null,
-            supportingText = nameError?.let { error -> { Text(error) } },
-        )
+        if (!nameFirst) {
+            nameField(12)
+        }
 
         helperText?.let {
             Text(

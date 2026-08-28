@@ -90,7 +90,7 @@ class YourDevicesUiTest {
             0,
             compose.onAllNodesWithText("Add a device").fetchSemanticsNodes().size,
         )
-        compose.onNodeWithText("Only Kitchen phone can add a device", substring = true)
+        compose.onNodeWithText("Only Kitchen phone can add or remove devices", substring = true)
             .performScrollTo()
             .assertIsDisplayed()
     }
@@ -117,18 +117,26 @@ class YourDevicesUiTest {
             }
         }
 
-        // Which device to use, and what to do when that device is the one that
-        // is gone -- which is why a person came looking for Remove at all.
-        compose.onNodeWithText("Only Kitchen phone can remove a device", substring = true)
-            .assertIsDisplayed()
-        // The recovery path is named on the row and again where Add a device
-        // would have been -- both of them are dead ends without that phone.
+        // One page-level sentence carries the approver rule and the recovery
+        // path; the rows stay silent so it is not repeated under each of them.
         assertEquals(
-            2,
+            1,
+            compose.onAllNodesWithText(
+                "Only Kitchen phone can add or remove devices",
+                substring = true,
+            ).fetchSemanticsNodes().size,
+        )
+        // The recovery path is the backup, not a support ticket: support holds
+        // no lever over a device roster and must not be offered one.
+        assertEquals(
+            0,
             compose.onAllNodesWithText("contact support", substring = true)
                 .fetchSemanticsNodes()
                 .size,
         )
+        compose.onNodeWithText("restore your backup", substring = true)
+            .performScrollTo()
+            .assertIsDisplayed()
     }
 
     @Test
