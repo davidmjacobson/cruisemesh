@@ -52,12 +52,22 @@ does not implement this transport remains fully compatible over BLE and relay.
   hint, mDNS discovery, or the cached endpoint starts the next attempt.
 - A manual `IP[:port]` field and endpoint QR are available for diagnosis when
   automatic discovery is unavailable.
-- The user may explicitly search the phone's current IPv4 `/24`. The search is
-  bounded to 253 candidate hosts, eight concurrent TCP attempts, and a
-  350-millisecond attempt timeout. CruiseMesh never silently expands this to a
-  `/16` or broader scan.
-- An automatic fallback sweep runs while discovery has produced nothing. It is
-  deliberately hard to escalate and easy to quiet:
+- The user may explicitly search the phone's own IPv4 subnet, as the network
+  reports it. The scanned prefix is clamped to the range `/16` to `/30`, and a
+  network that reports no prefix length is treated as a `/24`. A home `/24` is
+  therefore 254 candidate hosts; a genuinely huge flat network (a `/8`, say) is
+  clamped *down* to a `/16` around this phone's address rather than scanned
+  whole. The search runs eight concurrent TCP attempts with a 350-millisecond
+  attempt timeout. The `/16` ceiling is deliberate and applies to this manual
+  button only -- the user asked for it -- and CruiseMesh never widens beyond
+  the phone's own reported subnet, nor scans anything broader than a `/16` on
+  any path.
+- An automatic fallback sweep runs while discovery has produced nothing. Its
+  ceiling is narrower than the manual button's: `/20` (~4,094 hosts) rather
+  than `/16`, because ship and hotel Wi-Fi are exactly where the underlying
+  network is one huge flat subnet, and an unattended sweep there must not cost
+  minutes of sustained radio. It is deliberately hard to escalate and easy to
+  quiet:
   - It only runs while the transport has no links at all, or while a contact
     that recently demonstrated LAN support still has no LAN link -- one
     connected family member must not stop discovery of the rest. "Recently"
