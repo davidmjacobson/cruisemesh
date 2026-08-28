@@ -54,7 +54,18 @@ cd android
 ```
 
 For an intentional UI change, review regenerated references from
-`.\gradlew.bat :app:updateDebugScreenshotTest`. Managed-device UI tests require
+`.\gradlew.bat :app:updateDebugScreenshotTest`; they live in
+`android/app/src/screenshotTestDebug/reference/`.
+
+A preview is only rendered if it carries `@PreviewTest` as well as `@Preview`:
+the screenshot plugin narrowed collection to that annotation in alpha10, and the
+gate then passed for days while rendering zero of the 14 previews. Judge that
+gate by its count, never by BUILD SUCCESSFUL —
+`:app:verifyScreenshotPreviewsCollected` runs after every validation and fails
+unless previews declared, reference images committed, and testcases in
+`app/build/test-results/validateDebugScreenshotTest/*.xml` are the same number.
+
+Managed-device UI tests require
 the full `core/build-android.sh` path described below; run API 36 with
 `.\gradlew.bat :app:pixel6Api36DebugAndroidTest` or minimum-SDK API 31 with
 `.\gradlew.bat :app:pixel2Api31DebugAndroidTest`.
