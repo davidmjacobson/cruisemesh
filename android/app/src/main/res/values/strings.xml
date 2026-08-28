@@ -757,7 +757,7 @@
     <string name="ui_save_diagnostics_to_device">Save to device</string>
     <string name="ui_show_less">Show less</string>
     <string name="ui_clear_connection_history">Clear connection history</string>
-    <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.</string>
+    <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.</string>
     <string name="ui_no_diagnostics_captured_yet">No diagnostics captured yet.</string>
     <string name="ui_clear_connection_history_confirm">Clear connection history?</string>
     <string name="ui_this_removes_local_connection_events_and_per_person">This removes local connection events and per-person path summaries. Messages and friends are not affected.</string>
