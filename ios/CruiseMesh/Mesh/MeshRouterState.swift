@@ -78,6 +78,13 @@ final class MeshRouterState {
     func identifiedRoutes() -> [IdentifiedRoute] {
         core.identifiedRoutes().map { IdentifiedRoute(transport: $0.transport.platform, address: $0.address, userId: $0.userId) }
     }
+    /// Live links admitted as a device of this person's own. Deliberately in
+    /// none of the route accessors (they never become routes), which is why
+    /// they need naming separately: see `CoreMeshRouterState.ownDeviceLinks`.
+    func ownDeviceLinks() -> [(transport: Transport, address: String)] {
+        core.ownDeviceLinks().map { (transport: $0.transport.platform, address: $0.address) }
+    }
+
     func selectedIdentifiedRoutes() -> [IdentifiedRoute] {
         core.selectedIdentifiedRoutes().map { IdentifiedRoute(transport: $0.transport.platform, address: $0.address, userId: $0.userId) }
     }

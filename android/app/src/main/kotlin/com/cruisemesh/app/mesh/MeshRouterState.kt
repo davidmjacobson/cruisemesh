@@ -46,6 +46,14 @@ class MeshRouterState {
     fun transportFor(address: String): Transport? = core.transportFor(address)?.toPlatform()
     fun connectedRoutes(): List<Pair<Transport, String>> = core.connectedRoutes().map { it.transport.toPlatform() to it.address }
     fun identifiedRoutes(): List<IdentifiedRoute> = core.identifiedRoutes().map { IdentifiedRoute(it.transport.toPlatform(), it.address, it.userId) }
+
+    /**
+     * Live links admitted as a device of this person's own. Deliberately in
+     * none of the route accessors above (they never become routes), which is
+     * why they need naming separately: see `CoreMeshRouterState.ownDeviceLinks`.
+     */
+    fun ownDeviceLinks(): List<Pair<Transport, String>> =
+        core.ownDeviceLinks().map { it.transport.toPlatform() to it.address }
     fun selectedIdentifiedRoutes(): List<IdentifiedRoute> =
         core.selectedIdentifiedRoutes().map { IdentifiedRoute(it.transport.toPlatform(), it.address, it.userId) }
     fun isSelectedRoute(address: String): Boolean = core.isSelectedRoute(address)

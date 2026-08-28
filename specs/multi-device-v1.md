@@ -335,12 +335,92 @@ On "Remove device" (approving device) or recovery-code override:
    drawer" device is on the same footing and otherwise believes itself
    linked forever, keeps advertising, and keeps accepting messages. So:
    when a removed device next meets a sibling on a link that has already
-   proved it belongs to this person — a LAN Noise session whose remote
-   static key is this person's own agreement key — the sibling pushes the
-   current signed roster (frame `0x07`, gated by `CAP_OWN_ROSTER_NOTICE`
-   on HELLO2). A device that reads a roster tombstoning itself stores it,
+   proved it belongs to this person, the sibling pushes the current
+   signed roster (frame `0x07`, gated by `CAP_OWN_ROSTER_NOTICE` on
+   HELLO2). A device that reads a roster tombstoning itself stores it,
    clears its fleet projection, stops advertising, authoring and acking,
    and surfaces that it was removed.
+
+   **What "proved it belongs to this person" means, and what it must
+   never mean.** The admission test is a *roster proof*: on a finished
+   LAN Noise session each side signs that session's transcript hash with
+   its device signing key (`core_own_device_lan_proof`) and checks the
+   other's against the roster it holds (`core_own_device_lan_proof_open`,
+   both `devices` and `tombstones`). Binding to the transcript is what
+   makes it unreplayable across sessions and unforwardable by a machine
+   in the middle. The initiator proves first and a responder that cannot
+   verify closes without answering, so a stranger who dials us learns
+   nothing Noise XX message 2 did not already hand it.
+
+   **A proof names the end it was made for, and a device is not its own
+   sibling.** Both ends of one handshake compute the identical transcript
+   hash, so a signature over the hash alone says only "somebody on this
+   session is a device of this person's". A host we dial holds the
+   session legitimately: it can decrypt the proof we send, re-encrypt
+   that same plaintext under its own sending key, and return it — and
+   opened against our own roster that reflection verifies, names us, and
+   is found. So the signed bytes carry a role tag (`CoreLanProofRole`),
+   each side opens only a proof made for the *other* end, and a proof
+   deriving to this device's own id is refused outright.
+
+   **A phone with no fleet mints nothing.** A proof is a stable device
+   signing key with a signature attached, and the initiator puts it in
+   front of a host it dialed before that host has proved anything — so a
+   subnet sweep on a shared network would otherwise hand a durable
+   identifier to every host answering the port. A roster naming no device
+   but this one has nobody to recognise and nobody who could recognise
+   it, so no proof is minted at all (`core_roster_names_a_sibling`). The
+   disclosure is confined to phones that genuinely have a sibling to
+   find, which is exactly when this step has work to do.
+
+   **One own-device link per standing, and cross-connects are settled by
+   the keys.** Two phones that dial each other at once finish their
+   handshakes in opposite orders on the two hosts, so "newest wins" has
+   each keep a different socket and close the one the other kept — both
+   die and the pair flaps. The link dialed by the phone with the lower
+   Noise static key survives; both ends compute that from what they
+   already hold, with no extra message. A revoked device's link and a
+   live sibling's never compete for the same slot either, so a removed
+   phone reconnecting in a loop cannot starve the link that carries
+   roster convergence between the devices that remain.
+
+   It must never be "the peer's Noise static key is this person's own
+   agreement key". That is a **clone** test, not a sibling test, and the
+   first build shipped it. §9's ceremony deliberately gives a linked
+   device keys of its own and withholds the person root secret (§3), so
+   two genuine siblings share no private key at all: the test admitted a
+   `.cmbak` restore and refused every real sibling, in both roles, before
+   any removal and independent of address family. A 2026-08-24 two-phone
+   capture is the record — 25 refusals across 15 minutes on one `/24`, an
+   own-device link that never came up once, and a removed phone that
+   never learned. The clone arm is *kept* alongside the roster proof,
+   because such a device already holds everything a roster could tell it;
+   it is simply not the whole test.
+
+   Three consequences follow, and each is load-bearing:
+
+   - **A tombstoned device is admitted on purpose.** The device that most
+     needs the notice is the removed one, so refusing its proof would
+     slam the only door the notice can come through. It gains no
+     capability by it: a link with no user id is not a route, and §10.1
+     rotated the inbox key at the moment of removal, long before this
+     meeting. Tombstones deliberately keep no key (DL-4), so the prover
+     carries its `device_sign_pk` in the payload and the verifier
+     *derives* the device id from it rather than reading a claim —
+     without that the approver could not verify the very device it must
+     notify, and the exchange would work in one direction only.
+   - **A sibling's HELLO does not carry this person's user id.** A linked
+     device derives its user id from its own signing key, so anything
+     that recognises siblings by comparing user ids sees a stranger and
+     the capability bits that gate the notice never register. The link,
+     not the frame, is what says whose device this is.
+   - **A linked device cannot check a roster against its own identity
+     key.** `Identity.sign_pk` is the person root only on the *original*
+     device. Everywhere else the anchor is recovered from the roster the
+     device already holds (`core_roster_person_root_sign_pk`), which is
+     pinned by the same `person_id` binding the argument would have been
+     checked against. Without that, the removed device would read the
+     document burying it, check it against the wrong key, and stay live.
 
    It hears only from a document signed under the person root that
    strictly supersedes the one it held, so "you're out" is never a bare
@@ -348,6 +428,77 @@ On "Remove device" (approving device) or recovery-code override:
    step 1: the inbox key rotates at the moment of removal, before any
    meeting, so the fleet's self-sync channel and retained backlog are
    already shut when the notice arrives.
+
+   **The push is level-triggered, not edge-triggered — the meeting is
+   not the only moment it may happen.** The first build made the offer at
+   the instant a HELLO2 landed on an own-device link and at no other, and
+   a 2026-08-24 two-phone capture showed what that costs: the two phones
+   had already met, the removal happened seconds later on a link that was
+   already up, and there was no second HELLO to carry it. The removed
+   phone held the roster that still listed it through 26 minutes on the
+   same Wi-Fi, a force-stop of both apps, and a reboot. So a live
+   own-device link is re-offered the current roster on a timer
+   (`core_own_roster_notice_reoffer_due`, one minute) for as long as it
+   lasts. That is safe to do bluntly because the frame is idempotent in
+   both directions — the sender rebuilds it from its store, and the
+   receiver refuses anything that does not strictly supersede what it
+   holds — and it is deliberately a timer rather than a roster-changed
+   event, because the mechanism has to work on the phone that is *wrong*
+   and must not depend on any event having been delivered anywhere. The
+   one event it did still depend on — the peer's HELLO2, which carries
+   the capability bit and crosses the wire once per link — is nudged: an
+   own-device link that has not produced one gets our HELLO2 re-sent a
+   bounded number of times.
+
+   *This widens the §10.1/§10.2 window, and the trade is owned here
+   rather than left in a code comment.* The notice tells the holder of a
+   removed phone that they are out, while §10.2's relay-`family_token`
+   rotation lands only on the first pass that reaches the relay — and
+   LAN-with-no-internet is precisely where that gap is widest.
+   Edge-triggered, reaching it took a fresh HELLO2 and was the exception;
+   level-triggered it is the ordinary case, within about a minute, for as
+   long as the link lasts. Accepted deliberately: an honest removed
+   device has to converge offline, and this is the only thing that makes
+   the phone that is wrong right. The window closes by the rotation
+   landing sooner, never by withholding the notice.
+
+   **And something has to go looking for the link in the first place.**
+   A device of this person's own shares their user id, so it has no
+   contact row: the LAN transport's automatic subnet sweep was motivated
+   only by unlinked *contacts*, and a live own-device link counted toward
+   the "this phone has company" test that suppresses the sweep — while
+   being, uniquely, the one kind of link no heartbeat ever probed, so a
+   half-open one could suppress it for a whole Wi-Fi join. Both are
+   corrected: own-device links are heartbeated like any other LAN link
+   and closed when they stop answering, they no longer count as company,
+   and this phone searches for its own devices as a motive in its own
+   right (`core_lan_scan_gate_open`).
+
+   That search is **bounded**, in the same spirit as the contact-side
+   motive's recency decay (`lan_capability_motivates_scan`). "A roster
+   device I have no link to" never stops being true — a second phone
+   switched off, or left at home, is missing forever, and a person with
+   three devices can never have them all linked, since the transport
+   keeps one own-device link at a time. Left unbounded it would sweep the
+   `/24` every five minutes on every Wi-Fi the person ever joins, on
+   battery, for the life of each join. So a *reason* opens a window
+   (`core_lan_own_device_search_since`, fifteen minutes) and the window
+   closes. The reasons are: joining a Wi-Fi network, a roster device
+   becoming unlinked, and **this person's roster changing at all** — that
+   last one is what sends the *approving* phone looking, since a removal
+   drops the removed device from its roster immediately and would
+   otherwise leave the phone holding the signed document with no motive
+   to go and find its recipient.
+
+   **On iOS both halves run only while the app is on screen.** Android
+   drives them from its foreground service; iOS drives them from the LAN
+   health loop, which stops when backgrounded — as does the LAN
+   transport's discovery. So "the removed device learns within minutes,
+   surviving restart and reboot" is unqualified on Android and means
+   "within minutes of either phone being opened" on iOS. That is a
+   platform limit rather than a design choice, and it is why the notice
+   is idempotent and re-offered rather than sent once: whenever the app
+   does come forward, the next tick carries it.
 
    **Step 2 lands on its own clock, and the notice must not be described
    as though the two were simultaneous.** Both shells drive the relay

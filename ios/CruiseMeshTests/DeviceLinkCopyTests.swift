@@ -63,24 +63,24 @@ final class DeviceLinkCopyTests: XCTestCase {
     }
 
     func testEveryReasonRemoveIsWithheldHasFamilyWords() {
-        for block: RemoveDeviceBlock in [
-            .notTheApprovingDevice, .isTheApprovingDevice, .lastDevice,
-        ] {
+        for block: RemoveDeviceBlock in [.isTheApprovingDevice, .lastDevice] {
             assertFamilyWords(
-                removeBlockText(block, approverName: "Kitchen phone"),
+                removeBlockText(block)!,
                 "block \(block)"
             )
         }
-        // The one that needs more than a rule stated back: it names the device
-        // that can do it, and the way out when that device is the one that is
-        // gone -- which is why a person came looking for Remove at all.
-        let wrongPhone = removeBlockText(.notTheApprovingDevice, approverName: "Kitchen phone")
-        XCTAssertTrue(wrongPhone.contains("Kitchen phone"))
-        XCTAssertTrue(wrongPhone.contains("contact support"))
-        assertFamilyWords(
-            addDeviceWithheldText(approverName: "Kitchen phone"),
-            "add-device withheld"
-        )
+        // Not-the-approving-device stays silent on the row: the page-level
+        // line already carries the approver rule and the recovery path, so
+        // it is not repeated under every device.
+        XCTAssertNil(removeBlockText(.notTheApprovingDevice))
+        // That page-level line names the approver and points at the backup —
+        // never at support, which holds no lever over a device roster.
+        let withheld = addDeviceWithheldText(approverName: "Kitchen phone")
+        assertFamilyWords(withheld, "add-device withheld")
+        XCTAssertTrue(withheld.contains("Kitchen phone"))
+        XCTAssertTrue(withheld.contains("add or remove"))
+        XCTAssertTrue(withheld.contains("restore your backup"))
+        XCTAssertFalse(withheld.contains("contact support"))
     }
 
     func testEveryDeviceLabelHasWords() {
