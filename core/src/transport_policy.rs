@@ -994,6 +994,36 @@ impl CoreMeshRouterState {
             .collect()
     }
 
+    /// Every live link admitted as one of THIS person's own devices
+    /// ([`Self::on_own_device_connected`]), address-sorted.
+    ///
+    /// Such a link is deliberately absent from [`Self::identified_routes`] --
+    /// it has no user id and never becomes a route -- and that absence is what
+    /// left it outside every periodic pass the shells run over their links. A
+    /// link nothing probes is a link nothing closes: a half-open one held its
+    /// socket for the whole Wi-Fi join, carried no frames, and (being a live
+    /// connection) told the LAN transport it was not lonely enough to search.
+    /// That is the state an approver sat in while it failed to tell a phone it
+    /// had removed.
+    ///
+    /// So the shells get a way to name these links: to heartbeat them like any
+    /// other LAN link, and to re-offer §10 step 5's roster on them rather than
+    /// only at the instant a HELLO2 arrives.
+    pub fn own_device_links(&self) -> Vec<CoreTransportRoute> {
+        let peers = self.peers.lock_recoverable();
+        let mut routes: Vec<_> = peers
+            .iter()
+            .filter(|(_, peer)| peer.own_device)
+            .map(|(address, peer)| CoreTransportRoute {
+                transport: peer.transport,
+                address: address.clone(),
+            })
+            .collect();
+        drop(peers);
+        routes.sort_by(|a, b| a.address.cmp(&b.address));
+        routes
+    }
+
     pub fn identified_routes(&self) -> Vec<CoreIdentifiedRoute> {
         self.peers
             .lock_recoverable()
@@ -2457,6 +2487,41 @@ mod tests {
         assert_eq!(
             router.transport_for("sibling".into()),
             Some(CoreTransport::Lan)
+        );
+    }
+
+    /// The shells cannot heartbeat or re-offer a roster on a link they cannot
+    /// name, and an own-device link is in none of the route accessors.
+    #[test]
+    fn own_device_links_are_nameable_without_becoming_routes() {
+        let router = CoreMeshRouterState::new();
+        let contact = vec![9; 16];
+        router.on_own_device_connected("sibling-b".into(), CoreTransport::Lan);
+        router.on_own_device_connected("sibling-a".into(), CoreTransport::Lan);
+        router.on_connected("friend".into(), CoreTransport::Lan);
+        assert!(router.on_hello("friend".into(), contact));
+
+        assert_eq!(
+            router
+                .own_device_links()
+                .into_iter()
+                .map(|route| route.address)
+                .collect::<Vec<_>>(),
+            vec!["sibling-a".to_string(), "sibling-b".to_string()]
+        );
+        assert!(router
+            .identified_routes()
+            .iter()
+            .all(|route| route.address == "friend"));
+
+        router.on_disconnected("sibling-a".into());
+        assert_eq!(
+            router
+                .own_device_links()
+                .into_iter()
+                .map(|route| route.address)
+                .collect::<Vec<_>>(),
+            vec!["sibling-b".to_string()]
         );
     }
 

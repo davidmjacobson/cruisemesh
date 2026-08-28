@@ -151,6 +151,14 @@ enum MeshRouter {
         state.selectedIdentifiedRoutes()
     }
 
+    /// Live links to a device of this person's own
+    /// (`specs/multi-device-v1.md` §10 step 5). Never routes, so never in
+    /// `identifiedRoutes` -- and that is exactly why they have to be nameable:
+    /// something has to heartbeat them and re-offer the roster on them.
+    static func ownDeviceLinks() -> [(transport: MeshRouterState.Transport, address: String)] {
+        state.ownDeviceLinks()
+    }
+
     static func isSelectedRoute(address: String) -> Bool {
         state.isSelectedRoute(address: address)
     }
