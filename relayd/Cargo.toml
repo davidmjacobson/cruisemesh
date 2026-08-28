@@ -33,5 +33,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 cruisemesh-core = { path = "../core" }
 futures-util = "0.3"
 tempfile = "3"
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
