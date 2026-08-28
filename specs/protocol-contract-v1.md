@@ -1608,14 +1608,18 @@ Recorded so a reader does not have to diff two documents:
   page `CoreRelayPass` ingests being persisted but never handed to the shell's
   inbound processor so nothing raised a notification for it, and the presence
   answer never being projected back onto the connectivity surface so contact
-  "last seen" stopped moving. Three are now closed. The pass drains a typed
+  "last seen" stopped moving. All four are now closed. The pass drains a typed
   projection — the rows its ingest transaction newly took, and the presence it
   was answered, as an age rather than as a relay timestamp — and each shell
   hands those to the same inbound path and the same last-seen merge its legacy
   pass uses, without re-deciding anything core already committed. Both shells
   also now pass `endpoint_usable` and `endpoint_answering` distinctly, so the
   silence brake engages rather than borrowing the rejection answer. Group
-  fan-out remains, and it is the one thing left on this list.
+  fan-out was the last of the four and closed with `FANOUT-01`: core's upload
+  planning decomposes a group-addressed row per member and retires the envelope
+  only when every member it owes has landed. Closing the list is not the same as
+  moving the default — the presence-scope row and clean canary evidence over real
+  passes are still what that waits on.
 - What is deliberately *not* on that list is anything the shell still owns on
   both paths. The prunes, the pre-upload receipt backfill, the contact-silence
   breaker's pass boundaries and the endpoint announcement all run on the core

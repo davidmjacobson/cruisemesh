@@ -36,6 +36,7 @@
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
     <string name="ui_backup_contains_contacts_and_groups">Backup contains %1$s contacts and %2$s groups.</string>
+    <string name="ui_backup_file_selected">Backup file selected</string>
     <string name="ui_backup_identity_always_included">Your identity, contacts, groups, privacy settings, and message-number continuity are always included.</string>
     <string name="ui_backup_identity_always_restored">Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.</string>
     <string name="ui_backup_saved">Backup saved</string>

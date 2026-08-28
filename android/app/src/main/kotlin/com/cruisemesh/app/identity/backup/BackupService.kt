@@ -173,10 +173,14 @@ object BackupService {
     }
 
     /**
-     * The name to show for a picked document. A SAF uri's last path segment is
-     * a provider document id, which for a file the app itself wrote is often
-     * just a number ("152"); the provider's display-name column is the actual
-     * filename. Falls back to the path segment when no provider answers.
+     * The name to show for a picked document, or null when the providers give
+     * us nothing a person would recognise and the caller should show generic
+     * copy instead. A SAF uri's last path segment is a provider document id,
+     * which for a file the app itself wrote is often just a number ("152"); the
+     * provider's display-name column is the actual filename. [BackupFileName]
+     * owns the choice between the two.
+     *
+     * Does blocking IO (a content-resolver query) — call it off the main thread.
      */
     fun displayName(context: Context, uri: Uri): String? {
         val fromProvider = runCatching {
@@ -187,8 +191,7 @@ object BackupService {
                     if (column >= 0 && cursor.moveToFirst()) cursor.getString(column) else null
                 }
         }.getOrNull()
-        return fromProvider?.takeIf { it.isNotBlank() }
-            ?: uri.lastPathSegment?.substringAfterLast('/')
+        return BackupFileName.resolve(fromProvider, uri.lastPathSegment)
     }
 
     /** Write bytes to a SAF document (the destination the user chose to save the backup). */
