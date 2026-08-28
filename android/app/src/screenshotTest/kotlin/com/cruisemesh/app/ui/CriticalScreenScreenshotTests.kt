@@ -8,6 +8,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import com.android.tools.screenshot.PreviewTest
 import com.cruisemesh.app.chat.MessageComposer
 import uniffi.cruisemesh_core.CoreConnectionHealth
 import uniffi.cruisemesh_core.CoreDeliveryBlockedReason
@@ -21,8 +22,16 @@ import uniffi.cruisemesh_core.CorePersonRoute
 import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.PeerConnectionTransport
 
+// Every preview in this file is annotated twice, and the second annotation is
+// the load-bearing one: since screenshot plugin alpha10 a preview is collected
+// only if it is marked @PreviewTest, so one carrying just the Compose annotation
+// is rendered by nobody while the gate goes on reporting success. The
+// `verifyScreenshotPreviewsCollected` task in app/build.gradle.kts fails the
+// build if the number rendered ever stops matching the previews declared here.
+
 @Preview(name = "terms_compact", widthDp = 360, heightDp = 640, showBackground = true)
 @Preview(name = "terms_compact_large_font", widthDp = 360, heightDp = 640, fontScale = 1.3f, showBackground = true)
+@PreviewTest
 @Composable
 fun TermsScreenshot() {
     CruiseMeshTheme {
@@ -32,6 +41,7 @@ fun TermsScreenshot() {
 
 @Preview(name = "onboarding_compact", widthDp = 360, heightDp = 640, showBackground = true)
 @Preview(name = "onboarding_compact_large_font", widthDp = 360, heightDp = 640, fontScale = 1.3f, showBackground = true)
+@PreviewTest
 @Composable
 fun OnboardingScreenshot() {
     CruiseMeshTheme {
@@ -57,12 +67,14 @@ fun OnboardingScreenshot() {
 }
 
 @Preview(name = "composer_empty", widthDp = 360, heightDp = 120, showBackground = true)
+@PreviewTest
 @Composable
 fun EmptyComposerScreenshot() {
     ComposerFrame(draft = "", hasPendingAttachment = false)
 }
 
 @Preview(name = "composer_caption", widthDp = 360, heightDp = 160, fontScale = 1.3f, showBackground = true)
+@PreviewTest
 @Composable
 fun CaptionComposerScreenshot() {
     ComposerFrame(draft = "Meet by the pool after dinner", hasPendingAttachment = true)
@@ -406,12 +418,14 @@ private fun ConnectionDetailsFixture(
     fontScale = 2.0f,
     showBackground = true,
 )
+@PreviewTest
 @Composable
 fun ConnectionDetailsReadyScreenshot() {
     ConnectionDetailsFixture(readyState)
 }
 
 @Preview(name = "connection_limited", widthDp = 360, heightDp = 900, showBackground = true)
+@PreviewTest
 @Composable
 fun ConnectionDetailsLimitedScreenshot() {
     ConnectionDetailsFixture(limitedState)
@@ -423,6 +437,7 @@ fun ConnectionDetailsLimitedScreenshot() {
     heightDp = 900,
     showBackground = true,
 )
+@PreviewTest
 @Composable
 fun ConnectionDetailsNeedsAttentionScreenshot() {
     ConnectionDetailsFixture(needsAttentionState)
@@ -434,12 +449,14 @@ fun ConnectionDetailsNeedsAttentionScreenshot() {
     heightDp = 900,
     showBackground = true,
 )
+@PreviewTest
 @Composable
 fun ConnectionDetailsDelayedScreenshot() {
     ConnectionDetailsFixture(delayedState)
 }
 
 @Preview(name = "connection_long_list", widthDp = 360, heightDp = 900, showBackground = true)
+@PreviewTest
 @Composable
 fun ConnectionDetailsLongListScreenshot() {
     ConnectionDetailsFixture(longListState)
@@ -451,6 +468,7 @@ fun ConnectionDetailsLongListScreenshot() {
     heightDp = 900,
     showBackground = true,
 )
+@PreviewTest
 @Composable
 fun ConnectionDetailsPersonExpandedScreenshot() {
     ConnectionDetailsFixture(
