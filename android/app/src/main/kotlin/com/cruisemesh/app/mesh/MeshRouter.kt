@@ -191,6 +191,14 @@ object MeshRouter {
     /** Live routes that have identified themselves via HELLO. */
     fun identifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.identifiedRoutes()
 
+    /**
+     * Live links to a device of this person's own (`specs/multi-device-v1.md`
+     * §10 step 5). Never routes, so never in [identifiedRoutes] -- and that is
+     * exactly why they have to be nameable: something has to heartbeat them
+     * and re-offer the roster on them.
+     */
+    fun ownDeviceLinks(): List<Pair<MeshRouterState.Transport, String>> = state.ownDeviceLinks()
+
     /** One elected application-data route per authenticated logical peer. */
     fun selectedIdentifiedRoutes(): List<MeshRouterState.IdentifiedRoute> = state.selectedIdentifiedRoutes()
 

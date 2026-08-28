@@ -46,6 +46,8 @@ import com.cruisemesh.app.identity.TermsAcceptanceStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.CoreLanOwnDeviceProof
+import uniffi.cruisemesh_core.CoreLanProofRole
 import uniffi.cruisemesh_core.CoreOwnIdentityPeer
 import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.CoreSprayTrigger
@@ -57,13 +59,17 @@ import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.PeerConnectionEventKind
 import uniffi.cruisemesh_core.PeerConnectionTransport
+import uniffi.cruisemesh_core.Roster
 import uniffi.cruisemesh_core.RevocationAdoptionOutcome
 import uniffi.cruisemesh_core.StoredMessage
 import uniffi.cruisemesh_core.digestIsSharedGroup
 import uniffi.cruisemesh_core.encodeDigest
 import uniffi.cruisemesh_core.coreIsHiddenSprayKind
 import uniffi.cruisemesh_core.coreOwnCapabilities
+import uniffi.cruisemesh_core.coreOwnDeviceLanProof
+import uniffi.cruisemesh_core.coreOwnDeviceLanProofOpen
 import uniffi.cruisemesh_core.coreOwnIdentityPeer
+import uniffi.cruisemesh_core.coreRosterNamesASibling
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeHello2
 import uniffi.cruisemesh_core.encodeLanEndpoint
@@ -365,6 +371,20 @@ class MeshService : Service() {
      * time so an entry going stale needs no refresh at all.
      */
     @Volatile private var lanCapableContacts: Map<String, Long> = emptyMap()
+
+    /**
+     * How many devices this person's own roster lists besides this one, cached
+     * for the same reason [lanCapableContacts] is: reading the fleet costs a
+     * SQLite hit, and the sweep motive is recomputed on every LAN health tick.
+     * Refreshed off the main thread by [refreshLanCapableContacts].
+     */
+    @Volatile private var ownRosterSiblingCount: Int = 0
+
+    /** §10 step 5's re-offer bookkeeping; see [OwnRosterNoticeSchedule]. */
+    private val ownRosterNoticeSchedule = OwnRosterNoticeSchedule()
+
+    /** §10 step 5's sweep motive; see [OwnDeviceSearchWindow]. */
+    private val ownDeviceSearchWindow = OwnDeviceSearchWindow()
     private val lanEndpointCache by lazy { LanEndpointCache(this) }
     private val a2dpAudioBackoff = A2dpAudioBackoff()
 
@@ -690,7 +710,10 @@ class MeshService : Service() {
                         null
                     }
             },
+            ownDeviceLanProof = ::ownDeviceLanProof,
+            openOwnDeviceLanProof = ::openOwnDeviceLanProof,
             unlinkedCapableContacts = ::countUnlinkedCapableContacts,
+            ownDeviceSearchLive = ownDeviceSearchWindow::isLive,
             onNetworkReady = ::onLanNetworkReady,
             onEndpointObserved = { userId, endpoint, networkId ->
                 // An address the contact hinted at, already checked against
@@ -838,6 +861,8 @@ class MeshService : Service() {
         // way, so there is nothing to await synchronously here.
         storeExecutor.shutdown()
         lanHealthTracker.clear()
+        ownRosterNoticeSchedule.clear()
+        ownDeviceSearchWindow.clear()
         RelaySyncEvents.unregister()
         LinkVisibility.unregister()
         stopMeshRoles()
@@ -1387,6 +1412,7 @@ class MeshService : Service() {
     }
 
     private fun onLanPeerDisconnected(address: String) {
+        ownRosterNoticeSchedule.forget(address)
         val peerUserId = MeshRouter.userIdFor(address)
         val wasSelected = MeshRouter.isSelectedRoute(address)
         recordPeerDisconnected(address)
@@ -1563,6 +1589,10 @@ class MeshService : Service() {
         synchronized(gatedDigests) { gatedDigests.remove(UserIdHex.encode(peerUserId)) }
 
     private fun onLanNetworkReady(hint: Frame.LanEndpoint, networkId: String?) {
+        // A new Wi-Fi is a fresh reason to look for a device of this person's
+        // own: every peer on it has to be found again from nothing, and the
+        // shortfall this phone was carrying is not itself news.
+        ownDeviceSearchWindow.rearm(System.currentTimeMillis())
         val frame = encodeLanEndpointFrame(hint) ?: return
         for (route in MeshRouter.selectedIdentifiedRoutes()) {
             if (route.transport == MeshRouterState.Transport.LAN) continue
@@ -1639,6 +1669,10 @@ class MeshService : Service() {
                     // A device of this person's own, on a link that has proved
                     // it: §10 step 5's meeting. Here rather than in the legacy
                     // HELLO branch because the capability bits only ride 0x06.
+                    // Remembered as well as acted on: the meeting is the only
+                    // moment those bits cross the wire, and [checkLanHealth]
+                    // re-offers on this link long after it.
+                    ownRosterNoticeSchedule.noteHello2(address, parsed.capabilities)
                     offerOwnRosterNotice(address, parsed.capabilities, identity)
                 } else {
                     MeshRouter.onHello2(address, parsed.userId, parsed.capabilities)
@@ -1739,10 +1773,33 @@ class MeshService : Service() {
     }
 
     /**
-     * Rebuilds [lanCapableContacts] off the main thread. Called whenever a
-     * peer demonstrates LAN support and on the periodic LAN health tick, so
-     * a deleted or blocked contact drops out of the sweep gate without any
-     * extra plumbing from the screens that delete or block.
+     * How many devices this person's own roster lists that are not on an
+     * own-device link right now. Feeds [ownDeviceSearchWindow], which is what
+     * the sweep gate actually asks -- this count on its own is an absence, and
+     * an absence never ends.
+     *
+     * A sibling shares this person's user id, so it has no contact row and can
+     * never show up in [countUnlinkedCapableContacts] however long it waits.
+     * Without a motive of its own, a phone whose only missing peer is its
+     * other phone never sweeps for it -- leaving mDNS as the single channel
+     * between two devices of one person, which is what the field capture
+     * caught failing.
+     */
+    private fun countUnlinkedOwnDevices(): Int =
+        (ownRosterSiblingCount - MeshRouter.ownDeviceLinks().size).coerceAtLeast(0)
+
+    /**
+     * Rebuilds [lanCapableContacts] and [ownRosterSiblingCount] off the main
+     * thread, and folds the result into [ownDeviceSearchWindow]. Called
+     * whenever a peer demonstrates LAN support and on the periodic LAN health
+     * tick, so a deleted or blocked contact drops out of the sweep gate without
+     * any extra plumbing from the screens that delete or block -- and so does a
+     * device this person has just removed.
+     *
+     * The roster is fingerprinted rather than counted because a *removal* does
+     * not raise the shortfall, it lowers it: the removed device leaves the
+     * roster at once, so the phone holding the signed news for it would have no
+     * motive to go looking for it. The change itself is the motive.
      */
     private fun refreshLanCapableContacts() {
         runOnStoreExecutor("lan capability cache") {
@@ -1756,16 +1813,35 @@ class MeshService : Service() {
                         ?.let { userIdHex to it }
                 }
                 .toMap()
+            val fingerprint = runCatching {
+                val fleet = store.ownDeviceFleet()
+                ownRosterSiblingCount =
+                    (fleet.deviceIds.size - if (fleet.ownDeviceId != null) 1 else 0)
+                        .coerceAtLeast(0)
+                ownRosterFingerprint(fleet.deviceIds)
+            }.getOrElse {
+                ownRosterSiblingCount = 0
+                ownRosterFingerprint(emptyList())
+            }
+            ownDeviceSearchWindow.observe(
+                rosterFingerprint = fingerprint,
+                unlinkedOwnDevices = countUnlinkedOwnDevices(),
+                nowMs = System.currentTimeMillis(),
+            )
         }
     }
 
     private fun checkLanHealth() {
         refreshLanCapableContacts()
-        for (route in MeshRouter.identifiedRoutes()) {
-            if (route.transport != MeshRouterState.Transport.LAN) continue
-            when (val decision = nextLanHealthDecision(route.address)) {
+        val ownDeviceLinks = MeshRouter.ownDeviceLinks()
+        // A link to one of this person's own devices is never a route, so it
+        // was in none of the accessors this loop used to read -- see
+        // [lanHealthProbeAddresses], which is where that selection now lives so
+        // a test can hold it in place.
+        for (address in lanHealthProbeAddresses(MeshRouter.identifiedRoutes(), ownDeviceLinks)) {
+            when (val decision = nextLanHealthDecision(address)) {
                 is LanHealthTracker.Decision.Send -> MeshRouter.sendToAddress(
-                    route.address,
+                    address,
                     encodeTransportProbe(decision.nonce, response = false),
                 )
                 LanHealthTracker.Decision.Wait -> Unit
@@ -1773,9 +1849,40 @@ class MeshService : Service() {
                     LanTransportDiagnostics.probeFailed(
                         "Encrypted LAN heartbeat timed out; reconnecting",
                     )
-                    lanTransport?.closeLink(route.address)
+                    lanTransport?.closeLink(address)
                 }
             }
+        }
+        reofferOwnRosterNotices(ownDeviceLinks)
+    }
+
+    /**
+     * **§10 step 5, level-triggered.** Re-offer this person's roster on every
+     * live own-device link that is due one, and nudge any link whose peer
+     * HELLO2 never arrived.
+     *
+     * The notice shipped edge-triggered on an inbound HELLO2 and nothing else,
+     * so a removal that happened while a sibling link was *already up* was
+     * never announced on it. Nothing else in either shell pushed one: no
+     * roster-change hook, no periodic re-offer, and HELLO is sent only when a
+     * link is established. See [OwnRosterNoticeSchedule] for why this is a
+     * timer rather than an event, and [ownRosterNoticeTargets] /
+     * [ownDeviceLinksAwaitingHello2] for the selection this delegates.
+     */
+    private fun reofferOwnRosterNotices(
+        ownDeviceLinks: List<Pair<MeshRouterState.Transport, String>>,
+    ) {
+        val identity = this.identity ?: return
+        val nowMs = System.currentTimeMillis()
+        for ((address, capabilities) in ownRosterNoticeTargets(
+            ownDeviceLinks,
+            ownRosterNoticeSchedule,
+            nowMs,
+        )) {
+            offerOwnRosterNotice(address, capabilities, identity)
+        }
+        for (address in ownDeviceLinksAwaitingHello2(ownDeviceLinks, ownRosterNoticeSchedule)) {
+            sendHello(address)
         }
     }
 
@@ -1816,39 +1923,152 @@ class MeshService : Service() {
      * `msg_id` suppression above.
      */
     /**
-     * A HELLO claiming our user id is either the `.cmbak`-clone meeting or one
-     * of this person's own devices, and the frame alone cannot tell: a user id
-     * is a claim, and the proof is the Noise static key the link's peer
-     * actually holds ([ownIdentityLinkIsProven]).
+     * Whether this HELLO came from this person rather than from a peer — in
+     * which case it must not become a route, because a route to this person
+     * leads back to this phone.
      *
-     * Whichever it is, it must not become a route -- a route to this person
-     * leads back to this phone -- so this returns true for both and the caller
-     * stops. The clone warning is not recorded here: the LAN handshake raised
-     * it one moment earlier for exactly this link
+     * Two ways that can be true, and **the second one is why the 2026-08-24
+     * field failure survived every other repair.**
+     *
+     * - *The link proved it* ([ownIdentityLinkIsProven]). This is the sibling
+     *   case, and it is the only one that ever happens between two devices §9
+     *   linked. The old test could not see it: it asked whether the HELLO
+     *   *claimed our user id*, and a linked device has a user id of its own —
+     *   derived from its own signing key, because the ceremony never hands over
+     *   the person's. So a sibling's HELLO2 read as a stranger's, the roster
+     *   notice schedule never learned its capability bits, and
+     *   `dueCapabilities` returned null forever. That is the "HELLO from
+     *   unrecognized userId" in the field capture, on a link that was this
+     *   person's own the whole time.
+     * - *The frame claims our user id*, proven or not. That is the
+     *   `.cmbak`-clone meeting, or somebody asserting our identity on a
+     *   cleartext BLE HELLO. Both must be kept off the router; only the first
+     *   is believed anywhere else, and [ownIdentityLinkIsProven] is what
+     *   separates them.
+     *
+     * The clone warning is not recorded here: the LAN handshake raised it one
+     * moment earlier for exactly this link
      * ([recordOwnIdentityCloneIfAuthenticated]), and raising it again would
-     * count one meeting twice. An unproven claim -- a cleartext BLE HELLO, or a
-     * LAN link authenticated as some other peer -- is logged and dropped.
+     * count one meeting twice.
      */
     private fun noteOwnIdentityHello(address: String, userId: ByteArray, identity: Identity): Boolean {
+        if (ownIdentityLinkIsProven(address, identity)) return true
         if (!userId.contentEquals(identity.userId)) return false
-        if (!ownIdentityLinkIsProven(address, identity)) {
-            Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")
-        }
+        Log.w(TAG, "Ignoring unauthenticated HELLO that claims our identity")
         return true
     }
 
     /**
-     * Whether this link has proved, cryptographically, that the other end holds
-     * this person's own agreement secret.
+     * This device's §10 step 5 proof for one finished LAN Noise session: a
+     * signature over that session's transcript hash under this device's roster
+     * signing key.
      *
-     * The bar the clone warning already used, hoisted so §10 step 5's roster
-     * notice is held to exactly the same one rather than to a second copy of it
-     * that could drift. A cleartext BLE HELLO never clears it.
+     * Null on an install that has never linked — no device key means no
+     * certificate in anybody's roster, so there is no sibling that could
+     * recognise this phone and nothing a proof could assert. Refusing to mint
+     * one there is not a degradation: it is the honest answer.
+     *
+     * **Null also on a phone whose roster names no device but itself**, which
+     * is most phones. A proof is this device's stable signing public key with a
+     * signature attached, and the initiator puts it in front of a host it
+     * dialed before that host has proved anything — so a phone sweeping a
+     * ship's /24 would hand a durable identifier to whatever answered on the
+     * port. A solo phone gains nothing for it: with nobody in its roster to
+     * recognise, the only proof it could ever open is its own coming back, and
+     * `core_own_device_lan_proof_open` refuses that. So the key stays off the
+     * wire until this person actually has a fleet, which is exactly when §10
+     * step 5 has work to do.
+     *
+     * Runs on the LAN handshake thread, which is where [LanTransport] needs the
+     * answer. The keystore unwrap is the same one [handleOwnRosterNotice]
+     * already does off the main thread; the roster read is the same single-row
+     * lookup [openOwnDeviceLanProof] makes on that thread.
+     */
+    private fun ownDeviceLanProof(
+        handshakeHash: ByteArray,
+        role: CoreLanProofRole,
+    ): ByteArray? {
+        val device = DeviceKeyStore.load(this) ?: return null
+        val roster = ownRosterOrNull() ?: return null
+        if (!coreRosterNamesASibling(roster, device.deviceId)) return null
+        return runCatching { coreOwnDeviceLanProof(device.signSk, handshakeHash, role) }
+            .onFailure { Log.w(TAG, "Could not sign this phone's own-device proof", it) }
+            .getOrNull()
+    }
+
+    /**
+     * Which of this person's devices the far end of a LAN session just proved
+     * it is, checked against the roster this phone holds.
+     *
+     * Null for everything else, which is the overwhelming majority of what
+     * dials a phone on a shared Wi-Fi: a stranger, a neighbour's CruiseMesh
+     * install, a contact that somehow reached this arm. The roster is the only
+     * place the answer comes from and it names nobody but this person's own
+     * devices, live and buried.
+     *
+     * A tombstoned device answers here on purpose — see
+     * [uniffi.cruisemesh_core.CoreLanOwnDeviceProof.revoked]. It is the device
+     * the notice exists for.
+     *
+     * `peerRole` is the end the peer speaks from, and this device's own id goes
+     * in beside it. Together they are what stops a host this phone dialed from
+     * decrypting the proof it was just sent, re-encrypting it under its own
+     * sending key, and handing it back: both ends of one Noise session share a
+     * transcript hash, so without them that reflection verifies, names this
+     * phone, and is found in this phone's own roster.
+     *
+     * One indexed read against a single-row table, on the handshake thread, for
+     * exactly the same reason `trustedPeerForStaticKey` reads `listContacts`
+     * there: the answer gates the socket, and deferring it to the store
+     * executor would mean holding a half-admitted connection open across a
+     * queue this phone also uses for message writes.
+     */
+    private fun openOwnDeviceLanProof(
+        handshakeHash: ByteArray,
+        payload: ByteArray,
+        peerRole: CoreLanProofRole,
+    ): CoreLanOwnDeviceProof? {
+        val roster = ownRosterOrNull() ?: return null
+        return coreOwnDeviceLanProofOpen(
+            roster,
+            handshakeHash,
+            payload,
+            peerRole,
+            DeviceKeyStore.load(this)?.deviceId ?: ByteArray(0),
+        )
+    }
+
+    /** This person's device list, or null when it cannot be read. */
+    private fun ownRosterOrNull(): Roster? =
+        runCatching { store.ownRoster() }
+            .onFailure { Log.w(TAG, "Could not read this person's device list", it) }
+            .getOrNull()
+
+    /**
+     * Whether this link has proved, cryptographically, that the other end is
+     * this person's — either one of their devices or a clone of their identity.
+     *
+     * **This used to ask only the clone question**, and that is the second half
+     * of the 2026-08-24 field failure. Even with the transport's admission gate
+     * repaired, a sibling link would have been admitted and then found
+     * ineligible here, because a §9-linked device holds an agreement key of its
+     * own and can never present ours. The notice would have crossed no link at
+     * all, for exactly the reason it crossed none before.
+     *
+     * So the bar is what the transport actually established: a LAN link it
+     * admitted as one of this person's own, by roster proof
+     * ([ownDeviceLanProof]) or by the clone test, and nothing else. A cleartext
+     * BLE HELLO still never clears it.
      */
     private fun ownIdentityLinkIsProven(address: String, identity: Identity): Boolean {
         val isLanLink = MeshRouter.transportFor(address) == MeshRouterState.Transport.LAN
-        val sessionKey = if (isLanLink) lanTransport?.remoteStaticKeyFor(address) else null
-        return OwnRosterNoticePolicy.mayCross(isLanLink, identity.agreePk, sessionKey)
+        val transport = if (isLanLink) lanTransport else null
+        return OwnRosterNoticePolicy.mayCross(
+            isLanLink = isLanLink,
+            ownAgreePk = identity.agreePk,
+            sessionRemoteStaticKey = transport?.remoteStaticKeyFor(address),
+            provenOwnDeviceId = transport?.ownDeviceIdFor(address),
+        )
     }
 
     /**
@@ -1884,7 +2104,12 @@ class MeshService : Service() {
         if (!OwnRosterNoticePolicy.peerReadsNotices(capabilities)) return
         runOnStoreExecutor("own-roster notice") {
             val frame = store.ownRosterNoticeFrame() ?: return@runOnStoreExecutor
-            MeshRouter.sendToAddress(address, frame)
+            // The timer only restarts for a write the router accepted: a send
+            // that never left this phone has told the link nothing, and booking
+            // it as delivered would sit a half-open own-device link out another
+            // full interval.
+            if (!MeshRouter.sendToAddress(address, frame)) return@runOnStoreExecutor
+            ownRosterNoticeSchedule.noteOffered(address, System.currentTimeMillis())
             Log.i(TAG, "Sent our device list to another device of ours on $address")
         }
     }

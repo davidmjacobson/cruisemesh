@@ -870,13 +870,12 @@
     <string name="ui_device_not_removed">Device not removed</string>
     <string name="ui_remove_device_no_devices">This phone is not set up with any other devices yet.</string>
     <string name="ui_remove_device_wrong_phone">Only the device that approves new devices can remove one. Use that device instead.</string>
-    <string name="ui_remove_device_use_the_approver">Only %1$s can remove a device. Open Your devices there. If that device is lost or broken, contact support — this one cannot remove devices on its own.</string>
+    <string name="ui_only_approver_manages_devices">Only %1$s can add or remove devices. If that phone is lost or broken, restore your backup on a new phone to take its place.</string>
     <string name="ui_add_a_device_not_the_approver">Only the device that approves new devices can add one. Open Your devices there.</string>
-    <string name="ui_add_a_device_wrong_phone">Only %1$s can add a device. Open Your devices there. If that device is lost or broken, contact support.</string>
     <string name="ui_remove_device_is_the_approver">This device approves new devices, so it cannot remove itself.</string>
     <string name="ui_remove_device_last_one">You cannot remove your only device.</string>
     <string name="ui_remove_device_not_caught_up">This device has not caught up with an earlier change yet. Let it get online, then try again.</string>
-    <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Contact support before removing anything else.</string>
+    <string name="ui_remove_device_earlier_one_unfinished">An earlier removal on this device was interrupted and has not finished. Open Troubleshooting &amp; diagnostics and share diagnostics before removing anything else.</string>
     <string name="ui_remove_device_failed">Something went wrong and nothing was changed. Try again.</string>
 
     <!-- What the removed phone itself shows (§10 step 5). It finds out the next

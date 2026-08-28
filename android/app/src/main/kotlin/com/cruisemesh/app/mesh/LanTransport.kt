@@ -3,6 +3,7 @@ package com.cruisemesh.app.mesh
 import android.annotation.SuppressLint
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -12,6 +13,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.os.ext.SdkExtensions
 import android.util.Log
 import java.io.DataInputStream
@@ -34,14 +36,20 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
+import uniffi.cruisemesh_core.CoreLanOwnDeviceProof
+import uniffi.cruisemesh_core.CoreLanProofRole
 import uniffi.cruisemesh_core.Frame
 import uniffi.cruisemesh_core.Identity
 import uniffi.cruisemesh_core.LanNoiseSession
+import uniffi.cruisemesh_core.coreLanHostIsReachableEndpoint
+import uniffi.cruisemesh_core.coreLanReconnectTargetIsExhausted
+import uniffi.cruisemesh_core.coreLanScanGateOpen
 import uniffi.cruisemesh_core.lanDefaultTcpPort
 import uniffi.cruisemesh_core.lanHostsAreSameAddress
 import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
@@ -58,7 +66,50 @@ internal class LanTransport(
     context: Context,
     private val identity: Identity,
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
+    /**
+     * This device's own §10 step 5 proof for a finished LAN Noise session:
+     * [uniffi.cruisemesh_core.coreOwnDeviceLanProof] over the session's
+     * transcript hash and the end this device is speaking from, signed with
+     * this device's roster signing key.
+     *
+     * Null whenever no proof should go on the wire at all: an install that
+     * holds no device key or no roster, and one whose roster names no device
+     * but itself. See [acceptOwnDeviceOrRefuse].
+     */
+    private val ownDeviceLanProof: (
+        handshakeHash: ByteArray,
+        role: CoreLanProofRole,
+    ) -> ByteArray?,
+    /**
+     * The peer's proof, checked against the roster this phone holds. Null for
+     * anything that is not one of this person's devices, live or tombstoned.
+     *
+     * `peerRole` is the end the *peer* speaks from, which is always the
+     * opposite of this device's: a proof minted for the other end does not
+     * open, which is what stops a host we dialed from handing our own proof
+     * straight back to us.
+     */
+    private val openOwnDeviceLanProof: (
+        handshakeHash: ByteArray,
+        payload: ByteArray,
+        peerRole: CoreLanProofRole,
+    ) -> CoreLanOwnDeviceProof?,
     private val unlinkedCapableContacts: () -> Int,
+    /**
+     * Whether this phone is inside the bounded window during which it looks
+     * for one of this person's own devices (`specs/multi-device-v1.md` §10
+     * step 5). [OwnDeviceSearchWindow] keeps it; core defines the window.
+     *
+     * A sibling shares this person's user id, so it has no contact row and
+     * cannot appear in [unlinkedCapableContacts] however hard it looks for us.
+     * Without a motive of its own a phone whose only missing peer is its other
+     * phone never sweeps, and mDNS is left as the sole channel between them --
+     * which is precisely the state the field capture caught. Bounded, because
+     * a second phone that is switched off or left at home is missing forever:
+     * an unbounded motive would sweep the subnet every five minutes on every
+     * Wi-Fi this person joins, on battery, for the life of every join.
+     */
+    private val ownDeviceSearchLive: () -> Boolean,
     private val onNetworkReady: (Frame.LanEndpoint, networkId: String?) -> Unit,
     private val onEndpointObserved: (
         userId: ByteArray,
@@ -148,8 +199,9 @@ internal class LanTransport(
     // never swept for.
     private val authenticatedOutboundKeys = ConcurrentHashMap.newKeySet<String>()
 
-    // Addresses of live links admitted as a device of this person's own
-    // (specs/multi-device-v1.md §10 step 5). Capped at one, newest wins.
+    // Live links admitted as a device of this person's own
+    // (specs/multi-device-v1.md §10 step 5), and what each one's standing is.
+    // Capped at one per standing -- see [ownDeviceLinkDecision].
     //
     // Such a link is deliberately never filed under a user id, so the
     // duplicate-link test that bounds a contact to a single link cannot see it
@@ -158,10 +210,13 @@ internal class LanTransport(
     // the inbox key, never the LAN Noise static). Uncapped it could hold every
     // one of MAX_CONNECTIONS and keep real contacts off this Wi-Fi
     // indefinitely: the "block" leg of §10's threat model, which refusing the
-    // handshake outright used to close. Newest-wins rather than
-    // refuse-the-newcomer so a half-dead link can never wedge the notice
-    // channel shut.
-    private val ownDeviceLinks = ConcurrentHashMap.newKeySet<String>()
+    // handshake outright used to close.
+    private val ownDeviceLinks = ConcurrentHashMap<String, OwnDeviceLinkStanding>()
+
+    // Connection keys whose address has completed a Noise handshake at least
+    // once on this network join. Only such a key's reconnect target survives
+    // an unbounded run of failures; see [retireExhaustedReconnectTarget].
+    private val provenReconnectKeys = ConcurrentHashMap.newKeySet<String>()
 
     // Consecutive completed sweeps whose verdict was ISOLATION_SUSPECTED. A
     // single congested sweep can look isolated (every probe timing out), so
@@ -218,13 +273,18 @@ internal class LanTransport(
         if (!started || wifiNetwork == null) return@Runnable
         if (
             shouldRunAutomaticLanScan(
-                activeConnections = connections.size,
+                // Own-device links are subtracted deliberately: one is not a
+                // friend on this Wi-Fi, and being route-less it also sat
+                // outside checkLanHealth until this change, so a half-open one
+                // could read as company for the whole Wi-Fi join.
+                peerLinks = connections.size - ownDeviceLinks.size,
                 pendingOutboundAttempts = pendingLanOutboundAttempts(
                     outboundServiceKeys,
                     authenticatedOutboundKeys,
                 ),
                 scanRemaining = runningSweep?.outcomes?.remainingCandidates() ?: 0,
                 unlinkedCapableContacts = unlinkedCapableContacts(),
+                ownDeviceSearchLive = ownDeviceSearchLive(),
             )
         ) {
             scanPlanner.takeDueScan(System.currentTimeMillis())?.let { breadth ->
@@ -235,6 +295,15 @@ internal class LanTransport(
         scheduleAutomaticSubnetScan(AUTO_SCAN_RETRY_INTERVAL_MS)
     }
 
+    // Set when [openListener] could not take the default TCP port. Main
+    // handler only, alongside the rest of the per-network session state.
+    private var listeningOnFallbackPort = false
+
+    private val defaultPortRebindRunnable = Runnable {
+        if (!started || wifiNetwork == null || !listeningOnFallbackPort) return@Runnable
+        probeDefaultLanPort()
+    }
+
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) {
             mainHandler.post {
@@ -243,6 +312,20 @@ internal class LanTransport(
                 if (wifiNetwork != null) return@post
                 wifiNetwork = network
                 restartNetworkSession(network)
+            }
+        }
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+            // The session's endpoint hint is computed once, at the moment the
+            // network became available -- which on a join whose DHCPv4 lease
+            // has not landed yet is before this phone has any address another
+            // phone could dial. [localEndpoint] refuses to publish an
+            // unreachable one, so without this the phone would advertise
+            // nothing for the whole join and never repair it. Addresses
+            // arriving later is exactly what this callback reports.
+            mainHandler.post {
+                if (!started || wifiNetwork != network) return@post
+                republishLocalEndpoint(network)
             }
         }
 
@@ -359,6 +442,18 @@ internal class LanTransport(
      */
     fun remoteStaticKeyFor(address: String): ByteArray? =
         connections[address]?.remoteStaticKey?.copyOf()
+
+    /**
+     * Which of this person's own devices the peer on [address] proved it is
+     * (`specs/multi-device-v1.md` §10 step 5), or null if this link is a
+     * contact's, a clone's, or gone.
+     *
+     * This is the handle §10 step 5's roster notice is gated on: a link that
+     * answers here has produced a signature over this session's Noise
+     * transcript with a device signing key the roster names.
+     */
+    fun ownDeviceIdFor(address: String): ByteArray? =
+        connections[address]?.ownDeviceId?.copyOf()
 
     fun startSubnetScan(
         breadth: LanScanBreadth,
@@ -648,30 +743,10 @@ internal class LanTransport(
 
         val listener = openListener() ?: return
         serverSocket = listener
+        listeningOnFallbackPort = listener.localPort != lanDefaultTcpPort().toInt()
         acceptExecutor.execute { acceptLoop(listener) }
 
-        // The opaque token is also the cross-platform connection-election
-        // value. Publishing it as the service name lets Apple Bonjour choose
-        // the same single initiator without exposing an identity.
-        requestedServiceName = instanceToken
-        registeredServiceName = requestedServiceName
-        val serviceInfo = NsdServiceInfo().apply {
-            serviceName = requestedServiceName
-            serviceType = lanServiceType()
-            port = listener.localPort
-            setAttribute(TXT_VERSION, "1")
-            setAttribute(TXT_INSTANCE, instanceToken)
-            if (supportsNetworkScopedServiceInfo()) {
-                setNetworkCompat(this, network)
-            }
-        }
-        val registration = makeRegistrationListener()
-        registrationListener = registration
-        try {
-            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registration)
-        } catch (error: RuntimeException) {
-            Log.w(TAG, "Unable to advertise LAN transport", error)
-        }
+        advertiseListener(network, listener.localPort)
 
         val discovery = makeDiscoveryListener()
         discoveryListener = discovery
@@ -708,6 +783,151 @@ internal class LanTransport(
         scanPlanner.onNetworkJoined(System.currentTimeMillis())
         LanTransportDiagnostics.networkJoined()
         scheduleAutomaticSubnetScan(AUTO_SCAN_INITIAL_DELAY_MS)
+        if (listeningOnFallbackPort) scheduleDefaultPortRebind()
+    }
+
+    /** Publishes this listener over mDNS. Also used when the port moves. */
+    private fun advertiseListener(network: Network, port: Int) {
+        // The opaque token is also the cross-platform connection-election
+        // value. Publishing it as the service name lets Apple Bonjour choose
+        // the same single initiator without exposing an identity.
+        requestedServiceName = instanceToken
+        registeredServiceName = requestedServiceName
+        val serviceInfo = NsdServiceInfo().apply {
+            serviceName = requestedServiceName
+            serviceType = lanServiceType()
+            this.port = port
+            setAttribute(TXT_VERSION, "1")
+            setAttribute(TXT_INSTANCE, instanceToken)
+            if (supportsNetworkScopedServiceInfo()) {
+                setNetworkCompat(this, network)
+            }
+        }
+        val registration = makeRegistrationListener()
+        registrationListener = registration
+        try {
+            nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registration)
+        } catch (error: RuntimeException) {
+            Log.w(TAG, "Unable to advertise LAN transport", error)
+        }
+    }
+
+    /**
+     * Re-publish this phone's own address when it has changed -- including from
+     * "nothing publishable" to a real one.
+     *
+     * [localEndpoint] refuses to advertise an address no other phone could dial,
+     * and on a Wi-Fi join whose DHCPv4 lease has not landed there is no such
+     * address yet. The session's hint was computed once, so refusing would have
+     * meant publishing nothing for the whole join; this is the repair, driven by
+     * the link-properties callback that reports the address arriving.
+     */
+    private fun republishLocalEndpoint(network: Network) {
+        val port = serverSocket?.localPort ?: return
+        val endpoint = localEndpoint(network, port) ?: return
+        val existing = endpointHint
+        if (existing != null && existing.host == endpoint.host && existing.port.toInt() == endpoint.port) {
+            return
+        }
+        currentNetworkId = lanNetworkId(connectivityManager, network)
+        val hint = Frame.LanEndpoint(
+            instanceToken = instanceTokenBytes.copyOf(),
+            host = endpoint.host,
+            port = endpoint.port.toUShort(),
+        )
+        endpointHint = hint
+        ownHostAddresses = null
+        ownHostAddressesAtMs = 0L
+        LanTransportDiagnostics.listening(endpoint.display)
+        Log.i(TAG, "This phone's local Wi-Fi address is now ${endpoint.display}")
+        onNetworkReady(hint, currentNetworkId)
+    }
+
+    /**
+     * A listener that had to settle for a fallback port is not merely untidy:
+     * a subnet sweep probes [lanDefaultTcpPort] and nothing else, so this
+     * phone is invisible to every other phone's fallback search for as long as
+     * it stays there -- mDNS becomes the only channel that can find it, and
+     * the field capture is what one stale mDNS record does to that.
+     *
+     * The port is usually taken by this app's own previous process during a
+     * restart, so it frees itself within seconds. The probe is a bind -- a
+     * blocking syscall -- so it runs off the main looper, and the move itself
+     * ([moveListenerToDefaultPort]) replaces only the listener: every
+     * established link survives it.
+     */
+    private fun scheduleDefaultPortRebind() {
+        mainHandler.removeCallbacks(defaultPortRebindRunnable)
+        mainHandler.postDelayed(defaultPortRebindRunnable, DEFAULT_PORT_REBIND_RETRY_MS)
+    }
+
+    private fun probeDefaultLanPort() {
+        // Not [acceptExecutor]: that single thread is inside a blocking
+        // accept() for the life of the listener, so anything queued behind it
+        // would never run.
+        try {
+            connectionExecutor.execute {
+                val free = try {
+                    ServerSocket().use { probe ->
+                        probe.reuseAddress = true
+                        probe.bind(InetSocketAddress(lanDefaultTcpPort().toInt()))
+                    }
+                    true
+                } catch (_: IOException) {
+                    false
+                }
+                mainHandler.post {
+                    if (!started || wifiNetwork == null || !listeningOnFallbackPort) return@post
+                    if (free) moveListenerToDefaultPort() else scheduleDefaultPortRebind()
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            // Shutting down with the service; nothing left to move.
+        }
+    }
+
+    /**
+     * Move the listener back to the default port without disturbing anything
+     * else about the session.
+     *
+     * Deliberately not a [restartNetworkSession]: that tears down every live
+     * LAN socket, forgets the reconnect targets and the proven-address set, and
+     * re-runs discovery. Losing a family member's established link is far too
+     * much to pay for a tidier port, and on a port that a *different* app holds
+     * this would repeat every retry period.
+     */
+    private fun moveListenerToDefaultPort() {
+        val network = wifiNetwork ?: return
+        val previous = serverSocket
+        val listener = openListener() ?: run {
+            scheduleDefaultPortRebind()
+            return
+        }
+        if (listener.localPort != lanDefaultTcpPort().toInt()) {
+            // Something took the port between the probe and here. Moving to a
+            // *different* fallback port buys nothing, so keep the one that is
+            // already serving and try again later.
+            listener.closeQuietly()
+            scheduleDefaultPortRebind()
+            return
+        }
+        serverSocket = listener
+        listeningOnFallbackPort = false
+        // Closing the old socket ends its accept loop; links it already
+        // produced are untouched.
+        previous?.closeQuietly()
+        acceptExecutor.execute { acceptLoop(listener) }
+        registrationListener?.let(::unregisterService)
+        registrationListener = null
+        advertiseListener(network, listener.localPort)
+        endpointHint = endpointHint?.let { hint ->
+            Frame.LanEndpoint(
+                instanceToken = hint.instanceToken,
+                host = hint.host,
+                port = listener.localPort.toUShort(),
+            )
+        }
+        endpointHint?.let { onNetworkReady(it, currentNetworkId) }
     }
 
     private fun openListener(): ServerSocket? {
@@ -808,7 +1028,8 @@ internal class LanTransport(
         // racing a Wi-Fi join, a second interface, IPv6) has to be re-checked
         // before every attempt. Nothing left to dial retires the target, so
         // the retry timer stops instead of looping forever.
-        val remoteEndpoints = remoteLanEndpoints(ownLanHostAddresses(), endpoints)
+        val remoteEndpoints =
+            orderedLanDialCandidates(remoteLanEndpoints(ownLanHostAddresses(), endpoints))
         if (remoteEndpoints.isEmpty()) {
             reconnectTargets.remove(key)
             Log.i(TAG, "Ignoring LAN endpoint that resolves to this phone")
@@ -843,8 +1064,10 @@ internal class LanTransport(
                 var socket: Socket? = null
                 var connectedEndpoint: InetSocketAddress? = null
                 var lastError: Exception? = null
+                var lastFailedEndpoint: String? = null
                 for (endpoint in remoteEndpoints) {
-                    LanTransportDiagnostics.connecting(endpointDisplay(endpoint))
+                    val display = endpointDisplay(endpoint)
+                    LanTransportDiagnostics.connecting(display)
                     try {
                         socket = network.socketFactory.createSocket().apply {
                             tcpNoDelay = true
@@ -855,13 +1078,26 @@ internal class LanTransport(
                         break
                     } catch (error: Exception) {
                         lastError = error
+                        lastFailedEndpoint = display
+                        // Per endpoint, because a peer that publishes several
+                        // addresses fails them for different reasons, and only
+                        // one of them is the one worth reading.
+                        Log.d(TAG, "LAN connect to $display failed: ${error.message}")
                         socket?.closeQuietly()
                         socket = null
                     }
                 }
                 if (socket == null) {
-                    val endpoint = remoteEndpoints.firstOrNull()?.let(::endpointDisplay) ?: key
-                    Log.d(TAG, "LAN peer connection attempt failed", lastError)
+                    // The endpoint that produced [lastError], not the first one
+                    // in the list. Pairing the first address with the last
+                    // exception is what made a 2026-08-24 field log read
+                    // "resolved 192.168.86.37 / failed fe80::... ECONNREFUSED"
+                    // and sent a whole investigation after an address-family
+                    // bug that was not there.
+                    val endpoint = lastFailedEndpoint
+                        ?: remoteEndpoints.firstOrNull()?.let(::endpointDisplay)
+                        ?: key
+                    Log.d(TAG, "LAN peer connection attempt to $endpoint failed", lastError)
                     LanTransportDiagnostics.connectionFailed(
                         endpoint,
                         lastError?.message ?: "Connection timed out",
@@ -874,6 +1110,7 @@ internal class LanTransport(
                     // answer, so it is unproven again -- retire it rather than
                     // let one good handshake license a standing probe.
                     if (isSingleShotLanConnectKey(key)) reconnectTargets.remove(key)
+                    retireExhaustedReconnectTarget(key)
                     scheduleReconnect(key)
                     // A failed direct connect is exactly when a fallback
                     // sweep becomes worth checking promptly, instead of
@@ -919,22 +1156,127 @@ internal class LanTransport(
      *
      * Before §10 step 5 both ended the same way -- "not an accepted contact",
      * socket closed -- and that is exactly what left a removed phone sitting on
-     * the same Wi-Fi as the phone that removed it with no way to be told. This
-     * person's own agreement key is the one thing that tells the two apart, and
-     * only a device holding this person's own secret can present it.
+     * the same Wi-Fi as the phone that removed it with no way to be told.
      *
-     * Returning null means "kept, with no user id", which everything downstream
-     * reads as "not a peer": no route, no contact bookkeeping, no counters.
+     * # Why the agreement key cannot be the test
+     *
+     * The first build asked one question: is the peer's Noise static this
+     * identity's own agreement key? That admits a *clone* -- a `.cmbak` restore
+     * running this person's identity -- and it admits nothing else, because §9's
+     * link ceremony deliberately withholds the person root secret and gives a
+     * new device keys of its own. Two genuine siblings therefore share no
+     * private key at all, and the test refused both of them, in both roles. A
+     * 2026-08-24 two-phone capture is the record of it: 25 refusals across 15
+     * minutes on one /24, an own-device link that never came up once, and a
+     * removed phone that never learned.
+     *
+     * # What replaces it
+     *
+     * The roster, which is the document that actually says who is whose. Each
+     * side signs this session's Noise transcript hash with its device signing
+     * key ([uniffi.cruisemesh_core.coreOwnDeviceLanProof]) and checks the
+     * other's against the roster it holds
+     * ([uniffi.cruisemesh_core.coreOwnDeviceLanProofOpen]). Bound to the
+     * transcript, so a recorded proof is worthless on the next session and no
+     * machine in the middle can forward one.
+     *
+     * Order matters and is not symmetric: the initiator proves first, and a
+     * responder that cannot verify it closes without answering. Each side signs
+     * *which end it is speaking from* as well as the transcript, so the proof
+     * this phone sends does not open as the answer it expects back -- see
+     * [uniffi.cruisemesh_core.CoreLanProofRole]. Without that a host we dialed
+     * could simply re-encrypt our own proof and return it, and we would read our
+     * own device id out of our own roster and admit a stranger as a sibling.
+     *
+     * Nothing is minted at all unless this person's roster names a device
+     * besides this one ([ownDeviceLanProof] returns null otherwise). A solo
+     * phone has no sibling to recognise and none that could recognise it, so a
+     * proof from it could only ever come back reflected; refusing to sign one
+     * keeps a stable device identifier off the wire on every install that has
+     * no use for the feature.
+     *
+     * Both halves of the roster count, live devices and tombstones alike. A
+     * removed device MUST still be admitted or the notice that exists to tell
+     * it can never arrive; it gains nothing by it (no user id, so no route, no
+     * contact bookkeeping, no counters -- and §10.1 rotated the inbox key at the
+     * moment of removal, long before this meeting).
+     *
+     * Returns what the roster proof named, or null for the clone case, which is
+     * kept exactly as it was so the clone warning still has a link to be raised
+     * on.
      */
-    private fun acceptOwnDeviceOrRefuse(remoteStaticKey: ByteArray, role: String): ByteArray? {
-        if (!ownLanStaticKeyMatches(identity.agreePk, remoteStaticKey)) {
-            throw IOException("$role is not an accepted contact")
-        }
-        return null
+    private fun acceptOwnDeviceOrRefuse(
+        session: LanNoiseSession,
+        socket: Socket,
+        input: DataInputStream,
+        output: DataOutputStream,
+        remoteStaticKey: ByteArray,
+        initiator: Boolean,
+        role: String,
+        peerEndpoint: String,
+    ): CoreLanOwnDeviceProof? {
+        // The clone case first, and unchanged. Symmetric, so both ends take
+        // this branch together and no proof frame is exchanged on a link where
+        // one would never arrive.
+        if (ownLanStaticKeyMatches(identity.agreePk, remoteStaticKey)) return null
+
+        // S3: the address is in the message, so a field log attributes each
+        // refusal instead of leaving the sibling and the neighbour's phone
+        // indistinguishable.
+        fun refuse(): Nothing = throw IOException("$role is not an accepted contact ($peerEndpoint)")
+
+        val handshakeHash = session.handshakeHash() ?: refuse()
+        return exchangeOwnDeviceProof(
+            initiator = initiator,
+            channel = SocketOwnDeviceProofChannel(session, socket, input, output),
+            mint = { proofRole -> ownDeviceLanProof(handshakeHash, proofRole) },
+            open = { payload, peerRole ->
+                openOwnDeviceLanProof(handshakeHash, payload, peerRole)
+            },
+        ) ?: refuse()
     }
 
     /**
-     * Make [address] the one live own-device link, closing any earlier one.
+     * [exchangeOwnDeviceProof]'s two moves, over this link's socket.
+     *
+     * The read is bounded twice over, because it is the one read a *stranger*
+     * can make this phone wait on: a proof is a hundred-odd bytes and always
+     * arrives as one record, so a peer still feeding partial records is
+     * stalling rather than proving. [MAX_OWN_DEVICE_PROOF_RECORDS] caps how
+     * many records it may send, and the deadline caps the whole exchange in
+     * wall clock -- each read is given only what is *left* of the budget rather
+     * than a fresh copy of it, so a peer that dribbles records cannot collect
+     * one socket timeout per record and hold a connection slot for a multiple
+     * of the handshake budget.
+     */
+    private inner class SocketOwnDeviceProofChannel(
+        private val session: LanNoiseSession,
+        private val socket: Socket,
+        private val input: DataInputStream,
+        private val output: DataOutputStream,
+    ) : OwnDeviceProofChannel {
+        private val deadlineMs = SystemClock.elapsedRealtime() + HANDSHAKE_TIMEOUT_MS
+
+        override fun send(proof: ByteArray) {
+            for (record in session.encryptFrame(proof)) writePacket(output, record)
+        }
+
+        override fun receive(): ByteArray? {
+            repeat(MAX_OWN_DEVICE_PROOF_RECORDS) {
+                val remainingMs = deadlineMs - SystemClock.elapsedRealtime()
+                if (remainingMs <= 0) return null
+                // Never 0: on a Socket that means "block forever".
+                socket.soTimeout = remainingMs.coerceIn(1L, HANDSHAKE_TIMEOUT_MS.toLong()).toInt()
+                session.decryptRecord(readPacket(input))?.let { return it }
+            }
+            return null
+        }
+    }
+
+    /**
+     * File [address] among the live own-device links, closing the ones it
+     * replaces -- or refuse it, when the link it would replace is the one both
+     * phones agreed to keep.
      *
      * A contact is bounded to a single link by [authenticatedUserIds]; a device
      * of this person's own has no user id, so nothing bounded it at all. That
@@ -945,17 +1287,23 @@ internal class LanTransport(
      * [MAX_CONNECTIONS]. Filling the table is the "block" leg of §10's threat
      * model, and it is the one refusing the handshake used to close for free.
      *
-     * One link is all §10 step 5 needs. The newest wins rather than the oldest
-     * so a half-dead link can never wedge the notice channel shut; closing the
-     * loser lets its own reader thread run the usual teardown (slot released,
-     * router told, address forgotten).
+     * Returns false when the incoming link must be dropped -- see
+     * [ownDeviceLinkDecision] for the two rules and why plain newest-wins is not
+     * enough now that this arm admits anybody.
      */
-    private fun supersedeOtherOwnDeviceLinks(address: String) {
+    private fun supersedeOtherOwnDeviceLinks(
+        address: String,
+        standing: OwnDeviceLinkStanding,
+    ): Boolean {
         val superseded = synchronized(ownDeviceLinks) {
-            val older = supersededOwnDeviceLinks(ownDeviceLinks, address)
-            ownDeviceLinks.clear()
-            ownDeviceLinks += address
-            older
+            when (val decision = ownDeviceLinkDecision(ownDeviceLinks, address, standing)) {
+                OwnDeviceLinkDecision.Refuse -> return false
+                is OwnDeviceLinkDecision.Admit -> {
+                    decision.superseded.forEach(ownDeviceLinks::remove)
+                    ownDeviceLinks[address] = standing
+                    decision.superseded
+                }
+            }
         }
         superseded.forEach { older ->
             connections[older]?.let {
@@ -963,6 +1311,7 @@ internal class LanTransport(
                 it.close()
             }
         }
+        return true
     }
 
     private fun runConnection(
@@ -982,6 +1331,8 @@ internal class LanTransport(
         var authenticated = false
         var abortedDuplicateLink = false
         var abortedSelfConnection = false
+        /** What the far end's §10 step 5 roster proof named, if it made one. */
+        var provenOwnDevice: CoreLanOwnDeviceProof? = null
         try {
             // Last line of defence against dialing this phone's own listener.
             // Every earlier gate compares advertised addresses; this one asks
@@ -1006,21 +1357,46 @@ internal class LanTransport(
             val session = LanNoiseSession(initiator, identity.agreeSk)
             noise = session
 
-            val trustedUserId = if (initiator) {
+            val trustedUserId = if (initiator) run {
                 writePacket(output, session.writeHandshakeMessage())
                 session.readHandshakeMessage(readPacket(input))
                 val remoteStatic = session.remoteStaticKey()
                     ?: throw IOException("LAN responder did not provide a static key")
                 val userId = trustedPeerForStaticKey(remoteStatic)
-                    ?: acceptOwnDeviceOrRefuse(remoteStatic, "LAN responder")
-                if (
-                    userId != null &&
-                    expectedUserId != null &&
-                    !userId.contentEquals(expectedUserId)
-                ) {
+                if (userId == null) {
+                    // Nobody's contact. The own-device proof is bound to this
+                    // session's transcript hash, which is not final until
+                    // message 3 has gone out -- so unlike the contact arm, the
+                    // handshake finishes before the admission question is
+                    // answered.
+                    //
+                    // That is a real disclosure, not a free one: message 3
+                    // carries this identity's Noise static and the proof
+                    // behind it carries this device's signing key, both to a
+                    // host that has proved nothing. Two things bound it. Only
+                    // a phone whose roster names a second device gets this far
+                    // at all -- [ownDeviceLanProof] returns null otherwise --
+                    // so a solo install still sweeps a whole subnet without
+                    // saying who it is. And what the host does learn it cannot
+                    // use: the proof it receives was minted for the dialing
+                    // end and does not open as the answer.
+                    writePacket(output, session.writeHandshakeMessage())
+                    provenOwnDevice = acceptOwnDeviceOrRefuse(
+                        session = session,
+                        socket = socket,
+                        input = input,
+                        output = output,
+                        remoteStaticKey = remoteStatic,
+                        initiator = true,
+                        role = "LAN responder",
+                        peerEndpoint = peerEndpoint,
+                    )
+                    return@run null
+                }
+                if (expectedUserId != null && !userId.contentEquals(expectedUserId)) {
                     throw IOException("LAN responder does not match the BLE endpoint hint")
                 }
-                if (userId != null && authenticatedUserIds.containsValue(userId.toHex())) {
+                if (authenticatedUserIds.containsValue(userId.toHex())) {
                     // Election fallbacks and sweeps may dial a contact that
                     // connected to us in the meantime. Close the redundant
                     // socket before it becomes a second live link -- but a
@@ -1041,18 +1417,52 @@ internal class LanTransport(
                 session.readHandshakeMessage(readPacket(input))
                 val remoteStatic = session.remoteStaticKey()
                     ?: throw IOException("LAN initiator did not provide a static key")
-                trustedPeerForStaticKey(remoteStatic)
-                    ?: acceptOwnDeviceOrRefuse(remoteStatic, "LAN initiator")
+                val userId = trustedPeerForStaticKey(remoteStatic)
+                if (userId == null) {
+                    provenOwnDevice = acceptOwnDeviceOrRefuse(
+                        session = session,
+                        socket = socket,
+                        input = input,
+                        output = output,
+                        remoteStaticKey = remoteStatic,
+                        initiator = false,
+                        role = "LAN initiator",
+                        peerEndpoint = peerEndpoint,
+                    )
+                }
+                userId
             }
             if (!session.isHandshakeFinished()) {
                 throw IOException("LAN Noise handshake did not finish")
             }
 
             socket.soTimeout = 0
-            address = "lan:${UUID.randomUUID()}"
-            connection = LanConnection(address, socket, output, session)
-            connections[address] = connection
-            if (trustedUserId == null) supersedeOtherOwnDeviceLinks(address)
+            // Named but not yet adopted: a link the cross-connect rule turns
+            // away must leave no trace behind it, so [address] -- which the
+            // teardown reads as "this link was announced" -- is assigned only
+            // once the link is certainly staying.
+            val candidate = "lan:${UUID.randomUUID()}"
+            if (trustedUserId == null) {
+                val standing = OwnDeviceLinkStanding(
+                    revoked = provenOwnDevice?.revoked == true,
+                    prevails = ownDeviceLinkPrevails(
+                        ownAgreePk = identity.agreePk,
+                        remoteStaticKey = session.remoteStaticKey() ?: ByteArray(0),
+                        initiator = initiator,
+                    ),
+                )
+                if (!supersedeOtherOwnDeviceLinks(candidate, standing)) {
+                    // The other socket of a simultaneous cross-connect, and the
+                    // one both phones agreed to drop. Not a failure -- see
+                    // [ownDeviceLinkDecision] -- so it is filed exactly as the
+                    // contact arm files its own redundant socket.
+                    abortedDuplicateLink = true
+                    throw IOException("Another device of ours already has an active LAN link")
+                }
+            }
+            address = candidate
+            connection = LanConnection(candidate, socket, output, session, provenOwnDevice?.deviceId)
+            connections[candidate] = connection
             // A device of this person's own is not a peer and is not filed as
             // one: no user id, so no route, no entry in the counters that say
             // how many friends are on this Wi-Fi, and nothing keyed to a
@@ -1098,7 +1508,12 @@ internal class LanTransport(
             } else {
                 onOwnDeviceAuthenticated(address)
             }
-            outboundServiceKey?.let(connectionBackoff::recordSuccess)
+            outboundServiceKey?.let {
+                connectionBackoff.recordSuccess(it)
+                // Proof this address is real, which is what buys its reconnect
+                // target the right to be retried without a ceiling.
+                provenReconnectKeys += it
+            }
             authenticated = true
             if (outboundServiceKey != null) {
                 // Every key that reached a finished handshake, contact or own
@@ -1108,10 +1523,15 @@ internal class LanTransport(
                 // out left that count stuck at one and shut the sweep off for
                 // as long as the two phones stayed linked.
                 authenticatedOutboundKeys += outboundServiceKey
-                if (trustedUserId != null && outboundServiceKey.startsWith("scan:")) {
-                    // Only an authenticated friend counts as a sweep find --
-                    // see onScanCompleted. Harmless no-op if the sweep has
-                    // already completed or been replaced.
+                if (outboundServiceKey.startsWith("scan:")) {
+                    // A completed handshake -- a friend, or one of this
+                    // person's own devices -- is what counts as a sweep find;
+                    // a bare TCP connect to some unrelated service still does
+                    // not (see onScanCompleted). A sibling answering proves
+                    // discovery works on this network exactly as a contact
+                    // does, so it must not leave the expensive full tier
+                    // armed. Harmless no-op if the sweep has already completed
+                    // or been replaced.
                     markSweepFoundFriend(sweep)
                 }
             }
@@ -1121,7 +1541,16 @@ internal class LanTransport(
                 if (trustedUserId != null) {
                     "Authenticated CruiseMesh peer over local Wi-Fi"
                 } else {
-                    "Another device of ours is on this Wi-Fi"
+                    // Named, because until this line landed the only positive
+                    // signal an own-device link had ever produced in a field
+                    // log was "Closing an older link", which needs two of
+                    // them. What appears here is a device id, derived from a
+                    // public key, and the socket address this transport
+                    // already logs on every dial and every refusal -- no
+                    // secret and no user id.
+                    "Another device of ours is on this Wi-Fi at $peerEndpoint" +
+                        (provenOwnDevice?.let { " (device ${it.deviceId.toHex()})" }
+                            ?: " (our own key)")
                 },
             )
 
@@ -1182,6 +1611,7 @@ internal class LanTransport(
                     reconnectTargets.remove(it)
                 } else if (shouldRetainLanReconnectTarget(it, authenticated)) {
                     connectionBackoff.recordFailure(it, System.currentTimeMillis())
+                    retireExhaustedReconnectTarget(it)
                     scheduleReconnect(it)
                 } else {
                     reconnectTargets.remove(it)
@@ -1254,6 +1684,32 @@ internal class LanTransport(
             },
             delayMs,
         )
+    }
+
+    /**
+     * Drop a reconnect target whose address has failed often enough, and has
+     * never once answered, that retrying it is only costing battery.
+     *
+     * The rule is core's ([coreLanReconnectTargetIsExhausted]); this supplies
+     * the two facts. Nothing here can strand a working link: a key that
+     * completed a handshake is in [provenReconnectKeys] and keeps its target
+     * forever, and an unproven address that is genuinely there is re-created
+     * as a target by the next mDNS resolution or sweep hit.
+     */
+    private fun retireExhaustedReconnectTarget(serviceKey: String) {
+        if (
+            !coreLanReconnectTargetIsExhausted(
+                everAuthenticated = serviceKey in provenReconnectKeys,
+                consecutiveFailures = connectionBackoff.failureCount(serviceKey)
+                    .coerceAtLeast(0)
+                    .toUInt(),
+            )
+        ) {
+            return
+        }
+        if (reconnectTargets.remove(serviceKey) != null) {
+            Log.i(TAG, "Giving up on a local Wi-Fi address that never answered")
+        }
     }
 
     private fun rememberReconnectTarget(
@@ -1571,6 +2027,8 @@ internal class LanTransport(
 
     private fun teardownNetworkSession() {
         mainHandler.removeCallbacks(automaticScanRunnable)
+        mainHandler.removeCallbacks(defaultPortRebindRunnable)
+        listeningOnFallbackPort = false
         scanPlanner.onNetworkLost()
         scanBuildGate.reset {
             runningSweep = null
@@ -1593,6 +2051,7 @@ internal class LanTransport(
         electionFallbackKeys.clear()
         consecutiveIsolationVerdicts.set(0)
         authenticatedOutboundKeys.clear()
+        provenReconnectKeys.clear()
         reconnectTargets.clear()
         outboundServiceKeys.clear()
         serverSocket?.closeQuietly()
@@ -1682,13 +2141,31 @@ internal class LanTransport(
         return lanHostIsOwnDevice(ownLanHostAddresses(), remoteHost)
     }
 
+    /**
+     * The address this phone publishes as its own -- in mDNS, in the endpoint
+     * hint, and as the self-address filter every dial is checked against.
+     *
+     * IPv4 first, then any other address another phone could actually dial.
+     * The old fallback was "whatever is left", which on a Wi-Fi join that has
+     * not produced an IPv4 address yet is an `fe80::/10` link-local one. That
+     * is a local address but not a reachable one: it resolves only against the
+     * *dialer's* scope id, so publishing it hands every peer a target that can
+     * never answer. One of those was observed in the field being retried for
+     * half an hour while the phone it belonged to sat on the same Wi-Fi.
+     *
+     * Publishing nothing is the honest alternative: discovery still runs, and
+     * the next link-property change re-runs this with a real address.
+     */
     private fun localEndpoint(network: Network, port: Int): LanManualEndpoint? {
         val addresses = connectivityManager.getLinkProperties(network)
             ?.linkAddresses
             ?.map { it.address }
             ?.filterNot { it.isAnyLocalAddress || it.isLoopbackAddress }
             .orEmpty()
-        val address = addresses.firstOrNull { it is Inet4Address } ?: addresses.firstOrNull()
+        val address = addresses.firstOrNull { it is Inet4Address }
+            ?: addresses.firstOrNull { candidate ->
+                candidate.hostAddress?.let(::coreLanHostIsReachableEndpoint) == true
+            }
         return address?.hostAddress?.let { LanManualEndpoint(it, port) }
     }
 
@@ -1769,6 +2246,12 @@ internal class LanTransport(
         private val socket: Socket,
         private val output: DataOutputStream,
         private val noise: LanNoiseSession,
+        /**
+         * Which of this person's devices the far end proved it is, when the
+         * §10 step 5 roster proof named one. Null both for a contact link and
+         * for the clone case, which proves an identity rather than a device.
+         */
+        val ownDeviceId: ByteArray? = null,
     ) {
         @Volatile
         private var closed = false
@@ -1823,6 +2306,14 @@ internal class LanTransport(
         private const val MAX_SERVICE_INFO_CALLBACKS = 8
         private const val CONNECT_TIMEOUT_MS = 3_000
         private const val HANDSHAKE_TIMEOUT_MS = 5_000
+
+        /**
+         * How many Noise records the own-device proof exchange will read
+         * before giving up. A proof is a hundred-odd bytes and always arrives
+         * as one record; the slack is for a peer that sends an empty frame
+         * first, not for one that streams.
+         */
+        private const val MAX_OWN_DEVICE_PROOF_RECORDS = 4
         private const val SCAN_CONNECT_TIMEOUT_MS = 350
         // Sized for the manual /16 case: at 64-way parallelism a fully
         // unresponsive /16 finishes its ~65k probes in roughly six minutes
@@ -1864,6 +2355,14 @@ internal class LanTransport(
         // so this recheck will usually find nothing due yet.
         private const val AUTO_SCAN_ESCALATE_DELAY_MS = 2_000L
         private const val AUTO_SCAN_RETRY_INTERVAL_MS = 5 * 60_000L
+
+        // How often a listener that had to settle for a fallback port checks
+        // whether the default one has come free. See [openListener]: a phone
+        // on a fallback port is invisible to every other phone's subnet
+        // sweep, which probes the default port and nothing else, so this is
+        // not a cosmetic tidy-up -- it is the difference between being
+        // findable on this Wi-Fi and being findable only through mDNS.
+        private const val DEFAULT_PORT_REBIND_RETRY_MS = 60_000L
         private const val MAX_PACKET_SIZE = 65_535
         private fun writePacket(output: DataOutputStream, bytes: ByteArray) {
             require(bytes.isNotEmpty() && bytes.size <= MAX_PACKET_SIZE)
@@ -1978,21 +2477,174 @@ internal fun pendingLanOutboundAttempts(
 ): Int = outboundServiceKeys.count { it !in authenticatedOutboundKeys }
 
 /**
- * Which links to a device of this person's own must close when [incoming] is
- * admitted (`specs/multi-device-v1.md` §10 step 5): every other one, because
- * one is all the roster notice needs and the socket table has only
- * `MAX_CONNECTIONS` slots to give.
+ * The two moves §10 step 5's proof exchange makes on a finished Noise session:
+ * seal and write one proof, and read the peer's back.
  *
- * The cap is a safety rule, not tidiness. Such a link carries no user id, so
- * the duplicate-link test that bounds a *contact* to one link cannot see it,
- * and a removed phone still holds the agreement key that gets admitted here --
- * §10.1 rotates the inbox key, never the LAN Noise static. Without a cap it
- * could hold every slot and keep the family's real contacts off this Wi-Fi.
+ * An interface rather than the socket itself so [exchangeOwnDeviceProof] --
+ * which is the whole ordering rule, and the only part of this handshake a
+ * stranger can steer -- can be driven by a test over two in-process sessions.
  */
-internal fun supersededOwnDeviceLinks(
-    liveOwnDeviceLinks: Set<String>,
+internal interface OwnDeviceProofChannel {
+    /** Seal [proof] into Noise records and write them. */
+    fun send(proof: ByteArray)
+
+    /**
+     * The peer's next decrypted payload, or null if it stalled, ran out of the
+     * records it is allowed, or never sent one.
+     */
+    fun receive(): ByteArray?
+}
+
+/**
+ * Prove to the far end of a finished LAN Noise session that this is one of the
+ * same person's devices, and find out whether it is
+ * (`specs/multi-device-v1.md` §10 step 5).
+ *
+ * Returns what the peer's proof named, or null for every refusal — no device
+ * key of our own, a peer that sent something else, a peer that sent nothing.
+ * The caller turns null into a closed socket.
+ *
+ * # The order is the security property
+ *
+ * The initiator proves first and the responder answers only once the
+ * initiator's proof has verified, so a stranger who *dials us* is never handed
+ * anything: it must produce a roster proof before this phone signs a byte.
+ * Reversing that would put this device's signing key in front of every host on
+ * the Wi-Fi that cares to open a socket.
+ *
+ * Dialing costs something, and it is deliberate rather than free. A host we
+ * dial does learn our device signing public key. That is why [mint] is allowed
+ * to refuse: it does, on every install whose roster names no second device, so
+ * the disclosure is confined to phones that actually have a fleet to find. Two
+ * further guards make the disclosure useless as a lever rather than merely
+ * cheap — [mint] and [open] carry the *end* each proof was made for, so the
+ * proof this phone just sent cannot be re-encrypted and returned as the answer
+ * (`CoreLanProofRole`), and `core_own_device_lan_proof_open` refuses any proof
+ * that derives to this very device.
+ */
+internal fun exchangeOwnDeviceProof(
+    initiator: Boolean,
+    channel: OwnDeviceProofChannel,
+    mint: (role: CoreLanProofRole) -> ByteArray?,
+    open: (payload: ByteArray, peerRole: CoreLanProofRole) -> CoreLanOwnDeviceProof?,
+): CoreLanOwnDeviceProof? {
+    val ourRole = if (initiator) CoreLanProofRole.INITIATOR else CoreLanProofRole.RESPONDER
+    val peerRole = if (initiator) CoreLanProofRole.RESPONDER else CoreLanProofRole.INITIATOR
+    // Minted before anything is read, so a phone with nothing to prove refuses
+    // here rather than verifying a proof it could never answer.
+    val ours = mint(ourRole) ?: return null
+    if (initiator) {
+        channel.send(ours)
+        return open(channel.receive() ?: return null, peerRole)
+    }
+    val proven = open(channel.receive() ?: return null, peerRole) ?: return null
+    channel.send(ours)
+    return proven
+}
+
+/**
+ * What a live own-device link is worth when another one turns up.
+ *
+ * @param revoked whether the roster this phone holds has already buried the
+ *   device on the far end.
+ * @param prevails whether this end of a simultaneous cross-connect is the one
+ *   *both* phones keep — see [ownDeviceLinkPrevails]. Null when nothing
+ *   distinguishes the two ends, which is the clone case.
+ */
+internal data class OwnDeviceLinkStanding(
+    val revoked: Boolean,
+    val prevails: Boolean?,
+)
+
+/**
+ * Whether this end of a link is the one both phones will keep, when the same
+ * pair happens to dial each other at once.
+ *
+ * Both sides must reach the same answer about the same socket from what each
+ * one already knows, and no symmetric rule can: "keep the link I dialed" makes
+ * each phone keep its own and close the other's, and so does "keep the link I
+ * answered" — both leave the pair with two dead sockets, a rediscovery, and a
+ * repeat. So the rule is asymmetric and settled by the keys themselves: **the
+ * link dialed by the phone with the lower Noise static key survives.** A dials
+ * B and A's key is lower, so A keeps what it dialed and B keeps what it
+ * answered — one socket, agreed without a message.
+ *
+ * Null when the two keys are identical, which is the clone case: two installs
+ * of one identity genuinely have nothing to tell them apart, and the caller
+ * falls back to newest-wins there exactly as it always did.
+ */
+internal fun ownDeviceLinkPrevails(
+    ownAgreePk: ByteArray,
+    remoteStaticKey: ByteArray,
+    initiator: Boolean,
+): Boolean? {
+    val order = compareLanKeys(ownAgreePk, remoteStaticKey)
+    if (order == 0) return null
+    return (order < 0) == initiator
+}
+
+/** Unsigned lexicographic order over two keys; shorter sorts first. */
+private fun compareLanKeys(left: ByteArray, right: ByteArray): Int {
+    for (index in 0 until minOf(left.size, right.size)) {
+        val difference = (left[index].toInt() and 0xff) - (right[index].toInt() and 0xff)
+        if (difference != 0) return difference
+    }
+    return left.size - right.size
+}
+
+/** What happens to a new own-device link, given the ones already live. */
+internal sealed interface OwnDeviceLinkDecision {
+    /** Filed, and these links are the ones it replaces. */
+    data class Admit(val superseded: List<String>) : OwnDeviceLinkDecision
+
+    /** Dropped: a live link already won this cross-connect on both phones. */
+    data object Refuse : OwnDeviceLinkDecision
+}
+
+/**
+ * Which links to a device of this person's own must close when a new one is
+ * admitted (`specs/multi-device-v1.md` §10 step 5), and whether it may be
+ * admitted at all.
+ *
+ * A cap is a safety rule, not tidiness. Such a link carries no user id, so the
+ * duplicate-link test that bounds a *contact* to one link cannot see it, and a
+ * removed phone still holds the agreement key that reaches this arm — §10.1
+ * rotates the inbox key, never the LAN Noise static. Without a cap it could
+ * hold every slot and keep the family's real contacts off this Wi-Fi.
+ *
+ * Newest-wins alone is not the cap, though, and this is the first build where
+ * that matters: the old admission gate admitted nobody, so this code has never
+ * run to completion in the field. Two rules join it.
+ *
+ * - **A cross-connect is settled by [OwnDeviceLinkStanding.prevails], not by
+ *   arrival order.** Two phones that dial each other at the same moment finish
+ *   their handshakes in opposite orders on the two hosts, so newest-wins has
+ *   each of them keep a different socket and close the one the other kept:
+ *   both die, both rediscover, and the pair flaps. A link that lost the
+ *   tie-break therefore steps aside while the winner is live, instead of
+ *   killing it.
+ * - **A revoked device and a live sibling do not compete.** Each keeps its own
+ *   slot. A removed phone reconnecting in a loop would otherwise take the one
+ *   slot every time and close the link that carries roster convergence between
+ *   the devices that remain — the thief in §10's threat model starving the very
+ *   mechanism this change exists to make work. Two slots is still a cap.
+ *
+ * Within one standing the newest still wins, so a half-dead link can never
+ * wedge the notice channel shut.
+ */
+internal fun ownDeviceLinkDecision(
+    liveOwnDeviceLinks: Map<String, OwnDeviceLinkStanding>,
     incoming: String,
-): List<String> = liveOwnDeviceLinks.filterNot { it == incoming }
+    standing: OwnDeviceLinkStanding,
+): OwnDeviceLinkDecision {
+    val rivals = liveOwnDeviceLinks.filterKeys { it != incoming }
+        .filterValues { it.revoked == standing.revoked }
+    if (standing.prevails == false && rivals.values.any { it.prevails == true }) {
+        return OwnDeviceLinkDecision.Refuse
+    }
+    return OwnDeviceLinkDecision.Admit(rivals.keys.toList())
+}
+
 
 /**
  * The "have I already handled this?" memory the transport keeps for one
@@ -2102,23 +2754,26 @@ internal fun lanCapabilityMotivatesScan(
 internal const val LAN_CAPABILITY_RECENCY_WINDOW_MS = 14L * 24 * 60 * 60 * 1_000
 
 /**
- * Whether the periodic check may claim a scan from [LanScanPlanner]. A scan
- * is worthwhile while the transport has no links at all, OR while some
- * contact that has recently demonstrated LAN support still has no
- * authenticated LAN link ([lanCapabilityMotivatesScan]) -- one connected
- * family member must not stop discovery of the rest.
- * In-flight work (pending outbound attempts, a running sweep) always defers.
+ * Whether the periodic check may claim a scan from [LanScanPlanner].
+ *
+ * The rule itself is core's ([uniffi.cruisemesh_core.coreLanScanGateOpen]) --
+ * both shells owned a copy each, and the copies drifted into the multi-device
+ * bug the core doc now names. This is the counting: negatives clamped to zero
+ * so a miscount slows discovery down instead of disabling it.
  */
 internal fun shouldRunAutomaticLanScan(
-    activeConnections: Int,
+    peerLinks: Int,
     pendingOutboundAttempts: Int,
     scanRemaining: Int,
     unlinkedCapableContacts: Int,
-): Boolean = (activeConnections == 0 || unlinkedCapableContacts > 0) &&
-    // <= 0, not == 0: a caller that ever miscounts in-flight work low must
-    // slow discovery down, never disable it.
-    pendingOutboundAttempts <= 0 &&
-    scanRemaining <= 0
+    ownDeviceSearchLive: Boolean,
+): Boolean = coreLanScanGateOpen(
+    peerLinks = peerLinks.coerceAtLeast(0).toUInt(),
+    unlinkedCapableContacts = unlinkedCapableContacts.coerceAtLeast(0).toUInt(),
+    ownDeviceSearchLive = ownDeviceSearchLive,
+    pendingOutboundAttempts = pendingOutboundAttempts.coerceAtLeast(0).toUInt(),
+    scanRemaining = scanRemaining.coerceAtLeast(0).toUInt(),
+)
 
 /**
  * Whether a closed link's reconnect target survives the close.
@@ -2185,6 +2840,26 @@ internal fun remoteLanEndpoints(
     localHost: String?,
     endpoints: List<InetSocketAddress>,
 ): List<InetSocketAddress> = remoteLanEndpoints(listOfNotNull(localHost), endpoints)
+
+/**
+ * The order a peer's addresses are dialed in: IPv4 first, then everything
+ * else, each group in the order the platform gave them.
+ *
+ * `NsdServiceInfo.hostAddresses` comes back unsorted, and a phone that
+ * publishes both an IPv4 address and a Wi-Fi link-local IPv6 one can hand
+ * either first. Dialing the link-local first costs a connect timeout (or an
+ * `ECONNREFUSED`, which is what a 2026-08-24 field log recorded) before the
+ * address that was always going to work is tried at all. Every CruiseMesh
+ * listener binds the wildcard, so if a peer is reachable at all it is
+ * reachable on IPv4 -- this only decides which attempt pays the latency.
+ *
+ * Stable within each family, so nothing else about the platform's ordering
+ * changes.
+ */
+internal fun orderedLanDialCandidates(
+    endpoints: List<InetSocketAddress>,
+): List<InetSocketAddress> =
+    endpoints.sortedBy { if (it.address is Inet4Address) 0 else 1 }
 
 /**
  * Whether a connection key may only ever be attempted once per piece of

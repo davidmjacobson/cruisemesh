@@ -728,6 +728,62 @@ pub struct CoreLinkBootstrapImport {
     pub catch_up: Vec<super::bootstrap::CoreLinkCatchUp>,
 }
 
+/// How often a live own-device link is re-offered §10 step 5's roster.
+///
+/// See [`core_own_roster_notice_reoffer_due`]. Small because the document is
+/// small and the link is a LAN socket to the person's own phone; long enough
+/// that it is a heartbeat rather than chatter.
+pub const OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS: i64 = 60_000;
+
+/// [`OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS`], for the shells (a `const` does
+/// not cross the binding; a function does).
+#[uniffi::export]
+pub fn core_own_roster_notice_reoffer_interval_ms() -> i64 {
+    OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+}
+
+/// **§10 step 5, the part that was missing.** Whether an own-device link that
+/// has already been offered this person's roster is owed it again.
+///
+/// The notice shipped edge-triggered: built and pushed at the instant a HELLO2
+/// arrived on an own-device link, and at no other moment in either shell. So a
+/// removal that happened while such a link was *already up* was never announced
+/// on it — no new HELLO, no new offer, and the removed phone kept believing it
+/// was linked for as long as the link lasted. In the field that was 26 minutes,
+/// two force-stops and a reboot.
+///
+/// Making it level-triggered is what fixes that, and it is safe to do bluntly
+/// because the frame is idempotent in both directions: the sender's copy is
+/// rebuilt from the store every time, and
+/// [`MessageStore::apply_own_roster_notice`] refuses anything that does not
+/// strictly supersede what the receiver holds. Re-offering costs one signed
+/// document per minute per own-device link and needs no event plumbing to reach
+/// it — which also means it survives an app restart, a reboot, and a roster
+/// change this process never saw.
+///
+/// **The trade this widens, stated plainly.** A notice tells the holder of a
+/// removed phone that they were removed, and §10.2's relay-`family_token`
+/// rotation lands only on the first pass that reaches the relay — so there is a
+/// window in which a removed device knows it is out while the family credential
+/// it already holds is still live, and LAN-with-no-internet is exactly where
+/// that window is widest. Edge-triggered, reaching that window needed a fresh
+/// HELLO2; level-triggered it is the ordinary case, within a minute, for as
+/// long as the link lasts. Accepted deliberately — an honest removed device has
+/// to converge offline, and nothing else makes the phone that is *wrong* right
+/// — but it is a widening rather than a neutral change, and §10 step 5 records
+/// it as one.
+///
+/// `None` means never offered on this link, which is always due.
+#[uniffi::export]
+pub fn core_own_roster_notice_reoffer_due(last_offered_at_ms: Option<i64>, now_ms: i64) -> bool {
+    let Some(last) = last_offered_at_ms else {
+        return true;
+    };
+    // Saturating, and a clock that jumped backwards is due rather than stuck:
+    // the notice is idempotent, so the failure worth avoiding is silence.
+    now_ms < last || now_ms.saturating_sub(last) >= OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+}
+
 #[uniffi::export]
 impl MessageStore {
     /// This device's activation record (§9.4). A store that has never begun a
@@ -1294,6 +1350,21 @@ impl MessageStore {
     /// §3 makes the person root the deployed identity key, so the anchor is
     /// already on the phone and no new trust material is introduced.
     ///
+    /// **On a §9-linked device that sentence is false, and this call repairs
+    /// it.** The ceremony gives a new device keys of its own and withholds the
+    /// person root secret (§3); neither shell persists the person material the
+    /// bootstrap carries, so a linked device's `Identity.sign_pk` is a key of
+    /// its own and derives to a different person id entirely. Handed that, the
+    /// anchor check would refuse every roster the person ever signed — and the
+    /// device this call exists for is exactly a linked one. So the argument is
+    /// verified against the stored roster's `person_id` and, when it does not
+    /// belong to this person, the true anchor is recovered from the roster this
+    /// device already holds ([`crate::core_roster_person_root_sign_pk`]). That
+    /// is no weaker: the stored roster was validated against the anchor when it
+    /// was imported, and `person_id` is `derive_user_id` of the anchor, so the
+    /// recovered key is pinned by the same binding the argument would have been
+    /// checked against.
+    ///
     /// # Why a push, and why this is not a tip-off
     ///
     /// §10.1 addresses its gossip to contacts and to *remaining* own devices,
@@ -1390,11 +1461,37 @@ impl MessageStore {
             let conn = self.locked_conn();
             crate::roster_store::load_state(&conn, &held.person_id)?.quarantined
         };
+        // The anchor. The caller's key is used when it really is this person's
+        // root -- the original device, where `Identity` IS the person -- and
+        // otherwise the one the held roster is rooted in. See this method's
+        // doc comment: on a §9-linked device the caller has no way to know the
+        // person root, and refusing here would strand exactly the device §10
+        // step 5 exists to reach.
+        //
+        // Read the fallback as *ignoring* the argument, not as repairing it.
+        // It cannot tell a §9-linked device's own key from a key the shell got
+        // wrong, so it does not try: when the argument is not this person's
+        // root the held roster decides alone, and `person_id` is what pins it.
+        // That is the same binding the argument would have been checked
+        // against, so nothing is loosened -- but a caller that passes the wrong
+        // key gets a correct answer rather than a complaint, and any future
+        // reader chasing a key mix-up should start here rather than end here.
+        let anchor =
+            if crate::identity::derive_user_id(&person_root_sign_pk).to_vec() == held.person_id {
+                person_root_sign_pk
+            } else {
+                crate::core_roster_person_root_sign_pk(held.clone()).ok_or_else(|| {
+                    CoreError::Store(
+                        "this device's roster names no person root to check a notice against"
+                            .to_string(),
+                    )
+                })?
+            };
         let decision = crate::core_roster_accept(
             Some(held.clone()),
             stored_quarantined,
             incoming.clone(),
-            person_root_sign_pk,
+            anchor,
         );
         let revoked_device_ids = core_roster_newly_revoked(Some(held.clone()), incoming.clone());
         let answer = |outcome, reason, revoked_device_ids| crate::RevocationAdoption {
@@ -2535,6 +2632,95 @@ mod tests {
         assert!(store.abandon_link_activation(NOW).is_err());
     }
 
+    /// **The 2026-08-24 field case, at the last gate that would still have
+    /// stopped it.**
+    ///
+    /// Every other test here hands this call `fleet.person.sign_pk` — the true
+    /// person root — because the original device's `Identity` *is* the person.
+    /// A §9-linked device is not that device. The ceremony gives it keys of its
+    /// own and withholds the person root secret, and neither shell persists the
+    /// person material the bootstrap carries, so what the shell actually passes
+    /// is `Identity.sign_pk`: a key of the phone's own, deriving to a different
+    /// person id entirely.
+    ///
+    /// Handed that, the anchor check refused every roster the person ever
+    /// signed — and the device this call exists for is exactly a linked one. So
+    /// the removed phone would have read the document that buries it, checked it
+    /// against the wrong key, and stayed live. This pins the recovery: the
+    /// anchor comes from the roster the device already holds, and the burial
+    /// lands.
+    #[test]
+    fn a_linked_device_converges_though_its_identity_is_not_the_person_root() {
+        let fleet = fleet();
+        let store = my_store(&fleet);
+
+        // What §9 actually leaves on a linked phone: an identity of its own.
+        let linked_shell_identity = generate_identity();
+        assert_ne!(linked_shell_identity.sign_pk, fleet.person.sign_pk);
+        assert_ne!(linked_shell_identity.user_id, fleet.held.person_id);
+
+        let adoption = store
+            .apply_own_roster_notice(
+                notice(&fleet.burying),
+                linked_shell_identity.sign_pk.clone(),
+                fleet.me.device_id.clone(),
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(
+            adoption.outcome,
+            crate::RevocationAdoptionOutcome::RevokedSelf,
+            "a linked device must converge on the key it actually holds"
+        );
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.burying);
+        assert!(store.own_device_fleet().unwrap().device_ids.is_empty());
+        assert!(
+            !store
+                .link_gate(CoreLinkGatedAction::Advertise)
+                .unwrap()
+                .allowed
+        );
+    }
+
+    /// The recovery above must not become a way in. A stranger's roster is still
+    /// refused when the caller's key is a linked device's own — the anchor is
+    /// taken from the *held* roster's person id, which no outsider can move.
+    #[test]
+    fn a_linked_devices_anchor_recovery_still_refuses_a_forged_roster() {
+        let fleet = fleet();
+        let stranger = generate_identity();
+        let forged = crate::core_sign_roster(fleet.burying.clone(), stranger.sign_sk).unwrap();
+        let store = my_store(&fleet);
+
+        let adoption = store
+            .apply_own_roster_notice(
+                notice(&forged),
+                generate_identity().sign_pk,
+                fleet.me.device_id.clone(),
+                NOW,
+            )
+            .unwrap();
+        assert_eq!(adoption.outcome, crate::RevocationAdoptionOutcome::Refused);
+        assert_eq!(adoption.reason, crate::RosterUpdateReason::Invalid);
+        assert_eq!(store.own_roster().unwrap().unwrap(), fleet.held);
+    }
+
+    /// The anchor a roster is rooted in is recoverable from the roster itself,
+    /// which is what makes the repair above sound: `person_id` is
+    /// `derive_user_id` of the person root, so a key inside the document that
+    /// derives to it *is* the root and nothing else can be.
+    #[test]
+    fn a_roster_names_the_person_root_it_is_rooted_in() {
+        let fleet = fleet();
+        for roster in [&fleet.held, &fleet.grown, &fleet.rotated, &fleet.burying] {
+            assert_eq!(
+                crate::core_roster_person_root_sign_pk(roster.clone()),
+                Some(fleet.person.sign_pk.clone()),
+            );
+        }
+    }
+
     /// The notice is authenticated by the document, not by the link: a roster
     /// this person's root did not vouch for buries nobody, however it arrived.
     #[test]
@@ -2670,6 +2856,28 @@ mod tests {
             )
             .is_err());
         assert_eq!(store.own_roster().unwrap().unwrap(), mine.held);
+    }
+
+    /// §10 step 5 has to be level-triggered, not edge-triggered: the removal
+    /// the field missed happened while the own-device link was already up, so
+    /// the one HELLO2 that would have carried the notice had come and gone.
+    #[test]
+    fn a_live_own_device_link_is_re_offered_the_roster_on_a_timer() {
+        // Never offered on this link: due immediately.
+        assert!(core_own_roster_notice_reoffer_due(None, 0));
+        // Just offered: not again yet.
+        assert!(!core_own_roster_notice_reoffer_due(Some(1_000), 1_001));
+        assert!(!core_own_roster_notice_reoffer_due(
+            Some(1_000),
+            1_000 + OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS - 1
+        ));
+        assert!(core_own_roster_notice_reoffer_due(
+            Some(1_000),
+            1_000 + OWN_ROSTER_NOTICE_REOFFER_INTERVAL_MS
+        ));
+        // A clock that jumped backwards is due rather than wedged shut: the
+        // frame is idempotent, so silence is the only failure worth avoiding.
+        assert!(core_own_roster_notice_reoffer_due(Some(1_000), 4));
     }
 
     /// The sending half: what goes out, and the states in which nothing does. A

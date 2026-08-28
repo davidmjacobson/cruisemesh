@@ -70,37 +70,94 @@ final class LanSubnetScanTests: XCTestCase {
 
     func testAutomaticScanLonelinessGateMatchesAndroid() {
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, ownDeviceSearchLive: false
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, ownDeviceSearchLive: false
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 0, ownDeviceSearchLive: false
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 0, pendingOutboundAttempts: 0, scanRemaining: 1, unlinkedCapableContacts: 0
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 1, unlinkedCapableContacts: 0, ownDeviceSearchLive: false
         ))
     }
 
     func testUnlinkedCapableContactKeepsSweepGateOpenDespiteLiveLinks() {
         // One connected family member must not stop discovery of the rest.
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 1, ownDeviceSearchLive: false
         ))
         XCTAssertTrue(shouldRunAutomaticLanScan(
-            activeConnections: 3, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 2
+            peerLinks: 3, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 2, ownDeviceSearchLive: false
         ))
         // But in-flight work still defers, links or not.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 1, scanRemaining: 0, unlinkedCapableContacts: 1, ownDeviceSearchLive: false
         ))
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 7, unlinkedCapableContacts: 1
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 7, unlinkedCapableContacts: 1, ownDeviceSearchLive: false
         ))
         // Everyone capable is linked: nothing left to sweep for.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0
+            peerLinks: 1, pendingOutboundAttempts: 0, scanRemaining: 0, unlinkedCapableContacts: 0, ownDeviceSearchLive: false
+        ))
+    }
+
+    func testLinkToOneOfThisPersonsOwnDevicesNeverCountsAsCompany() {
+        // The field case, on the approving phone: its only live LAN link was to
+        // the device it had just removed. That link carries no contact's mail
+        // and, having no route, sat outside the LAN heartbeat -- so a half-open
+        // one used to read as "not lonely" and shut discovery off for the whole
+        // Wi-Fi join. The transport passes peer links only, so the gate here
+        // sees zero.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: 0, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, ownDeviceSearchLive: false
+        ))
+        // A negative miscount slows discovery, never disables it.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: -1, pendingOutboundAttempts: -3, scanRemaining: 0,
+            unlinkedCapableContacts: 0, ownDeviceSearchLive: false
+        ))
+    }
+
+    func testSiblingWithNoLinkKeepsTheSweepGateOpen() {
+        // A device of this person's own shares their user id, so it has no
+        // contact row and can never appear in unlinkedCapableContacts. Without
+        // a motive of its own, Bonjour is the only channel between two phones
+        // of one person -- and one stale Bonjour record is all the field
+        // failure was. Whether that motive is live is OwnDeviceSearchWindow's
+        // call, and it is bounded; see OwnDeviceSearchWindowTests.
+        XCTAssertTrue(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, ownDeviceSearchLive: true
+        ))
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 0, scanRemaining: 0,
+            unlinkedCapableContacts: 0, ownDeviceSearchLive: false
+        ))
+        // In-flight work still defers.
+        XCTAssertFalse(shouldRunAutomaticLanScan(
+            peerLinks: 4, pendingOutboundAttempts: 2, scanRemaining: 0,
+            unlinkedCapableContacts: 0, ownDeviceSearchLive: true
+        ))
+    }
+
+    /// The field loop: a Bonjour-derived endpoint at an address that never
+    /// answered (a link-local IPv6 one, which no other phone can dial), retried
+    /// every retry period for as long as the phone stayed on the Wi-Fi.
+    func testAddressThatNeverAnsweredStopsBeingRetried() {
+        XCTAssertFalse(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: false, consecutiveFailures: 1
+        ))
+        XCTAssertTrue(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: false, consecutiveFailures: 6
+        ))
+        // An address a handshake proved is never retired by failure count:
+        // ordinary contact LAN delivery has to survive a sleeping peer.
+        XCTAssertFalse(coreLanReconnectTargetIsExhausted(
+            everAuthenticated: true, consecutiveFailures: 60
         ))
     }
 
@@ -133,10 +190,11 @@ final class LanSubnetScanTests: XCTestCase {
         XCTAssertEqual(motivating, 0)
         // A live link plus no motivating contact means no sweep at all.
         XCTAssertFalse(shouldRunAutomaticLanScan(
-            activeConnections: 1,
+            peerLinks: 1,
             pendingOutboundAttempts: 0,
             scanRemaining: 0,
-            unlinkedCapableContacts: motivating
+            unlinkedCapableContacts: motivating,
+            ownDeviceSearchLive: false
         ))
     }
 

@@ -202,6 +202,50 @@ final class LanTransportTests: XCTestCase {
         XCTAssertFalse(ownLanStaticKeyMatches(ownAgreePk: own.agreePk, remoteStaticKey: stranger))
     }
 
+    /// **The flap this fix would otherwise have shipped.**
+    ///
+    /// Take 4's logs show the shape exactly: one phone waits out the tie-break,
+    /// gives up and dials, while the other is separately dialing it by sweep.
+    /// Two handshakes finish in opposite orders on the two hosts, so plain
+    /// newest-wins has each phone keep a different socket and close the one the
+    /// other kept. Both die, both rediscover, and the pair flaps — which in a
+    /// field log reads as "the link forms and immediately drops", very hard to
+    /// tell from the bug just fixed. That code had never once run to completion
+    /// before this change, because the old gate admitted nobody.
+    ///
+    /// The rule is settled by the keys, so both phones reach the same answer
+    /// about the same socket with no extra message. Mirrors Android's
+    /// `ownDeviceLinkPrevails`.
+    func testACrossConnectLeavesBothPhonesKeepingTheSameSocket() {
+        let lower = Data(repeating: 0x11, count: 32)
+        let higher = Data(repeating: 0x22, count: 32)
+
+        // On the phone with the lower key: it keeps what it dialed.
+        XCTAssertEqual(
+            ownDeviceLinkPrevails(ownAgreePk: lower, remoteStaticKey: higher, initiator: true),
+            true
+        )
+        XCTAssertEqual(
+            ownDeviceLinkPrevails(ownAgreePk: lower, remoteStaticKey: higher, initiator: false),
+            false
+        )
+        // On the phone with the higher key: it keeps what it answered. The same
+        // socket, agreed without a message.
+        XCTAssertEqual(
+            ownDeviceLinkPrevails(ownAgreePk: higher, remoteStaticKey: lower, initiator: true),
+            false
+        )
+        XCTAssertEqual(
+            ownDeviceLinkPrevails(ownAgreePk: higher, remoteStaticKey: lower, initiator: false),
+            true
+        )
+        // Two installs of one identity have nothing to tell their ends apart,
+        // so the clone case falls back to newest-wins as it always did.
+        XCTAssertNil(
+            ownDeviceLinkPrevails(ownAgreePk: lower, remoteStaticKey: lower, initiator: true)
+        )
+    }
+
     func testOwnIdentityHelloRecordsCloneOnlyWithOurSessionKey() {
         let own = contact(userByte: 1, agreeByte: 7)
         let other = contact(userByte: 2, agreeByte: 8)
