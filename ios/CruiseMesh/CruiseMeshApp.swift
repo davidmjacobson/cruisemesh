@@ -19,7 +19,12 @@ struct CruiseMeshApp: App {
     /// must still know.
     @StateObject private var deviceRemoval = DeviceRemovalStatus.shared
     @State private var termsAccepted: Bool
-    @State private var onboardingCompleted: Bool
+    /// Which first-run screen this launch owes, decided from the store rather
+    /// than from whichever door was tapped. "This is another of my devices" and
+    /// a backup restore both mark setup complete without ever showing the
+    /// permissions step, and a phone closed between the ceremony and the next
+    /// launch still owes it. See `FirstRunRouter`.
+    @State private var firstRun: FirstRunDestination
     @AppStorage(AppearancePreference.storageKey, store: AppDefaults.current)
     private var appearanceRawValue = AppearancePreference.system.rawValue
 
@@ -38,10 +43,16 @@ struct CruiseMeshApp: App {
         _appModel = StateObject(wrappedValue: AppModel())
         if let scenario = UITestConfiguration.scenario {
             _termsAccepted = State(initialValue: scenario.termsAccepted)
-            _onboardingCompleted = State(initialValue: scenario.onboardingCompleted)
+            // No UI-test scenario stands on the permissions step: every one of
+            // them is either before setup or past it.
+            _firstRun = State(initialValue: scenario.onboardingCompleted ? .home : .wizard)
         } else {
             _termsAccepted = State(initialValue: TermsAcceptanceStore.isCurrentVersionAccepted())
-            _onboardingCompleted = State(initialValue: OnboardingStore.isCompleted())
+            _firstRun = State(initialValue: FirstRunRouter.destination(
+                setupComplete: OnboardingStore.isCompleted(),
+                permissionsStepDone: OnboardingStore.permissionsStepDone(),
+                meshPermissionsGranted: OnboardingPermissions.meshPermissionGranted()
+            ))
         }
     }
 
@@ -64,15 +75,24 @@ struct CruiseMeshApp: App {
                     // than left running behind a screen that says the opposite.
                     DeviceRemovedView()
                         .onAppear { appModel.stopMesh() }
-                } else if onboardingCompleted {
-                    ChatListView(
-                        identity: appModel.identity,
-                        appModel: appModel,
-                        appearance: appearanceBinding
-                    )
                 } else {
-                    OnboardingView(identity: appModel.identity, appModel: appModel) {
-                        onboardingCompleted = true
+                    switch firstRun {
+                    case .home:
+                        ChatListView(
+                            identity: appModel.identity,
+                            appModel: appModel,
+                            appearance: appearanceBinding
+                        )
+                    case .permissions:
+                        // The step a door past the wizard skipped. Its own
+                        // screen rather than a sheet over the chat list: the
+                        // mesh is off until it is answered, so there is nothing
+                        // behind it worth looking at yet.
+                        PermissionsSetupView(appModel: appModel) { firstRun = .home }
+                    case .wizard:
+                        OnboardingView(identity: appModel.identity, appModel: appModel) { next in
+                            firstRun = next
+                        }
                     }
                 }
             }

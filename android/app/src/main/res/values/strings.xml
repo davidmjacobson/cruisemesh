@@ -219,6 +219,7 @@
     <string name="ui_onboarding_shore_pass_body">Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family\'s messages over the internet when you\'re spread out or someone\'s back home.</string>
     <string name="ui_onboarding_shore_pass_family_title">One pass covers your whole family</string>
     <string name="ui_onboarding_shore_pass_family_detail">Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card.</string>
+    <string name="ui_permissions_setup_linked_note">Your phone is set up. One last thing before you start.</string>
     <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
     <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
     <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
