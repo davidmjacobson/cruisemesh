@@ -391,15 +391,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         let lan = LanTransport(
             identity: identity,
-            trustedPeerForStaticKey: { [weak self, store = self.store] remoteStaticKey in
-                if let userId = trustedLanPeerUserId(
+            trustedPeerForStaticKey: { [store = self.store] remoteStaticKey in
+                trustedLanPeerUserId(
                     contacts: (try? store.listContacts()) ?? [],
                     remoteStaticKey: remoteStaticKey
-                ) {
-                    return userId
-                }
-                self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
-                return nil
+                )
+            },
+            onOwnIdentityPeer: { [weak self] remoteStaticKey, provenPeerDeviceId in
+                self?.recordOwnIdentityCloneIfAuthenticated(
+                    remoteStaticKey: remoteStaticKey,
+                    provenPeerDeviceId: provenPeerDeviceId
+                )
             },
             ownDeviceLanProof: { [weak self] handshakeHash, role in
                 self?.ownDeviceLanProof(handshakeHash: handshakeHash, role: role)
@@ -1441,11 +1443,68 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         stopOnMeshQueue()
     }
 
-    private func recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: Data) {
-        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) else {
+    /// **The clone guard**, asked once per own-device LAN link at the moment the
+    /// handshake has settled what the far end actually is
+    /// (`specs/multi-device-v1.md` §1, §6, §10 step 5).
+    ///
+    /// It runs from the transport's own-device arm now, not from the
+    /// trusted-peer lookup that used to raise it. The lookup is asked in the
+    /// *middle* of the handshake — before §10 step 5's proof has been exchanged,
+    /// because the proof signs a transcript hash that is not final until the last
+    /// handshake message has gone out — so a guard placed there had no device id
+    /// to reason about, and this shell asked the key question and nothing else:
+    /// it recorded a clone warning for any peer whose Noise static was this
+    /// identity's own agreement key and never asked core whether that peer was a
+    /// device of this person's at all. Android at least asked, with a hardcoded
+    /// null; this shell was the larger half of the gap.
+    ///
+    /// It does not follow that the answer changes today. The clone arm of the
+    /// handshake is symmetric and exchanges no proof, so what arrives here is
+    /// still nil and the verdict is still a clone — see `OwnIdentityClonePolicy`
+    /// for why that is the handshake's property and not the rule's.
+    ///
+    /// `provenPeerDeviceId` is `coreOwnDeviceLanProofOpen`'s answer for *this*
+    /// session and nothing weaker. The rule it feeds lives in
+    /// `OwnIdentityClonePolicy`, where a unit test can read it — including the
+    /// honest note that today's clone arm exchanges no proof, so the sibling
+    /// answer is not yet reachable over LAN.
+    ///
+    /// Mirrors Android's `MeshService.recordOwnIdentityCloneIfAuthenticated`.
+    private func recordOwnIdentityCloneIfAuthenticated(
+        remoteStaticKey: Data,
+        provenPeerDeviceId: Data?
+    ) {
+        switch OwnIdentityClonePolicy.verdict(
+            ownAgreePk: identity.agreePk,
+            remoteStaticKey: remoteStaticKey,
+            // Read on the mesh queue, for the same reason
+            // `trustedPeerForStaticKey` reads `listContacts` there: it is one
+            // indexed read of a handful of rows, and the alternative is judging
+            // a peer that holds this identity's key against a projection
+            // fetched after the link went live. The policy asks for it only
+            // once the key test has passed, so an ordinary refused stranger
+            // costs nothing.
+            fleet: {
+                guard let fleet = try? self.store.ownDeviceFleet() else {
+                    self.log.warning("Could not read this phone's own devices")
+                    return nil
+                }
+                return fleet
+            },
+            provenPeerDeviceId: provenPeerDeviceId
+        ) {
+        case .notOurIdentity:
             return
+        case .sibling:
+            // A device this person's own roster names is not a clone. Warning
+            // about one would greet a deliberate link with the most alarming
+            // sentence the app can say — and a warning that fires on the normal
+            // case is one people learn to dismiss, which leaves it useless for
+            // the real thing.
+            log.info("A device of ours presented our identity; not a clone")
+        case .clone:
+            recordOwnIdentityClone()
         }
-        recordOwnIdentityClone()
     }
 
     private func recordOwnIdentityClone() {
