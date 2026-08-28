@@ -92,9 +92,36 @@ does not implement this transport remains fully compatible over BLE and relay.
   responder must still present the agreement key of an accepted friend during
   the Noise handshake.
 
-45892 is a provisional unassigned port in IANA's user-port range as of
-2026-07-16. Before treating it as a permanent public assignment, the project
-should request an IANA service-name and port registration.
+### Port 45892 and its IANA status
+
+Re-checked against IANA's service-name and port-number registry on 2026-08-27.
+
+- 45892 sits in the **User Ports** range (1024–49151), not the dynamic/private
+  range (49152–65535). The distinction matters: user ports are the range IANA
+  does assign, under Expert Review. Dynamic ports are never assigned, so a
+  number up there could not be registered at all.
+- 45892/tcp and 45892/udp are **unassigned**. The nearest assignments on either
+  side are 45825 (`qdb2service`) and 45966 (`ssr-servermgr`). Nothing in the
+  registry conflicts with CruiseMesh's use.
+- Unassigned is not the same as reserved for us. Another application may squat
+  the same number, which is why the listener never depends on it (below) and
+  why a bare TCP response on 45892 is never treated as finding a peer — only a
+  completed Noise handshake is.
+- The number has one definition, `LAN_DEFAULT_TCP_PORT` in the core, which both
+  shells and the desktop helper read over the FFI. Everything else that names
+  45892 is prose or a test fixture, with one functional exception: the desktop
+  helper opens a Windows firewall rule for the port. If a registration ever
+  returns a different number, that constant and that rule are the two places
+  that have to move.
+
+Registering it is an external submission, deliberately not automated. It would
+mean filing IANA's service-name and port-number application — the process
+defined in RFC 6335 — with an assignee and contact, a service name, a short
+description, and a reference document describing the protocol, for which this
+spec would serve. User-port requests go through Expert Review, so a request can
+be declined or answered with a different number, and CruiseMesh has to keep
+working either way. No request has been filed; the port stays provisional until
+one is.
 
 The listener first tries 45892. If another local process already owns it, the
 app may bind an ephemeral port and advertise that actual port through DNS-SD.
@@ -184,16 +211,197 @@ Android runs this transport under the existing connected-device foreground
 service. iOS runs it while the app has execution time; Bonjour/TCP does not
 create a promise of continuous background execution.
 
-## Platform privacy
+## Platform privacy and permissions
 
-Android currently targets API 36 and does not request location for same-LAN
-DNS-SD. Android 16's local-network protection is opt-in only at target 36;
-the `ACCESS_LOCAL_NETWORK` runtime permission becomes mandatory at target 37
-(Android 17) and must be added before raising the target again.
+Reviewed 2026-08-27 against the current platform documentation, sources listed
+at the end of this section. Both shells are compliant as they ship today; the
+work this section exists to protect is the Android target bump, which breaks
+the transport quietly rather than loudly.
 
-iOS declares `_cruisemesh._tcp` in `NSBonjourServices` and provides an
-`NSLocalNetworkUsageDescription`. The user may deny local-network access; BLE
-and relay continue to work.
+### What the transport actually does on the wire
+
+Worth stating plainly, because every permission question below turns on it:
+
+- Registers and browses one DNS-SD service type, `_cruisemesh._tcp.`, through
+  the platform's own resolver (Android `NsdManager`, Apple `NWListener` /
+  `NWBrowser`). Neither phone shell opens a multicast socket of its own or
+  takes a multicast lock; the platform daemon does the mDNS. (The desktop
+  helper is the exception — it runs mDNS in-process through the `mdns-sd`
+  crate — but desktop platforms have no equivalent permission regime, so
+  nothing below applies to it.)
+- Listens for and accepts inbound TCP on 45892 (or an ephemeral port).
+- Dials outbound TCP to local addresses: resolved services, cached endpoints,
+  sealed endpoint hints, and the bounded subnet sweep. Every sweep probe dials
+  only the listen port; the automatic tier is capped at a `/20` and the manual
+  button at a `/16`, per "Discovery and port" above. It is not a `/24`-only
+  sweep, which matters here only in that a wider sweep is still nothing but
+  ordinary outbound TCP to local addresses.
+- Sends and receives no UDP of its own, and no broadcast.
+
+### Android
+
+Local network protection gates every one of those operations at the socket
+layer — outgoing TCP to a local address, inbound TCP accept, UDP in either
+direction, `.local` resolution, and `NsdManager`. Because the check sits in the
+networking stack it applies to all APIs; there is no library that routes around
+it. When the grant is missing the app is not told so: TCP fails as a timeout and
+UDP as `EPERM`. From the user's chair, LAN delivery would simply stop working.
+
+State at targetSdk 36:
+
+- Not required, and must not be declared. Apps targeting SDK 36 or lower get an
+  implicit `ACCESS_LOCAL_NETWORK` grant from `INTERNET`; the platform docs say
+  in as many words not to add the permission to the manifest or request it at
+  runtime below target 37.
+- The restriction can still be exercised on 36 for testing, because Android 16
+  ships it as a per-app opt-in behind a compat flag:
+
+  ```sh
+  # com.cruisemesh.app.debug for a debug build
+  adb shell am compat enable RESTRICT_LOCAL_NETWORK com.cruisemesh.app
+  adb reboot            # the flag only takes effect after a reboot
+  # ... exercise LAN discovery and delivery; expect it to fail ...
+  adb shell am compat disable RESTRICT_LOCAL_NETWORK com.cruisemesh.app
+  ```
+
+  Under that flag `NEARBY_WIFI_DEVICES` is what restores access, so a build used
+  for this test needs it declared temporarily. Do not merge that declaration:
+  the app calls none of the Wi-Fi APIs `NEARBY_WIFI_DEVICES` actually gates
+  (`WifiManager.startLocalOnlyHotspot`, Wi-Fi Aware, Wi-Fi Direct, Wi-Fi RTT),
+  and a declared-but-unexercised permission is a review flag.
+- No location permission is requested, and none is needed: DNS-SD and TCP are
+  not location-gated. (BLE scanning is, which is why `BLUETOOTH_SCAN` carries
+  `neverForLocation` — a separate matter.)
+
+At targetSdk 37 (Android 17) the protection becomes mandatory, and the docs
+offer two paths. The picker path is the wrong one here, which is worth writing
+down because the code sits one flag away from it:
+
+- **Not the picker.** `NsdManager` accepts a `DiscoveryRequest` carrying
+  `FLAG_SHOW_PICKER`, and this app already builds a `DiscoveryRequest` (for
+  `setNetwork`), so the change would look trivial. It is not: the picker shows
+  the user a system dialog and returns *one device they choose*, which suits an
+  app casting to a speaker and not a mesh that must keep finding every accepted
+  contact on the network, unattended, for as long as the service runs. Android's
+  own guidance points apps needing "broad, persistent access to the local
+  network" at the permission instead.
+- **The permission.** So, when the target is raised:
+  1. Declare `ACCESS_LOCAL_NETWORK` in the manifest.
+  2. Request it at runtime *before* starting the transport, and handle denial
+     and later revocation by falling back to BLE and relay, exactly as the
+     transport already handles a LAN that carries no peers. Revocation matters
+     as much as denial: the docs are explicit that local network traffic is
+     blocked from that moment on.
+  3. Expect to surface nothing new in the permission sheet in the common case.
+     `ACCESS_LOCAL_NETWORK` is in the `NEARBY_DEVICES` group, and CruiseMesh
+     already holds Bluetooth permissions from that group, so a user who granted
+     nearby devices for the BLE mesh is not prompted again. Anyone who denied it
+     is a person for whom the BLE mesh is already off.
+
+Google Play's target-API floor is 36 as of 31 August 2026, which this app meets.
+Google has announced no equivalent date for 37 yet; whenever it lands, it is the
+deadline that forces the work above.
+
+### iOS
+
+Already correct, and the reasoning is worth keeping so nobody "tidies" it:
+
+- `NSLocalNetworkUsageDescription` is present. Apple's rule is that an app
+  accessing the local network carries one, and its own table makes both halves
+  of this transport qualify: *every* Bonjour operation (register, browse,
+  resolve) requires local network access, and so does making an outgoing TCP
+  connection to a local address. The subnet sweep is therefore covered by the
+  same key as discovery and needs nothing extra. The string describes finding
+  and exchanging messages with accepted contacts over local Wi-Fi, which is
+  what the transport does.
+
+  Note the key is *not* required merely for using something that happens to
+  speak Bonjour underneath — AirPlay, UIKit printing, `DeviceDiscoveryUI` and
+  `AccessorySetupKit` are all exempt because they keep the app away from the
+  network's details. CruiseMesh gets no such exemption: it drives Bonjour and
+  the sockets itself.
+- `NSBonjourServices` lists `_cruisemesh._tcp`, matching the one type the app
+  registers and browses. The shared constant carries a trailing dot
+  (`_cruisemesh._tcp.`); the iOS shell trims it before handing the type to
+  `NWListener`/`NWBrowser`, which is why the plist entry has no dot. Keep those
+  two in step — a mismatch would break browsing without breaking the build.
+- The multicast entitlement is deliberately absent. iOS requires
+  `com.apple.developer.networking.multicast` only for sending or receiving real
+  UDP multicast or broadcast, for working with arbitrary Bonjour service types,
+  or for browsing all advertised types with a `_services._dns-sd._udp.local.`
+  query. CruiseMesh does none of those: one fixed service type, resolved out of
+  process, and no UDP at all. It is also a managed capability — Apple grants it
+  on request rather than automatically — so not needing it is a feature, not an
+  oversight to correct.
+- Accepting inbound TCP does not itself require local network access on iOS
+  (Apple's table lists it as the one common local operation that does not). But
+  every Bonjour operation and every outbound dial to a local address does, so in
+  practice the transport always needs the grant.
+- Two behaviors to design around rather than fix:
+  - The system may deny an operation *immediately*, before the user has answered
+    the alert it just raised. Apple's remedy is an API that waits for
+    connectivity, or retry logic. The shell already satisfies this: `NWBrowser`
+    and `NWListener` sit in `.waiting` and are retried, and `LanTransport`
+    tracks how long each has been stuck there so a genuinely denied privilege is
+    surfaced to diagnostics instead of retried forever in silence. Keep that
+    property if this code is reworked — the first attempt failing is normal.
+  - If the privilege is undetermined and the app performs a local network
+    operation while in the background, the system denies it without showing the
+    alert *and without recording a decision*. The prompt appears the first time
+    the app tries while in the foreground. So a first LAN attempt that happens
+    while backgrounded is expected to fail once, and must not be cached as a
+    permanent denial.
+- The user may deny local network access outright; BLE and relay continue to
+  work, which is the whole reason the transport is opportunistic.
+- The simulator does not implement local network privacy at all. None of the
+  above can be verified there — it needs a real device, which is worth knowing
+  before anyone reads a green CI run as evidence about this.
+
+### Declared versus used
+
+No gaps in either direction as of this review — checked both ways, because a
+permission declared and never exercised draws review attention just as a missing
+one breaks the feature.
+
+| Shell | Declared | Exercised by | Verdict |
+| --- | --- | --- | --- |
+| Android | `INTERNET` | relay sync, and the LAN transport's TCP | used |
+| Android | `ACCESS_NETWORK_STATE` | `ConnectivityManager` capability reads | used |
+| Android | `CHANGE_NETWORK_STATE` | `requestNetwork` for relay sync and the LAN transport's network binding | used |
+| Android | `BLUETOOTH_SCAN` (`neverForLocation`), `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT` | BLE mesh | used |
+| Android | *(no `NEARBY_WIFI_DEVICES`)* | no `WifiManager` scan, Wi-Fi Direct, Aware or RTT call exists | correctly absent |
+| Android | *(no `ACCESS_LOCAL_NETWORK`)* | implicit from `INTERNET` below target 37 | correctly absent |
+| Android | *(no `CHANGE_WIFI_MULTICAST_STATE`)* | no multicast lock is taken | correctly absent |
+| Android | *(no location permission)* | DNS-SD and TCP are not location-gated | correctly absent |
+| iOS | `NSLocalNetworkUsageDescription` | Bonjour plus every outbound local dial | used |
+| iOS | `NSBonjourServices` = `_cruisemesh._tcp` | the one type registered and browsed | used |
+| iOS | *(no multicast entitlement)* | no UDP, one fixed service type | correctly absent |
+
+Two invariants hide in that table and are easy to break by accident. The service
+type has a single source of truth in the core (`LAN_SERVICE_TYPE`) and carries a
+**trailing dot**; the iOS shell trims it before handing the type to `NWListener`
+and `NWBrowser`, which is why the plist entry has none. A mismatch between the
+plist and the type actually browsed would stop discovery without failing the
+build. And `NEARBY_WIFI_DEVICES` must not be merged even though the Android 16
+test recipe above temporarily needs it.
+
+### Sources
+
+Checked 2026-08-27. Re-read these rather than this summary before acting on the
+target bump, since the Android side is still moving.
+
+- Android, local network permission:
+  <https://developer.android.com/privacy-and-security/local-network-permission>
+- Android 17 behavior changes:
+  <https://developer.android.com/about/versions/17/behavior-changes-17>
+- Google Play target API level requirements:
+  <https://developer.android.com/google/play/requirements/target-sdk>
+- Apple TN3179, Understanding local network privacy:
+  <https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy>
+- IANA service name and port number registry:
+  <https://www.iana.org/assignments/service-names-port-numbers/>
+- RFC 6335, the port ranges and IANA's assignment procedures:
+  <https://www.rfc-editor.org/rfc/rfc6335.html>
 
 ## Delivery policy
 

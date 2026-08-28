@@ -6,9 +6,7 @@ name: Android release
 # AAB and ships it to the Play track named by PLAY_TRACK below via the Play
 # Developer API.
 #
-# The Play path is gated on secrets (PLAY_ENABLED below) so the workflow still
-# works without them: with no secrets it behaves exactly like the old
-# debug-signed-APK-only release. Required repository secrets to enable Play:
+# Required repository secrets for the Play path:
 #   CRUISEMESH_RELEASE_STORE_B64      base64 (no newlines) of app/upload-keystore.jks
 #   CRUISEMESH_RELEASE_STORE_PASSWORD keystore store password
 #   CRUISEMESH_RELEASE_KEY_ALIAS      key alias (cruisemesh-upload)
@@ -16,6 +14,14 @@ name: Android release
 #   PLAY_SERVICE_ACCOUNT_JSON         full JSON of the Play Developer API service account
 # The AAB is signed with the upload key; Google Play App Signing re-signs it
 # with the app signing key for distribution.
+#
+# DISTRIBUTING IS NOT OPTIONAL ON A TAG. Pushing the tag *is* the request to
+# publish, so a tag run with a publishing secret missing fails immediately and
+# names the secret, rather than skipping the upload and reporting success --
+# a green release that shipped nothing is the worst outcome this workflow has.
+# The build-only mode still exists, but you have to ask for it: run the
+# workflow manually from the Actions tab with `distribute: no`, which builds,
+# verifies and archives without touching Play or cutting a GitHub Release.
 #
 # WARNING about the sideload APK: it comes from a separate gradle invocation
 # with no signing env, so it falls back to the *debug* keystore -- and a GitHub
@@ -35,6 +41,15 @@ on:
   push:
     tags:
       - "android-v*"
+  workflow_dispatch:
+    inputs:
+      distribute:
+        description: "Publish to Play and cut a GitHub Release? 'no' = build + verify only."
+        type: choice
+        options:
+          - "no"
+          - "yes"
+        default: "no"
 
 permissions:
   contents: write
@@ -43,9 +58,12 @@ jobs:
   build-and-release:
     runs-on: ubuntu-latest
     env:
-      # Secrets can't be referenced in step `if:` conditions directly, so surface
-      # their presence as a plain env flag ('true'/'false') the steps can gate on.
-      PLAY_ENABLED: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON != '' && secrets.CRUISEMESH_RELEASE_STORE_B64 != '' }}
+      # The one switch every publishing step gates on. A tag push is, by
+      # definition, a request to distribute; a manual run is a rehearsal unless
+      # it explicitly says otherwise. Nothing here reads secret presence: a
+      # missing secret must fail the run (see "Assert release mode"), never
+      # quietly turn distribution off.
+      DISTRIBUTE: ${{ github.event_name == 'push' && 'yes' || inputs.distribute }}
       # Play Developer API track name. `alpha` is what the API calls the
       # console's "Closed testing" -- that is the track the production
       # readiness gate counts (>=12 opted-in testers for 14 continuous days);
@@ -61,6 +79,78 @@ jobs:
       CRUISEMESH_PROVENANCE_FILE: ${{ github.workspace }}/release-provenance.txt
     steps:
       - uses: actions/checkout@v7
+
+      # --- Release intent ---------------------------------------------------
+      # Decide, before anything is built, whether this run publishes. If it
+      # does, every credential it will need must already be present: finding
+      # out at the upload step is finding out after the release has been
+      # announced. If it does not, say so loudly and in the run summary, so a
+      # rehearsal can never be mistaken for a shipped release.
+      - name: Assert release mode and publishing secrets
+        env:
+          CRUISEMESH_RELEASE_STORE_B64: ${{ secrets.CRUISEMESH_RELEASE_STORE_B64 }}
+          CRUISEMESH_RELEASE_STORE_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_STORE_PASSWORD }}
+          CRUISEMESH_RELEASE_KEY_ALIAS: ${{ secrets.CRUISEMESH_RELEASE_KEY_ALIAS }}
+          CRUISEMESH_RELEASE_KEY_PASSWORD: ${{ secrets.CRUISEMESH_RELEASE_KEY_PASSWORD }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -eo pipefail
+          if [ "$DISTRIBUTE" != "yes" ]; then
+            echo "::warning title=Build only::This run will NOT publish to Play and will NOT cut a GitHub Release."
+            {
+              echo "## Build only — nothing was published"
+              echo
+              echo "This run was started with \`distribute: no\`, so it builds and"
+              echo "verifies the artifacts and stops. Push an \`android-v*\` tag to"
+              echo "actually release."
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "ERROR: asked to distribute from '$GITHUB_REF' (ref type '$GITHUB_REF_TYPE')." >&2
+            echo "A published build must come from an 'android-v*' tag so the release" >&2
+            echo "names one immutable commit. Push a tag, or re-run with distribute: no." >&2
+            exit 1
+          fi
+
+          missing=""
+          for name in \
+            CRUISEMESH_RELEASE_STORE_B64 \
+            CRUISEMESH_RELEASE_STORE_PASSWORD \
+            CRUISEMESH_RELEASE_KEY_ALIAS \
+            CRUISEMESH_RELEASE_KEY_PASSWORD \
+            PLAY_SERVICE_ACCOUNT_JSON
+          do
+            eval "value=\${$name}"
+            if [ -z "$value" ]; then
+              missing="$missing $name"
+            fi
+          done
+
+          if [ -n "$missing" ]; then
+            {
+              echo "ERROR: this run was asked to publish to Google Play, but the"
+              echo "repository is missing the secrets it needs:"
+              for name in $missing; do
+                echo "  - $name"
+              done
+              echo
+              echo "Set them under Settings -> Secrets and variables -> Actions and"
+              echo "re-tag. Failing here is deliberate: skipping the upload and"
+              echo "reporting success would announce a release that shipped nothing."
+            } >&2
+            exit 1
+          fi
+          echo "Publishing enabled: all Play signing and API secrets are present."
+
+      # A tag is only worth anything if it names exactly one commit forever.
+      # Fetch it back from the origin and compare: a tag deleted and re-pushed
+      # elsewhere, or an old run re-run after the tag moved, fails here.
+      - name: Assert the release tag pins this commit
+        if: github.ref_type == 'tag'
+        run: bash tools/assert_release_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -109,7 +199,13 @@ jobs:
         id: version
         run: |
           tag="${GITHUB_REF_NAME}"
-          version_name="${tag#android-v}"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version_name="${tag#android-v}"
+          else
+            # Build-only rehearsal from a branch: there is no release version to
+            # claim, so say so rather than stamping a branch name as one.
+            version_name="0.0.0-${GITHUB_SHA:0:7}"
+          fi
           version_code="$(date +%s)"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
@@ -144,6 +240,14 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Everything below produces something signable/shippable, so this is the
+      # last moment where "what we built" and "what the tag says" can still be
+      # made to agree. kotlin-gen/, jniLibs/, target/ and the Gradle build dirs
+      # are gitignored, so a clean checkout plus core/build-android.sh leaves
+      # nothing behind here.
+      - name: Assert the working tree matches the commit being released
+        run: bash tools/assert_clean_tree.sh
+
       - name: gradlew assembleRelease (debug-signed APK for sideloading)
         working-directory: android
         run: |
@@ -154,6 +258,12 @@ jobs:
 
       - name: Verify APK 16 KiB native-library support
         run: python3 tools/check_android_elf_alignment.py android/app/build/outputs/apk/release/app-release.apk
+
+      # The container, not the contents: zipalign + apksigner read the actual
+      # zip and signature blocks, so an unaligned or unsigned APK fails here
+      # instead of on a tester's phone.
+      - name: Assert APK is aligned and signed
+        run: bash tools/assert_android_artifact.sh android/app/build/outputs/apk/release/app-release.apk
 
       - name: Rename APK for the release asset
         id: apk
@@ -186,6 +296,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create GitHub Release and attach APK
+        if: env.DISTRIBUTE == 'yes'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -198,13 +309,13 @@ jobs:
       # --- Play publish to PLAY_TRACK (only when secrets are configured) ---
 
       - name: Decode upload keystore
-        if: env.PLAY_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         env:
           KEYSTORE_B64: ${{ secrets.CRUISEMESH_RELEASE_STORE_B64 }}
         run: printf '%s' "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
 
       - name: gradlew bundleRelease (upload-key-signed AAB)
-        if: env.PLAY_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         working-directory: android
         env:
           # build.gradle.kts's signingProp() reads these when app/keystore.properties
@@ -225,12 +336,20 @@ jobs:
             -PversionNameOverride=${{ steps.version.outputs.version_name }}
 
       - name: Verify AAB 16 KiB native-library support
-        if: env.PLAY_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         run: python3 tools/check_android_elf_alignment.py android/app/build/outputs/bundle/release/app-release.aab
+
+      # A bundle is jar-signed, so apksigner cannot read it; jarsigner is the
+      # equivalent proof that the upload key actually signed this file. Play
+      # would reject an unsigned bundle too, but only after the workflow had
+      # already reported success.
+      - name: Assert AAB is signed by the upload key
+        if: env.DISTRIBUTE == 'yes'
+        run: bash tools/assert_android_artifact.sh android/app/build/outputs/bundle/release/app-release.aab
 
       # Hash the AAB before the upload, so the record survives a failed publish.
       - name: Record AAB checksum
-        if: env.PLAY_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         continue-on-error: true
         run: |
           path="android/app/build/outputs/bundle/release/app-release.aab"
@@ -252,7 +371,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish AAB to Play (closed testing)
-        if: env.PLAY_ENABLED == 'true'
+        if: env.DISTRIBUTE == 'yes'
         env:
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
         run: |
@@ -267,8 +386,24 @@ jobs:
             "$PLAY_TRACK"
 
       - name: Clean up decoded keystore
-        if: always() && env.PLAY_ENABLED == 'true'
+        if: always() && env.DISTRIBUTE == 'yes'
         run: rm -f android/app/upload-keystore.jks
+
+      # The counterpart to the loud failure above: when a run legitimately does
+      # not publish, it says so in the log and in the run summary. A skipped
+      # upload is a state someone chose, never one nobody noticed.
+      - name: Note skipped publish
+        if: env.DISTRIBUTE != 'yes'
+        run: |
+          echo "::notice title=Nothing published::Built and verified only; no Play upload, no GitHub Release."
+          {
+            echo "### Nothing was published"
+            echo
+            echo "APK built and verified (aligned, signed, 16 KiB-safe). No AAB was"
+            echo "built, nothing was uploaded to Play, and no GitHub Release exists"
+            echo "for this run."
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # if: always() so the partial record still lands when an earlier step
       # failed -- that is exactly the run whose provenance is worth reading.
