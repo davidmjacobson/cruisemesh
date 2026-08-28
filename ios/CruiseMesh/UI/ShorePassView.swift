@@ -5,6 +5,9 @@ struct ShorePassView: View {
     let initialCard: String?
     @ObservedObject var appModel: AppModel
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    /// The family's own pass state from the relay -- the end date the health
+    /// signal above cannot know. Read once per app session.
+    @ObservedObject private var familyStatus = FamilyStatusStore.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var input: String
@@ -142,6 +145,32 @@ struct ShorePassView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        // When delivery runs to, in the same quiet supporting
+                        // style as everything else here. An ordinary future
+                        // date is not a warning and must never be coloured as
+                        // one; nothing shows at all until the status read
+                        // lands, or for a pass with no end date.
+                        let deliveryThroughMs = ShorePassRenewal.deliveryThroughMs(
+                            status: familyStatus.status,
+                            nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+                        )
+                        if let throughMs = deliveryThroughMs {
+                            Text("Internet delivery through \(ShorePassRenewal.passDate(throughMs))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        // Renewal happens on the site, not in the app -- the
+                        // app never sells a pass, exactly as the empty state
+                        // above says of a first one. The token rides the URL
+                        // fragment so it stays out of every log between here
+                        // and the site.
+                        if ShorePassRenewal.offersRenewal(
+                            health: connectivity.relay,
+                            deliveryThroughMs: deliveryThroughMs
+                        ), let renewURL {
+                            Link("Renew Shore Pass", destination: renewURL)
+                                .font(.subheadline)
+                        }
                     }
                 }
 
@@ -263,6 +292,7 @@ struct ShorePassView: View {
         }
         .onAppear {
             if let initialCard, !initialCard.isEmpty { startSetup(initialCard) }
+            familyStatus.refresh()
         }
         .onDisappear {
             setupTask?.cancel()
@@ -501,6 +531,11 @@ struct ShorePassView: View {
                 case .success:
                     RelayConfigStore.save(relayUrl: setup.relayUrl, relayToken: setup.relayToken)
                     configured = RelayConfig(relayUrl: setup.relayUrl, relayToken: setup.relayToken)
+                    // A different pass has a different end date. The store
+                    // keys its cache by the configuration it read, so this
+                    // replaces the previous family's date rather than leaving
+                    // it on screen.
+                    familyStatus.refresh()
                     showManualEntry = false
                     MeshConnectivityStatus.shared.setRelayHealth(
                         .ok(lastSyncMs: Int64(Date().timeIntervalSince1970 * 1_000))
@@ -550,6 +585,14 @@ struct ShorePassView: View {
         URL(string: value)?.host ?? value
     }
 
+    /// The renewal page for the pass this screen is showing. Built from
+    /// `configured` rather than the saved configuration so it follows a setup
+    /// card pasted moments ago.
+    private var renewURL: URL? {
+        guard let configured else { return nil }
+        return ShorePassRenewal.renewURL(familyToken: configured.relayToken)
+    }
+
     private var passStatus: String {
         if isTesting { return "Checking setup…" }
         switch connectivity.relay {
@@ -590,6 +633,8 @@ struct ShorePassView: View {
             return String(localized: "One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.")
         case .rateLimited:
             return String(localized: "Syncing is slowed right now. Your messages are still queued and will be delivered. It recovers on its own.")
+        case .expired:
+            return String(localized: "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.")
         default:
             return nil
         }

@@ -463,6 +463,33 @@ enum RelayClient {
         return data
     }
 
+    /// Reads this family's own pass state -- plan, expiry, billing state --
+    /// so the pass surface can say when internet delivery runs out and offer a
+    /// renewal before it does.
+    ///
+    /// The one relay read that has to keep answering while the pass is expired
+    /// or suspended: those are exactly the states a person needs to be told
+    /// about, so relayd skips its billing checks for this route alone
+    /// (`FamilyOp::Status`). Member-only -- a deposit credential is refused
+    /// with the same structured 403 as any other member-only op, so
+    /// `FamilyStatusStore` declines to ask on one at all rather than spending
+    /// a round trip to be told -- and it carries the saved member token like
+    /// every other call here.
+    ///
+    /// Shaped like every other GET here: core names the route and decodes the
+    /// body, the shell only carries bytes -- so an unrecognized account state
+    /// is forgiven identically on both platforms rather than in two hand-written
+    /// decoders. Mirrors Android `RelayClient.fetchFamilyStatus`.
+    static func fetchFamilyStatus(config: RelayConfig) throws -> CoreFamilyStatus {
+        let url = try buildURL(config.relayUrl, path: relayFamilyStatusPath())
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = "GET"
+        applyAuth(&request, config: config)
+        let (data, response) = try syncRequest(request)
+        try ensureOK(response, data: data)
+        return try relayDecodeFamilyStatus(body: data)
+    }
+
     private static func postEnvelope(
         config: RelayConfig,
         msgId: Data,

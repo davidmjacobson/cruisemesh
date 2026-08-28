@@ -1041,4 +1041,45 @@ class ConnectionDetailsLogicTest {
         val result = state(people = listOf(person(9, "Blocked", blocked = true)))
         assertFalse(result.hasContacts)
     }
+
+    @Test
+    fun `an expired pass is offered renewal instead of the screen that cannot renew`() {
+        assertEquals(
+            HowToFixAction.RENEW_SHORE_PASS,
+            howToFixAction(CoreHealthReason.PASS_EXPIRED),
+        )
+        assertEquals(
+            HowToFixAction.RENEW_SHORE_PASS,
+            howToFixAction(CoreDeliveryBlockedReason.PASS_EXPIRED),
+        )
+    }
+
+    @Test
+    fun `the faults the pass screen can still repair keep leading there`() {
+        for (reason in listOf(CoreHealthReason.PASS_SUSPENDED, CoreHealthReason.OWN_SETUP_REJECTED)) {
+            assertEquals(reason.name, HowToFixAction.MANAGE_SHORE_PASS, howToFixAction(reason))
+        }
+        for (
+            reason in listOf(
+                CoreDeliveryBlockedReason.PASS_SUSPENDED,
+                CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
+            )
+        ) {
+            assertEquals(reason.name, HowToFixAction.MANAGE_SHORE_PASS, howToFixAction(reason))
+        }
+    }
+
+    @Test
+    fun `faults no pass action repairs still carry no button`() {
+        for (
+            reason in listOf(
+                CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+                CoreDeliveryBlockedReason.STORAGE_FULL,
+                CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
+            )
+        ) {
+            assertEquals(reason.name, HowToFixAction.NONE, howToFixAction(reason))
+        }
+        assertEquals(HowToFixAction.NONE, howToFixAction(CoreHealthReason.MESH_STOPPED))
+    }
 }

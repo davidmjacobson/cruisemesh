@@ -254,15 +254,16 @@ pub use relay_status::{
 };
 pub use relay_wire::{
     core_group_fanout_relay_target, normalize_relay_url, relay_build_fetch_path,
-    relay_contact_shares_own_family, relay_decode_fetch_page, relay_decode_post_response,
-    relay_decode_presence_page, relay_decode_rotate_response, relay_deposit_token_for,
-    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
-    relay_encode_rotate_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
-    relay_max_response_bytes, relay_rotate_path, relay_token_is_deposit,
+    relay_contact_shares_own_family, relay_decode_family_status, relay_decode_fetch_page,
+    relay_decode_post_response, relay_decode_presence_page, relay_decode_rotate_response,
+    relay_deposit_token_for, relay_encode_ack_request, relay_encode_post_envelope,
+    relay_encode_presence_request, relay_encode_rotate_request, relay_family_status_path,
+    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
+    relay_pass_delivery_through_ms, relay_rotate_path, relay_token_is_deposit,
     resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
-    resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
-    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, CoreRelayRotation,
-    GroupRelayMember, RelayEndpoint,
+    resolved_contact_poll_relay, resolved_contact_relay, CoreFamilyPassState, CoreFamilyStatus,
+    CoreRelayFetchPage, CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage,
+    CoreRelayRotation, GroupRelayMember, RelayEndpoint,
 };
 pub use revocation::{
     core_recovery_revoke_roster, core_revoke_devices_roster, core_roster_newly_revoked,

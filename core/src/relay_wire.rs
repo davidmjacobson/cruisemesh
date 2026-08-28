@@ -149,6 +149,22 @@ struct RotateFamilyResponse {
     rotated: bool,
 }
 
+#[derive(Deserialize)]
+struct FamilyStatusResponse {
+    /// `null` for a relay whose families were configured rather than sold --
+    /// a self-hosted deployment has no plan to name. Optional for the same
+    /// reason `expires_ms` is: the only required field is the one every
+    /// answer has.
+    #[serde(default)]
+    plan: Option<String>,
+    /// Absent and `null` mean the same thing -- a pass with no end date -- so
+    /// the field is defaulted rather than required. A relay that stops
+    /// emitting it must not turn a working pass into a decode failure.
+    #[serde(default)]
+    expires_ms: Option<i64>,
+    state: String,
+}
+
 /// CP4 (deposit-token split): class prefix that marks a *deposit* relay
 /// token — post-only into one family's mailbox, minted by attenuating the
 /// family's full member token. The prefix makes the class recognizable from
@@ -940,6 +956,110 @@ pub fn relay_decode_rotate_response(
         envelopes_moved: wire.envelopes_moved,
         rotated: wire.rotated,
     })
+}
+
+// ---------------------------------------------------------------------------
+// What the family's pass says about itself
+// ---------------------------------------------------------------------------
+
+/// Where a pass stands with the service that sold it.
+///
+/// Deliberately not a re-statement of [`CoreRelayFault`](crate::CoreRelayFault):
+/// that is what one HTTP call *just did*, this is what the account says when
+/// asked. A pass can be `Active` and still have a failing sync (no internet),
+/// and it is the only source for the one thing no sync outcome can reveal —
+/// when internet delivery is going to stop.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreFamilyPassState {
+    /// Paid up and inside its term.
+    Active,
+    /// Past its end date, still delivering: the window in which renewing
+    /// costs nobody any mail.
+    Grace,
+    /// Turned off by the service. Renewing is not the remedy; support is.
+    Suspended,
+    /// A state this build has no rule for.
+    ///
+    /// A shipped phone outlives the server it talks to, and the one thing a
+    /// status read must never do is fail closed on a word it does not
+    /// recognize — that would take the end date away from every phone in the
+    /// field the day the service adds a fourth state. Callers treat this as
+    /// "no claim about the account": the fields that were understood still
+    /// stand, and nothing is asserted about the rest.
+    Unknown,
+}
+
+/// What relayd reports about the family's pass (`GET /family/status`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreFamilyStatus {
+    /// The plan the pass was bought on, as the service names it, or `None`
+    /// for a family that was configured rather than sold — a self-hosted
+    /// relay's env-allowlist family has no plan because no pass was ever
+    /// bought for it.
+    pub plan: Option<String>,
+    /// When internet delivery stops, or `None` for a pass with no end date —
+    /// a self-hosted relay, or a plan that does not expire. `None` is not an
+    /// error and not "unknown": it means there is no date to show, so shells
+    /// show nothing rather than inventing one.
+    pub expires_ms: Option<i64>,
+    pub state: CoreFamilyPassState,
+}
+
+/// The path a device reads its family's pass status from.
+///
+/// A function rather than a constant for the same reason as
+/// [`relay_rotate_path`]: both shells route identically and neither
+/// hand-writes the string.
+#[uniffi::export]
+pub fn relay_family_status_path() -> String {
+    "/family/status".to_string()
+}
+
+/// Decode relayd's answer to [`relay_family_status_path`].
+///
+/// Nothing here is trusted enough to act on by itself — this is a read of a
+/// bearer-authenticated route about the caller's own family, so there is no
+/// second party whose claim needs checking, and unlike a rotation the result
+/// is never committed to storage or gossiped. An unrecognized `state` is
+/// [`CoreFamilyPassState::Unknown`] rather than a failure; see that variant.
+#[uniffi::export]
+pub fn relay_decode_family_status(body: Vec<u8>) -> Result<CoreFamilyStatus, CoreError> {
+    validate_response_body(&body)?;
+    let wire = json_decode::<FamilyStatusResponse>(&body)?;
+    Ok(CoreFamilyStatus {
+        plan: wire.plan,
+        expires_ms: wire.expires_ms,
+        state: match wire.state.as_str() {
+            "active" => CoreFamilyPassState::Active,
+            "grace" => CoreFamilyPassState::Grace,
+            "suspended" => CoreFamilyPassState::Suspended,
+            _ => CoreFamilyPassState::Unknown,
+        },
+    })
+}
+
+/// When to tell someone their internet delivery runs through, given the
+/// status and this shell's clock — or `None` for "say nothing".
+///
+/// The rule, so both shells say the same thing on the same day:
+///
+/// - No end date, no line. Nothing is promised about a pass that never said
+///   when it stops.
+/// - A date already past is not a promise either. Grace is real delivery, but
+///   "internet delivery through last Tuesday" reads as a fault to the person
+///   holding the phone, and the expired states already have their own copy.
+/// - A suspended pass makes no claim about delivery at all, whatever date its
+///   row still carries.
+///
+/// [`CoreFamilyPassState::Unknown`] deliberately still shows the date: the end
+/// date is the field the reader came for, and a state word this build cannot
+/// place is no reason to withhold one the server did state plainly.
+#[uniffi::export]
+pub fn relay_pass_delivery_through_ms(status: CoreFamilyStatus, now_ms: i64) -> Option<i64> {
+    if status.state == CoreFamilyPassState::Suspended {
+        return None;
+    }
+    status.expires_ms.filter(|expires| *expires > now_ms)
 }
 
 fn validate_envelope(msg_id: &[u8], hint: &[u8], sealed: &[u8]) -> Result<(), CoreError> {
@@ -1992,5 +2112,107 @@ mod tests {
             true,
         )
         .is_some());
+    }
+
+    fn family_status(body: &str) -> CoreFamilyStatus {
+        relay_decode_family_status(body.as_bytes().to_vec()).expect("decodes")
+    }
+
+    #[test]
+    fn family_status_route_is_named_in_one_place() {
+        assert_eq!(relay_family_status_path(), "/family/status");
+    }
+
+    #[test]
+    fn family_status_decodes_the_three_states_relayd_reports() {
+        let active =
+            family_status(r#"{"plan":"shore","expires_ms":1735689600000,"state":"active"}"#);
+        assert_eq!(active.plan.as_deref(), Some("shore"));
+        assert_eq!(active.expires_ms, Some(1_735_689_600_000));
+        assert_eq!(active.state, CoreFamilyPassState::Active);
+        assert_eq!(
+            family_status(r#"{"plan":"shore","expires_ms":1,"state":"grace"}"#).state,
+            CoreFamilyPassState::Grace
+        );
+        assert_eq!(
+            family_status(r#"{"plan":"shore","expires_ms":1,"state":"suspended"}"#).state,
+            CoreFamilyPassState::Suspended
+        );
+    }
+
+    #[test]
+    fn a_pass_with_no_end_date_decodes_as_no_date_rather_than_as_an_error() {
+        // Both spellings of "there is no date": relayd's null, and a relay
+        // that never emits the field at all.
+        assert_eq!(
+            family_status(r#"{"plan":"self-hosted","expires_ms":null,"state":"active"}"#)
+                .expires_ms,
+            None
+        );
+        assert_eq!(
+            family_status(r#"{"plan":"self-hosted","state":"active"}"#).expires_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_state_keeps_the_rest_of_the_answer() {
+        // The forward-compatibility rule: a phone in the field must not lose
+        // its end date the day the service adds a state word.
+        let status = family_status(r#"{"plan":"shore","expires_ms":42,"state":"paused"}"#);
+        assert_eq!(status.state, CoreFamilyPassState::Unknown);
+        assert_eq!(status.expires_ms, Some(42));
+    }
+
+    #[test]
+    fn a_family_with_no_plan_decodes_as_no_plan_rather_than_as_an_error() {
+        // A self-hosted relay's env-allowlist family has no `families` row, so
+        // relayd reports a null plan for it. That is an ordinary answer about
+        // an ordinary family, not a broken one.
+        let status = family_status(r#"{"plan":null,"expires_ms":null,"state":"active"}"#);
+        assert_eq!(status.plan, None);
+        assert_eq!(status.state, CoreFamilyPassState::Active);
+        assert_eq!(family_status(r#"{"state":"active"}"#).plan, None);
+    }
+
+    #[test]
+    fn family_status_still_refuses_a_body_that_is_not_the_answer() {
+        assert!(relay_decode_family_status(b"not json".to_vec()).is_err());
+        // `state` is the one required field -- every answer has one, and a
+        // body without it is some other route's, not a pass with fields left
+        // out.
+        assert!(relay_decode_family_status(br#"{"expires_ms":1}"#.to_vec()).is_err());
+    }
+
+    #[test]
+    fn delivery_through_is_shown_only_for_a_future_date_on_a_live_pass() {
+        let now = 1_000_000i64;
+        let at = |expires: Option<i64>, state: CoreFamilyPassState| {
+            relay_pass_delivery_through_ms(
+                CoreFamilyStatus {
+                    plan: Some("shore".into()),
+                    expires_ms: expires,
+                    state,
+                },
+                now,
+            )
+        };
+        assert_eq!(
+            at(Some(now + 1), CoreFamilyPassState::Active),
+            Some(now + 1)
+        );
+        // No date, nothing to say -- not "expired".
+        assert_eq!(at(None, CoreFamilyPassState::Active), None);
+        // Grace still delivers, but a date in the past is not a promise.
+        assert_eq!(at(Some(now - 1), CoreFamilyPassState::Grace), None);
+        assert_eq!(at(Some(now), CoreFamilyPassState::Active), None);
+        // A suspended pass makes no delivery claim, whatever date it carries.
+        assert_eq!(at(Some(now + 1), CoreFamilyPassState::Suspended), None);
+        // A state this build cannot place is no reason to withhold a date the
+        // server stated plainly.
+        assert_eq!(
+            at(Some(now + 1), CoreFamilyPassState::Unknown),
+            Some(now + 1)
+        );
     }
 }

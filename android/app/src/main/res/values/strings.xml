@@ -420,6 +420,15 @@
          this is the only screen where a data charge can surprise anyone. Say
          who bills for what before a pass is set up, not after. -->
     <string name="ui_shore_pass_data_note">Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.</string>
+    <!-- Renewal. The end date is stated plainly and in the same quiet style as
+         the rest of the supporting text: a pass that runs until March is not a
+         problem, and dressing an ordinary future date as a warning teaches
+         people to ignore the ones that matter. Shown only while the date is
+         still ahead; a pass with no end date says nothing at all. -->
+    <string name="ui_internet_delivery_through">Internet delivery through %1$s</string>
+    <string name="ui_renew_shore_pass">Renew Shore Pass</string>
+    <string name="ui_renew_shore_pass_detail">Opens cruisemesh.app to renew your family\'s pass.</string>
+    <string name="ui_shore_pass_expired_explanation">Your pass has run out, so messages can\'t travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.</string>
     <string name="ui_relay_deferred_roaming">Waiting for non-roaming internet to avoid roaming charges</string>
     <string name="ui_paste_and_set_up">Paste and set up</string>
     <string name="ui_enter_setup_card_manually">Enter setup card manually</string>
@@ -683,7 +692,7 @@
     <string name="ui_how_to_fix_unknown">CruiseMesh doesn\'t have step-by-step help for this one yet. Open Troubleshooting &amp; diagnostics, share diagnostics, and contact support.</string>
     <string name="ui_how_to_fix_setup_rejected">Shore Pass didn\'t accept this phone\'s saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.</string>
     <string name="ui_how_to_fix_storage_full">Your family\'s Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.</string>
-    <string name="ui_how_to_fix_pass_expired">Your Shore Pass has run out, so messages can\'t travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.</string>
+    <string name="ui_how_to_fix_pass_expired">Your Shore Pass has run out, so messages can\'t travel over the internet right now. Renewing it at cruisemesh.app starts internet delivery again. Messages still reach your friends whenever you are near each other.</string>
     <string name="ui_how_to_fix_pass_suspended">Your Shore Pass has been turned off, so messages can\'t travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.</string>
     <!-- The order-sensitive one. A friend card shared before the friend has
          fixed their own pass carries the same broken setup, so a reader who
