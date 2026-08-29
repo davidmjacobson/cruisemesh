@@ -51,7 +51,7 @@ enum PassIndicator {
         // slow down. Same reaction either way -- none.
         case .failing, .rateLimited: return .attention
         // Persistent, actionable ("!"): these stay until someone acts.
-        case .expired, .suspended, .tokenRejected, .quotaFull, .messageTooLarge:
+        case .expired, .expiredReadOnly, .suspended, .tokenRejected, .quotaFull, .messageTooLarge:
             return .actionRequired
         }
     }

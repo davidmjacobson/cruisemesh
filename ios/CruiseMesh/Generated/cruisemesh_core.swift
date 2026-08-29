@@ -38369,9 +38369,14 @@ public enum CoreHealthReason {
      */
     case passSuspended
     /**
-     * Our pass has lapsed.
+     * Our pass has lapsed and the service now refuses everything.
      */
     case passExpired
+    /**
+     * Our pass has lapsed but is still in the read-only grace window: mail
+     * already on its way still arrives, new sends over the internet do not.
+     */
+    case passExpiredReadOnly
     /**
      * Our own saved setup was rejected.
      */
@@ -38418,17 +38423,19 @@ public struct FfiConverterTypeCoreHealthReason: FfiConverterRustBuffer {
         
         case 4: return .passExpired
         
-        case 5: return .ownSetupRejected
+        case 5: return .passExpiredReadOnly
         
-        case 6: return .storageFull
+        case 6: return .ownSetupRejected
         
-        case 7: return .shorePassUnreachable
+        case 7: return .storageFull
         
-        case 8: return .waitingForInternet
+        case 8: return .shorePassUnreachable
         
-        case 9: return .shorePassSlowed
+        case 9: return .waitingForInternet
         
-        case 10: return .noPathAvailable
+        case 10: return .shorePassSlowed
+        
+        case 11: return .noPathAvailable
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -38454,28 +38461,32 @@ public struct FfiConverterTypeCoreHealthReason: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .ownSetupRejected:
+        case .passExpiredReadOnly:
             writeInt(&buf, Int32(5))
         
         
-        case .storageFull:
+        case .ownSetupRejected:
             writeInt(&buf, Int32(6))
         
         
-        case .shorePassUnreachable:
+        case .storageFull:
             writeInt(&buf, Int32(7))
         
         
-        case .waitingForInternet:
+        case .shorePassUnreachable:
             writeInt(&buf, Int32(8))
         
         
-        case .shorePassSlowed:
+        case .waitingForInternet:
             writeInt(&buf, Int32(9))
         
         
-        case .noPathAvailable:
+        case .shorePassSlowed:
             writeInt(&buf, Int32(10))
+        
+        
+        case .noPathAvailable:
+            writeInt(&buf, Int32(11))
         
         }
     }
@@ -40981,9 +40992,22 @@ public enum CoreRelayPassHealth {
      */
     case rateLimited
     /**
-     * 403 `family_expired`.
+     * 403 `family_expired` on a pass that could not fetch either: relayd's
+     * grace window is over and every operation is refused.
      */
     case expired
+    /**
+     * 403 `family_expired` on a pass whose own mailbox still answered: the
+     * read-only grace window. Envelopes queued for us keep arriving and keep
+     * being acked; only new posts take the 403.
+     *
+     * Split out from [`CoreRelayPassHealth::Expired`] because the two need
+     * different sentences. Folded together, a family inside the window was
+     * told their pass had stopped working while their friends' messages were
+     * visibly still landing, which reads as the app being half-broken rather
+     * than as a pass that needs renewing.
+     */
+    case expiredReadOnly
     /**
      * 403 `family_suspended`.
      */
@@ -41019,11 +41043,13 @@ public struct FfiConverterTypeCoreRelayPassHealth: FfiConverterRustBuffer {
         
         case 5: return .expired
         
-        case 6: return .suspended
+        case 6: return .expiredReadOnly
         
-        case 7: return .tokenRejected
+        case 7: return .suspended
         
-        case 8: return .failing
+        case 8: return .tokenRejected
+        
+        case 9: return .failing
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -41053,16 +41079,20 @@ public struct FfiConverterTypeCoreRelayPassHealth: FfiConverterRustBuffer {
             writeInt(&buf, Int32(5))
         
         
-        case .suspended:
+        case .expiredReadOnly:
             writeInt(&buf, Int32(6))
         
         
-        case .tokenRejected:
+        case .suspended:
             writeInt(&buf, Int32(7))
         
         
-        case .failing:
+        case .tokenRejected:
             writeInt(&buf, Int32(8))
+        
+        
+        case .failing:
+            writeInt(&buf, Int32(9))
         
         }
     }
@@ -41253,9 +41283,20 @@ public enum CoreRelayPathState {
      */
     case unreachable
     /**
-     * Our pass has lapsed.
+     * Our pass has lapsed and the service now refuses everything.
      */
     case passExpired
+    /**
+     * Our pass has lapsed, but it is still inside the service's read-only
+     * grace window: mail already queued for us keeps arriving, and only new
+     * sends over the internet are refused.
+     *
+     * A separate row rather than a footnote on [`Self::PassExpired`] because
+     * the two states look different to the person holding the phone --
+     * messages keep landing in one and not in the other -- and a page that
+     * gave them the same sentence was describing the wrong one half the time.
+     */
+    case passExpiredReadOnly
     /**
      * Our pass was turned off by the operator.
      */
@@ -41298,13 +41339,15 @@ public struct FfiConverterTypeCoreRelayPathState: FfiConverterRustBuffer {
         
         case 6: return .passExpired
         
-        case 7: return .passSuspended
+        case 7: return .passExpiredReadOnly
         
-        case 8: return .setupRejected
+        case 8: return .passSuspended
         
-        case 9: return .storageFull
+        case 9: return .setupRejected
         
-        case 10: return .syncingSlowed
+        case 10: return .storageFull
+        
+        case 11: return .syncingSlowed
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -41338,20 +41381,24 @@ public struct FfiConverterTypeCoreRelayPathState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
         
         
-        case .passSuspended:
+        case .passExpiredReadOnly:
             writeInt(&buf, Int32(7))
         
         
-        case .setupRejected:
+        case .passSuspended:
             writeInt(&buf, Int32(8))
         
         
-        case .storageFull:
+        case .setupRejected:
             writeInt(&buf, Int32(9))
         
         
-        case .syncingSlowed:
+        case .storageFull:
             writeInt(&buf, Int32(10))
+        
+        
+        case .syncingSlowed:
+            writeInt(&buf, Int32(11))
         
         }
     }
@@ -53385,6 +53432,15 @@ public func coreRelayPassDefaultBudgets() -> CoreRelayPassBudgets {
  * an unknown token, so neither can co-occur with a successful poll at all.
  * Expiry-in-grace is the only credential fault that can, which is why it is
  * the only one that moves.
+ *
+ * The success flags then separate the two expiry shapes. A pass that took the
+ * 403 on its posts and still got its own mailbox answered is inside the grace
+ * window ([`CoreRelayPassHealth::ExpiredReadOnly`]); one that got nothing at
+ * all is past it ([`CoreRelayPassHealth::Expired`]). That distinction is
+ * derived here rather than read off the wire on purpose: relayd returns the
+ * same 403 and the same `family_expired` code either way, deliberately, so
+ * that clients need exactly one renewal flow — the asymmetry a person can
+ * actually see is which requests worked, and that is what this reads.
  */
 public func coreRelayPassHealth(fault: CoreRelayFault?, ownRelaySucceeded: Bool, anyRelaySucceeded: Bool) -> CoreRelayPassHealth {
     return try!  FfiConverterTypeCoreRelayPassHealth.lift(try! rustCall() {
@@ -57349,7 +57405,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_default_budgets() != 26530) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_health() != 29254) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_health() != 41335) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_queue_reflects_delivery() != 16350) {

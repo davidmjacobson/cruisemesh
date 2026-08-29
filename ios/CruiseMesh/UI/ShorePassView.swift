@@ -565,6 +565,8 @@ struct ShorePassView: View {
             return "Service unavailable · try again later"
         case .expired:
             return "Pass expired · renewal required"
+        case .expiredReadOnly:
+            return String(localized: "Pass expired · still receiving")
         case .suspended:
             return "Pass suspended · contact support"
         case .tokenRejected:
@@ -584,6 +586,8 @@ struct ShorePassView: View {
     /// own.
     private var passStatusExplanation: String? {
         switch connectivity.relay {
+        case .expiredReadOnly:
+            return String(localized: "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until you renew the pass.")
         case .quotaFull:
             return String(localized: "The space that holds your family’s waiting messages is full. Delivery resumes as your family’s phones collect their messages, or as older ones expire. If it stays full, contact support@cruisemesh.app.")
         case .messageTooLarge:

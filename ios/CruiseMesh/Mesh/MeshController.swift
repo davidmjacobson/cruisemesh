@@ -6096,6 +6096,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
         case .expired: return .expired(lastAttemptMs: nowMs)
+        case .expiredReadOnly: return .expiredReadOnly(lastAttemptMs: nowMs)
         case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         case .failing: return .failing(lastAttemptMs: nowMs)
