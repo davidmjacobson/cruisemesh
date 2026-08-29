@@ -308,6 +308,67 @@ pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
 /// this on any realistic itinerary while still bounding the $4 VPS's disk.
 pub const DEFAULT_FAMILY_QUOTA_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Percentage of a family's storage quota that *all* deposit-class rows
+/// combined may occupy at once.
+///
+/// The quota above is a single family-wide pool, and before this constant
+/// existed a deposit-class post drew on it exactly like a member-class one.
+/// That is fine as an accounting rule and wrong as a fairness rule: a
+/// family's deposit credential is stamped onto every friend card it has ever
+/// handed out, so the pool the family's own phones depend on could be filled
+/// entirely by traffic none of those phones sent — after which the family's
+/// own posts start failing too, and keep failing until the deposited rows
+/// age out (up to [`MAX_DEPOSIT_RETENTION_MS`] later).
+///
+/// Reserving half the pool for member-class traffic is the smallest rule
+/// that makes that impossible. The reservation is one-sided: member-class
+/// posts still see the *whole* quota, so a family whose friends post nothing
+/// is unaffected, and a family whose friends post constantly still has half
+/// a mailbox of its own. Half is deliberately generous rather than minimal —
+/// friend traffic is traffic the family wants, and 128 MiB of it is ~700
+/// max-size attachments, well past a cruise's worth of friend photos.
+pub const DEPOSIT_QUOTA_TOTAL_PERCENT: u64 = 50;
+
+/// Percentage of a family's storage quota that any *one* depositor may
+/// occupy, checked in addition to [`DEPOSIT_QUOTA_TOTAL_PERCENT`].
+///
+/// The aggregate share protects the family from its friends; this one
+/// protects the friends from each other. Without it the first depositor to
+/// fill the deposit half shuts out every other depositor, which is the same
+/// starvation one level down. A quarter means it takes at least two
+/// depositors to reach the aggregate ceiling, and four before any single one
+/// of them could have been the whole cause.
+///
+/// It is a percentage of the *quota*, not of the aggregate share, so the two
+/// numbers can be read directly against each other. Shares deliberately do
+/// **not** shrink as depositors arrive: a share divided by a live depositor
+/// count would let any credential holder shrink everyone else's allowance
+/// just by inventing depositors, and would make an honest friend's admission
+/// depend on strangers. Fixed shares oversubscribe instead (four depositors
+/// at a quarter each sum to the whole quota), which is exactly why the
+/// aggregate ceiling above exists and is checked as well — the sum of the
+/// shares can never become a family lockout, because the family's half is
+/// never on offer to any of them.
+pub const DEPOSIT_QUOTA_PER_DEPOSITOR_PERCENT: u64 = 25;
+
+/// `value * percent / 100`, computed in `u128` so a large quota cannot
+/// overflow the multiplication before the division brings it back in range.
+fn percent_of(value: u64, percent: u64) -> u64 {
+    ((u128::from(value) * u128::from(percent)) / 100) as u64
+}
+
+/// Ceiling on the sealed bytes all deposit-class rows together may hold for
+/// a family whose storage quota is `family_quota_bytes`.
+pub fn deposit_total_share_bytes(family_quota_bytes: u64) -> u64 {
+    percent_of(family_quota_bytes, DEPOSIT_QUOTA_TOTAL_PERCENT)
+}
+
+/// Ceiling on the sealed bytes one depositor may hold for a family whose
+/// storage quota is `family_quota_bytes`.
+pub fn deposit_per_depositor_share_bytes(family_quota_bytes: u64) -> u64 {
+    percent_of(family_quota_bytes, DEPOSIT_QUOTA_PER_DEPOSITOR_PERCENT)
+}
+
 /// Abuse protection (`DEPLOY.md` §10): default sustained request allowance
 /// for one family token, configurable via
 /// `CRUISEMESH_RELAY_RATE_REQUESTS_PER_MIN`.
@@ -1505,6 +1566,35 @@ pub struct StoredPresence {
     pub last_seen_ms: i64,
 }
 
+/// Which deposit-class ceiling an admission ran into.
+///
+/// The distinction is the whole point of reporting it: "your own share is
+/// full" is a condition the depositor caused and can fix (stop posting, or
+/// wait for its own rows to age out), while "the family's deposit half is
+/// full" is a condition other depositors caused, which this one can do
+/// nothing about but wait through. Both are strictly different from the
+/// family mailbox genuinely being full, which is what
+/// [`QuotaInsertResult::QuotaExceeded`] means and is the only one of the
+/// three the family's own devices can ever see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepositShareScope {
+    /// This depositor alone is at [`DEPOSIT_QUOTA_PER_DEPOSITOR_PERCENT`].
+    Depositor,
+    /// Deposit-class rows together are at [`DEPOSIT_QUOTA_TOTAL_PERCENT`].
+    AllDepositors,
+}
+
+impl DepositShareScope {
+    /// Stable wire discriminant for the structured API error, so a client can
+    /// tell the two apart without parsing prose.
+    fn code(self) -> &'static str {
+        match self {
+            DepositShareScope::Depositor => "depositor_share_exceeded",
+            DepositShareScope::AllDepositors => "deposit_share_exceeded",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum QuotaInsertResult {
     Stored {
@@ -1512,6 +1602,19 @@ pub enum QuotaInsertResult {
     },
     QuotaExceeded {
         usage_bytes: u64,
+    },
+    /// A deposit-class post that the family mailbox has room for, but that
+    /// its depositor's share (or the deposit-class share as a whole) does
+    /// not. Deliberately distinct from [`QuotaInsertResult::QuotaExceeded`]:
+    /// the mailbox is not full, so telling the depositor it is would be a
+    /// lie, and would send the family looking for a backlog to drain that
+    /// draining would not fix. Member-class posts can never produce this.
+    DepositShareExceeded {
+        scope: DepositShareScope,
+        /// Bytes already stored under the ceiling that rejected this post.
+        usage_bytes: u64,
+        /// The ceiling itself.
+        share_bytes: u64,
     },
     /// A row with this `(family_token, msg_id)` already exists carrying
     /// *different* sealed bytes. The stored (first) row is authoritative and
@@ -1673,6 +1776,12 @@ impl RelayStore {
         // plus a backfill of the id, so an already-deployed database gains
         // both on the next restart with no operator step and no downtime.
         migrate_families_rotation_authority(&conn)?;
+        // Per-depositor quota accounting: one additive `envelopes` column
+        // whose constant default reads every pre-existing row as member
+        // class, so a deployed database gains the column on the next restart
+        // without a backfill, without a row rewrite, and with no envelope at
+        // risk.
+        migrate_envelopes_depositor(&conn)?;
         Ok(Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
         })
@@ -1781,9 +1890,18 @@ impl RelayStore {
         Ok(InsertOutcome::Stored { id })
     }
 
-    /// Atomically admit a new row under the per-family sealed-byte quota.
+    /// Atomically admit a new row under the per-family sealed-byte quota and,
+    /// for a deposit-class post, its depositor's fair share of that quota.
     /// The dedupe check, usage calculation, optional expiry pruning, and insert
     /// all run while holding one store lock and one SQLite transaction.
+    ///
+    /// `depositor` is the accounting identity the row is charged to: `None`
+    /// for a member-class post (the family's own devices, which keep the full
+    /// quota and are the only class that can be told the mailbox is full),
+    /// `Some(key)` for a deposit-class one, where `key` is the deposit
+    /// credential that authorized it. The stored column is the *first*
+    /// writer's: a dedupe re-post never re-attributes an existing row, for
+    /// the same first-writer reason its sealed bytes are never rewritten.
     // Kept parallel to `insert_envelope`: quota admission must receive the
     // same individual stored columns plus its family-level quota.
     #[allow(clippy::too_many_arguments)]
@@ -1797,6 +1915,7 @@ impl RelayStore {
         expiry_ms: i64,
         created_at_ms: i64,
         family_quota_bytes: u64,
+        depositor: Option<&str>,
     ) -> Result<QuotaInsertResult, String> {
         if sealed.len() > MAX_ENVELOPE_SEALED_BYTES {
             return Err(format!(
@@ -1840,21 +1959,29 @@ impl RelayStore {
         }
 
         let candidate_bytes = sealed.len() as u64;
-        let mut usage_bytes = family_sealed_bytes_on(&tx, family_token)?;
-        if usage_bytes.saturating_add(candidate_bytes) > family_quota_bytes {
+        // Prune-then-recheck, exactly as before, but now driven by whichever
+        // of the ceilings actually rejected: expired rows free space under
+        // every one of them, and a deposit share that is only full of rows
+        // past their (much shorter, MAX_DEPOSIT_RETENTION_MS) life must not
+        // reject a post the prune would have made room for.
+        let mut usage = quota_usage_on(&tx, family_token, depositor)?;
+        let mut rejection = quota_rejection(&usage, candidate_bytes, family_quota_bytes, depositor);
+        if rejection.is_some() {
             prune_expired_on(&tx, created_at_ms)?;
-            usage_bytes = family_sealed_bytes_on(&tx, family_token)?;
+            usage = quota_usage_on(&tx, family_token, depositor)?;
+            rejection = quota_rejection(&usage, candidate_bytes, family_quota_bytes, depositor);
         }
-        if usage_bytes.saturating_add(candidate_bytes) > family_quota_bytes {
+        if let Some(rejection) = rejection {
             tx.commit().map_err(|e| e.to_string())?;
-            return Ok(QuotaInsertResult::QuotaExceeded { usage_bytes });
+            return Ok(rejection);
         }
 
         let id = tx
             .query_row(
                 "INSERT INTO envelopes
-                    (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms, created_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    (family_token, msg_id, hop_ttl, recipient_hint, sealed, expiry_ms,
+                     created_at_ms, depositor)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  RETURNING id",
                 params![
                     family_token,
@@ -1864,6 +1991,7 @@ impl RelayStore {
                     sealed,
                     expiry_ms,
                     created_at_ms,
+                    depositor.unwrap_or(MEMBER_DEPOSITOR),
                 ],
                 |row| row.get(0),
             )
@@ -2880,6 +3008,114 @@ fn family_sealed_bytes_on(conn: &Connection, family_token: &str) -> Result<u64, 
     Ok(total.flatten().unwrap_or(0) as u64)
 }
 
+/// The `envelopes.depositor` value that means "posted by the family itself".
+///
+/// The empty string rather than SQL NULL, deliberately: it is a valid
+/// `DEFAULT` for `ALTER TABLE ... ADD COLUMN ... NOT NULL`, which is what
+/// lets the migration land on a live database without rewriting a single
+/// existing row, and it keeps `depositor <> ''` a plain indexable predicate
+/// instead of three-valued-logic. A deposit credential can never collide
+/// with it — every one of them carries [`DEPOSIT_TOKEN_PREFIX`].
+const MEMBER_DEPOSITOR: &str = "";
+
+/// The three sealed-byte figures an admission decision needs.
+///
+/// `deposit_bytes` and `depositor_bytes` are only populated for a
+/// deposit-class post; a member-class one is checked against the family
+/// total alone, so the two extra `SUM()`s are not run at all for it and the
+/// hot path for a family's own devices costs exactly what it did before.
+struct QuotaUsage {
+    family_bytes: u64,
+    deposit_bytes: u64,
+    depositor_bytes: u64,
+}
+
+fn sealed_bytes_sum_on(
+    conn: &Connection,
+    sql: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<u64, String> {
+    let total: Option<Option<i64>> = conn
+        .query_row(sql, args, |row| row.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(total.flatten().unwrap_or(0) as u64)
+}
+
+fn quota_usage_on(
+    conn: &Connection,
+    family_token: &str,
+    depositor: Option<&str>,
+) -> Result<QuotaUsage, String> {
+    let family_bytes = family_sealed_bytes_on(conn, family_token)?;
+    let Some(depositor) = depositor else {
+        return Ok(QuotaUsage {
+            family_bytes,
+            deposit_bytes: 0,
+            depositor_bytes: 0,
+        });
+    };
+    let deposit_bytes = sealed_bytes_sum_on(
+        conn,
+        "SELECT SUM(LENGTH(sealed)) FROM envelopes
+         WHERE family_token = ?1 AND depositor <> ''",
+        &[&family_token],
+    )?;
+    let depositor_bytes = sealed_bytes_sum_on(
+        conn,
+        "SELECT SUM(LENGTH(sealed)) FROM envelopes
+         WHERE family_token = ?1 AND depositor = ?2",
+        &[&family_token, &depositor],
+    )?;
+    Ok(QuotaUsage {
+        family_bytes,
+        deposit_bytes,
+        depositor_bytes,
+    })
+}
+
+/// Decide whether a candidate row is admissible, and if not, which ceiling
+/// said no.
+///
+/// Order is the reporting order, not just an evaluation order. The family
+/// quota is checked first because when the mailbox really is full that is
+/// the true and actionable answer for anyone — a share rejection would send
+/// the depositor away waiting for space that draining the family's backlog
+/// is what actually frees. Within the deposit ceilings the depositor's own
+/// share comes first: it is the tighter bound and the more specific
+/// diagnosis, so a depositor is only ever told "the deposit share is full"
+/// when other depositors are genuinely the reason.
+fn quota_rejection(
+    usage: &QuotaUsage,
+    candidate_bytes: u64,
+    family_quota_bytes: u64,
+    depositor: Option<&str>,
+) -> Option<QuotaInsertResult> {
+    if usage.family_bytes.saturating_add(candidate_bytes) > family_quota_bytes {
+        return Some(QuotaInsertResult::QuotaExceeded {
+            usage_bytes: usage.family_bytes,
+        });
+    }
+    depositor?;
+    let per_depositor = deposit_per_depositor_share_bytes(family_quota_bytes);
+    if usage.depositor_bytes.saturating_add(candidate_bytes) > per_depositor {
+        return Some(QuotaInsertResult::DepositShareExceeded {
+            scope: DepositShareScope::Depositor,
+            usage_bytes: usage.depositor_bytes,
+            share_bytes: per_depositor,
+        });
+    }
+    let total_share = deposit_total_share_bytes(family_quota_bytes);
+    if usage.deposit_bytes.saturating_add(candidate_bytes) > total_share {
+        return Some(QuotaInsertResult::DepositShareExceeded {
+            scope: DepositShareScope::AllDepositors,
+            usage_bytes: usage.deposit_bytes,
+            share_bytes: total_share,
+        });
+    }
+    None
+}
+
 /// FR7: `SCHEMA`'s leading `PRAGMA auto_vacuum = INCREMENTAL` only takes
 /// effect on a database with *no tables yet* -- for a brand-new
 /// `RelayStore::open`, that pragma runs (as the first statement of the
@@ -2928,7 +3164,7 @@ fn ensure_incremental_auto_vacuum(conn: &Connection) -> Result<(), String> {
 ///    `SCHEMA` because on a pre-CP4 database `SCHEMA` runs before the column
 ///    exists.
 fn migrate_families_deposit_token(conn: &Connection) -> Result<(), String> {
-    let has_column = families_has_column(conn, "deposit_token")?;
+    let has_column = table_has_column(conn, "families", "deposit_token")?;
     if !has_column {
         conn.execute("ALTER TABLE families ADD COLUMN deposit_token TEXT", [])
             .map_err(|e| e.to_string())?;
@@ -2964,13 +3200,17 @@ fn migrate_families_deposit_token(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the `families` table already has a given column. Pulled out
-/// because every additive migration here starts with the same question, and
-/// `PRAGMA table_info` returning the name in column 1 is exactly the kind of
-/// detail that gets copied wrong the third time.
-fn families_has_column(conn: &Connection, column: &str) -> Result<bool, String> {
+/// Whether a table already has a given column. Pulled out because every
+/// additive migration here starts with the same question, and `PRAGMA
+/// table_info` returning the name in column 1 is exactly the kind of detail
+/// that gets copied wrong the third time.
+///
+/// `table` is interpolated into the pragma because SQLite does not bind
+/// identifiers; every caller passes a literal from this file, never anything
+/// request-derived.
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info(families)")
+        .prepare(&format!("PRAGMA table_info({table})"))
         .map_err(|e| e.to_string())?;
     let present = stmt
         .query_map([], |row| row.get::<_, String>(1))
@@ -3001,11 +3241,11 @@ fn families_has_column(conn: &Connection, column: &str) -> Result<bool, String> 
 /// that predates this change is in that state, and the first rotation each
 /// one performs is what registers its key.
 fn migrate_families_rotation_authority(conn: &Connection) -> Result<(), String> {
-    if !families_has_column(conn, "family_id")? {
+    if !table_has_column(conn, "families", "family_id")? {
         conn.execute("ALTER TABLE families ADD COLUMN family_id TEXT", [])
             .map_err(|e| e.to_string())?;
     }
-    if !families_has_column(conn, "rotation_pk")? {
+    if !table_has_column(conn, "families", "rotation_pk")? {
         conn.execute("ALTER TABLE families ADD COLUMN rotation_pk BLOB", [])
             .map_err(|e| e.to_string())?;
     }
@@ -3035,6 +3275,53 @@ fn migrate_families_rotation_authority(conn: &Connection) -> Result<(), String> 
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_families_family_id
              ON families(family_id);",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Additive migration for per-depositor quota accounting, following the same
+/// pattern as every schema change before it (idempotent, self-applying, safe
+/// on a deployed database, no operator step):
+///
+/// 1. `ALTER TABLE envelopes ADD COLUMN depositor TEXT NOT NULL DEFAULT ''`
+///    when the column is missing. `SCHEMA`'s `CREATE TABLE IF NOT EXISTS` is
+///    a no-op on an existing database and cannot add columns, so this is the
+///    only path by which a live relay grows it. A constant `DEFAULT` is what
+///    makes `NOT NULL` legal in an `ADD COLUMN` at all, and it means SQLite
+///    records the new column in the schema and synthesizes the default on
+///    read: **no existing row is rewritten, moved, or deleted**, so no
+///    envelope can be lost by applying this, and nothing needs backfilling
+///    afterwards.
+/// 2. An index on `(family_token, depositor)` so the two extra `SUM()`s a
+///    deposit-class admission runs can seek their rows instead of walking
+///    every row the family owns. Created here rather than in `SCHEMA`
+///    because on a pre-migration database `SCHEMA` runs before the column
+///    exists.
+///
+/// The migration default is deliberately **member class**
+/// ([`MEMBER_DEPOSITOR`]) for every row that predates it, which is the only
+/// safe reading of rows posted before the relay recorded who deposited them.
+/// Guessing "deposit" instead would retroactively charge a family's existing
+/// friend mail against a share that did not exist when it was posted, and
+/// could put that family's friends over their ceiling the moment the process
+/// restarts — rejecting posts on account of history rather than behavior.
+/// Reading them as member class costs nothing: the family quota still bounds
+/// the total exactly as it does today, and the misattribution ages out on
+/// its own within [`MAX_DEPOSIT_RETENTION_MS`], the longest any such row can
+/// still be alive.
+fn migrate_envelopes_depositor(conn: &Connection) -> Result<(), String> {
+    if !table_has_column(conn, "envelopes", "depositor")? {
+        conn.execute(
+            "ALTER TABLE envelopes ADD COLUMN depositor TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        info!("migration: envelopes.depositor added; existing rows read as member class");
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_envelopes_family_depositor
+             ON envelopes(family_token, depositor);",
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -3329,6 +3616,10 @@ async fn post_envelope(
     // Per-family quota override (hosted families) falls back to the server
     // default inside `authorize_family`; FR8 keeps the write off the reactor.
     let family_quota_bytes = access.quota_bytes;
+    // The storage-accounting identity: None for the family's own devices
+    // (full quota), the presented deposit credential for a friend-card post
+    // (its share of that quota). See `FamilyAccess::depositor`.
+    let insert_depositor = access.depositor.clone();
     let result = state
         .store
         .run_blocking(move |store| {
@@ -3341,6 +3632,7 @@ async fn post_envelope(
                 expiry_ms_req,
                 now,
                 family_quota_bytes,
+                insert_depositor.as_deref(),
             )
         })
         .await
@@ -3356,6 +3648,31 @@ async fn post_envelope(
             );
             return Err(ApiError::family_quota_exceeded(
                 usage_bytes,
+                access.quota_bytes,
+            ));
+        }
+        QuotaInsertResult::DepositShareExceeded {
+            scope,
+            usage_bytes,
+            share_bytes,
+        } => {
+            // Logged at warn like the other rejections, but never with the
+            // depositing credential itself (FR2): a deposit token is
+            // semi-public and belongs in `families`, not in a log line. The
+            // scope is what an operator actually needs — it says whether one
+            // card is running hot or the family's friends collectively are.
+            warn!(
+                family = %token_prefix(&family_token),
+                scope = ?scope,
+                usage_bytes,
+                share_bytes,
+                quota_bytes = access.quota_bytes,
+                "envelope rejected: deposit-class share exceeded (507)"
+            );
+            return Err(ApiError::deposit_share_exceeded(
+                scope,
+                usage_bytes,
+                share_bytes,
                 access.quota_bytes,
             ));
         }
@@ -4711,6 +5028,29 @@ struct FamilyAccess {
     /// static-allowlist fallback.
     family_key: String,
     quota_bytes: u64,
+    /// The storage-accounting identity a post by this caller is charged to:
+    /// `None` for member class (the family itself, which keeps the full
+    /// quota), `Some(credential)` for deposit class.
+    ///
+    /// It is the *presented* credential rather than the resolved member
+    /// token, because the resolved token is the same for every friend and
+    /// would collapse every depositor into one. Today one deposit credential
+    /// per family means that collapse happens anyway — a family stamps one
+    /// derived deposit token onto every card it hands out, so the relay
+    /// genuinely cannot tell one friend from another, and the honest
+    /// enforceable unit of fairness is the credential, not the person
+    /// holding it. Keying the accounting on the credential is what makes
+    /// that a property of the *credential model* rather than of this code:
+    /// the day friend cards carry per-friend deposit credentials, each one
+    /// gets its own share here with no further change.
+    ///
+    /// `POST /family/rotate` retires every outstanding friend card, so the
+    /// keys of rows deposited before a rotation name credentials that no
+    /// longer authenticate. Their bytes keep counting against the family
+    /// quota (nothing is lost or hidden) but stop counting against any live
+    /// depositor's share, which is the right answer: those depositors cannot
+    /// post again, and the family's remedy was the rotation.
+    depositor: Option<String>,
 }
 
 /// The stable per-family key the rate buckets and the WS semaphore use.
@@ -4772,6 +5112,7 @@ async fn authorize_family(
             rate_key: family_rate_key(TokenClass::Member, token),
             family_key: token.to_string(),
             quota_bytes: state.family_quota_bytes,
+            depositor: None,
         });
     }
     if let Some(member) = state.static_deposit_tokens.get(token) {
@@ -4784,6 +5125,7 @@ async fn authorize_family(
             token: member.clone(),
             class: TokenClass::Deposit,
             quota_bytes: state.family_quota_bytes,
+            depositor: Some(token.to_string()),
         });
     }
     // FR8: the families lookup is a store read on the request hot path --
@@ -4821,6 +5163,10 @@ async fn authorize_family(
         class,
         rate_key: family_rate_key(class, &family_key),
         family_key,
+        depositor: match class {
+            TokenClass::Member => None,
+            TokenClass::Deposit => Some(token.to_string()),
+        },
     })
 }
 
@@ -5128,6 +5474,47 @@ impl ApiError {
         }
     }
 
+    /// A deposit-class post the family mailbox has room for, but that its
+    /// depositor's fair share of that mailbox does not.
+    ///
+    /// The status stays 507 on purpose. It is the honest status — the server
+    /// understood the request and will not store the result — and it is what
+    /// keeps this safe for clients that predate it: `core`'s classifier falls
+    /// back to the status when it does not recognize a `code`, so an older
+    /// app reads this exactly as it reads a full mailbox today (a persistent
+    /// storage condition, envelope stays queued for retry), which is the
+    /// correct degrade rather than a guess.
+    ///
+    /// What must never be reused is the *code*. `family_quota_exceeded` means
+    /// "this mailbox is full", a claim about the family that a depositor
+    /// hitting its own share would be making falsely: the family's own
+    /// devices can still post, and no amount of draining by the family
+    /// changes this depositor's answer. Two distinct codes, one per
+    /// [`DepositShareScope`], let a client say which of the three actually
+    /// happened, and let an operator reading logs tell "the family filled its
+    /// mailbox" from "one friend card is running hot" without inference.
+    fn deposit_share_exceeded(
+        scope: DepositShareScope,
+        usage_bytes: u64,
+        share_bytes: u64,
+        quota_bytes: u64,
+    ) -> Self {
+        let subject = match scope {
+            DepositShareScope::Depositor => "this deposit credential's share of",
+            DepositShareScope::AllDepositors => "the deposit-class share of",
+        };
+        Self {
+            status: StatusCode::INSUFFICIENT_STORAGE,
+            message: format!(
+                "{subject} the family mailbox is full: {usage_bytes} bytes used of a \
+                 {share_bytes}-byte share ({quota_bytes}-byte family quota, expired rows \
+                 already pruned). The family mailbox itself is not full."
+            ),
+            code: Some(scope.code()),
+            retry_after_secs: None,
+        }
+    }
+
     /// A row with this `(family_token, msg_id)` already holds *different*
     /// sealed content. The stored row is the first writer and is authoritative;
     /// the relay is content-agnostic and cannot know which post is genuine, so
@@ -5181,6 +5568,7 @@ CREATE TABLE IF NOT EXISTS envelopes (
     sealed         BLOB NOT NULL,
     expiry_ms      INTEGER NOT NULL,
     created_at_ms  INTEGER NOT NULL,
+    depositor      TEXT NOT NULL DEFAULT '',
     UNIQUE(family_token, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_envelopes_family_hint_id
@@ -7194,6 +7582,237 @@ mod tests {
         );
     }
 
+    /// Shares are a fixed percentage of whatever quota a family has, so a
+    /// per-family override scales both of them and the two always sit in the
+    /// documented order.
+    #[test]
+    fn deposit_shares_are_fractions_of_the_family_quota() {
+        for quota in [400u64, 1_000, DEFAULT_FAMILY_QUOTA_BYTES, u64::MAX] {
+            let per_depositor = deposit_per_depositor_share_bytes(quota);
+            let total = deposit_total_share_bytes(quota);
+            assert!(per_depositor <= total, "quota {quota}");
+            assert!(total < quota, "quota {quota}");
+        }
+        assert_eq!(deposit_per_depositor_share_bytes(400), 100);
+        assert_eq!(deposit_total_share_bytes(400), 200);
+        // Wide quotas must not overflow the percentage arithmetic.
+        assert_eq!(deposit_total_share_bytes(u64::MAX), u64::MAX / 2);
+    }
+
+    /// The availability property this exists for: a friend card holding a
+    /// family's deposit credential cannot fill that family's mailbox and
+    /// leave the family's own phones unable to post.
+    #[tokio::test]
+    async fn one_depositor_cannot_spend_the_familys_whole_quota() {
+        let app = admin_app();
+        // 400-byte quota => 100-byte per-depositor share, 200-byte deposit
+        // share in total.
+        let response = app
+            .clone()
+            .oneshot(admin_json(
+                "POST",
+                "/admin/families",
+                serde_json::json!({"token": "fam-share", "quota_bytes": 400}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let deposit = deposit_token_for("fam-share");
+
+        // First friend-card post is comfortably inside the share.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request(&deposit, 1, 80))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // The second would put this depositor at 160 of its 100-byte share.
+        // It is refused with its own code -- the mailbox is 320 bytes short
+        // of full, so calling this `family_quota_exceeded` would be false.
+        let response = app
+            .clone()
+            .oneshot(envelope_request(&deposit, 2, 80))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "depositor_share_exceeded");
+
+        // ...and the family itself still reaches its full quota, which is the
+        // whole point: 80 deposited + 300 of its own = 380 of 400.
+        assert_eq!(
+            app.clone()
+                .oneshot(envelope_request("fam-share", 3, 300))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        // Only when the mailbox is genuinely full does anyone hear that.
+        let response = app
+            .oneshot(envelope_request("fam-share", 4, 40))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(body_json(response).await["code"], "family_quota_exceeded");
+    }
+
+    /// Several depositors against one family: each gets its own share, one
+    /// running out does not touch another's, and the shares together stop at
+    /// the deposit ceiling rather than growing into the family's half.
+    ///
+    /// Driven at the store, which is where the policy lives. Over HTTP today
+    /// every friend card for a family carries the same derived deposit
+    /// credential, so the *credential* is the finest depositor the relay can
+    /// honestly distinguish; keying the accounting here means per-friend
+    /// credentials, if they ever ship, get per-friend shares for free.
+    #[test]
+    fn distinct_depositors_get_independent_shares_under_a_shared_ceiling() {
+        let (_db, store) = test_store();
+        // 1,000-byte quota => 250 per depositor, 500 for all of them.
+        let quota = 1_000u64;
+        let post = |depositor: Option<&str>, msg_byte: u8, len: usize| {
+            store
+                .insert_envelope_with_quota(
+                    "family-a",
+                    sample_msg_id(msg_byte),
+                    3,
+                    sample_hint(1),
+                    vec![msg_byte; len],
+                    5_000,
+                    1_000,
+                    quota,
+                    depositor,
+                )
+                .unwrap()
+        };
+
+        assert!(matches!(
+            post(Some("cmdep1-one"), 1, 240),
+            QuotaInsertResult::Stored { .. }
+        ));
+        // The same depositor again: its own share, and nothing else, is full.
+        assert_eq!(
+            post(Some("cmdep1-one"), 2, 240),
+            QuotaInsertResult::DepositShareExceeded {
+                scope: DepositShareScope::Depositor,
+                usage_bytes: 240,
+                share_bytes: 250,
+            }
+        );
+        // A second depositor is entirely unaffected by the first.
+        assert!(matches!(
+            post(Some("cmdep1-two"), 3, 240),
+            QuotaInsertResult::Stored { .. }
+        ));
+        // A third is inside its own share but hits the shared ceiling, and is
+        // told so specifically -- this one is not its own doing.
+        assert_eq!(
+            post(Some("cmdep1-three"), 4, 240),
+            QuotaInsertResult::DepositShareExceeded {
+                scope: DepositShareScope::AllDepositors,
+                usage_bytes: 480,
+                share_bytes: 500,
+            }
+        );
+        // However many depositors turn up, the family's own devices still
+        // reach the full quota: 480 deposited + 500 of the family's own.
+        assert!(matches!(
+            post(None, 5, 500),
+            QuotaInsertResult::Stored { .. }
+        ));
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 980);
+    }
+
+    /// The additive `envelopes.depositor` migration against a database seeded
+    /// exactly as a relay running today would have left it: the rows survive
+    /// untouched, they read as member class, and the family's depositors
+    /// start from a clean share rather than being charged for history the
+    /// relay never recorded.
+    #[test]
+    fn migration_adds_depositor_and_reads_existing_rows_as_member_class() {
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE envelopes (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    family_token   TEXT NOT NULL,
+                    msg_id         BLOB NOT NULL,
+                    hop_ttl        INTEGER NOT NULL,
+                    recipient_hint BLOB NOT NULL,
+                    sealed         BLOB NOT NULL,
+                    expiry_ms      INTEGER NOT NULL,
+                    created_at_ms  INTEGER NOT NULL,
+                    UNIQUE(family_token, msg_id)
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO envelopes
+                    (family_token, msg_id, hop_ttl, recipient_hint, sealed,
+                     expiry_ms, created_at_ms)
+                 VALUES ('family-a', ?1, 3, ?2, ?3, 5000, 100)",
+                params![sample_msg_id(1), sample_hint(1), vec![7u8; 150]],
+            )
+            .unwrap();
+        }
+
+        let store = RelayStore::open(&path).unwrap();
+        // Nothing was rewritten or dropped by the migration.
+        let rows = store
+            .fetch_envelopes("family-a", vec![sample_hint(1)], 0, 10, 1_000)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sealed, vec![7u8; 150]);
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 150);
+
+        // The pre-migration row reads as member class. Had it been guessed to
+        // be a deposit, this 60-byte post would have been over the 100-byte
+        // per-depositor share of a 400-byte quota before it started.
+        let admitted = store
+            .insert_envelope_with_quota(
+                "family-a",
+                sample_msg_id(2),
+                3,
+                sample_hint(1),
+                vec![8u8; 60],
+                5_000,
+                1_000,
+                400,
+                Some("cmdep1-friend"),
+            )
+            .unwrap();
+        assert!(matches!(admitted, QuotaInsertResult::Stored { .. }));
+
+        // Reopening applies nothing further (idempotent), and the row the
+        // migration defaulted still reads as member class.
+        drop(store);
+        let store = RelayStore::open(&path).unwrap();
+        assert_eq!(store.family_sealed_bytes("family-a").unwrap(), 210);
+        let depositors: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT depositor FROM envelopes ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(
+            depositors,
+            vec![MEMBER_DEPOSITOR.to_string(), "cmdep1-friend".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn fetch_and_ack_cardinality_caps_fail_before_dynamic_sql() {
         let app = test_app();
@@ -7263,6 +7882,7 @@ mod tests {
                             2_000,
                             1_000,
                             100,
+                            None,
                         )
                         .unwrap()
                 })
@@ -7617,6 +8237,7 @@ mod tests {
                 5_000,
                 1_000,
                 quota,
+                None,
             )
             .unwrap();
         let first_id = match first {
@@ -7635,6 +8256,7 @@ mod tests {
                 9_000,
                 2_000,
                 quota,
+                None,
             )
             .unwrap();
         assert_eq!(dedupe, QuotaInsertResult::Stored { id: first_id });
@@ -7651,6 +8273,7 @@ mod tests {
                 9_000,
                 2_000,
                 quota,
+                None,
             )
             .unwrap();
         assert_eq!(conflict, QuotaInsertResult::MsgIdConflict);

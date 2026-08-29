@@ -550,6 +550,73 @@ envelope, so a rejected envelope stays queued locally for a later retry
 shrinking the payload; useful for the quota error, which resolves once the
 family drains their mailbox).
 
+### Deposit-class shares of that quota
+
+The quota above is one pool per family, and a family's deposit credential
+(§1, "Token classes") is stamped onto every friend card it hands out. Charged naively, the
+pool a family's own phones depend on can be filled entirely by posts none of
+those phones sent — and once it is full, the family's own posts are refused
+too, until the deposited rows age out. Two additional ceilings, applied only
+to deposit-class posts, take that away:
+
+| Ceiling | Default | Applies to |
+| --- | --- | --- |
+| Family storage quota | 100% (`CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES`) | every post, member or deposit |
+| All deposit-class rows together | 50% of that quota | deposit-class posts only |
+| Any one depositor | 25% of that quota | deposit-class posts only |
+
+Both are fixed percentages of whatever quota the family has, so a per-family
+`quota_bytes` override scales them with it; there is no separate knob and no
+operator step.
+
+**Member-class posts are unchanged** — the family's own devices still see the
+whole quota, and are still the only class that can be told the mailbox is
+full. The reservation is one-sided: a family whose friends post nothing
+notices nothing, and a family whose friends post constantly still has half a
+mailbox of its own that no friend card can reach.
+
+Shares deliberately do not shrink as depositors arrive. A share divided by a
+live depositor count would let any credential holder shrink everyone else's
+allowance by inventing depositors, and would make an honest friend's
+admission depend on strangers. Fixed shares oversubscribe instead (four
+depositors at a quarter each would sum to the whole quota), which is exactly
+what the 50% aggregate ceiling is for: however many friend cards are in
+circulation, their shares can never add up to a family locked out of its own
+mailbox.
+
+A post over a deposit ceiling is refused with its own `code`, never the
+family's:
+
+```
+HTTP 507 Insufficient Storage
+{ "error": "this deposit credential's share of the family mailbox is full: ...",
+  "code": "depositor_share_exceeded" }     # this credential alone is at its share
+{ "error": "the deposit-class share of the family mailbox is full: ...",
+  "code": "deposit_share_exceeded" }       # deposit-class rows together are at theirs
+```
+
+The status stays 507 on purpose — the server understood the request and will
+not store the result — and `core/src/relay_status.rs` falls back to the
+status when it does not recognize a `code`, so an app predating these codes
+reads them exactly as it reads a full mailbox today (persistent storage
+condition, envelope stays queued locally for retry). That is the correct
+degrade. Reusing `family_quota_exceeded` would not be: it asserts the mailbox
+is full, which in these two cases it is not, and it would send a family
+looking for a backlog to drain when draining changes nothing.
+
+Accounting is keyed on the *presented credential*. Today a family derives one
+deposit token and every friend card carries it, so the relay genuinely cannot
+tell one friend from another, and the credential is the finest depositor it
+can honestly distinguish — the per-depositor and aggregate ceilings coincide
+until friend cards carry per-friend credentials, at which point each gets its
+own share with no further change. `POST /family/rotate` retires every
+outstanding card, so rows deposited before a rotation keep counting against
+the family quota but stop counting against any live depositor's share.
+
+Rows are attributed by a `depositor` column on `envelopes`, added by an
+additive startup migration whose constant default makes every row that
+predates it read as member class — see §11, "Schema migrations".
+
 ### Request and upload rate limits
 
 The two limits above bound how much a family can *store*; neither bounds how
@@ -720,17 +787,38 @@ to take at most a few seconds; there is no separate migration step to run
 by hand. If you operate an unusually large relayd database, expect a
 one-time longer startup on the first upgrade.
 
-### `families` schema migrations
+### Schema migrations
 
-Column additions to `families` are applied by `RelayStore::open` on start,
-idempotently, with no operator step and no downtime beyond the restart:
-`deposit_token` (backfilled by derivation from each existing member token),
-then `family_id` (backfilled with a freshly minted `cmfid1-…` per row) and
-`rotation_pk`. `rotation_pk` is deliberately **not** backfilled — NULL is its
-meaningful value and means "no rotation authority registered yet", which is
-the correct starting state for every family that predates §6.1. Re-running is
-a no-op, so a rollback and re-upgrade is safe; a downgrade to a build that
-predates these columns also works, since it simply ignores them.
+Column additions are applied by `RelayStore::open` on start, idempotently,
+with no operator step and no downtime beyond the restart.
+
+On `families`: `deposit_token` (backfilled by derivation from each existing
+member token), then `family_id` (backfilled with a freshly minted `cmfid1-…`
+per row) and `rotation_pk`. `rotation_pk` is deliberately **not** backfilled —
+NULL is its meaningful value and means "no rotation authority registered
+yet", which is the correct starting state for every family that predates
+§6.1.
+
+On `envelopes`: `depositor TEXT NOT NULL DEFAULT ''`, which carries the
+deposit-share accounting in §10. The constant `DEFAULT` is what makes a
+`NOT NULL` `ADD COLUMN` legal at all, and it means SQLite records the column
+in the schema and synthesizes the default on read: **no existing row is
+rewritten, moved, or deleted**, there is nothing to backfill, and no envelope
+is at risk. Every row that predates the column therefore reads as member
+class, the only safe reading of rows posted before the relay recorded who
+deposited them — guessing "deposit" would charge a family's existing friend
+mail against a share that did not exist when it was posted, and could refuse
+that family's friends on restart for history rather than behavior.
+
+Re-running any of them is a no-op, so a rollback and re-upgrade is safe; a
+downgrade to a build that predates these columns also works, since it simply
+ignores them — an older binary keeps writing envelopes without a `depositor`,
+SQLite supplies `''`, and a later re-upgrade reads those rows as member class
+exactly as it does the rest.
+
+**Check after deploying**: `PRAGMA table_info(envelopes)` on the live
+database should list `depositor`, and the startup log carries
+`migration: envelopes.depositor added` once (and only once).
 
 ## 12. Hosted-family admin API (`/admin/families`)
 
