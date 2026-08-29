@@ -7,6 +7,11 @@ struct SettingsView: View {
     @Binding var appearance: AppearancePreference
     @ObservedObject private var runtime = MeshRuntimeStatus.shared
     @ObservedObject private var connectivity = MeshConnectivityStatus.shared
+    /// The pass's own end date, read once per app session. Read here as well
+    /// as on the Shore Pass screen so the renewal row is there for someone who
+    /// never opens that screen; the second ask costs nothing once one has
+    /// landed.
+    @ObservedObject private var familyStatus = FamilyStatusStore.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var shareOnline = RelayConfigStore.shareOnline()
@@ -65,6 +70,33 @@ struct SettingsView: View {
                                     .accessibilityLabel(
                                         passIndicator.accessibilityLabel ?? ""
                                     )
+                            }
+                        }
+                    }
+                    // When delivery runs to, in the same words and the same
+                    // quiet supporting style as the Shore Pass screen's line.
+                    // An ordinary future date is not a warning and must never
+                    // be coloured as one; nothing shows at all until the status
+                    // read lands, or for a pass with no end date -- the
+                    // household that owns the relay never expires and must not
+                    // be told a date or nagged.
+                    if let throughMs = deliveryThroughMs {
+                        Text("Internet delivery through \(ShorePassRenewal.passDate(throughMs))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    // Renewal is a purchase, so it happens on the site rather
+                    // than in the app -- the row above still leads to the pass
+                    // screen, which is where everything the app itself can do
+                    // lives. The family token rides the URL fragment, which
+                    // never reaches a server log.
+                    if let renewURL = shorePassRenewURL {
+                        Link(destination: renewURL) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Renew Shore Pass")
+                                Text("Opens cruisemesh.app to renew your family's pass.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -220,6 +252,7 @@ struct SettingsView: View {
                 }
             }
             .accessibilityIdentifier("screen.settings")
+            .onAppear { familyStatus.refresh() }
         }
     }
 
@@ -289,6 +322,24 @@ struct SettingsView: View {
         let short = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "CruiseMesh \(short) (\(build))"
+    }
+
+    /// When internet delivery runs through, or nil for "say nothing".
+    private var deliveryThroughMs: Int64? {
+        ShorePassRenewal.deliveryThroughMs(
+            status: familyStatus.status,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+    }
+
+    /// The renewal page, on the two occasions a pass surface offers one, or
+    /// nil when there is nothing to offer or nothing to build a link from.
+    private var shorePassRenewURL: URL? {
+        guard ShorePassRenewal.offersRenewal(
+            health: connectivity.relay,
+            deliveryThroughMs: deliveryThroughMs
+        ) else { return nil }
+        return ShorePassRenewal.currentRenewURL()
     }
 
     private var relayTitle: String {

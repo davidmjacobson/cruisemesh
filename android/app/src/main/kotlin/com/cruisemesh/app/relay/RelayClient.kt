@@ -4,6 +4,7 @@ import android.net.Network
 import android.util.Log
 import com.google.gson.JsonParser
 import uniffi.cruisemesh_core.CarriedEnvelope
+import uniffi.cruisemesh_core.CoreFamilyStatus
 import uniffi.cruisemesh_core.CoreGroupFanoutRow
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
@@ -15,12 +16,14 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import uniffi.cruisemesh_core.relayBuildFetchPath
+import uniffi.cruisemesh_core.relayDecodeFamilyStatus
 import uniffi.cruisemesh_core.relayDecodeFetchPage
 import uniffi.cruisemesh_core.relayDecodePostResponse
 import uniffi.cruisemesh_core.relayDecodePresencePage
 import uniffi.cruisemesh_core.relayEncodeAckRequest
 import uniffi.cruisemesh_core.relayEncodePostEnvelope
 import uniffi.cruisemesh_core.relayEncodePresenceRequest
+import uniffi.cruisemesh_core.relayFamilyStatusPath
 import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMaxResponseBytes
 import uniffi.cruisemesh_core.relayRotatePath
@@ -315,6 +318,21 @@ object RelayClient {
         val connection = openConnection(buildUrl(config.relayUrl, relayRotatePath()), "POST", config, network)
         connection.writeJson(String(body, StandardCharsets.UTF_8))
         return connection.useJsonResponse { it }
+    }
+
+    /**
+     * What the family's pass says about itself: plan, end date, account state.
+     *
+     * A read of the caller's own family under the member credential, shaped
+     * like every other GET here -- core names the route and decodes the body,
+     * the shell only carries bytes. A deposit-class credential is refused with
+     * the same structured 403 the other read routes give it, so
+     * [FamilyStatusStore] declines to ask on one at all rather than spending a
+     * round trip to be told.
+     */
+    fun fetchFamilyStatus(config: RelayConfig, network: Network? = null): CoreFamilyStatus {
+        val connection = openConnection(buildUrl(config.relayUrl, relayFamilyStatusPath()), "GET", config, network)
+        return connection.useJsonResponse { relayDecodeFamilyStatus(it) }
     }
 
     /**

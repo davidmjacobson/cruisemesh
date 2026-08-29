@@ -3414,6 +3414,7 @@ pub fn app(state: AppState) -> Router {
         // purpose: this is the family acting on itself with its own
         // credential, not an operator acting on a family with theirs.
         .route("/family/rotate", post(rotate_family))
+        .route("/family/status", get(family_status))
         .route(
             "/admin/families",
             post(admin_provision_family).get(admin_list_families),
@@ -4577,6 +4578,91 @@ async fn rotate_family(
     }
 }
 
+#[derive(Serialize)]
+struct FamilyStatusResponse {
+    /// The plan the family was provisioned on, verbatim. `null` for a static
+    /// env-allowlist family, which was never sold a pass at all.
+    plan: Option<String>,
+    /// When internet delivery stops. `null` = never expires, and a shell
+    /// showing a delivery date shows nothing at all for that case rather
+    /// than inventing one.
+    expires_ms: Option<i64>,
+    /// `active` | `grace` | `suspended`; see `family_pass_state`.
+    state: &'static str,
+}
+
+/// Derive the pass state a shell should render from the family's stored row.
+///
+/// Mirrors `authorize_family`'s billing checks rather than inventing a second
+/// rule, so what the shell says and what the relay does cannot drift apart:
+///
+/// * `suspended` — the relay refuses everything until someone renews. Both an
+///   administrative suspension (`status != "active"`) and an expiry past
+///   `FAMILY_EXPIRY_GRACE_MS` land here. There is deliberately no fourth
+///   "expired" value: from the shell's side the two are the same fact, and a
+///   shell that does want to tell them apart already can, because it holds
+///   `expires_ms`. Suspension wins when a row is both, matching the order
+///   `authorize_family` checks them in.
+/// * `grace` — past `expires_ms` but inside the window: queued mail still
+///   drains, new envelopes are refused.
+/// * `active` — everything works, including a family with no expiry at all.
+fn family_pass_state(row: &FamilyRow, now_ms: i64) -> &'static str {
+    if row.status != "active" {
+        return "suspended";
+    }
+    match row.expires_ms {
+        Some(expires_ms) if now_ms > expires_ms.saturating_add(FAMILY_EXPIRY_GRACE_MS) => {
+            "suspended"
+        }
+        Some(expires_ms) if now_ms > expires_ms => "grace",
+        _ => "active",
+    }
+}
+
+/// `GET /family/status` — what each shell's pass surface reads to say when
+/// internet delivery runs out, and to decide whether to offer a renewal.
+///
+/// Member credential only (see `FamilyOp::Status`, which is also what lets
+/// this answer while the family is suspended or past grace — the two states
+/// the renewal prompt exists for). Every field already lives on the family's
+/// row, so there is no schema change and no second source of truth for the
+/// expiry the relay itself enforces.
+async fn family_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<FamilyStatusResponse>, ApiError> {
+    let access = authorize_bearer(&state, &headers, FamilyOp::Status).await?;
+    // Charged one request unit and no bytes, exactly like `GET /envelopes`:
+    // this is a client poll, one per phone, and exempting it would leave one
+    // authenticated route a stuck client could spin on for free. Enforced
+    // only once the token has authorized (see `check_rate_limit`).
+    state.check_rate_limit(&access, 1.0, 0.0)?;
+    let family_token = access.token;
+    // FR8: off the reactor like every other store call.
+    let family = state
+        .store
+        .run_blocking(move |store| store.get_family(&family_token))
+        .await
+        .map_err(ApiError::internal)?;
+    // Static env-allowlist families (`CRUISEMESH_RELAY_TOKENS`) have no
+    // `families` row — they are the implicit always-active families of a
+    // self-hosted relay. No pass was ever sold, so there is no plan and no
+    // expiry to report, and the shell shows no delivery date for them.
+    let Some(family) = family else {
+        return Ok(Json(FamilyStatusResponse {
+            plan: None,
+            expires_ms: None,
+            state: "active",
+        }));
+    };
+    let pass_state = family_pass_state(&family, now_ms());
+    Ok(Json(FamilyStatusResponse {
+        plan: family.plan,
+        expires_ms: family.expires_ms,
+        state: pass_state,
+    }))
+}
+
 #[derive(Deserialize)]
 struct WsQuery {
     hints: String,
@@ -4992,6 +5078,15 @@ enum FamilyOp {
     /// rides friend cards, i.e. is held by people outside the family — must
     /// never be able to lock a family out of its own mailbox.
     Rotate,
+    /// `GET /family/status` — a family reading its own pass state so the
+    /// shell can say "internet delivery through <date>" and offer a renewal.
+    /// Its own op because it is the only one that must be answerable *while*
+    /// the family is suspended or past its grace window: those are exactly
+    /// the states the renewal prompt exists for, so routing this through the
+    /// ordinary billing checks would 403 precisely when the answer matters.
+    /// Member-only — a friend card holds a deposit token, and when someone
+    /// else's pass lapses is not a friend's business.
+    Status,
 }
 
 impl FamilyOp {
@@ -5099,6 +5194,13 @@ fn family_rate_key(class: TokenClass, family_key: &str) -> String {
 /// may ask and what it is told back. Suspension and expiry are checked for it
 /// exactly as for every other op — a lapsed or suspended family answers
 /// nothing, to anyone.
+///
+/// `FamilyOp::Status` is the single exception to that last sentence, and only
+/// to that: it reports the billing state instead of spending the relay, so
+/// the suspension and expiry checks are skipped for it and a lapsed family
+/// can still be told it has lapsed. Its class rule is not relaxed — a deposit
+/// credential is refused with the same `deposit_only` 403 as for any other
+/// member-only op.
 async fn authorize_family(
     state: &AppState,
     token: &str,
@@ -5145,15 +5247,23 @@ async fn authorize_family(
     if class == TokenClass::Deposit && !op.allowed_for_deposit() {
         return Err(ApiError::deposit_only(token));
     }
-    if family.status != "active" {
-        return Err(ApiError::family_suspended(&family.token));
-    }
-    if let Some(expires_ms) = family.expires_ms {
-        if now_ms > expires_ms.saturating_add(FAMILY_EXPIRY_GRACE_MS) {
-            return Err(ApiError::family_expired(&family.token, false));
+    // Billing state gates the ops that *use* the relay. `FamilyOp::Status`
+    // only reports it, and so has to survive it: a suspended or past-grace
+    // family is exactly the one whose shell must say so and offer a renewal,
+    // and a 403 here would leave that shell with nothing to show. Nothing is
+    // weakened for the other ops, and the class boundary above still applies,
+    // so this stays a member-only read of the family's own row.
+    if op != FamilyOp::Status {
+        if family.status != "active" {
+            return Err(ApiError::family_suspended(&family.token));
         }
-        if now_ms > expires_ms && op == FamilyOp::Post {
-            return Err(ApiError::family_expired(&family.token, true));
+        if let Some(expires_ms) = family.expires_ms {
+            if now_ms > expires_ms.saturating_add(FAMILY_EXPIRY_GRACE_MS) {
+                return Err(ApiError::family_expired(&family.token, false));
+            }
+            if now_ms > expires_ms && op == FamilyOp::Post {
+                return Err(ApiError::family_expired(&family.token, true));
+            }
         }
     }
     let family_key = family_limit_key(&family.family_id, &family.token);

@@ -61,7 +61,11 @@ import com.cruisemesh.app.mesh.RelaySyncEvents
 import com.cruisemesh.app.mesh.shorePassHeading
 import com.cruisemesh.app.mesh.isPassVerdict
 import com.cruisemesh.app.mesh.relayCheckFailureRes
+import com.cruisemesh.app.mesh.shorePassDeliveryThroughMs
+import com.cruisemesh.app.mesh.shorePassOffersRenewal
+import com.cruisemesh.app.mesh.shorePassRenewUrl
 import com.cruisemesh.app.mesh.shouldRetryFirstRelayCheck
+import com.cruisemesh.app.relay.FamilyStatusStore
 import com.cruisemesh.app.relay.RelayClient
 import com.cruisemesh.app.relay.RelayConfig
 import com.cruisemesh.app.relay.RelayConfigStore
@@ -73,6 +77,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import uniffi.cruisemesh_core.RelaySetup
 import uniffi.cruisemesh_core.makeRelaySetupCard
 import uniffi.cruisemesh_core.parseRelaySetupText
@@ -104,6 +111,12 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
     LaunchedEffect(relayHealth) {
         if (relayHealth.isPassVerdict()) lastVerdict = relayHealth
     }
+    // The end date, read once per app session (see [FamilyStatusStore]). Not
+    // part of the health signal above: health is what the last sync did, this
+    // is what the account says, and only the account knows when delivery
+    // stops.
+    val familyStatus by FamilyStatusStore.status.collectAsState()
+    LaunchedEffect(configured) { configured?.let { FamilyStatusStore.refresh(it) } }
     var input by remember { mutableStateOf(initialCard.orEmpty()) }
     var pending by remember { mutableStateOf<RelaySetup?>(null) }
     var pendingUntrusted by remember { mutableStateOf<RelaySetup?>(null) }
@@ -383,6 +396,38 @@ fun ShorePassScreen(initialCard: String?, onBack: () -> Unit) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 6.dp),
                         )
+                    }
+                    // When delivery runs to, in the same quiet supporting style
+                    // as everything else here. An ordinary future date is not a
+                    // warning and must never be coloured as one; nothing shows
+                    // at all until the status read lands, or for a pass with no
+                    // end date.
+                    val deliveryThroughMs =
+                        shorePassDeliveryThroughMs(familyStatus, System.currentTimeMillis())
+                    deliveryThroughMs?.let { throughMs ->
+                        Text(
+                            stringResource(R.string.ui_internet_delivery_through, passDate(throughMs)),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
+                    // Renewal happens on the site, not in the app -- the app
+                    // never sells a pass, exactly as the empty state above says
+                    // of a first one. The token rides the URL fragment so it
+                    // stays out of every log between here and the site.
+                    if (shorePassOffersRenewal(relayHealth, deliveryThroughMs)) {
+                        configured?.relayToken?.let(::shorePassRenewUrl)?.let { renewUrl ->
+                            TextButton(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW, Uri.parse(renewUrl)),
+                                    )
+                                },
+                            ) {
+                                Text(stringResource(R.string.ui_renew_shore_pass))
+                            }
+                        }
                     }
                 }
 
@@ -796,8 +841,19 @@ private fun passStatusExplanation(health: RelayHealth): String? = when (health) 
     is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_explanation)
     is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_explanation)
     is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_explanation)
+    is RelayHealth.Expired -> stringResource(R.string.ui_shore_pass_expired_explanation)
     else -> null
 }
+
+/**
+ * A date to read, not a timestamp. Same format as the device list's.
+ *
+ * Shared with the Settings screen, which shows the same delivery-through line
+ * about the same pass: one date formatted two ways on two screens is a support
+ * question waiting to happen.
+ */
+internal fun passDate(timestampMs: Long): String =
+    SimpleDateFormat("MMMM d, yyyy", Locale.getDefault()).format(Date(timestampMs))
 
 private fun passRelativeAge(timestampMs: Long): String {
     val minutes = ((System.currentTimeMillis() - timestampMs).coerceAtLeast(0L) / 60_000L)

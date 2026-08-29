@@ -2097,6 +2097,16 @@
         }
       }
     },
+    "Opens cruisemesh.app to renew your family's pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opens cruisemesh.app to renew your family's pass."
+          }
+        }
+      }
+    },
     "Optional. If you bought one, add it before trading codes.": {
       "localizations": {
         "en": {
@@ -2367,6 +2377,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Removing…"
+          }
+        }
+      }
+    },
+    "Renew Shore Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Renew Shore Pass"
           }
         }
       }
@@ -3729,6 +3749,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Internet delivery"
+          }
+        }
+      }
+    },
+    "Internet delivery through %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internet delivery through %@"
           }
         }
       }
@@ -5775,6 +5805,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them."
+          }
+        }
+      }
+    },
+    "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other."
           }
         }
       }

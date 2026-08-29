@@ -182,6 +182,7 @@ named volume so this cannot silently drift.
 - **WebSocket push** (`GET /ws`): see §7. Acks remain `POST /envelopes/ack`;
   poll stays available and unchanged for offline/reconnect catch-up.
 - **Self-service token rotation** (`POST /family/rotate`): see §6.1.
+- **Pass status read** (`GET /family/status`): see §6.2.
 
 ### 6.1 Self-service token rotation (`POST /family/rotate`)
 
@@ -264,6 +265,43 @@ Two consequences worth stating to an operator plainly:
 Operational note: after a rotation the family appears under a **new token** in
 `GET /admin/families`, but its `family_id` is unchanged — record that, not the
 token, if you track a customer across time (§12).
+
+### 6.2 Pass status (`GET /family/status`)
+
+What each phone's Shore Pass surface reads to say when internet delivery runs
+out, and to decide whether to offer a renewal. Member credential only — a
+deposit token is refused with the same `deposit_only` 403 as any other
+member-only op, because when someone else's pass lapses is not a friend's
+business.
+
+```sh
+curl -sS https://relay.example.com/family/status \
+  -H "Authorization: Bearer $MEMBER_TOKEN"
+```
+
+```json
+{"plan": "shore-pass", "expires_ms": 1767225600000, "state": "active"}
+```
+
+- `state` is `active`, `grace` (past `expires_ms` but inside
+  `FAMILY_EXPIRY_GRACE_MS`: queued mail still drains, new envelopes are
+  refused) or `suspended` (an administrative suspension, or an expiry past the
+  grace window — from a phone's side those are the same fact, and a client
+  that wants to tell them apart already holds `expires_ms`).
+- `expires_ms` is `null` for a family with no end date. `plan` is `null` for a
+  static env-allowlist family (`CRUISEMESH_RELAY_TOKENS`), which has no
+  `families` row because no pass was ever sold for it; those read as `active`
+  with no expiry. A phone shows no delivery date at all in that case rather
+  than inventing one, and offers no renewal.
+- **This is the one route that answers while the family is suspended or past
+  its grace window.** Every other authenticated route 403s in those states,
+  which are exactly the states the renewal prompt exists for — a 403 here
+  would leave the phone with nothing to show. Nothing else is relaxed: the
+  class boundary above still applies, the read is of the caller's own row
+  only, and no field is exposed that the family does not already hold.
+- Every field already lives on the `families` row, so there is **no schema
+  change** and nothing new is written. It costs one request unit, like
+  `GET /envelopes`.
 
 ## 7. WebSocket push (`GET /ws`)
 

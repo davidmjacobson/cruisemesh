@@ -978,3 +978,46 @@ fun badgeFor(transport: PeerConnectionTransport): ConnectionPathBadge? = when (t
     PeerConnectionTransport.CARRIED -> null
 }
 
+/** The one button a How-to-fix sheet may carry, if it carries one at all. */
+enum class HowToFixAction {
+    /**
+     * No button. Nothing the app can open repairs a friend's card, an
+     * oversized message, or a full mailbox, and a button that leads somewhere
+     * useless costs a reader more than no button at all.
+     */
+    NONE,
+
+    /** Opens the Shore Pass screen, where this phone's own setup is managed. */
+    MANAGE_SHORE_PASS,
+
+    /**
+     * Opens the renewal page in the browser.
+     *
+     * Only an expired pass gets this, and it gets it *instead of* the pass
+     * screen: nothing on that screen can renew, so sending someone there was
+     * the dead end this replaces. A suspended pass is deliberately not here --
+     * paying again does not lift a suspension.
+     */
+    RENEW_SHORE_PASS,
+}
+
+/** The How-to-fix button for a fault stopping delivery to one friend. */
+fun howToFixAction(reason: CoreDeliveryBlockedReason): HowToFixAction = when (reason) {
+    CoreDeliveryBlockedReason.PASS_EXPIRED -> HowToFixAction.RENEW_SHORE_PASS
+    CoreDeliveryBlockedReason.PASS_SUSPENDED,
+    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
+    -> HowToFixAction.MANAGE_SHORE_PASS
+    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+    CoreDeliveryBlockedReason.STORAGE_FULL,
+    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
+    -> HowToFixAction.NONE
+}
+
+/** The How-to-fix button for a device-wide fault. */
+fun howToFixAction(reason: CoreHealthReason): HowToFixAction = when (reason) {
+    CoreHealthReason.PASS_EXPIRED -> HowToFixAction.RENEW_SHORE_PASS
+    CoreHealthReason.PASS_SUSPENDED,
+    CoreHealthReason.OWN_SETUP_REJECTED,
+    -> HowToFixAction.MANAGE_SHORE_PASS
+    else -> HowToFixAction.NONE
+}

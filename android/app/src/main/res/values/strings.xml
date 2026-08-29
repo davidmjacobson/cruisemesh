@@ -426,6 +426,15 @@
          this is the only screen where a data charge can surprise anyone. Say
          who bills for what before a pass is set up, not after. -->
     <string name="ui_shore_pass_data_note">Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.</string>
+    <!-- Renewal. The end date is stated plainly and in the same quiet style as
+         the rest of the supporting text: a pass that runs until March is not a
+         problem, and dressing an ordinary future date as a warning teaches
+         people to ignore the ones that matter. Shown only while the date is
+         still ahead; a pass with no end date says nothing at all. -->
+    <string name="ui_internet_delivery_through">Internet delivery through %1$s</string>
+    <string name="ui_renew_shore_pass">Renew Shore Pass</string>
+    <string name="ui_renew_shore_pass_detail">Opens cruisemesh.app to renew your family\'s pass.</string>
+    <string name="ui_shore_pass_expired_explanation">Your pass has run out, so messages can\'t travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.</string>
     <string name="ui_relay_deferred_roaming">Waiting for non-roaming internet to avoid roaming charges</string>
     <string name="ui_paste_and_set_up">Paste and set up</string>
     <string name="ui_enter_setup_card_manually">Enter setup card manually</string>

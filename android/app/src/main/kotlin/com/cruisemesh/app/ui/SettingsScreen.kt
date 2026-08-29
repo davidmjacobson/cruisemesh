@@ -35,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -59,6 +60,10 @@ import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.mesh.PassIndicator
 import com.cruisemesh.app.mesh.RelayHealth
 import com.cruisemesh.app.mesh.passIndicator
+import com.cruisemesh.app.mesh.shorePassDeliveryThroughMs
+import com.cruisemesh.app.mesh.shorePassOffersRenewal
+import com.cruisemesh.app.mesh.shorePassRenewUrl
+import com.cruisemesh.app.relay.FamilyStatusStore
 import com.cruisemesh.app.relay.RelayConfigStore
 import com.cruisemesh.app.relay.RelayEngineSettings
 import com.cruisemesh.app.friending.FriendsOfFriendsStore
@@ -94,7 +99,14 @@ fun SettingsScreen(
         mutableStateOf(FriendsOfFriendsStore.isEnabled(context))
     }
     var useRoamingData by remember { mutableStateOf(RelayEngineSettings.allowsRoamingData(context)) }
-    val relayConfigured = RelayConfigStore.load(context) != null
+    val relayConfig = RelayConfigStore.load(context)
+    val relayConfigured = relayConfig != null
+    // The pass's own end date, read once per app session. Read here as well as
+    // on the Shore Pass screen so the renewal row is there for someone who
+    // never opens that screen; the second ask costs nothing once one has
+    // landed.
+    val familyStatus by FamilyStatusStore.status.collectAsState()
+    LaunchedEffect(relayConfig) { relayConfig?.let { FamilyStatusStore.refresh(it) } }
     // Debuggable builds show the entry outright, as they always have. A
     // release build shows it once someone has done the seven-tap run on the
     // version line at the bottom of this screen -- the only way a closed-test
@@ -164,6 +176,37 @@ fun SettingsScreen(
                     indicator = passIndicator(relayHealth, relayConfigured),
                     onClick = onShorePass,
                 )
+                val deliveryThroughMs =
+                    shorePassDeliveryThroughMs(familyStatus, System.currentTimeMillis())
+                // When delivery runs to, in the same words and the same quiet
+                // supporting style as the Shore Pass screen's line. An ordinary
+                // future date is not a warning and must never be coloured as
+                // one; nothing shows at all until the status read lands, or for
+                // a pass with no end date -- the household that owns the relay
+                // never expires and must not be told a date or nagged.
+                deliveryThroughMs?.let { throughMs ->
+                    Text(
+                        stringResource(R.string.ui_internet_delivery_through, passDate(throughMs)),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(bottom = 4.dp),
+                    )
+                }
+                // Renewal is a purchase, so it happens on the site rather than
+                // in the app -- the row above still leads to the pass screen,
+                // which is where everything the app itself can do lives. The
+                // family token rides the URL fragment, which never reaches a
+                // server log.
+                if (shorePassOffersRenewal(relayHealth, deliveryThroughMs)) {
+                    relayConfig?.relayToken?.let(::shorePassRenewUrl)?.let { renewUrl ->
+                        SettingsLink(
+                            title = stringResource(R.string.ui_renew_shore_pass),
+                            detail = stringResource(R.string.ui_renew_shore_pass_detail),
+                        ) {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(renewUrl)))
+                        }
+                    }
+                }
             }
 
             SettingsGap()

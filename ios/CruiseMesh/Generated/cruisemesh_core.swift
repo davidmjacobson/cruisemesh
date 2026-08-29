@@ -17335,6 +17335,107 @@ public func FfiConverterTypeCoreFailoverResumeArm_lower(_ value: CoreFailoverRes
 
 
 /**
+ * What relayd reports about the family's pass (`GET /family/status`).
+ */
+public struct CoreFamilyStatus {
+    /**
+     * The plan the pass was bought on, as the service names it, or `None`
+     * for a family that was configured rather than sold — a self-hosted
+     * relay's env-allowlist family has no plan because no pass was ever
+     * bought for it.
+     */
+    public var plan: String?
+    /**
+     * When internet delivery stops, or `None` for a pass with no end date —
+     * a self-hosted relay, or a plan that does not expire. `None` is not an
+     * error and not "unknown": it means there is no date to show, so shells
+     * show nothing rather than inventing one.
+     */
+    public var expiresMs: Int64?
+    public var state: CoreFamilyPassState
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The plan the pass was bought on, as the service names it, or `None`
+         * for a family that was configured rather than sold — a self-hosted
+         * relay's env-allowlist family has no plan because no pass was ever
+         * bought for it.
+         */plan: String?, 
+        /**
+         * When internet delivery stops, or `None` for a pass with no end date —
+         * a self-hosted relay, or a plan that does not expire. `None` is not an
+         * error and not "unknown": it means there is no date to show, so shells
+         * show nothing rather than inventing one.
+         */expiresMs: Int64?, state: CoreFamilyPassState) {
+        self.plan = plan
+        self.expiresMs = expiresMs
+        self.state = state
+    }
+}
+
+
+
+extension CoreFamilyStatus: Equatable, Hashable {
+    public static func ==(lhs: CoreFamilyStatus, rhs: CoreFamilyStatus) -> Bool {
+        if lhs.plan != rhs.plan {
+            return false
+        }
+        if lhs.expiresMs != rhs.expiresMs {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(plan)
+        hasher.combine(expiresMs)
+        hasher.combine(state)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyStatus {
+        return
+            try CoreFamilyStatus(
+                plan: FfiConverterOptionString.read(from: &buf), 
+                expiresMs: FfiConverterOptionInt64.read(from: &buf), 
+                state: FfiConverterTypeCoreFamilyPassState.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreFamilyStatus, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.plan, into: &buf)
+        FfiConverterOptionInt64.write(value.expiresMs, into: &buf)
+        FfiConverterTypeCoreFamilyPassState.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyStatus_lift(_ buf: RustBuffer) throws -> CoreFamilyStatus {
+    return try FfiConverterTypeCoreFamilyStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyStatus_lower(_ value: CoreFamilyStatus) -> RustBuffer {
+    return FfiConverterTypeCoreFamilyStatus.lower(value)
+}
+
+
+/**
  * One relay-post row of a group message's per-member fan-out
  * (`specs/group-relay-durability.md` §4, DTN_TODOS.md N1). Deliberately
  * NOT [`CarriedEnvelope`], even though the fields coincide -- a fan-out row
@@ -38265,6 +38366,113 @@ extension CoreError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Where a pass stands with the service that sold it.
+ *
+ * Deliberately not a re-statement of [`CoreRelayFault`](crate::CoreRelayFault):
+ * that is what one HTTP call *just did*, this is what the account says when
+ * asked. A pass can be `Active` and still have a failing sync (no internet),
+ * and it is the only source for the one thing no sync outcome can reveal —
+ * when internet delivery is going to stop.
+ */
+
+public enum CoreFamilyPassState {
+    
+    /**
+     * Paid up and inside its term.
+     */
+    case active
+    /**
+     * Past its end date, still delivering: the window in which renewing
+     * costs nobody any mail.
+     */
+    case grace
+    /**
+     * Turned off by the service. Renewing is not the remedy; support is.
+     */
+    case suspended
+    /**
+     * A state this build has no rule for.
+     *
+     * A shipped phone outlives the server it talks to, and the one thing a
+     * status read must never do is fail closed on a word it does not
+     * recognize — that would take the end date away from every phone in the
+     * field the day the service adds a fourth state. Callers treat this as
+     * "no claim about the account": the fields that were understood still
+     * stand, and nothing is asserted about the rest.
+     */
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyPassState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreFamilyPassState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyPassState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .active
+        
+        case 2: return .grace
+        
+        case 3: return .suspended
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreFamilyPassState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .active:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .grace:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .suspended:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyPassState_lift(_ buf: RustBuffer) throws -> CoreFamilyPassState {
+    return try FfiConverterTypeCoreFamilyPassState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyPassState_lower(_ value: CoreFamilyPassState) -> RustBuffer {
+    return FfiConverterTypeCoreFamilyPassState.lower(value)
+}
+
+
+
+extension CoreFamilyPassState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The single action the card may offer. `None` means the app has nothing
  * honest to offer and should say only what is true.
  */
@@ -55818,6 +56026,22 @@ public func relayCursorKey(relayUrl: String, relayToken: String) -> String {
     )
 })
 }
+/**
+ * Decode relayd's answer to [`relay_family_status_path`].
+ *
+ * Nothing here is trusted enough to act on by itself — this is a read of a
+ * bearer-authenticated route about the caller's own family, so there is no
+ * second party whose claim needs checking, and unlike a rotation the result
+ * is never committed to storage or gossiped. An unrecognized `state` is
+ * [`CoreFamilyPassState::Unknown`] rather than a failure; see that variant.
+ */
+public func relayDecodeFamilyStatus(body: Data)throws  -> CoreFamilyStatus {
+    return try  FfiConverterTypeCoreFamilyStatus.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_family_status(
+        FfiConverterData.lower(body),$0
+    )
+})
+}
 public func relayDecodeFetchPage(body: Data)throws  -> CoreRelayFetchPage {
     return try  FfiConverterTypeCoreRelayFetchPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(
@@ -55951,6 +56175,19 @@ public func relayEncodeRotateRequest(currentToken: String, newToken: String, per
         FfiConverterString.lower(currentToken),
         FfiConverterString.lower(newToken),
         FfiConverterData.lower(personRootSignSk),$0
+    )
+})
+}
+/**
+ * The path a device reads its family's pass status from.
+ *
+ * A function rather than a constant for the same reason as
+ * [`relay_rotate_path`]: both shells route identically and neither
+ * hand-writes the string.
+ */
+public func relayFamilyStatusPath() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_family_status_path($0
     )
 })
 }
@@ -56282,6 +56519,32 @@ public func relayMailboxWalkAction(pagesFetched: UInt32, envelopesFetched: UInt3
 public func relayMaxResponseBytes() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_relay_max_response_bytes($0
+    )
+})
+}
+/**
+ * When to tell someone their internet delivery runs through, given the
+ * status and this shell's clock — or `None` for "say nothing".
+ *
+ * The rule, so both shells say the same thing on the same day:
+ *
+ * - No end date, no line. Nothing is promised about a pass that never said
+ * when it stops.
+ * - A date already past is not a promise either. Grace is real delivery, but
+ * "internet delivery through last Tuesday" reads as a fault to the person
+ * holding the phone, and the expired states already have their own copy.
+ * - A suspended pass makes no claim about delivery at all, whatever date its
+ * row still carries.
+ *
+ * [`CoreFamilyPassState::Unknown`] deliberately still shows the date: the end
+ * date is the field the reader came for, and a state word this build cannot
+ * place is no reason to withhold one the server did state plainly.
+ */
+public func relayPassDeliveryThroughMs(status: CoreFamilyStatus, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_pass_delivery_through_ms(
+        FfiConverterTypeCoreFamilyStatus.lower(status),
+        FfiConverterInt64.lower(nowMs),$0
     )
 })
 }
@@ -57895,6 +58158,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_key() != 37643) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_family_status() != 46232) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page() != 49617) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57920,6 +58186,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_rotate_request() != 32464) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_family_status_path() != 29493) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24532) {
@@ -57956,6 +58225,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_pass_delivery_through_ms() != 18723) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 57175) {
