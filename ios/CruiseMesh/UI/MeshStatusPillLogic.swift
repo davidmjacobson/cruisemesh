@@ -100,7 +100,10 @@ enum MeshStatusPillLogic {
         guard PassIndicator.of(relayHealth, configured: true) == .actionRequired else { return nil }
         let name = service.displayName
         switch relayHealth {
-        case .expired:
+        // The grace window is not given its own suffix: the pill has room for
+        // three words, and the asymmetry it would have to explain is spelled
+        // out on the pass screens instead.
+        case .expired, .expiredReadOnly:
             return String(localized: "\(name) expired")
         case .suspended:
             return String(localized: "\(name) suspended")

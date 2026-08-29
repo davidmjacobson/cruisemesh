@@ -55,6 +55,7 @@ fun relayHealthFor(health: CoreRelayPassHealth, now: Long): RelayHealth = when (
     CoreRelayPassHealth.MESSAGE_TOO_LARGE -> RelayHealth.MessageTooLarge(now)
     CoreRelayPassHealth.RATE_LIMITED -> RelayHealth.RateLimited(now)
     CoreRelayPassHealth.EXPIRED -> RelayHealth.Expired(now)
+    CoreRelayPassHealth.EXPIRED_READ_ONLY -> RelayHealth.ExpiredReadOnly(now)
     CoreRelayPassHealth.SUSPENDED -> RelayHealth.Suspended(now)
     CoreRelayPassHealth.TOKEN_REJECTED -> RelayHealth.TokenRejected(now)
     CoreRelayPassHealth.FAILING -> RelayHealth.Failing(now)
