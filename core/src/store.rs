@@ -1186,6 +1186,15 @@ impl MessageStore {
         // told about.
         conn.execute_batch(crate::roster_gossip::ROSTER_GOSSIP_SCHEMA_SQL)
             .map_err(store_err)?;
+        // The blob plane's partial-transfer bookkeeping
+        // (specs/media-two-plane.md): which chunks of a pulled blob are
+        // present, and the LRU order the device budget evicts by. Only
+        // metadata lands here — the ciphertext lives in chunk files the
+        // drivers own, because a 128 MB clip inside this database would put a
+        // video in every backup, every VACUUM, and every restore
+        // sanitization.
+        conn.execute_batch(crate::media::store::MEDIA_SCHEMA_SQL)
+            .map_err(store_err)?;
         // A roster describes a contact, so it has no business outliving one,
         // and neither does a safety warning about them, or a note of what they
         // were once told about our devices.
@@ -2073,6 +2082,22 @@ fn sanitize_restore_contents(
     // and would offer a handoff re-issue pointing at a stream slot it does not
     // have.
     tx.execute("DELETE FROM own_revocation", [])
+        .map_err(store_err)?;
+    // The blob plane's backup posture, decided here: a partial transfer does
+    // not back up at all — not its chunk files, and not its metadata either.
+    // This function runs on the export path as well as the restore path, so
+    // the rows are gone from the `.cmbak` itself rather than merely dropped on
+    // the way back in.
+    //
+    // A `media_blobs` row is a claim about a file on disk — "these chunks of
+    // this blob are already present" — and the file belongs to the phone the
+    // backup came from. Carrying the row without the file is carrying a
+    // bitmap that dangles: the restored install would report bytes present for
+    // a file that does not exist, charge them to its partial-transfer budget,
+    // and resume a transfer that can never complete. The manifests survive in
+    // message history, which is what a restored device actually needs: it
+    // re-opens each row from the manifest and pulls the bytes again.
+    tx.execute("DELETE FROM media_blobs", [])
         .map_err(store_err)?;
 
     if options.include_message_history {
@@ -16538,6 +16563,15 @@ mod tests {
                 params![now_ms - 1, b"alice-id".as_slice()],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO media_blobs
+                    (blob_id, plaintext_bytes, ciphertext_bytes, chunk_count, bitmap,
+                     bytes_present, verified, transfer_active, manifest_unread, chunk_file,
+                     created_at_ms, last_used_at_ms)
+                 VALUES (X'0102', 1000, 1016, 1, X'01', 1016, 0, 0, 1, 'blob.part', ?1, ?1)",
+                params![now_ms - 300],
+            )
+            .unwrap();
             for (id, expiry, bytes) in [
                 (b"active-courier-1".as_slice(), now_ms + 10_000, 111_i64),
                 (b"expired-courier".as_slice(), now_ms, 222_i64),
@@ -16583,6 +16617,20 @@ mod tests {
         assert_eq!(report.removed_expired_delivery_count, 1);
         assert_eq!(report.removed_connection_event_count, 2);
 
+        // The blob plane's posture, asserted on the exported file before
+        // anything restores it: `media_blobs` is empty in the `.cmbak` itself,
+        // not merely emptied on the way back in. Read with a bare connection
+        // so nothing in `MessageStore::open` can be what makes it true.
+        let snapshot = Connection::open(&path).unwrap();
+        let exported_blobs: i64 = snapshot
+            .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            exported_blobs, 0,
+            "a partial transfer must not leave the phone it started on"
+        );
+        drop(snapshot);
+
         let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
         assert!(restored
             .messages_for_chat(b"alice-id".to_vec())
@@ -16614,6 +16662,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(transient, (0, 0, None));
+        // And it is still empty after a restore, which is the same fact from
+        // the other end: the chunk files these rows name never left the other
+        // phone, so a surviving row would claim bytes this device lacks.
+        let tracked_blobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tracked_blobs, 0);
         drop(conn);
         drop(restored);
         let _ = fs::remove_dir_all(&dir);
@@ -16660,6 +16715,15 @@ mod tests {
                     params![now_ms + 10_000, now_ms - 1],
                 )
                 .unwrap();
+                conn.execute(
+                    "INSERT INTO media_blobs
+                        (blob_id, plaintext_bytes, ciphertext_bytes, chunk_count, bitmap,
+                         bytes_present, verified, transfer_active, manifest_unread, chunk_file,
+                         created_at_ms, last_used_at_ms)
+                     VALUES (X'0102', 1000, 1016, 1, X'01', 1016, 0, 0, 1, 'blob.part', ?1, ?1)",
+                    params![now_ms - 300],
+                )
+                .unwrap();
             }
 
             store
@@ -16672,6 +16736,19 @@ mod tests {
                     now_ms,
                 )
                 .unwrap();
+            // Partial blob transfers are neither content nor cargo, so no
+            // option keeps them — asserted on the exported file, before any
+            // restore, because the export is where they are dropped.
+            let snapshot = Connection::open(&path).unwrap();
+            let exported_blobs: i64 = snapshot
+                .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                exported_blobs, 0,
+                "include_history={include_history} include_courier={include_courier}"
+            );
+            drop(snapshot);
+
             let restored = MessageStore::open(path.to_string_lossy().to_string()).unwrap();
             assert_eq!(
                 !restored
@@ -16682,7 +16759,8 @@ mod tests {
             );
             assert_eq!(restored.carried_len().unwrap() == 1, include_courier);
             assert_eq!(restored.has_message_conflicts().unwrap(), include_history);
-            let authored_high: i64 = lock_conn(&restored.conn)
+            let conn = lock_conn(&restored.conn);
+            let authored_high: i64 = conn
                 .query_row(
                     "SELECT high_lamport FROM authored_lamport_watermarks
                      WHERE chat_id = ?1 AND sender_user_id = ?2",
@@ -16691,6 +16769,12 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(authored_high, 8);
+            // And nothing puts them back on the way in either.
+            let tracked_blobs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM media_blobs", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(tracked_blobs, 0);
+            drop(conn);
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -21171,6 +21255,57 @@ mod tests {
         assert_eq!(
             store.carried_msg_ids(10).unwrap(),
             vec![b"foreign-old".to_vec(), b"foreign-big".to_vec()]
+        );
+    }
+
+    /// `BLOB-01` at the carry queue: blob-sized bytes cannot become a mule's
+    /// problem, and the manifest that stands in for them can.
+    ///
+    /// Nothing plans a carried envelope out of blob bytes -- the blob plane
+    /// has no path into `carried_envelopes` at all. The cap is what would be
+    /// left if that stopped being true, so it is what this pins: offered
+    /// directly, with the 1 MiB foreign budget a phone really runs, a
+    /// blob-shaped payload is refused and the queue is left exactly as it was.
+    #[test]
+    fn blob_01_a_blob_sized_payload_is_refused_admission_to_the_carry_queue() {
+        use crate::media::{MEDIA_CHUNK_CIPHERTEXT_BYTES, MEDIA_MANIFEST_MAX_BYTES};
+
+        // The foreign carry budget a device actually offers a stranger's mail.
+        const FOREIGN_BUDGET: i64 = 1024 * 1024;
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+
+        // The message plane's half of a media send: the largest manifest the
+        // codec will emit, carried like any other envelope.
+        assert!(store
+            .enqueue_carried_envelope(
+                carried(b"manifest", b"hint", 9_000, MEDIA_MANIFEST_MAX_BYTES),
+                false,
+                1_000,
+                FOREIGN_BUDGET,
+            )
+            .unwrap());
+
+        // The blob plane's half, at the smallest granularity that clears the
+        // whole budget: four chunks. Not a contrived size -- four chunks is a
+        // second of phone video.
+        let four_chunks = 4 * MEDIA_CHUNK_CIPHERTEXT_BYTES as usize;
+        assert!(four_chunks as i64 > FOREIGN_BUDGET);
+        let error = store
+            .enqueue_carried_envelope(
+                carried(b"blob-bytes", b"hint", 9_000, four_chunks),
+                false,
+                1_100,
+                FOREIGN_BUDGET,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CoreError::Store(message) if message == CARRY_ADMISSION_CAPACITY_ERROR
+        ));
+        assert_eq!(
+            store.carried_msg_ids(10).unwrap(),
+            vec![b"manifest".to_vec()],
+            "a refused blob must not evict the manifest that was doing the work"
         );
     }
 

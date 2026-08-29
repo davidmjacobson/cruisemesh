@@ -35,7 +35,13 @@ const NOISE_PROLOGUE: &[u8] = b"CruiseMesh same-LAN transport v1";
 const NOISE_MAX_MESSAGE_SIZE: usize = 65_535;
 const NOISE_TAG_SIZE: usize = 16;
 const RECORD_HEADER_SIZE: usize = 9;
+/// The two record types the LAN link multiplexes: ordinary CruiseMesh
+/// protocol frames and the blob plane's pull frames. Each type has its own
+/// frame-id space and its own reassembler, so a transfer in progress never
+/// disturbs the message plane — see specs/media-two-plane.md, "LAN
+/// sub-channel: multiplexing".
 const RECORD_TYPE_FRAME: u8 = 1;
+const RECORD_TYPE_BLOB: u8 = 2;
 const RECORD_PLAINTEXT_SIZE: usize = 60 * 1024;
 const RECORD_CHUNK_SIZE: usize = RECORD_PLAINTEXT_SIZE - RECORD_HEADER_SIZE;
 
@@ -54,6 +60,35 @@ pub fn lan_max_frame_size() -> u64 {
     LAN_MAX_FRAME_SIZE
 }
 
+/// Send-queue ordering for one outbound frame: lower goes first. Core holds
+/// no socket, so the shells own the queue; what core owns is the rule that
+/// mesh frames outrank blob frames, so a bulk transfer never delays the
+/// message plane sharing the link.
+///
+/// This orders frames *waiting to be encrypted*. A Noise transport nonce is
+/// implicit and sequential, so records must reach the wire in the order
+/// [`LanNoiseSession::encrypt_frame`] and
+/// [`LanNoiseSession::encrypt_blob_record`] produced them — already-encrypted
+/// records must never be reordered. Head-of-line delay for a mesh frame is
+/// therefore bounded by one blob frame's records, not by a whole transfer.
+#[uniffi::export]
+pub fn lan_record_priority(record_type: u8) -> u8 {
+    match record_type {
+        RECORD_TYPE_FRAME => 0,
+        RECORD_TYPE_BLOB => 1,
+        _ => 2,
+    }
+}
+
+/// One decrypted record's plane and payload. `record_type` is
+/// [`RECORD_TYPE_FRAME`] for a mesh protocol frame or [`RECORD_TYPE_BLOB`]
+/// for an encoded blob-plane pull frame.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct LanRecord {
+    pub record_type: u8,
+    pub frame: Vec<u8>,
+}
+
 #[derive(uniffi::Object)]
 pub struct LanNoiseSession {
     inner: Mutex<SessionInner>,
@@ -69,7 +104,12 @@ struct SessionInner {
     /// state, and `promote_if_finished` consumes that state.
     handshake_hash: Option<Vec<u8>>,
     next_outbound_frame_id: u32,
+    next_outbound_blob_frame_id: u32,
     inbound: Option<InboundFrame>,
+    inbound_blob: Option<InboundFrame>,
+    /// Whether this peer advertised `CAP_MEDIA_BLOB` in its HELLO2. False
+    /// until a shell says otherwise — see [`LanNoiseSession::set_peer_capabilities`].
+    peer_speaks_blob_plane: bool,
 }
 
 struct InboundFrame {
@@ -113,7 +153,10 @@ impl LanNoiseSession {
                 remote_static: None,
                 handshake_hash: None,
                 next_outbound_frame_id: 0,
+                next_outbound_blob_frame_id: 0,
                 inbound: None,
+                inbound_blob: None,
+                peer_speaks_blob_plane: false,
             }),
         })
     }
@@ -202,6 +245,78 @@ impl LanNoiseSession {
     /// records. Native shells prefix each returned record with a u32 BE length
     /// before writing it to TCP.
     pub fn encrypt_frame(&self, frame: Vec<u8>) -> Result<Vec<Vec<u8>>, CoreError> {
+        self.encrypt_typed(RECORD_TYPE_FRAME, frame)
+    }
+
+    /// Encrypt one encoded blob-plane pull frame into blob records. Records of
+    /// the two types may interleave freely on the wire; the shell's send queue
+    /// keeps mesh records ahead of these (see [`lan_record_priority`]).
+    pub fn encrypt_blob_record(&self, frame: Vec<u8>) -> Result<Vec<Vec<u8>>, CoreError> {
+        self.encrypt_typed(RECORD_TYPE_BLOB, frame)
+    }
+
+    /// Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
+    /// after the final record, or `None` while a multi-record frame is still
+    /// being assembled. This is the message plane only: a blob record is
+    /// skipped the way any unknown record type is — `Ok(None)`, so the read
+    /// loop drops it and keeps the link, which is exactly how a peer without
+    /// the blob plane behaves.
+    pub fn decrypt_record(&self, record: Vec<u8>) -> Result<Option<Vec<u8>>, CoreError> {
+        Ok(self
+            .decrypt_typed(record, false)?
+            .map(|complete| complete.frame))
+    }
+
+    /// Decrypt one Noise record from either plane, naming the plane a
+    /// completed frame came from.
+    ///
+    /// The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+    /// (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+    /// is skipped the way an unknown record type is.
+    pub fn decrypt_record_typed(&self, record: Vec<u8>) -> Result<Option<LanRecord>, CoreError> {
+        let accept_blob = self.lock()?.peer_speaks_blob_plane;
+        self.decrypt_typed(record, accept_blob)
+    }
+
+    /// Record what the peer advertised in its HELLO2, once the shell has read
+    /// it. Until this is called the session accepts message-plane records
+    /// only.
+    ///
+    /// Authenticating the link is not the same as agreeing to a second one.
+    /// The blob lane carries its own reassembler with its own
+    /// [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+    /// authenticated peer would let a contact who never claimed the blob plane
+    /// open a second megabyte of reassembly on every link — capability for
+    /// something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+    /// does, and it is the same bit
+    /// ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+    /// consults before it opens a pull session, so both directions agree on
+    /// one gate.
+    ///
+    /// Idempotent, and safe to call again if a peer re-advertises: the flag
+    /// tracks the latest HELLO2 rather than accumulating.
+    pub fn set_peer_capabilities(&self, capabilities: u32) -> Result<(), CoreError> {
+        self.lock()?.peer_speaks_blob_plane = crate::media::peer_speaks_blob_plane(capabilities);
+        Ok(())
+    }
+
+    /// Whether this session will currently accept blob records.
+    pub fn accepts_blob_records(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|inner| inner.peer_speaks_blob_plane)
+            .unwrap_or(false)
+    }
+}
+
+impl LanNoiseSession {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionInner>, CoreError> {
+        self.inner
+            .lock()
+            .map_err(|_| CoreError::Crypto("LAN session state is unavailable".to_string()))
+    }
+
+    fn encrypt_typed(&self, record_type: u8, frame: Vec<u8>) -> Result<Vec<Vec<u8>>, CoreError> {
         if frame.len() as u64 > LAN_MAX_FRAME_SIZE {
             return Err(CoreError::Malformed(format!(
                 "LAN frame exceeds {} byte limit",
@@ -209,8 +324,13 @@ impl LanNoiseSession {
             )));
         }
         let mut inner = self.lock()?;
-        let frame_id = inner.next_outbound_frame_id;
-        inner.next_outbound_frame_id = inner.next_outbound_frame_id.wrapping_add(1);
+        let counter = if record_type == RECORD_TYPE_BLOB {
+            &mut inner.next_outbound_blob_frame_id
+        } else {
+            &mut inner.next_outbound_frame_id
+        };
+        let frame_id = *counter;
+        *counter = counter.wrapping_add(1);
         let total = max_of_one(frame.len().div_ceil(RECORD_CHUNK_SIZE));
         let total_u16 = u16::try_from(total)
             .map_err(|_| CoreError::Malformed("LAN frame requires too many records".to_string()))?;
@@ -224,7 +344,7 @@ impl LanNoiseSession {
             let start = index * RECORD_CHUNK_SIZE;
             let end = usize::min(start + RECORD_CHUNK_SIZE, frame.len());
             let mut plaintext = Vec::with_capacity(RECORD_HEADER_SIZE + end.saturating_sub(start));
-            plaintext.push(RECORD_TYPE_FRAME);
+            plaintext.push(record_type);
             plaintext.extend_from_slice(&frame_id.to_be_bytes());
             plaintext.extend_from_slice(&(index as u16).to_be_bytes());
             plaintext.extend_from_slice(&total_u16.to_be_bytes());
@@ -240,10 +360,14 @@ impl LanNoiseSession {
         Ok(records)
     }
 
-    /// Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
-    /// after the final record, or `None` while a multi-record frame is still
-    /// being assembled.
-    pub fn decrypt_record(&self, record: Vec<u8>) -> Result<Option<Vec<u8>>, CoreError> {
+    /// Decrypt one Noise record into its plane's reassembler. A record that
+    /// fails to parse resets only the lane it names, so a malformed blob
+    /// record can never abort an in-flight mesh frame.
+    fn decrypt_typed(
+        &self,
+        record: Vec<u8>,
+        accept_blob: bool,
+    ) -> Result<Option<LanRecord>, CoreError> {
         if record.len() > NOISE_MAX_MESSAGE_SIZE {
             return Err(CoreError::Malformed(
                 "LAN encrypted record is too large".to_string(),
@@ -259,18 +383,43 @@ impl LanNoiseSession {
             .read_message(&record, &mut plaintext)
             .map_err(noise_error)?;
         plaintext.truncate(read);
-        if plaintext.len() < RECORD_HEADER_SIZE || plaintext[0] != RECORD_TYPE_FRAME {
-            inner.inbound = None;
+        // A record too short to carry a header names no lane to reset, and is
+        // structurally broken rather than merely unfamiliar: both reassemblers
+        // are left alone and it stays an error.
+        if plaintext.len() < RECORD_HEADER_SIZE {
             return Err(CoreError::Malformed(
                 "invalid LAN transport record".to_string(),
             ));
         }
+        let record_type = plaintext[0];
+        match record_type {
+            RECORD_TYPE_FRAME => {}
+            RECORD_TYPE_BLOB if accept_blob => {}
+            // A type this session does not speak is *skipped*, not failed. The
+            // record is authenticated, so an unfamiliar type means a peer on a
+            // newer build rather than an attacker, and the three ways to reach
+            // here are exactly that: a blob record at a build without the blob
+            // plane, a blob record from a peer that never advertised
+            // `CAP_MEDIA_BLOB` (`accept_blob` is false, so it opens no lane),
+            // and a type some later version allocates. An error here
+            // would read as fatal to every shell's read loop — each one
+            // propagates a decrypt failure and drops the socket — turning
+            // "reject the record, keep the link" into a message-plane outage
+            // that repeats on every reconnect. `None` is the answer the caller
+            // already handles for a partial frame: drop it and read on.
+            _ => return Ok(None),
+        }
+        let lane = if record_type == RECORD_TYPE_BLOB {
+            &mut inner.inbound_blob
+        } else {
+            &mut inner.inbound
+        };
 
         let frame_id = u32::from_be_bytes(plaintext[1..5].try_into().expect("fixed slice"));
         let index = u16::from_be_bytes(plaintext[5..7].try_into().expect("fixed slice"));
         let total = u16::from_be_bytes(plaintext[7..9].try_into().expect("fixed slice"));
         if total == 0 || index >= total {
-            inner.inbound = None;
+            *lane = None;
             return Err(CoreError::Malformed(
                 "invalid LAN record sequence".to_string(),
             ));
@@ -278,7 +427,7 @@ impl LanNoiseSession {
         let chunk = &plaintext[RECORD_HEADER_SIZE..];
 
         if index == 0 {
-            inner.inbound = Some(InboundFrame {
+            *lane = Some(InboundFrame {
                 frame_id,
                 total,
                 next_index: 0,
@@ -288,17 +437,17 @@ impl LanNoiseSession {
                 )),
             });
         }
-        let inbound = inner.inbound.as_mut().ok_or_else(|| {
+        let inbound = lane.as_mut().ok_or_else(|| {
             CoreError::Malformed("LAN record arrived without a frame start".to_string())
         })?;
         if inbound.frame_id != frame_id || inbound.total != total || inbound.next_index != index {
-            inner.inbound = None;
+            *lane = None;
             return Err(CoreError::Malformed(
                 "out-of-order LAN transport record".to_string(),
             ));
         }
         if inbound.bytes.len() + chunk.len() > LAN_MAX_FRAME_SIZE as usize {
-            inner.inbound = None;
+            *lane = None;
             return Err(CoreError::Malformed(
                 "reassembled LAN frame is too large".to_string(),
             ));
@@ -308,15 +457,10 @@ impl LanNoiseSession {
         if inbound.next_index < inbound.total {
             return Ok(None);
         }
-        Ok(inner.inbound.take().map(|complete| complete.bytes))
-    }
-}
-
-impl LanNoiseSession {
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, SessionInner>, CoreError> {
-        self.inner
-            .lock()
-            .map_err(|_| CoreError::Crypto("LAN session state is unavailable".to_string()))
+        Ok(lane.take().map(|complete| LanRecord {
+            record_type,
+            frame: complete.bytes,
+        }))
     }
 }
 
@@ -361,7 +505,22 @@ mod tests {
         (secret.to_bytes(), public.to_bytes())
     }
 
+    /// A handshaken pair that has also exchanged HELLO2 capabilities naming
+    /// the blob plane — the state a link is in before any blob record is
+    /// legitimately on it.
     fn connected_pair() -> (LanNoiseSession, LanNoiseSession) {
+        let (initiator, responder) = handshaken_pair();
+        initiator
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        responder
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        (initiator, responder)
+    }
+
+    /// The handshake alone: no capabilities have been exchanged yet.
+    fn handshaken_pair() -> (LanNoiseSession, LanNoiseSession) {
         let (initiator_sk, initiator_pk) = key(7);
         let (responder_sk, responder_pk) = key(11);
         let initiator = LanNoiseSession::new(true, initiator_sk.to_vec()).unwrap();
@@ -379,6 +538,32 @@ mod tests {
         assert!(responder.is_handshake_finished());
         assert_eq!(responder.remote_static_key(), Some(initiator_pk.to_vec()));
         (initiator, responder)
+    }
+
+    /// Seal one record by hand, so a test can put a header on the wire that
+    /// this crate's own encrypt path would never produce — a peer is free to
+    /// interleave the two planes record by record. Records must be sealed in
+    /// the order they will be delivered: a Noise transport nonce is implicit
+    /// and sequential.
+    fn seal(
+        session: &LanNoiseSession,
+        record_type: u8,
+        frame_id: u32,
+        index: u16,
+        total: u16,
+        chunk: &[u8],
+    ) -> Vec<u8> {
+        let mut plaintext = vec![record_type];
+        plaintext.extend_from_slice(&frame_id.to_be_bytes());
+        plaintext.extend_from_slice(&index.to_be_bytes());
+        plaintext.extend_from_slice(&total.to_be_bytes());
+        plaintext.extend_from_slice(chunk);
+        let mut inner = session.lock().unwrap();
+        let transport = inner.transport.as_mut().unwrap();
+        let mut encrypted = vec![0u8; plaintext.len() + NOISE_TAG_SIZE];
+        let written = transport.write_message(&plaintext, &mut encrypted).unwrap();
+        encrypted.truncate(written);
+        encrypted
     }
 
     #[test]
@@ -407,6 +592,261 @@ mod tests {
             recovered = responder.decrypt_record(record).unwrap().or(recovered);
         }
         assert_eq!(recovered, Some(frame));
+    }
+
+    #[test]
+    fn a_blob_record_round_trips_on_the_same_session() {
+        let (initiator, responder) = connected_pair();
+        let records = initiator
+            .encrypt_blob_record(b"pull frame".to_vec())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            responder.decrypt_record_typed(records[0].clone()).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_BLOB,
+                frame: b"pull frame".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn mesh_and_blob_records_interleave_without_corrupting_either_frame() {
+        let (initiator, responder) = connected_pair();
+        // A 180 KiB transfer frame spans four records; a two-record mesh frame
+        // is emitted between them, which is the courtesy the spec's acceptance
+        // bound rests on. Both frames carry frame id 0.
+        let blob = vec![0xCD; 180 * 1024];
+        let mesh = vec![0xEF; 90 * 1024];
+        let blob_chunks: Vec<&[u8]> = blob.chunks(RECORD_CHUNK_SIZE).collect();
+        let mesh_chunks: Vec<&[u8]> = mesh.chunks(RECORD_CHUNK_SIZE).collect();
+        assert_eq!(blob_chunks.len(), 4);
+        assert_eq!(mesh_chunks.len(), 2);
+        let wire = vec![
+            seal(&initiator, RECORD_TYPE_BLOB, 0, 0, 4, blob_chunks[0]),
+            seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, mesh_chunks[0]),
+            seal(&initiator, RECORD_TYPE_BLOB, 0, 1, 4, blob_chunks[1]),
+            seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, mesh_chunks[1]),
+            seal(&initiator, RECORD_TYPE_BLOB, 0, 2, 4, blob_chunks[2]),
+            seal(&initiator, RECORD_TYPE_BLOB, 0, 3, 4, blob_chunks[3]),
+        ];
+
+        let mut completed = Vec::new();
+        for record in wire {
+            if let Some(complete) = responder.decrypt_record_typed(record).unwrap() {
+                completed.push(complete);
+            }
+        }
+        assert_eq!(
+            completed,
+            vec![
+                LanRecord {
+                    record_type: RECORD_TYPE_FRAME,
+                    frame: mesh,
+                },
+                LanRecord {
+                    record_type: RECORD_TYPE_BLOB,
+                    frame: blob,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_two_record_types_have_independent_frame_id_spaces() {
+        let (initiator, responder) = connected_pair();
+        // Both planes number their first frame 0; only the record type keeps
+        // them apart, and neither counter moves when the other plane sends.
+        let blob = initiator.encrypt_blob_record(vec![1u8; 90 * 1024]).unwrap();
+        let mesh = initiator.encrypt_frame(vec![2u8; 90 * 1024]).unwrap();
+        assert_eq!(blob.len(), 2);
+        assert_eq!(mesh.len(), 2);
+        {
+            let inner = initiator.lock().unwrap();
+            assert_eq!(inner.next_outbound_frame_id, 1);
+            assert_eq!(inner.next_outbound_blob_frame_id, 1);
+        }
+
+        // Each frame's records arrive contiguously, and the frame id they
+        // share does not let one reassembler adopt the other's records.
+        assert_eq!(
+            responder.decrypt_record_typed(blob[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(
+            responder.decrypt_record_typed(blob[1].clone()).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_BLOB,
+                frame: vec![1u8; 90 * 1024],
+            })
+        );
+        assert_eq!(
+            responder.decrypt_record_typed(mesh[0].clone()).unwrap(),
+            None
+        );
+        assert_eq!(
+            responder.decrypt_record_typed(mesh[1].clone()).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_FRAME,
+                frame: vec![2u8; 90 * 1024],
+            })
+        );
+    }
+
+    #[test]
+    fn a_rejected_blob_record_leaves_an_in_flight_mesh_frame_alone() {
+        let (initiator, responder) = connected_pair();
+        // A blob record with an impossible sequence arrives in the middle of
+        // a mesh frame. It must reset the blob lane only: resetting the shared
+        // state would make a malformed transfer abort an innocent message.
+        let head = seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, b"first half ");
+        let junk = seal(&initiator, RECORD_TYPE_BLOB, 0, 0, 0, b"nonsense");
+        let tail = seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, b"second half");
+
+        assert_eq!(responder.decrypt_record_typed(head).unwrap(), None);
+        assert!(responder.decrypt_record_typed(junk).is_err());
+        assert_eq!(
+            responder.decrypt_record_typed(tail).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_FRAME,
+                frame: b"first half second half".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_blob_record_is_skipped_by_the_message_plane_decoder() {
+        // What a peer without the blob plane does, and the property that
+        // actually matters: `Ok(None)`, not an error. Every shell read loop
+        // treats a decrypt error as fatal and closes the socket, so an error
+        // here would let a requester on a newer build knock the message plane
+        // over by asking politely. Asserted mid-frame, because the record has
+        // to be skipped without disturbing the mesh reassembler either.
+        let (initiator, responder) = connected_pair();
+        let head = seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, b"still ");
+        let blob = initiator
+            .encrypt_blob_record(b"unwelcome".to_vec())
+            .unwrap();
+        let tail = seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, b"talking");
+
+        assert_eq!(responder.decrypt_record(head).unwrap(), None);
+        assert_eq!(
+            responder.decrypt_record(blob[0].clone()).unwrap(),
+            None,
+            "a blob record must be dropped, not fail the link"
+        );
+        assert_eq!(
+            responder.decrypt_record(tail).unwrap(),
+            Some(b"still talking".to_vec())
+        );
+
+        // And the link keeps working for whole frames afterwards.
+        let records = initiator.encrypt_frame(b"and again".to_vec()).unwrap();
+        assert_eq!(
+            responder.decrypt_record(records[0].clone()).unwrap(),
+            Some(b"and again".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_blob_record_from_a_peer_that_never_advertised_the_bit_is_skipped() {
+        // Authenticating the link is not agreeing to a second plane on it. A
+        // contact whose HELLO2 never carried CAP_MEDIA_BLOB must not be able
+        // to open the blob reassembler — that lane holds its own megabyte of
+        // buffer, and the requester side already refuses to open a pull
+        // session against a peer without the bit, so the accept side has to
+        // agree or the gate is one-sided.
+        let (initiator, responder) = handshaken_pair();
+        assert!(!responder.accepts_blob_records());
+
+        let head = seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, b"still ");
+        let blob = initiator
+            .encrypt_blob_record(b"unadvertised".to_vec())
+            .unwrap();
+        let tail = seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, b"talking");
+
+        assert_eq!(responder.decrypt_record_typed(head).unwrap(), None);
+        assert_eq!(
+            responder.decrypt_record_typed(blob[0].clone()).unwrap(),
+            None,
+            "the blob lane stays shut, and the record is skipped rather than fatal"
+        );
+        assert_eq!(
+            responder.decrypt_record_typed(tail).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_FRAME,
+                frame: b"still talking".to_vec(),
+            }),
+            "and the message plane is undisturbed"
+        );
+
+        // Capabilities a peer does advertise, minus the blob bit, are still no.
+        responder
+            .set_peer_capabilities(!crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        assert!(!responder.accepts_blob_records());
+
+        // And once HELLO2 does carry it, the same session opens the lane.
+        responder
+            .set_peer_capabilities(crate::protocol::CAP_MEDIA_BLOB)
+            .unwrap();
+        assert!(responder.accepts_blob_records());
+        let allowed = initiator.encrypt_blob_record(b"welcome".to_vec()).unwrap();
+        assert_eq!(
+            responder.decrypt_record_typed(allowed[0].clone()).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_BLOB,
+                frame: b"welcome".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_record_type_is_skipped_and_the_link_survives() {
+        let (initiator, responder) = connected_pair();
+        // A well-formed record naming an unallocated type, mid mesh frame. The
+        // record is authenticated, so this is a peer from a later version, and
+        // forward compatibility costs nothing here: skip it and read on.
+        let head = seal(&initiator, RECORD_TYPE_FRAME, 0, 0, 2, b"before ");
+        let future = seal(&initiator, 3, 0, 0, 1, b"from the future");
+        let tail = seal(&initiator, RECORD_TYPE_FRAME, 0, 1, 2, b"after");
+
+        assert_eq!(responder.decrypt_record_typed(head).unwrap(), None);
+        assert_eq!(responder.decrypt_record_typed(future).unwrap(), None);
+        assert_eq!(
+            responder.decrypt_record_typed(tail).unwrap(),
+            Some(LanRecord {
+                record_type: RECORD_TYPE_FRAME,
+                frame: b"before after".to_vec(),
+            })
+        );
+
+        let records = initiator.encrypt_frame(b"still talking".to_vec()).unwrap();
+        assert_eq!(
+            responder.decrypt_record(records[0].clone()).unwrap(),
+            Some(b"still talking".to_vec())
+        );
+    }
+
+    #[test]
+    fn mesh_frames_outrank_blob_frames_in_the_send_queue() {
+        assert_eq!(lan_record_priority(RECORD_TYPE_FRAME), 0);
+        assert_eq!(lan_record_priority(RECORD_TYPE_BLOB), 1);
+        assert_eq!(lan_record_priority(9), 2);
+
+        // A queue sorted by priority encrypts every waiting mesh frame first
+        // while preserving each plane's own order.
+        let mut queued = [
+            (RECORD_TYPE_BLOB, "blob 0"),
+            (RECORD_TYPE_FRAME, "mesh 0"),
+            (RECORD_TYPE_BLOB, "blob 1"),
+            (RECORD_TYPE_FRAME, "mesh 1"),
+        ];
+        queued.sort_by_key(|(record_type, _)| lan_record_priority(*record_type));
+        assert_eq!(
+            queued.iter().map(|(_, label)| *label).collect::<Vec<_>>(),
+            vec!["mesh 0", "mesh 1", "blob 0", "blob 1"]
+        );
     }
 
     #[test]

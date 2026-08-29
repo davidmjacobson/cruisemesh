@@ -4301,11 +4301,36 @@ public func FfiConverterTypeCoreSprayPolicy_lower(_ value: CoreSprayPolicy) -> U
 public protocol LanNoiseSessionProtocol : AnyObject {
     
     /**
+     * Whether this session will currently accept blob records.
+     */
+    func acceptsBlobRecords()  -> Bool
+    
+    /**
      * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
      * after the final record, or `None` while a multi-record frame is still
-     * being assembled.
+     * being assembled. This is the message plane only: a blob record is
+     * skipped the way any unknown record type is — `Ok(None)`, so the read
+     * loop drops it and keeps the link, which is exactly how a peer without
+     * the blob plane behaves.
      */
     func decryptRecord(record: Data) throws  -> Data?
+    
+    /**
+     * Decrypt one Noise record from either plane, naming the plane a
+     * completed frame came from.
+     *
+     * The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+     * (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+     * is skipped the way an unknown record type is.
+     */
+    func decryptRecordTyped(record: Data) throws  -> LanRecord?
+    
+    /**
+     * Encrypt one encoded blob-plane pull frame into blob records. Records of
+     * the two types may interleave freely on the wire; the shell's send queue
+     * keeps mesh records ahead of these (see [`lan_record_priority`]).
+     */
+    func encryptBlobRecord(frame: Data) throws  -> [Data]
     
     /**
      * Encrypt one complete CruiseMesh protocol frame into one or more Noise
@@ -4343,6 +4368,27 @@ public protocol LanNoiseSessionProtocol : AnyObject {
      * 3, immediately before the session enters transport mode.
      */
     func remoteStaticKey()  -> Data?
+    
+    /**
+     * Record what the peer advertised in its HELLO2, once the shell has read
+     * it. Until this is called the session accepts message-plane records
+     * only.
+     *
+     * Authenticating the link is not the same as agreeing to a second one.
+     * The blob lane carries its own reassembler with its own
+     * [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+     * authenticated peer would let a contact who never claimed the blob plane
+     * open a second megabyte of reassembly on every link — capability for
+     * something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+     * does, and it is the same bit
+     * ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+     * consults before it opens a pull session, so both directions agree on
+     * one gate.
+     *
+     * Idempotent, and safe to call again if a peer re-advertises: the flag
+     * tracks the latest HELLO2 rather than accumulating.
+     */
+    func setPeerCapabilities(capabilities: UInt32) throws 
     
     /**
      * Produce the next Noise XX handshake message. Callers follow the
@@ -4417,14 +4463,56 @@ public convenience init(initiator: Bool, localPrivateKey: Data)throws  {
 
     
     /**
+     * Whether this session will currently accept blob records.
+     */
+open func acceptsBlobRecords() -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_accepts_blob_records(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Decrypt one Noise record. Returns a complete CruiseMesh protocol frame
      * after the final record, or `None` while a multi-record frame is still
-     * being assembled.
+     * being assembled. This is the message plane only: a blob record is
+     * skipped the way any unknown record type is — `Ok(None)`, so the read
+     * loop drops it and keeps the link, which is exactly how a peer without
+     * the blob plane behaves.
      */
 open func decryptRecord(record: Data)throws  -> Data? {
     return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_method_lannoisesession_decrypt_record(self.uniffiClonePointer(),
         FfiConverterData.lower(record),$0
+    )
+})
+}
+    
+    /**
+     * Decrypt one Noise record from either plane, naming the plane a
+     * completed frame came from.
+     *
+     * The blob lane opens only for a peer that advertised `CAP_MEDIA_BLOB`
+     * (see [`Self::set_peer_capabilities`]); a blob record from anyone else
+     * is skipped the way an unknown record type is.
+     */
+open func decryptRecordTyped(record: Data)throws  -> LanRecord? {
+    return try  FfiConverterOptionTypeLanRecord.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_decrypt_record_typed(self.uniffiClonePointer(),
+        FfiConverterData.lower(record),$0
+    )
+})
+}
+    
+    /**
+     * Encrypt one encoded blob-plane pull frame into blob records. Records of
+     * the two types may interleave freely on the wire; the shell's send queue
+     * keeps mesh records ahead of these (see [`lan_record_priority`]).
+     */
+open func encryptBlobRecord(frame: Data)throws  -> [Data] {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_encrypt_blob_record(self.uniffiClonePointer(),
+        FfiConverterData.lower(frame),$0
     )
 })
 }
@@ -4490,6 +4578,32 @@ open func remoteStaticKey() -> Data? {
     uniffi_cruisemesh_core_fn_method_lannoisesession_remote_static_key(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Record what the peer advertised in its HELLO2, once the shell has read
+     * it. Until this is called the session accepts message-plane records
+     * only.
+     *
+     * Authenticating the link is not the same as agreeing to a second one.
+     * The blob lane carries its own reassembler with its own
+     * [`LAN_MAX_FRAME_SIZE`] buffer, so accepting blob records from any
+     * authenticated peer would let a contact who never claimed the blob plane
+     * open a second megabyte of reassembly on every link — capability for
+     * something the peer never said it does. `CAP_MEDIA_BLOB` is what says it
+     * does, and it is the same bit
+     * ([`crate::media::peer_speaks_blob_plane`]) the requester side already
+     * consults before it opens a pull session, so both directions agree on
+     * one gate.
+     *
+     * Idempotent, and safe to call again if a peer re-advertises: the flag
+     * tracks the latest HELLO2 rather than accumulating.
+     */
+open func setPeerCapabilities(capabilities: UInt32)throws  {try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_method_lannoisesession_set_peer_capabilities(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(capabilities),$0
+    )
+}
 }
     
     /**
@@ -19269,6 +19383,172 @@ public func FfiConverterTypeCoreLinkSummary_lower(_ value: CoreLinkSummary) -> R
 
 
 /**
+ * Mirror of [`MediaManifest`]: the same fields, with the two digests widened
+ * to byte arrays because a binding has no fixed-width one.
+ */
+public struct CoreMediaManifest {
+    /**
+     * 32 bytes, the digest of the ciphertext.
+     */
+    public var blobId: Data
+    /**
+     * 32 bytes. Sealed to each recipient by the ordinary message pipeline;
+     * nothing on either shell stores it outside a manifest.
+     */
+    public var blobKey: Data
+    public var plaintextBytes: UInt64
+    public var kind: CoreMediaKind
+    public var mimeType: String
+    public var width: UInt32
+    public var height: UInt32
+    public var durationMs: UInt32
+    /**
+     * Empty is the absent case, as on the wire. Display metadata only — a
+     * shell that writes it to disk runs it through
+     * [`super::sanitize_media_filename`] first.
+     */
+    public var filename: String
+    public var thumbnail: Data
+    public var caption: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * 32 bytes, the digest of the ciphertext.
+         */blobId: Data, 
+        /**
+         * 32 bytes. Sealed to each recipient by the ordinary message pipeline;
+         * nothing on either shell stores it outside a manifest.
+         */blobKey: Data, plaintextBytes: UInt64, kind: CoreMediaKind, mimeType: String, width: UInt32, height: UInt32, durationMs: UInt32, 
+        /**
+         * Empty is the absent case, as on the wire. Display metadata only — a
+         * shell that writes it to disk runs it through
+         * [`super::sanitize_media_filename`] first.
+         */filename: String, thumbnail: Data, caption: String) {
+        self.blobId = blobId
+        self.blobKey = blobKey
+        self.plaintextBytes = plaintextBytes
+        self.kind = kind
+        self.mimeType = mimeType
+        self.width = width
+        self.height = height
+        self.durationMs = durationMs
+        self.filename = filename
+        self.thumbnail = thumbnail
+        self.caption = caption
+    }
+}
+
+
+
+extension CoreMediaManifest: Equatable, Hashable {
+    public static func ==(lhs: CoreMediaManifest, rhs: CoreMediaManifest) -> Bool {
+        if lhs.blobId != rhs.blobId {
+            return false
+        }
+        if lhs.blobKey != rhs.blobKey {
+            return false
+        }
+        if lhs.plaintextBytes != rhs.plaintextBytes {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.mimeType != rhs.mimeType {
+            return false
+        }
+        if lhs.width != rhs.width {
+            return false
+        }
+        if lhs.height != rhs.height {
+            return false
+        }
+        if lhs.durationMs != rhs.durationMs {
+            return false
+        }
+        if lhs.filename != rhs.filename {
+            return false
+        }
+        if lhs.thumbnail != rhs.thumbnail {
+            return false
+        }
+        if lhs.caption != rhs.caption {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(blobId)
+        hasher.combine(blobKey)
+        hasher.combine(plaintextBytes)
+        hasher.combine(kind)
+        hasher.combine(mimeType)
+        hasher.combine(width)
+        hasher.combine(height)
+        hasher.combine(durationMs)
+        hasher.combine(filename)
+        hasher.combine(thumbnail)
+        hasher.combine(caption)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMediaManifest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMediaManifest {
+        return
+            try CoreMediaManifest(
+                blobId: FfiConverterData.read(from: &buf), 
+                blobKey: FfiConverterData.read(from: &buf), 
+                plaintextBytes: FfiConverterUInt64.read(from: &buf), 
+                kind: FfiConverterTypeCoreMediaKind.read(from: &buf), 
+                mimeType: FfiConverterString.read(from: &buf), 
+                width: FfiConverterUInt32.read(from: &buf), 
+                height: FfiConverterUInt32.read(from: &buf), 
+                durationMs: FfiConverterUInt32.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                thumbnail: FfiConverterData.read(from: &buf), 
+                caption: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreMediaManifest, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.blobId, into: &buf)
+        FfiConverterData.write(value.blobKey, into: &buf)
+        FfiConverterUInt64.write(value.plaintextBytes, into: &buf)
+        FfiConverterTypeCoreMediaKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.mimeType, into: &buf)
+        FfiConverterUInt32.write(value.width, into: &buf)
+        FfiConverterUInt32.write(value.height, into: &buf)
+        FfiConverterUInt32.write(value.durationMs, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterData.write(value.thumbnail, into: &buf)
+        FfiConverterString.write(value.caption, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMediaManifest_lift(_ buf: RustBuffer) throws -> CoreMediaManifest {
+    return try FfiConverterTypeCoreMediaManifest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMediaManifest_lower(_ value: CoreMediaManifest) -> RustBuffer {
+    return FfiConverterTypeCoreMediaManifest.lower(value)
+}
+
+
+/**
  * The result of planning one encounter through [`MessageStore::plan_mesh_meet`].
  *
  * Every list here is the page this encounter is allowed to offer: the
@@ -25661,6 +25941,99 @@ public func FfiConverterTypeCoreSailPermissionRow_lower(_ value: CoreSailPermiss
 
 
 /**
+ * Mirror of [`super::integration::AuthoredMediaBlob`], flattened: the id, the
+ * key, the length the geometry derives from, and the bytes to serve.
+ *
+ * The ciphertext crosses whole. That is honest for phase 1, where the caller
+ * already holds the plaintext in memory to hand it here; a driver that seals
+ * a 128 MiB clip streams instead, and that is phase 2's boundary to design.
+ * Until it does, [`crate::media::media_authoring_max_bytes`] — not the
+ * protocol cap — is what a picker checks, because the several transient
+ * copies this shape costs are what a phone runs out of memory over.
+ */
+public struct CoreSealedMediaBlob {
+    public var blobId: Data
+    public var blobKey: Data
+    public var plaintextBytes: UInt64
+    public var ciphertext: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(blobId: Data, blobKey: Data, plaintextBytes: UInt64, ciphertext: Data) {
+        self.blobId = blobId
+        self.blobKey = blobKey
+        self.plaintextBytes = plaintextBytes
+        self.ciphertext = ciphertext
+    }
+}
+
+
+
+extension CoreSealedMediaBlob: Equatable, Hashable {
+    public static func ==(lhs: CoreSealedMediaBlob, rhs: CoreSealedMediaBlob) -> Bool {
+        if lhs.blobId != rhs.blobId {
+            return false
+        }
+        if lhs.blobKey != rhs.blobKey {
+            return false
+        }
+        if lhs.plaintextBytes != rhs.plaintextBytes {
+            return false
+        }
+        if lhs.ciphertext != rhs.ciphertext {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(blobId)
+        hasher.combine(blobKey)
+        hasher.combine(plaintextBytes)
+        hasher.combine(ciphertext)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreSealedMediaBlob: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreSealedMediaBlob {
+        return
+            try CoreSealedMediaBlob(
+                blobId: FfiConverterData.read(from: &buf), 
+                blobKey: FfiConverterData.read(from: &buf), 
+                plaintextBytes: FfiConverterUInt64.read(from: &buf), 
+                ciphertext: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreSealedMediaBlob, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.blobId, into: &buf)
+        FfiConverterData.write(value.blobKey, into: &buf)
+        FfiConverterUInt64.write(value.plaintextBytes, into: &buf)
+        FfiConverterData.write(value.ciphertext, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSealedMediaBlob_lift(_ buf: RustBuffer) throws -> CoreSealedMediaBlob {
+    return try FfiConverterTypeCoreSealedMediaBlob.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreSealedMediaBlob_lower(_ value: CoreSealedMediaBlob) -> RustBuffer {
+    return FfiConverterTypeCoreSealedMediaBlob.lower(value)
+}
+
+
+/**
  * The answer to "this is what the plan came out as; does it go on the radio?".
  */
 public struct CoreSprayAdmission {
@@ -28535,6 +28908,77 @@ public func FfiConverterTypeLanEndpointContent_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeLanEndpointContent_lower(_ value: LanEndpointContent) -> RustBuffer {
     return FfiConverterTypeLanEndpointContent.lower(value)
+}
+
+
+/**
+ * One decrypted record's plane and payload. `record_type` is
+ * [`RECORD_TYPE_FRAME`] for a mesh protocol frame or [`RECORD_TYPE_BLOB`]
+ * for an encoded blob-plane pull frame.
+ */
+public struct LanRecord {
+    public var recordType: UInt8
+    public var frame: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(recordType: UInt8, frame: Data) {
+        self.recordType = recordType
+        self.frame = frame
+    }
+}
+
+
+
+extension LanRecord: Equatable, Hashable {
+    public static func ==(lhs: LanRecord, rhs: LanRecord) -> Bool {
+        if lhs.recordType != rhs.recordType {
+            return false
+        }
+        if lhs.frame != rhs.frame {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(recordType)
+        hasher.combine(frame)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLanRecord: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LanRecord {
+        return
+            try LanRecord(
+                recordType: FfiConverterUInt8.read(from: &buf), 
+                frame: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LanRecord, into buf: inout [UInt8]) {
+        FfiConverterUInt8.write(value.recordType, into: &buf)
+        FfiConverterData.write(value.frame, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanRecord_lift(_ buf: RustBuffer) throws -> LanRecord {
+    return try FfiConverterTypeLanRecord.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLanRecord_lower(_ value: LanRecord) -> RustBuffer {
+    return FfiConverterTypeLanRecord.lower(value)
 }
 
 
@@ -37039,6 +37483,178 @@ extension BackupPassphraseStrength: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Where a recipient would fetch the bytes from.
+ *
+ * Exported as itself rather than mirrored in [`super::ffi`]: it carries no
+ * fixed-width array, so a binding can spell it exactly as written.
+ */
+
+public enum BlobTransferSource {
+    
+    /**
+     * A LAN link the mesh has already authenticated with the sender. Free,
+     * local, and off the internet entirely.
+     */
+    case lan
+    /**
+     * The relay blob store, over whatever internet path is selected.
+     */
+    case relay
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBlobTransferSource: FfiConverterRustBuffer {
+    typealias SwiftType = BlobTransferSource
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BlobTransferSource {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .lan
+        
+        case 2: return .relay
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: BlobTransferSource, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .lan:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .relay:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobTransferSource_lift(_ buf: RustBuffer) throws -> BlobTransferSource {
+    return try FfiConverterTypeBlobTransferSource.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobTransferSource_lower(_ value: BlobTransferSource) -> RustBuffer {
+    return FfiConverterTypeBlobTransferSource.lower(value)
+}
+
+
+
+extension BlobTransferSource: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What may happen to a blob transfer right now.
+ */
+
+public enum BlobTransferVerdict {
+    
+    /**
+     * Start without asking.
+     */
+    case autoStart
+    /**
+     * Do not start, but offer it: the person can price the transfer from
+     * `ciphertext_bytes` and say yes. Never a warning state — the spec's
+     * "Tap to download over the internet (34 MB)".
+     */
+    case askFirst(ciphertextBytes: UInt64
+    )
+    /**
+     * Do not start and do not offer: the path itself is closed, which today
+     * means only [`CoreRelayNetworkVerdict::DeferredRoaming`]. `network` is
+     * carried anyway so the bubble reads the reason off the verdict rather
+     * than inventing one, and so a later deferral needs no new variant.
+     */
+    case deferred(network: CoreRelayNetworkVerdict, ciphertextBytes: UInt64
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBlobTransferVerdict: FfiConverterRustBuffer {
+    typealias SwiftType = BlobTransferVerdict
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BlobTransferVerdict {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .autoStart
+        
+        case 2: return .askFirst(ciphertextBytes: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 3: return .deferred(network: try FfiConverterTypeCoreRelayNetworkVerdict.read(from: &buf), ciphertextBytes: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: BlobTransferVerdict, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .autoStart:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .askFirst(ciphertextBytes):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(ciphertextBytes, into: &buf)
+            
+        
+        case let .deferred(network,ciphertextBytes):
+            writeInt(&buf, Int32(3))
+            FfiConverterTypeCoreRelayNetworkVerdict.write(network, into: &buf)
+            FfiConverterUInt64.write(ciphertextBytes, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobTransferVerdict_lift(_ buf: RustBuffer) throws -> BlobTransferVerdict {
+    return try FfiConverterTypeBlobTransferVerdict.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBlobTransferVerdict_lower(_ value: BlobTransferVerdict) -> RustBuffer {
+    return FfiConverterTypeBlobTransferVerdict.lower(value)
+}
+
+
+
+extension BlobTransferVerdict: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which direction of a one-to-one conversation cannot carry beyond
  * Bluetooth range, decided entirely from local facts -- no network call, no
  * round trip, and no evidence of the other phone's current state.
@@ -39926,6 +40542,80 @@ public func FfiConverterTypeCoreLinkScheme_lower(_ value: CoreLinkScheme) -> Rus
 
 
 extension CoreLinkScheme: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Mirror of [`MediaKind`].
+ */
+
+public enum CoreMediaKind {
+    
+    case photo
+    case video
+    case file
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreMediaKind: FfiConverterRustBuffer {
+    typealias SwiftType = CoreMediaKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreMediaKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .photo
+        
+        case 2: return .video
+        
+        case 3: return .file
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreMediaKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .photo:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .video:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .file:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMediaKind_lift(_ buf: RustBuffer) throws -> CoreMediaKind {
+    return try FfiConverterTypeCoreMediaKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreMediaKind_lower(_ value: CoreMediaKind) -> RustBuffer {
+    return FfiConverterTypeCoreMediaKind.lower(value)
+}
+
+
+
+extension CoreMediaKind: Equatable, Hashable {}
 
 
 
@@ -47709,6 +48399,30 @@ fileprivate struct FfiConverterOptionTypeCoreLinkSummary: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeCoreMediaManifest: FfiConverterRustBuffer {
+    typealias SwiftType = CoreMediaManifest?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeCoreMediaManifest.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeCoreMediaManifest.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCoreReactionPayload: FfiConverterRustBuffer {
     typealias SwiftType = CoreReactionPayload?
 
@@ -47893,6 +48607,30 @@ fileprivate struct FfiConverterOptionTypeLanEndpointCacheEntry: FfiConverterRust
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeLanEndpointCacheEntry.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeLanRecord: FfiConverterRustBuffer {
+    typealias SwiftType = LanRecord?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeLanRecord.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeLanRecord.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -50602,6 +51340,48 @@ public func bleMaxAttValueLen() -> UInt16 {
 })
 }
 /**
+ * `BLOB-03`'s device half: no blob transfer starts on an expensive or roaming
+ * path without an explicit user action.
+ *
+ * Pure, clock-free, and composed:
+ *
+ * * **LAN is always permitted.** It does not touch the internet, so the relay
+ * network verdict is not consulted for it — a roaming SIM says nothing
+ * about a cabin Wi-Fi. Auto-start is the per-device setting the spec
+ * defaults on; with it off the transfer is offered rather than deferred,
+ * because nothing is being spent.
+ * * **Relay never starts unattended at all.** Even a fully permitted path
+ * asks first unless the caller carries a confirmation, which is what makes
+ * the action explicit and size-aware. That is already stricter than the
+ * mailbox, so the network verdict's remaining job here is narrow.
+ * * **A roaming deferral is the one thing a confirmation cannot buy past.**
+ * [`CoreRelayNetworkVerdict::DeferredRoaming`] means "do not start a relay
+ * pass"; its only override is the Advanced roaming toggle, and that already
+ * lives inside [`crate::core_relay_network_permitted`], where the mailbox
+ * honours it too. A second copy of that rule is how a family ends up with a
+ * plane that roams when the mailbox will not.
+ * * **A constrained path is expensive, not closed.**
+ * [`CoreRelayNetworkVerdict::DeferredConstrained`] (Android Data Saver, iOS
+ * Low Data Mode) defers the mailbox's *unattended* carried-envelope uploads
+ * while lightweight sync keeps running — it is a degradation, and nothing
+ * ever clears it, since the roaming toggle does not apply. Mapping it to
+ * [`BlobTransferVerdict::Deferred`] would leave a phone in Low Data Mode
+ * unable to fetch a photo ever, with no offer on the bubble to escape
+ * through, on a network the relay itself is still using. So it asks — which
+ * is exactly the rule BLOB-03 states for an expensive path.
+ */
+public func blobTransferPermitted(source: BlobTransferSource, network: CoreRelayNetworkVerdict, userConfirmed: Bool, ciphertextBytes: UInt64, autoDownloadOnLan: Bool) -> BlobTransferVerdict {
+    return try!  FfiConverterTypeBlobTransferVerdict.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_blob_transfer_permitted(
+        FfiConverterTypeBlobTransferSource.lower(source),
+        FfiConverterTypeCoreRelayNetworkVerdict.lower(network),
+        FfiConverterBool.lower(userConfirmed),
+        FfiConverterUInt64.lower(ciphertextBytes),
+        FfiConverterBool.lower(autoDownloadOnLan),$0
+    )
+})
+}
+/**
  * What (if anything) the composer should say about a one-to-one chat.
  *
  * `contact_nearby` must come from the same live link lookup the send path
@@ -52568,6 +53348,41 @@ public func coreMakeLanEndpointLink(endpoint: CoreLanEndpoint) -> String {
 })
 }
 /**
+ * The sender's second step: the `content` of a [`media_manifest_kind`]
+ * message, to hand to the ordinary authoring call unchanged.
+ */
+public func coreMediaManifestBody(manifest: CoreMediaManifest)throws  -> Data {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_media_manifest_body(
+        FfiConverterTypeCoreMediaManifest.lower(manifest),$0
+    )
+})
+}
+/**
+ * The receive side: a delivered body, or `None` for every kind but the
+ * manifest kind and for a legacy inline attachment carried under it. See
+ * [`recognize_media_manifest`].
+ */
+public func coreMediaRecognizeManifest(kind: UInt8, content: Data) -> CoreMediaManifest? {
+    return try!  FfiConverterOptionTypeCoreMediaManifest.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_media_recognize_manifest(
+        FfiConverterUInt8.lower(kind),
+        FfiConverterData.lower(content),$0
+    )
+})
+}
+/**
+ * The sender's first step: a fresh key, the ciphertext, and the digest that
+ * names it. See [`seal_media_blob`].
+ */
+public func coreMediaSealBlob(plaintext: Data)throws  -> CoreSealedMediaBlob {
+    return try  FfiConverterTypeCoreSealedMediaBlob.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_core_media_seal_blob(
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+/**
  * Mint a fresh inbox key at `generation` (§6).
  */
 public func coreMintInboxKey(generation: UInt64) -> InboxKey {
@@ -52685,6 +53500,10 @@ public func coreOpenSyncRecord(sealed: Data, inboxKey: InboxKey, ownRoster: Rost
 /**
  * The capability bits this build advertises in HELLO2. Both shells call
  * this instead of hardcoding bits so they can never disagree with core.
+ *
+ * Every bit here is a claim about behavior this build actually has. See
+ * [`CAP_MEDIA_BLOB`] for the one that is allocated but withheld until its
+ * drivers ship.
  */
 public func coreOwnCapabilities() -> UInt32 {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
@@ -55367,6 +56186,26 @@ public func lanMaxFrameSize() -> UInt64 {
     )
 })
 }
+/**
+ * Send-queue ordering for one outbound frame: lower goes first. Core holds
+ * no socket, so the shells own the queue; what core owns is the rule that
+ * mesh frames outrank blob frames, so a bulk transfer never delays the
+ * message plane sharing the link.
+ *
+ * This orders frames *waiting to be encrypted*. A Noise transport nonce is
+ * implicit and sequential, so records must reach the wire in the order
+ * [`LanNoiseSession::encrypt_frame`] and
+ * [`LanNoiseSession::encrypt_blob_record`] produced them — already-encrypted
+ * records must never be reordered. Head-of-line delay for a mesh frame is
+ * therefore bounded by one blob frame's records, not by a whole transfer.
+ */
+public func lanRecordPriority(recordType: UInt8) -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_record_priority(
+        FfiConverterUInt8.lower(recordType),$0
+    )
+})
+}
 public func lanServiceType() -> String {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_lan_service_type($0
@@ -55459,6 +56298,56 @@ public func mayStartCarriedOffer(activeOffers: UInt32) -> Bool {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cruisemesh_core_fn_func_may_start_carried_offer(
         FfiConverterUInt32.lower(activeOffers),$0
+    )
+})
+}
+/**
+ * See [`MEDIA_AUTHORING_MAX_BYTES`]. A picker checks against this before it
+ * reads a file in and asks core to seal it.
+ */
+public func mediaAuthoringMaxBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_authoring_max_bytes($0
+    )
+})
+}
+/**
+ * See [`MEDIA_BLOB_MAX_BYTES`]. The *protocol* cap: the largest blob a
+ * manifest may describe or a transfer may move. It is not the bound a picker
+ * checks — that is [`media_authoring_max_bytes`], which is smaller because
+ * this phase's boundary copies whole buffers.
+ */
+public func mediaBlobMaxBytes() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_blob_max_bytes($0
+    )
+})
+}
+/**
+ * The message kind a manifest rides, for a shell that authors one.
+ */
+public func mediaManifestKind() -> UInt8 {
+    return try!  FfiConverterUInt8.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_manifest_kind($0
+    )
+})
+}
+/**
+ * See [`MEDIA_MANIFEST_MAX_BYTES`].
+ */
+public func mediaManifestMaxBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_manifest_max_bytes($0
+    )
+})
+}
+/**
+ * See [`MEDIA_THUMBNAIL_MAX_BYTES`]. The bound a shell's thumbnail encoder
+ * targets; a thumbnail over it is a refused manifest, not a resized one.
+ */
+public func mediaThumbnailMaxBytes() -> UInt32 {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_media_thumbnail_max_bytes($0
     )
 })
 }
@@ -55614,6 +56503,22 @@ public func parseRelaySetupText(text: String)throws  -> RelaySetup {
     return try  FfiConverterTypeRelaySetup.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_parse_relay_setup_text(
         FfiConverterString.lower(text),$0
+    )
+})
+}
+/**
+ * Whether a peer's advertised HELLO2 capabilities say it speaks the LAN pull
+ * sub-channel. A requester opens a pull session only against a peer that
+ * advertised the bit; the manifest itself is sent regardless, because it is
+ * delay-tolerant mail like any other.
+ *
+ * The bit's meaning lives here rather than beside its allocation so that the
+ * blob plane stays the only place that knows what it licenses.
+ */
+public func peerSpeaksBlobPlane(peerCapabilities: UInt32) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_peer_speaks_blob_plane(
+        FfiConverterUInt32.lower(peerCapabilities),$0
     )
 })
 }
@@ -56668,6 +57573,22 @@ public func rotateGroup(group: Group, memberUserIds: [Data])throws  -> Group {
 })
 }
 /**
+ * The name a received blob is written under: one filesystem-safe component,
+ * extension derived from `mime`, never empty.
+ *
+ * Exported: the receive-side save path is a shell's, and the rule it applies
+ * must not be. The collision-suffix form stays unexported until a driver
+ * exists to loop it (phase 3).
+ */
+public func sanitizeMediaFilename(name: String, mime: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_sanitize_media_filename(
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(mime),$0
+    )
+})
+}
+/**
  * Make an installed legacy full-database backup safe before any transport
  * opens it. The path is opened through [`MessageStore::open`] first so old
  * schemas receive the normal forward migrations before the cleanup runs.
@@ -56993,6 +57914,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_ble_max_att_value_len() != 51624) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_blob_transfer_permitted() != 53371) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_composer_reach() != 10891) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57314,6 +58238,15 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_make_lan_endpoint_link() != 27969) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_media_manifest_body() != 35637) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_media_recognize_manifest() != 30787) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_media_seal_blob() != 57239) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_mint_inbox_key() != 38877) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57326,7 +58259,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_open_sync_record() != 6040) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 36411) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_capabilities() != 12435) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof() != 6942) {
@@ -57785,6 +58718,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_lan_max_frame_size() != 29933) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_lan_record_priority() != 49200) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_lan_service_type() != 61768) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57804,6 +58740,21 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_may_start_carried_offer() != 61552) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_authoring_max_bytes() != 64152) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_blob_max_bytes() != 52749) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_manifest_kind() != 33839) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_manifest_max_bytes() != 18686) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_media_thumbnail_max_bytes() != 61053) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_normalize_relay_url() != 20691) {
@@ -57834,6 +58785,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_parse_relay_setup_text() != 37250) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_peer_speaks_blob_plane() != 34310) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_recent_device_hints_for() != 17789) {
@@ -57966,6 +58920,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_rotate_group() != 56003) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_sanitize_media_filename() != 55399) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_sanitize_restored_message_store() != 11599) {
@@ -58328,7 +59285,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_corespraypolicy_quiet_rounds() != 64566) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 12115) {
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_accepts_blob_records() != 22133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record() != 61860) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_decrypt_record_typed() != 4136) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_encrypt_blob_record() != 484) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_encrypt_frame() != 54052) {
@@ -58344,6 +59310,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_remote_static_key() != 43732) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_method_lannoisesession_set_peer_capabilities() != 25489) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_lannoisesession_write_handshake_message() != 61679) {

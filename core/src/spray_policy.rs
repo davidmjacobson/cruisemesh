@@ -1694,6 +1694,111 @@ mod tests {
         assert_eq!(queued, frame);
     }
 
+    /// `BLOB-01`, the budget half: a media manifest is charged here as an
+    /// ordinary envelope, and no amount of blob is ever a thing this policy
+    /// could be asked to admit.
+    ///
+    /// The two-plane split only holds if the message plane's half of a media
+    /// send stays *ordinary* -- a manifest that needed its own lane, or that
+    /// starved the others, would be a bulk transfer wearing an envelope. So
+    /// the largest manifest the codec will emit is charged, exactly, against
+    /// the same budgets a text message is charged against, and the lanes it
+    /// does not use keep their allowance.
+    #[test]
+    fn blob_01_a_max_manifest_sprays_as_an_ordinary_envelope() {
+        use crate::media::MEDIA_MANIFEST_MAX_BYTES;
+
+        let manifest = MEDIA_MANIFEST_MAX_BYTES as u64;
+        let policy = burst_policy();
+        let gate = policy.may_spray(PEER.into(), LINK.into(), CoreSprayTrigger::FirstContact, 0);
+        assert!(gate.allow);
+        assert!(
+            manifest <= gate.carried_budget_bytes,
+            "the biggest manifest must fit one encounter's courier lane whole; \
+             a manifest that had to be paced would be bulk"
+        );
+
+        // Charged as a carried envelope, because that is what a manifest is to
+        // a mule: it costs its bytes and nothing more.
+        let admitted = policy.admit_plan(
+            PEER.into(),
+            LINK.into(),
+            CoreSprayPlanShape {
+                carried: CoreSprayLanePlan {
+                    set_digest: 1,
+                    bytes: manifest,
+                },
+                own_outbound: empty_lane(),
+                own_receipts: empty_lane(),
+            },
+            0,
+        );
+        assert!(admitted.send);
+        assert_eq!(admitted.charged_bytes, manifest);
+        assert_eq!(
+            policy.link_allowance_bytes(LINK.into(), 0),
+            LINK_BURST_BYTES - manifest,
+            "one manifest spends one manifest's worth of the link's burst"
+        );
+
+        // How many back-to-back maximal manifests one burst buys, in the
+        // arithmetic style of the 34-round case above: the cap must bite, and
+        // it must bite at a number that leaves a media chat usable.
+        let policy = burst_policy();
+        let mut queued = 0_u64;
+        let mut sent = 0_u32;
+        for round in 0..16_u64 {
+            let gate =
+                policy.may_spray(PEER.into(), LINK.into(), CoreSprayTrigger::FirstContact, 0);
+            if !gate.allow {
+                assert_eq!(gate.reason, CoreSprayGateReason::LinkBurstExhausted);
+                break;
+            }
+            // Each round advertises a different set, so suppression cannot
+            // stand in for the byte cap being measured.
+            let admitted = policy.admit_plan(PEER.into(), LINK.into(), plan(round, manifest), 0);
+            if admitted.send {
+                sent += 1;
+                queued += admitted.charged_bytes;
+            }
+        }
+        assert_eq!(sent, 6, "a burst is exactly six maximal manifests");
+        assert!(queued <= LINK_BURST_BYTES);
+    }
+
+    /// The other half of the same invariant: blob bytes are not a quantity
+    /// this policy has a budget for, at any granularity.
+    ///
+    /// This is arithmetic over constants rather than a call, and deliberately
+    /// so -- there is no `admit_plan` that could be handed a chunk, because
+    /// nothing plans one. What a future patch could do is decide a chunk is
+    /// "small enough to just spray"; these numbers are what that patch would
+    /// have to argue with.
+    #[test]
+    fn blob_01_no_blob_granularity_fits_an_encounter_budget() {
+        use crate::media::{MEDIA_BLOB_MAX_BYTES, MEDIA_CHUNK_CIPHERTEXT_BYTES};
+
+        let chunk = MEDIA_CHUNK_CIPHERTEXT_BYTES as u64;
+        assert!(
+            chunk > CARRIED_SPRAY_BUDGET_BYTES,
+            "one chunk ({chunk}) must not fit a whole encounter's courier lane"
+        );
+        assert!(
+            chunk > LINK_BURST_BYTES / 3,
+            "and it must be a big enough share of one link's burst that pacing \
+             it would visibly displace mail"
+        );
+
+        // A blob at the cap, if it ever rode this lane, would monopolize one
+        // link's entire spray allowance for over an hour of accrual. The
+        // point of the second plane is that this hour does not exist.
+        let seconds_of_allowance = MEDIA_BLOB_MAX_BYTES / LINK_DRAIN_BYTES_PER_SEC;
+        assert!(
+            seconds_of_allowance > 3_600,
+            "a blob is {seconds_of_allowance}s of one link's whole spray allowance"
+        );
+    }
+
     #[test]
     fn an_exhausted_link_recovers_on_its_own_and_says_when() {
         let policy = burst_policy();

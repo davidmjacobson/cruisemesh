@@ -1,9 +1,16 @@
 # Media over two planes: design specification
 
-Status: Proposed (rev 1)
+Status: Proposed (rev 2) — the heart of the blob plane already exists as a
+dark, fully-tested module tree at `core/src/media/` (manifest codec, chunk
+crypto, bitmap, partial-transfer store, pull wire frames, both session state
+machines), reachable by nothing and exported nowhere. Rev 2 documents that
+concrete protocol, decides the three pieces rev 1 left open (link
+multiplexing, the capability bit, the relayd blob API), and replaces the
+delivery-phase sketch with implementation phases.
 Platforms: Android and iOS, with relayd additions
-Scope: photos at full quality, video clips, and the boundary that keeps both
-out of the delay-tolerant message pipeline
+Scope: photos at full quality, video clips, generic file attachments, and
+the boundary that keeps all of them out of the delay-tolerant message
+pipeline
 
 ## Outcome
 
@@ -96,9 +103,11 @@ bytes, the *conversation* is complete on every device.
 
 Rules:
 
-- The thumbnail is mandatory, generated at send time, and is the only
-  degradation the message plane ever performs. There is no "full quality
-  over the message plane" escape hatch.
+- The thumbnail is mandatory for photos and video, generated at send time,
+  and is the only degradation the message plane ever performs. There is no
+  "full quality over the message plane" escape hatch. A generic file has no
+  thumbnail; its bubble renders from the manifest's filename, type, and
+  size instead.
 - The manifest's digest names the encrypted bytes, so any copy fetched from
   anywhere can be verified before it is shown or stored.
 - Deleting the local original after sending does not invalidate the
@@ -187,9 +196,238 @@ plane adds only what TCP cannot give across connections, days, and sources:
   already does; possession of a manifest (digest + sealed key) is the
   capability to fetch and read.
 
-## Proposed contract invariants
+## Wire protocol
 
-To be added to the protocol contract with executable owners when this ships:
+What follows is the protocol as implemented in the dark module (normative
+where it exists — the code and its tests are the reference), plus the three
+decisions rev 1 deferred, marked **(new in rev 2)**: how pull frames share
+the LAN link, how support is advertised, and the relayd blob API.
+
+### Message plane: the manifest message
+
+A media send authors one ordinary sealed message of kind
+`KIND_ATTACHMENT_MANIFEST` (16, allocated since the media-readiness work;
+kind 17 `KIND_ATTACHMENT_CHUNK` stays reserved and unused — chunks never
+ride the message plane). The body is the versioned manifest codec in
+`core/src/media/manifest.rs` (`MANIFEST_WIRE_VERSION = 2`, deliberately not
+1: kind 16 carries two body codecs, and spending the next version byte is
+what makes the legacy inline attachment and the manifest disjoint
+structurally rather than statistically — a blob id can be ground until the
+rest of the body reads as an attachment, a version byte cannot):
+
+| Field | Meaning |
+|---|---|
+| `blob_id` (32 bytes) | BLAKE2b-256 of the ciphertext — the blob's permanent name |
+| `blob_key` (32 bytes) | per-blob key; travels only here, inside sealed content |
+| `ciphertext_bytes`, `plaintext_bytes` | exact sizes, so geometry is derivable everywhere |
+| `kind` | photo (1), video (2), or file (3, new in rev 2) |
+| `mime` (≤128 B), width/height, `duration_ms` | render metadata |
+| `filename` (≤255 B, new in rev 2) | the sender's display name for the item; required for kind file, optional otherwise |
+| `thumbnail` (≤64 KiB) | mandatory for photo/video (poster frame for video); absent for file |
+| `caption` (≤4 KiB) | ordinary text |
+
+The encoded manifest is capped at 96 KiB (`MEDIA_MANIFEST_MAX_BYTES`), and a
+test pins that a maximal manifest fits today's attachment envelope with
+room. The decoder permits trailing extension bytes, so the manifest can grow
+without a version bump.
+
+### Blob encoding: encrypt, then name
+
+`core/src/media/blob.rs`. The plaintext is split into 256 KiB chunks
+(`MEDIA_CHUNK_PLAINTEXT_BYTES`); each chunk is sealed independently with
+XChaCha20-Poly1305 under the per-blob key (AAD domain
+`cruisemesh.media.blob/v1`, nonce prefix `cmblob01` + chunk index), so every
+chunk but the last is exactly 256 KiB + 16 bytes of ciphertext and a chunk's
+ciphertext offset is a multiplication, not a lookup — chunk boundaries are
+identical at every source. `blob_id` = BLAKE2b-256 over the whole
+ciphertext, verified on completion (`verify_assembled`) and per-chunk on
+arrival (a chunk that fails its AEAD open is rejected and stays missing in
+the bitmap — BLOB-05 at chunk granularity). Blob cap: 128 MiB
+(`MEDIA_BLOB_MAX_BYTES`).
+
+### Generic files (new in rev 2)
+
+Everything below the manifest is content-agnostic — chunking, chunk crypto,
+the pull proof, resume bitmaps, session budgets, the relay blob store, and
+every BLOB invariant apply to a PDF exactly as they apply to a clip. So
+generic file attachments are a manifest-kind, not a new mechanism:
+
+- **Wire.** `kind = 3 (file)` plus the `filename` field, both added to
+  manifest wire v1 *now*, while the codec is dark and nothing has shipped —
+  after Phase 2 ships, additions ride the codec's trailing-extension room
+  instead. Width/height/duration are zero for files; the same 128 MiB blob
+  cap applies.
+- **Receive side.** A completed, verified file lands in the platform's
+  document space (Downloads / the Files app), never the photo library, via
+  the platform's own save mechanism. The manifest filename is display
+  metadata, not a path: it is sanitized before any filesystem use (no
+  separators, no traversal, no leading dots), collisions get a numeric
+  suffix, and the saved file's extension is derived from the manifest mime
+  rather than trusted from the name. CruiseMesh never auto-opens a received
+  file; the bubble offers open-with/share through the platform sheet.
+- **Consent.** Files follow the same cost rules as media — auto-fetch on
+  LAN, size-aware consent on expensive paths. No special case.
+
+### Capability advertisement (new in rev 2)
+
+Allocate HELLO2 capability bit `CAP_MEDIA_BLOB = 1 << 5` in
+`core/src/protocol.rs`. It means: this device renders media manifests and
+speaks the LAN pull sub-channel (both roles). It gates nothing on the message
+plane — a manifest is delay-tolerant mail like any other and is sent
+regardless — but a requester only opens a pull session against a peer that
+advertised the bit, and the sender's UI may use its absence to explain a
+contact stuck on an old build. Legacy HELLO never grows trailing fields; the
+bit rides frame 0x06 only.
+
+The bit is *allocated* in Phase 1 and *advertised* in the phase that ships
+the pull drivers: `core_own_capabilities()` gains it in that PR, not before.
+A bit means "this build does the thing", and a Phase 1 build does not — a
+requester that believed it would spend a session on a peer with nothing to
+answer with.
+
+#### Compatibility with older builds
+
+A manifest delivered to a build that predates this work is **lost, not
+delayed**. The new `KIND_ATTACHMENT_MANIFEST` body fails the shipped inline
+attachment decoder, and the shipped receive path treats that as
+`DroppedMalformed`: terminal, recorded in the dedupe set, and silent on both
+ends — no error to the sender, no placeholder to the recipient, and no second
+chance when the recipient updates, because the message will not be redelivered.
+
+That is accepted rather than fixed. The fix would have to live in decoders
+that are already on people's phones, and there is no way to reach them; a
+"manifest fallback" body those builds could read would have to be an inline
+attachment, which is the whole thing this design exists to stop sending.
+
+The mitigation is therefore entirely send-side, and it belongs to Phase 2 —
+the phase that first authors a manifest. The composer offers media into a
+conversation only once every one of the contact's devices has advertised
+`CAP_MEDIA_BLOB`; otherwise the media option is unavailable and the surface
+says plainly that the other person's app is too old, in the ordinary "ask
+them to update" vocabulary rather than in protocol terms. Copy through
+resources, as always.
+
+Until Phase 2 ships, nothing in the app authors a manifest at all, so no
+manifest can be delivered to anyone and the exposure is zero. The gate has to
+land in the same PR series as the send path, not after it.
+
+### LAN sub-channel: multiplexing (new in rev 2)
+
+The pull conversation rides the *existing* authenticated LAN link — the
+Noise XX session of `core/src/lan_session.rs`, whose encrypted records
+already carry a one-byte record type. Today `RECORD_TYPE_FRAME = 1` is the
+only allocation. Rev 2 allocates:
+
+- **`RECORD_TYPE_BLOB = 2`** — a record whose reassembled payload is one
+  encoded `PullFrame` (`core/src/media/wire.rs`), in either direction.
+
+Blob records use the same 9-byte inner header (`record_type ‖ frame_id:u32 ‖
+index:u16 ‖ total:u16`) but their `frame_id` space is independent of record
+type 1's, and each record type gets its own single-in-flight reassembler.
+Records of the two types may interleave freely on the wire: a 256 KiB chunk
+frame spans ~5 Noise records of ≤60 KiB, and mesh-plane records may be
+emitted between them. That interleaving point *is* the courtesy mechanism —
+the acceptance criterion that a transfer in progress never measurably delays
+the message plane is tested at this layer (mesh records get priority at the
+send queue). A peer that did not advertise `CAP_MEDIA_BLOB` treats record
+type 2 as it treats any unknown type: drop the record, keep the link. That
+is a `None` out of the decoder, not an error — the record is authenticated,
+so an unfamiliar type is a peer on a newer build, and every shell read loop
+treats a decrypt error as fatal and closes the socket.
+
+The gate runs in both directions, and on both sides of one link. A session
+accepts record type 2 only once the shell has told it the peer's HELLO2
+capabilities include `CAP_MEDIA_BLOB` (`set_peer_capabilities` on
+`LanNoiseSession`; the default is closed). Authenticating the link is not the
+same as agreeing to a second plane on it: the blob lane carries its own
+reassembler with its own frame buffer, and a contact who never claimed the
+blob plane must not be able to open one. A blob record from such a peer is
+skipped exactly like an unknown type — the link survives. Rejected alternative: a second TCP connection with its own handshake —
+more sockets, a second discovery/firewall story, and nothing the record mux
+doesn't already give.
+
+### LAN pull sub-channel: frames and proof
+
+`core/src/media/wire.rs` and `core/src/media/lan_pull.rs`, already
+implemented and table-tested. Frame tags (their own byte space, inside
+record type 2): `Open(1)`, `Challenge(2)`, `Fetch(3)`, `Chunk(4)`,
+`BatchDone(5)`, `Refused(6)`, `Close(7)`.
+
+```text
+requester                              responder
+---------                              ---------
+Open{blob_id}            ->
+                         <-            Challenge{nonce, chunks_held}
+Fetch{proof, ranges≤8}   ->
+                         <-            Chunk{index, ciphertext} …
+                         <-            BatchDone
+Fetch{…}                 ->            (window: ≤16 chunks / 4 MiB)
+…                        ->            Close
+```
+
+A responder answers only for blobs it holds and only to a requester that
+proves manifest possession: `proof = BLAKE2b-256("cruisemesh.media.pull-proof/v1"
+‖ blob_id ‖ nonce ‖ blob_key)`, nonce chosen by the responder, single-use.
+This is abuse resistance (bandwidth, existence-probing, conversation-scoped
+consent), not confidentiality — the ciphertext is unreadable without the
+sealed key regardless. Refusals (`NotHeld`, `ProofInvalid`, `BadRequest`,
+`BudgetSpent`, `Busy`) are terminal for the session; `BudgetSpent` is a
+pause, and the requester resumes later from its bitmap.
+
+Both roles run as pure state machines (typed actions out, typed results in,
+explicit `now_ms` — the `relay_pass.rs` shape) with declared budgets: a
+requester session issues ≤64 fetches and accepts ≤48 MiB inside a 60 s
+deadline; a responder serves ≤512 chunks / ≤48 MiB / ≤64 fetches. A 128 MiB
+clip deliberately spans several sessions; the bitmap makes each next one
+cheap.
+
+### Resume state
+
+`core/src/media/bitmap.rs` + `core/src/media/store.rs`: a persisted per-blob
+chunk bitmap with a `missing_ranges` walk, and SQLite metadata
+(`media_blobs` table, applied to the app's existing `MessageStore`
+connection at integration) tracking bytes present, verification state, and
+LRU order for the 512 MiB partial-transfer GC budget. A completed, verified
+blob leaves for the platform media store and is no longer charged.
+
+### Relay blob store API (new in rev 2, Phase 2)
+
+relayd gains a content-addressed blob store beside the mailbox, same bearer
+auth, same limiter discipline:
+
+| Route | Method | Token class | What it does |
+|---|---|---|---|
+| `/blobs/{blob_id}` | `POST` | member | Create: declares `ciphertext_bytes`; checked against the family blob quota; 409 if complete copy exists (dedupe — success for the sender) |
+| `/blobs/{blob_id}` | `PATCH` | member | Ranged upload: `Content-Range` ciphertext bytes, resumable; on the final range relayd verifies BLAKE2b-256(ciphertext) = `blob_id` and only then marks the blob fetchable — a digest mismatch discards the upload |
+| `/blobs/{blob_id}` | `HEAD` | member or deposit | Existence + completeness + size, so a recipient can price the download before consenting |
+| `/blobs/{blob_id}` | `GET` | member or deposit | Ranged fetch, ≤4 MiB per request (`Range` header), bytes charged to the requesting token's byte bucket |
+
+Auth for cross-family recipients is the deposit token they already hold: a
+friend card carries the sender family's post-only deposit token, and Phase 2
+widens the deposit class from "may post mail" to "may post mail and fetch
+this family's blobs" — read access to unreadable ciphertext, gated on
+possessing both the card and the 32-byte blob id from a sealed manifest.
+Deposit tokens still cannot touch envelopes, presence, or WS. Rejected
+alternative: unauthenticated fetch-by-blob-id — an unguessable name is a
+capability, but an unauthenticated 128 MiB endpoint invites scraping and
+sits outside the per-family limiter that protects the hosted service.
+
+Storage: blob bytes as files on disk under the relayd data dir, one metadata
+row per blob in SQLite (family token, sizes, completeness, `expires_at`,
+per-blob upload bitmap); never inline in the mailbox database. Quota is a
+separate per-family blob quota (512 MiB default, `families` column beside
+the mailbox quota, enforced at create and at upload commit). Expiry is 7
+days from completion (incomplete uploads expire faster), pruned by the
+existing sweep. All four routes ride the family rate limiter's request and
+byte dimensions plus the global backstop.
+
+## Contract invariants
+
+All six are already registered — in `specs/protocol-contract-v1.md` §1 and
+the machine index `core/tests/protocol_contract.rs`. BLOB-02, BLOB-04, and
+BLOB-05 are core-owned today (the dark module's tests); BLOB-01, BLOB-03,
+and BLOB-06 are registered `unimplemented` and flip to executable owners in
+the phases below.
 
 - **BLOB-01 — plane separation.** Blob bytes never enter an envelope, a
   carry queue, a digest spray plan, or any BLE frame. (The existing spray
@@ -206,11 +444,17 @@ To be added to the protocol contract with executable owners when this ships:
   like every other pass.
 - **BLOB-05 — verify before trust.** No blob is decrypted, shown, or
   retained without matching its manifest digest.
+- **BLOB-06 — the relay blob store is a separate, bounded window.** Its
+  per-family quota is distinct from the mailbox quota, its copies expire in
+  days, and its ranged fetches sit under the family rate limiter — owned by
+  relayd e2e tests when Phase 2 ships.
 
 ## UX requirements (family-obvious surface)
 
 - A media message always renders instantly as thumbnail + size; the bubble
-  is never blank and never blocks the conversation.
+  is never blank and never blocks the conversation. A file message renders
+  the same way from filename + type + size, with a document glyph where the
+  thumbnail would be.
 - Pending state is calm and truthful, reusing the connection-details
   vocabulary: "Will download when you're near Dad" / "Waiting for internet" /
   "Tap to download over the internet (34 MB)". Never a warning color for
@@ -238,19 +482,86 @@ To be added to the protocol contract with executable owners when this ships:
 | Relay blob expiry | 7 days | matches the delivery-window philosophy |
 | Partial-chunk GC budget (device) | 512 MiB, oldest first | bounded incompleteness |
 
-## Delivery phases
+## Implementation phases
 
-**Phase 1 — LAN-only, photos first.** Manifests + thumbnails on the message
-plane; blob fetch over the existing authenticated LAN links with chunk
-bitmap and resume; photos ship full-quality; video behind the same machinery
-once soak-tested. No relayd changes. This alone transforms the on-ship and
-at-home experience.
+Phase 0 — the pure protocol core — is done: `core/src/media/` implements
+everything above except the two "(new in rev 2)" link/relay pieces, dark and
+table-tested. What remains is wiring, in shippable slices. Each phase is one
+PR series off its own branch, lands green on the full workspace, and ships
+both platforms together where behavior is shared.
 
-**Phase 2 — relay blob store.** relayd blob endpoints (upload, ranged fetch,
-quota, expiry), sender consent flow, recipient size-aware download, roaming
-composition. This makes media work apart, not just together.
+**Phase 1 — core surface and link plumbing (pure Rust, no UI).**
+The whole of this phase is testable with `cargo test` alone.
 
-**Phase 3 — polish and study.** Group-send efficiencies, per-chat policies
+- `RECORD_TYPE_BLOB = 2` in `lan_session.rs`: per-type reassemblers,
+  independent frame-id spaces, mesh-priority interleaving at the record
+  layer, unknown-type behavior pinned by test.
+- `CAP_MEDIA_BLOB = 1 << 5` allocated in `protocol.rs`, with the
+  bit-allocation test pattern the existing bits use, and *withheld* from
+  `core_own_capabilities()` until Phase 2's drivers ship (above).
+- The manifest codec's rev-2 additions while the wire is still dark:
+  `kind = file (3)` and the `filename` field, with filename-sanitization
+  policy as pure, table-tested core logic.
+- The integration module the checklist in `core/src/media/mod.rs` owes:
+  authoring (seal + manifest encode as a `KIND_ATTACHMENT_MANIFEST` body),
+  receive-side manifest recognition opening a `BlobStore` row,
+  `MEDIA_SCHEMA_SQL` applied on the `MessageStore` connection (and the
+  backup posture for partial transfers decided: metadata backs up, chunk
+  files do not), and the blob-transfer consent verdict composed from
+  `core_relay_network_permitted` rather than duplicated (LAN is always
+  permitted; a relay path inherits the roaming deferral, and a constrained
+  path — an expensive path, not a closed one — is offered with a size).
+- UniFFI exports for all of the above; regenerate bindings.
+- Adversarial BLOB-01 cases in the spray and carry suites; flip BLOB-01 and
+  BLOB-03 to core-owned in the protocol contract.
+
+**Phase 2 — photos end-to-end on LAN, both shells, one PR series.**
+The first user-visible slice: full-quality photos when the phones share a
+network.
+
+- Send path: photo pick, thumbnail generation, manifest authoring, original
+  retained as the servable blob.
+- The send-side capability gate, in this same series: the composer offers
+  media into a conversation only once every one of the contact's devices has
+  advertised `CAP_MEDIA_BLOB`, and says plainly that their app is too old
+  otherwise (copy through resources). A manifest delivered to an older build
+  is lost permanently, not delayed — see "Compatibility with older builds" —
+  so this gate is what keeps the loss mode unreachable, and it cannot land
+  after the send path.
+- The LAN sub-channel drivers on both shells: socket writes for record type
+  2, chunk-file writes, `take_accepted` drain, serve-side chunk reads. With
+  them, and only with them, `CAP_MEDIA_BLOB` joins
+  `core_own_capabilities()`.
+- Bubble UX: instant thumbnail + size, pending states in the
+  connection-details vocabulary, progress, auto-download-on-LAN setting
+  (default on). All copy through resources.
+- Acceptance: the LAN-media criteria below, applied to photos, including
+  the kill-and-resume test and the message-plane-latency courtesy bound.
+
+**Phase 3 — video, generic files, resilience, field soak.**
+
+- Video capture/pick with the clip-length guideline, poster-frame
+  thumbnails, duration metadata.
+- Generic files: document pick on send, the file bubble, save-to-Downloads
+  with sanitized names and the platform open-with sheet on receive. Same
+  transfer machinery as photos — this is UX plus the receive-side save
+  path, both shells.
+- Multi-session transfers exercised for real (a 128 MiB clip spans ≥3
+  sessions), partial-GC behavior verified, source re-selection after
+  network changes.
+- Two-phone rig smoke extension for the blob plane; run the full acceptance
+  list on hardware.
+
+**Phase 4 — relay blob store (works apart, not just together).**
+
+- relayd: the four `/blobs/{blob_id}` routes, disk-file storage, separate
+  family blob quota, expiry sweep, deposit-class widening, e2e tests; flip
+  BLOB-06 to owned.
+- Clients: sender "make this available over the internet" consent with size
+  shown, recipient size-aware download, roaming-deferral composition,
+  remaining-space in Advanced.
+
+**Phase 5 — polish and study.** Group-send efficiencies, per-chat policies
 informed by field metrics, and a *study* (not a commitment) of consented
 mule-assist for blobs — whether a plugged-in, opted-in family device may
 courier encrypted blobs under its own storage grant.
@@ -261,13 +572,14 @@ This is deliberately a new plane rather than a change to the existing one: no
 policy here duplicates anything the in-flight mesh/session consolidation is
 unifying, and none of it should land inside that work. Build it after the
 peer-encounter half of that consolidation settles, since its budgets are the
-ones BLOB-01 must respect. Then proceed as its own series: the core policy
-module first (chunking, bitmap, source selection, consent verdicts — pure and
-table-tested), then the LAN bulk sub-channel drivers, then relayd. Voice
+ones BLOB-01 must respect. The core policy module (chunking, bitmap, pull
+sessions — pure and table-tested) is already landed dark; the implementation
+phases above sequence the rest: core wiring and link plumbing first, then
+the LAN bulk sub-channel drivers, then relayd. Voice
 push-to-talk does not wait for any of this; it rides the existing pipeline
 today.
 
-## Acceptance criteria (Phase 1)
+## Acceptance criteria (LAN media — met across Phases 2 and 3)
 
 - A 30-second clip sent between two phones on one Wi-Fi network completes
   in well under a minute and survives an app kill + relaunch mid-transfer,

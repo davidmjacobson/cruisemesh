@@ -46,6 +46,7 @@
 
 use super::bitmap::{ChunkBitmap, ChunkRange};
 use super::blob::{open_chunk, BlobGeometry, BlobId, BlobKey};
+use super::store::BlobOrigin;
 use super::wire::{
     pull_proof, verify_pull_proof, PullFrame, RefusalReason, PULL_MAX_RANGES_PER_FETCH,
     PULL_NONCE_LEN, PULL_PROOF_LEN,
@@ -602,14 +603,19 @@ pub struct ServeAction {
     pub kind: ServeActionKind,
 }
 
-/// What a responder needs before it answers: which blob, what it holds, and
-/// the key — used **only** to verify a requester's manifest-possession proof.
-/// The bytes it serves are never decrypted.
+/// What a responder needs before it answers: which blob, whose it is, what it
+/// holds, and the key — used **only** to verify a requester's
+/// manifest-possession proof. The bytes it serves are never decrypted.
 #[derive(Clone, Debug)]
 pub struct ServePlan {
     pub blob_id: BlobId,
     pub blob_key: BlobKey,
     pub geometry: BlobGeometry,
+    /// Only [`BlobOrigin::AuthoredHere`] is servable. See
+    /// [`super::integration::servable_plan`] and `BLOB-01`'s second clause: a
+    /// device that finished a download holds every chunk, and must still not
+    /// become a second source for someone else's blob.
+    pub origin: BlobOrigin,
     pub held: ChunkBitmap,
     pub budgets: ServeBudgets,
 }
@@ -676,11 +682,18 @@ impl ServeSession {
                     return self.refuse(RefusalReason::BadRequest, ServeOutcome::ProtocolError);
                 }
                 self.opened = true;
-                if blob_id != self.plan.blob_id || self.plan.held.present_count() == 0 {
+                if blob_id != self.plan.blob_id
+                    || self.plan.origin != BlobOrigin::AuthoredHere
+                    || self.plan.held.present_count() == 0
+                {
                     // BLOB-01/BLOB-03, from the serving side: a device offers
-                    // only what it holds for itself. It never goes looking,
-                    // never asks a third party, and never carries a blob for
-                    // someone else.
+                    // only what it holds *for itself*. It never goes looking,
+                    // never asks a third party, and never carries or re-serves
+                    // a blob for someone else — a completed download is not a
+                    // new source, however complete it is. The refusal is the
+                    // same `NotHeld` a genuinely absent blob gets, so a
+                    // requester learns nothing about what this device has
+                    // downloaded.
                     return self.refuse(
                         RefusalReason::NotHeld,
                         ServeOutcome::Refused {
@@ -923,11 +936,13 @@ mod tests {
         }
     }
 
+    /// The sender's own copy: the only origin a responder may serve from.
     fn serve_plan(blob: &SealedBlob, held: ChunkBitmap) -> ServePlan {
         ServePlan {
             blob_id: blob.id,
             blob_key: test_key(42),
             geometry: blob.geometry,
+            origin: BlobOrigin::AuthoredHere,
             held,
             budgets: ServeBudgets::default(),
         }
@@ -1188,6 +1203,62 @@ mod tests {
             }
         );
         assert_eq!(serve.summary().chunks_served, 0);
+    }
+
+    #[test]
+    fn a_received_blob_is_never_served_onward_however_complete_it_is() {
+        // BLOB-01's second clause. A downloader that finishes holds exactly
+        // what the sender holds — same chunks, same digest, same key, since
+        // the key came in the manifest — so nothing but the origin can stop it
+        // from becoming a second source. The interesting row is the first one:
+        // complete, verified-able, and still refused.
+        let blob = sealed(3);
+        let full = full_bitmap(blob.geometry.chunk_count);
+        let mut partial = ChunkBitmap::empty(blob.geometry.chunk_count).unwrap();
+        partial.set(0);
+
+        let cases = [
+            (BlobOrigin::Received, full.clone(), false),
+            (BlobOrigin::Received, partial, false),
+            (BlobOrigin::AuthoredHere, full.clone(), true),
+        ];
+        for (origin, held, servable) in cases {
+            let plan = ServePlan {
+                origin,
+                ..serve_plan(&blob, held)
+            };
+            let mut serve = ServeSession::new(plan, [0x1A; PULL_NONCE_LEN], 1_000);
+            let action = serve.on_frame(PullFrame::Open { blob_id: blob.id }, 1_000);
+            let refused = action.kind
+                == ServeActionKind::Reply {
+                    frame: PullFrame::Refused {
+                        reason: RefusalReason::NotHeld,
+                    },
+                };
+            assert_eq!(refused, !servable, "origin={origin:?}");
+        }
+
+        // And a refused holder does not leak that it has the bytes: it says
+        // exactly what a device with none of the blob says, and serves none.
+        let plan = ServePlan {
+            origin: BlobOrigin::Received,
+            ..serve_plan(&blob, full)
+        };
+        let mut received = ServeSession::new(plan, [0x1B; PULL_NONCE_LEN], 1_000);
+        let mut pull = PullSession::new(pull_plan(
+            &blob,
+            ChunkBitmap::empty(blob.geometry.chunk_count).unwrap(),
+        ));
+        let mut wire = Wire::new(blob.clone());
+        let summary = wire.run(&mut pull, &mut received);
+        assert_eq!(
+            summary.outcome,
+            PullOutcome::Refused {
+                reason: RefusalReason::NotHeld
+            }
+        );
+        assert_eq!(received.summary().chunks_served, 0);
+        assert!(wire.accepted.is_empty(), "not one byte was re-served");
     }
 
     #[test]
