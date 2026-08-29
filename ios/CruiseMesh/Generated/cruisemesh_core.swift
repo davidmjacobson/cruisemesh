@@ -52714,13 +52714,18 @@ public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, paylo
  * (`specs/multi-device-v1.md` §1, §6).
  *
  * The clone guard predates linking, and its whole test was "does this peer
- * hold my agreement key". That was a sound proxy while a person was a device.
- * It stops being one the moment a person has two: a sibling holds the
- * person-scoped inbox key by design, so the guard would greet every deliberate
- * link with "another phone is using your backup" — the most alarming sentence
- * the app can say, about the thing the person just did on purpose. A warning
- * that fires on the normal case is a warning people learn to dismiss, and then
- * it is not there for the real clone either.
+ * hold my agreement key". That was a sound proxy while a person was a device,
+ * and §9's ceremony keeps it one for now: a linked device is given keys of its
+ * own, so it presents an agreement key this person's other phones have never
+ * seen and the bare key test does not fire on it.
+ *
+ * It is a proxy on borrowed time. §6 makes the inbox key person-scoped and
+ * generation 0 of it *is* the deployed person agreement key, so the day a
+ * sibling holds that key the bare test would greet every deliberate link with
+ * "another phone is using your backup" — the most alarming sentence the app can
+ * say, about the thing the person just did on purpose. A warning that fires on
+ * the normal case is a warning people learn to dismiss, and then it is not
+ * there for the real clone either. So the rule here never rests on the key.
  *
  * `peer_device_id` is what separates the two, and there is no substitute for
  * it: the keys are identical by construction. `None` means the transport could
@@ -52730,10 +52735,36 @@ public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, paylo
  * for, and a person told about a sibling once is better served than a person
  * never told about a clone.
  *
- * WP4's own-device sync records are what will put a device id on this wire.
- * Until then the shells pass `None` and the guard behaves precisely as it does
- * today; the rule is implemented and pinned here so the day a device id
- * arrives, the answer is already right.
+ * **Where a device id comes from, and what it is worth.** §10 step 5's LAN
+ * roster proof is the one that exists today: a peer signs the finished Noise
+ * session's transcript hash with its device signing key, and
+ * [`core_own_device_lan_proof_open`] hands back the device id it derived from
+ * that signature — never a claim read off the wire. Pass that, and nothing
+ * weaker. A HELLO's `user_id`, a roster a peer sent, a device id inside a
+ * frame: none of them are evidence about who is on the far end of a link.
+ *
+ * What the proof establishes is narrow and worth stating: the peer holds the
+ * secret half of a device signing key this roster names, on *this* session. It
+ * does not establish that the peer is distinct hardware. It rules out replay —
+ * the signature covers a transcript that is unique to one handshake, and a
+ * role tag stops the peer returning ours — and it rules out a `.cmbak` restore,
+ * which carries the person identity and the message store but no device signing
+ * secret (those are minted per install and kept in the platform keystore). It
+ * does not rule out a peer that extracted a device signing secret from a
+ * device, which is device compromise and outside what a LAN handshake can see.
+ *
+ * `None` therefore remains the honest answer whenever no proof was opened, and
+ * it still means [`CoreOwnIdentityPeer::Clone`].
+ *
+ * **And on today's LAN, `None` is what the shells pass.** §10 step 5 keeps the
+ * clone arm of the handshake symmetric: two ends that each see their own
+ * agreement key coming back take that arm together and exchange no proof frame,
+ * because on a link where one could never arrive, waiting for one is a hang. So
+ * the only arm that asks this question hands it `None`, and
+ * [`CoreOwnIdentityPeer::Sibling`] is not yet reachable from a shell. The rule
+ * is complete here so that both shells derive one answer from one place rather
+ * than each inventing a different unreachable one at its own call site — which
+ * is exactly what they had been doing.
  */
 public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> CoreOwnIdentityPeer {
     return try!  FfiConverterTypeCoreOwnIdentityPeer.lift(try! rustCall() {
@@ -57225,7 +57256,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof_open() != 63639) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 44514) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_due() != 22705) {
