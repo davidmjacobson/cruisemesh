@@ -251,7 +251,7 @@ class CoreBindingSmokeTest {
 
     /**
      * Every declared variant of the returned enum is reachable, so none of the
-     * eight discriminants lifts onto another's name. Which input produces
+     * nine discriminants lifts onto another's name. Which input produces
      * which is the core's business and is not asserted; only that the set is
      * covered.
      */

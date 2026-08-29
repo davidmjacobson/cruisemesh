@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelUuid
 import android.util.Log
+import com.cruisemesh.app.chat.UserIdHex
 
 private const val TAG = "BleCentral"
 private const val REQUESTED_MTU = 517
@@ -53,9 +54,20 @@ private const val CONNECT_TIMEOUT_MS = 12_000L
 // below the cap and is unaffected.
 private const val MAX_CENTRAL_LINKS = 5
 
+// How many of MAX_CENTRAL_LINKS a contact may never take away from strangers.
+// A new friend is, by definition, a stranger on their first connection, and
+// the priority rule added alongside this (contact with mail > contact >
+// unknown) would otherwise make a phone that has already filled its budget
+// with contacts unable to meet anybody new. See CentralConnectAdmission's
+// class doc for the two rules this number drives.
+private const val UNKNOWN_LINK_RESERVE = 1
+
 // onScanResult fires once per advertisement in range, so in a saturated room
 // the at-cap path is hit hundreds of times a minute -- throttle its log so it
-// reports the condition without reproducing the very spam it prevents.
+// reports the condition without reproducing the very spam it prevents. Every
+// other reason a candidate is refused (our own advertisement, a duplicate of
+// a peer already linked) arrives at the same rate and is throttled the same
+// way, but on its own clock -- see [logRejection].
 private const val AT_CAP_LOG_INTERVAL_MS = 10_000L
 
 /**
@@ -65,21 +77,44 @@ private const val AT_CAP_LOG_INTERVAL_MS = 10_000L
  * discovered device address.
  *
  * Connection churn hardening (2026-07-08 status=133 retry-loop bug): a
- * per-address [ReconnectBackoffTracker] replaces the old flat cooldown --
- * repeated failures to the same address back off exponentially and, past a
- * failure budget, that address is given up on entirely (it's presumably a
- * stale/rotated BLE address; a real peer re-advertising is rediscovered
- * under a fresh address with no prior failure history). The tracker resets
- * for an address the moment it fully connects. That per-address backoff can't
- * help when a whole *fleet* of phones keeps rotating to fresh addresses (each
- * seen exactly once), so a second layer -- [MAX_CENTRAL_LINKS] -- caps the
- * central role's concurrent links and stops issuing new connects once full,
- * bounding the dense-fleet connect storm the backoff never engaged against.
- * Separately, since a device
- * can't reliably read its own BLE address (rotates, and
- * BluetoothAdapter#getAddress is a dummy constant since API 23) to filter
- * out its own advertisement, [MeshConstants.LOCAL_INSTANCE_ID] is compared
- * against each scan result's service data as a self-connection guard.
+ * [ReconnectBackoffTracker] replaces the old flat cooldown -- repeated
+ * failures to the same peer back off exponentially and, past a failure
+ * budget, that peer is given up on (slow probing only). A second layer --
+ * [MAX_CENTRAL_LINKS] -- caps the central role's concurrent links and stops
+ * issuing new connects once full, bounding the dense-fleet connect storm.
+ *
+ * Both of those were keyed on the BLE *address*, which is not a peer. Under
+ * Bluetooth privacy an address is a resolvable private address that rotates
+ * every ~15 minutes, so a churning fleet is never seen twice under the same
+ * key: the backoff never engaged, and the budget could be spent several times
+ * over on one phone reachable under several addresses while a contact with
+ * mail waiting got nothing. Both are now keyed on
+ * [CentralConnectAdmission.identityKeyFor] instead -- the peer's advertised
+ * instance token, upgraded to its user id once HELLO names it, and falling
+ * back to the address only when the advertisement carries neither (an iOS
+ * peer; CoreBluetooth cannot advertise service data at all). That class also
+ * owns which candidate wins a contested slot; see its doc for the ranking and
+ * for the reserve that keeps strangers -- every new friend's first
+ * connection -- from being starved by contacts.
+ *
+ * Since a device can't reliably read its own BLE address (it rotates, and
+ * BluetoothAdapter#getAddress is a dummy constant since API 23) to filter out
+ * its own advertisement, [MeshConstants.LOCAL_INSTANCE_ID] is compared
+ * against each scan result's service data as a self-connection guard. The old
+ * guard stopped there and went blind on every scan result that carried no
+ * service data -- which our own advertisement produces routinely, since a
+ * legacy advertisement is two PDUs and the bare ADV_IND half arrives with no
+ * scan response merged in. That is the self-dial seen in the field every few
+ * seconds. The classification is now sticky per address inside
+ * [CentralConnectAdmission], so one sighting carrying our token is enough to
+ * refuse that address for as long as it is remembered.
+ *
+ * The token is a random *per-process* value on purpose, and must stay one: a
+ * device-wide or build-wide constant would be identical on every phone
+ * running the app, and the guard would then reject the whole mesh. Two
+ * packages of this app on one handset (a debug build beside a release build)
+ * therefore hold two distinct tokens and see each other as ordinary peers,
+ * which is what makes that pair usable as a test rig.
  *
  * Frames larger than one ATT write are fragmented per DESIGN.md §5.2: right
  * after connecting we negotiate the largest MTU the peer allows, then chunk
@@ -140,6 +175,13 @@ class BleCentral(
     private val onFrameReceived: (address: String, frame: ByteArray) -> Unit,
     private val onPeerConnected: (String) -> Unit = {},
     private val onPeerDisconnected: (String) -> Unit = {},
+    /**
+     * How much a user id is worth a scarce slot. Supplied by [MeshService]
+     * from its cached contact set and [PendingPeerMail]; a plain in-memory
+     * lookup, never a store read, because it is called on the scan callback
+     * for every advertisement in a saturated room.
+     */
+    peerStanding: (userIdHex: String) -> BlePeerStanding = { BlePeerStanding.UNKNOWN },
 ) {
     private val bluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -151,7 +193,13 @@ class BleCentral(
     private val reassemblers = mutableMapOf<String, FrameReassembler>()
     private val writeQueue = GattWriteQueue()
     private val scanDiagnostics = mutableMapOf<String, ScanDiagnostics>()
-    private val connectAdmission = CentralConnectAdmission(MAX_CENTRAL_LINKS)
+    private val selfInstanceToken = MeshConstants.LOCAL_INSTANCE_ID.toHex()
+    private val connectAdmission = CentralConnectAdmission(
+        maxActive = MAX_CENTRAL_LINKS,
+        selfInstanceToken = selfInstanceToken,
+        unknownReserve = UNKNOWN_LINK_RESERVE,
+        standingOf = peerStanding,
+    )
 
     // Battery: which ScanSettings mode [start]/[restartScan] build with --
     // see [setScanDutyMode] and RadioPowerPolicy's class doc. Volatile (not
@@ -195,9 +243,9 @@ class BleCentral(
     // than left to fire uselessly. Guarded by [lock].
     private val fullyConnected = mutableSetOf<String>()
 
-    // Epoch-ms of the last "at central link cap" log; throttles that log per
-    // [AT_CAP_LOG_INTERVAL_MS]. Guarded by [lock].
-    private var lastAtCapLogMs = 0L
+    // Epoch-ms of the last log line for each reason a candidate was refused;
+    // throttles those lines per [AT_CAP_LOG_INTERVAL_MS]. Guarded by [lock].
+    private val lastRejectionLogMs = mutableMapOf<CentralConnectAdmission.Outcome, Long>()
 
     /**
      * Advertised service UUIDs + device name + whether our service *data*
@@ -232,33 +280,38 @@ class BleCentral(
             )
             synchronized(lock) { scanDiagnostics[device.address] = diagnostics }
 
-            if (ownInstanceData != null && ownInstanceData.contentEquals(MeshConstants.LOCAL_INSTANCE_ID)) {
-                Log.i(TAG, "Ignoring own advertisement from ${device.address} ($diagnostics)")
-                return
-            }
-
             val now = System.currentTimeMillis()
-            if (!backoff.canAttempt(device.address, now)) return
+            val instanceToken = ownInstanceData?.toHex()
+            // Identity, not address: a peer that rotates its RPA keeps the
+            // same advertised token (and, once HELLO has named it, the same
+            // user id), so its backoff history and its one slot follow it
+            // across the rotation instead of resetting on every new address.
+            val identityKey = connectAdmission.identityKeyFor(device.address, instanceToken)
+            if (!backoff.canAttempt(identityKey, now)) return
             // Reserve before posting. Counting both pending and established
             // addresses closes the async admission race where a dense burst
             // queued far more than MAX_CENTRAL_LINKS before the worker had
             // inserted even its first BluetoothGatt into [connections].
-            val attempt = connectAdmission.tryReserve(device.address)
+            val attempt = connectAdmission.tryReserve(device.address, instanceToken, now)
             val reservation = attempt.reservation
             if (reservation == null) {
-                if (!attempt.atCapacity) return
-                val shouldLog = synchronized(lock) {
-                    (now - lastAtCapLogMs >= AT_CAP_LOG_INTERVAL_MS).also { if (it) lastAtCapLogMs = now }
-                }
-                if (shouldLog) {
-                    Log.i(
-                        TAG,
-                        "At central link cap (${attempt.activeCount}/$MAX_CENTRAL_LINKS); not connecting newly " +
-                            "discovered peers (e.g. ${device.address}) until a slot frees -- dense-fleet " +
-                            "connect-churn guard ($diagnostics)",
-                    )
-                }
+                logRejection(attempt, device.address, diagnostics, now)
                 return
+            }
+            // A preempted link is torn down before this connect is issued, so
+            // the radio is never asked to hold both. The teardown goes on the
+            // worker looper for the same reason connectGatt does (G5): this
+            // callback runs on the main thread and gatt.disconnect()/close()
+            // are binder calls. Handler order is FIFO, so the eviction always
+            // runs before the connect it made room for. Nothing queued for
+            // the evicted peer is lost: it lives in the persistent store and
+            // redelivers via digest sync the next time that peer is linked.
+            attempt.preemptedAddress?.let { evicted ->
+                Log.i(
+                    TAG,
+                    "Yielding central slot held by $evicted to a higher-priority peer (${device.address})",
+                )
+                handler.post { dropLink(evicted, "preempted by a higher-priority peer") }
             }
             Log.d(TAG, "Discovered peer ${device.address}, connecting ($diagnostics)")
             // G5: connectGatt off main / binder — post to worker looper.
@@ -317,12 +370,13 @@ class BleCentral(
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     val address = gatt.device.address
                     val diagnostics = synchronized(lock) { scanDiagnostics[address] }
-                    val failures = backoff.recordFailure(address, System.currentTimeMillis())
+                    val peerKey = backoffKey(address)
+                    val failures = backoff.recordFailure(peerKey, System.currentTimeMillis())
                     Log.i(
                         TAG,
                         "Peer $address disconnected (status=$status, consecutive failures=$failures) ($diagnostics)",
                     )
-                    if (backoff.isGivenUp(address)) {
+                    if (backoff.isGivenUp(peerKey)) {
                         Log.w(
                             TAG,
                             "Backing off $address to slow probing after $failures consecutive " +
@@ -388,9 +442,9 @@ class BleCentral(
                 // occasional text frame for the phone's audio staying usable.
                 gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
                 val address = gatt.device.address
-                // Fully connected: clear this address's failure history so a
+                // Fully connected: clear this peer's failure history so a
                 // peer that connects reliably never accumulates backoff.
-                backoff.recordSuccess(address)
+                backoff.recordSuccess(backoffKey(address))
                 // Setup is done -- the connect watchdog (1a) no longer has
                 // anything to guard against, and must not fire and tear
                 // down a perfectly healthy link.
@@ -427,7 +481,7 @@ class BleCentral(
                     "onCharacteristicWrite: write failed for ${gatt.device.address} " +
                         "(status=$status); tearing down link",
                 )
-                backoff.recordFailure(gatt.device.address, System.currentTimeMillis())
+                backoff.recordFailure(backoffKey(gatt.device.address), System.currentTimeMillis())
                 tearDownLink(gatt, "characteristic write failed (status=$status)")
                 return
             }
@@ -555,6 +609,7 @@ class BleCentral(
             negotiatedMtu.clear()
             reassemblers.clear()
             scanDiagnostics.clear()
+            lastRejectionLogMs.clear()
             snapshot
         }
         connectionsSnapshot.forEach { runCatching { it.close() } }
@@ -627,9 +682,90 @@ class BleCentral(
             // slot stays reserved until the async onCharacteristicWrite ack
             // calls writeQueue.completeWrite.
             Log.w(TAG, "sendNextQueuedFragment: writeCharacteristic rejected for $address; tearing down link")
-            backoff.recordFailure(address, System.currentTimeMillis())
+            backoff.recordFailure(backoffKey(address), System.currentTimeMillis())
             tearDownLink(gatt, "writeCharacteristic rejected")
         }
+    }
+
+    /**
+     * HELLO on [address] named the peer. Binds the link to that identity so
+     * later sightings of the same advertised token resolve straight to it,
+     * and drops the redundant link when this identity turns out to already
+     * hold another central slot.
+     *
+     * This is the only place a *tokenless* peer can be deduped. An iPhone
+     * cannot advertise service data at all, so its rotated addresses look
+     * like different peers right up until they say who they are; two of them
+     * can each win a slot, and only this callback can tell that they were one
+     * phone all along. The younger link is dropped -- the older one is the
+     * one the router has already elected and been sending on.
+     *
+     * The slot is released synchronously (the caller is entitled to a correct
+     * count the moment it returns) but the teardown is posted to the worker
+     * looper: this runs inside the HELLO handler, on a binder thread, and
+     * tearing the link down inline would unmap a route that same handler is
+     * still in the middle of using.
+     */
+    fun onPeerIdentified(address: String, userIdHex: String) {
+        val redundant = connectAdmission.onIdentified(address, userIdHex) ?: return
+        Log.i(
+            TAG,
+            "Dropping $redundant: same peer as $address under a second address, holding two central slots",
+        )
+        handler.post { dropLink(redundant, "duplicate central link for one identity") }
+    }
+
+    /** Tears down the live link on [address], if this class still holds one. */
+    private fun dropLink(address: String, reason: String) {
+        val gatt = synchronized(lock) { connections[address] } ?: run {
+            connectAdmission.disconnect(address)
+            return
+        }
+        runCatching { gatt.disconnect() }
+        tearDownLink(gatt, reason)
+    }
+
+    /**
+     * The key this link's reconnect history is filed under. The admission
+     * policy already holds one identity key per live address and upgrades it
+     * when HELLO names the peer, so asking it here keeps the failure and
+     * success paths -- which only ever have a [BluetoothGatt], i.e. an
+     * address -- filing against the same key the scan callback consults.
+     */
+    private fun backoffKey(address: String): String = connectAdmission.identityKeyOf(address)
+
+    /**
+     * Reports a refused candidate at most once per [AT_CAP_LOG_INTERVAL_MS]
+     * *per reason*. Every branch here is reachable hundreds of times a minute
+     * in a crowded room -- one advertisement per peer per scan window -- so
+     * an unthrottled line would be the log spam this class exists to prevent,
+     * and a single shared throttle would let whichever reason fires fastest
+     * hide the others.
+     */
+    private fun logRejection(
+        attempt: CentralConnectAdmission.Attempt,
+        address: String,
+        diagnostics: ScanDiagnostics,
+        nowMs: Long,
+    ) {
+        val message = when (attempt.outcome) {
+            CentralConnectAdmission.Outcome.SELF ->
+                "Ignoring our own advertisement from $address ($diagnostics)"
+            CentralConnectAdmission.Outcome.DUPLICATE_IDENTITY ->
+                "Ignoring $address: already linked to that peer under another address ($diagnostics)"
+            CentralConnectAdmission.Outcome.AT_CAPACITY ->
+                "At central link cap (${attempt.activeCount}/$MAX_CENTRAL_LINKS); not connecting newly " +
+                    "discovered peers (e.g. $address) until a slot frees or a higher-priority peer " +
+                    "claims one -- dense-fleet connect-churn guard ($diagnostics)"
+            else -> return
+        }
+        val shouldLog = synchronized(lock) {
+            val last = lastRejectionLogMs[attempt.outcome] ?: 0L
+            (nowMs - last >= AT_CAP_LOG_INTERVAL_MS).also {
+                if (it) lastRejectionLogMs[attempt.outcome] = nowMs
+            }
+        }
+        if (shouldLog) Log.i(TAG, message)
     }
 
     /**
@@ -661,8 +797,9 @@ class BleCentral(
             Log.w(TAG, "connect watchdog: $address stuck for ${CONNECT_TIMEOUT_MS}ms; freeing slot")
             runCatching { gatt.disconnect() }
             runCatching { gatt.close() }
+            val peerKey = backoffKey(address)
             tearDownLink(gatt, "connect watchdog timeout (${CONNECT_TIMEOUT_MS}ms)")
-            backoff.recordFailure(address, System.currentTimeMillis())
+            backoff.recordFailure(peerKey, System.currentTimeMillis())
         }
         connectWatchdogs[address] = watchdog
         handler.postDelayed(watchdog, CONNECT_TIMEOUT_MS)
@@ -716,3 +853,9 @@ class BleCentral(
         gatt.close()
     }
 }
+
+/**
+ * Lowercase hex, reusing the one encoder this app already has rather than a
+ * second implementation of the same four lines.
+ */
+private fun ByteArray.toHex(): String = UserIdHex.encode(this)

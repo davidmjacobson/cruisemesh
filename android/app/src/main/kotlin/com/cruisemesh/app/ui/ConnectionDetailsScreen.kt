@@ -112,6 +112,7 @@ import uniffi.cruisemesh_core.CoreRelayPathState
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.PeerConnectionTransport
 import uniffi.cruisemesh_core.coreContactDisplayName
+import java.io.File
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
@@ -1319,6 +1320,30 @@ private fun TroubleshootingControls(
         if (sharedDiagnosticsMessage != null) supportMessage = sharedDiagnosticsMessage
     }
 
+    // Save to device. The picker hands back a document to write into, so the
+    // prepared archive has to outlive the launch.
+    var pendingSaveSource by remember { mutableStateOf<File?>(null) }
+    val saveLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val source = pendingSaveSource
+        pendingSaveSource = null
+        val target = result.data?.data
+        if (result.resultCode != Activity.RESULT_OK || target == null || source == null) {
+            // Backing out of a file picker is a decision, not a failure. Saying
+            // anything here would train people to ignore this line.
+            return@rememberLauncherForActivityResult
+        }
+        scope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                DiagnosticsShare.writeTo(context, source, target)
+            }
+            supportMessage = context.getString(
+                if (saved) R.string.ui_diagnostics_saved else R.string.ui_diagnostics_save_failed,
+            )
+        }
+    }
+
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.weight(1f)) {
             Text(stringResource(R.string.ui_diagnostic_logging))
@@ -1366,6 +1391,21 @@ private fun TroubleshootingControls(
         },
         modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
     ) { Text(stringResource(R.string.ui_share_diagnostics)) }
+    OutlinedButton(
+        onClick = {
+            // A share sheet is only as good as the apps behind it, and at sea
+            // there may be none: no mail account signed in, nothing willing to
+            // take a zip, no network for either. The same bytes, into a folder.
+            DiagnosticsShare.savePlan(context)?.let { plan ->
+                pendingSaveSource = plan.source
+                saveLauncher.launch(plan.intent)
+                hasCapturedDiagnostics = true
+            } ?: run {
+                supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+            }
+        },
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+    ) { Text(stringResource(R.string.ui_save_diagnostics_to_device)) }
     OutlinedButton(
         onClick = {
             hasCapturedDiagnostics = false
@@ -1441,6 +1481,8 @@ private fun howToFixTextId(reason: CoreHealthReason): Int? = when (reason) {
     CoreHealthReason.OWN_SETUP_REJECTED -> R.string.ui_how_to_fix_setup_rejected
     CoreHealthReason.STORAGE_FULL -> R.string.ui_how_to_fix_storage_full
     CoreHealthReason.PASS_EXPIRED -> R.string.ui_how_to_fix_pass_expired
+    CoreHealthReason.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_how_to_fix_pass_expired_still_receiving
     CoreHealthReason.PASS_SUSPENDED -> R.string.ui_how_to_fix_pass_suspended
     else -> null
 }
@@ -1609,6 +1651,8 @@ private fun relayEvidenceId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_shore_pass_state_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_shore_pass_state_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_shore_pass_state_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_shore_pass_state_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_shore_pass_state_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_shore_pass_state_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_shore_pass_state_storage_full
@@ -1623,6 +1667,8 @@ private fun relayRowStateId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_path_shore_pass_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_path_shore_pass_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_path_shore_pass_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_path_shore_pass_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_path_shore_pass_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_path_shore_pass_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_path_shore_pass_storage_full
