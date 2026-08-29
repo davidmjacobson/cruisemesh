@@ -415,10 +415,37 @@ object RelayClient {
         Log.e(TAG, "$method $path failed after ${ms}ms: $detail")
     }
 
+    /**
+     * How a failure that came back with a 2xx is described in the log.
+     *
+     * A relay answered, the body arrived whole, and the decoder refused it.
+     * That is the one relay failure whose cause is *in* the bytes, which is
+     * exactly why the bytes are not here: whatever answered the request may
+     * not have been the relay at all, and this line lands in a file the user
+     * exports and mails to whoever is helping.
+     *
+     * What replaces them is what the reader works from. The size says whether
+     * a whole page came back or a stub; the exception class says which
+     * decoder gave up; and the core's message (see `json_fault`) says which
+     * kind of malformation it was and the line and column it stopped at --
+     * derived from the body, never quoting it.
+     *
+     * Its own function so a test can pin the whole sentence. `Log` is a
+     * no-op stub under JVM unit tests, so an assertion on what was logged has
+     * to be an assertion on what was handed to [logFailure].
+     */
+    internal fun decodeFailureDetail(bytes: Int, e: Throwable): String =
+        "could not decode ${bytes}B: ${e.javaClass.simpleName}: ${e.message}"
+
     private inline fun <T> HttpURLConnection.useJsonResponse(block: (ByteArray) -> T): T {
         val started = System.currentTimeMillis()
         val method = requestMethod ?: "?"
         val path = runCatching { url.path }.getOrNull() ?: "?"
+        // Set once the decode catch below has written its own line, so the
+        // transport catch does not write a second, vaguer one about the same
+        // failure -- the same reason [RelayHttpException] is caught and
+        // rethrown untouched.
+        var decodeLogged = false
         return try {
             val code = responseCode
             val maxBytes = relayMaxResponseBytes().toInt()
@@ -472,15 +499,41 @@ object RelayClient {
             }
             val body = inputStream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
             logOutcome(method, path, code, System.currentTimeMillis() - started, body.size)
-            block(body)
+            try {
+                block(body)
+            } catch (e: Exception) {
+                // Separated from the transport catch below because the two
+                // failures read nothing alike and are fixed nowhere alike: the
+                // call succeeded, the bytes are all here, and something about
+                // them is wrong. Naming that phase and the size is the whole
+                // difference between "the relay is unreachable" and "the
+                // relay, or whatever is standing in for it, is answering with
+                // something this build cannot read".
+                logFailure(
+                    method,
+                    path,
+                    System.currentTimeMillis() - started,
+                    decodeFailureDetail(body.size, e),
+                )
+                decodeLogged = true
+                throw e
+            }
         } catch (e: RelayHttpException) {
             // Already logged above with its status and Retry-After; re-logging
             // here would double every relay failure in the shared archive.
             throw e
         } catch (e: Exception) {
-            // Transport and decode failures never reach the branch above, so
-            // this is their only chance to be recorded.
-            logFailure(method, path, System.currentTimeMillis() - started, "${e.javaClass.simpleName}: ${e.message}")
+            // Transport failures never reach either branch above, so this is
+            // their only chance to be recorded. A decode failure passes
+            // through here too, already described one line up.
+            if (!decodeLogged) {
+                logFailure(
+                    method,
+                    path,
+                    System.currentTimeMillis() - started,
+                    "${e.javaClass.simpleName}: ${e.message}",
+                )
+            }
             throw e
         } finally {
             disconnect()

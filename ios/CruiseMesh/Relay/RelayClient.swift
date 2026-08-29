@@ -287,6 +287,52 @@ enum RelayClient {
     /// Overridable for unit tests (URLProtocol / mock sessions).
     static var urlSession: URLSession = .shared
 
+    /// How a failure that came back with a 2xx is described in the log.
+    ///
+    /// A relay answered, the body arrived whole, and the core decoder refused
+    /// it. That is the one relay failure whose cause is *in* the bytes, which
+    /// is exactly why the bytes are not here: whatever answered the request
+    /// may not have been the relay at all, and this line lands in a file the
+    /// user exports and mails to whoever is helping.
+    ///
+    /// What replaces them is what the reader works from. The size says
+    /// whether a whole page came back or a stub, and the core's message (see
+    /// `json_fault`) says which kind of malformation it was and the line and
+    /// column it stopped at -- derived from the body, never quoting it.
+    ///
+    /// Its own function so a test can pin the whole sentence: `os.Logger`
+    /// output is not readable from a unit test, so an assertion about what was
+    /// logged has to be an assertion about what was composed. Mirrors Android
+    /// `RelayClient.decodeFailureDetail`.
+    static func decodeFailureDetail(bytes: Int, error: Error) -> String {
+        "could not decode \(bytes)B: \(error.localizedDescription)"
+    }
+
+    /// Runs a core decoder over a 2xx body and records a refusal.
+    ///
+    /// Until now a decode failure was the one relay outcome that left no
+    /// trace on this shell: the transport catch in `syncRequest` never sees
+    /// it, and `logOutcome` has already written its success line by the time
+    /// the decoder runs. A silent failure is worse than a noisy one, and
+    /// Android has logged this case all along.
+    private static func decoding<T>(
+        _ request: URLRequest,
+        _ data: Data,
+        _ decode: () throws -> T
+    ) throws -> T {
+        do {
+            return try decode()
+        } catch {
+            log.error(
+                """
+                \(relayDiagnosticRequestLabel(request), privacy: .public) \
+                \(decodeFailureDetail(bytes: data.count, error: error), privacy: .public)
+                """
+            )
+            throw error
+        }
+    }
+
     static func postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope) throws -> Int64 {
         try postEnvelope(
             config: config,
@@ -366,7 +412,7 @@ enum RelayClient {
         applyAuth(&request, config: config)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let page = try relayDecodeFetchPage(body: data)
+        let page = try decoding(request, data) { try relayDecodeFetchPage(body: data) }
         let envelopes: [RelayFetchedEnvelope] = page.envelopes.map { item in
             return RelayFetchedEnvelope(
                 id: item.id, msgId: item.msgId, hopTtl: item.hopTtl,
@@ -447,7 +493,7 @@ enum RelayClient {
         request.httpBody = try relayEncodePresenceRequest(announce: announce, query: query)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let page = try relayDecodePresencePage(body: data)
+        let page = try decoding(request, data) { try relayDecodePresencePage(body: data) }
         return RelayPresencePage(nowMs: page.nowMs, presence: page.presence)
     }
 
@@ -523,7 +569,7 @@ enum RelayClient {
         )
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        return try relayDecodePostResponse(body: data)
+        return try decoding(request, data) { try relayDecodePostResponse(body: data) }
     }
 
     private static func applyAuth(_ request: inout URLRequest, config: RelayConfig) {

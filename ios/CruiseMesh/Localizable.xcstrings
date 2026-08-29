@@ -2833,6 +2833,16 @@
         }
       }
     },
+    "Start using CruiseMesh": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start using CruiseMesh"
+          }
+        }
+      }
+    },
     "Stop": {
       "localizations": {
         "en": {
@@ -3373,12 +3383,12 @@
         }
       }
     },
-    "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.": {
+    "Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names."
+            "value": "Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded."
           }
         }
       }
@@ -5805,6 +5815,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other."
+          }
+        }
+      }
+    },
+    "Your phone is set up. One last thing before you start.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your phone is set up. One last thing before you start."
           }
         }
       }

@@ -7,7 +7,11 @@ import UserNotifications
 struct OnboardingView: View {
     let identity: Identity
     @ObservedObject var appModel: AppModel
-    let onComplete: () -> Void
+    /// Where setup goes next, which is not always the app: the door that adopts
+    /// this phone onto an existing fleet skips the permissions slide, so it
+    /// hands back `.permissions` and the root shows that step on its own. See
+    /// `FirstRunRouter`.
+    let onComplete: (FirstRunDestination) -> Void
 
     @State private var page = 0
     @State private var displayName = ProfileStore.loadStoredDisplayName()
@@ -248,8 +252,22 @@ struct OnboardingView: View {
         guard adoptedByAnotherDevice else { return }
         adoptedByAnotherDevice = false
         appModel.displayName = ProfileStore.loadDisplayName()
-        appModel.startMesh()
-        onComplete()
+        // Not into the app unconditionally any more. An adopted phone has never
+        // seen the permissions slide -- the wizard carries it and this door went
+        // around it -- so `FirstRunRouter` sends it to that step first, and the
+        // mesh is started there once the person has agreed rather than by a
+        // Bluetooth prompt appearing over a chat list that has explained
+        // nothing. A phone that somehow already holds the permission is not
+        // asked again and goes straight in.
+        let next = FirstRunRouter.destination(
+            setupComplete: true,
+            permissionsStepDone: OnboardingStore.permissionsStepDone(),
+            meshPermissionsGranted: OnboardingPermissions.meshPermissionGranted()
+        )
+        if next != .permissions {
+            appModel.startMesh()
+        }
+        onComplete(next)
     }
 
     private func complete() {
@@ -263,8 +281,12 @@ struct OnboardingView: View {
             ProfileStore.bumpOwnAvatarEpoch()
         }
         OnboardingStore.markCompleted()
+        // Slide 4 was the permissions step, so this door has paid it. Recorded
+        // rather than inferred, so `FirstRunRouter` answers the same question
+        // for all three doors.
+        OnboardingStore.markPermissionsStepDone()
         appModel.startMesh()
-        onComplete()
+        onComplete(.home)
     }
 }
 
@@ -337,6 +359,16 @@ enum OnboardingPermissions {
         notifications == .denied
     }
 
+    /// Whether the one permission the mesh cannot run without is already held.
+    ///
+    /// Read statically, the way `PermissionsSlide` reads it: asking
+    /// `CBCentralManager.authorization` does not construct a manager and so
+    /// cannot pop a system prompt at a moment nothing has explained yet.
+    static func meshPermissionGranted() -> Bool {
+        if UITestConfiguration.isEnabled { return true }
+        return CBCentralManager.authorization == .allowedAlways
+    }
+
     static func action(
         bluetooth: CBManagerAuthorization,
         notifications: UNAuthorizationStatus
@@ -354,7 +386,11 @@ enum OnboardingPermissions {
     }
 }
 
-private struct PermissionsSlide: View {
+/// Shared with `PermissionsSetupView`, which shows this same step on its own
+/// for the doors that arrive past the wizard. Deliberately one slide rather
+/// than two tellings of it, so the wizard and the standalone step can never
+/// drift apart.
+struct PermissionsSlide: View {
     let onEnable: () -> Void
 
     @Environment(\.scenePhase) private var scenePhase

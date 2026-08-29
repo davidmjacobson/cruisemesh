@@ -2874,6 +2874,12 @@ RustBuffer uniffi_cruisemesh_core_fn_func_core_mint_relay_member_token(RustCallS
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_NEW_LOG_REDACTION_SALT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_NEW_LOG_REDACTION_SALT
+RustBuffer uniffi_cruisemesh_core_fn_func_core_new_log_redaction_salt(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_OPEN_SYNC_HANDOFF
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_OPEN_SYNC_HANDOFF
 RustBuffer uniffi_cruisemesh_core_fn_func_core_open_sync_handoff(RustBuffer sealed, RustBuffer own_device_agree_sk, RustBuffer own_roster, RustBuffer person_root_sign_pk, RustCallStatus *_Nonnull out_status
@@ -2994,6 +3000,11 @@ RustBuffer uniffi_cruisemesh_core_fn_func_core_reactors_for_reaction(RustBuffer 
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RECOVERY_REVOKE_ROSTER
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RECOVERY_REVOKE_ROSTER
 RustBuffer uniffi_cruisemesh_core_fn_func_core_recovery_revoke_roster(RustBuffer stored, RustBuffer person_root_sign_sk, RustBuffer recovering_device_sign_pk, RustBuffer recovering_device_agree_pk, RustBuffer revoked_device_ids, RustBuffer current_inbox_key, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_REDACT_LOG_LINE
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_REDACT_LOG_LINE
+RustBuffer uniffi_cruisemesh_core_fn_func_core_redact_log_line(RustBuffer salt, RustBuffer line, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_FN_FUNC_CORE_RELAY_ACK_IDS
@@ -5080,6 +5091,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_core_mint_relay_member_token(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_NEW_LOG_REDACTION_SALT
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_NEW_LOG_REDACTION_SALT
+uint16_t uniffi_cruisemesh_core_checksum_func_core_new_log_redaction_salt(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_OPEN_SYNC_HANDOFF
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_OPEN_SYNC_HANDOFF
 uint16_t uniffi_cruisemesh_core_checksum_func_core_open_sync_handoff(void
@@ -5221,6 +5238,12 @@ uint16_t uniffi_cruisemesh_core_checksum_func_core_reactors_for_reaction(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RECOVERY_REVOKE_ROSTER
 #define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_RECOVERY_REVOKE_ROSTER
 uint16_t uniffi_cruisemesh_core_checksum_func_core_recovery_revoke_roster(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_REDACT_LOG_LINE
+#define UNIFFI_FFIDEF_UNIFFI_CRUISEMESH_CORE_CHECKSUM_FUNC_CORE_REDACT_LOG_LINE
+uint16_t uniffi_cruisemesh_core_checksum_func_core_redact_log_line(void
     
 );
 #endif

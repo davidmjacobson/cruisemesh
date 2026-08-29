@@ -66,6 +66,35 @@ fun OnboardingScreenshot() {
     }
 }
 
+// The same step as the wizard's slide 4, on its own, for the doors that arrive
+// past the wizard. Worth its own reference: it is the only screen between an
+// adopted phone and a mesh that will not start, and it is the tallest content
+// in first-run setup, so the large-font variant is where a grant button would
+// scroll out of reach.
+@Preview(name = "permissions_setup_compact", widthDp = 360, heightDp = 640, showBackground = true)
+@Preview(
+    name = "permissions_setup_compact_large_font",
+    widthDp = 360,
+    heightDp = 640,
+    fontScale = 1.3f,
+    showBackground = true,
+)
+@PreviewTest
+@Composable
+fun PermissionsSetupScreenshot() {
+    CruiseMeshTheme {
+        PermissionsSetupScreen(
+            meshPermissionsGranted = false,
+            notificationPermissionGranted = false,
+            batteryExemptionGranted = false,
+            onRequestMeshPermissions = {},
+            onRequestNotificationPermission = {},
+            onRequestBatteryExemption = {},
+            onContinue = {},
+        )
+    }
+}
+
 @Preview(name = "composer_empty", widthDp = 360, heightDp = 120, showBackground = true)
 @PreviewTest
 @Composable

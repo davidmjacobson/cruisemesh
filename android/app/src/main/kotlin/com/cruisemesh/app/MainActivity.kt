@@ -93,6 +93,8 @@ import com.cruisemesh.app.friending.ShareContactPolicy
 import com.cruisemesh.app.friending.ShareContactScreen
 import com.cruisemesh.app.friending.SharedCardImport
 import com.cruisemesh.app.friending.WaitingToConnectScreen
+import com.cruisemesh.app.identity.FirstRunDestination
+import com.cruisemesh.app.identity.FirstRunRouter
 import com.cruisemesh.app.identity.IdentityStore
 import com.cruisemesh.app.identity.OnboardingStore
 import com.cruisemesh.app.identity.TermsAcceptanceStore
@@ -135,6 +137,7 @@ import com.cruisemesh.app.ui.MeshStatusLegendDialog
 import com.cruisemesh.app.ui.MeshStatusTextLogic
 import com.cruisemesh.app.ui.NewGroupScreen
 import com.cruisemesh.app.ui.OnboardingScreen
+import com.cruisemesh.app.ui.PermissionsSetupScreen
 import com.cruisemesh.app.ui.ProfileScreen
 import com.cruisemesh.app.ui.TermsAcceptanceScreen
 import com.cruisemesh.app.ui.ConnectionDetailsScreen
@@ -297,6 +300,21 @@ fun CruiseMeshApp(
         mutableStateOf(TermsAcceptanceStore.isCurrentVersionAccepted(context))
     }
     var onboardingCompleted by remember { mutableStateOf(OnboardingStore.isCompleted(context)) }
+    // Which first-run screen this launch owes, from the store rather than from
+    // whichever door was tapped: "This is another of my devices" and a backup
+    // restore both mark setup complete without ever showing the permissions
+    // step, and a phone that is closed between the ceremony and the next launch
+    // still owes it. See [FirstRunRouter].
+    val firstRunStart = remember {
+        FirstRunRouter.destination(
+            setupComplete = OnboardingStore.isCompleted(context),
+            permissionsStepDone = OnboardingStore.permissionsStepDone(context),
+            meshPermissionsGranted = hasMeshPermissions(context),
+        )
+    }
+    var permissionsStepPending by remember {
+        mutableStateOf(firstRunStart == FirstRunDestination.PERMISSIONS)
+    }
 
     if (!termsAccepted) {
         TermsAcceptanceScreen {
@@ -326,9 +344,42 @@ fun CruiseMeshApp(
         return
     }
 
+    // §9's closing paragraph: the doors out of first-run setup land a person in
+    // the same place, and none of them leaves a setup screen one Back press
+    // behind the app.
+    //
+    // [popUpToRoute] is the setup screen being left, or `null` for "whatever
+    // this launch started on". The two spellings are both needed because setup
+    // can now take two legs: the wizard's own door pops the graph's start
+    // destination, but the leg after it -- "This is another of my devices" ->
+    // permissions -> the app -- has already popped that start destination, so
+    // the second leg has to name the permissions screen or nothing is popped
+    // at all and Back returns to it.
+    fun leaveSetup(popUpToRoute: String? = null) {
+        onboardingCompleted = true
+        val next = FirstRunRouter.destination(
+            setupComplete = true,
+            permissionsStepDone = OnboardingStore.permissionsStepDone(context),
+            meshPermissionsGranted = hasMeshPermissions(context),
+        )
+        permissionsStepPending = next == FirstRunDestination.PERMISSIONS
+        val route = if (next == FirstRunDestination.PERMISSIONS) "permissions" else "home"
+        navController.navigate(route) {
+            if (popUpToRoute != null) {
+                popUpTo(popUpToRoute) { inclusive = true }
+            } else {
+                popUpTo(navController.graph.findStartDestination().id) { inclusive = true }
+            }
+        }
+    }
+
     NavHost(
         navController = navController,
-        startDestination = if (onboardingCompleted) "home" else "onboarding",
+        startDestination = when (firstRunStart) {
+            FirstRunDestination.WIZARD -> "onboarding"
+            FirstRunDestination.PERMISSIONS -> "permissions"
+            FirstRunDestination.HOME -> "home"
+        },
     ) {
         composable("onboarding") {
             OnboardingRoute(
@@ -340,12 +391,13 @@ fun CruiseMeshApp(
                 // so the only thing this phone knows is that the other one is
                 // theirs, and the ceremony's own confirm is what checks that.
                 onSetUpAsAnotherDevice = { navController.navigate("addDevice?role=new") },
-            ) {
-                onboardingCompleted = true
-                navController.navigate("home") {
-                    popUpTo("onboarding") { inclusive = true }
-                }
-            }
+                onComplete = { leaveSetup() },
+            )
+        }
+        // The permissions step on its own, for a phone that reached "set up"
+        // without passing through the wizard that carries it.
+        composable("permissions") {
+            PermissionsSetupRoute(onDone = { leaveSetup(popUpToRoute = "permissions") })
         }
         composable("home") { HomeRoute(identity, navController) }
         composable("profile") { ProfileRoute(identity, navController) }
@@ -419,14 +471,14 @@ fun CruiseMeshApp(
                 // to the graph's start rather than to "onboarding" by name:
                 // the route is also reachable as onboarding -> restore ->
                 // addDevice, and only one of those spellings survives both.
-                onLinked = {
-                    onboardingCompleted = true
-                    navController.navigate("home") {
-                        popUpTo(navController.graph.findStartDestination().id) {
-                            inclusive = true
-                        }
-                    }
-                },
+                //
+                // Into the app -- unless this phone still owes the permissions
+                // step, which an adopted one always does: the wizard carries
+                // that step and this route went around it. A two-phone session
+                // landed here with the mesh off behind a "Permissions required"
+                // notice and had to grant Nearby devices by hand from system
+                // settings.
+                onLinked = { leaveSetup() },
             )
         }
         composable("help") {
@@ -496,9 +548,12 @@ fun CruiseMeshApp(
         }
     }
 
-    LaunchedEffect(pendingDeepLink, onboardingCompleted) {
+    LaunchedEffect(pendingDeepLink, onboardingCompleted, permissionsStepPending) {
         val link = pendingDeepLink ?: return@LaunchedEffect
-        if (!onboardingCompleted) return@LaunchedEffect
+        // A phone still standing on the permissions step counts as mid-setup:
+        // the store says "set up", but sending it to a chat now would step over
+        // the one screen it is here for. The link keeps until the step is done.
+        if (!onboardingCompleted || permissionsStepPending) return@LaunchedEffect
         link.relayCard?.let { relayCard ->
             navController.navigate("shorePass?card=${Uri.encode(relayCard)}") {
                 launchSingleTop = true
@@ -540,59 +595,7 @@ private fun OnboardingRoute(
     // so the user supplies a real one (see ProfileStore.loadStoredDisplayName).
     var displayName by remember { mutableStateOf(ProfileStore.loadStoredDisplayName(context)) }
     var avatarPath by remember { mutableStateOf(ProfilePhotoStore.loadAvatarPath(context)) }
-    var permissionRefreshToken by remember { mutableStateOf(0) }
-    val meshPermissionsGranted = remember(context, permissionRefreshToken) {
-        hasMeshPermissions(context)
-    }
-    val notificationPermissionGranted = remember(context, permissionRefreshToken) {
-        hasNotificationPermission(context)
-    }
-    val batteryExemptionGranted = remember(context, permissionRefreshToken) {
-        isIgnoringBatteryOptimizations(context)
-    }
-    val meshPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions(),
-    ) { grants ->
-        permissionRefreshToken += 1
-        if (!grants.values.all { it }) {
-            val activity = context as? ComponentActivity
-            val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
-                grants[perm] == false &&
-                    !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
-            }
-            if (permanentlyDenied) {
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.ui_enable_nearby_in_app_permissions),
-                    Toast.LENGTH_LONG,
-                ).show()
-                openAppPermissionSettings(context)
-            } else {
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.ui_nearby_required_for_messages),
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-    }
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission(),
-    ) { granted ->
-        permissionRefreshToken += 1
-        if (!granted) {
-            Toast.makeText(
-                context,
-                context.getString(R.string.ui_notifications_denied_mesh_continues),
-                Toast.LENGTH_LONG,
-            ).show()
-        }
-    }
-    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.StartActivityForResult(),
-    ) {
-        permissionRefreshToken += 1
-    }
+    val permissions = rememberSetupPermissionState()
     val pickPhotoLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri ->
@@ -633,9 +636,9 @@ private fun OnboardingRoute(
         displayId = displayId,
         displayName = displayName,
         avatarPath = avatarPath,
-        meshPermissionsGranted = meshPermissionsGranted,
-        notificationPermissionGranted = notificationPermissionGranted,
-        batteryExemptionGranted = batteryExemptionGranted,
+        meshPermissionsGranted = permissions.meshGranted,
+        notificationPermissionGranted = permissions.notificationsGranted,
+        batteryExemptionGranted = permissions.batteryExempt,
         onDisplayNameChange = {
             displayName = it
             ProfileStore.saveDisplayName(context, it)
@@ -661,21 +664,9 @@ private fun OnboardingRoute(
             avatarPath = null
             ProfileStore.bumpOwnAvatarEpoch(context)
         },
-        onRequestMeshPermissions = {
-            if (!meshPermissionsGranted) {
-                meshPermissionLauncher.launch(MeshService.requiredPermissions())
-            }
-        },
-        onRequestNotificationPermission = {
-            if (!notificationPermissionGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        },
-        onRequestBatteryExemption = {
-            if (!batteryExemptionGranted) {
-                batteryOptimizationLauncher.launch(batteryOptimizationIntent(context))
-            }
-        },
+        onRequestMeshPermissions = permissions.requestMesh,
+        onRequestNotificationPermission = permissions.requestNotifications,
+        onRequestBatteryExemption = permissions.requestBatteryExemption,
         onRestore = onRestore,
         onSetUpAsAnotherDevice = onSetUpAsAnotherDevice,
         onComplete = {
@@ -686,7 +677,143 @@ private fun OnboardingRoute(
                 ProfileStore.bumpOwnAvatarEpoch(context)
             }
             OnboardingStore.markCompleted(context)
+            // The wizard carries the permissions step on slide 4, so this route
+            // has paid it. Recorded rather than inferred, so [FirstRunRouter]
+            // answers the same question for all three doors.
+            OnboardingStore.markPermissionsStepDone(context)
             onComplete()
+        },
+    )
+}
+
+/**
+ * The permissions step for the two doors that arrive past the wizard.
+ *
+ * Same content, same grant buttons and the same live status the wizard's slide
+ * shows — [PermissionsSetupScreen] shares that slide rather than restating it.
+ * The only thing this route adds is the ending: once the person is through, the
+ * mesh is turned on the way finishing the wizard turns it on, instead of being
+ * left off behind a notice on the chat list.
+ */
+@Composable
+private fun PermissionsSetupRoute(onDone: () -> Unit) {
+    val context = LocalContext.current
+    val permissions = rememberSetupPermissionState()
+
+    PermissionsSetupScreen(
+        meshPermissionsGranted = permissions.meshGranted,
+        notificationPermissionGranted = permissions.notificationsGranted,
+        batteryExemptionGranted = permissions.batteryExempt,
+        onRequestMeshPermissions = permissions.requestMesh,
+        onRequestNotificationPermission = permissions.requestNotifications,
+        onRequestBatteryExemption = permissions.requestBatteryExemption,
+        onContinue = {
+            OnboardingStore.markPermissionsStepDone(context)
+            // Asked once. Somebody who declined is not held here, and is not
+            // asked again on the next launch either -- the home screen's
+            // blocking banner is where a missing grant lives after this.
+            onDone()
+        },
+    )
+}
+
+/**
+ * The grant state of the three permissions first-run setup asks for, plus the
+ * requests that change them.
+ *
+ * Shared by the wizard and the standalone step so the two cannot answer the
+ * same question differently. Re-read on every resume as well as after each
+ * launcher returns: a permanently denied permission is granted in system
+ * Settings, and coming back to a step that still says "not granted" is what
+ * makes people grant it twice.
+ */
+private class SetupPermissionState(
+    val meshGranted: Boolean,
+    val notificationsGranted: Boolean,
+    val batteryExempt: Boolean,
+    val requestMesh: () -> Unit,
+    val requestNotifications: () -> Unit,
+    val requestBatteryExemption: () -> Unit,
+)
+
+@Composable
+private fun rememberSetupPermissionState(): SetupPermissionState {
+    val context = LocalContext.current
+    var refreshToken by remember { mutableStateOf(0) }
+    val meshGranted = remember(context, refreshToken) { hasMeshPermissions(context) }
+    val notificationsGranted = remember(context, refreshToken) { hasNotificationPermission(context) }
+    val batteryExempt = remember(context, refreshToken) { isIgnoringBatteryOptimizations(context) }
+
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) refreshToken += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    val meshLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants ->
+        refreshToken += 1
+        if (grants.values.all { it }) {
+            // The one grant the mesh cannot run without has just landed, so
+            // bring it up rather than waiting for the next screen to notice.
+            MeshStartupPreferences.setMeshEnabled(context, true)
+            startMesh(context)
+            return@rememberLauncherForActivityResult
+        }
+        val activity = context as? ComponentActivity
+        val permanentlyDenied = activity != null && MeshService.requiredPermissions().any { perm ->
+            grants[perm] == false &&
+                !ActivityCompat.shouldShowRequestPermissionRationale(activity, perm)
+        }
+        if (permanentlyDenied) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_enable_nearby_in_app_permissions),
+                Toast.LENGTH_LONG,
+            ).show()
+            openAppPermissionSettings(context)
+        } else {
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_nearby_required_for_messages),
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+    val notificationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        refreshToken += 1
+        if (!granted) {
+            Toast.makeText(
+                context,
+                context.getString(R.string.ui_notifications_denied_mesh_continues),
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+    }
+    val batteryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { refreshToken += 1 }
+
+    return SetupPermissionState(
+        meshGranted = meshGranted,
+        notificationsGranted = notificationsGranted,
+        batteryExempt = batteryExempt,
+        requestMesh = {
+            if (!meshGranted) meshLauncher.launch(MeshService.requiredPermissions())
+        },
+        requestNotifications = {
+            if (!notificationsGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                notificationLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        },
+        requestBatteryExemption = {
+            if (!batteryExempt) batteryLauncher.launch(batteryOptimizationIntent(context))
         },
     )
 }
