@@ -68,6 +68,11 @@ data class RelayCappedFetch(
  * Relay HTTP failure carrying the status, relayd's stable error code, and --
  * for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
  * core's `relayRetryAfterMs`, never here).
+ *
+ * The response body is not among them, in the message or in a field. Callers
+ * log [message] as-is, so anything on here is content the far end chose and
+ * this app then wrote into a file a user shares. Mirrors iOS
+ * `RelayHTTPError`.
  */
 class RelayHttpException(
     val code: Int,
@@ -434,11 +439,10 @@ object RelayClient {
             // read to name the failure, so only a preview of it is taken, and
             // a body that will not finish arriving does not hide the status.
             if (code !in 200..299) {
-                val preview = String(
+                val previewBytes =
                     runCatching { errorStream?.use { it.readAtMost(ERROR_BODY_PREVIEW_BYTES) } }
-                        .getOrNull() ?: ByteArray(0),
-                    StandardCharsets.UTF_8,
-                )
+                        .getOrNull() ?: ByteArray(0)
+                val preview = String(previewBytes, StandardCharsets.UTF_8)
                 val relayCode = runCatching {
                     JsonParser.parseString(preview).asJsonObject.get("code")?.asString
                 }.getOrNull()
@@ -446,18 +450,29 @@ object RelayClient {
                 val retryAfter = getHeaderField("Retry-After")
                 // The fields that explain a stuck relay: relayd's own
                 // machine-readable reason, and the header the carry re-upload
-                // storm ignored. The body preview is deliberately not logged --
-                // it is the one part of a relay response not under our control.
+                // storm ignored.
                 Log.e(
                     TAG,
                     "$method $path -> $code${semantic.ifEmpty { " [-]" }} " +
                         "in ${System.currentTimeMillis() - started}ms " +
                         "retryAfter=${retryAfter ?: "-"}",
                 )
+                // `preview` ends here. It was read to name the failure, and
+                // `relayCode` is that name; the bytes themselves are whatever
+                // the far end chose to send -- a captive-portal page, a proxy
+                // banner, a gateway error -- and this exception's message is
+                // logged verbatim at a dozen call sites in RelaySyncEngine and
+                // again with the throwable during Shore Pass setup. It is not
+                // kept as an unlogged field either: nothing reads one, and a
+                // field that exists is one `Log.w(TAG, msg, e)` away from being
+                // in the archive anyway. What survives is what triage used:
+                // status, relayd's code, and whether a body came back at all.
                 throw RelayHttpException(
                     code,
                     relayCode,
-                    "Relay request failed ($code)$semantic: $preview",
+                    "Relay request failed ($code)${semantic.ifEmpty { " [-]" }} " +
+                        "body=${previewBytes.size}" +
+                        (if (previewBytes.size >= ERROR_BODY_PREVIEW_BYTES) "+" else "") + "B",
                     retryAfter = retryAfter,
                 )
             }

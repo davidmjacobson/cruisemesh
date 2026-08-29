@@ -168,6 +168,57 @@ class RelayClientTest {
     }
 
     @Test
+    fun `an error response body stays out of the exception message`() {
+        // Whatever answers a relay call is not necessarily the relay: a
+        // captive portal, a proxy, a gateway. Its bytes are logged verbatim
+        // wherever RelaySyncEngine writes `${e.message}`, so the message
+        // carries the status, relayd's code and the size -- and nothing that
+        // came off the wire.
+        val server = MockWebServer()
+        val portal = "<html><title>Guest Wi-Fi sign in</title>deck 5 stateroom 8042</html>"
+        server.enqueue(MockResponse().setResponseCode(502).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(RelayHttpException::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            // Whole-message equality on purpose. "does not contain the body"
+            // is the property, but only pinning the message exactly rules out
+            // a future edit appending something else that came off the wire.
+            assertEquals(
+                "Relay request failed (502) [-] body=${portal.length}B",
+                error.message,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `a relay code still names the failure without the body`() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(507)
+                .setBody("""{"error":"mailbox is full","code":"mailbox_full"}"""),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(RelayHttpException::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            assertEquals("mailbox_full", error.relayCode)
+            // relayd's own code names the failure; the sentence it shipped
+            // alongside does not travel.
+            assertEquals("Relay request failed (507) [mailbox_full] body=49B", error.message)
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun `post receipt envelope uses the same relay contract`() {
         val server = MockWebServer()
         server.enqueue(MockResponse().setResponseCode(200).setBody("""{"id":11}"""))

@@ -21,6 +21,7 @@ final class PassIndicatorTests: XCTestCase {
             .ok(lastSyncMs: now),
             .failing(lastAttemptMs: now),
             .expired(lastAttemptMs: now),
+            .expiredReadOnly(lastAttemptMs: now),
             .suspended(lastAttemptMs: now),
             .tokenRejected(lastAttemptMs: now),
             .quotaFull(lastAttemptMs: now),
@@ -44,6 +45,7 @@ final class PassIndicatorTests: XCTestCase {
     func testStatesThatNeedTheUserToActAreRed() {
         let healths: [RelayHealth] = [
             .expired(lastAttemptMs: now),
+            .expiredReadOnly(lastAttemptMs: now),
             .suspended(lastAttemptMs: now),
             .tokenRejected(lastAttemptMs: now),
             .quotaFull(lastAttemptMs: now),
@@ -104,6 +106,7 @@ final class PassIndicatorTests: XCTestCase {
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
         case .expired: return .expired(lastAttemptMs: nowMs)
+        case .expiredReadOnly: return .expiredReadOnly(lastAttemptMs: nowMs)
         case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         case .failing: return .failing(lastAttemptMs: nowMs)
@@ -189,6 +192,7 @@ final class PassIndicatorTests: XCTestCase {
             .noInternet,
             .failing(lastAttemptMs: now),
             .expired(lastAttemptMs: now),
+            .expiredReadOnly(lastAttemptMs: now),
             .suspended(lastAttemptMs: now),
             .tokenRejected(lastAttemptMs: now),
             .quotaFull(lastAttemptMs: now),
@@ -219,6 +223,7 @@ final class PassIndicatorTests: XCTestCase {
             .noInternet,
             .failing(lastAttemptMs: now),
             .expired(lastAttemptMs: now),
+            .expiredReadOnly(lastAttemptMs: now),
             .suspended(lastAttemptMs: now),
             .tokenRejected(lastAttemptMs: now),
             .quotaFull(lastAttemptMs: now),

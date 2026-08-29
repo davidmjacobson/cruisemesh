@@ -1,6 +1,7 @@
 package com.cruisemesh.app.mesh
 
 import android.util.Log
+import com.cruisemesh.app.chat.UserIdHex
 import uniffi.cruisemesh_core.CoreCarriedCursor
 import uniffi.cruisemesh_core.CoreCarriedLane
 
@@ -74,6 +75,7 @@ object MeshRouter {
      */
     fun reset() {
         state.clear()
+        PendingPeerMail.shared.clear()
     }
 
     /**
@@ -123,7 +125,13 @@ object MeshRouter {
     fun onDisconnected(address: String) = state.onDisconnected(address)
 
     /** [address] identified itself as [userId] via a HELLO frame. */
-    fun onHello(address: String, userId: ByteArray): Boolean = state.onHello(address, userId)
+    fun onHello(address: String, userId: ByteArray): Boolean =
+        state.onHello(address, userId).also { registered ->
+            // Reachable again: whatever we could not hand over earlier is now
+            // digest sync's job, so this contact no longer needs BLE slot
+            // priority. See [PendingPeerMail].
+            if (registered) PendingPeerMail.shared.noteRouted(UserIdHex.encode(userId))
+        }
 
     /** [address]'s HELLO2 follow-up: identity + capability bits. */
     fun onHello2(address: String, userId: ByteArray, capabilities: UInt): Boolean =
@@ -213,7 +221,14 @@ object MeshRouter {
      */
     fun sendToUserId(userId: ByteArray, frame: ByteArray): Boolean {
         val routes = state.routesFor(userId)
-        if (routes.isEmpty()) return false
+        if (routes.isEmpty()) {
+            // Nothing is lost -- digest sync redelivers -- but this contact is
+            // now someone this phone has a concrete reason to reach, which is
+            // what earns them a contested BLE link slot. See [PendingPeerMail]
+            // and [CentralConnectAdmission].
+            PendingPeerMail.shared.noteUnrouted(UserIdHex.encode(userId), System.currentTimeMillis())
+            return false
+        }
         val selected = transportSendPlan(routes, frame.size)
         var sent = false
         for ((transport, address) in selected) {

@@ -230,7 +230,7 @@ pub use protocol_event::{
 };
 pub use recipient_hints::{
     dedupe_hints, recent_device_hints_for, recent_hints_for, recent_presence_hints_for,
-    HINTS_PER_ID_FETCH, HINTS_PER_ID_PUSH, RELAY_MAX_FETCH_HINTS,
+    CARRY_HINT_DAY_WINDOW_DAYS, HINTS_PER_ID_FETCH, HINTS_PER_ID_PUSH, RELAY_MAX_FETCH_HINTS,
 };
 pub use relay_cursor::{
     relay_cursor_advance, relay_cursor_key, relay_fetch_walk_continues,
