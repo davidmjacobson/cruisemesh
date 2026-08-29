@@ -3,6 +3,7 @@ use blake2::Blake2bVar;
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Serialize};
 
+use crate::json_fault::json_fault;
 use crate::CoreError;
 
 const RELAY_MAX_SEALED_BYTES: usize = 512 * 1024;
@@ -1006,8 +1007,20 @@ fn validate_response_body(body: &[u8]) -> Result<(), CoreError> {
 fn json_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
     serde_json::to_vec(value).map_err(|e| malformed(&format!("invalid relay JSON: {e}")))
 }
+
+/// Decodes a relay response body.
+///
+/// The failure is described by [`json_fault`] rather than by `serde_json`'s
+/// own text. What answers a relay call is not necessarily the relay — on a
+/// ship it is as often a captive portal or a hotel proxy — and both shells log
+/// this message into a file the user can export and share.
 fn json_decode<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, CoreError> {
-    serde_json::from_slice(body).map_err(|e| malformed(&format!("invalid relay JSON: {e}")))
+    serde_json::from_slice(body).map_err(|e| {
+        malformed(&format!(
+            "invalid relay JSON: {}",
+            json_fault(&e, body.len())
+        ))
+    })
 }
 fn malformed(message: &str) -> CoreError {
     CoreError::Malformed(message.to_string())
@@ -1439,6 +1452,61 @@ mod tests {
         let page = relay_decode_fetch_page(response).unwrap();
         assert_eq!(page.envelopes[0].msg_id, vec![1; 16]);
         assert_eq!(page.next_cursor, 4);
+    }
+
+    /// Whatever answers a relay call is not necessarily the relay: a captive
+    /// portal, a hotel proxy, a gateway. Both shells log this message when a
+    /// 2xx body will not decode, so it carries the shape of the failure and
+    /// nothing that came off the wire.
+    ///
+    /// Whole-message equality on purpose. "Does not contain the body" is the
+    /// property, but only pinning the message exactly rules out a future edit
+    /// appending something else that came off the wire.
+    #[test]
+    fn a_malformed_page_is_named_without_quoting_the_page() {
+        let body = br#"{"envelopes":[],"next_cursor":"MARKER-portal-deck-5"}"#.to_vec();
+        let len = body.len();
+        let err = relay_decode_fetch_page(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed relay page");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: data error at line 1 column 52 of {len}B")
+        );
+    }
+
+    /// A sign-in page where a fetch page should have been. The status branch
+    /// catches these when the portal is honest enough to send a non-2xx; this
+    /// is the one that answers 200 and hands over HTML.
+    #[test]
+    fn a_sign_in_page_answered_with_200_is_a_syntax_error_and_nothing_else() {
+        let body = b"<html><title>MARKER Guest Wi-Fi</title></html>".to_vec();
+        let len = body.len();
+        let err = relay_decode_fetch_page(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed relay page");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: syntax error at line 1 column 1 of {len}B")
+        );
+    }
+
+    /// The post response is the smallest decode on this surface and takes the
+    /// same route through `json_decode`, so it gets the same guarantee.
+    #[test]
+    fn a_malformed_post_response_is_named_without_quoting_it() {
+        let body = br#"{"id":"MARKER-not-a-number"}"#.to_vec();
+        let len = body.len();
+        let err = relay_decode_post_response(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed post response");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: data error at line 1 column 27 of {len}B")
+        );
     }
 
     #[test]
