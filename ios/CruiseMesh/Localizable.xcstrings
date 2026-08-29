@@ -5245,12 +5245,12 @@
         }
       }
     },
-    "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.": {
+    "CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through."
+            "value": "CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through."
           }
         }
       }

@@ -14,8 +14,10 @@
     <string name="ui_add_a_friend_to_start_messaging_over_bluetooth">Add a friend to start messaging over Bluetooth — no Wi-Fi needed.</string>
     <string name="ui_connected">You\'re connected</string>
     <string name="ui_friend_added">Friend added</string>
-    <!-- One-time hint, shown once after the first friend is added -->
-    <string name="ui_hint_try_airplane_mode">Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.</string>
+    <!-- One-time hint, from the first friend onward. Names Bluetooth outright:
+         testers hear "works with no internet" as a slogan until they are told
+         what is actually carrying the message, and how to prove it. -->
+    <string name="ui_hint_try_airplane_mode">CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through.</string>
     <string name="ui_add_all">Add all</string>
     <string name="ui_add_all_count">Add all (%1$d)</string>
     <string name="ui_add_count">Add (%1$d)</string>
