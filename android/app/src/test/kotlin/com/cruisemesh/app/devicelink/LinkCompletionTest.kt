@@ -39,4 +39,43 @@ class LinkCompletionTest {
             assertFalse(step.name, LinkCompletion.entersApp(CoreLinkRole.NEW_DEVICE, step))
         }
     }
+
+    /**
+     * The regression this pair of rules exists for: a cancelled run kept the
+     * code and the copy button on screen, so the screen that said "Stopped"
+     * was at the same time inviting somebody to scan something dead.
+     */
+    @Test
+    fun `a stopped run shows no code to scan`() {
+        assertFalse(LinkCompletion.showsOffer(CoreLinkRole.NEW_DEVICE, LinkStep.FAILED))
+    }
+
+    @Test
+    fun `a finished run shows no code either`() {
+        assertFalse(LinkCompletion.showsOffer(CoreLinkRole.NEW_DEVICE, LinkStep.DONE))
+    }
+
+    @Test
+    fun `a live run still shows its code`() {
+        val live = LinkStep.values().filterNot { it == LinkStep.DONE || it == LinkStep.FAILED }
+        for (step in live) {
+            assertTrue(step.name, LinkCompletion.showsOffer(CoreLinkRole.NEW_DEVICE, step))
+        }
+    }
+
+    /** The approving end scans an offer; it never shows one. */
+    @Test
+    fun `the approving device never shows a code`() {
+        for (step in LinkStep.values()) {
+            assertFalse(step.name, LinkCompletion.showsOffer(CoreLinkRole.APPROVING_DEVICE, step))
+        }
+    }
+
+    @Test
+    fun `only a stopped run offers another go`() {
+        assertTrue(LinkCompletion.offersRestart(LinkStep.FAILED))
+        for (step in LinkStep.values().filterNot { it == LinkStep.FAILED }) {
+            assertFalse(step.name, LinkCompletion.offersRestart(step))
+        }
+    }
 }
