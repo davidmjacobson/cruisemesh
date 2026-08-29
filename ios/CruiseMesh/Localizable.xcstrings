@@ -2813,6 +2813,16 @@
         }
       }
     },
+    "Start using CruiseMesh": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start using CruiseMesh"
+          }
+        }
+      }
+    },
     "Stop": {
       "localizations": {
         "en": {
@@ -5765,6 +5775,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them."
+          }
+        }
+      }
+    },
+    "Your phone is set up. One last thing before you start.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your phone is set up. One last thing before you start."
           }
         }
       }

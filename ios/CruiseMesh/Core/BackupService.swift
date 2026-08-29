@@ -99,6 +99,9 @@ enum BackupService {
         RelayConfigStore.setShareOnline(payload.shareOnline)
         _ = FriendsOfFriendsStore.setEnabled(payload.friendsOfFriendsEnabled)
         OnboardingStore.markCompleted()
+        // A restore skips the wizard, and with it the permissions step. Say so,
+        // so the relaunch lands on that step rather than on a chat list.
+        OnboardingStore.markPermissionsStepPending()
     }
 
     /// Validate/migrate the payload and remove restored courier/relay runtime

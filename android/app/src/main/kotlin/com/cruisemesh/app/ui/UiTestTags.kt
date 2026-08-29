@@ -9,6 +9,7 @@ package com.cruisemesh.app.ui
 object UiTestTags {
     const val TERMS_SCREEN = "terms_screen"
     const val ONBOARDING_SCREEN = "onboarding_screen"
+    const val PERMISSIONS_SETUP_SCREEN = "permissions_setup_screen"
     const val NEW_GROUP_SCREEN = "new_group_screen"
     const val MESSAGE_COMPOSER = "message_composer"
 }

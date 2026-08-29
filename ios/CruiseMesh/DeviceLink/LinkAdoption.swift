@@ -53,5 +53,11 @@ enum LinkAdoption {
         ProfilePhotoStore.restoreBackupBytes(profile.avatar)
         ProfileStore.restoreOwnAvatarEpoch(profile.avatarEpoch)
         OnboardingStore.markCompleted()
+        // Setup is complete, but the wizard never ran and neither did the
+        // permissions step inside it. Recorded here for the same reason the
+        // line above is: it is a fact about the store, not about a screen, so a
+        // phone that is closed between the ceremony and the next launch still
+        // owes the step. `FirstRunRouter` is what collects it.
+        OnboardingStore.markPermissionsStepPending()
     }
 }
