@@ -231,17 +231,29 @@ struct RelayPresencePage {
     let presence: [CoreRelayPresence]
 }
 
+/// Relay HTTP failure carrying the status, relayd's stable error code, and --
+/// for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
+/// core's `relayRetryAfterMs`, never here).
+///
+/// The response body is not among them, in `errorDescription` or in a stored
+/// property. Callers log `localizedDescription` as-is, so anything held here
+/// is content the far end chose and this app then wrote into a file the user
+/// shares. What is kept is what triage used: the status, relayd's own code,
+/// and whether a body came back at all. Mirrors Android `RelayHttpException`.
 struct RelayHTTPError: LocalizedError {
     let statusCode: Int
     let relayCode: String?
-    let responseBody: String
+    /// How many bytes of body came back, up to the preview cap -- never the
+    /// bytes. A `+` in the description marks a body that reached the cap.
+    let responseBodyBytes: Int
     /// Raw `Retry-After` header on a 429 (CP2b); parsed/clamped by the
     /// core's `relayRetryAfterMs`, never here.
     var retryAfter: String? = nil
 
     var errorDescription: String? {
-        let semantic = relayCode.map { " [\($0)]" } ?? ""
-        return "Relay request failed (\(statusCode))\(semantic): \(responseBody)"
+        let semantic = relayCode.map { " [\($0)]" } ?? " [-]"
+        let capped = responseBodyBytes >= RelayClient.errorBodyPreviewBytes ? "+" : ""
+        return "Relay request failed (\(statusCode))\(semantic) body=\(responseBodyBytes)\(capped)B"
     }
 }
 
@@ -255,9 +267,11 @@ enum RelayClient {
     /// fail the same window from the same cursor on every pass forever.
     /// Matches Android, whose `readTimeout` is likewise per-read.
     private static let inactivityTimeout: TimeInterval = 15
-    /// How much of a non-2xx body is kept -- enough to quote the relay's
-    /// reason in the error, not enough for an error page to cost memory.
-    private static let errorBodyPreviewBytes = 2_048
+    /// How much of a non-2xx body is read -- enough to find relayd's own
+    /// error code in it, not enough for an error page to cost memory. None of
+    /// it is kept past that. Not `private`: `RelayHTTPError` reads the cap to
+    /// say whether the body it counted had been truncated.
+    static let errorBodyPreviewBytes = 2_048
     private static let userAgent = "CruiseMeshRelayClient-iOS/0.1"
 
     /// Every relay call lands here, and until now none of them left a trace.
@@ -694,12 +708,17 @@ enum RelayClient {
         guard (200..<300).contains(http.statusCode) else {
             // Already truncated to a preview by the delegate; bounded again
             // here so this stays correct for any other caller.
-            let body = String(data: data.prefix(errorBodyPreviewBytes), encoding: .utf8) ?? ""
+            let preview = data.prefix(errorBodyPreviewBytes)
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            // `preview` ends here. It was read to name the failure, and
+            // `relayCode` is that name; the bytes themselves are whatever the
+            // far end chose to send -- a captive-portal page, a proxy banner,
+            // a gateway error -- and this error's description is logged
+            // verbatim wherever a relay call fails. Only the count travels.
             throw RelayHTTPError(
                 statusCode: http.statusCode,
                 relayCode: json?["code"] as? String,
-                responseBody: body,
+                responseBodyBytes: preview.count,
                 retryAfter: http.value(forHTTPHeaderField: "Retry-After")
             )
         }

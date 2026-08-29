@@ -56510,6 +56510,29 @@ public func relaySweepRestartFromZero(sweepProgressAfterId: Int64, sweepStartedA
 })
 }
 /**
+ * Short, stable, non-reversible label for a Shore Pass token, for logs.
+ *
+ * A shared diagnostics log has to be able to answer "which pass is this
+ * phone using, and is it the same one as in yesterday's log" without the
+ * file carrying the pass itself. Truncation cannot do both jobs: every
+ * character it prints is a character of a live bearer credential. A digest
+ * can — the same token always produces the same label, and the label says
+ * nothing about the token that produced it.
+ *
+ * Both shells call this rather than hashing on their own: two hand-written
+ * digests would drift, and the moment they did, a support person comparing
+ * an Android archive against an iPhone's would stop seeing a match with
+ * nothing failing to say so. Changing the domain string or the output length
+ * breaks that same correlation across app versions, so don't.
+ */
+public func relayTokenFingerprint(relayToken: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_token_fingerprint(
+        FfiConverterString.lower(relayToken),$0
+    )
+})
+}
+/**
  * True when `token` is a deposit-class relay credential (CP4): valid only
  * for posting envelopes into its family's mailbox, never for fetch/ack/
  * presence/WebSocket. Friend cards carry this class; the Shore Pass setup
@@ -57919,6 +57942,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_restart_from_zero() != 61201) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_token_fingerprint() != 31720) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 58985) {
