@@ -46,12 +46,26 @@ final class RelayDecodeFailureTests: XCTestCase {
         assertDescribes(detail, body, "eof error at line 1 column 26 of 26B")
     }
 
-    /// Everything this app authors is pinned exactly, at both ends: a later
-    /// edit that appends anything at all to the sentence has to be a
-    /// deliberate act. Only UniFFI's own rendering of the error case sits
-    /// between the two halves, which is why this is a prefix and a suffix
-    /// rather than one equality — that middle is not this app's text to
-    /// author, and pinning it would pin a binding generator's formatting.
+    /// The whole sentence, pinned exactly — the same standard the core's own
+    /// tests and Android's `RelayClientTest` hold this line to. "Does not
+    /// contain the body" is the property, but only equality rules out a later
+    /// edit appending something else that came off the wire.
+    ///
+    /// UniFFI wraps the core message rather than merely prefixing it: it
+    /// conforms `CoreError` to `LocalizedError` with `String(reflecting:
+    /// self)`, so the rendered case is `CruiseMesh.CoreError.Malformed("…")`
+    /// — a module-qualified head *and* a closing `")` after the message. That
+    /// middle is the generator's formatting rather than this app's text, and
+    /// pinning it does tie this test to the binding generator; that is the
+    /// deliberate trade, because the alternative left the tail of the sentence
+    /// unpinned, which is precisely where appended wire content would land.
+    /// If a UniFFI upgrade changes the rendering, this is the assertion to
+    /// re-read against the new output — never to loosen.
+    ///
+    /// The marker check is kept alongside it. Equality already implies it, but
+    /// it states the property this file exists for and, failing first, says so
+    /// in the failure message instead of leaving a reader to diff two long
+    /// strings.
     private func assertDescribes(
         _ detail: String,
         _ body: Data,
@@ -65,15 +79,12 @@ final class RelayDecodeFailureTests: XCTestCase {
             file: file,
             line: line
         )
-        XCTAssertTrue(
-            detail.hasPrefix("could not decode \(body.count)B: "),
-            "unexpected prefix: \(detail)",
-            file: file,
-            line: line
-        )
-        XCTAssertTrue(
-            detail.hasSuffix("invalid relay JSON: \(coreMessage)"),
-            "unexpected core message: \(detail)",
+        XCTAssertEqual(
+            detail,
+            """
+            could not decode \(body.count)B: \
+            CruiseMesh.CoreError.Malformed("invalid relay JSON: \(coreMessage)")
+            """,
             file: file,
             line: line
         )
