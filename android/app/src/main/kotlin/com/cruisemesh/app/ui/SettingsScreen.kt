@@ -439,6 +439,8 @@ private fun relayTitle(health: RelayHealth, configured: Boolean): String {
         RelayHealth.DeferredRoaming -> stringResource(R.string.ui_relay_deferred_roaming)
         is RelayHealth.Failing -> "Shore Pass needs attention"
         is RelayHealth.Expired -> "Shore Pass expired"
+        is RelayHealth.ExpiredReadOnly ->
+            stringResource(R.string.ui_shore_pass_expired_still_receiving_title)
         is RelayHealth.Suspended -> "Shore Pass suspended"
         is RelayHealth.TokenRejected -> "Shore Pass setup was rejected"
         is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_title)
@@ -458,6 +460,8 @@ private fun relayDetail(health: RelayHealth, configured: Boolean): String {
         RelayHealth.DeferredRoaming -> stringResource(R.string.ui_relay_deferred_roaming)
         is RelayHealth.Failing -> "The relay could not be reached."
         is RelayHealth.Expired -> "Renew your pass to resume internet delivery."
+        is RelayHealth.ExpiredReadOnly ->
+            stringResource(R.string.ui_shore_pass_expired_still_receiving_detail)
         is RelayHealth.Suspended -> "Contact support for help with this pass."
         is RelayHealth.TokenRejected -> "Paste the setup card again, or use a different Shore Pass."
         is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_detail)

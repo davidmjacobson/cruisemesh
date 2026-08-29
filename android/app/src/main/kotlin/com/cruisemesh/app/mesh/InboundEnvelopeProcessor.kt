@@ -230,7 +230,7 @@ internal class InboundEnvelopeProcessor(
                 payload: ByteArray,
                 identity: Identity,
             ): Boolean {
-                val sourceLabel = sourceAddress ?: "relay"
+                val source = ArrivalAddress.of(sourceAddress)
                 val opened = OpenedMessage(senderUserId = senderUserId, payload = payload)
                 val arrival = messageArrival(sourceAddress, hopTtl, senderUserId)
                 return try {
@@ -242,14 +242,14 @@ internal class InboundEnvelopeProcessor(
                             // is a store problem, not a delivery verdict:
                             // report failure and leave the envelope
                             // re-presentable rather than acking it away.
-                            Log.w(TAG, "Deferring group envelope from $sourceLabel: group row is gone")
+                            Log.w(TAG, "Deferring group envelope from $source: group row is gone")
                             return false
                         }
-                        deliverOpenedGroupEnvelope(sourceLabel, group, opened, identity, arrival, msgId)
+                        deliverOpenedGroupEnvelope(source.label, group, opened, identity, arrival, msgId)
                     } else {
                         val consumed = deliverOpenedEnvelope(
-                            sourceLabel,
-                            sourceAddress != null,
+                            source,
+                            source.isLiveLink,
                             opened,
                             identity,
                             arrival,
@@ -265,7 +265,7 @@ internal class InboundEnvelopeProcessor(
                 } catch (e: CoreException) {
                     // T4-06: a message that was OURS to open failed to persist.
                     // Never let it unwind the receive thread.
-                    Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
+                    Log.w(TAG, "Deferring envelope from $source: durable delivery failed (${e.message})")
                     false
                 }
             }
@@ -395,7 +395,7 @@ internal class InboundEnvelopeProcessor(
         envelope: Frame.Envelope,
         identity: Identity,
     ): CoreInboundDisposition {
-        val sourceLabel = sourceAddress ?: "relay"
+        val source = ArrivalAddress.of(sourceAddress)
         // FA5: this function runs concurrently on up to four threads (central-
         // GATT binder, peripheral-GATT binder, LanTransport's
         // connectionExecutor, the relay-sync thread) -- see
@@ -451,12 +451,12 @@ internal class InboundEnvelopeProcessor(
                 return finishAdmission(CoreInboundDisposition.SEEN, terminal = false)
             }
             CoreInboundGate.EXPIRED -> {
-                Log.i(TAG, "Dropping expired envelope from $sourceLabel (expiry=${envelope.expiry})")
+                Log.i(TAG, "Dropping expired envelope from $source (expiry=${envelope.expiry})")
                 // A deliberate drop is still a terminal handled state.
                 return finishAdmission(CoreInboundDisposition.EXPIRED, terminal = true)
             }
             CoreInboundGate.REJECTED -> {
-                Log.w(TAG, "Dropping envelope with invalid hop or expiry fields from $sourceLabel")
+                Log.w(TAG, "Dropping envelope with invalid hop or expiry fields from $source")
                 return finishAdmission(CoreInboundDisposition.REJECTED, terminal = true)
             }
             CoreInboundGate.DISPATCH -> Unit
@@ -475,7 +475,7 @@ internal class InboundEnvelopeProcessor(
                 val arrival = messageArrival(sourceAddress, envelope.hopTtl, groupOpened.second.senderUserId)
                 try {
                     deliverOpenedGroupEnvelope(
-                        sourceLabel,
+                        source.label,
                         groupOpened.first,
                         groupOpened.second,
                         identity,
@@ -489,7 +489,7 @@ internal class InboundEnvelopeProcessor(
                     // must not be acked. The best-effort relay/carry for
                     // absent members is skipped; the next re-presentation
                     // re-runs the whole branch.
-                    Log.w(TAG, "Deferring group envelope from $sourceLabel: durable delivery failed (${e.message})")
+                    Log.w(TAG, "Deferring group envelope from $source: durable delivery failed (${e.message})")
                     return finishAdmission(CoreInboundDisposition.FAILED, terminal = false)
                 }
                 // specs/group-relay-durability.md §4.3 no-reinjection rule:
@@ -538,7 +538,7 @@ internal class InboundEnvelopeProcessor(
         }
         val arrival = messageArrival(sourceAddress, envelope.hopTtl, opened.senderUserId)
         val consumed = try {
-            deliverOpenedEnvelope(sourceLabel, sourceAddress != null, opened, identity, arrival, envelope.msgId)
+            deliverOpenedEnvelope(source, source.isLiveLink, opened, identity, arrival, envelope.msgId)
         } catch (e: CoreException) {
             // T4-06: [deliverOpenedEnvelope] does not swallow store exceptions
             // (see [handleIncomingChatMessage] etc.), so a throw here means a
@@ -547,7 +547,7 @@ internal class InboundEnvelopeProcessor(
             // receive thread / relay batch loop must not be torn down, the
             // msg_id stays unrecorded so the next copy re-dispatches, and
             // FAILED is never acked so the relay copy survives for that retry.
-            Log.w(TAG, "Deferring envelope from $sourceLabel: durable delivery failed (${e.message})")
+            Log.w(TAG, "Deferring envelope from $source: durable delivery failed (${e.message})")
             return finishAdmission(CoreInboundDisposition.FAILED, terminal = false)
         }
         // The ONE place this device may vouch for a hidden kind's relay copy:
@@ -954,7 +954,7 @@ internal class InboundEnvelopeProcessor(
      * what this was" withholds that.
      */
     private fun deliverOpenedEnvelope(
-        address: String,
+        address: ArrivalAddress,
         directBle: Boolean,
         opened: OpenedMessage,
         identity: Identity,
@@ -1077,7 +1077,7 @@ internal class InboundEnvelopeProcessor(
     }
 
     private fun handleIncomingLanEndpointHint(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1141,6 +1141,13 @@ internal class InboundEnvelopeProcessor(
      * verified signer must be a current member (core does not check this).
      * D9 group receipts go pairwise back to the author after the local
      * watermark advances.
+     *
+     * [address] is a log label only ([ArrivalAddress.label]), never something
+     * to send on: the whole group subtree answers via
+     * [emitGroupReceiptsToAuthor] -> [sendGroupReceiptToContact], which routes
+     * by the author's userId and so is already correct for a relay arrival.
+     * That is why this half of the tree takes a plain [String] while the
+     * pairwise half takes an [ArrivalAddress].
      */
     private fun deliverOpenedGroupEnvelope(
         address: String,
@@ -1347,7 +1354,7 @@ internal class InboundEnvelopeProcessor(
      * under `chat_id = group.id`.
      */
     private fun handleIncomingGroupInvite(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1433,7 +1440,7 @@ internal class InboundEnvelopeProcessor(
      * verify it matches the envelope sender's signing key before trusting it.
      */
     private fun handleIncomingFriendRequest(
-        address: String,
+        address: ArrivalAddress,
         directBle: Boolean,
         senderUserId: ByteArray,
         body: MessageBody,
@@ -1493,7 +1500,7 @@ internal class InboundEnvelopeProcessor(
             contact,
             ProfileStore.loadOwnAvatarEpoch(context),
         )
-        lan.sendLanEndpointHintTo(address)
+        address.link?.let(lan::sendLanEndpointHintTo)
         val inserted = store.insertMessage(
             StoredMessage(
                 chatId = senderUserId,
@@ -1531,7 +1538,7 @@ internal class InboundEnvelopeProcessor(
      * whose answer is "no".
      */
     private fun holdSharedFriendRequest(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1628,7 +1635,7 @@ internal class InboundEnvelopeProcessor(
     }
 
     private fun handleIncomingProfileSync(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1693,7 +1700,7 @@ internal class InboundEnvelopeProcessor(
      * own sender's endpoint, never a third party's.
      */
     private fun handleIncomingRelayUpdate(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1771,7 +1778,7 @@ internal class InboundEnvelopeProcessor(
      * document that still vouches for a device its person has since buried.
      */
     private fun handleIncomingRosterGossip(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1836,7 +1843,7 @@ internal class InboundEnvelopeProcessor(
     }
 
     private fun handleIncomingFriendDirectory(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -1893,7 +1900,7 @@ internal class InboundEnvelopeProcessor(
     }
 
     private fun handleIncomingIntroducedFriendRequest(
-        address: String,
+        address: ArrivalAddress,
         directBle: Boolean,
         senderUserId: ByteArray,
         body: MessageBody,
@@ -1984,7 +1991,7 @@ internal class InboundEnvelopeProcessor(
             contact,
             ProfileStore.loadOwnAvatarEpoch(context),
         )
-        lan.sendLanEndpointHintTo(address)
+        address.link?.let(lan::sendLanEndpointHintTo)
         if (!wasKnown) FriendDirectorySender.queueToAllContacts(context, store, identity)
         ChatEvents.notifyChatChanged(senderUserId)
         if (!wasKnown) {
@@ -1995,7 +2002,7 @@ internal class InboundEnvelopeProcessor(
 
     /** Hidden-kind rows (endpoint hints, directories, introductions) are never on screen, so they ack DELIVERED only -- never READ. */
     private fun acknowledgeHiddenMessage(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         identity: Identity,
         contact: Contact,
@@ -2008,8 +2015,9 @@ internal class InboundEnvelopeProcessor(
      * group receipts will extend exactly this sequence): persist the
      * cumulative DELIVERED watermark (plus READ when [markRead] -- the chat
      * is on screen), refresh the relay-uploadable receipt envelope(s), kick a
-     * relay sync if a watermark advanced, and send the receipt(s) back on the
-     * link the message arrived on.
+     * relay sync if a watermark advanced, and send the receipt(s) back to the
+     * sender over whatever route the arrival leaves open (see
+     * [sendReceiptForArrival]).
      *
      * See [PeerStreamWatermark] for why the watermark is a plain MAX and what
      * [atLeastLamport] is for (the group invite, whose row lives under the
@@ -2018,7 +2026,7 @@ internal class InboundEnvelopeProcessor(
     private fun acknowledgePeerStream(
         identity: Identity,
         contact: Contact,
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         markRead: Boolean,
         atLeastLamport: ULong = 0uL,
@@ -2045,15 +2053,17 @@ internal class InboundEnvelopeProcessor(
         if (relayQueueChanged) {
             RelaySyncEvents.requestSync()
         }
-        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+        sendReceiptForArrival(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
         if (markRead) {
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+            sendReceiptForArrival(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         }
     }
 
     /**
      * Stores an incoming text message and, only if it was newly inserted,
-     * sends a delivered receipt back on the same link (DESIGN.md §7.2), plus
+     * sends a delivered receipt back to the sender (DESIGN.md §7.2) -- on the
+     * exact link it arrived on, or, when the relay handed it over, on whatever
+     * link currently reaches them (see [sendReceiptForArrival]) -- plus
      * -- if the chat is currently on screen ([ChatVisibility.isVisible]) -- a
      * read receipt too. Otherwise, posts a notification
      * ([IncomingMessageAnnouncer.announceDirectMessage]) instead, since the chat isn't
@@ -2083,7 +2093,7 @@ internal class InboundEnvelopeProcessor(
      * always written to — so absence is expected, not an error.
      */
     private fun handleIncomingChatMessage(
-        address: String,
+        address: ArrivalAddress,
         senderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -2108,7 +2118,7 @@ internal class InboundEnvelopeProcessor(
             replyToMsgId,
             arrival,
         )
-        if (!acceptIncomingInsert(outcome, address, kind, senderUserId, body.lamport)) return
+        if (!acceptIncomingInsert(outcome, address.label, kind, senderUserId, body.lamport)) return
         Log.i(
             TAG,
             "Stored kind=$kind from $address sender=${UserIdHex.encode(senderUserId)} lamport=${body.lamport}",
@@ -2163,14 +2173,14 @@ internal class InboundEnvelopeProcessor(
             RelaySyncEvents.requestSync()
         }
 
-        sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
+        sendReceiptForArrival(identity, contact, address, RECEIPT_TYPE_DELIVERED, senderUserId, throughLamport)
 
         if (isVisible) {
             // The user is already looking at this chat, so it was read the
             // instant it landed -- send the read receipt now rather than
             // waiting for ChatViewEvents, which only fires when a chat
             // *becomes* visible, not for messages arriving while it already is.
-            sendReceiptOnAddress(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
+            sendReceiptForArrival(identity, contact, address, RECEIPT_TYPE_READ, senderUserId, throughLamport)
         } else if (isVisibleChatKind(kind)) {
             val preview = when (kind) {
                 KIND_ATTACHMENT_MANIFEST ->
@@ -2244,7 +2254,7 @@ internal class InboundEnvelopeProcessor(
      * receipt (see [handleIncomingChatMessage]'s KDoc for the full argument).
      */
     private fun handleIncomingReceipt(
-        address: String,
+        address: ArrivalAddress,
         envelopeSenderUserId: ByteArray,
         body: MessageBody,
         identity: Identity,
@@ -2334,7 +2344,7 @@ internal class InboundEnvelopeProcessor(
      * `receipts` table so it cannot paint ticks on a pairwise chat.
      */
     private fun handleIncomingGroupReceipt(
-        address: String,
+        address: ArrivalAddress,
         envelopeSenderUserId: ByteArray,
         receipt: ReceiptContent,
         groupId: ByteArray,
@@ -2476,6 +2486,46 @@ internal class InboundEnvelopeProcessor(
             RelaySyncEvents.requestSync()
         }
         sendReceiptToContact(identity, contact, RECEIPT_TYPE_READ, peerUserId, throughLamport)
+    }
+
+    /**
+     * Sends a receipt back to the author of an envelope that just arrived,
+     * over whatever route that arrival actually leaves open.
+     *
+     * A frame that came in on a live link is answered on that exact link
+     * ([sendReceiptOnAddress]) -- same connection, no route election, which is
+     * what DESIGN.md §7.2 asks for. A frame the relay handed over has no link
+     * at all, so it goes to whichever link currently reaches the contact
+     * ([sendReceiptToContact]), which is usually none and occasionally the
+     * BLE or Wi-Fi link to the very person who sent it.
+     *
+     * The old code passed [ArrivalAddress.RELAY_LABEL] straight into
+     * [sendReceiptOnAddress] instead. Nothing is registered under that name,
+     * so the send could only ever fail: a message that arrived over the
+     * internet produced no receipt on the spot, and the sender's ticks waited
+     * for the durable receipt envelope to make a relay round trip (or for the
+     * next in-person digest sync) even when both phones were in the same room.
+     *
+     * This is not an ack of anything. It sends a receipt to the one contact
+     * whose message this device opened with its own key and durably stored --
+     * the sole-endpoint case. The relay copy's own disposition is decided by
+     * [processInboundEnvelope]'s return value and is untouched here, and no
+     * carried envelope is dropped on this path.
+     */
+    private fun sendReceiptForArrival(
+        identity: Identity,
+        contact: Contact,
+        address: ArrivalAddress,
+        receiptType: UByte,
+        ackedSenderUserId: ByteArray,
+        throughLamport: ULong,
+    ) {
+        val link = address.link
+        if (link == null) {
+            sendReceiptToContact(identity, contact, receiptType, ackedSenderUserId, throughLamport)
+        } else {
+            sendReceiptOnAddress(identity, contact, link, receiptType, ackedSenderUserId, throughLamport)
+        }
     }
 
     /**

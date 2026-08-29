@@ -352,6 +352,7 @@ struct SettingsView: View {
         case .deferredRoaming: return String(localized: "Waiting for non-roaming internet to avoid roaming charges")
         case .failing: return "Shore Pass needs attention"
         case .expired: return "Shore Pass expired"
+        case .expiredReadOnly: return String(localized: "Shore Pass expired")
         case .suspended: return "Shore Pass suspended"
         case .tokenRejected: return "Shore Pass setup was rejected"
         case .quotaFull: return String(localized: "Shore Pass storage is full")
@@ -372,6 +373,8 @@ struct SettingsView: View {
         case .deferredRoaming: return String(localized: "Waiting for non-roaming internet to avoid roaming charges")
         case .failing: return "The relay could not be reached."
         case .expired: return "Renew your pass to resume internet delivery."
+        case .expiredReadOnly:
+            return String(localized: "Messages already on their way still arrive. Renew your pass to send over the internet again.")
         case .suspended: return "Contact support for help with this pass."
         case .tokenRejected: return "Paste the setup card again, or use a different Shore Pass."
         case .quotaFull:

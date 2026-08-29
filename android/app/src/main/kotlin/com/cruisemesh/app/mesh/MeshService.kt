@@ -48,7 +48,6 @@ import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.CoreException
 import uniffi.cruisemesh_core.CoreLanOwnDeviceProof
 import uniffi.cruisemesh_core.CoreLanProofRole
-import uniffi.cruisemesh_core.CoreOwnIdentityPeer
 import uniffi.cruisemesh_core.CoreSprayGate
 import uniffi.cruisemesh_core.CoreSprayTrigger
 import uniffi.cruisemesh_core.DigestEntry
@@ -68,7 +67,6 @@ import uniffi.cruisemesh_core.coreIsHiddenSprayKind
 import uniffi.cruisemesh_core.coreOwnCapabilities
 import uniffi.cruisemesh_core.coreOwnDeviceLanProof
 import uniffi.cruisemesh_core.coreOwnDeviceLanProofOpen
-import uniffi.cruisemesh_core.coreOwnIdentityPeer
 import uniffi.cruisemesh_core.coreRosterNamesASibling
 import uniffi.cruisemesh_core.encodeHello
 import uniffi.cruisemesh_core.encodeHello2
@@ -373,6 +371,16 @@ class MeshService : Service() {
     @Volatile private var lanCapableContacts: Map<String, Long> = emptyMap()
 
     /**
+     * Accepted, unblocked contacts as UserID hex. Cached for the same reason
+     * [lanCapableContacts] is, only harder: [centralPeerStanding] answers the
+     * BLE scan callback, which in a crowded room fires once per advertiser
+     * per scan window, and a store read there would put SQLite on the radio's
+     * critical path. Refreshed off the main thread by
+     * [refreshLanCapableContacts].
+     */
+    @Volatile private var contactUserIds: Set<String> = emptySet()
+
+    /**
      * How many devices this person's own roster lists besides this one, cached
      * for the same reason [lanCapableContacts] is: reading the fleet costs a
      * SQLite hit, and the sweep motive is recomputed on every LAN health tick.
@@ -392,7 +400,13 @@ class MeshService : Service() {
         BlePeripheral(this, ::onFrameReceived, ::onPeripheralCentralSubscribed, ::onPeripheralCentralDisconnected)
     }
     private val central by lazy {
-        BleCentral(this, ::onFrameReceived, ::onCentralPeerConnected, ::onCentralPeerDisconnected)
+        BleCentral(
+            this,
+            ::onFrameReceived,
+            ::onCentralPeerConnected,
+            ::onCentralPeerDisconnected,
+            ::centralPeerStanding,
+        )
     }
 
     /**
@@ -705,11 +719,8 @@ class MeshService : Service() {
             identity = loadedIdentity,
             trustedPeerForStaticKey = { remoteStaticKey ->
                 trustedLanPeerUserId(store.listContacts(), remoteStaticKey)
-                    ?: run {
-                        recordOwnIdentityCloneIfAuthenticated(remoteStaticKey)
-                        null
-                    }
             },
+            onOwnIdentityPeer = ::recordOwnIdentityCloneIfAuthenticated,
             ownDeviceLanProof = ::ownDeviceLanProof,
             openOwnDeviceLanProof = ::openOwnDeviceLanProof,
             unlinkedCapableContacts = ::countUnlinkedCapableContacts,
@@ -1278,6 +1289,23 @@ class MeshService : Service() {
         }
     }
 
+    /**
+     * How much this user id is worth one of the central role's few link
+     * slots (see [CentralConnectAdmission]). Two in-memory lookups and no
+     * store read: this answers the BLE scan callback, once per advertiser per
+     * scan window.
+     *
+     * A blocked user is not a contact here, so they rank as a stranger and
+     * can never displace anyone -- the block itself is enforced elsewhere, on
+     * the envelope; this only declines to spend a scarce slot on them.
+     */
+    private fun centralPeerStanding(userIdHex: String): BlePeerStanding = when {
+        userIdHex !in contactUserIds -> BlePeerStanding.UNKNOWN
+        PendingPeerMail.shared.isWaiting(userIdHex, System.currentTimeMillis()) ->
+            BlePeerStanding.CONTACT_WITH_MAIL
+        else -> BlePeerStanding.CONTACT
+    }
+
     private fun onCentralPeerConnected(address: String) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.CENTRAL)
         sendHello(address)
@@ -1804,7 +1832,13 @@ class MeshService : Service() {
     private fun refreshLanCapableContacts() {
         runOnStoreExecutor("lan capability cache") {
             val blocked = store.listBlockedUsers().map(UserIdHex::encode).toSet()
-            lanCapableContacts = store.listContacts()
+            val contacts = store.listContacts()
+            contactUserIds = contacts
+                .asSequence()
+                .map { UserIdHex.encode(it.userId) }
+                .filterNot { it in blocked }
+                .toSet()
+            lanCapableContacts = contacts
                 .asSequence()
                 .mapNotNull { contact ->
                     val userIdHex = UserIdHex.encode(contact.userId)
@@ -2188,39 +2222,66 @@ class MeshService : Service() {
         }
     }
 
-    private fun recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: ByteArray) {
-        val id = identity ?: return
-        if (!ownLanStaticKeyMatches(id.agreePk, remoteStaticKey)) return
-        recordOwnIdentityClone(peerDeviceIdFor(remoteStaticKey))
-    }
-
     /**
-     * Which of this person's devices a peer holding this person's own key is,
-     * if the transport can say (`specs/multi-device-v1.md` §6).
+     * **The clone guard**, asked once per own-device LAN link at the moment the
+     * handshake has settled what the far end actually is
+     * (`specs/multi-device-v1.md` §1, §6, §10 step 5).
      *
-     * Always null today, and honestly so: nothing on the BLE or LAN wire
-     * carries a device id, and the key itself cannot distinguish -- §6 makes
-     * the inbox key person-scoped, so a linked sibling holds exactly the key
-     * the clone guard recognises. WP4's own-device sync records are what will
-     * put a device id here. The seam exists now so the rule lives in
-     * [uniffi.cruisemesh_core.coreOwnIdentityPeer] rather than being invented
-     * at the call site on the day it can be answered.
+     * It runs from the transport's own-device arm now, not from the trusted-peer
+     * lookup that used to raise it. The lookup is asked in the *middle* of the
+     * handshake — before §10 step 5's proof has been exchanged, because the
+     * proof signs a transcript hash that is not final until the last handshake
+     * message has gone out — so a guard placed there had no device id to reason
+     * about and passed `peerDeviceIdFor()`, a function that returned a hardcoded
+     * null with a KDoc claiming nothing on the wire could ever carry one. §10
+     * step 5 has carried one since #434, which is what made that comment wrong;
+     * this asks the question one decision later, where the answer exists.
+     *
+     * It does not follow that the answer changes today. The clone arm of the
+     * handshake is symmetric and exchanges no proof, so what arrives here is
+     * still null and the verdict is still a clone — see [OwnIdentityClonePolicy]
+     * for why that is the handshake's property and not the rule's.
+     *
+     * `provenPeerDeviceId` is `core_own_device_lan_proof_open`'s answer for
+     * *this* session and nothing weaker. The rule it feeds lives in
+     * [OwnIdentityClonePolicy], where a unit test can read it — including the
+     * honest note that today's clone arm exchanges no proof, so the sibling
+     * answer is not yet reachable over LAN.
      */
-    @Suppress("UNUSED_PARAMETER")
-    private fun peerDeviceIdFor(remoteStaticKey: ByteArray): ByteArray? = null
-
-    private fun recordOwnIdentityClone(peerDeviceId: ByteArray?) {
+    private fun recordOwnIdentityCloneIfAuthenticated(
+        remoteStaticKey: ByteArray,
+        provenPeerDeviceId: ByteArray?,
+    ) {
         val id = identity ?: return
-        // A device this person's own roster lists is not a clone. Warning about
-        // one would greet a deliberate link with the most alarming sentence the
-        // app can say -- and a warning that fires on the normal case is one
-        // people learn to dismiss, which leaves it useless for the real thing.
-        val verdict = runCatching {
-            coreOwnIdentityPeer(store.ownDeviceFleet(), peerDeviceId)
-        }.getOrDefault(CoreOwnIdentityPeer.CLONE)
-        if (verdict == CoreOwnIdentityPeer.SIBLING) {
-            Log.i(TAG, "A device of ours presented our identity; not a clone")
-            return
+        val verdict = OwnIdentityClonePolicy.verdict(
+            ownAgreePk = id.agreePk,
+            remoteStaticKey = remoteStaticKey,
+            // Read on the handshake thread, for the same reason
+            // `trustedPeerForStaticKey` reads `listContacts` there: it is one
+            // indexed read of a handful of rows, and the alternative is judging
+            // a peer that holds this identity's key against a projection
+            // fetched after the link went live. The policy asks for it only
+            // once the key test has passed, so an ordinary refused stranger
+            // costs nothing.
+            fleet = {
+                runCatching { store.ownDeviceFleet() }
+                    .onFailure { Log.w(TAG, "Could not read this phone's own devices", it) }
+                    .getOrNull()
+            },
+            provenPeerDeviceId = provenPeerDeviceId,
+        )
+        when (verdict) {
+            OwnIdentityClonePolicy.Verdict.NOT_OUR_IDENTITY -> return
+            OwnIdentityClonePolicy.Verdict.SIBLING -> {
+                // A device this person's own roster names is not a clone.
+                // Warning about one would greet a deliberate link with the most
+                // alarming sentence the app can say -- and a warning that fires
+                // on the normal case is one people learn to dismiss, which
+                // leaves it useless for the real thing.
+                Log.i(TAG, "A device of ours presented our identity; not a clone")
+                return
+            }
+            OwnIdentityClonePolicy.Verdict.CLONE -> Unit
         }
         runCatching {
             store.recordIdentityCloneWarning(id.userId, System.currentTimeMillis())
@@ -2247,7 +2308,15 @@ class MeshService : Service() {
             return
         }
         MeshConnectivityStatus.refreshNearbyRoutes()
-        MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
+        val userIdHex = UserIdHex.encode(userId)
+        // Now that this link has a name, the central role can tell whether it
+        // is a second slot for a peer it is already linked to (the only way a
+        // peer that advertises no service data can be deduped at all) and can
+        // rank later sightings of the same advertiser by standing.
+        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.CENTRAL) {
+            central.onPeerIdentified(address, userIdHex)
+        }
+        MeshConnectivityStatus.mergeLastSeen(userIdHex, System.currentTimeMillis())
         if (store.getContact(userId) != null) {
             MeshRouter.transportFor(address)?.let { transport ->
                 recordPeerConnection(userId, transport, PeerConnectionEventKind.CONNECTED)

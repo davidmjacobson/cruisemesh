@@ -206,6 +206,16 @@ impl BootstrapStore {
                 title: "This Shore Pass has expired".into(),
                 detail: "Renew it, then open the new setup link.".into(),
             },
+            // Inside the service's read-only grace window. Names what still
+            // works before what has stopped, for the same reason the phones
+            // do: messages keep landing while nothing new goes out, and a
+            // line that only said "expired" would read as a contradiction.
+            Some(CoreRelayPassHealth::ExpiredReadOnly) => ShorePassStatus {
+                configured: true,
+                state: "expired_still_receiving".into(),
+                title: "This Shore Pass has expired".into(),
+                detail: "Messages already on their way still arrive. Renew the pass, then open the new setup link, to send over the internet again.".into(),
+            },
             Some(CoreRelayPassHealth::Suspended) => ShorePassStatus {
                 configured: true,
                 state: "suspended".into(),

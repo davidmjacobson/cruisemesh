@@ -819,6 +819,8 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
         is RelayHealth.Ok -> "Ready · checked ${passRelativeAge(health.lastSyncMs)}"
         is RelayHealth.Failing -> "Service unavailable · try again later"
         is RelayHealth.Expired -> "Pass expired · renewal required"
+        is RelayHealth.ExpiredReadOnly ->
+            stringResource(R.string.ui_shore_pass_expired_still_receiving_status)
         is RelayHealth.Suspended -> "Pass suspended · contact support"
         is RelayHealth.TokenRejected -> "Setup card rejected"
         is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_status)
@@ -834,6 +836,8 @@ private fun passStatus(health: RelayHealth, setupState: PassSetupState): String 
  */
 @Composable
 private fun passStatusExplanation(health: RelayHealth): String? = when (health) {
+    is RelayHealth.ExpiredReadOnly ->
+        stringResource(R.string.ui_shore_pass_expired_still_receiving_explanation)
     is RelayHealth.QuotaFull -> stringResource(R.string.ui_shore_pass_storage_full_explanation)
     is RelayHealth.MessageTooLarge -> stringResource(R.string.ui_shore_pass_message_too_large_explanation)
     is RelayHealth.RateLimited -> stringResource(R.string.ui_shore_pass_slowed_explanation)

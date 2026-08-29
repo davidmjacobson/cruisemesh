@@ -321,6 +321,7 @@ object ConnectionInputs {
             is RelayHealth.Ok -> CoreRelayPathState.CONNECTED
             is RelayHealth.Failing -> CoreRelayPathState.UNREACHABLE
             is RelayHealth.Expired -> CoreRelayPathState.PASS_EXPIRED
+            is RelayHealth.ExpiredReadOnly -> CoreRelayPathState.PASS_EXPIRED_READ_ONLY
             is RelayHealth.Suspended -> CoreRelayPathState.PASS_SUSPENDED
             is RelayHealth.TokenRejected -> CoreRelayPathState.SETUP_REJECTED
             is RelayHealth.QuotaFull -> CoreRelayPathState.STORAGE_FULL

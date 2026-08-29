@@ -116,8 +116,17 @@ pub enum CoreRelayPathState {
     WaitingForInternet,
     /// We have internet and the service did not answer. Transient.
     Unreachable,
-    /// Our pass has lapsed.
+    /// Our pass has lapsed and the service now refuses everything.
     PassExpired,
+    /// Our pass has lapsed, but it is still inside the service's read-only
+    /// grace window: mail already queued for us keeps arriving, and only new
+    /// sends over the internet are refused.
+    ///
+    /// A separate row rather than a footnote on [`Self::PassExpired`] because
+    /// the two states look different to the person holding the phone --
+    /// messages keep landing in one and not in the other -- and a page that
+    /// gave them the same sentence was describing the wrong one half the time.
+    PassExpiredReadOnly,
     /// Our pass was turned off by the operator.
     PassSuspended,
     /// Our own saved setup was rejected (HTTP 401/403 on our own token).
@@ -190,8 +199,11 @@ pub enum CoreHealthReason {
     BluetoothOff,
     /// Our pass was turned off.
     PassSuspended,
-    /// Our pass has lapsed.
+    /// Our pass has lapsed and the service now refuses everything.
     PassExpired,
+    /// Our pass has lapsed but is still in the read-only grace window: mail
+    /// already on its way still arrives, new sends over the internet do not.
+    PassExpiredReadOnly,
     /// Our own saved setup was rejected.
     OwnSetupRejected,
     /// Our family's hosted storage is full.
@@ -304,6 +316,7 @@ fn relay_is_actionable(relay: CoreRelayPathState) -> bool {
     matches!(
         relay,
         CoreRelayPathState::PassExpired
+            | CoreRelayPathState::PassExpiredReadOnly
             | CoreRelayPathState::PassSuspended
             | CoreRelayPathState::SetupRejected
             | CoreRelayPathState::StorageFull
@@ -334,6 +347,7 @@ fn relay_is_degraded(relay: CoreRelayPathState) -> bool {
         | CoreRelayPathState::Unreachable
         | CoreRelayPathState::SyncingSlowed => true,
         CoreRelayPathState::PassExpired
+        | CoreRelayPathState::PassExpiredReadOnly
         | CoreRelayPathState::PassSuspended
         | CoreRelayPathState::SetupRejected
         | CoreRelayPathState::StorageFull => true,
@@ -372,6 +386,10 @@ fn reason_and_action(
         )),
         CoreRelayPathState::PassExpired => Some((
             CoreHealthReason::PassExpired,
+            Some(CoreHealthAction::ManageShorePass),
+        )),
+        CoreRelayPathState::PassExpiredReadOnly => Some((
+            CoreHealthReason::PassExpiredReadOnly,
             Some(CoreHealthAction::ManageShorePass),
         )),
         CoreRelayPathState::SetupRejected => Some((
@@ -1206,6 +1224,13 @@ fn delivery_blocked_reason(facts: &DeliveryFacts) -> Option<CoreDeliveryBlockedR
     match facts.relay {
         CoreRelayPathState::PassSuspended => Some(CoreDeliveryBlockedReason::PassSuspended),
         CoreRelayPathState::PassExpired => Some(CoreDeliveryBlockedReason::PassExpired),
+        // The grace window changes nothing about *this* person's waiting mail:
+        // it serves fetches, and nothing written here leaves the phone over
+        // the internet until renewal. The row is about outbound work, so the
+        // two expiry states share it; where the difference is visible -- the
+        // device-wide card, which also speaks for what is still arriving -- it
+        // gets its own reason.
+        CoreRelayPathState::PassExpiredReadOnly => Some(CoreDeliveryBlockedReason::PassExpired),
         CoreRelayPathState::StorageFull => Some(CoreDeliveryBlockedReason::StorageFull),
         CoreRelayPathState::SetupRejected => Some(CoreDeliveryBlockedReason::OwnSetupRejected),
         // Everything else is a service having a moment, or no pass at all.

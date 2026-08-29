@@ -141,7 +141,7 @@ final class RelayShadowAdapterTests: XCTestCase {
         let capture = try XCTUnwrap(adapter.beginPass(nowMs: Self.now))
         // A full mailbox is evidence about the mailbox, so core stops spending
         // on it; the legacy engine here offered it the next row anyway.
-        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 507, relayCode: "mailbox_full", responseBody: "full"))
+        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 507, relayCode: "mailbox_full", responseBodyBytes: 4))
         capture.noteSucceeded(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA))
         adapter.finishPass(capture: capture, own: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), contacts: contacts(usable: true), nowMs: Self.now)
 
@@ -156,7 +156,7 @@ final class RelayShadowAdapterTests: XCTestCase {
     func testAFailureWithNoNextRowForThatMailboxDidNotContinueTheLane() throws {
         let adapter = adapterFor(try MessageStore.open(path: ":memory:"))
         let capture = try XCTUnwrap(adapter.beginPass(nowMs: Self.now))
-        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 500, relayCode: nil, responseBody: "boom"))
+        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 500, relayCode: nil, responseBodyBytes: 4))
         // A row for a *different* mailbox is not this mailbox continuing.
         capture.noteSucceeded(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlB, relayToken: Self.tokenB))
         XCTAssertFalse(capture.steps()[0].legacyContinuedLane)
@@ -165,7 +165,7 @@ final class RelayShadowAdapterTests: XCTestCase {
     func testAFailureThePassFollowedWithAnotherRowToTheSameMailboxDidContinueTheLane() throws {
         let adapter = adapterFor(try MessageStore.open(path: ":memory:"))
         let capture = try XCTUnwrap(adapter.beginPass(nowMs: Self.now))
-        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 413, relayCode: nil, responseBody: "too big"))
+        capture.noteFailed(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA), error: RelayHTTPError(statusCode: 413, relayCode: nil, responseBodyBytes: 7))
         capture.noteSucceeded(lane: .authored, msgId: msgId(), hopTtl: 4, recipientHint: hint(), recipientUserId: Self.recipient, sealedLen: Self.sealedLen, expiryMs: Self.now, endpoint: RelayConfig(relayUrl: Self.urlA, relayToken: Self.tokenA))
         XCTAssertTrue(capture.steps()[0].legacyContinuedLane)
     }

@@ -2179,6 +2179,16 @@
         }
       }
     },
+    "Pass expired · still receiving": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pass expired · still receiving"
+          }
+        }
+      }
+    },
     "Pass suspended": {
       "localizations": {
         "en": {
@@ -2643,6 +2653,16 @@
         }
       }
     },
+    "Shore Pass expired · still receiving": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass expired · still receiving"
+          }
+        }
+      }
+    },
     "Shore Pass is catching up": {
       "localizations": {
         "en": {
@@ -2799,6 +2819,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Start"
+          }
+        }
+      }
+    },
+    "Start again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start again"
           }
         }
       }
@@ -3829,6 +3859,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Message info"
+          }
+        }
+      }
+    },
+    "Messages already on their way still arrive. Renew your pass to send over the internet again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Messages already on their way still arrive. Renew your pass to send over the internet again."
           }
         }
       }
@@ -5265,12 +5305,12 @@
         }
       }
     },
-    "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.": {
+    "CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through."
+            "value": "CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through."
           }
         }
       }
@@ -5619,12 +5659,32 @@
         }
       }
     },
-    "Your Shore Pass has run out, so messages can't travel over the internet right now. Renewing it at cruisemesh.app starts internet delivery again. Messages still reach your friends whenever you are near each other.": {
+    "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Your Shore Pass has run out, so messages can't travel over the internet right now. Renewing it at cruisemesh.app starts internet delivery again. Messages still reach your friends whenever you are near each other."
+            "value": "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other."
+          }
+        }
+      }
+    },
+    "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until you renew the pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until you renew the pass."
+          }
+        }
+      }
+    },
+    "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it."
           }
         }
       }

@@ -391,15 +391,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         let lan = LanTransport(
             identity: identity,
-            trustedPeerForStaticKey: { [weak self, store = self.store] remoteStaticKey in
-                if let userId = trustedLanPeerUserId(
+            trustedPeerForStaticKey: { [store = self.store] remoteStaticKey in
+                trustedLanPeerUserId(
                     contacts: (try? store.listContacts()) ?? [],
                     remoteStaticKey: remoteStaticKey
-                ) {
-                    return userId
-                }
-                self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
-                return nil
+                )
+            },
+            onOwnIdentityPeer: { [weak self] remoteStaticKey, provenPeerDeviceId in
+                self?.recordOwnIdentityCloneIfAuthenticated(
+                    remoteStaticKey: remoteStaticKey,
+                    provenPeerDeviceId: provenPeerDeviceId
+                )
             },
             ownDeviceLanProof: { [weak self] handshakeHash, role in
                 self?.ownDeviceLanProof(handshakeHash: handshakeHash, role: role)
@@ -1441,11 +1443,68 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         stopOnMeshQueue()
     }
 
-    private func recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: Data) {
-        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) else {
+    /// **The clone guard**, asked once per own-device LAN link at the moment the
+    /// handshake has settled what the far end actually is
+    /// (`specs/multi-device-v1.md` §1, §6, §10 step 5).
+    ///
+    /// It runs from the transport's own-device arm now, not from the
+    /// trusted-peer lookup that used to raise it. The lookup is asked in the
+    /// *middle* of the handshake — before §10 step 5's proof has been exchanged,
+    /// because the proof signs a transcript hash that is not final until the last
+    /// handshake message has gone out — so a guard placed there had no device id
+    /// to reason about, and this shell asked the key question and nothing else:
+    /// it recorded a clone warning for any peer whose Noise static was this
+    /// identity's own agreement key and never asked core whether that peer was a
+    /// device of this person's at all. Android at least asked, with a hardcoded
+    /// null; this shell was the larger half of the gap.
+    ///
+    /// It does not follow that the answer changes today. The clone arm of the
+    /// handshake is symmetric and exchanges no proof, so what arrives here is
+    /// still nil and the verdict is still a clone — see `OwnIdentityClonePolicy`
+    /// for why that is the handshake's property and not the rule's.
+    ///
+    /// `provenPeerDeviceId` is `coreOwnDeviceLanProofOpen`'s answer for *this*
+    /// session and nothing weaker. The rule it feeds lives in
+    /// `OwnIdentityClonePolicy`, where a unit test can read it — including the
+    /// honest note that today's clone arm exchanges no proof, so the sibling
+    /// answer is not yet reachable over LAN.
+    ///
+    /// Mirrors Android's `MeshService.recordOwnIdentityCloneIfAuthenticated`.
+    private func recordOwnIdentityCloneIfAuthenticated(
+        remoteStaticKey: Data,
+        provenPeerDeviceId: Data?
+    ) {
+        switch OwnIdentityClonePolicy.verdict(
+            ownAgreePk: identity.agreePk,
+            remoteStaticKey: remoteStaticKey,
+            // Read on the mesh queue, for the same reason
+            // `trustedPeerForStaticKey` reads `listContacts` there: it is one
+            // indexed read of a handful of rows, and the alternative is judging
+            // a peer that holds this identity's key against a projection
+            // fetched after the link went live. The policy asks for it only
+            // once the key test has passed, so an ordinary refused stranger
+            // costs nothing.
+            fleet: {
+                guard let fleet = try? self.store.ownDeviceFleet() else {
+                    self.log.warning("Could not read this phone's own devices")
+                    return nil
+                }
+                return fleet
+            },
+            provenPeerDeviceId: provenPeerDeviceId
+        ) {
+        case .notOurIdentity:
             return
+        case .sibling:
+            // A device this person's own roster names is not a clone. Warning
+            // about one would greet a deliberate link with the most alarming
+            // sentence the app can say — and a warning that fires on the normal
+            // case is one people learn to dismiss, which leaves it useless for
+            // the real thing.
+            log.info("A device of ours presented our identity; not a clone")
+        case .clone:
+            recordOwnIdentityClone()
         }
-        recordOwnIdentityClone()
     }
 
     private func recordOwnIdentityClone() {
@@ -3331,6 +3390,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 identity: identity,
                 contact: contact,
                 address: sourceAddress,
+                receiptType: ReceiptType.delivered,
+                ackedSenderUserId: senderUserId,
+                throughLamport: through
+            )
+        } else {
+            // The relay handed this over, so there is no link to answer on --
+            // send to whichever link currently reaches them, exactly as the
+            // chat-message and hidden-kind paths above do. Without this the
+            // sender's tick for a friend request that arrived over the
+            // internet waited on the durable receipt envelope even when both
+            // phones were on the same Wi-Fi.
+            sendReceiptToContact(
+                identity: identity,
+                contact: contact,
                 receiptType: ReceiptType.delivered,
                 ackedSenderUserId: senderUserId,
                 throughLamport: through
@@ -5806,10 +5879,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// health pill and the retry/continuation timers this shell owns. It makes
     /// no protocol arithmetic itself.
     ///
-    /// Off by default; `RelayEngineSettings.passEngine` selects it. The
-    /// remaining known gap keeping the default legacy is group fan-out,
-    /// recorded in the contract's §5.2. What used to sit beside it, and no
-    /// longer does: an ingested page now reaches the inbound processor through
+    /// Off by default; `RelayEngineSettings.passEngine` selects it, and until
+    /// canary evidence says otherwise the answer is the legacy engine.
+    ///
+    /// The gap that used to be named here is closed. Core's upload planning
+    /// decomposes a group-addressed authored row into one row per member, picks
+    /// the single destination mailbox with `core_group_fanout_relay_target` (so
+    /// a member resting for silence contributes no fallback), and stamps
+    /// `relay_posted_at` only once every member the envelope owes has landed —
+    /// remembering per member which ones did, so a partial fan-out resumes with
+    /// the remainder rather than re-posting the set, which is one step past what
+    /// this pass does. `FANOUT-01` in the contract pins it.
+    ///
+    /// What else used to sit beside it, and no longer does: an ingested page now
+    /// reaches the inbound processor through
     /// `CoreRelayPassProjector`, so it raises the same notification the legacy
     /// walk raises; a presence answer now reaches `MeshConnectivityStatus` the
     /// same way; and a contact endpoint resting for *silence* is now told apart
@@ -6013,6 +6096,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
         case .expired: return .expired(lastAttemptMs: nowMs)
+        case .expiredReadOnly: return .expiredReadOnly(lastAttemptMs: nowMs)
         case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         case .failing: return .failing(lastAttemptMs: nowMs)
