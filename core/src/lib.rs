@@ -25,6 +25,7 @@ mod lan_util;
 mod late_arrival;
 mod limits;
 mod link_detect;
+mod log_redaction;
 // The blob plane (specs/media-two-plane.md). Deliberately dark: declared so it
 // compiles and is tested, exported over no binding, reachable from neither
 // shell. Nothing is re-exported at the crate root, which is what keeps the
@@ -186,6 +187,7 @@ pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
 };
+pub use log_redaction::{core_new_log_redaction_salt, core_redact_log_line};
 // Plain Rust policy, deliberately not `#[uniffi::export]`: the shells never
 // decide any of this. The store executes it, and `core/tests` asserts it under
 // `QUEUE-01`.
