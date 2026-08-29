@@ -79,6 +79,7 @@ fun OnboardingScreenshot() {
     fontScale = 1.3f,
     showBackground = true,
 )
+@PreviewTest
 @Composable
 fun PermissionsSetupScreenshot() {
     CruiseMeshTheme {
