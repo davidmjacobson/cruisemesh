@@ -8,10 +8,11 @@
 //!
 //! A `recipient_hint` is `BLAKE2b-8(UserID || day-number)` where the
 //! day-number is the envelope's *creation* day (DESIGN.md §6.4); since
-//! envelopes live `DEFAULT_EXPIRY_MS` (7 days), hashing an id against today
-//! back through 7 days ago covers every day-salt a still-live envelope could
-//! have used. Presence announcements are shorter-lived, hence the separate
-//! 3-day window.
+//! envelopes live at most `DEFAULT_EXPIRY_MS` (7 days), hashing an id against
+//! today back through [`CARRY_HINT_DAY_WINDOW_DAYS`] days ago covers every
+//! day-salt a still-live envelope could have used, with one day of slack for
+//! clock skew between the authoring and fetching devices. Presence
+//! announcements are shorter-lived, hence the separate 3-day window.
 
 use std::collections::HashSet;
 
@@ -22,7 +23,44 @@ use crate::{RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ};
 /// DESIGN.md §5.3 carry window: also used by `engine.rs` (fan-out hint
 /// recognition, digest spray) so every hint check in core and both shells
 /// agrees on one window.
-pub(crate) const CARRY_HINT_DAY_WINDOW_DAYS: i64 = 7;
+///
+/// Derived from the longest lifetime core ever authors
+/// ([`crate::DEFAULT_EXPIRY_MS`], 7 days) plus [`CARRY_HINT_SKEW_DAYS`],
+/// rather than written as a bare 7. A `recipient_hint` is salted with the
+/// envelope's *creation* day, so a window of exactly the lifetime covers it
+/// with no slack at all: a row in the last hours of its life is findable only
+/// if the fetching device's UTC day number agrees exactly with the authoring
+/// device's, and nothing makes it. The forward side of the push window
+/// already buys a day for precisely this reason ([`PUSH_HINT_FORWARD_DAYS`]);
+/// the backward side bought none, so a row could sit on a relay, unexpired
+/// and undelivered, addressed to a day-salt no device was still asking for.
+///
+/// The resulting 8 days is also exactly relayd's deposit-class retention
+/// ceiling (`MAX_DEPOSIT_RETENTION_MS`), which is the same argument made from
+/// the server's side: the honest client's 7-day envelope life, plus one day
+/// to absorb clock skew. relayd's
+/// `deposit_retention_matches_the_core_carry_hint_window` asserts the two
+/// stay equal, so neither can be moved alone.
+///
+/// Deliberately NOT the 30-day ceilings ([`crate::MAX_CARRY_FUTURE_MS`],
+/// relayd's `MAX_RETENTION_MS`). Those bound hostile input; they do not
+/// describe a horizon anything authors, since every envelope core creates
+/// gets [`crate::DEFAULT_EXPIRY_MS`] or less
+/// (`crate::outbound_retirement::authored_delivery_lifetime_ms`). Buying that
+/// width costs 31 hints per routing id, so the worst-case family the budget
+/// tests below pin — 18 routing ids — would ask for 558 hints (576 on the
+/// push window) against [`RELAY_MAX_FETCH_HINTS`] = 256, and
+/// [`clamp_hint_groups`] would shed every proxy contact and most groups to
+/// cover a lifetime no writer produces. One skew day costs 18 more hints and
+/// still leaves 7 spare routing ids.
+pub const CARRY_HINT_DAY_WINDOW_DAYS: i64 =
+    crate::DEFAULT_EXPIRY_MS / MS_PER_DAY + CARRY_HINT_SKEW_DAYS;
+
+/// The one day [`CARRY_HINT_DAY_WINDOW_DAYS`] adds on top of an envelope's
+/// authored lifetime, mirroring [`PUSH_HINT_FORWARD_DAYS`] on the other side
+/// of the window. Named rather than inlined so the derivation reads as the
+/// argument it is.
+const CARRY_HINT_SKEW_DAYS: i64 = 1;
 pub(crate) const PRESENCE_HINT_DAY_WINDOW_DAYS: i64 = 3;
 
 /// How far ahead of `now_ms` a relay *push-subscription* hint set reaches --
@@ -584,13 +622,13 @@ impl MessageStore {
     /// fetch; see [`Self::relay_self_push_hints`] for why the forward day is
     /// safe).
     ///
-    /// Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 9 hints (was 8
-    /// pre-fix) against relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays
-    /// under the cap for up to 28 combined ids -- comfortably above family
-    /// scale. `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
+    /// Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 10 hints against
+    /// relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays under the cap
+    /// for up to 25 combined ids -- comfortably above family scale.
+    /// `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
     /// device subscribes to its own namespace and to no sibling's (see
     /// [`MessageStore::own_device_namespace_ids`]), whatever the fleet's size,
-    /// which leaves 26 for groups and proxy-polled contacts.
+    /// which leaves 23 for groups and proxy-polled contacts.
     /// `the_combined_fetch_budget_of_a_worst_case_family_fits` pins the
     /// arithmetic through these shipped builders; this doc is only its summary.
     pub fn relay_fetch_push_hints(
@@ -835,10 +873,62 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
 
+    /// The two constants that must never drift apart: how long an envelope
+    /// lives, and how far back a fetch/carry/classification sweep still asks
+    /// for it. If the lifetime ever grows past the window — or the window is
+    /// trimmed back to the lifetime — mail sits on a relay, unexpired and
+    /// undelivered, addressed to a day-salt nothing is asking for.
+    #[test]
+    fn the_carry_hint_window_outlasts_every_envelope_core_authors() {
+        let longest_authored_days = crate::DEFAULT_EXPIRY_MS / MS_PER_DAY;
+        assert!(
+            CARRY_HINT_DAY_WINDOW_DAYS > longest_authored_days,
+            "the hint window ({CARRY_HINT_DAY_WINDOW_DAYS} days) has to outlast \
+             the longest authored envelope ({longest_authored_days} days) by at \
+             least a day, because the authoring and fetching devices need not \
+             agree on the UTC day number"
+        );
+        // The numbers themselves, so moving either is a deliberate act.
+        assert_eq!(longest_authored_days, 7);
+        assert_eq!(CARRY_HINT_DAY_WINDOW_DAYS, 8);
+
+        // That lifetime really is the horizon: no kind authors longer than
+        // the default, and the one that differs is deliberately shorter.
+        for kind in [
+            crate::KIND_TEXT,
+            crate::KIND_RECEIPT,
+            crate::KIND_FRIEND_REQUEST,
+            crate::KIND_GROUP_INVITE,
+            crate::KIND_ROSTER_GOSSIP,
+            crate::KIND_LAN_ENDPOINT_HINT,
+        ] {
+            assert!(
+                crate::authored_delivery_lifetime_ms(kind) <= crate::DEFAULT_EXPIRY_MS,
+                "kind {kind} authors a longer life than the hint window covers"
+            );
+        }
+
+        // And behaviourally, not just arithmetically: an envelope authored a
+        // whole lifetime ago — the last instant it can still be on a relay —
+        // is still asked for, and so is one a further skew day older.
+        let id = b"user".to_vec();
+        let hints = recent_hints_for(id.clone(), NOW);
+        for age_ms in [
+            crate::DEFAULT_EXPIRY_MS,
+            crate::DEFAULT_EXPIRY_MS + MS_PER_DAY,
+        ] {
+            assert!(
+                hints.contains(&compute_recipient_hint(id.clone(), NOW - age_ms)),
+                "a hint {age_ms} ms old is no longer asked for"
+            );
+        }
+    }
+
     #[test]
     fn recent_hints_cover_the_full_carry_window_per_day() {
         let hints = recent_hints_for(b"user".to_vec(), NOW);
-        assert_eq!(hints.len(), 8);
+        assert_eq!(hints.len(), HINTS_PER_ID_FETCH);
+        assert_eq!(hints.len(), 9);
         for (days_ago, hint) in hints.iter().enumerate() {
             assert_eq!(
                 *hint,
@@ -969,17 +1059,14 @@ mod tests {
 
         // 1 person + 1 own device namespace + 4 groups + 12 proxy contacts.
         let routing_ids = 1 + 1 + groups + contacts;
-        assert_eq!(HINTS_PER_ID_PUSH, 9);
+        assert_eq!(HINTS_PER_ID_PUSH, 10);
         assert_eq!(routing_ids, 18);
         assert_eq!(hints.len(), routing_ids * HINTS_PER_ID_PUSH);
-        assert_eq!(hints.len(), 162);
+        assert_eq!(hints.len(), 180);
         assert!(hints.len() <= RELAY_MAX_FETCH_HINTS);
         // Headroom, stated so a later work package can see what it is
-        // spending: 10 more routing ids fit beside this worst case.
-        assert_eq!(
-            (RELAY_MAX_FETCH_HINTS - hints.len()) / HINTS_PER_ID_PUSH,
-            10
-        );
+        // spending: 7 more routing ids fit beside this worst case.
+        assert_eq!((RELAY_MAX_FETCH_HINTS - hints.len()) / HINTS_PER_ID_PUSH, 7);
 
         for hint in hints_over_range(
             &person.user_id,
@@ -1023,17 +1110,17 @@ mod tests {
     #[test]
     fn the_hint_budget_clamp_sheds_the_lowest_priority_ids_first() {
         let person = generate_identity();
-        // 1 person + 1 own device + 4 groups + 40 contacts = 46 ids × 9 = 414,
-        // comfortably past the 256 cap.
+        // 1 person + 1 own device + 4 groups + 40 contacts = 46 ids × 10 =
+        // 460, comfortably past the 256 cap.
         let store = worst_case_store(&person, 40, 4);
 
         let hints = store
             .relay_fetch_push_hints(person.user_id.clone(), NOW)
             .unwrap();
         assert!(hints.len() <= RELAY_MAX_FETCH_HINTS);
-        // Whole ids only: 28 of them fit, and the 29th is shed entire.
-        assert_eq!(hints.len(), 28 * HINTS_PER_ID_PUSH);
-        assert_eq!(hints.len(), 252);
+        // Whole ids only: 25 of them fit, and the 26th is shed entire.
+        assert_eq!(hints.len(), 25 * HINTS_PER_ID_PUSH);
+        assert_eq!(hints.len(), 250);
 
         // The two ids that must never be shed, and the groups above the
         // proxy contacts.
@@ -1073,7 +1160,7 @@ mod tests {
             .into_iter()
             .filter(|contact| hints.contains(&compute_recipient_hint(contact.user_id.clone(), NOW)))
             .count();
-        assert_eq!(proxied, 28 - 1 - 1 - 4);
+        assert_eq!(proxied, 25 - 1 - 1 - 4);
     }
 
     /// The fetch window and the classification window, pinned together: every
@@ -1234,8 +1321,9 @@ mod tests {
         store.upsert_group(group).unwrap();
 
         let hints = store.relay_fetch_hints(me.user_id.clone(), NOW).unwrap();
-        // self (8) + member group (8) + one contact (8), all distinct inputs.
-        assert_eq!(hints.len(), 24);
+        // self (9) + member group (9) + one contact (9), all distinct inputs.
+        assert_eq!(hints.len(), 3 * HINTS_PER_ID_FETCH);
+        assert_eq!(hints.len(), 27);
         let self_today = compute_recipient_hint(me.user_id.clone(), NOW);
         let group_today = compute_recipient_hint(b"group-id-0123456".to_vec(), NOW);
         let friend_today = compute_recipient_hint(friend.user_id.clone(), NOW);
@@ -1244,7 +1332,7 @@ mod tests {
         assert!(hints.contains(&friend_today));
         // A group we are NOT a member of contributes nothing to self hints.
         let outsider = store.relay_self_hints(friend.user_id.clone(), NOW).unwrap();
-        assert_eq!(outsider.len(), 16); // friend + the group they're in
+        assert_eq!(outsider.len(), 2 * HINTS_PER_ID_FETCH); // friend + their group
     }
 
     #[test]
@@ -1260,7 +1348,7 @@ mod tests {
             .unwrap();
 
         let proxy = store.relay_proxy_hints(me.user_id.clone(), NOW).unwrap();
-        assert_eq!(proxy.len(), 8); // friend only
+        assert_eq!(proxy.len(), HINTS_PER_ID_FETCH); // friend only
         let own_today = compute_recipient_hint(me.user_id.clone(), NOW);
         assert!(!proxy.contains(&own_today));
     }

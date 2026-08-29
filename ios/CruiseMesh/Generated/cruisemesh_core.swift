@@ -4809,6 +4809,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * further ahead than a few days of clock skew is refused as
      * `false`, like any other notice that does not apply.
      *
+     * A notice that does move the endpoint also retires every "already
+     * posted there" marker the move invalidates — carried rows, and this
+     * device's authored 1:1 envelopes and outgoing receipts addressed to
+     * that contact — in the same transaction as the move itself, so the two
+     * halves cannot come apart across a crash. Those markers say only *that*
+     * a row was posted, never *where*, so a move leaves them claiming mail is
+     * out when it is sitting in a mailbox the recipient no longer reads.
+     * Re-post eligibility only: nothing is removed and nothing is acked.
+     *
      * Returns whether the contact's endpoint actually moved. `false` covers
      * "not a contact", "we already hold this or newer", and "that epoch is
      * not a time" — none is an error, all are ordinary outcomes of a
@@ -7877,13 +7886,13 @@ public protocol MessageStoreProtocol : AnyObject {
      * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
      * safe).
      *
-     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 9 hints (was 8
-     * pre-fix) against relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays
-     * under the cap for up to 28 combined ids -- comfortably above family
-     * scale. `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
+     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 10 hints against
+     * relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays under the cap
+     * for up to 25 combined ids -- comfortably above family scale.
+     * `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
      * device subscribes to its own namespace and to no sibling's (see
      * [`MessageStore::own_device_namespace_ids`]), whatever the fleet's size,
-     * which leaves 26 for groups and proxy-polled contacts.
+     * which leaves 23 for groups and proxy-polled contacts.
      * `the_combined_fetch_budget_of_a_worst_case_family_fits` pins the
      * arithmetic through these shipped builders; this doc is only its summary.
      */
@@ -8525,6 +8534,15 @@ open func announceOwnRoster(identity: Identity, nowMs: Int64)throws  -> RosterGo
      * would survive the rotation that was supposed to remove it. An epoch
      * further ahead than a few days of clock skew is refused as
      * `false`, like any other notice that does not apply.
+     *
+     * A notice that does move the endpoint also retires every "already
+     * posted there" marker the move invalidates — carried rows, and this
+     * device's authored 1:1 envelopes and outgoing receipts addressed to
+     * that contact — in the same transaction as the move itself, so the two
+     * halves cannot come apart across a crash. Those markers say only *that*
+     * a row was posted, never *where*, so a move leaves them claiming mail is
+     * out when it is sitting in a mailbox the recipient no longer reads.
+     * Re-post eligibility only: nothing is removed and nothing is acked.
      *
      * Returns whether the contact's endpoint actually moved. `false` covers
      * "not a contact", "we already hold this or newer", and "that epoch is
@@ -12994,13 +13012,13 @@ open func relayFetchHints(ownUserId: Data, nowMs: Int64)throws  -> [Data] {
      * fetch; see [`Self::relay_self_push_hints`] for why the forward day is
      * safe).
      *
-     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 9 hints (was 8
-     * pre-fix) against relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays
-     * under the cap for up to 28 combined ids -- comfortably above family
-     * scale. `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
+     * Budget: each id contributes [`HINTS_PER_ID_PUSH`] = 10 hints against
+     * relayd's [`RELAY_MAX_FETCH_HINTS`] = 256, so this stays under the cap
+     * for up to 25 combined ids -- comfortably above family scale.
+     * `specs/multi-device-v1.md` §7 spends exactly ONE of those ids: a
      * device subscribes to its own namespace and to no sibling's (see
      * [`MessageStore::own_device_namespace_ids`]), whatever the fleet's size,
-     * which leaves 26 for groups and proxy-polled contacts.
+     * which leaves 23 for groups and proxy-polled contacts.
      * `the_combined_fetch_budget_of_a_worst_case_family_fits` pins the
      * arithmetic through these shipped builders; this doc is only its summary.
      */
@@ -58276,7 +58294,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_announce_own_roster() != 44394) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 59804) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 34108) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 29083) {
@@ -58873,7 +58891,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_hints() != 59297) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_push_hints() != 6270) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_fetch_push_hints() != 24871) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_relay_proxy_hints() != 9978) {

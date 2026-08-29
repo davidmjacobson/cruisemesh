@@ -371,6 +371,16 @@ class MeshService : Service() {
     @Volatile private var lanCapableContacts: Map<String, Long> = emptyMap()
 
     /**
+     * Accepted, unblocked contacts as UserID hex. Cached for the same reason
+     * [lanCapableContacts] is, only harder: [centralPeerStanding] answers the
+     * BLE scan callback, which in a crowded room fires once per advertiser
+     * per scan window, and a store read there would put SQLite on the radio's
+     * critical path. Refreshed off the main thread by
+     * [refreshLanCapableContacts].
+     */
+    @Volatile private var contactUserIds: Set<String> = emptySet()
+
+    /**
      * How many devices this person's own roster lists besides this one, cached
      * for the same reason [lanCapableContacts] is: reading the fleet costs a
      * SQLite hit, and the sweep motive is recomputed on every LAN health tick.
@@ -390,7 +400,13 @@ class MeshService : Service() {
         BlePeripheral(this, ::onFrameReceived, ::onPeripheralCentralSubscribed, ::onPeripheralCentralDisconnected)
     }
     private val central by lazy {
-        BleCentral(this, ::onFrameReceived, ::onCentralPeerConnected, ::onCentralPeerDisconnected)
+        BleCentral(
+            this,
+            ::onFrameReceived,
+            ::onCentralPeerConnected,
+            ::onCentralPeerDisconnected,
+            ::centralPeerStanding,
+        )
     }
 
     /**
@@ -1273,6 +1289,23 @@ class MeshService : Service() {
         }
     }
 
+    /**
+     * How much this user id is worth one of the central role's few link
+     * slots (see [CentralConnectAdmission]). Two in-memory lookups and no
+     * store read: this answers the BLE scan callback, once per advertiser per
+     * scan window.
+     *
+     * A blocked user is not a contact here, so they rank as a stranger and
+     * can never displace anyone -- the block itself is enforced elsewhere, on
+     * the envelope; this only declines to spend a scarce slot on them.
+     */
+    private fun centralPeerStanding(userIdHex: String): BlePeerStanding = when {
+        userIdHex !in contactUserIds -> BlePeerStanding.UNKNOWN
+        PendingPeerMail.shared.isWaiting(userIdHex, System.currentTimeMillis()) ->
+            BlePeerStanding.CONTACT_WITH_MAIL
+        else -> BlePeerStanding.CONTACT
+    }
+
     private fun onCentralPeerConnected(address: String) {
         MeshRouter.onConnected(address, MeshRouterState.Transport.CENTRAL)
         sendHello(address)
@@ -1799,7 +1832,13 @@ class MeshService : Service() {
     private fun refreshLanCapableContacts() {
         runOnStoreExecutor("lan capability cache") {
             val blocked = store.listBlockedUsers().map(UserIdHex::encode).toSet()
-            lanCapableContacts = store.listContacts()
+            val contacts = store.listContacts()
+            contactUserIds = contacts
+                .asSequence()
+                .map { UserIdHex.encode(it.userId) }
+                .filterNot { it in blocked }
+                .toSet()
+            lanCapableContacts = contacts
                 .asSequence()
                 .mapNotNull { contact ->
                     val userIdHex = UserIdHex.encode(contact.userId)
@@ -2269,7 +2308,15 @@ class MeshService : Service() {
             return
         }
         MeshConnectivityStatus.refreshNearbyRoutes()
-        MeshConnectivityStatus.mergeLastSeen(UserIdHex.encode(userId), System.currentTimeMillis())
+        val userIdHex = UserIdHex.encode(userId)
+        // Now that this link has a name, the central role can tell whether it
+        // is a second slot for a peer it is already linked to (the only way a
+        // peer that advertises no service data can be deduped at all) and can
+        // rank later sightings of the same advertiser by standing.
+        if (MeshRouter.transportFor(address) == MeshRouterState.Transport.CENTRAL) {
+            central.onPeerIdentified(address, userIdHex)
+        }
+        MeshConnectivityStatus.mergeLastSeen(userIdHex, System.currentTimeMillis())
         if (store.getContact(userId) != null) {
             MeshRouter.transportFor(address)?.let { transport ->
                 recordPeerConnection(userId, transport, PeerConnectionEventKind.CONNECTED)

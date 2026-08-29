@@ -177,6 +177,24 @@ class LinkSession(
         worker?.interrupt()
     }
 
+    /**
+     * Back to the start after a run has ended, so "start over" is one tap
+     * rather than leaving the screen and coming back in by the same door.
+     *
+     * Only ever reached from an ended run: the screen offers it beside "Done",
+     * on the step a worker writes as its last act before returning. That is
+     * what makes dropping the [worker] reference safe here and nowhere else --
+     * [launch]'s "one run at a time" guard reads it, so clearing it mid-run
+     * would let a second ceremony start underneath the first.
+     */
+    fun reset() {
+        close()
+        worker = null
+        decision = LinkConfirmDecision.WAITING
+        cancelRequested = false
+        _state.value = LinkState()
+    }
+
     private fun launch(role: CoreLinkRole, transport: LinkTransport, body: () -> Unit) {
         if (worker?.isAlive == true) return
         decision = LinkConfirmDecision.WAITING

@@ -18,6 +18,7 @@ class AirplaneDemoHintStoreTest {
     @Before
     fun setUp() {
         preferences.edit().clear().commit()
+        AirplaneDemoHintStore.refresh(context)
     }
 
     @After
@@ -32,14 +33,33 @@ class AirplaneDemoHintStoreTest {
 
     @Test
     fun `never offered twice`() {
-        AirplaneDemoHintStore.markShown(context)
+        AirplaneDemoHintStore.dismiss(context)
         assertFalse(AirplaneDemoHintStore.shouldShow(context))
     }
 
     @Test
-    fun `marking twice is harmless`() {
-        AirplaneDemoHintStore.markShown(context)
-        AirplaneDemoHintStore.markShown(context)
+    fun `dismissing twice is harmless`() {
+        AirplaneDemoHintStore.dismiss(context)
+        AirplaneDemoHintStore.dismiss(context)
         assertFalse(AirplaneDemoHintStore.shouldShow(context))
+    }
+
+    /**
+     * Both surfaces that show the hint read this flow, so a dismissal on either
+     * one has to reach the other without a reload.
+     */
+    @Test
+    fun `the flow follows the saved answer`() {
+        assertTrue(AirplaneDemoHintStore.showHint.value)
+        AirplaneDemoHintStore.dismiss(context)
+        assertFalse(AirplaneDemoHintStore.showHint.value)
+    }
+
+    /** A restart re-reads the flag rather than starting the hint over. */
+    @Test
+    fun `refresh reloads a dismissal from a previous launch`() {
+        AirplaneDemoHintStore.dismiss(context)
+        AirplaneDemoHintStore.refresh(context)
+        assertFalse(AirplaneDemoHintStore.showHint.value)
     }
 }
