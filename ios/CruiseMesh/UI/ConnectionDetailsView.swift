@@ -71,6 +71,8 @@ enum ConnectionCopy {
         case .waitingForInternet: return String(localized: "Waiting for internet")
         case .unreachable: return String(localized: "Shore Pass unreachable")
         case .passExpired: return String(localized: "Shore Pass expired")
+        case .passExpiredReadOnly:
+            return String(localized: "Shore Pass expired · still receiving")
         case .passSuspended: return String(localized: "Shore Pass suspended")
         case .setupRejected: return String(localized: "Shore Pass setup rejected")
         case .storageFull: return String(localized: "Shore Pass storage full")
@@ -105,6 +107,12 @@ enum ConnectionCopy {
             return String(localized: "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.")
         case .passExpired:
             return String(localized: "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.")
+        // Names what still works before what has stopped: a person reading
+        // this is watching messages arrive while their own will not send, and
+        // a line that only said "expired" would read as the app contradicting
+        // itself.
+        case .passExpiredReadOnly:
+            return String(localized: "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it.")
         case .passSuspended:
             return String(localized: "Your Shore Pass has been turned off, so messages can't travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.")
         default:
@@ -233,6 +241,8 @@ enum ConnectionCopy {
         case .waitingForInternet: return String(localized: "Waiting for internet")
         case .unreachable: return String(localized: "Unreachable")
         case .passExpired: return String(localized: "Pass expired")
+        case .passExpiredReadOnly:
+            return String(localized: "Pass expired · still receiving")
         case .passSuspended: return String(localized: "Pass suspended")
         case .setupRejected: return String(localized: "Setup rejected")
         case .storageFull: return String(localized: "Storage full")

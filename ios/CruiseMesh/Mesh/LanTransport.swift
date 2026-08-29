@@ -21,6 +21,11 @@ final class LanTransport {
     /// device's: a proof minted for the other end does not open, which is what
     /// stops a host we dialed from handing our own proof straight back to us.
     typealias OwnDeviceProofOpen = (Data, Data, CoreLanProofRole) -> CoreLanOwnDeviceProof?
+    /// One own-device link's two facts, for the clone guard: the Noise static
+    /// key the far end proved it holds, and the device id §10 step 5's roster
+    /// proof named for this session (nil when it named none). See
+    /// `onOwnIdentityPeer`.
+    typealias OwnIdentityPeerSighting = (Data, Data?) -> Void
 
     var onNetworkReady: ((LanManualEndpoint, Data, String?) -> Void)?
     /// A link finished the Noise handshake. The third argument is the address
@@ -33,6 +38,39 @@ final class LanTransport {
     /// this person's own, and a route to this person leads straight back to this
     /// phone.
     var onOwnDeviceAuthenticated: ((String) -> Void)?
+    /// **The clone guard's one call site.** Raised once per link that reached the
+    /// own-device arm — the peer is nobody's contact — with the Noise static key
+    /// the far end proved it holds and the device id §10 step 5's roster proof
+    /// named for *this* session, or nil when it named none.
+    ///
+    /// Deliberately here rather than inside `trustedPeerForStaticKey`, which is
+    /// where it used to live. That lookup is asked in the middle of the
+    /// handshake, and a proof signs a transcript hash that is not final until the
+    /// last handshake message has gone out — so a guard placed there could never
+    /// have a device id to reason about, and this shell simply never asked core
+    /// the sibling question at all.
+    ///
+    /// Raised from `LanConnection.authenticate`, before the cross-connect rule
+    /// has had a chance to turn the link away: a peer that got far enough to
+    /// present this identity's key has been seen whether or not its socket is
+    /// the one kept. Not raised for a contact's link, and not for a peer a
+    /// refused proof closed on — neither can be holding this identity's own
+    /// agreement key, since `admit` answers `.clone` before any proof is asked
+    /// for.
+    ///
+    /// The corollary is worth being blunt about: `admit`'s two own-device arms
+    /// are disjoint, so on today's wire this is raised either with a device id
+    /// and a static key that is *not* ours, or with our static key and a nil
+    /// device id — never both. `OwnIdentityClonePolicy` therefore answers
+    /// `.sibling` for nobody yet. That is a property of §10 step 5's symmetric
+    /// clone arm, not of the rule, and the rule is where it belongs so that
+    /// changing the arm is the only work left when a proof can cross it.
+    ///
+    /// An `init` parameter rather than an assignable `var` like the callbacks
+    /// above it, and Android's is a constructor argument for the same reason: a
+    /// safety warning that a forgotten assignment silently disables is worse
+    /// than no warning, because nothing fails.
+    private let onOwnIdentityPeer: OwnIdentityPeerSighting
     var onDisconnected: ((String) -> Void)?
     var onFrame: ((String, Data) -> Void)?
 
@@ -130,11 +168,13 @@ final class LanTransport {
     init(
         identity: Identity,
         trustedPeerForStaticKey: @escaping TrustedPeerLookup,
+        onOwnIdentityPeer: @escaping OwnIdentityPeerSighting,
         ownDeviceLanProof: @escaping OwnDeviceProofMint,
         openOwnDeviceLanProof: @escaping OwnDeviceProofOpen
     ) {
         self.identity = identity
         self.trustedPeerForStaticKey = trustedPeerForStaticKey
+        self.onOwnIdentityPeer = onOwnIdentityPeer
         self.ownDeviceLanProof = ownDeviceLanProof
         self.openOwnDeviceLanProof = openOwnDeviceLanProof
         var uuid = UUID().uuid
@@ -855,15 +895,24 @@ final class LanTransport {
     /// worthless on the next session and no machine in the middle can forward
     /// one.
     ///
-    /// `trustedPeerForStaticKey` is asked first and unchanged, so the clone
-    /// warning it raises on a key that is ours still happens exactly once, during
-    /// the handshake, whichever way this answers.
+    /// `trustedPeerForStaticKey` is asked first and answers only the contact
+    /// question now. The clone warning it used to raise as a side effect has
+    /// moved to `onOwnIdentityPeer`, which runs one decision later — once this
+    /// link knows whether the far end proved a roster device id, which is the
+    /// only thing that can tell a sibling from a `.cmbak` restore.
     fileprivate func admit(remoteStaticKey: Data) -> LanHandshakeVerdict {
         if let userId = trustedPeerForStaticKey(remoteStaticKey) { return .contact(userId) }
         if ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) {
             return .clone
         }
         return .proveOwnDevice
+    }
+
+    /// Hand the clone guard what this link settled: the key the far end proved
+    /// it holds, and the device id §10 step 5's proof named for this session.
+    /// See `onOwnIdentityPeer`.
+    fileprivate func noteOwnIdentityPeer(remoteStaticKey: Data, provenOwnDeviceId: Data?) {
+        onOwnIdentityPeer(remoteStaticKey, provenOwnDeviceId)
     }
 
     /// S3: name the peer a handshake refused, so a field capture can tell the
@@ -1869,6 +1918,12 @@ private final class LanConnection {
         remoteStaticKey = noise.remoteStaticKey()
         setupTimeout?.cancel()
         setupTimeout = nil
+        // Before the transport files the link, so the cross-connect rule cannot
+        // drop a sighting of a peer holding this identity's key. See
+        // `LanTransport.onOwnIdentityPeer`.
+        if case .ownDevice(let deviceId) = admission, let remoteStatic = remoteStaticKey {
+            owner?.noteOwnIdentityPeer(remoteStaticKey: remoteStatic, provenOwnDeviceId: deviceId)
+        }
         owner?.connectionAuthenticated(self, admission: admission)
     }
 

@@ -4845,6 +4845,15 @@ impl MessageStore {
     ///    further ahead than a few days of clock skew is refused as
     ///    `false`, like any other notice that does not apply.
     ///
+    /// A notice that does move the endpoint also retires every "already
+    /// posted there" marker the move invalidates — carried rows, and this
+    /// device's authored 1:1 envelopes and outgoing receipts addressed to
+    /// that contact — in the same transaction as the move itself, so the two
+    /// halves cannot come apart across a crash. Those markers say only *that*
+    /// a row was posted, never *where*, so a move leaves them claiming mail is
+    /// out when it is sitting in a mailbox the recipient no longer reads.
+    /// Re-post eligibility only: nothing is removed and nothing is acked.
+    ///
     /// Returns whether the contact's endpoint actually moved. `false` covers
     /// "not a contact", "we already hold this or newer", and "that epoch is
     /// not a time" — none is an error, all are ordinary outcomes of a
@@ -4895,6 +4904,66 @@ impl MessageStore {
                 "UPDATE carried_envelopes SET relay_uploaded_to = NULL
                  WHERE relay_uploaded_to IS NOT NULL",
                 [],
+            )
+            .map_err(store_err)?;
+            // MARK-01 again, applied to the rows this device *authored*.
+            // `relay_posted_at` is terminal by design -- a stamped envelope
+            // is never offered to the relay path again -- and it records only
+            // *that* a row was posted, never *where*. Left standing across an
+            // endpoint move, every envelope already deposited in the old
+            // mailbox is stranded: this device believes the mail went out,
+            // the recipient reads a mailbox it was never put in, and nothing
+            // ever retries.
+            //
+            // Clearing the marker here, rather than teaching it which mailbox
+            // it names, is deliberate. A `relay_posted_to` column would have
+            // to be read by `pending_relay_outbound_envelopes`, and that
+            // query cannot know a row's target endpoint: endpoint resolution
+            // is relay-pass policy (rejection versus silence, own-relay
+            // fallback, group fan-out target) driven by a plan the shell
+            // supplies, not by SQL over `contacts`. Scoping the marker would
+            // put a second, divergent copy of that policy in the store. This
+            // is the one moment a marker is *provably* stale, so this is
+            // where it is cleared.
+            //
+            // Scoped to rows addressed to this contact, so no other
+            // conversation's queue is disturbed. Group-addressed envelopes
+            // carry `recipient_user_id = group_id` and are deliberately left
+            // alone: group fan-out sends every member's row to one chosen
+            // mailbox, so re-offering a fully posted group envelope would
+            // re-deposit the whole member set rather than the single row that
+            // moved. That case belongs to `outbound_fanout_posted`, which is
+            // already keyed by mailbox.
+            //
+            // Running inside the transaction that installs the new endpoint
+            // is what makes this safe in both directions. A crash can never
+            // leave the endpoint moved with markers still claiming the mail
+            // is out, and it can never leave the markers cleared with the old
+            // endpoint still stored -- which is the only way this could
+            // deposit into the old mailbox a second time.
+            //
+            // Re-post eligibility ONLY. Nothing is removed and nothing is
+            // acked: a queued envelope still leaves `outbound_envelopes` only
+            // on a delivery receipt that covers it, on supersession, or on
+            // expiry (the DTN ack-safety rule in CLAUDE.md). The worst a
+            // cleared stamp can cost is one extra deposit, which the relay
+            // dedupes by `msg_id`.
+            tx.execute(
+                "UPDATE outbound_envelopes SET relay_posted_at = NULL
+                 WHERE recipient_user_id = ?1 AND relay_posted_at IS NOT NULL",
+                params![sender_user_id],
+            )
+            .map_err(store_err)?;
+            // The outgoing receipt queue is authored mail too, addressed per
+            // recipient, and strands identically. Its only other route back
+            // to unposted is the watermark advancing, which a conversation
+            // that has gone quiet never does -- so a receipt left in the old
+            // mailbox would sit there until it expired, and the person who
+            // moved would keep seeing their own message as unacknowledged.
+            tx.execute(
+                "UPDATE outgoing_receipt_envelopes SET relay_posted_at = NULL
+                 WHERE recipient_user_id = ?1 AND relay_posted_at IS NOT NULL",
+                params![sender_user_id],
             )
             .map_err(store_err)?;
         }
@@ -9270,7 +9339,7 @@ fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
         id: row.get(0)?,
         name: row.get(1)?,
         key: row.get(2)?,
-        metadata_revision: row.get(3)?,
+        metadata_revision: row.get::<_, i64>(3)? as u64,
         metadata_changed_by: row.get(4)?,
     })
 }
@@ -9294,7 +9363,7 @@ pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(),
         .query_row(
             "SELECT metadata_revision, metadata_changed_by FROM groups WHERE group_id = ?1",
             params![&group.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
         )
         .optional()
         .map_err(store_err)?;
@@ -9321,7 +9390,7 @@ pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(),
             &group.id,
             &group.name,
             &group.key,
-            group.metadata_revision,
+            group.metadata_revision as i64,
             &group.metadata_changed_by,
         ],
     )
@@ -21384,6 +21453,129 @@ mod tests {
             .unwrap());
         assert!(store
             .family_carried_envelopes(10, 2_000, vec![])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Authored mail must be re-offered to the mailbox the contact just moved
+    /// to. `relay_posted_at` is terminal and says only *that* a row was
+    /// posted, not *where*: without the clear, everything already deposited
+    /// in the old mailbox is stranded for good -- sent as far as this device
+    /// is concerned, never readable by the recipient, never retried.
+    #[test]
+    fn contact_relay_update_reoffers_authored_mail_to_the_new_mailbox() {
+        let store = MessageStore::open(":memory:".to_string()).unwrap();
+        let mut alice = contact(b"alice-id", "Alice");
+        alice.relay_url = Some("https://old.relay.example".to_string());
+        alice.relay_token = Some("cmdep1-old".to_string());
+        store.upsert_contact(alice).unwrap();
+        store.upsert_contact(contact(b"bob-id", "Bob")).unwrap();
+
+        // A 1:1 chat is keyed by the peer's user id, so chat, recipient and
+        // the receipt's subject are all Alice.
+        let message = msg(b"alice-id", b"me", 1, "see you at the pier");
+        let mut envelope = outbound_for(&message, b"alice-id", b"msg-alice-00001");
+        envelope.expiry = RELAY_NOTICE_NOW + 60_000;
+        store
+            .insert_outgoing_message(message, envelope.clone(), 1_000)
+            .unwrap();
+        let mut receipt = outgoing_receipt_for(
+            b"alice-id",
+            b"alice-id",
+            b"alice-id",
+            crate::RECEIPT_TYPE_DELIVERED,
+            1,
+            b"receipt-alice-0001",
+        );
+        receipt.expiry = RELAY_NOTICE_NOW + 60_000;
+        assert!(store
+            .upsert_outgoing_receipt_envelope(receipt.clone(), 1_000)
+            .unwrap());
+
+        // Bob's mail is the control: his endpoint did not move, so his
+        // marker must survive Alice's notice untouched.
+        let bob_message = msg(b"bob-id", b"me", 1, "unrelated");
+        let mut bob_envelope = outbound_for(&bob_message, b"bob-id", b"msg-bob-000001");
+        bob_envelope.expiry = RELAY_NOTICE_NOW + 60_000;
+        store
+            .insert_outgoing_message(bob_message, bob_envelope.clone(), 1_100)
+            .unwrap();
+
+        // Everything lands on the old mailboxes, and the queue goes quiet.
+        for msg_id in [envelope.msg_id.clone(), bob_envelope.msg_id.clone()] {
+            assert!(store
+                .mark_outbound_envelope_relay_posted(msg_id, 2_000)
+                .unwrap());
+        }
+        assert!(store
+            .mark_outgoing_receipt_envelope_relay_posted(receipt.msg_id.clone(), 2_000)
+            .unwrap());
+        assert!(store
+            .pending_relay_outbound_envelopes(10, RELAY_NOTICE_NOW, vec![])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .pending_relay_outgoing_receipt_envelopes(10, RELAY_NOTICE_NOW, vec![])
+            .unwrap()
+            .is_empty());
+
+        let notice = relay_notice(b"alice-id", 100, "https://new.relay.example");
+        assert!(store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice.clone(), RELAY_NOTICE_NOW)
+            .unwrap());
+
+        // Alice's envelope and receipt are candidates again -- the same rows,
+        // not new ones. Exact equality is also Bob's control: his row did not
+        // move relay, so it must stay marked posted and out of both queues.
+        assert_eq!(
+            store
+                .pending_relay_outbound_envelopes(10, RELAY_NOTICE_NOW, vec![])
+                .unwrap(),
+            vec![envelope.clone()],
+            "authored 1:1 mail must be re-offered after the contact moves relay, \
+             and only that contact's mail",
+        );
+        assert_eq!(
+            store
+                .pending_relay_outgoing_receipt_envelopes(10, RELAY_NOTICE_NOW, vec![])
+                .unwrap(),
+            vec![receipt.clone()],
+            "an outgoing receipt strands the same way and must be re-offered too",
+        );
+        assert_eq!(
+            store
+                .outbound_envelopes_after(b"alice-id".to_vec(), b"me".to_vec(), 0)
+                .unwrap(),
+            vec![envelope.clone()],
+            "re-post eligibility only -- the envelope itself must never be removed",
+        );
+
+        // The re-post can only go to the endpoint this same transaction
+        // installed, so the old mailbox is never deposited into twice.
+        let stored = store.get_contact(b"alice-id".to_vec()).unwrap().unwrap();
+        assert_eq!(
+            stored.relay_url.as_deref(),
+            Some("https://new.relay.example")
+        );
+
+        // Post to the new mailbox, then replay the same (now stale) notice.
+        // It moves no endpoint, so it must clear nothing: a spray or a relay
+        // replay of an already-applied notice cannot keep re-posting mail.
+        assert!(store
+            .mark_outbound_envelope_relay_posted(envelope.msg_id.clone(), 3_000)
+            .unwrap());
+        assert!(store
+            .mark_outgoing_receipt_envelope_relay_posted(receipt.msg_id.clone(), 3_000)
+            .unwrap());
+        assert!(!store
+            .apply_contact_relay_update(b"alice-id".to_vec(), notice, RELAY_NOTICE_NOW)
+            .unwrap());
+        assert!(store
+            .pending_relay_outbound_envelopes(10, RELAY_NOTICE_NOW, vec![])
+            .unwrap()
+            .is_empty());
+        assert!(store
+            .pending_relay_outgoing_receipt_envelopes(10, RELAY_NOTICE_NOW, vec![])
             .unwrap()
             .is_empty());
     }

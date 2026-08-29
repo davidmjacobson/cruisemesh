@@ -132,6 +132,7 @@ fun passIndicator(health: RelayHealth, configured: Boolean): PassIndicator {
         -> PassIndicator.ATTENTION
         // Persistent, actionable ("!"): these stay until someone acts.
         is RelayHealth.Expired,
+        is RelayHealth.ExpiredReadOnly,
         is RelayHealth.Suspended,
         is RelayHealth.TokenRejected,
         is RelayHealth.QuotaFull,

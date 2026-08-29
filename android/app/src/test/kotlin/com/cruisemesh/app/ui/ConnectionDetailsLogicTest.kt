@@ -114,6 +114,7 @@ class ConnectionDetailsLogicTest {
             RelayHealth.Ok(NOW) to CoreRelayPathState.CONNECTED,
             RelayHealth.Failing(NOW) to CoreRelayPathState.UNREACHABLE,
             RelayHealth.Expired(NOW) to CoreRelayPathState.PASS_EXPIRED,
+            RelayHealth.ExpiredReadOnly(NOW) to CoreRelayPathState.PASS_EXPIRED_READ_ONLY,
             RelayHealth.Suspended(NOW) to CoreRelayPathState.PASS_SUSPENDED,
             RelayHealth.TokenRejected(NOW) to CoreRelayPathState.SETUP_REJECTED,
             RelayHealth.QuotaFull(NOW) to CoreRelayPathState.STORAGE_FULL,

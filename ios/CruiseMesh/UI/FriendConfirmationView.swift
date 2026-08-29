@@ -210,12 +210,14 @@ struct FriendConfirmationView: View {
                 .font(.callout)
                 .foregroundStyle(connected ? Color.accentColor : .secondary)
             if showAirplaneHint {
-                AirplaneDemoHint { showAirplaneHint = false }
-                    // Marked only once the hint has actually been on screen:
-                    // SwiftUI builds view values eagerly, so doing this in
-                    // init would burn the one-time hint for sheets that are
-                    // never presented.
-                    .onAppear { AirplaneDemoHintStore.markShown() }
+                // Written down only when somebody says they have read it.
+                // Swiping this sheet away does not spend the hint: the chat
+                // list underneath shows the same card, so there is a second
+                // chance rather than a card nobody read.
+                AirplaneDemoHint {
+                    AirplaneDemoHintStore.markShown()
+                    showAirplaneHint = false
+                }
             }
             Button("Say hi", action: onSayHi).buttonStyle(.borderedProminent)
             if let onAddAnother { Button("Add another", action: onAddAnother) }
@@ -252,16 +254,18 @@ struct FriendConfirmationView: View {
     }
 }
 
-/// The one-time "prove it to yourself" nudge, shown inside the friend-added
-/// sheet the first time somebody has a person to try it with. Deliberately a
-/// quiet card rather than an alert: it is an invitation, not a warning, and the
-/// sheet's own buttons stay the primary action.
+/// The one-time "prove it to yourself" nudge, from the first friend onward.
+/// Deliberately a quiet card rather than an alert: it is an invitation, not a
+/// warning, and whatever it sits on keeps its own primary action.
+///
+/// Shared by the friend-added sheet and the chat list, so the sentence is
+/// written once and cannot drift between the two places it appears.
 struct AirplaneDemoHint: View {
     let onDismiss: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.")
+            Text("CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through.")
                 .font(.callout)
                 .frame(maxWidth: .infinity, alignment: .leading)
             Button("Got it", action: onDismiss)

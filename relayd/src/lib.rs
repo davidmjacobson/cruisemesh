@@ -8854,6 +8854,30 @@ mod tests {
         assert_eq!(MAX_FETCH_HINTS, cruisemesh_core::RELAY_MAX_FETCH_HINTS);
     }
 
+    /// The same discipline for how long a deposit-class row may live here
+    /// versus how far back core still asks for it.
+    ///
+    /// A `recipient_hint` is salted with the envelope's creation day, so a row
+    /// this server is still willing to hold is only *reachable* while some
+    /// device's hint window still reaches back to that day. Both numbers were
+    /// derived the same way -- the honest client's 7-day envelope life
+    /// (`DEFAULT_EXPIRY_MS`) plus one day of clock slack -- so they are equal,
+    /// and raising this ceiling alone would leave rows sitting here addressed
+    /// to a day-salt no client asks for.
+    ///
+    /// The member-class [`MAX_RETENTION_MS`] is deliberately not tied to the
+    /// window: it bounds hostile input rather than describing a lifetime
+    /// anything authors, and buying 30 days of hint window would cost a
+    /// family more of `MAX_FETCH_HINTS` than its contacts and groups can
+    /// spare.
+    #[test]
+    fn deposit_retention_matches_the_core_carry_hint_window() {
+        assert_eq!(
+            MAX_DEPOSIT_RETENTION_MS,
+            cruisemesh_core::CARRY_HINT_DAY_WINDOW_DAYS * 24 * 60 * 60 * 1000
+        );
+    }
+
     /// The same discipline for the three budget numbers a per-DEVICE fan-out
     /// spends (`specs/multi-device-v1.md` §7): core plans one relay row per
     /// recipient device, each carrying the whole sealed body, so one message
