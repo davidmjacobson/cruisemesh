@@ -110,6 +110,63 @@ class RelayClientTest {
         }
     }
 
+    /**
+     * A 200 whose body will not decode. Whatever answered may not have been
+     * the relay -- a captive portal and a proxy can both answer 200 -- so the
+     * line this writes into the shared log describes the failure and quotes
+     * none of it.
+     *
+     * Whole-message equality on purpose. "Does not contain the body" is the
+     * property, but only pinning the sentence exactly rules out a later edit
+     * appending something else that came off the wire.
+     */
+    @Test
+    fun `a body that will not decode is described without quoting it`() {
+        val server = MockWebServer()
+        val portal = """{"id":"MARKER-cabin-8042"}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(Exception::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            assertEquals(
+                "could not decode ${portal.length}B: Malformed: v1=" +
+                    "invalid relay JSON: data error at line 1 column 25 of ${portal.length}B",
+                RelayClient.decodeFailureDetail(portal.length, error),
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    /**
+     * The other half of the same line: a sign-in page served with a 200. The
+     * status branch never sees this one, so the decode failure is all the
+     * reader gets -- and it still has to be enough to act on.
+     */
+    @Test
+    fun `a sign-in page served with a 200 is named by shape and size`() {
+        val server = MockWebServer()
+        val portal = "<html><title>MARKER Guest Wi-Fi</title></html>"
+        server.enqueue(MockResponse().setResponseCode(200).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(Exception::class.java) {
+                RelayClient.fetchEnvelopes(config, listOf(ByteArray(8) { 2 }), 0, 16)
+            }
+            assertEquals(
+                "could not decode ${portal.length}B: Malformed: v1=" +
+                    "invalid relay JSON: syntax error at line 1 column 1 of ${portal.length}B",
+                RelayClient.decodeFailureDetail(portal.length, error),
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test
     fun `an error response body stays out of the exception message`() {
         // Whatever answers a relay call is not necessarily the relay: a

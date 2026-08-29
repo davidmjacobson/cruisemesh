@@ -19,6 +19,7 @@ mod framing;
 mod gossip;
 mod groups;
 mod identity;
+mod json_fault;
 mod lan_session;
 mod lan_util;
 mod late_arrival;
