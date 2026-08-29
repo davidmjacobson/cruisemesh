@@ -206,7 +206,10 @@ struct AddDeviceView: View {
                 .font(.headline)
         }
 
-        if role == .newDevice, let qrText = state.qrText, state.step != .done {
+        // A stopped run's code is dead link material: see
+        // LinkCompletion.showsOffer for why both endings have to take it off
+        // the screen, not just the one.
+        if let qrText = state.qrText, LinkCompletion.showsOffer(role: role, step: state.step) {
             Section {
                 if let image = QRCodeGenerator.image(from: qrText, size: 280) {
                     Image(uiImage: image)
@@ -285,6 +288,17 @@ struct AddDeviceView: View {
         }
 
         Section {
+            if LinkCompletion.offersRestart(step: state.step) {
+                // A stopped run starts over here rather than by leaving and
+                // finding the door again. The scanned code goes with it: the
+                // offer it came from is dead, and a stale one left in the box
+                // would start a run that cannot finish.
+                Button("Start again") {
+                    scannedCode = ""
+                    session.reset()
+                }
+                .accessibilityIdentifier("add-device.start-again")
+            }
             if state.step == .done || state.step == .failed {
                 Button("Done") {
                     session.close()
