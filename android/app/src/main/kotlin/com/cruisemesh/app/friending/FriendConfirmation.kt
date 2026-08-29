@@ -19,6 +19,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -118,15 +119,11 @@ fun FriendConfirmationSheet(
         }
     }
 
-    // Read once and written straight away: the hint is offered at the first
-    // friend-added sheet and never again, whether it is dismissed or the sheet
-    // is swiped away with it still on screen.
+    // Still owed, until somebody says they have read it. Swiping this sheet
+    // away does not spend the hint: the chat list underneath shows the same
+    // card, so there is a second chance rather than a card nobody read.
     val context = LocalContext.current
-    var showAirplaneHint by remember {
-        val show = AirplaneDemoHintStore.shouldShow(context)
-        if (show) AirplaneDemoHintStore.markShown(context)
-        mutableStateOf(show)
-    }
+    val showAirplaneHint by AirplaneDemoHintStore.showHint.collectAsState()
 
     ModalBottomSheet(onDismissRequest = onDone) {
         Column(
@@ -163,7 +160,7 @@ fun FriendConfirmationSheet(
             }
 
             if (showAirplaneHint) {
-                AirplaneDemoHint(onDismiss = { showAirplaneHint = false })
+                AirplaneDemoHint(onDismiss = { AirplaneDemoHintStore.dismiss(context) })
             }
 
             Button(onClick = onSayHi, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.ui_say_hi)) }
@@ -176,19 +173,21 @@ fun FriendConfirmationSheet(
 }
 
 /**
- * The one-time "prove it to yourself" nudge, shown inside the friend-added
- * sheet the first time somebody has a person to try it with. Deliberately a
- * quiet card rather than a dialog: it is an invitation, not a warning, and the
- * sheet's own buttons stay the primary action.
+ * The one-time "prove it to yourself" nudge, from the first friend onward.
+ * Deliberately a quiet card rather than a dialog: it is an invitation, not a
+ * warning, and whatever it sits on keeps its own primary action.
+ *
+ * Shared by the friend-added sheet and the chat list, so the sentence is
+ * written once and cannot drift between the two places it appears.
  */
 @Composable
-private fun AirplaneDemoHint(onDismiss: () -> Unit) {
+internal fun AirplaneDemoHint(onDismiss: () -> Unit, modifier: Modifier = Modifier) {
     Card(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
             contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
         ),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
     ) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(16.dp),

@@ -67,6 +67,7 @@ import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.debug.DebugFileLog
 import com.cruisemesh.app.friending.ContactsScreen
 import com.cruisemesh.app.friending.FriendRequestSender
+import com.cruisemesh.app.friending.AirplaneDemoHintStore
 import com.cruisemesh.app.friending.AddFriendScreen
 import com.cruisemesh.app.friending.ImportFriendResult
 import com.cruisemesh.app.friending.FriendAddedOutcome
@@ -1194,6 +1195,10 @@ private fun HomeRoute(identity: Identity, navController: NavHostController) {
     // test succeeds or a backup lands, not on the next resume.
     val sailEvidenceVersion by SailChecklistEvidence.changes.collectAsState()
     LaunchedEffect(Unit) { SailChecklistCardStore.refresh(context) }
+    // The one-time "it works with no internet" hint. Read once here so the
+    // friend-added sheet and the chat list under it share one answer and one
+    // dismissal.
+    LaunchedEffect(Unit) { AirplaneDemoHintStore.refresh(context) }
     LaunchedEffect(sailCardDismissed, permissionRefreshToken, summaries.size, sailEvidenceVersion) {
         sailChecklistProgress = if (sailCardDismissed) {
             null
