@@ -69,13 +69,30 @@ print(json.dumps({k: f[k] for k in keep if f[k] is not None}))
 PY
 
   cat > "$WORK/match_prefix.py" <<'PY'
-# argv: prefix ; stdin: a list response. Prints every full token that matches.
+# argv: prefix ; stdin: a list response. Prints the full TOKEN of every family
+# whose token *or* stable family id starts with the prefix -- both of the
+# columns `list` prints are meant to be copied straight back into another
+# command, and both resolve to the one credential the caller needs.
 import json, sys
 
 prefix = sys.argv[1]
 for family in json.load(sys.stdin)["families"]:
-    if family["token"].startswith(prefix):
+    # A relay predating the stable id omits the field entirely; "" never
+    # matches a non-empty prefix, so the token match still stands alone.
+    family_id = family.get("family_id") or ""
+    if family["token"].startswith(prefix) or family_id.startswith(prefix):
         print(family["token"])
+PY
+
+  cat > "$WORK/family_field.py" <<'PY'
+# argv: field ; stdin: a family JSON. Prints that field, or nothing at all if
+# the server did not return it -- callers treat empty as "this relay is older
+# than the field" and fall back, rather than dying on a KeyError.
+import json, sys
+
+value = json.load(sys.stdin).get(sys.argv[1])
+if value is not None:
+    print(value)
 PY
 
   cat > "$WORK/render_list.py" <<'PY'
@@ -86,6 +103,12 @@ reveal = sys.argv[1] == "1"
 grace_ms = int(sys.argv[2])
 page = json.load(sys.stdin)
 now = time.time() * 1000
+
+# A family id is "cmfid1-" plus twelve base64url characters. Fixed-width so
+# the column stays aligned, and printed in full rather than truncated: unlike
+# the token it is not a credential, it is the handle every follow-up command
+# and every support note wants, so it has to be copy-pasteable as printed.
+FAMILY_ID_WIDTH = 19
 
 
 def human(size):
@@ -121,12 +144,18 @@ if not rows:
 
 width = 66 if reveal else 15
 header = "token".ljust(width)
-print(f"{header} {'state':<9} {'plan':<16} {'expires':<11} {'used':>9} {'msgs':>6}  note")
+print(f"{header} {'family_id':<{FAMILY_ID_WIDTH}} {'state':<9} {'plan':<16} "
+      f"{'expires':<11} {'used':>9} {'msgs':>6}  note")
 for family in rows:
     token = family["token"] if reveal else family["token"][:12] + "…"
+    # "-" rather than a blank keeps every row the same number of
+    # whitespace-separated fields, so `awk '{print $2}'` stays honest against a
+    # relay too old to send the id.
+    family_id = family.get("family_id") or "-"
     plan = (family["plan"] or "-")[:16]
     note = (family["note"] or "")[:40]
-    print(f"{token:<{width}} {state(family):<9} {plan:<16} {day(family['expires_ms']):<11} "
+    print(f"{token:<{width}} {family_id:<{FAMILY_ID_WIDTH}} {state(family):<9} {plan:<16} "
+          f"{day(family['expires_ms']):<11} "
           f"{human(family['usage_bytes']):>9} {family['envelope_count']:>6}  {note}")
 
 shown = page["offset"] + len(rows)
@@ -137,6 +166,12 @@ else:
 if not reveal:
     print("tokens truncated; the visible part is a valid prefix for "
           "show/link/extend/suspend/purge (--reveal prints the credential)")
+if any(family.get("family_id") for family in rows):
+    print("family_id is accepted by those same commands and, unlike the token, "
+          "survives a rotation -- record it, not the token")
+else:
+    print("this relay is older than the stable family id, so that column is "
+          "empty; redeploy it to get ids")
 PY
 
   cat > "$WORK/pretty.py" <<'PY'
@@ -247,11 +282,19 @@ setup_link() {
 
 # Accept the 12-character prefix that `list` prints, not just a full token:
 # the masked column is deliberately a usable prefix so it can be copied
-# straight back into another command.
+# straight back into another command. Same for the family_id column -- and
+# there this must resolve to the row's TOKEN rather than echoing back what it
+# was handed. Every by-family admin route takes either, so passing the id
+# through would work everywhere except the one place it matters most:
+# `link` embeds its argument in the CMRELAY1 card as the relay credential, and
+# a card carrying a family id installs cleanly and then 401s on every phone.
 resolve_token() {
-  local candidate=$1 matches count
-  if api GET "/admin/families/$candidate" >/dev/null 2>&1; then
-    printf '%s' "$candidate"
+  local candidate=$1 direct resolved matches count
+  # 2>/dev/null, not >/dev/null 2>&1: the body is wanted, only api()'s
+  # re-emitted error is not.
+  if direct=$(api GET "/admin/families/$candidate" 2>/dev/null); then
+    resolved=$(printf '%s' "$direct" | python3 "$WORK/family_field.py" token)
+    printf '%s' "${resolved:-$candidate}"
     return
   fi
   matches=$(api GET "/admin/families?limit=500" | python3 "$WORK/match_prefix.py" "$candidate")
@@ -279,7 +322,12 @@ cmd_provision() {
   local expires body
   expires=$(expiry_from_days "$days")
   body=$(python3 "$WORK/build_provision.py" "$token" "$plan" "$note" "$expires" "$quota")
-  api POST /admin/families "$body" >/dev/null
+  # The response carries the family id this call just minted. Discarding it
+  # meant the operator had to `show` the family right back to learn the one
+  # handle worth writing down.
+  local created family_id
+  created=$(api POST /admin/families "$body")
+  family_id=$(printf '%s' "$created" | python3 "$WORK/family_field.py" family_id)
 
   if [ -n "$expires" ]; then
     echo "provisioned  plan=$plan  expires $(date -u -d "@$((expires / 1000))" '+%Y-%m-%d') UTC (${days}d)"
@@ -287,6 +335,11 @@ cmd_provision() {
     echo "provisioned  plan=$plan  never expires"
   fi
   echo
+  if [ -n "$family_id" ]; then
+    echo "family id (stable across token rotation -- record this one):"
+    echo "  $family_id"
+    echo
+  fi
   echo "family token:"
   echo "  $token"
   echo
@@ -321,16 +374,26 @@ cmd_list() {
   fi
 }
 
+# resolve_token's die() only exits the *subshell* a command substitution runs
+# in, and `set -e` does not fire for a substitution embedded in another
+# command's arguments. So every caller assigns it to its own variable first:
+# there the failed substitution is the assignment's status and the script
+# stops. Inlining it instead used to mean `link <unknown>` printed
+# "no family matches" on stderr and then, on stdout and with exit status 0, a
+# CMRELAY1 card carrying an empty token -- a paste-ready link to nowhere.
 cmd_show() {
   [ $# -eq 1 ] || die "usage: show <token>"
-  local response
-  response=$(api GET "/admin/families/$(resolve_token "$1")")
+  local token response
+  token=$(resolve_token "$1")
+  response=$(api GET "/admin/families/$token")
   printf '%s' "$response" | python3 "$WORK/pretty.py"
 }
 
 cmd_link() {
   [ $# -eq 1 ] || die "usage: link <token>"
-  setup_link "$(resolve_token "$1")"
+  local token
+  token=$(resolve_token "$1")
+  setup_link "$token"
 }
 
 cmd_extend() {
@@ -351,7 +414,9 @@ cmd_extend() {
 }
 
 set_status() {
-  api PATCH "/admin/families/$(resolve_token "$1")" "{\"status\":\"$2\"}" >/dev/null
+  local token
+  token=$(resolve_token "$1")
+  api PATCH "/admin/families/$token" "{\"status\":\"$2\"}" >/dev/null
   echo "$3"
 }
 
@@ -370,7 +435,9 @@ cmd_resume() {
 cmd_purge() {
   { [ $# -eq 2 ] && [ "$2" = "--yes" ]; } ||
     die "usage: purge <token> --yes  (irreversible: drops the family and its stored envelopes)"
-  api DELETE "/admin/families/$(resolve_token "$1")" >/dev/null
+  local token
+  token=$(resolve_token "$1")
+  api DELETE "/admin/families/$token" >/dev/null
   echo "purged -- family deleted, stored envelopes and presence dropped"
 }
 
@@ -386,15 +453,16 @@ USAGE
 COMMANDS
   provision [--days N|never] [--plan P] [--note "..."] [--quota-bytes N]
             [--token T]
-        Mint a family and print its token plus a paste-ready CMRELAY1 setup
-        link. Defaults: --days 90, --plan dev-test. Re-running with an
-        existing --token re-provisions it (and reactivates a suspended one).
+        Mint a family and print its stable family id and token plus a
+        paste-ready CMRELAY1 setup link. Defaults: --days 90, --plan dev-test.
+        Re-running with an existing --token re-provisions it (and reactivates
+        a suspended one).
 
   list [--status active|suspended] [--limit N] [--offset N] [--reveal|--json]
-        Every family with its usage and effective state (active / grace /
-        expired / suspended). Tokens are truncated to 12 characters, which is
-        still a valid argument for the commands below; --reveal prints them
-        in full, --json emits the raw API response.
+        Every family with its stable id, usage and effective state (active /
+        grace / expired / suspended). Tokens are truncated to 12 characters,
+        which is still a valid argument for the commands below; --reveal
+        prints them in full, --json emits the raw API response.
 
   show <token>        One family as JSON, including usage_bytes and
                       envelope_count.
@@ -408,7 +476,14 @@ COMMANDS
   --help, -h          This message.
 
   <token> may be any unambiguous prefix -- including the 12 characters `list`
-  prints. An ambiguous prefix is refused rather than guessed.
+  prints. An ambiguous prefix is refused rather than guessed. It may equally
+  be a `cmfid1-...` family id, the stable handle in `list`'s family_id column:
+  a token changes under `POST /family/rotate` and an id never does, so the id
+  is what to record against a customer. `link` given an id still emits a card
+  carrying the family's current token, never the id.
+
+  A relay older than the stable id prints "-" in that column; every command
+  keeps working on tokens there.
 
 SUSPEND VS PURGE
   A pass that lapsed or was refunded should be SUSPENDED: reversible, and the

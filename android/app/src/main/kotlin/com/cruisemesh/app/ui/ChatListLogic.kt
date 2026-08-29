@@ -15,6 +15,19 @@ import java.util.Locale
 
 object ChatListLogic {
 
+    /**
+     * Whether the "it keeps working with no internet" hint belongs on the chat
+     * list right now.
+     *
+     * Two conditions, and the second is the one that matters: the hint asks a
+     * person to go and try something with somebody, so it waits for a friend.
+     * A group does not count -- a group with no friends in it is a list of
+     * people this phone cannot reach directly, which is the one case where the
+     * demo would not work.
+     */
+    fun showsAirplaneHint(hintUnseen: Boolean, summaries: List<ChatSummary>): Boolean =
+        hintUnseen && summaries.any { !it.isGroup }
+
     fun displayNameOrId(name: String, displayId: String): String =
         if (name.isNotBlank() && name != "Unknown") name else displayId
 

@@ -14,8 +14,10 @@
     <string name="ui_add_a_friend_to_start_messaging_over_bluetooth">Add a friend to start messaging over Bluetooth — no Wi-Fi needed.</string>
     <string name="ui_connected">You\'re connected</string>
     <string name="ui_friend_added">Friend added</string>
-    <!-- One-time hint, shown once after the first friend is added -->
-    <string name="ui_hint_try_airplane_mode">Try it: turn on airplane mode on both phones, then turn Bluetooth back on — messages still get through.</string>
+    <!-- One-time hint, from the first friend onward. Names Bluetooth outright:
+         testers hear "works with no internet" as a slogan until they are told
+         what is actually carrying the message, and how to prove it. -->
+    <string name="ui_hint_try_airplane_mode">CruiseMesh keeps working with no internet — your phones talk over Bluetooth. Try it: put both phones in airplane mode, turn Bluetooth back on, and messages still get through.</string>
     <string name="ui_add_all">Add all</string>
     <string name="ui_add_all_count">Add all (%1$d)</string>
     <string name="ui_add_count">Add (%1$d)</string>
@@ -36,6 +38,7 @@
     <string name="ui_back">Back</string>
     <string name="ui_back_up_account">Back up account</string>
     <string name="ui_backup_contains_contacts_and_groups">Backup contains %1$s contacts and %2$s groups.</string>
+    <string name="ui_backup_file_selected">Backup file selected</string>
     <string name="ui_backup_identity_always_included">Your identity, contacts, groups, privacy settings, and message-number continuity are always included.</string>
     <string name="ui_backup_identity_always_restored">Identity, contacts, groups, privacy settings, and message-number continuity will always be restored.</string>
     <string name="ui_backup_saved">Backup saved</string>
@@ -79,6 +82,8 @@
     <string name="ui_delete_captured_diagnostics">Delete captured diagnostics</string>
     <string name="ui_diagnostics_deleted">Captured diagnostics deleted.</string>
     <string name="ui_diagnostics_shared">Diagnostics shared.</string>
+    <string name="ui_diagnostics_saved">Diagnostics saved to the location you chose. Nothing was sent anywhere.</string>
+    <string name="ui_diagnostics_save_failed">Could not save the diagnostics file. If a file was created, it may be incomplete. Try again, or choose a different place to save.</string>
     <string name="ui_rebuilt_internet_sync">Rebuilt internet sync</string>
     <string name="ui_rebuilt_internet_sync_desc">Sends and receives over the internet using the rebuilt code. Leave this off unless you have been asked to turn it on for testing. It applies from the next sync.</string>
     <string name="ui_rebuilt_message_handling">Rebuilt message handling</string>
@@ -742,6 +747,7 @@
     <string name="ui_peer_activity_disconnected_no_path">%1$s disconnected · %2$s</string>
     <string name="ui_unnamed_friend">Friend</string>
     <string name="ui_share_diagnostics">Share diagnostics</string>
+    <string name="ui_save_diagnostics_to_device">Save to device</string>
     <string name="ui_show_less">Show less</string>
     <string name="ui_clear_connection_history">Clear connection history</string>
     <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.</string>
@@ -814,6 +820,10 @@
     <string name="ui_link_device_activating">Finishing up…</string>
     <string name="ui_link_device_done">Linked</string>
     <string name="ui_link_device_stopped">Stopped</string>
+    <!-- The way back into a run that ended without linking. The code that was
+         on screen is dead by then, so this starts a fresh one rather than
+         resuming anything. -->
+    <string name="ui_link_device_start_again">Start again</string>
     <string name="ui_link_device_outcome_declined">The numbers did not match.</string>
     <string name="ui_link_device_outcome_cancelled">One of the phones stopped.</string>
     <string name="ui_link_device_outcome_timed_out">The other phone never answered.</string>

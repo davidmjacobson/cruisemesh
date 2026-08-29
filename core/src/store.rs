@@ -9270,7 +9270,7 @@ fn row_to_group_row(row: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
         id: row.get(0)?,
         name: row.get(1)?,
         key: row.get(2)?,
-        metadata_revision: row.get(3)?,
+        metadata_revision: row.get::<_, i64>(3)? as u64,
         metadata_changed_by: row.get(4)?,
     })
 }
@@ -9294,7 +9294,7 @@ pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(),
         .query_row(
             "SELECT metadata_revision, metadata_changed_by FROM groups WHERE group_id = ?1",
             params![&group.id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?)),
         )
         .optional()
         .map_err(store_err)?;
@@ -9321,7 +9321,7 @@ pub(crate) fn upsert_group_tx(tx: &Transaction<'_>, group: &Group) -> Result<(),
             &group.id,
             &group.name,
             &group.key,
-            group.metadata_revision,
+            group.metadata_revision as i64,
             &group.metadata_changed_by,
         ],
     )

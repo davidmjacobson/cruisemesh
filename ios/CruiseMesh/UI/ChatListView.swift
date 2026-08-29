@@ -97,6 +97,9 @@ struct ChatListView: View {
     /// Read once when the view is built; the store is the durable answer and
     /// this only has to keep the card gone for the rest of this launch.
     @State private var sailCardDismissed = SailChecklistCardStore.isDismissed()
+    /// The one-time "it keeps working with no internet" hint. Re-read on every
+    /// reload so a dismissal in the friend-added sheet clears it here too.
+    @State private var showAirplaneHint = AirplaneDemoHintStore.shouldShow()
     @Environment(\.scenePhase) private var scenePhase
 
     private var connectivityWarning: ConnectivityWarning? {
@@ -332,6 +335,18 @@ struct ChatListView: View {
                             }
                         )
                     }
+                    // The surface where the first friend actually turns up.
+                    // The friend-added sheet offers the same card first, but
+                    // that sheet is gone in a second if somebody swipes it;
+                    // this is where the hint waits until it is read.
+                    if showAirplaneHint, hasContacts {
+                        AirplaneDemoHint {
+                            AirplaneDemoHintStore.markShown()
+                            showAirplaneHint = false
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 6)
+                    }
                     MeshStatusPill {
                         if bluetooth.isAuthorizationBlocked || bluetooth.isRadioOff {
                             bluetooth.openSystemSettings()
@@ -500,6 +515,7 @@ struct ChatListView: View {
         ownCloneWarning = (try? store.hasIdentityCloneWarning(userId: identity.userId)) ?? false
         let contacts = (try? store.listContacts()) ?? []
         hasContacts = !contacts.isEmpty
+        showAirplaneHint = AirplaneDemoHintStore.shouldShow()
         let direct: [ChatSummary] = contacts.map { c in
             let messages = (try? store.messagesForChat(chatId: c.userId)) ?? []
             let readThrough = (try? store.receiptThrough(

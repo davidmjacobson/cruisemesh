@@ -5820,10 +5820,20 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// health pill and the retry/continuation timers this shell owns. It makes
     /// no protocol arithmetic itself.
     ///
-    /// Off by default; `RelayEngineSettings.passEngine` selects it. The
-    /// remaining known gap keeping the default legacy is group fan-out,
-    /// recorded in the contract's §5.2. What used to sit beside it, and no
-    /// longer does: an ingested page now reaches the inbound processor through
+    /// Off by default; `RelayEngineSettings.passEngine` selects it, and until
+    /// canary evidence says otherwise the answer is the legacy engine.
+    ///
+    /// The gap that used to be named here is closed. Core's upload planning
+    /// decomposes a group-addressed authored row into one row per member, picks
+    /// the single destination mailbox with `core_group_fanout_relay_target` (so
+    /// a member resting for silence contributes no fallback), and stamps
+    /// `relay_posted_at` only once every member the envelope owes has landed —
+    /// remembering per member which ones did, so a partial fan-out resumes with
+    /// the remainder rather than re-posting the set, which is one step past what
+    /// this pass does. `FANOUT-01` in the contract pins it.
+    ///
+    /// What else used to sit beside it, and no longer does: an ingested page now
+    /// reaches the inbound processor through
     /// `CoreRelayPassProjector`, so it raises the same notification the legacy
     /// walk raises; a presence answer now reaches `MeshConnectivityStatus` the
     /// same way; and a contact endpoint resting for *silence* is now told apart
