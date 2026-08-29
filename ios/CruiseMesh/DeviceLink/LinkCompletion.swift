@@ -32,4 +32,28 @@ enum LinkCompletion {
     static func entersApp(role: CoreLinkRole, step: LinkStep) -> Bool {
         role == .newDevice && step == .done
     }
+
+    /// Whether the offer — the code on screen, and the button that copies it —
+    /// still means anything.
+    ///
+    /// It stops meaning something the moment the run ends, and that is true of
+    /// both endings, not just the happy one. A stopped ceremony leaves link
+    /// material with no session behind it, so a screen that keeps showing it is
+    /// inviting somebody to hold up a code, or paste one, that cannot work
+    /// however carefully they do it. `.done` was already excluded; `.failed`
+    /// was not, which is the whole of the bug this answers.
+    ///
+    /// Only the new device ever shows an offer at all: the approving end scans
+    /// one.
+    static func showsOffer(role: CoreLinkRole, step: LinkStep) -> Bool {
+        role == .newDevice && step != .done && step != .failed
+    }
+
+    /// Whether to offer a fresh run rather than only a way out.
+    ///
+    /// A stopped ceremony almost always wants another go — codes expire, phones
+    /// sleep, somebody taps Stop by mistake — and without this the only door is
+    /// "Done", which leaves the screen and makes the person find it again. A
+    /// finished one has nothing to repeat.
+    static func offersRestart(step: LinkStep) -> Bool { step == .failed }
 }
