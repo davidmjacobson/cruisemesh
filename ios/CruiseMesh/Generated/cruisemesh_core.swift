@@ -4809,6 +4809,15 @@ public protocol MessageStoreProtocol : AnyObject {
      * further ahead than a few days of clock skew is refused as
      * `false`, like any other notice that does not apply.
      *
+     * A notice that does move the endpoint also retires every "already
+     * posted there" marker the move invalidates — carried rows, and this
+     * device's authored 1:1 envelopes and outgoing receipts addressed to
+     * that contact — in the same transaction as the move itself, so the two
+     * halves cannot come apart across a crash. Those markers say only *that*
+     * a row was posted, never *where*, so a move leaves them claiming mail is
+     * out when it is sitting in a mailbox the recipient no longer reads.
+     * Re-post eligibility only: nothing is removed and nothing is acked.
+     *
      * Returns whether the contact's endpoint actually moved. `false` covers
      * "not a contact", "we already hold this or newer", and "that epoch is
      * not a time" — none is an error, all are ordinary outcomes of a
@@ -8525,6 +8534,15 @@ open func announceOwnRoster(identity: Identity, nowMs: Int64)throws  -> RosterGo
      * would survive the rotation that was supposed to remove it. An epoch
      * further ahead than a few days of clock skew is refused as
      * `false`, like any other notice that does not apply.
+     *
+     * A notice that does move the endpoint also retires every "already
+     * posted there" marker the move invalidates — carried rows, and this
+     * device's authored 1:1 envelopes and outgoing receipts addressed to
+     * that contact — in the same transaction as the move itself, so the two
+     * halves cannot come apart across a crash. Those markers say only *that*
+     * a row was posted, never *where*, so a move leaves them claiming mail is
+     * out when it is sitting in a mailbox the recipient no longer reads.
+     * Re-post eligibility only: nothing is removed and nothing is acked.
      *
      * Returns whether the contact's endpoint actually moved. `false` covers
      * "not a contact", "we already hold this or newer", and "that epoch is
@@ -58245,7 +58263,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_announce_own_roster() != 44394) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 59804) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_relay_update() != 34108) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_apply_contact_roster() != 29083) {
