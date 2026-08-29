@@ -13,6 +13,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.thread
+import uniffi.cruisemesh_core.coreNewLogRedactionSalt
+import uniffi.cruisemesh_core.coreRedactLogLine
 
 /**
  * On-device persistent logging: streams this process's own logcat output to a
@@ -29,6 +31,15 @@ import kotlin.concurrent.thread
  * offer outside debug builds too. Debuggable builds capture always; release
  * builds capture only when explicitly enabled by an internal diagnostic
  * control ([setOptIn], persisted so it survives restarts).
+ *
+ * Addresses do not reach the file. Every byte written here goes through
+ * [coreRedactLogLine] first, so a Wi-Fi address, a Bluetooth device address or
+ * a contact's public key is replaced by a short stand-in derived from a salt
+ * this phone keeps to itself. The stand-in is stable, so two lines about the
+ * same peer still read as the same peer; see the core module for why that
+ * matters and what it costs. Redacting at the sink rather than at the share
+ * sheet is deliberate: the file is what every export path hands out, and a
+ * future export path cannot forget a step it does not have to take.
  */
 object DebugFileLog {
     private const val TAG = "DebugFileLog"
@@ -37,6 +48,7 @@ object DebugFileLog {
     private const val ROTATED_NAME = "cruisemesh-log.1.txt"
     private const val PREFS_NAME = "debug_file_log"
     private const val KEY_OPT_IN = "opt_in"
+    private const val KEY_REDACTION_SALT = "redaction_salt"
 
     /** Rotate the active file once it passes this size; keep one older copy. */
     private const val MAX_BYTES = 4L * 1024 * 1024
@@ -76,6 +88,66 @@ object DebugFileLog {
         }
     }
 
+    /**
+     * This phone's redaction salt, minted on first use.
+     *
+     * Kept for the life of the capture rather than per share, so a support
+     * thread holding two archives from the same phone still reads as one
+     * story. It never leaves the device, which is what stops a shared archive
+     * from being matched back to a real address.
+     *
+     * Minting one also repairs whatever was captured before this build: an
+     * update must not leave a file on disk that the diagnostics note now
+     * describes wrongly, and deleting a tester's log to achieve that would be
+     * worse than rewriting it.
+     */
+    @Synchronized
+    internal fun redactionSalt(context: Context): String {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.getString(KEY_REDACTION_SALT, null)?.let { return it }
+        val salt = coreNewLogRedactionSalt()
+        prefs.edit().putString(KEY_REDACTION_SALT, salt).apply()
+        listOf(logFile(context), File(logDir(context), ROTATED_NAME))
+            .filter { it.exists() }
+            .forEach { redactInPlace(it, salt) }
+        return salt
+    }
+
+    /**
+     * Rewrites an already-captured file through the redactor.
+     *
+     * Via a sibling temp file and a rename so an interrupted rewrite cannot
+     * leave a half-redacted log behind; a failure leaves the original intact
+     * and is not worth crashing over, because the caller is on a diagnostics
+     * path. Internal so a test can drive it against a temp directory.
+     */
+    internal fun redactInPlace(file: File, salt: String): Boolean = runCatching {
+        val staged = File(file.parentFile, "${file.name}.redacting")
+        staged.delete()
+        file.bufferedReader().use { reader ->
+            staged.bufferedWriter().use { writer ->
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    writer.write(coreRedactLogLine(salt, line))
+                    writer.write("\n")
+                }
+            }
+        }
+        file.delete() && staged.renameTo(file)
+    }.getOrElse {
+        File(file.parentFile, "${file.name}.redacting").delete()
+        false
+    }
+
+    /**
+     * The one place capture writes to the file, so that "no address reaches
+     * this file" is a property of the sink rather than of every caller
+     * remembering. Context-free so it can be unit-tested against a temp file.
+     */
+    internal fun appendRedacted(file: File, salt: String, text: String) {
+        file.appendText(coreRedactLogLine(salt, text))
+    }
+
     private fun logDir(context: Context): File =
         File(context.getExternalFilesDir(null), LOG_DIR).apply { mkdirs() }
 
@@ -103,6 +175,10 @@ object DebugFileLog {
         stopCapture()
         val deleted = listOf(logFile(context), File(logDir(context), ROTATED_NAME))
             .all { !it.exists() || it.delete() }
+        // The salt is only meaningful against the lines it named, so erasing
+        // the capture erases it too; the next one starts a fresh namespace.
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().remove(KEY_REDACTION_SALT).apply()
         if (wasCapturing && isEnabled(context)) {
             // The capture thread exits asynchronously once logcat dies; start()
             // is idempotent and no-ops until it has, so re-arm on the next
@@ -146,6 +222,7 @@ object DebugFileLog {
     private fun capture(context: Context) {
         val file = logFile(context)
         if (file.exists() && file.length() >= MAX_BYTES) rotate(context, file)
+        val salt = redactionSalt(context)
 
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
         val version = try {
@@ -154,7 +231,9 @@ object DebugFileLog {
         } catch (e: Exception) {
             "unknown version"
         }
-        file.appendText(
+        appendRedacted(
+            file,
+            salt,
             "\n===== capture start $stamp pid=${Process.myPid()} " +
                 "CruiseMesh $version " +
                 "${Build.MANUFACTURER} ${Build.MODEL} Android ${Build.VERSION.RELEASE} =====\n",
@@ -162,8 +241,8 @@ object DebugFileLog {
         // The device conditions that silently stop the mesh working, and why
         // the last process died -- neither is inferable from the log lines
         // themselves. See EnvironmentSnapshot and ProcessExitHistory.
-        file.appendText(EnvironmentSnapshot.format(EnvironmentSnapshot.capture(context)))
-        file.appendText(ProcessExitHistory.format(ProcessExitHistory.recentExits(context)))
+        appendRedacted(file, salt, EnvironmentSnapshot.format(EnvironmentSnapshot.capture(context)))
+        appendRedacted(file, salt, ProcessExitHistory.format(ProcessExitHistory.recentExits(context)))
 
         // -v threadtime keeps timestamps + tid; --pid restricts to us even on
         // the off chance the platform would hand back more.
@@ -183,8 +262,7 @@ object DebugFileLog {
             var size = file.length()
             while (true) {
                 val line = reader.readLine() ?: break
-                file.appendText(line)
-                file.appendText("\n")
+                appendRedacted(file, salt, line + "\n")
                 size += line.length + 1
                 if (size >= MAX_BYTES) {
                     rotate(context, file)

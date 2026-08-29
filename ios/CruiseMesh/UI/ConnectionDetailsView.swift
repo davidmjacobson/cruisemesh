@@ -1126,7 +1126,7 @@ struct ConnectionDetailsView: View {
                     showClear = true
                 }
                 .frame(minHeight: 44)
-                Text("Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.")
+                Text("Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let supportMessage = supportMessage {

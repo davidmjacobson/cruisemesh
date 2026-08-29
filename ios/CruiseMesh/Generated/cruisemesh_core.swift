@@ -52592,6 +52592,21 @@ public func coreMintRelayMemberToken() -> String {
 })
 }
 /**
+ * A fresh redaction salt, as lowercase hex.
+ *
+ * Each shell generates this once and keeps it beside its capture switch, so
+ * every export from one phone shares a namespace and a support thread spanning
+ * two archives still reads as one story. It is discarded when the captured
+ * logs are erased: that gesture means "forget what was recorded", and a salt
+ * that outlived it would keep the old stand-ins meaningful.
+ */
+public func coreNewLogRedactionSalt() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_new_log_redaction_salt($0
+    )
+})
+}
+/**
  * Open §10.1's rotation announcement with this device's own X25519 secret.
  *
  * `own_roster` is the roster this device holds **now** — the pre-rotation one,
@@ -53215,6 +53230,20 @@ public func coreRecoveryRevokeRoster(stored: Roster, personRootSignSk: Data, rec
         FfiConverterData.lower(recoveringDeviceAgreePk),
         FfiConverterSequenceData.lower(revokedDeviceIds),
         FfiConverterOptionTypeInboxKey.lower(currentInboxKey),$0
+    )
+})
+}
+/**
+ * One log line with every address it carries replaced by a stand-in.
+ *
+ * Returns the line unchanged when it holds nothing of the sort, which is the
+ * overwhelmingly common case.
+ */
+public func coreRedactLogLine(salt: String, line: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_redact_log_line(
+        FfiConverterString.lower(salt),
+        FfiConverterString.lower(line),$0
     )
 })
 }
@@ -57320,6 +57349,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_mint_relay_member_token() != 6229) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_new_log_redaction_salt() != 49561) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_open_sync_handoff() != 33206) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57390,6 +57422,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_recovery_revoke_roster() != 32799) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_core_redact_log_line() != 49836) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
