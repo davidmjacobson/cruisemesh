@@ -1001,6 +1001,14 @@ impl MessageStore {
             endpoint_hint: None,
         };
 
+        // Floor for the auto-receipt tail below, for a body genuinely consumed
+        // off this sender's 1:1 lamport stream that is NOT filed under their
+        // 1:1 chat. Only the group invite has that shape (its row lands under
+        // the group's chat id), so a plain MAX over the 1:1 chat sits below its
+        // lamport. Mirrors the `atLeastLamport` argument the shipped shells
+        // pass at the same point.
+        let mut receipt_floor: u64 = 0;
+
         match body.kind {
             KIND_FRIEND_REQUEST if pairwise => {
                 self.apply_friend_request(
@@ -1137,6 +1145,12 @@ impl MessageStore {
                 stored.chat_id = group.id;
                 self.persist_inbound(&sender_user_id, &stored, &commit, arrival)?;
                 delivery.persisted = true;
+                // The invite rides the sender's 1:1 lamport stream but its row
+                // lives under the group chat, so nothing in the 1:1 chat ever
+                // reaches this lamport. Without the floor the sender's
+                // delivered watermark stalls below the newest thing they sent
+                // us and they replay their backlog on every send.
+                receipt_floor = body.lamport;
             }
             _ => {
                 self.persist_inbound(&sender_user_id, &body, &commit, arrival)?;
@@ -1144,12 +1158,42 @@ impl MessageStore {
             }
         }
 
-        // Auto-receipt tail: acknowledge a contact's stream up to its highest
-        // contiguous point. A receipt never acknowledges a receipt.
+        // Auto-receipt tail: acknowledge a contact's stream up to the highest
+        // lamport we actually hold from them. A receipt never acknowledges a
+        // receipt.
+        //
+        // [`MessageStore::highest_lamport`] — a plain MAX — never
+        // [`MessageStore::highest_contiguous_lamport`]. This is a watermark
+        // over a *peer's* stream, and that stream legitimately contains
+        // lamports this device will never hold a row for:
+        //
+        // * a front gap from the authoring lamport ratchet, where a chat-history
+        //   wipe or a backup restore restarts the sender above lamport 1 and the
+        //   lamports below the new base never existed for anyone;
+        // * an interior gap from a kind this build does not file (an older peer
+        //   receiving a newer sideband kind writes no `messages` row for it);
+        // * a lamport whose row was filed elsewhere — the group invite, which
+        //   `receipt_floor` above covers.
+        //
+        // The contiguous count stops at the first such hole and then reports
+        // the same number forever, so a receipt based on it pins the sender's
+        // delivered watermark permanently: their checkmarks never advance and
+        // they replay their whole backlog on every send. This is the same
+        // decision the shipped shells make in `PeerStreamWatermark`, and the
+        // engine must not diverge from it before it is switched on.
+        //
+        // Widening the receipt watermark does not weaken hole *repair*, which
+        // is a different lane and keeps the contiguous count: the digest
+        // ([`MessageStore::chat_digest`]) still reports the gap-aware
+        // contiguous watermark per sender, the responder still re-seals through
+        // `backfill_pairwise_envelope` for anything that digest asks for, and
+        // removal of a carried 1:1 envelope is still gated on digest proof of
+        // receipt. Detection of a genuinely lost message lives there, not here.
         if pairwise && body.kind != KIND_RECEIPT {
             if let Some(contact) = self.get_contact(sender_user_id.clone())? {
                 let through = self
-                    .highest_contiguous_lamport(sender_user_id.clone(), sender_user_id.clone())?;
+                    .highest_lamport(sender_user_id.clone(), sender_user_id.clone())?
+                    .max(receipt_floor);
                 let _ = self.author_receipt(
                     identity,
                     contact,
@@ -2018,10 +2062,16 @@ mod delivery_tests {
     }
 
     fn body(kind: u8, chat_id: Vec<u8>, content: Vec<u8>) -> Vec<u8> {
+        body_at(kind, chat_id, 1, content)
+    }
+
+    /// The same, at a chosen lamport, for the cases where the *shape* of the
+    /// sender's stream is the thing under test.
+    fn body_at(kind: u8, chat_id: Vec<u8>, lamport: u64, content: Vec<u8>) -> Vec<u8> {
         encode_message_body(MessageBody {
             kind,
             chat_id,
-            lamport: 1,
+            lamport,
             timestamp: NOW,
             content,
         })
@@ -2497,7 +2547,85 @@ mod delivery_tests {
                 )
                 .unwrap(),
             1,
-            "delivery acknowledges the sender's stream up to its contiguous point"
+            "delivery acknowledges the highest lamport held from the sender"
+        );
+    }
+
+    /// The regression this engine re-introduced and this test now pins: the
+    /// auto-receipt watermark is a plain MAX over the sender's stream, so a
+    /// hole in it cannot hold the watermark back.
+    ///
+    /// Against the previous `highest_contiguous_lamport` implementation the
+    /// contiguous run from lamport 1 is empty, so the watermark was 0 here and
+    /// stayed 0 for every later message this sender ever sends — the sender's
+    /// checkmarks never advance and they replay their backlog forever. Both
+    /// shells already compute this as MAX (`PeerStreamWatermark`); the engine
+    /// has to agree before it can be switched on.
+    #[test]
+    fn a_hole_in_the_senders_stream_does_not_hold_the_receipt_watermark_back() {
+        let store = store();
+        let me = generate_identity();
+        let sender = generate_identity();
+        store.upsert_contact(contact(&sender, "Sender")).unwrap();
+
+        // Lamports 1 and 2 never arrive: a front gap, which is what the
+        // authoring lamport ratchet leaves behind after a chat-history wipe or
+        // a backup restore on the sender's side.
+        let delivery = deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body_at(
+                KIND_TEXT,
+                sender.user_id.clone(),
+                3,
+                b"after the wipe".to_vec(),
+            ),
+        );
+        assert_eq!(delivery.verdict, CoreDeliveryVerdict::Applied);
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    sender.user_id.clone(),
+                    sender.user_id.clone(),
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            3,
+            "a front gap must not pin the watermark at 0"
+        );
+
+        // An interior hole (lamport 4 is not held here — a sideband kind an
+        // older build drops without filing a row, or a message still in
+        // flight) must not pin it either: the watermark follows the newest
+        // message held.
+        deliver_pairwise(
+            &store,
+            &me,
+            &sender,
+            body_at(KIND_TEXT, sender.user_id.clone(), 5, b"deck 9".to_vec()),
+        );
+        assert_eq!(
+            store
+                .outgoing_receipt_through(
+                    sender.user_id.clone(),
+                    sender.user_id.clone(),
+                    RECEIPT_TYPE_DELIVERED
+                )
+                .unwrap(),
+            5,
+            "an interior gap must not pin the watermark at the last contiguous lamport"
+        );
+
+        // The gap-aware view the repair lane uses is untouched: the digest
+        // still reports 0 for this sender, so a genuinely lost message is
+        // still detected and re-requested. Only the receipt watermark widened.
+        assert_eq!(
+            store
+                .highest_contiguous_lamport(sender.user_id.clone(), sender.user_id.clone())
+                .unwrap(),
+            0,
+            "hole detection stays with the digest's contiguous watermark"
         );
     }
 
