@@ -2783,6 +2783,16 @@
         }
       }
     },
+    "Start again": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start again"
+          }
+        }
+      }
+    },
     "Stop": {
       "localizations": {
         "en": {

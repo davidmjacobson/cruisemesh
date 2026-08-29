@@ -38,9 +38,20 @@ When an intentional visual change is reviewed, regenerate and inspect the PNGs:
 ./gradlew :app:updateDebugScreenshotTest
 ```
 
-The references live in `android/app/src/debug/screenshotTest/reference/`.
+The references live in `android/app/src/screenshotTestDebug/reference/`.
 Never update them merely to make a red test green; the image change is the
 review artifact.
+
+Every preview in `src/screenshotTest` needs `@PreviewTest` alongside `@Preview`:
+since screenshot plugin alpha10 that annotation is the only thing that makes a
+preview collectable, and a preview without it is rendered by nobody while
+`validateDebugScreenshotTest` still reports success. That is not a hypothetical
+— the gate spent several days reporting green while rendering zero of these
+previews. `:app:verifyScreenshotPreviewsCollected` now runs after every
+validation and fails unless the previews declared, the reference images
+committed, and the testcases in
+`app/build/test-results/validateDebugScreenshotTest/*.xml` are the same number.
+Read that count, not the build status, when judging whether the gate ran.
 
 Device tests need all ABI libraries and matching generated bindings:
 

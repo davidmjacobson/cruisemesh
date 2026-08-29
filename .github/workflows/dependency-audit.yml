@@ -1,16 +1,29 @@
 name: Dependency audit
 
+# Enforces the dependency, advisory and license policy written in SECURITY.md,
+# through deny.toml. Everything that page calls release-blocking is checked
+# here, including `sources` -- every dependency must come from crates.io.
+#
+# The daily schedule is the half a pull request cannot cover: an advisory
+# published against a crate nobody touched that week would otherwise sit
+# undiscovered until the next unrelated PR, which makes the response deadlines
+# in SECURITY.md unmeetable. Running on a schedule is what starts that clock.
+
 on:
   pull_request:
   push:
     branches: [master]
+  schedule:
+    # 06:40 UTC daily, offset from the other scheduled jobs in this repo.
+    - cron: "40 6 * * *"
+  workflow_dispatch:
 
 jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check Rust dependency advisories, licenses, and bans
+      - name: Check Rust dependency advisories, licenses, bans, and sources
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories bans licenses
+          command: check advisories bans licenses sources

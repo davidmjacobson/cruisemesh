@@ -178,6 +178,14 @@ fun AddDeviceScreen(
                     state = state,
                     onAnswer = session::answerDigits,
                     onStop = session::cancel,
+                    // A stopped run starts over here rather than by leaving and
+                    // finding the door again. The scanned code goes with it:
+                    // the offer it came from is dead, and a stale one left in
+                    // the box would start a run that cannot finish.
+                    onStartAgain = {
+                        scannedCode = ""
+                        session.reset()
+                    },
                     // One ending, two meanings: a phone that was just adopted is
                     // set up and belongs in the app, and everything else belongs
                     // back where it came from. Shared with the back arrow and
@@ -324,6 +332,7 @@ private fun LinkInProgress(
     state: LinkState,
     onAnswer: (Boolean) -> Unit,
     onStop: () -> Unit,
+    onStartAgain: () -> Unit,
     onFinish: () -> Unit,
 ) {
     Text(
@@ -332,7 +341,10 @@ private fun LinkInProgress(
     )
 
     val qrText = state.qrText
-    if (state.role == CoreLinkRole.NEW_DEVICE && qrText != null && state.step != LinkStep.DONE) {
+    val role = state.role
+    // A stopped run's code is dead link material: see LinkCompletion.showsOffer
+    // for why both endings have to take it off the screen, not just the one.
+    if (qrText != null && role != null && LinkCompletion.showsOffer(role, state.step)) {
         val bitmap = remember(qrText) { encodeQrBitmap(qrText) }
         Image(
             bitmap = bitmap,
@@ -434,9 +446,18 @@ private fun LinkInProgress(
     }
 
     if (state.step == LinkStep.DONE || state.step == LinkStep.FAILED) {
+        // "Start again" leads on a stopped run, because another go is what
+        // almost every stop wants next; "Done" stays the quieter way out.
+        val restart = LinkCompletion.offersRestart(state.step)
+        if (restart) {
+            Button(
+                onClick = onStartAgain,
+                modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+            ) { Text(stringResource(R.string.ui_link_device_start_again)) }
+        }
         OutlinedButton(
             onClick = onFinish,
-            modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+            modifier = Modifier.fillMaxWidth().padding(top = if (restart) 8.dp else 24.dp),
         ) { Text(stringResource(R.string.ui_done)) }
     } else {
         OutlinedButton(
