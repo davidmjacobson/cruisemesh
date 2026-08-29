@@ -41,4 +41,47 @@ final class LinkCompletionTests: XCTestCase {
             XCTAssertFalse(LinkCompletion.entersApp(role: .approvingDevice, step: step))
         }
     }
+
+    /// The regression this pair of rules exists for: a cancelled run kept the
+    /// code and the copy button on screen, so the screen that said "Stopped"
+    /// was at the same time inviting somebody to scan something dead.
+    func testAStoppedRunShowsNoCodeToScan() {
+        XCTAssertFalse(LinkCompletion.showsOffer(role: .newDevice, step: .failed))
+    }
+
+    func testAFinishedRunShowsNoCodeEither() {
+        XCTAssertFalse(LinkCompletion.showsOffer(role: .newDevice, step: .done))
+    }
+
+    func testALiveRunStillShowsItsCode() {
+        for step: LinkStep in [
+            .idle, .waitingForPeer, .handshaking, .comparingDigits,
+            .carryingBootstrap, .activating,
+        ] {
+            XCTAssertTrue(
+                LinkCompletion.showsOffer(role: .newDevice, step: step),
+                "step \(step) is live and still needs its code"
+            )
+        }
+    }
+
+    /// The approving end scans an offer; it never shows one.
+    func testTheApprovingDeviceNeverShowsACode() {
+        for step: LinkStep in [
+            .idle, .waitingForPeer, .handshaking, .comparingDigits,
+            .carryingBootstrap, .activating, .done, .failed,
+        ] {
+            XCTAssertFalse(LinkCompletion.showsOffer(role: .approvingDevice, step: step))
+        }
+    }
+
+    func testOnlyAStoppedRunOffersAnotherGo() {
+        XCTAssertTrue(LinkCompletion.offersRestart(step: .failed))
+        for step: LinkStep in [
+            .idle, .waitingForPeer, .handshaking, .comparingDigits,
+            .carryingBootstrap, .activating, .done,
+        ] {
+            XCTAssertFalse(LinkCompletion.offersRestart(step: step))
+        }
+    }
 }

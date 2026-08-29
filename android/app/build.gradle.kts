@@ -1,3 +1,4 @@
+import java.io.File
 import java.io.FileInputStream
 import java.util.Properties
 import org.gradle.api.tasks.testing.Test
@@ -235,6 +236,11 @@ dependencies {
     androidTestUtil(libs.androidx.test.orchestrator)
 
     screenshotTestImplementation(libs.compose.ui.tooling)
+    // @PreviewTest — without it the screenshot plugin collects nothing. compileOnly
+    // on purpose: the annotation is only needed to compile the previews, and the
+    // plugin's engine already carries its own matching copy at test runtime. See
+    // the catalog comment on screenshotValidationApi for the version split.
+    screenshotTestCompileOnly(libs.screenshot.validation.api)
 }
 
 // Pure JVM tests now exercise portable logic through UniFFI. Point JNA at the
@@ -297,6 +303,105 @@ val verifyNativeBindingsSync = tasks.register("verifyNativeBindingsSync") {
             )
         }
     }
+}
+
+// A screenshot gate that renders nothing still reports success. That is not
+// hypothetical here: screenshot plugin alpha10 narrowed collection to previews
+// annotated @PreviewTest, a dependency bump moved the pin from alpha09 to
+// alpha16, and validateDebugScreenshotTest went on passing while rendering zero
+// of the 14 previews -- `tests="0"` in its own result XML, with 14 reference
+// images in the tree comparing against nothing. Nothing failed, because nothing
+// ran, and only reading the XML by hand showed it.
+//
+// So assert on the count, not the exit status. Three numbers have to agree:
+// previews declared in src/screenshotTest, reference images committed under
+// src/screenshotTestDebug/reference, and testcases in the run's result XML.
+// Zero collected is the loud case; one preview quietly losing its annotation, or
+// a reference image left behind comparing against nothing, are the likelier
+// ones. Missing references already fail validation itself; orphaned ones do not,
+// which is how a whole directory of them survived the alpha09-to-alpha16 move.
+val screenshotPreviewSources = layout.projectDirectory.dir("src/screenshotTest")
+val screenshotReferenceImages = layout.projectDirectory.dir("src/screenshotTestDebug/reference")
+val screenshotTestResults = layout.buildDirectory.dir("test-results/validateDebugScreenshotTest")
+
+val verifyScreenshotPreviewsCollected = tasks.register("verifyScreenshotPreviewsCollected") {
+    group = "verification"
+    description = "Fails if validateDebugScreenshotTest did not compare every declared preview against its reference image."
+
+    val sourcesDir = screenshotPreviewSources.asFile
+    val referenceDir = screenshotReferenceImages.asFile
+    val resultsDir = screenshotTestResults
+
+    // Same reasoning as verifyNativeBindingsSync: a cheap consistency check, not
+    // a cacheable transform. An UP-TO-DATE here would be a gate that stopped
+    // checking, which is the exact failure this task exists to prevent.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        // Annotations only ever start a line in these sources; skipping comment
+        // lines keeps prose that mentions the annotations from being counted.
+        val previewLine = Regex("""^\s*@Preview\s*(\(|$)""")
+        val declared = sourcesDir.walkTopDown()
+            .filter { it.isFile && it.extension == "kt" }
+            .sumOf { source ->
+                source.readLines().count { line ->
+                    val trimmed = line.trim()
+                    !trimmed.startsWith("//") && !trimmed.startsWith("*") && previewLine.containsMatchIn(line)
+                }
+            }
+
+        val resultFiles = resultsDir.get().asFile
+            .listFiles { file: File -> file.isFile && file.name.endsWith(".xml") }
+            ?.sortedBy { it.name }
+            .orEmpty()
+        if (resultFiles.isEmpty()) {
+            throw GradleException(
+                "Screenshot gate produced no result XML in ${resultsDir.get().asFile.path} — " +
+                    "run :app:validateDebugScreenshotTest, which this task verifies."
+            )
+        }
+
+        val testsAttribute = Regex("""<testsuite\b[^>]*\btests="(\d+)"""")
+        val collected = resultFiles.sumOf { file ->
+            val matches = testsAttribute.findAll(file.readText()).toList()
+            if (matches.isEmpty()) {
+                throw GradleException(
+                    "Screenshot gate result XML has no testsuite count: ${file.path}"
+                )
+            }
+            matches.sumOf { it.groupValues[1].toInt() }
+        }
+
+        if (collected != declared) {
+            throw GradleException(
+                "Screenshot gate validated $collected of $declared previews declared in " +
+                    "${sourcesDir.path}.\n" +
+                    "Every preview needs @PreviewTest as well as @Preview — without it the " +
+                    "screenshot plugin does not collect it, and the gate passes without " +
+                    "rendering it. Counted from ${resultFiles.joinToString { it.name }}."
+            )
+        }
+
+        val references = referenceDir.walkTopDown().count { it.isFile && it.extension == "png" }
+        if (references != collected) {
+            throw GradleException(
+                "Screenshot gate validated $collected previews but ${referenceDir.path} holds " +
+                    "$references reference image(s).\n" +
+                    "A reference nothing compares against is worse than no reference: delete " +
+                    "the leftovers, or regenerate with :app:updateDebugScreenshotTest if the " +
+                    "plugin changed where they live."
+            )
+        }
+
+        logger.lifecycle("Screenshot gate compared $collected previews against $references reference images.")
+    }
+}
+
+// finalizedBy, not dependsOn: CI and AGENTS.md both invoke
+// :app:validateDebugScreenshotTest directly, so the check has to ride that task
+// rather than sit behind a name someone has to remember to type.
+tasks.matching { it.name.matches(Regex("validate\\w*ScreenshotTest")) }.configureEach {
+    finalizedBy(verifyScreenshotPreviewsCollected)
 }
 
 // Gate the check on the tasks that actually package jniLibs into an APK/AAB,

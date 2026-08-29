@@ -55,6 +55,8 @@ import androidx.compose.ui.unit.sp
 import com.cruisemesh.app.chat.UserIdHex
 import com.cruisemesh.app.chat.tickStatusFor
 import com.cruisemesh.app.mesh.ReachabilityLevel
+import com.cruisemesh.app.friending.AirplaneDemoHint
+import com.cruisemesh.app.friending.AirplaneDemoHintStore
 import com.cruisemesh.app.mesh.WifiTipStore
 import uniffi.cruisemesh_core.Contact
 import uniffi.cruisemesh_core.Group
@@ -294,6 +296,17 @@ fun ChatListScreen(
             val showWifiTip by WifiTipStore.showTip.collectAsState()
             if (showWifiTip) {
                 KeepWifiOnTip(onDismiss = { WifiTipStore.dismiss(tipContext) })
+            }
+            // The one-time "it keeps working with no internet" hint, on the
+            // surface where the first friend actually turns up. The
+            // friend-added sheet offers it first, but that sheet is gone in a
+            // second if somebody swipes it; this is where it waits.
+            val showAirplaneHint by AirplaneDemoHintStore.showHint.collectAsState()
+            if (ChatListLogic.showsAirplaneHint(showAirplaneHint, summaries)) {
+                AirplaneDemoHint(
+                    onDismiss = { AirplaneDemoHintStore.dismiss(tipContext) },
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
             }
 
             if (summaries.isEmpty()) {
