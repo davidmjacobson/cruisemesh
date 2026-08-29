@@ -4,6 +4,7 @@ import android.content.Context
 import android.provider.Settings
 import androidx.compose.ui.graphics.luminance
 import androidx.test.core.app.ApplicationProvider
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertEquals
 import org.junit.Test
@@ -17,6 +18,39 @@ import java.util.Calendar
 class ChatListLogicTest {
 
     private val context: Context = ApplicationProvider.getApplicationContext()
+
+    private fun summary(isGroup: Boolean) = ChatSummary(
+        chatId = byteArrayOf(if (isGroup) 2 else 1),
+        title = if (isGroup) "Deck party" else "A friend",
+        isGroup = isGroup,
+        lastMessage = null,
+        unreadCount = 0,
+        ownDeliveredThrough = 0uL,
+        ownReadThrough = 0uL,
+    )
+
+    @Test
+    fun airplaneHintWaitsForAFriend() {
+        assertFalse(ChatListLogic.showsAirplaneHint(hintUnseen = true, summaries = emptyList()))
+        assertTrue(
+            ChatListLogic.showsAirplaneHint(hintUnseen = true, summaries = listOf(summary(isGroup = false))),
+        )
+    }
+
+    /** A group on its own is not proof of anybody to try the demo with. */
+    @Test
+    fun airplaneHintIgnoresGroupsOnTheirOwn() {
+        assertFalse(
+            ChatListLogic.showsAirplaneHint(hintUnseen = true, summaries = listOf(summary(isGroup = true))),
+        )
+    }
+
+    @Test
+    fun airplaneHintStaysGoneOnceItHasBeenRead() {
+        assertFalse(
+            ChatListLogic.showsAirplaneHint(hintUnseen = false, summaries = listOf(summary(isGroup = false))),
+        )
+    }
 
     @Test
     fun unknownGroupMemberUsesStableReadableIdSuffix() {

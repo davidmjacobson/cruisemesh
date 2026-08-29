@@ -7,6 +7,9 @@ import androidx.core.content.FileProvider
 import com.cruisemesh.app.AppStore
 import java.io.File
 import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Locale
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -26,6 +29,8 @@ import java.util.zip.ZipOutputStream
  */
 object DiagnosticsShare {
     private const val ARCHIVE_DIR = "diagnostics"
+    private val SAVE_STAMP: DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss", Locale.US)
 
     /**
      * A share [Intent] carrying every captured artifact as one zip, or `null`
@@ -41,26 +46,89 @@ object DiagnosticsShare {
      * is a simpler thing to ask a family member for anyway.
      */
     fun shareIntent(context: Context): Intent? {
-        val files = capturedFiles(context)
-        if (files.isEmpty()) return null
-        val archive = writeArchive(files, archiveFile(context))
-        val uri = uriFor(context, archive ?: files.first())
+        val payload = preparePayload(context) ?: return null
+        val uri = uriFor(context, payload)
         // Chooser result is not a read; confirmation waits for this URI.
         DiagnosticsShareHandoff.expect(uri.toString())
         return Intent(Intent.ACTION_SEND).apply {
-            if (archive != null) {
-                type = "application/zip"
-                putExtra(Intent.EXTRA_STREAM, uri)
-            } else {
-                // Zipping is a disk write and can fail -- a full device, most
-                // likely. Sending the log alone beats telling someone who has
-                // captured diagnostics that they have none.
-                type = mimeFor(files.first())
-                putExtra(Intent.EXTRA_STREAM, uri)
-            }
+            type = mimeFor(payload)
+            putExtra(Intent.EXTRA_STREAM, uri)
             putExtra(Intent.EXTRA_SUBJECT, "CruiseMesh diagnostics")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+    }
+
+    /**
+     * What a save is waiting on: the picker to launch, and the bytes to copy
+     * into whatever it comes back with.
+     */
+    data class SavePlan(val intent: Intent, val source: File)
+
+    /**
+     * The same bytes [shareIntent] would send, headed for a folder the user
+     * picks instead of an app. Returns `null` when there is nothing captured.
+     *
+     * A share sheet is not a way out of the boat. At sea there may be no mail
+     * account signed in, no messaging app willing to take a zip, and no
+     * network for either -- which is the exact situation that produced the
+     * diagnostics. `ACTION_CREATE_DOCUMENT` needs none of that: the file lands
+     * in on-device storage, or on a USB drive, and can be handed over later.
+     *
+     * Deliberately built from [preparePayload], the same call the share path
+     * makes, so the two actions cannot drift into sending different bytes.
+     */
+    fun savePlan(context: Context, now: LocalDateTime = LocalDateTime.now()): SavePlan? {
+        val payload = preparePayload(context) ?: return null
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mimeFor(payload)
+            putExtra(Intent.EXTRA_TITLE, saveFileName(payload.name, now))
+        }
+        return SavePlan(intent, payload)
+    }
+
+    /**
+     * Copies [source] into the document the picker returned. `false` on any
+     * failure, including a provider that hands back no stream at all.
+     *
+     * Nothing is deleted on failure: the target belongs to whichever app backs
+     * the picked folder, and truncating someone else's file to zero would be a
+     * worse outcome than a partial write we report honestly.
+     */
+    fun writeTo(context: Context, source: File, target: Uri): Boolean = runCatching {
+        context.contentResolver.openOutputStream(target)?.use { out ->
+            source.inputStream().buffered().use { it.copyTo(out) }
+            true
+        } ?: false
+    }.getOrDefault(false)
+
+    /**
+     * The name the picker offers, from the payload's own extension so a
+     * fallback log is not proposed as a zip.
+     *
+     * Timestamped to the second rather than the day: someone working a problem
+     * saves twice in an afternoon, and two files called the same thing --
+     * silently renamed "(1)" by the picker -- is how the older one gets sent.
+     * No spaces, so it survives being typed into a shell or a mail client that
+     * breaks a URL at the first one.
+     */
+    internal fun saveFileName(payloadName: String, now: LocalDateTime): String {
+        val extension = payloadName.substringAfterLast('.', "")
+        val suffix = if (extension.isEmpty()) "" else ".$extension"
+        return "cruisemesh-diagnostics-${SAVE_STAMP.format(now)}$suffix"
+    }
+
+    /**
+     * The one file both actions hand over, or `null` when nothing is captured.
+     *
+     * Zipping is a disk write and can fail -- a full device, most likely --
+     * and the log alone beats telling someone who has captured diagnostics
+     * that they have none.
+     */
+    private fun preparePayload(context: Context): File? {
+        val files = capturedFiles(context)
+        if (files.isEmpty()) return null
+        return writeArchive(files, archiveFile(context)) ?: files.first()
     }
 
     /**
@@ -152,6 +220,9 @@ object DiagnosticsShare {
     private fun uriFor(context: Context, file: File): Uri =
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
 
-    private fun mimeFor(file: File): String =
-        if (file.name.endsWith(".csv")) "text/csv" else "text/plain"
+    private fun mimeFor(file: File): String = when {
+        file.name.endsWith(".zip") -> "application/zip"
+        file.name.endsWith(".csv") -> "text/csv"
+        else -> "text/plain"
+    }
 }
