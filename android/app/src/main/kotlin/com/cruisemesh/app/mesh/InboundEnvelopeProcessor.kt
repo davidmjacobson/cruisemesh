@@ -1515,7 +1515,16 @@ internal class InboundEnvelopeProcessor(
         if (!inserted) return
         ChatEvents.notifyChatChanged(senderUserId)
 
-        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = ChatVisibility.isVisible(senderUserId))
+        // DELIVERED only, never READ. A friend request is not a conversation
+        // row -- core's `coreIsVisibleChatKind` leaves kind=3 out, so it is
+        // never rendered and there is nothing here for the user to have read.
+        // The chat can only be on screen at all when an existing contact
+        // re-sends (a stranger has no chat to open), and keying READ off that
+        // raised this stream's READ watermark to the plain MAX lamport held --
+        // so a request that overtook a still-in-flight text painted a read
+        // tick on a message this phone had not even received. iOS's
+        // `handleIncomingFriendRequest` has always acked DELIVERED only.
+        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = false)
         if (!wasKnown) {
             FriendImportEvents.notifyImported(contact, directBle)
             announcer.announceFriendAdded(contact)
@@ -1684,7 +1693,10 @@ internal class InboundEnvelopeProcessor(
         ChatEvents.notifyChatChanged(senderUserId)
 
         val contact = store.getContact(senderUserId) ?: existing
-        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = ChatVisibility.isVisible(senderUserId))
+        // Same rule as the friend-request path: a profile sync is never a
+        // conversation row, so it acks DELIVERED only. iOS's
+        // `handleIncomingProfileSync` does the same.
+        acknowledgePeerStream(identity, contact, address, senderUserId, markRead = false)
         if (policyChanged) {
             FriendDirectorySender.queueToAllContacts(context, store, identity)
         }
