@@ -3385,6 +3385,27 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             receiptType: ReceiptType.delivered,
             throughLamport: through
         )
+        // The live receipt below is best-effort: it reaches the sender only if
+        // a link happens to be up right now. The durable half is this sealed
+        // receipt envelope, which the next relay sync uploads -- it is what
+        // eventually moves the sender's DELIVERED watermark and lets them
+        // retire their carried copy of the request. Every other consuming
+        // handler in this file queues it (`handleIncomingChatMessage`,
+        // `handleIncomingProfileSync`, and every hidden kind via
+        // `acknowledgeHiddenMessage`), and so does Android's twin, whose
+        // friend-request path runs the shared `acknowledgePeerStream`. This
+        // one did not, so a friend request that was accepted while the
+        // requester was offline was re-sprayed for the whole life of the
+        // envelope.
+        if queueOutgoingReceiptForRelay(
+            identity: identity,
+            contact: contact,
+            receiptType: ReceiptType.delivered,
+            ackedSenderUserId: senderUserId,
+            throughLamport: through
+        ) {
+            RelaySyncEvents.requestSync()
+        }
         if let sourceAddress {
             sendReceiptOnAddress(
                 identity: identity,
