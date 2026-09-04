@@ -1383,18 +1383,23 @@ private fun TroubleshootingControls(
     }
     Button(
         onClick = {
-            // One button, everything captured -- see DiagnosticsShare.
-            DiagnosticsShare.shareIntent(context)?.let { intent ->
-                if (onShareDiagnostics != null) {
-                    onShareDiagnostics(intent)
-                } else {
-                    context.startActivity(
-                        Intent.createChooser(intent, context.getString(R.string.ui_share_diagnostics)),
-                    )
+            // One button, everything captured -- see DiagnosticsShare. Zipping
+            // the captured files is disk (and SQLite) work, so it moves off
+            // the calling thread; only the chooser launch stays on Main.
+            scope.launch {
+                val intent = withContext(Dispatchers.IO) { DiagnosticsShare.shareIntent(context) }
+                intent?.let {
+                    if (onShareDiagnostics != null) {
+                        onShareDiagnostics(it)
+                    } else {
+                        context.startActivity(
+                            Intent.createChooser(it, context.getString(R.string.ui_share_diagnostics)),
+                        )
+                    }
+                    hasCapturedDiagnostics = true
+                } ?: run {
+                    supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
                 }
-                hasCapturedDiagnostics = true
-            } ?: run {
-                supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
             }
         },
         modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
@@ -1404,12 +1409,18 @@ private fun TroubleshootingControls(
             // A share sheet is only as good as the apps behind it, and at sea
             // there may be none: no mail account signed in, nothing willing to
             // take a zip, no network for either. The same bytes, into a folder.
-            DiagnosticsShare.savePlan(context)?.let { plan ->
-                pendingSaveSource = plan.source
-                saveLauncher.launch(plan.intent)
-                hasCapturedDiagnostics = true
-            } ?: run {
-                supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+            // Preparing them is the same disk work as the share path, moved
+            // off the calling thread the same way; only the picker launch
+            // stays on Main.
+            scope.launch {
+                val plan = withContext(Dispatchers.IO) { DiagnosticsShare.savePlan(context) }
+                plan?.let {
+                    pendingSaveSource = it.source
+                    saveLauncher.launch(it.intent)
+                    hasCapturedDiagnostics = true
+                } ?: run {
+                    supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+                }
             }
         },
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
