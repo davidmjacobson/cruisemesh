@@ -367,33 +367,36 @@ fun GroupChatScreen(
                 draft = draft,
                 onDraftChange = { draft = it },
                 onSend = {
-                    val text = draft.trim()
                     val replyToMsgId = replyingTo?.let { replyMetadata[messageStableKey(it)]?.msgId }
-                    val photo = pendingPhoto
-                    val result = if (photo != null) {
-                        sender.sendAttachment(
-                            currentGroup,
-                            AttachmentPayload(
-                                mediaType = AttachmentPayload.MediaType.IMAGE,
-                                mimeType = "image/jpeg",
-                                durationMs = 0,
-                                blob = photo,
-                                caption = text,
-                            ),
-                            replyToMsgId,
-                        )
-                    } else if (text.isNotEmpty()) {
-                        sender.sendText(currentGroup, text, replyToMsgId)
-                    } else {
-                        SendResult.FAILED
-                    }
-                    if (result == SendResult.STORED) {
-                        pendingPhoto = null
-                        draft = ""
-                        replyingTo = null
-                        reload()
-                    } else {
-                        showSendFailure()
+                    val outcome = ComposerSendPolicy.attempt(
+                        draft = draft,
+                        pendingPhoto = pendingPhoto,
+                        sendPhoto = { photo, caption ->
+                            sender.sendAttachment(
+                                currentGroup,
+                                AttachmentPayload(
+                                    mediaType = AttachmentPayload.MediaType.IMAGE,
+                                    mimeType = "image/jpeg",
+                                    durationMs = 0,
+                                    blob = photo,
+                                    caption = caption,
+                                ),
+                                replyToMsgId,
+                            )
+                        },
+                        sendText = { text -> sender.sendText(currentGroup, text, replyToMsgId) },
+                    )
+                    // Assigned back unconditionally: the composer empties only
+                    // when [ComposerSendPolicy] says the message is durably queued.
+                    draft = outcome.draft
+                    pendingPhoto = outcome.pendingPhoto
+                    when (outcome.status) {
+                        ComposerSendStatus.QUEUED -> {
+                            replyingTo = null
+                            reload()
+                        }
+                        ComposerSendStatus.NOT_QUEUED -> showSendFailure()
+                        ComposerSendStatus.NOTHING_TO_SEND -> Unit
                     }
                 },
                 hasPendingAttachment = pendingPhoto != null,

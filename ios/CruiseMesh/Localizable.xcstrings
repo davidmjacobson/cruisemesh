@@ -1435,6 +1435,16 @@
         }
       }
     },
+    "Couldn't send. Your message is still here.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't send. Your message is still here."
+          }
+        }
+      }
+    },
     "CruiseMesh doesn't have step-by-step help for this one yet. Open Troubleshooting & diagnostics, share diagnostics, and contact support.": {
       "localizations": {
         "en": {
