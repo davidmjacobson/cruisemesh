@@ -12,11 +12,29 @@ COPY relayd ./relayd
 COPY desktop ./desktop
 # FR4: the build context above deliberately does not include `.git`, so
 # `relayd/build.rs`'s `git rev-parse` fallback can't see the real commit
-# from inside this stage. Pass it in explicitly:
-#   docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
-# Falls back to "unknown" (build.rs's own default) if not provided.
-ARG GIT_SHA=unknown
+# from inside this stage. It has to be supplied per invocation:
+#   docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD) relayd
+# `tools/relay_deploy.sh` is the supported way to do that.
+#
+# There is deliberately no default. The old one was `unknown`, paired with
+# `GIT_SHA: ${GIT_SHA:-unknown}` in compose and a static `GIT_SHA=...` line
+# in the box's `relayd/.env` -- so a deploy that pulled new code and left
+# `.env` alone built the new commit and reported the previous one on
+# /healthz. A confident wrong answer is worse than no answer, and that one
+# misdirected two real deploy investigations. An absent GIT_SHA now fails
+# the build: here, cheaply, before cargo runs, and again inside build.rs
+# through CRUISEMESH_REQUIRE_GIT_SHA, which additionally rejects a literal
+# "unknown" and anything that is not shaped like a commit.
+ARG GIT_SHA
 ENV GIT_SHA=${GIT_SHA}
+ENV CRUISEMESH_REQUIRE_GIT_SHA=1
+RUN if [ -z "$GIT_SHA" ] || [ "$GIT_SHA" = "unknown" ]; then \
+        echo "ERROR: the GIT_SHA build arg is missing or 'unknown'." >&2; \
+        echo "This image would report the wrong commit on /healthz." >&2; \
+        echo "Deploy with tools/relay_deploy.sh, or build with:" >&2; \
+        echo '  docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD) relayd' >&2; \
+        exit 1; \
+    fi
 RUN cargo build --release -p cruisemesh-relayd
 
 FROM debian:bookworm-slim

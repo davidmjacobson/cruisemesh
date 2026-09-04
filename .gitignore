@@ -51,3 +51,10 @@ __pycache__/
 
 # Release provenance record the release workflows write into the workspace
 /release-provenance.txt
+
+# The relay box's own compose environment: family bearer tokens and the admin
+# token live here (relayd/DEPLOY.md §2). DEPLOY.md has always asked that it not
+# be committed; this makes that enforced rather than requested. A private
+# compose override carries the APNs key path (§7.1) for the same reason.
+/relayd/.env
+/relayd/docker-compose.override.yml
