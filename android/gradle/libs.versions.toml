@@ -34,7 +34,7 @@ screenshot = "0.0.1-alpha16"
 # @Testable-annotated), it is compileOnly, and the plugin's own engine puts its
 # matching alpha16 copy on the test runtime classpath. Bump this to match the
 # plugin once the project's Kotlin is 2.2+.
-screenshotValidationApi = "0.0.1-alpha15"
+screenshotValidationApi = "0.0.1-alpha16"
 
 [libraries]
 core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
