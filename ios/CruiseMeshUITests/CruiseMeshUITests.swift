@@ -135,7 +135,20 @@ final class CruiseMeshUITests: XCTestCase {
         app.buttons["More"].tap()
         app.buttons["Settings"].tap()
         XCTAssertTrue(element("screen.settings").waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["CruiseMesh operation"].exists)
+        // Third section down, under two tall ones: the checklist row, then the
+        // pass row with its own optional delivery-date and renewal lines. On a
+        // compact phone at an accessibility text size that header starts below
+        // the fold, and a Form builds its rows lazily -- so it is missing from
+        // the accessibility tree rather than merely off screen, and a bare
+        // `exists` can only ever be false there. Scroll and re-query together,
+        // the same way the other below-the-fold assertions in this file do.
+        let operation = app.staticTexts["CruiseMesh operation"]
+        XCTAssertTrue(
+            scrollUntilHittable(operation),
+            "The CruiseMesh operation section never came into view in settings"
+        )
+        // Close lives in the navigation bar, so scrolling the form does not
+        // move it out of reach.
         app.buttons["Close"].tap()
         assertUsableHome()
     }
