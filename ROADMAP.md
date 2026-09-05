@@ -4,9 +4,11 @@ Milestones 0–6 are the history: each one de-risked the next, and
 [DESIGN.md](DESIGN.md) §11 is their authoritative record. Everything under
 "Where this goes next" is planned rather than done, and says how firmly.
 
-**Where the project is right now:** both apps are in release testing (Play
-closed track, TestFlight) ahead of public store listings. One sailing has
-validated the ship-LAN transport; the instrumented week has not happened yet.
+**Where the project is right now:** both apps are public — [App
+Store](https://apps.apple.com/app/id6789561040) and [Google
+Play](https://play.google.com/store/apps/details?id=com.cruisemesh.app), free,
+no account. One sailing has validated the ship-LAN transport; the instrumented
+week has not happened yet.
 
 ## How it got here
 
