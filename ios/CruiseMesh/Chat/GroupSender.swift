@@ -51,12 +51,13 @@ final class GroupSender {
     }
 
     /// Sends `text` into `group`'s chat stream, sealed with the group key.
-    func sendText(group: Group, text: String, replyToMsgId: Data? = nil) {
+    @discardableResult
+    func sendText(group: Group, text: String, replyToMsgId: Data? = nil) -> SendResult {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let payload = Data(trimmed.utf8)
-        guard !payload.isEmpty, group.memberUserIds.contains(identity.userId) else { return }
+        guard !payload.isEmpty, group.memberUserIds.contains(identity.userId) else { return .failed }
 
-        enqueueGroupMessage(
+        return enqueueGroupMessage(
             group: group,
             kind: ProtocolKind.text,
             payload: payload,
@@ -65,14 +66,15 @@ final class GroupSender {
         )
     }
 
+    @discardableResult
     func sendAttachment(
         group: Group,
         attachment: AttachmentPayload,
         replyToMsgId: Data? = nil
-    ) {
+    ) -> SendResult {
         guard group.memberUserIds.contains(identity.userId),
-              attachment.blob.count <= AttachmentPayload.maxBlobBytes else { return }
-        enqueueGroupMessage(
+              attachment.blob.count <= AttachmentPayload.maxBlobBytes else { return .failed }
+        return enqueueGroupMessage(
             group: group,
             kind: ProtocolKind.attachmentManifest,
             payload: attachment.encode(),
@@ -81,10 +83,11 @@ final class GroupSender {
         )
     }
 
-    func sendReaction(group: Group, target: MessageTarget, emoji: String) {
-        guard group.memberUserIds.contains(identity.userId) else { return }
-        guard let payload = ReactionPayload(target: target, emoji: emoji).encode() else { return }
-        enqueueGroupMessage(
+    @discardableResult
+    func sendReaction(group: Group, target: MessageTarget, emoji: String) -> SendResult {
+        guard group.memberUserIds.contains(identity.userId) else { return .failed }
+        guard let payload = ReactionPayload(target: target, emoji: emoji).encode() else { return .failed }
+        return enqueueGroupMessage(
             group: group,
             kind: ProtocolKind.reaction,
             payload: payload,
@@ -138,20 +141,29 @@ final class GroupSender {
         }
     }
 
+    @discardableResult
     private func enqueueGroupMessage(
         group: Group,
         kind: UInt8,
         payload: Data,
         label: String,
         replyToMsgId: Data? = nil
-    ) {
+    ) -> SendResult {
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        guard let authored = try? store.authorGroupMessage(
-            identity: identity, group: group, kind: kind, payload: payload,
-            replyToMsgId: replyToMsgId, timestampMs: timestamp
-        ) else {
-            return
+        let authored: AuthoredEnvelope
+        do {
+            authored = try store.authorGroupMessage(
+                identity: identity, group: group, kind: kind, payload: payload,
+                replyToMsgId: replyToMsgId, timestampMs: timestamp
+            )
+        } catch {
+            // Nothing stored, nothing queued: the composer must keep the text.
+            log.error("\(label, privacy: .public): message was not stored: \(error.localizedDescription, privacy: .public)")
+            return .failed
         }
+        // Past the commit. Best-effort from here, never `.failed` — a retry
+        // would author the same message a second time.
+        //
         // V2 field metric: note the outbound group send for the cruise-test export.
         try? store.recordSentMetric(
             chatId: authored.message.chatId,
@@ -160,6 +172,7 @@ final class GroupSender {
         )
         ChatEvents.notifyChatChanged(authored.message.chatId)
         publishGroupFrame(label: label, authored: authored)
+        return .stored
     }
 
     private func publishGroupFrame(label: String, authored: AuthoredEnvelope) {
