@@ -77,16 +77,25 @@ if [ -z "$ADMIN_TOKEN" ]; then
 fi
 # CRUISEMESH_RELAY_TOKENS is intentionally empty: this is a hosted deploy where
 # every family is provisioned through the admin API, not the static allowlist.
+#
+# GIT_SHA is deliberately NOT written here. This file is rewritten only when
+# provisioning runs, while the checkout moves on every deploy, so a stored SHA
+# is a value that silently stops being true -- /healthz then reports the commit
+# from the last provisioning run while the box serves newer code. The deploy
+# script reads it from the checkout instead. Re-running this script drops a
+# GIT_SHA line left over from an older version of it.
 cat > "$ENV_FILE" <<EOF
 RELAY_DOMAIN=$RELAY_DOMAIN
 CRUISEMESH_RELAY_TOKENS=
 CRUISEMESH_RELAY_ADMIN_TOKEN=$ADMIN_TOKEN
-GIT_SHA=$(git rev-parse --short HEAD)
 EOF
 chmod 600 "$ENV_FILE"
 
 echo "==> [5/6] Build & start (relayd + Caddy)"
-docker compose up -d --build
+# Not `docker compose up -d --build`: the relayd image needs the commit passed
+# in as a build arg, and this script is where the checkout's HEAD is known to
+# be what was just fetched. relay_deploy.sh also verifies /healthz reports it.
+"$APP_DIR/tools/relay_deploy.sh"
 
 echo "==> [6/6] Waiting for https://$RELAY_DOMAIN/healthz (TLS issuance can take ~30s)"
 ok=""

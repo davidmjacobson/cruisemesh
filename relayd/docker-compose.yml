@@ -3,7 +3,17 @@
 # Usage (from this directory, on a VPS with a public DNS name):
 #   export CRUISEMESH_RELAY_TOKENS="your-long-random-family-token"
 #   export RELAY_DOMAIN="relay.example.com"
-#   docker compose up -d --build
+#   ../tools/relay_deploy.sh
+#
+# Build through `tools/relay_deploy.sh`, not `docker compose up -d --build`.
+# The image needs a GIT_SHA build arg it cannot derive for itself (`.git` is
+# outside the build context), and there is deliberately no `args: GIT_SHA:`
+# entry here any more: compose would resolve it from the environment, which
+# in practice meant the box's `relayd/.env`, and a stored value goes stale
+# the moment someone pulls without editing it. The script reads the commit
+# from the checkout at deploy time and passes it for that invocation only.
+# `docker compose up -d --build` still works for everything else, but the
+# relayd image build will fail loudly rather than bake in a wrong commit.
 #
 # See DEPLOY.md for the full walkthrough (tokens, DNS, DB path gotcha).
 
@@ -12,13 +22,6 @@ services:
     build:
       context: ..
       dockerfile: relayd/Dockerfile
-      args:
-        # FR4: `.git` is not in the build context (see Dockerfile comment);
-        # pass the real commit through explicitly, e.g.:
-        #   export GIT_SHA=$(git rev-parse --short HEAD)
-        #   docker compose up -d --build
-        # Falls back to "unknown" if unset.
-        GIT_SHA: ${GIT_SHA:-unknown}
     environment:
       # Comma-separated family bearer tokens. Required for self-hosted use;
       # a hosted deploy that provisions families via the admin API may set

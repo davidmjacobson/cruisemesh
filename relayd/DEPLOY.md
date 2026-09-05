@@ -78,14 +78,22 @@ export CRUISEMESH_RELAY_TOKENS="<paste token(s) here>"
 Optional: put the exports in a root-only `.env` next to `docker-compose.yml`
 (Compose loads it automatically). **Do not commit `.env`.**
 
+`.env` holds only values that stay true between deploys — the domain, the
+tokens, the APNs settings. **Never put `GIT_SHA` in it**; §3.1 explains what
+that cost. An older version of `provision-hetzner.sh` wrote one, so on an
+existing box delete the line if it is still there:
+
+```sh
+sed -i '/^GIT_SHA=/d' /opt/cruisemesh/relayd/.env
+```
+
+Nothing reads it any more, so a leftover line is inert rather than dangerous —
+but it invites the next person to trust it.
+
 ## 3. Start
 
 ```sh
-# Optional but recommended: bakes the exact commit into the image so
-# /healthz reports what's actually running instead of "unknown".
-export GIT_SHA=$(git rev-parse --short HEAD)
-
-docker compose up -d --build
+../tools/relay_deploy.sh
 docker compose ps
 curl -fsS "https://${RELAY_DOMAIN}/healthz"
 # → {"status":"ok","version":"0.1.0","commit":"abc1234"}
@@ -94,6 +102,42 @@ curl -fsS "https://${RELAY_DOMAIN}/healthz"
 Caddy obtains a Let's Encrypt cert for `RELAY_DOMAIN` on first start. If
 `/healthz` fails, check `docker compose logs caddy` (DNS not pointed yet is
 the usual cause).
+
+### 3.1 Redeploying a new commit
+
+```sh
+git -C /opt/cruisemesh pull --ff-only origin master
+/opt/cruisemesh/tools/relay_deploy.sh
+```
+
+That is the whole upgrade procedure. The script reads `HEAD` from the checkout,
+passes it to the image build as `--build-arg GIT_SHA=…` for that invocation
+only, starts the stack, then reads `/healthz` back and fails if the commit it
+reports is not the one just built.
+
+**Use it instead of `docker compose up -d --build`.** The commit in `/healthz`
+is baked in at build time, and the build context deliberately excludes `.git`
+(see `relayd/Dockerfile`), so the image cannot work out its own commit. It used
+to be handed in from a static `GIT_SHA=` line in `.env`, which meant pulling
+new code without also hand-editing `.env` produced a relay that ran the new
+commit and reported the previous one. `/healthz` is exactly what you consult
+when you are unsure whether a fix is live, so a wrong answer there is worse
+than no answer — that one sent two deploy investigations chasing changes which
+had in fact already shipped. A build with no `GIT_SHA` now fails outright
+rather than guessing.
+
+Two consequences:
+
+- The script **refuses to deploy a tree with uncommitted changes to tracked
+  files**, since the image would not be the commit it claims. Commit or revert
+  them, or set `ALLOW_DIRTY=1` to proceed — the image is then stamped
+  `<sha>-dirty`, so `/healthz` keeps saying that what is running is not exactly
+  any commit. Untracked files (`.env`, a private
+  `docker-compose.override.yml`, backups) are ignored; they do not change what
+  gets compiled.
+- `docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD) relayd`
+  followed by `docker compose up -d` is the same thing by hand, if you need to
+  take it a step at a time.
 
 ## 4. Point phones at the relay
 
@@ -139,6 +183,10 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_APNS_PRIVATE_KEY_FILE` | *(unset = APNs off)* | Absolute container path to the private `.p8` provider key. Never commit or bake it into the image. |
 | `CRUISEMESH_APNS_ENVIRONMENT` | `production` | `production`, `sandbox`, or `development` (`development` aliases `sandbox`). |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
+
+`GIT_SHA` is **not** in that table and does not belong in `.env`: it is a
+build-time argument, supplied per deploy by `tools/relay_deploy.sh` and baked
+into the image, not a setting the running process reads. See §3.1.
 
 ### The `CRUISEMESH_RELAY_DB` path gotcha
 
@@ -362,7 +410,7 @@ export CRUISEMESH_APNS_TEAM_ID=DEF456
 export CRUISEMESH_APNS_BUNDLE_ID=com.cruisemesh.app
 export CRUISEMESH_APNS_PRIVATE_KEY_FILE=/run/secrets/cruisemesh-apns.p8
 export CRUISEMESH_APNS_ENVIRONMENT=production
-docker compose up -d --build
+../tools/relay_deploy.sh          # §3.1 — supplies the GIT_SHA build arg
 docker compose logs relayd | grep apns_wakes
 ```
 
