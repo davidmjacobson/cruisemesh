@@ -3989,3 +3989,677 @@ fn a_presence_answer_is_reported_as_an_age_rather_than_a_relay_timestamp() {
         observation.observed_at_ms
     );
 }
+
+// ===========================================================================
+// HEALTH-01 — a friend's lapsed pass is theirs, not ours
+// ===========================================================================
+//
+// Field report: a phone whose own Shore Pass never expires showed "Pass
+// expired · renewal required", while the relay logged thousands of
+// `family_expired` refusals for a *different* family — a friend's 30-day pass
+// that had lapsed. Every post to that friend's deposit card took the 403, the
+// pass folded it into its own health, and nothing ever wrote the card off, so
+// it happened again on every pass. These scenarios pin the fix: only our own
+// credential decides our own pass health, and a contact's refusal advances
+// that contact's rejection streak (once per pass) instead.
+
+/// The bearer token a recorded request carried.
+fn bearer(recorded: &Recorded) -> String {
+    recorded
+        .request
+        .headers
+        .iter()
+        .find(|header| header.name == "Authorization")
+        .and_then(|header| header.value.strip_prefix("Bearer "))
+        .expect("every relay request is authenticated")
+        .to_string()
+}
+
+/// The field shape: a friend from another family whose post-only deposit card
+/// names the shared hosted relay, the same host as our own mailbox.
+fn cross_family_contact_on_own_host(
+    user_id: Vec<u8>,
+    member_token: &str,
+) -> CoreRelayContactConfig {
+    CoreRelayContactConfig {
+        user_id,
+        relay_url: Some(OWN_URL.to_string()),
+        relay_token: Some(cruisemesh_core::relay_deposit_token_for(
+            member_token.to_string(),
+        )),
+        endpoint_usable: true,
+        endpoint_answering: true,
+    }
+}
+
+fn contact_deposit_token() -> String {
+    cruisemesh_core::relay_deposit_token_for(CONTACT_TOKEN.to_string())
+}
+
+/// A reply with a status and no structured code at all.
+fn bare_status(status: u16) -> Reply {
+    Reply {
+        status,
+        headers: Vec::new(),
+        body: b"{}".to_vec(),
+        error: None,
+        elapsed_ms: 40,
+    }
+}
+
+fn reject_streak_of(store: &MessageStore, user_id: &[u8]) -> i64 {
+    store
+        .list_contact_relay_rejections()
+        .expect("list rejections")
+        .into_iter()
+        .find(|row| row.user_id == user_id)
+        .map(|row| row.reject_streak)
+        .unwrap_or(0)
+}
+
+fn seed_receipts_to(
+    store: &MessageStore,
+    recipient: &[u8],
+    seed_base: u64,
+    count: usize,
+    now_ms: i64,
+) {
+    let expiry = now_ms + 6 * 24 * 60 * 60 * 1000;
+    for index in 0..count {
+        store
+            .upsert_outgoing_receipt_envelope(
+                OutgoingReceiptEnvelope {
+                    msg_id: msg_id(seed_base + index as u64),
+                    recipient_user_id: recipient.to_vec(),
+                    // Distinct per seed: a receipt is keyed on its thread, so
+                    // two recipients sharing chat ids would collapse into one.
+                    chat_id: {
+                        let mut chat = vec![index as u8 + 1; 32];
+                        chat[..8].copy_from_slice(&seed_base.to_be_bytes());
+                        chat
+                    },
+                    sender_user_id: vec![7u8; 32],
+                    receipt_type: RECEIPT_TYPE_DELIVERED,
+                    through_lamport: 5,
+                    timestamp: now_ms,
+                    hop_ttl: 3,
+                    expiry,
+                    recipient_hint: compute_recipient_hint(recipient.to_vec(), now_ms),
+                    sealed: vec![0x22u8; 64],
+                },
+                now_ms,
+            )
+            .expect("queue receipt");
+    }
+}
+
+fn seed_named_contact(store: &MessageStore, user_id: &[u8], name: &str) {
+    store
+        .upsert_contact(Contact {
+            user_id: user_id.to_vec(),
+            name: name.to_string(),
+            sign_pk: vec![1u8; 32],
+            agree_pk: vec![2u8; 32],
+            relay_url: Some(OWN_URL.to_string()),
+            relay_token: None,
+            nickname: None,
+        })
+        .expect("upsert contact");
+}
+
+/// Our own mailbox healthy, the friend's deposit card refused with `reply`.
+fn own_ok_contact_refused(reply: Reply) -> impl FnMut(&Recorded, usize) -> Reply {
+    let deposit = contact_deposit_token();
+    move |request, _index| {
+        if bearer(request) == deposit {
+            return reply.clone();
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    }
+}
+
+#[test]
+fn a_contact_endpoints_expired_pass_is_not_our_own() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 2, now);
+    seed_receipts(&store, 2, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact_on_own_host(
+        contact_user_id(),
+        CONTACT_TOKEN,
+    )];
+
+    let pass = CoreRelayPass::new(store.clone(), plan.clone(), "p1".to_string());
+    let run = drive(
+        &pass,
+        now,
+        own_ok_contact_refused(Reply::status(403, "family_expired")),
+    );
+
+    assert!(
+        run.posts()
+            .iter()
+            .any(|post| bearer(post) == contact_deposit_token()),
+        "the scenario needs a post to the friend's card"
+    );
+    assert_eq!(
+        run.summary.health,
+        cruisemesh_core::CoreRelayPassHealth::Ok,
+        "a friend's lapsed family must never read as our own pass expiring"
+    );
+    assert_eq!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending outbound")
+            .len(),
+        2,
+        "a refused post marks nothing: the authored rows stay queued for mesh and later passes"
+    );
+    assert_eq!(
+        store
+            .pending_relay_outgoing_receipt_envelopes(1_000, now, Vec::new())
+            .expect("pending receipts")
+            .len(),
+        2,
+        "and so do the receipts"
+    );
+    assert!(run.acks().is_empty(), "nothing was acked");
+    assert_eq!(
+        reject_streak_of(&store, &contact_user_id()),
+        1,
+        "the refusal is the friend's card's, one step per pass"
+    );
+
+    // A second pass, the card still usable (streak 1 is below the threshold).
+    let usable = cruisemesh_core::core_contact_relay_endpoint_usable(1, now, now + 60_000);
+    assert!(usable, "one refusal does not write the card off yet");
+    let pass = CoreRelayPass::new(store.clone(), plan.clone(), "p2".to_string());
+    let run = drive(
+        &pass,
+        now + 60_000,
+        own_ok_contact_refused(Reply::status(403, "family_expired")),
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    let streak = reject_streak_of(&store, &contact_user_id());
+    assert_eq!(streak, 2);
+    assert!(
+        cruisemesh_core::core_contact_relay_is_stale(streak),
+        "two passes of refusals write the card off"
+    );
+
+    // What a person sees: our own path Connected, and this friend flagged.
+    let rejected_at = store
+        .list_contact_relay_rejections()
+        .expect("list")
+        .into_iter()
+        .find(|row| row.user_id == contact_user_id())
+        .expect("row")
+        .rejected_at_ms;
+    let line = cruisemesh_core::core_classify_recipient_delivery(
+        cruisemesh_core::CoreRecipientDeliveryInput {
+            waiting_count: 2,
+            unposted_waiting_count: 2,
+            oldest_waiting_ms: now,
+            last_progress_ms: now,
+            oversized_waiting: false,
+            relay_reject_streak: streak,
+            relay_rejected_at_ms: rejected_at,
+            relay_unreachable_streak: 0,
+            relay_unreachable_at_ms: 0,
+            relay: cruisemesh_core::CoreRelayPathState::Connected,
+            own_relay_usable: true,
+            contact_has_relay_endpoint: true,
+            direct_link: false,
+            now_ms: now + 120_000,
+        },
+    )
+    .expect("waiting mail has a line");
+    assert_eq!(
+        line.blocked_reason,
+        Some(cruisemesh_core::CoreDeliveryBlockedReason::ContactSetupRejected),
+        "the friend is the one who is unreachable over the internet"
+    );
+    assert_eq!(
+        line.attention,
+        Some(cruisemesh_core::CorePersonAttention::SetupRejected)
+    );
+
+    // And the written-off card stops being posted to on the shared host.
+    let mut written_off = plan.clone();
+    written_off.contacts[0].endpoint_usable = false;
+    let pass = CoreRelayPass::new(store.clone(), written_off, "p3".to_string());
+    let run = drive(
+        &pass,
+        now + 120_000,
+        own_ok_contact_refused(Reply::status(403, "family_expired")),
+    );
+    assert!(
+        run.posts()
+            .iter()
+            .all(|post| bearer(post) != contact_deposit_token()),
+        "a written-off card is not posted to again until its recheck is due"
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_no_violation_of(&store, &["SILENCE-01", "RATE-01"]);
+    assert_no_secrets(&store, &run.summary);
+}
+
+#[test]
+fn no_contact_endpoint_refusal_reads_as_our_own_pass_health() {
+    let now = T0;
+    let cases: Vec<(&str, Reply, bool)> = vec![
+        (
+            "family_suspended",
+            Reply::status(403, "family_suspended"),
+            true,
+        ),
+        ("bare 401", bare_status(401), true),
+        ("bare 403", bare_status(403), true),
+        (
+            "507 quota",
+            Reply::status(507, "family_quota_exceeded"),
+            false,
+        ),
+        ("413", bare_status(413), false),
+    ];
+    for (label, reply, advances) in cases {
+        let store = new_store();
+        seed_contact(&store);
+        seed_authored(&store, 2, now);
+        let mut plan = base_plan(now);
+        plan.contacts = vec![cross_family_contact_on_own_host(
+            contact_user_id(),
+            CONTACT_TOKEN,
+        )];
+        let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+        let run = drive(&pass, now, own_ok_contact_refused(reply));
+        assert_eq!(
+            run.summary.health,
+            cruisemesh_core::CoreRelayPassHealth::Ok,
+            "{label}: a friend's card's refusal is not our pass's health"
+        );
+        assert_eq!(
+            reject_streak_of(&store, &contact_user_id()),
+            i64::from(advances),
+            "{label}: only an authoritative refusal advances the friend's streak"
+        );
+        assert_eq!(
+            store
+                .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+                .expect("pending")
+                .len(),
+            2,
+            "{label}: nothing refused is marked posted"
+        );
+    }
+}
+
+#[test]
+fn an_own_credential_expiry_still_reads_as_expired() {
+    let now = T0;
+    // Rows to a recipient with no card in the plan go to our own mailbox.
+    let run_with = |respond: &dyn Fn(&Recorded) -> Reply| {
+        let store = new_store();
+        seed_contact(&store);
+        seed_authored(&store, 2, now);
+        let pass = CoreRelayPass::new(store.clone(), base_plan(now), "p1".to_string());
+        let run = drive(&pass, now, |request, _index| respond(request));
+        assert!(
+            run.posts().iter().all(|post| bearer(post) == OWN_TOKEN),
+            "the scenario posts with our own credential"
+        );
+        run.summary.health
+    };
+
+    // Inside the grace window: posts refused, own fetch still served.
+    assert_eq!(
+        run_with(&|request| {
+            if request.is_post() {
+                Reply::status(403, "family_expired")
+            } else {
+                Reply::ok(empty_page())
+            }
+        }),
+        cruisemesh_core::CoreRelayPassHealth::ExpiredReadOnly
+    );
+    // Past it: everything refused.
+    assert_eq!(
+        run_with(&|_request| Reply::status(403, "family_expired")),
+        cruisemesh_core::CoreRelayPassHealth::Expired
+    );
+    assert_eq!(
+        run_with(&|_request| Reply::status(403, "family_suspended")),
+        cruisemesh_core::CoreRelayPassHealth::Suspended
+    );
+    assert_eq!(
+        run_with(&|_request| bare_status(401)),
+        cruisemesh_core::CoreRelayPassHealth::TokenRejected
+    );
+}
+
+#[test]
+fn a_contact_endpoint_429_still_ends_the_pass() {
+    // RATE-01 parity with both legacy shells: a 429 is a family-budget
+    // verdict whichever credential took it.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 3, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact_on_own_host(
+        contact_user_id(),
+        CONTACT_TOKEN,
+    )];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, own_ok_contact_refused(Reply::rate_limited(20)));
+    assert_eq!(
+        run.summary.health,
+        cruisemesh_core::CoreRelayPassHealth::RateLimited
+    );
+    assert_eq!(run.summary.outcome, CoreRelayPassOutcome::RateLimited);
+    assert!(
+        run.summary.quiet_until_ms >= now + 20_000,
+        "the quiet window is set, got {}",
+        run.summary.quiet_until_ms
+    );
+    assert_eq!(
+        reject_streak_of(&store, &contact_user_id()),
+        0,
+        "a 429 is not a verdict on the friend's card"
+    );
+}
+
+#[test]
+fn a_cross_family_presence_probe_refusal_is_not_our_expiry() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact(contact_user_id(), CONTACT_URL)];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.request.base_url == CONTACT_URL {
+            return Reply::status(403, "family_expired");
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert_eq!(
+        presence_requests(&run)
+            .iter()
+            .filter(|r| r.request.base_url == CONTACT_URL)
+            .count(),
+        1,
+        "the scenario needs the probe"
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_eq!(
+        reject_streak_of(&store, &contact_user_id()),
+        0,
+        "a probe stays advisory: it writes nothing off"
+    );
+}
+
+#[test]
+fn a_legacy_member_card_walk_refusal_is_not_our_expiry() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![CoreRelayContactConfig {
+        user_id: contact_user_id(),
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(CONTACT_TOKEN.to_string()),
+        endpoint_usable: true,
+        endpoint_answering: true,
+    }];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if bearer(request) == CONTACT_TOKEN {
+            return Reply::status(403, "family_expired");
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.fetches().iter().any(|f| bearer(f) == CONTACT_TOKEN)
+            || run.requests.iter().any(|r| bearer(r) == CONTACT_TOKEN),
+        "the scenario needs the contact's mailbox to be walked"
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_eq!(reject_streak_of(&store, &contact_user_id()), 1);
+}
+
+#[test]
+fn many_envelopes_to_one_rejecting_contact_advance_one_step() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 3, now);
+    seed_receipts(&store, 3, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact_on_own_host(
+        contact_user_id(),
+        CONTACT_TOKEN,
+    )];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(
+        &pass,
+        now,
+        own_ok_contact_refused(Reply::status(403, "family_expired")),
+    );
+    assert!(
+        run.posts()
+            .iter()
+            .filter(|post| bearer(post) == contact_deposit_token())
+            .count()
+            >= 2,
+        "both lanes tried the friend's card"
+    );
+    assert_eq!(
+        reject_streak_of(&store, &contact_user_id()),
+        1,
+        "one pass is one step, however many rows it tried"
+    );
+}
+
+#[test]
+fn a_recovered_contact_endpoint_clears_its_rejection() {
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 2, now);
+    let rejected_at = now - cruisemesh_core::CONTACT_RELAY_RECHECK_MS - 60_000;
+    store
+        .note_contact_relay_rejected(contact_user_id(), rejected_at)
+        .expect("reject");
+    store
+        .note_contact_relay_rejected(contact_user_id(), rejected_at)
+        .expect("reject");
+    assert_eq!(reject_streak_of(&store, &contact_user_id()), 2);
+    let usable = cruisemesh_core::core_contact_relay_endpoint_usable(2, rejected_at, now);
+    assert!(usable, "the recheck is due");
+
+    let mut plan = base_plan(now);
+    let mut contact = cross_family_contact_on_own_host(contact_user_id(), CONTACT_TOKEN);
+    contact.endpoint_usable = usable;
+    plan.contacts = vec![contact];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.posts()
+            .iter()
+            .any(|post| bearer(post) == contact_deposit_token()),
+        "the recheck posts to the friend's card"
+    );
+    assert_eq!(
+        reject_streak_of(&store, &contact_user_id()),
+        0,
+        "the friend renewed: a successful post clears the write-off"
+    );
+    assert!(store
+        .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+        .expect("pending")
+        .is_empty());
+}
+
+#[test]
+fn one_dead_card_on_the_shared_host_does_not_starve_the_lane() {
+    let store = new_store();
+    let now = T0;
+    let dead = contact_user_id();
+    let live = vec![0x5Au8; 32];
+    let not_a_contact = vec![0xEEu8; 32];
+    let live_member_token = "member-token-dddddddddddd";
+    seed_contact(&store);
+    seed_named_contact(&store, &live, "Live");
+    // Each lane holds rows for the dead card, the live card, and our own
+    // mailbox, all on the one shared host.
+    seed_receipts_to(&store, &dead, 0x7000, 2, now);
+    seed_receipts_to(&store, &live, 0x7100, 2, now);
+    seed_receipts_to(&store, &not_a_contact, 0x7200, 2, now);
+    seed_authored_to(&store, &dead, 0x8000, 2, now);
+    seed_authored_to(&store, &live, 0x8100, 2, now);
+    seed_authored_to(&store, &not_a_contact, 0x8200, 2, now);
+
+    let mut plan = base_plan(now);
+    plan.contacts = vec![
+        cross_family_contact_on_own_host(dead.clone(), CONTACT_TOKEN),
+        cross_family_contact_on_own_host(live.clone(), live_member_token),
+    ];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(
+        &pass,
+        now,
+        own_ok_contact_refused(Reply::status(403, "family_expired")),
+    );
+
+    let live_deposit = cruisemesh_core::relay_deposit_token_for(live_member_token.to_string());
+    assert_eq!(
+        run.posts()
+            .iter()
+            .filter(|post| bearer(post) == live_deposit)
+            .count(),
+        4,
+        "the healthy friend's rows on the same host were all posted"
+    );
+    assert_eq!(
+        run.posts()
+            .iter()
+            .filter(|post| bearer(post) == OWN_TOKEN)
+            .count(),
+        4,
+        "our own mailbox's rows on the same host were all posted"
+    );
+    let pending_outbound = store
+        .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+        .expect("pending outbound");
+    assert!(
+        pending_outbound
+            .iter()
+            .all(|row| row.recipient_user_id == dead),
+        "only the dead card's rows are still queued"
+    );
+    assert_eq!(pending_outbound.len(), 2);
+    let pending_receipts = store
+        .pending_relay_outgoing_receipt_envelopes(1_000, now, Vec::new())
+        .expect("pending receipts");
+    assert!(pending_receipts
+        .iter()
+        .all(|row| row.recipient_user_id == dead));
+    assert_eq!(pending_receipts.len(), 2);
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_eq!(reject_streak_of(&store, &dead), 1);
+    assert_eq!(reject_streak_of(&store, &live), 0);
+}
+
+#[test]
+fn a_group_fanout_whose_chosen_member_card_rejects() {
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 2);
+    seed_group_authored(&store, &group, now);
+    let mut plan = base_plan(now);
+    plan.contacts = group_contacts(&group);
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_post() && bearer(request) == CONTACT_TOKEN {
+            return Reply::status(403, "family_expired");
+        }
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.posts().iter().any(|post| bearer(post) == CONTACT_TOKEN),
+        "the fan-out went to the first member's card"
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_eq!(
+        reject_streak_of(&store, &member_user_id(0)),
+        1,
+        "the refusal belongs to the member whose card was chosen"
+    );
+    assert_eq!(reject_streak_of(&store, &member_user_id(1)), 0);
+    assert_eq!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending")
+            .len(),
+        1,
+        "the group envelope stays queued"
+    );
+}
+
+#[test]
+fn own_relay_succeeded_needs_our_token() {
+    // Another family's deposit landing on our host proves the host is up,
+    // not that our own mailbox answered.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 1, now);
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact_on_own_host(
+        contact_user_id(),
+        CONTACT_TOKEN,
+    )];
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let deposit = contact_deposit_token();
+    let run = drive(&pass, now, |request, _index| {
+        if bearer(request) == deposit {
+            Reply::empty_ok()
+        } else {
+            Reply::status(500, "internal")
+        }
+    });
+    assert!(
+        run.posts().iter().any(|post| bearer(post) == deposit),
+        "the scenario needs the friend's deposit to land"
+    );
+    assert_eq!(
+        run.summary.health,
+        cruisemesh_core::CoreRelayPassHealth::Failing,
+        "our own mailbox never answered"
+    );
+}

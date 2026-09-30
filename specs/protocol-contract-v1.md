@@ -56,6 +56,7 @@ of it: the gap is now countable.
 | `RATE-01` | The first family 429 ends remaining pass network work. `Retry-After` is a floor, and pending nudges cannot bypass the quiet window. | core | `core/src/session/relay_policy.rs` owns request pacing, the exponential curve and its cap, the `Retry-After` floor, the stable identity jitter, the pending-rerun decision and the pass health fold; `relay_status.rs` owns the header clamp and the classification. Both shells delegate. The first clause — aborting the remaining stages — is completed by C0's pass |
 | `ENDPOINT-01` | A phone advertises only its own endpoint. A discovered or third-party address is never forwarded to anyone. | hoist-pending | receive-side scoping is core; hint authoring is shell-owned |
 | `SILENCE-01` | Contact silence advances only with same-pass proof that another relay answered; authoritative rejection does not require that proof. | core | `core/src/contact_relay_health.rs` silence tests; index re-asserts the delta rule |
+| `HEALTH-01` | This device's own pass health is derived only from requests made with its own credential. A contact endpoint's refusal (a friend's lapsed or suspended family, a card token relayd no longer knows) advances that contact's rejection streak, at most once per pass, and surfaces as their delivery line; it never reads as this device's pass expiring. A `429` from any endpoint is the one exception (`RATE-01`). | core | `core/src/session/relay_pass.rs` gates the fold on the credential each request carried and attributes upload refusals to the card's owner; `core/tests/relay_pass_replay.rs` drives a contact's `family_expired`/`family_suspended`/`401`/`403`/`507`/`413` against a healthy own mailbox, and an own-credential expiry that must still read as expired; index re-asserts the contact case |
 | `UI-01` | Delivery and via-transport claims require persisted arrival or receipt evidence, never a current-link guess. | core | `core/src/connection_health.rs` delivery tests; index re-asserts the queue-honesty gate |
 | `LIVE-01` | Every pass terminates inside its declared request, envelope, byte, and time/yield budgets. | core | `core/src/session/relay_pass.rs` declares the budgets and carries them in every summary; `core/tests/relay_pass_replay.rs` drives a real pass against four hostile relays (endless mail, a cursor that never moves, silence, blanket rejection) and every incident fixture |
 | `PRESENCE-01` | A presence answer to a credential from outside the answering family is coarsened to a recency bucket and charged to a tight per-credential allowance of its own. It can never spend the queried family's request or byte budget, it never carries an announcement, and a suspended or lapsed family answers nobody. The asking client holds a staleness floor of its own, so the server's cap is a backstop rather than a schedule. | core | `relayd/src/lib.rs` gives the presence dimension its own token bucket keyed by the presented credential and coarsens every cross-family answer, with `relayd/tests/e2e_presence.rs` covering the cap, the `Retry-After`, a paired assertion that a presence flood leaves the family's own allowance untouched, the suspended refusal, and the coarse-vs-precise split; `core/src/session/relay_pass.rs` bounds the query to one per contact per pass inside the pass request budget, skips a resting endpoint, and caches the bucket behind a client floor, with `core/tests/relay_pass_replay.rs` driving it |
@@ -246,6 +247,24 @@ indistinguishable from this device being offline, and acting on it writes off
 a healthy contact. An authoritative rejection — a credential or family
 refusal the server actually returned — needs no such proof, because the
 server plainly answered.
+
+#### `HEALTH-01` — a friend's lapsed pass is not yours
+
+The Shore Pass screen speaks for this device's own family pass, so only a
+request made with this device's own credential may move it. One relay hosts
+every family, and a friend's card names that same relay with *their* family's
+credential. When their pass lapses, relayd refuses that credential with
+`403 family_expired` — the same answer it would give us if ours had lapsed.
+Folding that into our own health once told a family whose pass never expires
+that theirs had, and because nothing wrote the friend's card off, every pass
+posted to it again.
+
+So a contact endpoint's authoritative refusal is that contact's evidence: it
+advances their card's rejection streak, once per pass however many rows were
+refused, and after the stale threshold their delivery line says their setup
+was rejected while ours stays connected. A successful post to their card clears
+it again. A `429` is the single exception, folded from any endpoint, because
+`RATE-01` treats it as a verdict on the whole family's request budget.
 
 #### `UI-01` — only evidence may be shown as delivery
 
