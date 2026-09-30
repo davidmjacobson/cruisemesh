@@ -21408,7 +21408,10 @@ public func FfiConverterTypeCoreRelayBackoffVector_lower(_ value: CoreRelayBacko
  * * **Rejection** — the endpoint answered, authoritatively, that it will not
  * serve us. The card is wrong. Falling back to this device's own mailbox
  * is right: a `401` proves nothing about our own relay, and when both
- * sides have since moved to the same host it really delivers.
+ * sides have since moved to the same host it really delivers. Not for a
+ * card carrying another family's deposit token, though (a friend whose
+ * pass lapsed, typically): our mailbox is one they never read, so that
+ * card gets the silence answer below instead.
  * * **Silence** — nothing answered at all. Falling back would put a
  * cross-family contact's mail in a mailbox they never read, and
  * `relay_posted_at` is terminal, so that is a permanent misroute rather
@@ -51960,7 +51963,11 @@ public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
  *
  * A member written off for *rejection* keeps falling back, unchanged: a 401
  * proves the card is wrong, and our own relay really delivers when both
- * sides have since moved to the same new host.
+ * sides have since moved to the same new host. The exception is the one
+ * [`resolved_contact_delivery_relay`] makes: a written-off card carrying
+ * another family's deposit token (a friend whose pass lapsed, typically)
+ * blocks the fallback exactly as a resting member does, because our mailbox
+ * is one that family never reads.
  */
 public func coreGroupFanoutRelayTarget(members: [GroupRelayMember], fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
@@ -56904,6 +56911,15 @@ public func resolvedContactDeliveryPollRelay(contactRelayUrl: String?, contactRe
  * to. For a cross-family contact it delivers nothing, but neither did the
  * dead endpoint, and unlike the dead endpoint this state is surfaced, so a
  * person can repair the card.
+ *
+ * One exception: a written-off card carrying *another family's* deposit
+ * token resolves to `None`, never to our own mailbox. That card is
+ * cross-family by construction, so our mailbox is one they never read, and
+ * `relay_posted_at` is terminal: falling back would mark their mail posted
+ * into a dead end for good. The common way to get here is a friend whose
+ * pass lapsed (`family_expired`), whose card is still right and starts
+ * working again the moment they renew. `None` leaves the rows queued for the
+ * periodic re-probe and for the mesh paths.
  */
 public func resolvedContactDeliveryRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?, contactEndpointUsable: Bool) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
@@ -57492,7 +57508,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_relay_target() != 49092) {
+    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_relay_target() != 22070) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows() != 44083) {
@@ -58278,7 +58294,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 7224) {
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 9094) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {

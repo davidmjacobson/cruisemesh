@@ -392,7 +392,10 @@ pub struct CoreRelayEndpointConfig {
 /// * **Rejection** — the endpoint answered, authoritatively, that it will not
 ///   serve us. The card is wrong. Falling back to this device's own mailbox
 ///   is right: a `401` proves nothing about our own relay, and when both
-///   sides have since moved to the same host it really delivers.
+///   sides have since moved to the same host it really delivers. Not for a
+///   card carrying another family's deposit token, though (a friend whose
+///   pass lapsed, typically): our mailbox is one they never read, so that
+///   card gets the silence answer below instead.
 /// * **Silence** — nothing answered at all. Falling back would put a
 ///   cross-family contact's mail in a mailbox they never read, and
 ///   `relay_posted_at` is terminal, so that is a permanent misroute rather
@@ -3570,6 +3573,9 @@ fn derive_pass_id(requested: &str) -> String {
 /// alternative forever and the messages would never leave the queue. Skipping
 /// it falls through to our own, exactly as though the card had carried no
 /// relay fields — which is what [`resolved_contact_delivery_relay`] does.
+/// The exception is a written-off card carrying another family's deposit
+/// token: our mailbox would strand that family's mail, so it resolves to
+/// `None` and waits for the periodic re-probe.
 ///
 /// An endpoint resting for *silence* takes the other answer: `None`, meaning
 /// "post nothing to this recipient this pass". See

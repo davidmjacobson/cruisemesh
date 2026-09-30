@@ -4663,3 +4663,130 @@ fn own_relay_succeeded_needs_our_token() {
         "our own mailbox never answered"
     );
 }
+
+/// A friend from another family whose deposit card names a *different* host
+/// from ours: the shape where a written-off card could fall back to our own
+/// mailbox.
+fn cross_family_contact_on_other_host(user_id: Vec<u8>, usable: bool) -> CoreRelayContactConfig {
+    CoreRelayContactConfig {
+        user_id,
+        relay_url: Some(CONTACT_URL.to_string()),
+        relay_token: Some(contact_deposit_token()),
+        endpoint_usable: usable,
+        endpoint_answering: true,
+    }
+}
+
+#[test]
+fn a_written_off_lapsed_friend_on_another_host_is_not_redirected_to_our_mailbox() {
+    // Our mailbox is one the friend's family never reads, and relay-posted is
+    // terminal: posting their backlog there once the card is written off would
+    // lose it from the relay path for good. It must wait for their renewal.
+    let store = new_store();
+    let now = T0;
+    seed_contact(&store);
+    seed_authored(&store, 2, now);
+    seed_receipts(&store, 2, now);
+    let pending = |store: &MessageStore, at: i64| {
+        (
+            store
+                .pending_relay_outbound_envelopes(1_000, at, Vec::new())
+                .expect("pending outbound")
+                .len(),
+            store
+                .pending_relay_outgoing_receipt_envelopes(1_000, at, Vec::new())
+                .expect("pending receipts")
+                .len(),
+        )
+    };
+
+    // Passes 1 and 2: the friend's lapsed family refuses their card.
+    let mut plan = base_plan(now);
+    plan.contacts = vec![cross_family_contact_on_other_host(contact_user_id(), true)];
+    for (index, at) in [now, now + 60_000].into_iter().enumerate() {
+        let pass = CoreRelayPass::new(store.clone(), plan.clone(), format!("p{}", index + 1));
+        let run = drive(
+            &pass,
+            at,
+            own_ok_contact_refused(Reply::status(403, "family_expired")),
+        );
+        assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    }
+    let streak = reject_streak_of(&store, &contact_user_id());
+    assert!(cruisemesh_core::core_contact_relay_is_stale(streak));
+    assert_eq!(pending(&store, now), (2, 2));
+
+    // Pass 3: written off. Nothing for the friend goes to our own mailbox.
+    let mut written_off = base_plan(now);
+    written_off.contacts = vec![cross_family_contact_on_other_host(contact_user_id(), false)];
+    let pass = CoreRelayPass::new(store.clone(), written_off, "p3".to_string());
+    let run = drive(&pass, now + 120_000, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.posts().is_empty(),
+        "a lapsed friend's rows are posted nowhere rather than into our mailbox"
+    );
+    assert_eq!(run.summary.health, cruisemesh_core::CoreRelayPassHealth::Ok);
+    assert_eq!(
+        pending(&store, now + 120_000),
+        (2, 2),
+        "the backlog stays queued for the mesh paths and for their renewal"
+    );
+
+    // Pass 4: the re-probe is due and the friend has renewed. The backlog
+    // lands on their card and the write-off clears.
+    let pass = CoreRelayPass::new(store.clone(), plan, "p4".to_string());
+    let run = drive(&pass, now + 180_000, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(!run.posts().is_empty());
+    assert!(run
+        .posts()
+        .iter()
+        .all(|post| bearer(post) == contact_deposit_token()));
+    assert_eq!(pending(&store, now + 180_000), (0, 0));
+    assert_eq!(reject_streak_of(&store, &contact_user_id()), 0);
+}
+
+#[test]
+fn a_group_whose_only_card_is_a_written_off_lapsed_friend_posts_nowhere() {
+    let store = new_store();
+    let now = T0;
+    let group = seed_group(&store, 1);
+    seed_group_authored(&store, &group, now);
+    let mut plan = base_plan(now);
+    plan.contacts = group
+        .member_user_ids
+        .iter()
+        .map(|user_id| cross_family_contact_on_other_host(user_id.clone(), false))
+        .collect();
+    let pass = CoreRelayPass::new(store.clone(), plan, "p1".to_string());
+    let run = drive(&pass, now, |request, _index| {
+        if request.is_fetch() {
+            Reply::ok(empty_page())
+        } else {
+            Reply::empty_ok()
+        }
+    });
+    assert!(
+        run.posts().is_empty(),
+        "the group copy is not redirected to our own mailbox"
+    );
+    assert_eq!(
+        store
+            .pending_relay_outbound_envelopes(1_000, now, Vec::new())
+            .expect("pending")
+            .len(),
+        1,
+        "the group envelope stays queued"
+    );
+}

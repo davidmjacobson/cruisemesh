@@ -5402,8 +5402,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             /// mailbox. Falling back for them would post a cross-family
             /// member's copy where they never read, and `relayPostedAt` is
             /// terminal, so that is a permanent misroute rather than a retry.
-            /// A member written off for *rejection* still falls back,
-            /// unchanged. Mirrors RelaySyncEngine.kt.
+            /// A member written off for *rejection* still falls back, unless
+            /// their card carries another family's deposit token, which
+            /// blocks the fallback the same way. Mirrors RelaySyncEngine.kt.
             func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
                 guard let group = groupsById[groupId] else { return config }
                 let members = group.memberUserIds.compactMap { member -> GroupRelayMember? in

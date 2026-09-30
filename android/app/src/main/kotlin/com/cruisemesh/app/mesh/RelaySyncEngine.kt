@@ -1103,7 +1103,8 @@ internal class RelaySyncEngine(
      * own mailbox. Falling back for them would post a cross-family member's
      * copy where they never read, and `relay_posted_at` is terminal, so that
      * is a permanent misroute rather than a retry. A member written off for
-     * *rejection* still falls back, unchanged.
+     * *rejection* still falls back, unless their card carries another
+     * family's deposit token, which blocks the fallback the same way.
      */
     private fun relayConfigForGroupRecipient(
         groupId: ByteArray,

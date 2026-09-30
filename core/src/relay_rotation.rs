@@ -1589,11 +1589,13 @@ mod tests {
         assert!(crate::core_contact_relay_is_stale(streak));
         assert!(!core_contact_relay_endpoint_usable(streak, NOW, NOW));
 
-        // Written off, their queue stops hammering a dead credential and falls
-        // back to their own endpoint rather than stalling. It delivers nothing
-        // to us — we are not on their relay — but the state is surfaced, which
-        // is what makes "re-share your card" something a person can be asked
-        // to do instead of a silent black hole.
+        // Written off, their queue stops hammering a dead credential. It does
+        // not fall back to their own endpoint: we are not on their relay, so
+        // that would mark their mail to us relay-posted into a mailbox we
+        // never read, which is terminal. It waits instead, for the re-probe
+        // below and for the mesh paths, and the state is surfaced, which is
+        // what makes "re-share your card" something a person can be asked to
+        // do instead of a silent black hole.
         assert!(resolved_contact_delivery_relay(
             us.relay_url.clone(),
             us.relay_token.clone(),
@@ -1601,7 +1603,7 @@ mod tests {
             their_token.clone(),
             false,
         )
-        .is_some());
+        .is_none());
         // Bounded, not permanent: the six-hour backstop re-probes even a
         // written-off endpoint, so the moment the credential is repaired by
         // any route, sending resumes with nobody restarting anything.
