@@ -350,6 +350,15 @@ pub fn resolved_contact_poll_relay(
 /// to. For a cross-family contact it delivers nothing, but neither did the
 /// dead endpoint, and unlike the dead endpoint this state is surfaced, so a
 /// person can repair the card.
+///
+/// One exception: a written-off card carrying *another family's* deposit
+/// token resolves to `None`, never to our own mailbox. That card is
+/// cross-family by construction, so our mailbox is one they never read, and
+/// `relay_posted_at` is terminal: falling back would mark their mail posted
+/// into a dead end for good. The common way to get here is a friend whose
+/// pass lapsed (`family_expired`), whose card is still right and starts
+/// working again the moment they renew. `None` leaves the rows queued for the
+/// periodic re-probe and for the mesh paths.
 #[uniffi::export]
 pub fn resolved_contact_delivery_relay(
     contact_relay_url: Option<String>,
@@ -367,13 +376,24 @@ pub fn resolved_contact_delivery_relay(
         );
     }
     let fallback = relay_endpoint_from(fallback_url, fallback_token)?;
-    // Only worth a request if it is somewhere other than the host we just
-    // wrote off; otherwise report "nowhere to post" honestly rather than
-    // retrying the same dead host under a different name.
     match relay_endpoint_from(contact_relay_url, contact_relay_token) {
+        // Only worth a request if it is somewhere other than the host we just
+        // wrote off; otherwise report "nowhere to post" honestly rather than
+        // retrying the same dead host under a different name.
         Some(contact) if contact.url == fallback.url => None,
+        // Another family's card: our mailbox would strand their mail.
+        Some(contact) if card_is_another_familys_deposit(&contact, &fallback) => None,
         _ => Some(fallback),
     }
+}
+
+/// Is this card credential another family's deposit token — cross-family by
+/// construction, so a post to *our* mailbox in its place can never reach the
+/// contact? Our own family's deposit token (the attenuation of our member
+/// token) is not: it is the same mailbox, wherever it now lives.
+fn card_is_another_familys_deposit(contact: &RelayEndpoint, own: &RelayEndpoint) -> bool {
+    relay_token_is_deposit(contact.token.clone())
+        && relay_deposit_token_for(own.token.clone()) != contact.token
 }
 
 /// One group member's relay situation, as the shell resolved it this pass.
@@ -415,18 +435,32 @@ pub struct GroupRelayMember {
 ///
 /// A member written off for *rejection* keeps falling back, unchanged: a 401
 /// proves the card is wrong, and our own relay really delivers when both
-/// sides have since moved to the same new host.
+/// sides have since moved to the same new host. The exception is the one
+/// [`resolved_contact_delivery_relay`] makes: a written-off card carrying
+/// another family's deposit token (a friend whose pass lapsed, typically)
+/// blocks the fallback exactly as a resting member does, because our mailbox
+/// is one that family never reads.
 #[uniffi::export]
 pub fn core_group_fanout_relay_target(
     members: Vec<GroupRelayMember>,
     fallback_url: Option<String>,
     fallback_token: Option<String>,
 ) -> Option<RelayEndpoint> {
-    let mut any_member_resting = false;
+    let own = relay_endpoint_from(fallback_url.clone(), fallback_token.clone());
+    let mut any_member_blocks_fallback = false;
     for member in members {
         if !member.endpoint_answering {
-            any_member_resting = true;
+            any_member_blocks_fallback = true;
             continue;
+        }
+        if !member.endpoint_usable {
+            let card = relay_endpoint_from(member.relay_url.clone(), member.relay_token.clone());
+            if let (Some(card), Some(own)) = (card.as_ref(), own.as_ref()) {
+                if card_is_another_familys_deposit(card, own) {
+                    any_member_blocks_fallback = true;
+                    continue;
+                }
+            }
         }
         if let Some(endpoint) = resolved_contact_delivery_relay(
             member.relay_url,
@@ -438,10 +472,10 @@ pub fn core_group_fanout_relay_target(
             return Some(endpoint);
         }
     }
-    if any_member_resting {
+    if any_member_blocks_fallback {
         return None;
     }
-    relay_endpoint_from(fallback_url, fallback_token)
+    own
 }
 
 /// Poll-path routing with the same written-off rule.
@@ -2066,6 +2100,83 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_written_off_card_from_another_family_never_falls_back_to_our_own() {
+        // A friend whose pass lapsed answers `family_expired` to their deposit
+        // card until it is written off. Our mailbox is one their family never
+        // reads, and `relay_posted_at` is terminal, so falling back would mark
+        // their mail posted into a dead end for good. Nothing to post: the
+        // rows stay queued for the re-probe after they renew.
+        let their_deposit = relay_deposit_token_for("their-member-token".to_string());
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://theirs.example"),
+                Some(their_deposit.clone()),
+                some("https://ours.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+        // Still their card, unchanged, while it is usable (and whenever the
+        // re-probe makes it usable again).
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://theirs.example"),
+                Some(their_deposit.clone()),
+                some("https://ours.example"),
+                some("our-token"),
+                true,
+            )
+            .unwrap()
+            .token,
+            their_deposit
+        );
+    }
+
+    #[test]
+    fn a_written_off_card_from_our_own_family_still_falls_back() {
+        // Our own family's deposit token on a host we have since left is the
+        // same mailbox under its new address: the fallback really delivers.
+        let ours = relay_deposit_token_for("our-token".to_string());
+        let routed = resolved_contact_delivery_relay(
+            some("https://old-host.example"),
+            Some(ours),
+            some("https://ours.example"),
+            some("our-token"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(routed.url, "https://ours.example");
+        assert_eq!(routed.token, "our-token");
+    }
+
+    #[test]
+    fn a_written_off_member_from_another_family_blocks_the_group_fallback() {
+        let lapsed = GroupRelayMember {
+            relay_url: some("https://theirs.example"),
+            relay_token: Some(relay_deposit_token_for("their-member-token".to_string())),
+            endpoint_usable: false,
+            endpoint_answering: true,
+        };
+        assert_eq!(
+            core_group_fanout_relay_target(
+                vec![lapsed.clone()],
+                some("https://ours.example"),
+                some("our-token"),
+            ),
+            None
+        );
+        // A healthy member beside them still carries the group, as before.
+        let target = core_group_fanout_relay_target(
+            vec![lapsed, member(some("https://live.example"), true, true)],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://live.example");
     }
 
     fn member(url: Option<String>, usable: bool, answering: bool) -> GroupRelayMember {

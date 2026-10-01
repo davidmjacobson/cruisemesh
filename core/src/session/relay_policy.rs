@@ -411,6 +411,12 @@ pub fn core_relay_rerun_action(
 /// The health one completed relay pass earns, as a domain fact. The shells map
 /// it to their own display type and attach their own timestamp; nothing here
 /// is a string, and nothing here is localized.
+///
+/// It is the health of *this device's own* Shore Pass, and only of that
+/// (`HEALTH-01`). A contact's card endpoint refusing us — a friend whose
+/// family pass lapsed, say — is that contact's problem, recorded against
+/// their card's rejection streak and surfaced as their delivery line's
+/// `ContactSetupRejected`, never as this device's pass expiring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreRelayPassHealth {
     /// Our own relay answered and so did every other one we tried.
@@ -496,6 +502,15 @@ pub fn core_worse_relay_fault(
 /// same 403 and the same `family_expired` code either way, deliberately, so
 /// that clients need exactly one renewal flow — the asymmetry a person can
 /// actually see is which requests worked, and that is what this reads.
+///
+/// # Precondition (`HEALTH-01`)
+///
+/// `fault` must be the worst of the faults this device's *own* credential
+/// earned this pass, with a single exception: a `429` from any endpoint, which
+/// `RATE-01` reads as a family-budget verdict. A caller that folds in a
+/// contact endpoint's `403 family_expired` makes a healthy pass read as
+/// expired; that was a field bug, and `CoreRelayPass` now gates the fold on
+/// the credential each request carried.
 #[uniffi::export]
 pub fn core_relay_pass_health(
     fault: Option<CoreRelayFault>,
