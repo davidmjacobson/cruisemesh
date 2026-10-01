@@ -224,6 +224,7 @@
     <string name="ui_onboarding_shore_pass_body">Everything nearby — Bluetooth, local Wi-Fi, groups, encryption — is free, always. A Shore Pass is the one optional extra: it delivers your family\'s messages over the internet when you\'re spread out or someone\'s back home.</string>
     <string name="ui_onboarding_shore_pass_family_title">One pass covers your whole family</string>
     <string name="ui_onboarding_shore_pass_family_detail">Somebody buys it once at cruisemesh.app, then shares the setup card with everyone. If your family already has one, all you need is their card.</string>
+    <string name="ui_permissions_setup_linked_note">Your phone is set up. One last thing before you start.</string>
     <string name="ui_onboarding_permissions_eyebrow">Turn on a few permissions</string>
     <string name="ui_onboarding_permissions_title">Give CruiseMesh more ways to connect</string>
     <string name="ui_onboarding_permissions_body">Each of these opens up another path for your messages.</string>
@@ -425,6 +426,15 @@
          this is the only screen where a data charge can surprise anyone. Say
          who bills for what before a pass is set up, not after. -->
     <string name="ui_shore_pass_data_note">Shore Pass uses the internet your phone already has. Ship Wi-Fi packages and roaming data are billed by your provider at their normal rates. Everything else in CruiseMesh works without any internet.</string>
+    <!-- Renewal. The end date is stated plainly and in the same quiet style as
+         the rest of the supporting text: a pass that runs until March is not a
+         problem, and dressing an ordinary future date as a warning teaches
+         people to ignore the ones that matter. Shown only while the date is
+         still ahead; a pass with no end date says nothing at all. -->
+    <string name="ui_internet_delivery_through">Internet delivery through %1$s</string>
+    <string name="ui_renew_shore_pass">Renew Shore Pass</string>
+    <string name="ui_renew_shore_pass_detail">Opens cruisemesh.app to renew your family\'s pass.</string>
+    <string name="ui_shore_pass_expired_explanation">Your pass has run out, so messages can\'t travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.</string>
     <string name="ui_relay_deferred_roaming">Waiting for non-roaming internet to avoid roaming charges</string>
     <string name="ui_paste_and_set_up">Paste and set up</string>
     <string name="ui_enter_setup_card_manually">Enter setup card manually</string>
@@ -511,6 +521,7 @@
     <string name="ui_shore_pass_state_waiting_for_internet">Waiting for internet</string>
     <string name="ui_shore_pass_state_unreachable">Shore Pass unreachable</string>
     <string name="ui_shore_pass_state_expired">Shore Pass expired</string>
+    <string name="ui_shore_pass_state_expired_still_receiving">Shore Pass expired · still receiving</string>
     <string name="ui_shore_pass_state_suspended">Shore Pass suspended</string>
     <string name="ui_shore_pass_state_setup_rejected">Shore Pass setup rejected</string>
     <string name="ui_shore_pass_state_storage_full">Shore Pass storage full</string>
@@ -523,6 +534,7 @@
     <string name="ui_path_shore_pass_waiting_for_internet">Waiting for internet</string>
     <string name="ui_path_shore_pass_unreachable">Unreachable</string>
     <string name="ui_path_shore_pass_expired">Pass expired</string>
+    <string name="ui_path_shore_pass_expired_still_receiving">Pass expired · still receiving</string>
     <string name="ui_path_shore_pass_suspended">Pass suspended</string>
     <string name="ui_path_shore_pass_setup_rejected">Setup rejected</string>
     <string name="ui_path_shore_pass_storage_full">Storage full</string>
@@ -689,6 +701,11 @@
     <string name="ui_how_to_fix_setup_rejected">Shore Pass didn\'t accept this phone\'s saved setup. Open Shore Pass and set it up again, or check the setup against another phone in your family.</string>
     <string name="ui_how_to_fix_storage_full">Your family\'s Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.</string>
     <string name="ui_how_to_fix_pass_expired">Your Shore Pass has run out, so messages can\'t travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.</string>
+    <!-- The grace-window twin of the line above. It names what still works
+         before what has stopped, because a person reading it is watching
+         messages arrive while their own will not send, and a line that only
+         said "expired" would read as the app contradicting itself. -->
+    <string name="ui_how_to_fix_pass_expired_still_receiving">Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can\'t go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it.</string>
     <string name="ui_how_to_fix_pass_suspended">Your Shore Pass has been turned off, so messages can\'t travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.</string>
     <!-- The order-sensitive one. A friend card shared before the friend has
          fixed their own pass carries the same broken setup, so a reader who
@@ -750,7 +767,7 @@
     <string name="ui_save_diagnostics_to_device">Save to device</string>
     <string name="ui_show_less">Show less</string>
     <string name="ui_clear_connection_history">Clear connection history</string>
-    <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.</string>
+    <string name="ui_diagnostics_contain_identity_paths_and_timings">Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.</string>
     <string name="ui_no_diagnostics_captured_yet">No diagnostics captured yet.</string>
     <string name="ui_clear_connection_history_confirm">Clear connection history?</string>
     <string name="ui_this_removes_local_connection_events_and_per_person">This removes local connection events and per-person path summaries. Messages and friends are not affected.</string>
@@ -781,6 +798,15 @@
     <string name="ui_shore_pass_message_too_large_detail">One message can’t be sent over internet delivery. Other messages still deliver.</string>
     <string name="ui_shore_pass_message_too_large_status">A message is too large to send</string>
     <string name="ui_shore_pass_message_too_large_explanation">One of your messages is too large to send over internet delivery. Try a smaller photo or a shorter message. Other messages still deliver normally.</string>
+    <!-- An expired pass inside the service's read-only grace window: messages
+         already on their way keep arriving, and only new internet sending has
+         stopped. Written as a state, not an alarm. The asymmetry is what
+         confused people, so each of these names what still works before it
+         names what does not, and none of them is shown in an error color. -->
+    <string name="ui_shore_pass_expired_still_receiving_title">Shore Pass expired</string>
+    <string name="ui_shore_pass_expired_still_receiving_detail">Messages already on their way still arrive. Renew your pass to send over the internet again.</string>
+    <string name="ui_shore_pass_expired_still_receiving_status">Pass expired · still receiving</string>
+    <string name="ui_shore_pass_expired_still_receiving_explanation">Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can\'t go out over the internet until you renew the pass.</string>
     <!-- Developer settings -->
     <string name="ui_developer_settings">Developer settings</string>
     <string name="ui_developer_settings_release_warning">These switches change how your messages are delivered. If nobody asked you to change one, leave them as they are. The safe position is off.</string>

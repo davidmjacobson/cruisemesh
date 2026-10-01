@@ -111,10 +111,15 @@ enum RelayConfigStore {
     /// pass is missing, pointed at a dead host, or working perfectly with
     /// nothing to carry.
     ///
-    /// The token is reduced to its first eight characters. That is enough to
-    /// tell one family's pass from another's, and from the shared tester pass,
-    /// while staying useless to anyone who reads the file: it is a bearer
-    /// credential, so the full value must never reach a share sheet.
+    /// The pass is named by a digest of its token, never by any part of the
+    /// token. That is enough to tell one household's pass from another's, and
+    /// from the shared tester pass, and to recognise the same pass across two
+    /// logs -- which is all triage ever needed from it. A prefix answered the
+    /// same question by printing eight characters of a live bearer credential
+    /// into a file that gets mailed to whoever is helping.
+    ///
+    /// Derived in the core (`relayTokenFingerprint`) so this shell and
+    /// Android print the same label for the same pass.
     static func logSummary() {
         guard let config = load() else {
             // Deliberately hedged. This also runs on a background Bluetooth
@@ -128,14 +133,20 @@ enum RelayConfigStore {
             return
         }
         let host = URL(string: config.relayUrl)?.host ?? "unparseable"
-        let tokenPrefix = String(config.relayToken.prefix(8))
         log.info(
             """
             Relay configured: host=\(host, privacy: .public) \
-            token=\(tokenPrefix, privacy: .public)… \
+            pass=\(tokenFingerprint(config.relayToken), privacy: .public) \
             epoch=\(relayEpoch(), privacy: .public) \
             shareOnline=\(shareOnline(), privacy: .public)
             """
         )
+    }
+
+    /// A digest of the pass, never any part of the pass itself. Mirrors
+    /// Android `RelayConfigStore.tokenFingerprint`; both go through the core
+    /// so the two archives name one pass the same way.
+    static func tokenFingerprint(_ token: String) -> String {
+        relayTokenFingerprint(relayToken: token)
     }
 }

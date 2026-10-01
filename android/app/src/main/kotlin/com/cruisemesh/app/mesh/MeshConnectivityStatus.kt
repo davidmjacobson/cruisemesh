@@ -15,6 +15,14 @@ sealed class RelayHealth {
     object NoConfig : RelayHealth()
     data class Failing(val lastAttemptMs: Long) : RelayHealth()
     data class Expired(val lastAttemptMs: Long) : RelayHealth()
+
+    /**
+     * The pass has lapsed but the service is still inside its read-only grace
+     * window: envelopes already queued for us keep arriving and keep being
+     * acked, and only new posts are refused. Distinct from [Expired] because
+     * the two states look different to the person holding the phone.
+     */
+    data class ExpiredReadOnly(val lastAttemptMs: Long) : RelayHealth()
     data class Suspended(val lastAttemptMs: Long) : RelayHealth()
 
     /** The relay answered but rejected our own saved family token (HTTP 401/403). */

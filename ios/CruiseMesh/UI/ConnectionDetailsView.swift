@@ -8,6 +8,27 @@ struct ConnectionTimeContext {
     let startOfTodayMs: Int64
 }
 
+/// The one button a How-to-fix sheet may carry, if it carries one at all.
+///
+/// Mirrors Android `HowToFixAction`.
+enum HowToFixAction {
+    /// No button. Nothing the app can open repairs a friend's card, an
+    /// oversized message, or a full mailbox, and a button that leads somewhere
+    /// useless costs a reader more than no button at all.
+    case none
+
+    /// Opens the Shore Pass screen, where this phone's own setup is managed.
+    case manageShorePass
+
+    /// Opens the renewal page in the browser.
+    ///
+    /// Only an expired pass gets this, and it gets it *instead of* the pass
+    /// screen: nothing on that screen can renew, so sending someone there was
+    /// the dead end this replaces. A suspended pass is deliberately not here --
+    /// paying again does not lift a suspension.
+    case renewShorePass
+}
+
 /**
  Every user-facing word on the Connection details page.
 
@@ -71,6 +92,8 @@ enum ConnectionCopy {
         case .waitingForInternet: return String(localized: "Waiting for internet")
         case .unreachable: return String(localized: "Shore Pass unreachable")
         case .passExpired: return String(localized: "Shore Pass expired")
+        case .passExpiredReadOnly:
+            return String(localized: "Shore Pass expired · still receiving")
         case .passSuspended: return String(localized: "Shore Pass suspended")
         case .setupRejected: return String(localized: "Shore Pass setup rejected")
         case .storageFull: return String(localized: "Shore Pass storage full")
@@ -105,6 +128,12 @@ enum ConnectionCopy {
             return String(localized: "Your family's Shore Pass storage is full. Space frees up as your friends collect their messages, so this usually clears on its own. If it lasts more than a day, contact support.")
         case .passExpired:
             return String(localized: "Your Shore Pass has run out, so messages can't travel over the internet right now. Open Manage Shore Pass and renew it. Messages still reach your friends whenever you are near each other.")
+        // Names what still works before what has stopped: a person reading
+        // this is watching messages arrive while their own will not send, and
+        // a line that only said "expired" would read as the app contradicting
+        // itself.
+        case .passExpiredReadOnly:
+            return String(localized: "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it.")
         case .passSuspended:
             return String(localized: "Your Shore Pass has been turned off, so messages can't travel over the internet right now. Open Manage Shore Pass to see why and to turn it back on. Messages still reach your friends whenever you are near each other.")
         default:
@@ -154,25 +183,33 @@ enum ConnectionCopy {
         String(localized: "CruiseMesh doesn't have step-by-step help for this one yet. Open Troubleshooting & diagnostics, share diagnostics, and contact support.")
     }
 
-    /// Does this fault have a button on it, and does that button do something?
-    static func offersManageShorePass(_ reason: CoreDeliveryBlockedReason) -> Bool {
+    /// The renewal page's label, the one alternative to `Manage Shore Pass` a
+    /// How-to-fix sheet's button carries.
+    static func renewShorePass() -> String {
+        String(localized: "Renew Shore Pass")
+    }
+
+    /// The How-to-fix button for a fault stopping delivery to one friend.
+    static func howToFixAction(_ reason: CoreDeliveryBlockedReason) -> HowToFixAction {
         switch reason {
-        case .passExpired, .passSuspended, .ownSetupRejected:
-            return true
-        // Nothing on the Shore Pass screen repairs a friend's card, an
-        // oversized message, or a full mailbox, and a button that leads
-        // somewhere useless costs a reader more than no button at all.
+        case .passExpired:
+            return .renewShorePass
+        case .passSuspended, .ownSetupRejected:
+            return .manageShorePass
         case .contactSetupRejected, .storageFull, .messageTooLarge:
-            return false
+            return .none
         }
     }
 
-    static func offersManageShorePass(_ reason: CoreHealthReason) -> Bool {
+    /// The How-to-fix button for a device-wide fault.
+    static func howToFixAction(_ reason: CoreHealthReason) -> HowToFixAction {
         switch reason {
-        case .passExpired, .passSuspended, .ownSetupRejected:
-            return true
+        case .passExpired:
+            return .renewShorePass
+        case .passSuspended, .ownSetupRejected:
+            return .manageShorePass
         default:
-            return false
+            return .none
         }
     }
 
@@ -233,6 +270,8 @@ enum ConnectionCopy {
         case .waitingForInternet: return String(localized: "Waiting for internet")
         case .unreachable: return String(localized: "Unreachable")
         case .passExpired: return String(localized: "Pass expired")
+        case .passExpiredReadOnly:
+            return String(localized: "Pass expired · still receiving")
         case .passSuspended: return String(localized: "Pass suspended")
         case .setupRejected: return String(localized: "Setup rejected")
         case .storageFull: return String(localized: "Storage full")
@@ -547,6 +586,10 @@ struct ConnectionDetailsView: View {
     /// be scrolled.
     @State private var howToFix: HowToFixTopic?
     @State private var showShorePass = false
+    /// Where an expired pass is renewed, read once as the page opens. Held
+    /// here rather than in the sheet so the sheet stays a renderer; nil means
+    /// there is no link to offer and the sheet keeps its Manage button.
+    @State private var renewURL = ShorePassRenewal.currentRenewURL()
     /// Set when `How to fix` asks for Shore Pass, consumed once that sheet has
     /// finished dismissing. See the `onDismiss` handoff below.
     @State private var shorePassAfterHowToFix = false
@@ -688,6 +731,7 @@ struct ConnectionDetailsView: View {
         ) { topic in
             HowToFixSheet(
                 topic: topic,
+                renewURL: renewURL,
                 onManageShorePass: {
                     shorePassAfterHowToFix = true
                     howToFix = nil
@@ -1116,7 +1160,7 @@ struct ConnectionDetailsView: View {
                     showClear = true
                 }
                 .frame(minHeight: 44)
-                Text("Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.")
+                Text("Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if let supportMessage = supportMessage {
@@ -1298,21 +1342,31 @@ struct ConnectionDetailsView: View {
  */
 private struct HowToFixSheet: View {
     let topic: HowToFixTopic
+    /// Where an expired pass is renewed, or nil when there is no link to
+    /// offer. Passed in rather than read here so this stays a renderer.
+    let renewURL: URL?
     let onManageShorePass: () -> Void
 
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         let explanation: String?
-        let showManage: Bool
+        let chosen: HowToFixAction
         switch topic {
         case .device(let reason):
             explanation = ConnectionCopy.howToFix(reason)
-            showManage = ConnectionCopy.offersManageShorePass(reason)
+            chosen = ConnectionCopy.howToFixAction(reason)
         case .person(let reason, let name):
             explanation = ConnectionCopy.howToFix(reason, name: name)
-            showManage = ConnectionCopy.offersManageShorePass(reason)
+            chosen = ConnectionCopy.howToFixAction(reason)
         }
+        // An expired pass with no renewal link to offer -- no saved pass to
+        // name, or a credential the site cannot resolve -- falls back to the
+        // pass screen rather than losing its button. Every fault that had one
+        // still has one.
+        let action: HowToFixAction = (chosen == .renewShorePass && renewURL == nil)
+            ? .manageShorePass
+            : chosen
         return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
@@ -1324,12 +1378,24 @@ private struct HowToFixSheet: View {
                     Text(explanation ?? ConnectionCopy.howToFixUnknown())
                         .font(.body)
                         .fixedSize(horizontal: false, vertical: true)
-                    if showManage {
+                    switch action {
+                    case .none:
+                        EmptyView()
+                    case .manageShorePass:
                         Button(ConnectionCopy.healthAction(.manageShorePass)) {
                             onManageShorePass()
                         }
                         .buttonStyle(.borderedProminent)
                         .frame(maxWidth: .infinity, minHeight: 44)
+                    case .renewShorePass:
+                        // A `Link` rather than a button that opens a URL: it
+                        // leaves the app, and the system's own control is what
+                        // says so to VoiceOver.
+                        if let renewURL {
+                            Link(ConnectionCopy.renewShorePass(), destination: renewURL)
+                                .buttonStyle(.borderedProminent)
+                                .frame(maxWidth: .infinity, minHeight: 44)
+                        }
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)

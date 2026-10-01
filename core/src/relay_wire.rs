@@ -3,6 +3,7 @@ use blake2::Blake2bVar;
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Serialize};
 
+use crate::json_fault::json_fault;
 use crate::CoreError;
 
 const RELAY_MAX_SEALED_BYTES: usize = 512 * 1024;
@@ -147,6 +148,22 @@ struct RotateFamilyResponse {
     deposit_token: String,
     envelopes_moved: u64,
     rotated: bool,
+}
+
+#[derive(Deserialize)]
+struct FamilyStatusResponse {
+    /// `null` for a relay whose families were configured rather than sold --
+    /// a self-hosted deployment has no plan to name. Optional for the same
+    /// reason `expires_ms` is: the only required field is the one every
+    /// answer has.
+    #[serde(default)]
+    plan: Option<String>,
+    /// Absent and `null` mean the same thing -- a pass with no end date -- so
+    /// the field is defaulted rather than required. A relay that stops
+    /// emitting it must not turn a working pass into a decode failure.
+    #[serde(default)]
+    expires_ms: Option<i64>,
+    state: String,
 }
 
 /// CP4 (deposit-token split): class prefix that marks a *deposit* relay
@@ -333,6 +350,15 @@ pub fn resolved_contact_poll_relay(
 /// to. For a cross-family contact it delivers nothing, but neither did the
 /// dead endpoint, and unlike the dead endpoint this state is surfaced, so a
 /// person can repair the card.
+///
+/// One exception: a written-off card carrying *another family's* deposit
+/// token resolves to `None`, never to our own mailbox. That card is
+/// cross-family by construction, so our mailbox is one they never read, and
+/// `relay_posted_at` is terminal: falling back would mark their mail posted
+/// into a dead end for good. The common way to get here is a friend whose
+/// pass lapsed (`family_expired`), whose card is still right and starts
+/// working again the moment they renew. `None` leaves the rows queued for the
+/// periodic re-probe and for the mesh paths.
 #[uniffi::export]
 pub fn resolved_contact_delivery_relay(
     contact_relay_url: Option<String>,
@@ -350,13 +376,24 @@ pub fn resolved_contact_delivery_relay(
         );
     }
     let fallback = relay_endpoint_from(fallback_url, fallback_token)?;
-    // Only worth a request if it is somewhere other than the host we just
-    // wrote off; otherwise report "nowhere to post" honestly rather than
-    // retrying the same dead host under a different name.
     match relay_endpoint_from(contact_relay_url, contact_relay_token) {
+        // Only worth a request if it is somewhere other than the host we just
+        // wrote off; otherwise report "nowhere to post" honestly rather than
+        // retrying the same dead host under a different name.
         Some(contact) if contact.url == fallback.url => None,
+        // Another family's card: our mailbox would strand their mail.
+        Some(contact) if card_is_another_familys_deposit(&contact, &fallback) => None,
         _ => Some(fallback),
     }
+}
+
+/// Is this card credential another family's deposit token — cross-family by
+/// construction, so a post to *our* mailbox in its place can never reach the
+/// contact? Our own family's deposit token (the attenuation of our member
+/// token) is not: it is the same mailbox, wherever it now lives.
+fn card_is_another_familys_deposit(contact: &RelayEndpoint, own: &RelayEndpoint) -> bool {
+    relay_token_is_deposit(contact.token.clone())
+        && relay_deposit_token_for(own.token.clone()) != contact.token
 }
 
 /// One group member's relay situation, as the shell resolved it this pass.
@@ -398,18 +435,32 @@ pub struct GroupRelayMember {
 ///
 /// A member written off for *rejection* keeps falling back, unchanged: a 401
 /// proves the card is wrong, and our own relay really delivers when both
-/// sides have since moved to the same new host.
+/// sides have since moved to the same new host. The exception is the one
+/// [`resolved_contact_delivery_relay`] makes: a written-off card carrying
+/// another family's deposit token (a friend whose pass lapsed, typically)
+/// blocks the fallback exactly as a resting member does, because our mailbox
+/// is one that family never reads.
 #[uniffi::export]
 pub fn core_group_fanout_relay_target(
     members: Vec<GroupRelayMember>,
     fallback_url: Option<String>,
     fallback_token: Option<String>,
 ) -> Option<RelayEndpoint> {
-    let mut any_member_resting = false;
+    let own = relay_endpoint_from(fallback_url.clone(), fallback_token.clone());
+    let mut any_member_blocks_fallback = false;
     for member in members {
         if !member.endpoint_answering {
-            any_member_resting = true;
+            any_member_blocks_fallback = true;
             continue;
+        }
+        if !member.endpoint_usable {
+            let card = relay_endpoint_from(member.relay_url.clone(), member.relay_token.clone());
+            if let (Some(card), Some(own)) = (card.as_ref(), own.as_ref()) {
+                if card_is_another_familys_deposit(card, own) {
+                    any_member_blocks_fallback = true;
+                    continue;
+                }
+            }
         }
         if let Some(endpoint) = resolved_contact_delivery_relay(
             member.relay_url,
@@ -421,10 +472,10 @@ pub fn core_group_fanout_relay_target(
             return Some(endpoint);
         }
     }
-    if any_member_resting {
+    if any_member_blocks_fallback {
         return None;
     }
-    relay_endpoint_from(fallback_url, fallback_token)
+    own
 }
 
 /// Poll-path routing with the same written-off rule.
@@ -942,6 +993,110 @@ pub fn relay_decode_rotate_response(
     })
 }
 
+// ---------------------------------------------------------------------------
+// What the family's pass says about itself
+// ---------------------------------------------------------------------------
+
+/// Where a pass stands with the service that sold it.
+///
+/// Deliberately not a re-statement of [`CoreRelayFault`](crate::CoreRelayFault):
+/// that is what one HTTP call *just did*, this is what the account says when
+/// asked. A pass can be `Active` and still have a failing sync (no internet),
+/// and it is the only source for the one thing no sync outcome can reveal —
+/// when internet delivery is going to stop.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum CoreFamilyPassState {
+    /// Paid up and inside its term.
+    Active,
+    /// Past its end date, still delivering: the window in which renewing
+    /// costs nobody any mail.
+    Grace,
+    /// Turned off by the service. Renewing is not the remedy; support is.
+    Suspended,
+    /// A state this build has no rule for.
+    ///
+    /// A shipped phone outlives the server it talks to, and the one thing a
+    /// status read must never do is fail closed on a word it does not
+    /// recognize — that would take the end date away from every phone in the
+    /// field the day the service adds a fourth state. Callers treat this as
+    /// "no claim about the account": the fields that were understood still
+    /// stand, and nothing is asserted about the rest.
+    Unknown,
+}
+
+/// What relayd reports about the family's pass (`GET /family/status`).
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct CoreFamilyStatus {
+    /// The plan the pass was bought on, as the service names it, or `None`
+    /// for a family that was configured rather than sold — a self-hosted
+    /// relay's env-allowlist family has no plan because no pass was ever
+    /// bought for it.
+    pub plan: Option<String>,
+    /// When internet delivery stops, or `None` for a pass with no end date —
+    /// a self-hosted relay, or a plan that does not expire. `None` is not an
+    /// error and not "unknown": it means there is no date to show, so shells
+    /// show nothing rather than inventing one.
+    pub expires_ms: Option<i64>,
+    pub state: CoreFamilyPassState,
+}
+
+/// The path a device reads its family's pass status from.
+///
+/// A function rather than a constant for the same reason as
+/// [`relay_rotate_path`]: both shells route identically and neither
+/// hand-writes the string.
+#[uniffi::export]
+pub fn relay_family_status_path() -> String {
+    "/family/status".to_string()
+}
+
+/// Decode relayd's answer to [`relay_family_status_path`].
+///
+/// Nothing here is trusted enough to act on by itself — this is a read of a
+/// bearer-authenticated route about the caller's own family, so there is no
+/// second party whose claim needs checking, and unlike a rotation the result
+/// is never committed to storage or gossiped. An unrecognized `state` is
+/// [`CoreFamilyPassState::Unknown`] rather than a failure; see that variant.
+#[uniffi::export]
+pub fn relay_decode_family_status(body: Vec<u8>) -> Result<CoreFamilyStatus, CoreError> {
+    validate_response_body(&body)?;
+    let wire = json_decode::<FamilyStatusResponse>(&body)?;
+    Ok(CoreFamilyStatus {
+        plan: wire.plan,
+        expires_ms: wire.expires_ms,
+        state: match wire.state.as_str() {
+            "active" => CoreFamilyPassState::Active,
+            "grace" => CoreFamilyPassState::Grace,
+            "suspended" => CoreFamilyPassState::Suspended,
+            _ => CoreFamilyPassState::Unknown,
+        },
+    })
+}
+
+/// When to tell someone their internet delivery runs through, given the
+/// status and this shell's clock — or `None` for "say nothing".
+///
+/// The rule, so both shells say the same thing on the same day:
+///
+/// - No end date, no line. Nothing is promised about a pass that never said
+///   when it stops.
+/// - A date already past is not a promise either. Grace is real delivery, but
+///   "internet delivery through last Tuesday" reads as a fault to the person
+///   holding the phone, and the expired states already have their own copy.
+/// - A suspended pass makes no claim about delivery at all, whatever date its
+///   row still carries.
+///
+/// [`CoreFamilyPassState::Unknown`] deliberately still shows the date: the end
+/// date is the field the reader came for, and a state word this build cannot
+/// place is no reason to withhold one the server did state plainly.
+#[uniffi::export]
+pub fn relay_pass_delivery_through_ms(status: CoreFamilyStatus, now_ms: i64) -> Option<i64> {
+    if status.state == CoreFamilyPassState::Suspended {
+        return None;
+    }
+    status.expires_ms.filter(|expires| *expires > now_ms)
+}
+
 fn validate_envelope(msg_id: &[u8], hint: &[u8], sealed: &[u8]) -> Result<(), CoreError> {
     relay_validate_envelope_sizes(msg_id.len(), hint.len(), sealed.len() as u64)
 }
@@ -1006,8 +1161,20 @@ fn validate_response_body(body: &[u8]) -> Result<(), CoreError> {
 fn json_encode<T: Serialize>(value: &T) -> Result<Vec<u8>, CoreError> {
     serde_json::to_vec(value).map_err(|e| malformed(&format!("invalid relay JSON: {e}")))
 }
+
+/// Decodes a relay response body.
+///
+/// The failure is described by [`json_fault`] rather than by `serde_json`'s
+/// own text. What answers a relay call is not necessarily the relay — on a
+/// ship it is as often a captive portal or a hotel proxy — and both shells log
+/// this message into a file the user can export and share.
 fn json_decode<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, CoreError> {
-    serde_json::from_slice(body).map_err(|e| malformed(&format!("invalid relay JSON: {e}")))
+    serde_json::from_slice(body).map_err(|e| {
+        malformed(&format!(
+            "invalid relay JSON: {}",
+            json_fault(&e, body.len())
+        ))
+    })
 }
 fn malformed(message: &str) -> CoreError {
     CoreError::Malformed(message.to_string())
@@ -1439,6 +1606,61 @@ mod tests {
         let page = relay_decode_fetch_page(response).unwrap();
         assert_eq!(page.envelopes[0].msg_id, vec![1; 16]);
         assert_eq!(page.next_cursor, 4);
+    }
+
+    /// Whatever answers a relay call is not necessarily the relay: a captive
+    /// portal, a hotel proxy, a gateway. Both shells log this message when a
+    /// 2xx body will not decode, so it carries the shape of the failure and
+    /// nothing that came off the wire.
+    ///
+    /// Whole-message equality on purpose. "Does not contain the body" is the
+    /// property, but only pinning the message exactly rules out a future edit
+    /// appending something else that came off the wire.
+    #[test]
+    fn a_malformed_page_is_named_without_quoting_the_page() {
+        let body = br#"{"envelopes":[],"next_cursor":"MARKER-portal-deck-5"}"#.to_vec();
+        let len = body.len();
+        let err = relay_decode_fetch_page(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed relay page");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: data error at line 1 column 52 of {len}B")
+        );
+    }
+
+    /// A sign-in page where a fetch page should have been. The status branch
+    /// catches these when the portal is honest enough to send a non-2xx; this
+    /// is the one that answers 200 and hands over HTML.
+    #[test]
+    fn a_sign_in_page_answered_with_200_is_a_syntax_error_and_nothing_else() {
+        let body = b"<html><title>MARKER Guest Wi-Fi</title></html>".to_vec();
+        let len = body.len();
+        let err = relay_decode_fetch_page(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed relay page");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: syntax error at line 1 column 1 of {len}B")
+        );
+    }
+
+    /// The post response is the smallest decode on this surface and takes the
+    /// same route through `json_decode`, so it gets the same guarantee.
+    #[test]
+    fn a_malformed_post_response_is_named_without_quoting_it() {
+        let body = br#"{"id":"MARKER-not-a-number"}"#.to_vec();
+        let len = body.len();
+        let err = relay_decode_post_response(body).unwrap_err();
+        let CoreError::Malformed(message) = err else {
+            panic!("expected a malformed post response");
+        };
+        assert_eq!(
+            message,
+            format!("invalid relay JSON: data error at line 1 column 27 of {len}B")
+        );
     }
 
     #[test]
@@ -1880,6 +2102,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_written_off_card_from_another_family_never_falls_back_to_our_own() {
+        // A friend whose pass lapsed answers `family_expired` to their deposit
+        // card until it is written off. Our mailbox is one their family never
+        // reads, and `relay_posted_at` is terminal, so falling back would mark
+        // their mail posted into a dead end for good. Nothing to post: the
+        // rows stay queued for the re-probe after they renew.
+        let their_deposit = relay_deposit_token_for("their-member-token".to_string());
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://theirs.example"),
+                Some(their_deposit.clone()),
+                some("https://ours.example"),
+                some("our-token"),
+                false,
+            ),
+            None
+        );
+        // Still their card, unchanged, while it is usable (and whenever the
+        // re-probe makes it usable again).
+        assert_eq!(
+            resolved_contact_delivery_relay(
+                some("https://theirs.example"),
+                Some(their_deposit.clone()),
+                some("https://ours.example"),
+                some("our-token"),
+                true,
+            )
+            .unwrap()
+            .token,
+            their_deposit
+        );
+    }
+
+    #[test]
+    fn a_written_off_card_from_our_own_family_still_falls_back() {
+        // Our own family's deposit token on a host we have since left is the
+        // same mailbox under its new address: the fallback really delivers.
+        let ours = relay_deposit_token_for("our-token".to_string());
+        let routed = resolved_contact_delivery_relay(
+            some("https://old-host.example"),
+            Some(ours),
+            some("https://ours.example"),
+            some("our-token"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(routed.url, "https://ours.example");
+        assert_eq!(routed.token, "our-token");
+    }
+
+    #[test]
+    fn a_written_off_member_from_another_family_blocks_the_group_fallback() {
+        let lapsed = GroupRelayMember {
+            relay_url: some("https://theirs.example"),
+            relay_token: Some(relay_deposit_token_for("their-member-token".to_string())),
+            endpoint_usable: false,
+            endpoint_answering: true,
+        };
+        assert_eq!(
+            core_group_fanout_relay_target(
+                vec![lapsed.clone()],
+                some("https://ours.example"),
+                some("our-token"),
+            ),
+            None
+        );
+        // A healthy member beside them still carries the group, as before.
+        let target = core_group_fanout_relay_target(
+            vec![lapsed, member(some("https://live.example"), true, true)],
+            some("https://ours.example"),
+            some("our-token"),
+        )
+        .unwrap();
+        assert_eq!(target.url, "https://live.example");
+    }
+
     fn member(url: Option<String>, usable: bool, answering: bool) -> GroupRelayMember {
         GroupRelayMember {
             relay_url: url,
@@ -1992,5 +2291,107 @@ mod tests {
             true,
         )
         .is_some());
+    }
+
+    fn family_status(body: &str) -> CoreFamilyStatus {
+        relay_decode_family_status(body.as_bytes().to_vec()).expect("decodes")
+    }
+
+    #[test]
+    fn family_status_route_is_named_in_one_place() {
+        assert_eq!(relay_family_status_path(), "/family/status");
+    }
+
+    #[test]
+    fn family_status_decodes_the_three_states_relayd_reports() {
+        let active =
+            family_status(r#"{"plan":"shore","expires_ms":1735689600000,"state":"active"}"#);
+        assert_eq!(active.plan.as_deref(), Some("shore"));
+        assert_eq!(active.expires_ms, Some(1_735_689_600_000));
+        assert_eq!(active.state, CoreFamilyPassState::Active);
+        assert_eq!(
+            family_status(r#"{"plan":"shore","expires_ms":1,"state":"grace"}"#).state,
+            CoreFamilyPassState::Grace
+        );
+        assert_eq!(
+            family_status(r#"{"plan":"shore","expires_ms":1,"state":"suspended"}"#).state,
+            CoreFamilyPassState::Suspended
+        );
+    }
+
+    #[test]
+    fn a_pass_with_no_end_date_decodes_as_no_date_rather_than_as_an_error() {
+        // Both spellings of "there is no date": relayd's null, and a relay
+        // that never emits the field at all.
+        assert_eq!(
+            family_status(r#"{"plan":"self-hosted","expires_ms":null,"state":"active"}"#)
+                .expires_ms,
+            None
+        );
+        assert_eq!(
+            family_status(r#"{"plan":"self-hosted","state":"active"}"#).expires_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_state_keeps_the_rest_of_the_answer() {
+        // The forward-compatibility rule: a phone in the field must not lose
+        // its end date the day the service adds a state word.
+        let status = family_status(r#"{"plan":"shore","expires_ms":42,"state":"paused"}"#);
+        assert_eq!(status.state, CoreFamilyPassState::Unknown);
+        assert_eq!(status.expires_ms, Some(42));
+    }
+
+    #[test]
+    fn a_family_with_no_plan_decodes_as_no_plan_rather_than_as_an_error() {
+        // A self-hosted relay's env-allowlist family has no `families` row, so
+        // relayd reports a null plan for it. That is an ordinary answer about
+        // an ordinary family, not a broken one.
+        let status = family_status(r#"{"plan":null,"expires_ms":null,"state":"active"}"#);
+        assert_eq!(status.plan, None);
+        assert_eq!(status.state, CoreFamilyPassState::Active);
+        assert_eq!(family_status(r#"{"state":"active"}"#).plan, None);
+    }
+
+    #[test]
+    fn family_status_still_refuses_a_body_that_is_not_the_answer() {
+        assert!(relay_decode_family_status(b"not json".to_vec()).is_err());
+        // `state` is the one required field -- every answer has one, and a
+        // body without it is some other route's, not a pass with fields left
+        // out.
+        assert!(relay_decode_family_status(br#"{"expires_ms":1}"#.to_vec()).is_err());
+    }
+
+    #[test]
+    fn delivery_through_is_shown_only_for_a_future_date_on_a_live_pass() {
+        let now = 1_000_000i64;
+        let at = |expires: Option<i64>, state: CoreFamilyPassState| {
+            relay_pass_delivery_through_ms(
+                CoreFamilyStatus {
+                    plan: Some("shore".into()),
+                    expires_ms: expires,
+                    state,
+                },
+                now,
+            )
+        };
+        assert_eq!(
+            at(Some(now + 1), CoreFamilyPassState::Active),
+            Some(now + 1)
+        );
+        // No date, nothing to say -- not "expired".
+        assert_eq!(at(None, CoreFamilyPassState::Active), None);
+        // Grace still delivers, but a date in the past is not a promise.
+        assert_eq!(at(Some(now - 1), CoreFamilyPassState::Grace), None);
+        assert_eq!(at(Some(now), CoreFamilyPassState::Active), None);
+        // A suspended pass makes no delivery claim, whatever date it carries.
+        assert_eq!(at(Some(now + 1), CoreFamilyPassState::Suspended), None);
+        // A state this build cannot place is no reason to withhold a date the
+        // server stated plainly.
+        assert_eq!(
+            at(Some(now + 1), CoreFamilyPassState::Unknown),
+            Some(now + 1)
+        );
     }
 }

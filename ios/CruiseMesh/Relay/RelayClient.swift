@@ -231,17 +231,29 @@ struct RelayPresencePage {
     let presence: [CoreRelayPresence]
 }
 
+/// Relay HTTP failure carrying the status, relayd's stable error code, and --
+/// for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
+/// core's `relayRetryAfterMs`, never here).
+///
+/// The response body is not among them, in `errorDescription` or in a stored
+/// property. Callers log `localizedDescription` as-is, so anything held here
+/// is content the far end chose and this app then wrote into a file the user
+/// shares. What is kept is what triage used: the status, relayd's own code,
+/// and whether a body came back at all. Mirrors Android `RelayHttpException`.
 struct RelayHTTPError: LocalizedError {
     let statusCode: Int
     let relayCode: String?
-    let responseBody: String
+    /// How many bytes of body came back, up to the preview cap -- never the
+    /// bytes. A `+` in the description marks a body that reached the cap.
+    let responseBodyBytes: Int
     /// Raw `Retry-After` header on a 429 (CP2b); parsed/clamped by the
     /// core's `relayRetryAfterMs`, never here.
     var retryAfter: String? = nil
 
     var errorDescription: String? {
-        let semantic = relayCode.map { " [\($0)]" } ?? ""
-        return "Relay request failed (\(statusCode))\(semantic): \(responseBody)"
+        let semantic = relayCode.map { " [\($0)]" } ?? " [-]"
+        let capped = responseBodyBytes >= RelayClient.errorBodyPreviewBytes ? "+" : ""
+        return "Relay request failed (\(statusCode))\(semantic) body=\(responseBodyBytes)\(capped)B"
     }
 }
 
@@ -255,9 +267,11 @@ enum RelayClient {
     /// fail the same window from the same cursor on every pass forever.
     /// Matches Android, whose `readTimeout` is likewise per-read.
     private static let inactivityTimeout: TimeInterval = 15
-    /// How much of a non-2xx body is kept -- enough to quote the relay's
-    /// reason in the error, not enough for an error page to cost memory.
-    private static let errorBodyPreviewBytes = 2_048
+    /// How much of a non-2xx body is read -- enough to find relayd's own
+    /// error code in it, not enough for an error page to cost memory. None of
+    /// it is kept past that. Not `private`: `RelayHTTPError` reads the cap to
+    /// say whether the body it counted had been truncated.
+    static let errorBodyPreviewBytes = 2_048
     private static let userAgent = "CruiseMeshRelayClient-iOS/0.1"
 
     /// Every relay call lands here, and until now none of them left a trace.
@@ -272,6 +286,52 @@ enum RelayClient {
 
     /// Overridable for unit tests (URLProtocol / mock sessions).
     static var urlSession: URLSession = .shared
+
+    /// How a failure that came back with a 2xx is described in the log.
+    ///
+    /// A relay answered, the body arrived whole, and the core decoder refused
+    /// it. That is the one relay failure whose cause is *in* the bytes, which
+    /// is exactly why the bytes are not here: whatever answered the request
+    /// may not have been the relay at all, and this line lands in a file the
+    /// user exports and mails to whoever is helping.
+    ///
+    /// What replaces them is what the reader works from. The size says
+    /// whether a whole page came back or a stub, and the core's message (see
+    /// `json_fault`) says which kind of malformation it was and the line and
+    /// column it stopped at -- derived from the body, never quoting it.
+    ///
+    /// Its own function so a test can pin the whole sentence: `os.Logger`
+    /// output is not readable from a unit test, so an assertion about what was
+    /// logged has to be an assertion about what was composed. Mirrors Android
+    /// `RelayClient.decodeFailureDetail`.
+    static func decodeFailureDetail(bytes: Int, error: Error) -> String {
+        "could not decode \(bytes)B: \(error.localizedDescription)"
+    }
+
+    /// Runs a core decoder over a 2xx body and records a refusal.
+    ///
+    /// Until now a decode failure was the one relay outcome that left no
+    /// trace on this shell: the transport catch in `syncRequest` never sees
+    /// it, and `logOutcome` has already written its success line by the time
+    /// the decoder runs. A silent failure is worse than a noisy one, and
+    /// Android has logged this case all along.
+    private static func decoding<T>(
+        _ request: URLRequest,
+        _ data: Data,
+        _ decode: () throws -> T
+    ) throws -> T {
+        do {
+            return try decode()
+        } catch {
+            log.error(
+                """
+                \(relayDiagnosticRequestLabel(request), privacy: .public) \
+                \(decodeFailureDetail(bytes: data.count, error: error), privacy: .public)
+                """
+            )
+            throw error
+        }
+    }
 
     static func postOutboundEnvelope(config: RelayConfig, envelope: OutboundEnvelope) throws -> Int64 {
         try postEnvelope(
@@ -352,7 +412,7 @@ enum RelayClient {
         applyAuth(&request, config: config)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let page = try relayDecodeFetchPage(body: data)
+        let page = try decoding(request, data) { try relayDecodeFetchPage(body: data) }
         let envelopes: [RelayFetchedEnvelope] = page.envelopes.map { item in
             return RelayFetchedEnvelope(
                 id: item.id, msgId: item.msgId, hopTtl: item.hopTtl,
@@ -433,7 +493,7 @@ enum RelayClient {
         request.httpBody = try relayEncodePresenceRequest(announce: announce, query: query)
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        let page = try relayDecodePresencePage(body: data)
+        let page = try decoding(request, data) { try relayDecodePresencePage(body: data) }
         return RelayPresencePage(nowMs: page.nowMs, presence: page.presence)
     }
 
@@ -463,6 +523,33 @@ enum RelayClient {
         return data
     }
 
+    /// Reads this family's own pass state -- plan, expiry, billing state --
+    /// so the pass surface can say when internet delivery runs out and offer a
+    /// renewal before it does.
+    ///
+    /// The one relay read that has to keep answering while the pass is expired
+    /// or suspended: those are exactly the states a person needs to be told
+    /// about, so relayd skips its billing checks for this route alone
+    /// (`FamilyOp::Status`). Member-only -- a deposit credential is refused
+    /// with the same structured 403 as any other member-only op, so
+    /// `FamilyStatusStore` declines to ask on one at all rather than spending
+    /// a round trip to be told -- and it carries the saved member token like
+    /// every other call here.
+    ///
+    /// Shaped like every other GET here: core names the route and decodes the
+    /// body, the shell only carries bytes -- so an unrecognized account state
+    /// is forgiven identically on both platforms rather than in two hand-written
+    /// decoders. Mirrors Android `RelayClient.fetchFamilyStatus`.
+    static func fetchFamilyStatus(config: RelayConfig) throws -> CoreFamilyStatus {
+        let url = try buildURL(config.relayUrl, path: relayFamilyStatusPath())
+        var request = URLRequest(url: url, timeoutInterval: connectTimeout)
+        request.httpMethod = "GET"
+        applyAuth(&request, config: config)
+        let (data, response) = try syncRequest(request)
+        try ensureOK(response, data: data)
+        return try relayDecodeFamilyStatus(body: data)
+    }
+
     private static func postEnvelope(
         config: RelayConfig,
         msgId: Data,
@@ -482,7 +569,7 @@ enum RelayClient {
         )
         let (data, response) = try syncRequest(request)
         try ensureOK(response, data: data)
-        return try relayDecodePostResponse(body: data)
+        return try decoding(request, data) { try relayDecodePostResponse(body: data) }
     }
 
     private static func applyAuth(_ request: inout URLRequest, config: RelayConfig) {
@@ -694,12 +781,17 @@ enum RelayClient {
         guard (200..<300).contains(http.statusCode) else {
             // Already truncated to a preview by the delegate; bounded again
             // here so this stays correct for any other caller.
-            let body = String(data: data.prefix(errorBodyPreviewBytes), encoding: .utf8) ?? ""
+            let preview = data.prefix(errorBodyPreviewBytes)
             let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            // `preview` ends here. It was read to name the failure, and
+            // `relayCode` is that name; the bytes themselves are whatever the
+            // far end chose to send -- a captive-portal page, a proxy banner,
+            // a gateway error -- and this error's description is logged
+            // verbatim wherever a relay call fails. Only the count travels.
             throw RelayHTTPError(
                 statusCode: http.statusCode,
                 relayCode: json?["code"] as? String,
-                responseBody: body,
+                responseBodyBytes: preview.count,
                 retryAfter: http.value(forHTTPHeaderField: "Retry-After")
             )
         }

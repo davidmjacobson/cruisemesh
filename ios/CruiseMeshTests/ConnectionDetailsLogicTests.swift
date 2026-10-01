@@ -111,6 +111,7 @@ final class ConnectionDetailsLogicTests: XCTestCase {
             (.ok(lastSyncMs: Self.fixedNowMs), .connected),
             (.failing(lastAttemptMs: Self.fixedNowMs), .unreachable),
             (.expired(lastAttemptMs: Self.fixedNowMs), .passExpired),
+            (.expiredReadOnly(lastAttemptMs: Self.fixedNowMs), .passExpiredReadOnly),
             (.suspended(lastAttemptMs: Self.fixedNowMs), .passSuspended),
             (.tokenRejected(lastAttemptMs: Self.fixedNowMs), .setupRejected),
             (.quotaFull(lastAttemptMs: Self.fixedNowMs), .storageFull),

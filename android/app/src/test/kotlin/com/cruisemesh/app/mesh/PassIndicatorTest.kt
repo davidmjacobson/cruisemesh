@@ -17,6 +17,7 @@ class PassIndicatorTest {
             RelayHealth.Ok(now),
             RelayHealth.Failing(now),
             RelayHealth.Expired(now),
+            RelayHealth.ExpiredReadOnly(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
             RelayHealth.QuotaFull(now),
@@ -69,6 +70,7 @@ class PassIndicatorTest {
     fun `states that need the user to act are red`() {
         for (health in listOf(
             RelayHealth.Expired(now),
+            RelayHealth.ExpiredReadOnly(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
             RelayHealth.QuotaFull(now),
@@ -143,6 +145,7 @@ class PassIndicatorTest {
             RelayHealth.NoInternet,
             RelayHealth.Failing(now),
             RelayHealth.Expired(now),
+            RelayHealth.ExpiredReadOnly(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
             RelayHealth.QuotaFull(now),
@@ -178,6 +181,7 @@ class PassIndicatorTest {
             RelayHealth.NoInternet,
             RelayHealth.Failing(now),
             RelayHealth.Expired(now),
+            RelayHealth.ExpiredReadOnly(now),
             RelayHealth.Suspended(now),
             RelayHealth.TokenRejected(now),
             RelayHealth.QuotaFull(now),

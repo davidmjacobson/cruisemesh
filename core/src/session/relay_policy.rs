@@ -411,6 +411,12 @@ pub fn core_relay_rerun_action(
 /// The health one completed relay pass earns, as a domain fact. The shells map
 /// it to their own display type and attach their own timestamp; nothing here
 /// is a string, and nothing here is localized.
+///
+/// It is the health of *this device's own* Shore Pass, and only of that
+/// (`HEALTH-01`). A contact's card endpoint refusing us — a friend whose
+/// family pass lapsed, say — is that contact's problem, recorded against
+/// their card's rejection streak and surfaced as their delivery line's
+/// `ContactSetupRejected`, never as this device's pass expiring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum CoreRelayPassHealth {
     /// Our own relay answered and so did every other one we tried.
@@ -421,8 +427,19 @@ pub enum CoreRelayPassHealth {
     MessageTooLarge,
     /// 429: self-healing, never an error to act on.
     RateLimited,
-    /// 403 `family_expired`.
+    /// 403 `family_expired` on a pass that could not fetch either: relayd's
+    /// grace window is over and every operation is refused.
     Expired,
+    /// 403 `family_expired` on a pass whose own mailbox still answered: the
+    /// read-only grace window. Envelopes queued for us keep arriving and keep
+    /// being acked; only new posts take the 403.
+    ///
+    /// Split out from [`CoreRelayPassHealth::Expired`] because the two need
+    /// different sentences. Folded together, a family inside the window was
+    /// told their pass had stopped working while their friends' messages were
+    /// visibly still landing, which reads as the app being half-broken rather
+    /// than as a pass that needs renewing.
+    ExpiredReadOnly,
     /// 403 `family_suspended`.
     Suspended,
     /// Any other 401/403 against our own saved credential.
@@ -476,6 +493,24 @@ pub fn core_worse_relay_fault(
 /// an unknown token, so neither can co-occur with a successful poll at all.
 /// Expiry-in-grace is the only credential fault that can, which is why it is
 /// the only one that moves.
+///
+/// The success flags then separate the two expiry shapes. A pass that took the
+/// 403 on its posts and still got its own mailbox answered is inside the grace
+/// window ([`CoreRelayPassHealth::ExpiredReadOnly`]); one that got nothing at
+/// all is past it ([`CoreRelayPassHealth::Expired`]). That distinction is
+/// derived here rather than read off the wire on purpose: relayd returns the
+/// same 403 and the same `family_expired` code either way, deliberately, so
+/// that clients need exactly one renewal flow — the asymmetry a person can
+/// actually see is which requests worked, and that is what this reads.
+///
+/// # Precondition (`HEALTH-01`)
+///
+/// `fault` must be the worst of the faults this device's *own* credential
+/// earned this pass, with a single exception: a `429` from any endpoint, which
+/// `RATE-01` reads as a family-budget verdict. A caller that folds in a
+/// contact endpoint's `403 family_expired` makes a healthy pass read as
+/// expired; that was a field bug, and `CoreRelayPass` now gates the fold on
+/// the credential each request carried.
 #[uniffi::export]
 pub fn core_relay_pass_health(
     fault: Option<CoreRelayFault>,
@@ -486,7 +521,13 @@ pub fn core_relay_pass_health(
         Some(CoreRelayFault::MailboxFull) => return CoreRelayPassHealth::QuotaFull,
         Some(CoreRelayFault::MessageTooLarge) => return CoreRelayPassHealth::MessageTooLarge,
         Some(CoreRelayFault::RateLimited) => return CoreRelayPassHealth::RateLimited,
-        Some(CoreRelayFault::PassExpired) => return CoreRelayPassHealth::Expired,
+        Some(CoreRelayFault::PassExpired) => {
+            return if own_relay_succeeded && any_relay_succeeded {
+                CoreRelayPassHealth::ExpiredReadOnly
+            } else {
+                CoreRelayPassHealth::Expired
+            };
+        }
         _ => {}
     }
     if own_relay_succeeded && any_relay_succeeded {
@@ -812,19 +853,30 @@ pub fn core_family_relay_health_vectors() -> Vec<CoreRelayHealthVector> {
             true,
             CoreRelayPassHealth::RateLimited,
         ),
-        // The seven-day read-only grace window is not health.
+        // The seven-day read-only grace window is not health, and it is not
+        // the same state as a pass past the window either: the mailbox still
+        // answered, so queued mail is still arriving.
         health_vector(
             "expiry-in-grace-beats-a-successful-poll",
             Some(CoreRelayFault::PassExpired),
             true,
             true,
-            CoreRelayPassHealth::Expired,
+            CoreRelayPassHealth::ExpiredReadOnly,
         ),
         health_vector(
             "expiry-past-the-grace-window",
             Some(CoreRelayFault::PassExpired),
             false,
             false,
+            CoreRelayPassHealth::Expired,
+        ),
+        // Another family's relay answering proves nothing about ours. Only our
+        // own mailbox answering means our queued mail is still coming in.
+        health_vector(
+            "expiry-with-only-someone-elses-relay-answering",
+            Some(CoreRelayFault::PassExpired),
+            false,
+            true,
             CoreRelayPassHealth::Expired,
         ),
         // Suspension and token rejection keep the older precedence, because

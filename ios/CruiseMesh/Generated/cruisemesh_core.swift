@@ -17335,6 +17335,107 @@ public func FfiConverterTypeCoreFailoverResumeArm_lower(_ value: CoreFailoverRes
 
 
 /**
+ * What relayd reports about the family's pass (`GET /family/status`).
+ */
+public struct CoreFamilyStatus {
+    /**
+     * The plan the pass was bought on, as the service names it, or `None`
+     * for a family that was configured rather than sold — a self-hosted
+     * relay's env-allowlist family has no plan because no pass was ever
+     * bought for it.
+     */
+    public var plan: String?
+    /**
+     * When internet delivery stops, or `None` for a pass with no end date —
+     * a self-hosted relay, or a plan that does not expire. `None` is not an
+     * error and not "unknown": it means there is no date to show, so shells
+     * show nothing rather than inventing one.
+     */
+    public var expiresMs: Int64?
+    public var state: CoreFamilyPassState
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The plan the pass was bought on, as the service names it, or `None`
+         * for a family that was configured rather than sold — a self-hosted
+         * relay's env-allowlist family has no plan because no pass was ever
+         * bought for it.
+         */plan: String?, 
+        /**
+         * When internet delivery stops, or `None` for a pass with no end date —
+         * a self-hosted relay, or a plan that does not expire. `None` is not an
+         * error and not "unknown": it means there is no date to show, so shells
+         * show nothing rather than inventing one.
+         */expiresMs: Int64?, state: CoreFamilyPassState) {
+        self.plan = plan
+        self.expiresMs = expiresMs
+        self.state = state
+    }
+}
+
+
+
+extension CoreFamilyStatus: Equatable, Hashable {
+    public static func ==(lhs: CoreFamilyStatus, rhs: CoreFamilyStatus) -> Bool {
+        if lhs.plan != rhs.plan {
+            return false
+        }
+        if lhs.expiresMs != rhs.expiresMs {
+            return false
+        }
+        if lhs.state != rhs.state {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(plan)
+        hasher.combine(expiresMs)
+        hasher.combine(state)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyStatus {
+        return
+            try CoreFamilyStatus(
+                plan: FfiConverterOptionString.read(from: &buf), 
+                expiresMs: FfiConverterOptionInt64.read(from: &buf), 
+                state: FfiConverterTypeCoreFamilyPassState.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CoreFamilyStatus, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.plan, into: &buf)
+        FfiConverterOptionInt64.write(value.expiresMs, into: &buf)
+        FfiConverterTypeCoreFamilyPassState.write(value.state, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyStatus_lift(_ buf: RustBuffer) throws -> CoreFamilyStatus {
+    return try FfiConverterTypeCoreFamilyStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyStatus_lower(_ value: CoreFamilyStatus) -> RustBuffer {
+    return FfiConverterTypeCoreFamilyStatus.lower(value)
+}
+
+
+/**
  * One relay-post row of a group message's per-member fan-out
  * (`specs/group-relay-durability.md` §4, DTN_TODOS.md N1). Deliberately
  * NOT [`CarriedEnvelope`], even though the fields coincide -- a fan-out row
@@ -21307,7 +21408,10 @@ public func FfiConverterTypeCoreRelayBackoffVector_lower(_ value: CoreRelayBacko
  * * **Rejection** — the endpoint answered, authoritatively, that it will not
  * serve us. The card is wrong. Falling back to this device's own mailbox
  * is right: a `401` proves nothing about our own relay, and when both
- * sides have since moved to the same host it really delivers.
+ * sides have since moved to the same host it really delivers. Not for a
+ * card carrying another family's deposit token, though (a friend whose
+ * pass lapsed, typically): our mailbox is one they never read, so that
+ * card gets the silence answer below instead.
  * * **Silence** — nothing answered at all. Falling back would put a
  * cross-family contact's mail in a mailbox they never read, and
  * `relay_posted_at` is terminal, so that is a permanent misroute rather
@@ -38265,6 +38369,113 @@ extension CoreError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Where a pass stands with the service that sold it.
+ *
+ * Deliberately not a re-statement of [`CoreRelayFault`](crate::CoreRelayFault):
+ * that is what one HTTP call *just did*, this is what the account says when
+ * asked. A pass can be `Active` and still have a failing sync (no internet),
+ * and it is the only source for the one thing no sync outcome can reveal —
+ * when internet delivery is going to stop.
+ */
+
+public enum CoreFamilyPassState {
+    
+    /**
+     * Paid up and inside its term.
+     */
+    case active
+    /**
+     * Past its end date, still delivering: the window in which renewing
+     * costs nobody any mail.
+     */
+    case grace
+    /**
+     * Turned off by the service. Renewing is not the remedy; support is.
+     */
+    case suspended
+    /**
+     * A state this build has no rule for.
+     *
+     * A shipped phone outlives the server it talks to, and the one thing a
+     * status read must never do is fail closed on a word it does not
+     * recognize — that would take the end date away from every phone in the
+     * field the day the service adds a fourth state. Callers treat this as
+     * "no claim about the account": the fields that were understood still
+     * stand, and nothing is asserted about the rest.
+     */
+    case unknown
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCoreFamilyPassState: FfiConverterRustBuffer {
+    typealias SwiftType = CoreFamilyPassState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CoreFamilyPassState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .active
+        
+        case 2: return .grace
+        
+        case 3: return .suspended
+        
+        case 4: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: CoreFamilyPassState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .active:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .grace:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .suspended:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyPassState_lift(_ buf: RustBuffer) throws -> CoreFamilyPassState {
+    return try FfiConverterTypeCoreFamilyPassState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCoreFamilyPassState_lower(_ value: CoreFamilyPassState) -> RustBuffer {
+    return FfiConverterTypeCoreFamilyPassState.lower(value)
+}
+
+
+
+extension CoreFamilyPassState: Equatable, Hashable {}
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The single action the card may offer. `None` means the app has nothing
  * honest to offer and should say only what is true.
  */
@@ -38369,9 +38580,14 @@ public enum CoreHealthReason {
      */
     case passSuspended
     /**
-     * Our pass has lapsed.
+     * Our pass has lapsed and the service now refuses everything.
      */
     case passExpired
+    /**
+     * Our pass has lapsed but is still in the read-only grace window: mail
+     * already on its way still arrives, new sends over the internet do not.
+     */
+    case passExpiredReadOnly
     /**
      * Our own saved setup was rejected.
      */
@@ -38418,17 +38634,19 @@ public struct FfiConverterTypeCoreHealthReason: FfiConverterRustBuffer {
         
         case 4: return .passExpired
         
-        case 5: return .ownSetupRejected
+        case 5: return .passExpiredReadOnly
         
-        case 6: return .storageFull
+        case 6: return .ownSetupRejected
         
-        case 7: return .shorePassUnreachable
+        case 7: return .storageFull
         
-        case 8: return .waitingForInternet
+        case 8: return .shorePassUnreachable
         
-        case 9: return .shorePassSlowed
+        case 9: return .waitingForInternet
         
-        case 10: return .noPathAvailable
+        case 10: return .shorePassSlowed
+        
+        case 11: return .noPathAvailable
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -38454,28 +38672,32 @@ public struct FfiConverterTypeCoreHealthReason: FfiConverterRustBuffer {
             writeInt(&buf, Int32(4))
         
         
-        case .ownSetupRejected:
+        case .passExpiredReadOnly:
             writeInt(&buf, Int32(5))
         
         
-        case .storageFull:
+        case .ownSetupRejected:
             writeInt(&buf, Int32(6))
         
         
-        case .shorePassUnreachable:
+        case .storageFull:
             writeInt(&buf, Int32(7))
         
         
-        case .waitingForInternet:
+        case .shorePassUnreachable:
             writeInt(&buf, Int32(8))
         
         
-        case .shorePassSlowed:
+        case .waitingForInternet:
             writeInt(&buf, Int32(9))
         
         
-        case .noPathAvailable:
+        case .shorePassSlowed:
             writeInt(&buf, Int32(10))
+        
+        
+        case .noPathAvailable:
+            writeInt(&buf, Int32(11))
         
         }
     }
@@ -40960,6 +41182,12 @@ extension CoreRelayOperation: Equatable, Hashable {}
  * The health one completed relay pass earns, as a domain fact. The shells map
  * it to their own display type and attach their own timestamp; nothing here
  * is a string, and nothing here is localized.
+ *
+ * It is the health of *this device's own* Shore Pass, and only of that
+ * (`HEALTH-01`). A contact's card endpoint refusing us — a friend whose
+ * family pass lapsed, say — is that contact's problem, recorded against
+ * their card's rejection streak and surfaced as their delivery line's
+ * `ContactSetupRejected`, never as this device's pass expiring.
  */
 
 public enum CoreRelayPassHealth {
@@ -40981,9 +41209,22 @@ public enum CoreRelayPassHealth {
      */
     case rateLimited
     /**
-     * 403 `family_expired`.
+     * 403 `family_expired` on a pass that could not fetch either: relayd's
+     * grace window is over and every operation is refused.
      */
     case expired
+    /**
+     * 403 `family_expired` on a pass whose own mailbox still answered: the
+     * read-only grace window. Envelopes queued for us keep arriving and keep
+     * being acked; only new posts take the 403.
+     *
+     * Split out from [`CoreRelayPassHealth::Expired`] because the two need
+     * different sentences. Folded together, a family inside the window was
+     * told their pass had stopped working while their friends' messages were
+     * visibly still landing, which reads as the app being half-broken rather
+     * than as a pass that needs renewing.
+     */
+    case expiredReadOnly
     /**
      * 403 `family_suspended`.
      */
@@ -41019,11 +41260,13 @@ public struct FfiConverterTypeCoreRelayPassHealth: FfiConverterRustBuffer {
         
         case 5: return .expired
         
-        case 6: return .suspended
+        case 6: return .expiredReadOnly
         
-        case 7: return .tokenRejected
+        case 7: return .suspended
         
-        case 8: return .failing
+        case 8: return .tokenRejected
+        
+        case 9: return .failing
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -41053,16 +41296,20 @@ public struct FfiConverterTypeCoreRelayPassHealth: FfiConverterRustBuffer {
             writeInt(&buf, Int32(5))
         
         
-        case .suspended:
+        case .expiredReadOnly:
             writeInt(&buf, Int32(6))
         
         
-        case .tokenRejected:
+        case .suspended:
             writeInt(&buf, Int32(7))
         
         
-        case .failing:
+        case .tokenRejected:
             writeInt(&buf, Int32(8))
+        
+        
+        case .failing:
+            writeInt(&buf, Int32(9))
         
         }
     }
@@ -41253,9 +41500,20 @@ public enum CoreRelayPathState {
      */
     case unreachable
     /**
-     * Our pass has lapsed.
+     * Our pass has lapsed and the service now refuses everything.
      */
     case passExpired
+    /**
+     * Our pass has lapsed, but it is still inside the service's read-only
+     * grace window: mail already queued for us keeps arriving, and only new
+     * sends over the internet are refused.
+     *
+     * A separate row rather than a footnote on [`Self::PassExpired`] because
+     * the two states look different to the person holding the phone --
+     * messages keep landing in one and not in the other -- and a page that
+     * gave them the same sentence was describing the wrong one half the time.
+     */
+    case passExpiredReadOnly
     /**
      * Our pass was turned off by the operator.
      */
@@ -41298,13 +41556,15 @@ public struct FfiConverterTypeCoreRelayPathState: FfiConverterRustBuffer {
         
         case 6: return .passExpired
         
-        case 7: return .passSuspended
+        case 7: return .passExpiredReadOnly
         
-        case 8: return .setupRejected
+        case 8: return .passSuspended
         
-        case 9: return .storageFull
+        case 9: return .setupRejected
         
-        case 10: return .syncingSlowed
+        case 10: return .storageFull
+        
+        case 11: return .syncingSlowed
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -41338,20 +41598,24 @@ public struct FfiConverterTypeCoreRelayPathState: FfiConverterRustBuffer {
             writeInt(&buf, Int32(6))
         
         
-        case .passSuspended:
+        case .passExpiredReadOnly:
             writeInt(&buf, Int32(7))
         
         
-        case .setupRejected:
+        case .passSuspended:
             writeInt(&buf, Int32(8))
         
         
-        case .storageFull:
+        case .setupRejected:
             writeInt(&buf, Int32(9))
         
         
-        case .syncingSlowed:
+        case .storageFull:
             writeInt(&buf, Int32(10))
+        
+        
+        case .syncingSlowed:
+            writeInt(&buf, Int32(11))
         
         }
     }
@@ -51699,7 +51963,11 @@ public func coreFormatLanEndpoint(endpoint: CoreLanEndpoint) -> String {
  *
  * A member written off for *rejection* keeps falling back, unchanged: a 401
  * proves the card is wrong, and our own relay really delivers when both
- * sides have since moved to the same new host.
+ * sides have since moved to the same new host. The exception is the one
+ * [`resolved_contact_delivery_relay`] makes: a written-off card carrying
+ * another family's deposit token (a friend whose pass lapsed, typically)
+ * blocks the fallback exactly as a resting member does, because our mailbox
+ * is one that family never reads.
  */
 public func coreGroupFanoutRelayTarget(members: [GroupRelayMember], fallbackUrl: String?, fallbackToken: String?) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
@@ -52545,6 +52813,21 @@ public func coreMintRelayMemberToken() -> String {
 })
 }
 /**
+ * A fresh redaction salt, as lowercase hex.
+ *
+ * Each shell generates this once and keeps it beside its capture switch, so
+ * every export from one phone shares a namespace and a support thread spanning
+ * two archives still reads as one story. It is discarded when the captured
+ * logs are erased: that gesture means "forget what was recorded", and a salt
+ * that outlived it would keep the old stand-ins meaningful.
+ */
+public func coreNewLogRedactionSalt() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_new_log_redaction_salt($0
+    )
+})
+}
+/**
  * Open §10.1's rotation announcement with this device's own X25519 secret.
  *
  * `own_roster` is the roster this device holds **now** — the pre-rotation one,
@@ -52714,13 +52997,18 @@ public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, paylo
  * (`specs/multi-device-v1.md` §1, §6).
  *
  * The clone guard predates linking, and its whole test was "does this peer
- * hold my agreement key". That was a sound proxy while a person was a device.
- * It stops being one the moment a person has two: a sibling holds the
- * person-scoped inbox key by design, so the guard would greet every deliberate
- * link with "another phone is using your backup" — the most alarming sentence
- * the app can say, about the thing the person just did on purpose. A warning
- * that fires on the normal case is a warning people learn to dismiss, and then
- * it is not there for the real clone either.
+ * hold my agreement key". That was a sound proxy while a person was a device,
+ * and §9's ceremony keeps it one for now: a linked device is given keys of its
+ * own, so it presents an agreement key this person's other phones have never
+ * seen and the bare key test does not fire on it.
+ *
+ * It is a proxy on borrowed time. §6 makes the inbox key person-scoped and
+ * generation 0 of it *is* the deployed person agreement key, so the day a
+ * sibling holds that key the bare test would greet every deliberate link with
+ * "another phone is using your backup" — the most alarming sentence the app can
+ * say, about the thing the person just did on purpose. A warning that fires on
+ * the normal case is a warning people learn to dismiss, and then it is not
+ * there for the real clone either. So the rule here never rests on the key.
  *
  * `peer_device_id` is what separates the two, and there is no substitute for
  * it: the keys are identical by construction. `None` means the transport could
@@ -52730,10 +53018,36 @@ public func coreOwnDeviceLanProofOpen(roster: Roster, handshakeHash: Data, paylo
  * for, and a person told about a sibling once is better served than a person
  * never told about a clone.
  *
- * WP4's own-device sync records are what will put a device id on this wire.
- * Until then the shells pass `None` and the guard behaves precisely as it does
- * today; the rule is implemented and pinned here so the day a device id
- * arrives, the answer is already right.
+ * **Where a device id comes from, and what it is worth.** §10 step 5's LAN
+ * roster proof is the one that exists today: a peer signs the finished Noise
+ * session's transcript hash with its device signing key, and
+ * [`core_own_device_lan_proof_open`] hands back the device id it derived from
+ * that signature — never a claim read off the wire. Pass that, and nothing
+ * weaker. A HELLO's `user_id`, a roster a peer sent, a device id inside a
+ * frame: none of them are evidence about who is on the far end of a link.
+ *
+ * What the proof establishes is narrow and worth stating: the peer holds the
+ * secret half of a device signing key this roster names, on *this* session. It
+ * does not establish that the peer is distinct hardware. It rules out replay —
+ * the signature covers a transcript that is unique to one handshake, and a
+ * role tag stops the peer returning ours — and it rules out a `.cmbak` restore,
+ * which carries the person identity and the message store but no device signing
+ * secret (those are minted per install and kept in the platform keystore). It
+ * does not rule out a peer that extracted a device signing secret from a
+ * device, which is device compromise and outside what a LAN handshake can see.
+ *
+ * `None` therefore remains the honest answer whenever no proof was opened, and
+ * it still means [`CoreOwnIdentityPeer::Clone`].
+ *
+ * **And on today's LAN, `None` is what the shells pass.** §10 step 5 keeps the
+ * clone arm of the handshake symmetric: two ends that each see their own
+ * agreement key coming back take that arm together and exchange no proof frame,
+ * because on a link where one could never arrive, waiting for one is a hang. So
+ * the only arm that asks this question hands it `None`, and
+ * [`CoreOwnIdentityPeer::Sibling`] is not yet reachable from a shell. The rule
+ * is complete here so that both shells derive one answer from one place rather
+ * than each inventing a different unreachable one at its own call site — which
+ * is exactly what they had been doing.
  */
 public func coreOwnIdentityPeer(fleet: OwnDeviceFleet, peerDeviceId: Data?) -> CoreOwnIdentityPeer {
     return try!  FfiConverterTypeCoreOwnIdentityPeer.lift(try! rustCall() {
@@ -53141,6 +53455,20 @@ public func coreRecoveryRevokeRoster(stored: Roster, personRootSignSk: Data, rec
 })
 }
 /**
+ * One log line with every address it carries replaced by a stand-in.
+ *
+ * Returns the line unchanged when it holds nothing of the sort, which is the
+ * overwhelmingly common case.
+ */
+public func coreRedactLogLine(salt: String, line: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_core_redact_log_line(
+        FfiConverterString.lower(salt),
+        FfiConverterString.lower(line),$0
+    )
+})
+}
+/**
  * Ack ids among `items` using [`core_should_ack_inbound`] alone -- i.e.
  * Consumed/Expired only. Deliberately does not know about the
  * consumed-SEEN rule (it has no store access to check it): a caller that
@@ -53354,6 +53682,24 @@ public func coreRelayPassDefaultBudgets() -> CoreRelayPassBudgets {
  * an unknown token, so neither can co-occur with a successful poll at all.
  * Expiry-in-grace is the only credential fault that can, which is why it is
  * the only one that moves.
+ *
+ * The success flags then separate the two expiry shapes. A pass that took the
+ * 403 on its posts and still got its own mailbox answered is inside the grace
+ * window ([`CoreRelayPassHealth::ExpiredReadOnly`]); one that got nothing at
+ * all is past it ([`CoreRelayPassHealth::Expired`]). That distinction is
+ * derived here rather than read off the wire on purpose: relayd returns the
+ * same 403 and the same `family_expired` code either way, deliberately, so
+ * that clients need exactly one renewal flow — the asymmetry a person can
+ * actually see is which requests worked, and that is what this reads.
+ *
+ * # Precondition (`HEALTH-01`)
+ *
+ * `fault` must be the worst of the faults this device's *own* credential
+ * earned this pass, with a single exception: a `429` from any endpoint, which
+ * `RATE-01` reads as a family-budget verdict. A caller that folds in a
+ * contact endpoint's `403 family_expired` makes a healthy pass read as
+ * expired; that was a field bug, and `CoreRelayPass` now gates the fold on
+ * the credential each request carried.
  */
 public func coreRelayPassHealth(fault: CoreRelayFault?, ownRelaySucceeded: Bool, anyRelaySucceeded: Bool) -> CoreRelayPassHealth {
     return try!  FfiConverterTypeCoreRelayPassHealth.lift(try! rustCall() {
@@ -55702,6 +56048,22 @@ public func relayCursorKey(relayUrl: String, relayToken: String) -> String {
     )
 })
 }
+/**
+ * Decode relayd's answer to [`relay_family_status_path`].
+ *
+ * Nothing here is trusted enough to act on by itself — this is a read of a
+ * bearer-authenticated route about the caller's own family, so there is no
+ * second party whose claim needs checking, and unlike a rotation the result
+ * is never committed to storage or gossiped. An unrecognized `state` is
+ * [`CoreFamilyPassState::Unknown`] rather than a failure; see that variant.
+ */
+public func relayDecodeFamilyStatus(body: Data)throws  -> CoreFamilyStatus {
+    return try  FfiConverterTypeCoreFamilyStatus.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
+    uniffi_cruisemesh_core_fn_func_relay_decode_family_status(
+        FfiConverterData.lower(body),$0
+    )
+})
+}
 public func relayDecodeFetchPage(body: Data)throws  -> CoreRelayFetchPage {
     return try  FfiConverterTypeCoreRelayFetchPage.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
     uniffi_cruisemesh_core_fn_func_relay_decode_fetch_page(
@@ -55835,6 +56197,19 @@ public func relayEncodeRotateRequest(currentToken: String, newToken: String, per
         FfiConverterString.lower(currentToken),
         FfiConverterString.lower(newToken),
         FfiConverterData.lower(personRootSignSk),$0
+    )
+})
+}
+/**
+ * The path a device reads its family's pass status from.
+ *
+ * A function rather than a constant for the same reason as
+ * [`relay_rotate_path`]: both shells route identically and neither
+ * hand-writes the string.
+ */
+public func relayFamilyStatusPath() -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_family_status_path($0
     )
 })
 }
@@ -56170,6 +56545,32 @@ public func relayMaxResponseBytes() -> UInt32 {
 })
 }
 /**
+ * When to tell someone their internet delivery runs through, given the
+ * status and this shell's clock — or `None` for "say nothing".
+ *
+ * The rule, so both shells say the same thing on the same day:
+ *
+ * - No end date, no line. Nothing is promised about a pass that never said
+ * when it stops.
+ * - A date already past is not a promise either. Grace is real delivery, but
+ * "internet delivery through last Tuesday" reads as a fault to the person
+ * holding the phone, and the expired states already have their own copy.
+ * - A suspended pass makes no claim about delivery at all, whatever date its
+ * row still carries.
+ *
+ * [`CoreFamilyPassState::Unknown`] deliberately still shows the date: the end
+ * date is the field the reader came for, and a state word this build cannot
+ * place is no reason to withhold one the server did state plainly.
+ */
+public func relayPassDeliveryThroughMs(status: CoreFamilyStatus, nowMs: Int64) -> Int64? {
+    return try!  FfiConverterOptionInt64.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_pass_delivery_through_ms(
+        FfiConverterTypeCoreFamilyStatus.lower(status),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+/**
  * The `after=` this pass starts its walk at.
  *
  * An ordinary pass resumes from the remembered frontier. A sweep resumes from
@@ -56423,6 +56824,29 @@ public func relaySweepRestartFromZero(sweepProgressAfterId: Int64, sweepStartedA
 })
 }
 /**
+ * Short, stable, non-reversible label for a Shore Pass token, for logs.
+ *
+ * A shared diagnostics log has to be able to answer "which pass is this
+ * phone using, and is it the same one as in yesterday's log" without the
+ * file carrying the pass itself. Truncation cannot do both jobs: every
+ * character it prints is a character of a live bearer credential. A digest
+ * can — the same token always produces the same label, and the label says
+ * nothing about the token that produced it.
+ *
+ * Both shells call this rather than hashing on their own: two hand-written
+ * digests would drift, and the moment they did, a support person comparing
+ * an Android archive against an iPhone's would stop seeing a match with
+ * nothing failing to say so. Changing the domain string or the output length
+ * breaks that same correlation across app versions, so don't.
+ */
+public func relayTokenFingerprint(relayToken: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_relay_token_fingerprint(
+        FfiConverterString.lower(relayToken),$0
+    )
+})
+}
+/**
  * True when `token` is a deposit-class relay credential (CP4): valid only
  * for posting envelopes into its family's mailbox, never for fetch/ack/
  * presence/WebSocket. Friend cards carry this class; the Shore Pass setup
@@ -56487,6 +56911,15 @@ public func resolvedContactDeliveryPollRelay(contactRelayUrl: String?, contactRe
  * to. For a cross-family contact it delivers nothing, but neither did the
  * dead endpoint, and unlike the dead endpoint this state is surfaced, so a
  * person can repair the card.
+ *
+ * One exception: a written-off card carrying *another family's* deposit
+ * token resolves to `None`, never to our own mailbox. That card is
+ * cross-family by construction, so our mailbox is one they never read, and
+ * `relay_posted_at` is terminal: falling back would mark their mail posted
+ * into a dead end for good. The common way to get here is a friend whose
+ * pass lapsed (`family_expired`), whose card is still right and starts
+ * working again the moment they renew. `None` leaves the rows queued for the
+ * periodic re-probe and for the mesh paths.
  */
 public func resolvedContactDeliveryRelay(contactRelayUrl: String?, contactRelayToken: String?, fallbackUrl: String?, fallbackToken: String?, contactEndpointUsable: Bool) -> RelayEndpoint? {
     return try!  FfiConverterOptionTypeRelayEndpoint.lift(try! rustCall() {
@@ -57075,7 +57508,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_format_lan_endpoint() != 59419) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_relay_target() != 49092) {
+    if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_relay_target() != 22070) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_group_fanout_rows() != 44083) {
@@ -57210,6 +57643,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_mint_relay_member_token() != 6229) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_new_log_redaction_salt() != 49561) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_open_sync_handoff() != 33206) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57225,7 +57661,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_own_device_lan_proof_open() != 63639) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 19489) {
+    if (uniffi_cruisemesh_core_checksum_func_core_own_identity_peer() != 44514) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_own_roster_notice_reoffer_due() != 22705) {
@@ -57282,6 +57718,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_recovery_revoke_roster() != 32799) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_core_redact_log_line() != 49836) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_ack_ids() != 51054) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57318,7 +57757,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_default_budgets() != 26530) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_health() != 29254) {
+    if (uniffi_cruisemesh_core_checksum_func_core_relay_pass_health() != 51604) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_core_relay_queue_reflects_delivery() != 16350) {
@@ -57750,6 +58189,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_cursor_key() != 37643) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_decode_family_status() != 46232) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_decode_fetch_page() != 49617) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57775,6 +58217,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_encode_rotate_request() != 32464) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_relay_family_status_path() != 29493) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_relay_fault_is_transient() != 24532) {
@@ -57813,6 +58258,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_max_response_bytes() != 30296) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_pass_delivery_through_ms() != 18723) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_pass_start_cursor() != 57175) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57834,6 +58282,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_relay_sweep_restart_from_zero() != 61201) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cruisemesh_core_checksum_func_relay_token_fingerprint() != 31720) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cruisemesh_core_checksum_func_relay_token_is_deposit() != 58985) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -57843,7 +58294,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_poll_relay() != 54665) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 7224) {
+    if (uniffi_cruisemesh_core_checksum_func_resolved_contact_delivery_relay() != 9094) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_resolved_contact_poll_relay() != 62901) {

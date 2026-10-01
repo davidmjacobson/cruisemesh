@@ -6,6 +6,7 @@
 //! over QR code or pasted text) containing both public keys.
 
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
+use crate::json_fault::json_fault;
 use crate::protocol::MS_PER_DAY;
 use crate::store::{contact_display_name, Contact};
 use blake2::digest::{Update, VariableOutput};
@@ -427,8 +428,13 @@ fn friend_card_from_json(json: &str) -> Result<FriendCard, CoreError> {
             "friend card is too large".to_string(),
         ));
     }
-    let card: FriendCard =
-        serde_json::from_str(json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    // A card arrives from someone else -- pasted, scanned, or forwarded inside
+    // a friend request off the mesh -- and both shells log this message when
+    // they drop one. `json_fault` describes the failure by shape and position
+    // instead of quoting the card back into the log.
+    let card: FriendCard = serde_json::from_str(json).map_err(|e| {
+        CoreError::InvalidFriendCard(format!("invalid card JSON: {}", json_fault(&e, json.len())))
+    })?;
     validate_friend_card(&card)?;
     Ok(card)
 }
@@ -1280,8 +1286,12 @@ pub fn make_shared_friend_request_payload(
 #[uniffi::export]
 pub fn parse_friend_request_content(json: String) -> Result<FriendRequestContent, CoreError> {
     let card = parse_friend_card(json.clone())?;
-    let value: serde_json::Value =
-        serde_json::from_str(&json).map_err(|e| CoreError::InvalidFriendCard(e.to_string()))?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
+        CoreError::InvalidFriendCard(format!(
+            "invalid friend request JSON: {}",
+            json_fault(&e, json.len())
+        ))
+    })?;
     let shared = match value.get("shared") {
         None => None,
         Some(serde_json::Value::String(encoded)) => {
@@ -1488,6 +1498,29 @@ const WORDLIST: [&str; 64] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A card is authored by someone else — pasted, scanned, or forwarded
+    /// inside a friend request off the mesh — and both shells log the reason
+    /// they dropped one. The card's own text must not be that reason.
+    ///
+    /// Whole-message equality on purpose: "does not contain the card" is the
+    /// property, but only pinning the message rules out a later edit
+    /// appending something else that arrived with it.
+    #[test]
+    fn a_malformed_friend_card_is_named_without_quoting_the_card() {
+        let json = r#"{"name":"MARKER-cabin-8042","sign_pk":7,"agree_pk":[]}"#;
+        let error = parse_friend_card(json.to_string()).unwrap_err();
+        let CoreError::InvalidFriendCard(message) = error else {
+            panic!("expected an invalid friend card");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "invalid card JSON: data error at line 1 column 39 of {}B",
+                json.len()
+            )
+        );
+    }
 
     /// A stored contact card plus the identities on both ends of a share:
     /// `sharer` holds `card` (the shared person's card) and hands it on.

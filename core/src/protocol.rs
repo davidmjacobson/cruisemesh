@@ -260,6 +260,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::crypto::{signing_key_from_bytes, verifying_key_from_bytes};
 use crate::device_roster::{DEVICE_ID_LEN, ROSTER_HEAD_HASH_LEN};
 use crate::identity::derive_user_id;
+use crate::json_fault::json_fault;
 use crate::limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 use crate::store::DigestEntry;
 use crate::{CoreError, Identity};
@@ -1517,8 +1518,15 @@ pub fn decode_friend_directory_content(
             "friend directory is too large".to_string(),
         ));
     }
-    let content: FriendDirectoryContent = serde_json::from_slice(&bytes)
-        .map_err(|e| CoreError::Malformed(format!("invalid friend directory: {e}")))?;
+    // These bytes came off a mesh link from a peer, and both shells log this
+    // message when they drop the frame, so the failure is described by shape
+    // and position (`json_fault`) rather than by quoting the document.
+    let content: FriendDirectoryContent = serde_json::from_slice(&bytes).map_err(|e| {
+        CoreError::Malformed(format!(
+            "invalid friend directory: {}",
+            json_fault(&e, bytes.len())
+        ))
+    })?;
     validate_friend_directory(&content)?;
     Ok(content)
 }
@@ -1537,8 +1545,12 @@ pub fn decode_introduced_friend_request(
             "introduced friend request is too large".to_string(),
         ));
     }
-    let request: IntroducedFriendRequest = serde_json::from_slice(&bytes)
-        .map_err(|e| CoreError::Malformed(format!("invalid introduced friend request: {e}")))?;
+    let request: IntroducedFriendRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        CoreError::Malformed(format!(
+            "invalid introduced friend request: {}",
+            json_fault(&e, bytes.len())
+        ))
+    })?;
     if request.version != INTRODUCED_FRIEND_REQUEST_VERSION {
         return Err(CoreError::Malformed(format!(
             "unknown introduced friend request version: {}",
@@ -3070,6 +3082,41 @@ mod tests {
             }],
         };
         (alice, bob, carol, directory)
+    }
+
+    /// A directory and an introduction both arrive over a mesh link from a
+    /// peer, and both shells log the reason they dropped the frame. The frame
+    /// itself must not be that reason.
+    ///
+    /// Whole-message equality on purpose: "does not contain the frame" is the
+    /// property, but only pinning the message rules out a later edit
+    /// appending something else that came off the link.
+    #[test]
+    fn a_malformed_directory_is_named_without_quoting_the_frame() {
+        let bytes = br#"{"entries":"MARKER-cabin-8042"}"#.to_vec();
+        let len = bytes.len();
+        let error = decode_friend_directory_content(bytes).unwrap_err();
+        let CoreError::Malformed(message) = error else {
+            panic!("expected a malformed friend directory");
+        };
+        assert_eq!(
+            message,
+            format!("invalid friend directory: data error at line 1 column 30 of {len}B")
+        );
+    }
+
+    #[test]
+    fn a_malformed_introduction_is_named_without_quoting_the_frame() {
+        let bytes = br#"{"version":"MARKER-cabin-8042"}"#.to_vec();
+        let len = bytes.len();
+        let error = decode_introduced_friend_request(bytes).unwrap_err();
+        let CoreError::Malformed(message) = error else {
+            panic!("expected a malformed introduced friend request");
+        };
+        assert_eq!(
+            message,
+            format!("invalid introduced friend request: data error at line 1 column 30 of {len}B")
+        );
     }
 
     #[test]

@@ -10,15 +10,19 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cruisemesh_core.Contact
+import uniffi.cruisemesh_core.CoreRelayContactConfig
 import uniffi.cruisemesh_core.CoreRelayEndpointConfig
+import uniffi.cruisemesh_core.CoreRelayPassHealth
 import uniffi.cruisemesh_core.CoreRelayPassOutcome
 import uniffi.cruisemesh_core.CoreRelayPassPlan
 import uniffi.cruisemesh_core.CoreRelayTransportError
 import uniffi.cruisemesh_core.MessageStore
 import uniffi.cruisemesh_core.computeRecipientHint
 import uniffi.cruisemesh_core.coreRelayPassDefaultBudgets
+import uniffi.cruisemesh_core.coreContactRelayIsStale
 import uniffi.cruisemesh_core.generateIdentity
 import uniffi.cruisemesh_core.relayCursorKey
+import uniffi.cruisemesh_core.relayDepositTokenFor
 
 /**
  * A whole core relay pass, driven end to end by the code that will drive it on
@@ -168,6 +172,50 @@ class CoreRelayPassRunnerTest {
         )
     }
 
+    @Test
+    fun `a friend's lapsed pass on the shared relay is theirs, not ours`() {
+        // The field shape behind HEALTH-01: a friend from another family whose
+        // deposit card names the same hosted relay as our own mailbox, and
+        // whose family pass has lapsed. relayd refuses their card with
+        // `family_expired`; our own pass is fine and must still read as fine.
+        val friendDeposit = relayDepositTokenFor("member-token-friend")
+        val relay = FakeRelay(
+            postResponse = { request ->
+                if (request.getHeader("Authorization") == "Bearer $friendDeposit") {
+                    MockResponse().setResponseCode(403).setBody("""{"code":"family_expired"}""")
+                } else {
+                    MockResponse().setResponseCode(200).setBody("""{"id":1}""")
+                }
+            },
+        )
+        relay.start()
+        try {
+            val fixture = Fixture(relay.baseUrl(), hinted = true, contactToken = friendDeposit)
+            fixture.queueAuthored(2)
+
+            val first = fixture.run()
+
+            assertEquals(CoreRelayPassHealth.OK, first.health)
+            assertTrue(
+                "our own pass must read as connected, got ${relayHealthFor(first.health, NOW)}",
+                relayHealthFor(first.health, NOW) is RelayHealth.Ok,
+            )
+            assertEquals("a refusal retires nothing", 2, fixture.pendingAuthored())
+            assertEquals("the refusal is the friend's card's, one step a pass", 1L, fixture.rejectStreak())
+
+            val second = fixture.run()
+
+            assertEquals(CoreRelayPassHealth.OK, second.health)
+            assertEquals(2L, fixture.rejectStreak())
+            assertTrue(
+                "two passes of refusals write the friend's card off",
+                coreContactRelayIsStale(fixture.rejectStreak()),
+            )
+        } finally {
+            relay.shutdown()
+        }
+    }
+
     // -----------------------------------------------------------------------
     // The walk: the lanes an upload-only pass never reaches
     // -----------------------------------------------------------------------
@@ -239,6 +287,8 @@ class CoreRelayPassRunnerTest {
         private val cancelled: Boolean = false,
         private val quietUntilMs: Long = 0L,
         private val hinted: Boolean = false,
+        /** A card credential for the contact on [baseUrl], or none. */
+        private val contactToken: String? = null,
     ) {
         private val identity = generateIdentity()
         private val peer = generateIdentity()
@@ -248,8 +298,8 @@ class CoreRelayPassRunnerTest {
             name = "Peer",
             signPk = peer.signPk,
             agreePk = peer.agreePk,
-            relayUrl = null,
-            relayToken = null,
+            relayUrl = contactToken?.let { baseUrl },
+            relayToken = contactToken,
         )
 
         init {
@@ -301,6 +351,11 @@ class CoreRelayPassRunnerTest {
             }
         }
 
+        fun rejectStreak(): Long =
+            store.listContactRelayRejections()
+                .firstOrNull { it.userId.contentEquals(peer.userId) }
+                ?.rejectStreak ?: 0L
+
         fun pendingAuthored(): Int =
             store.pendingRelayOutboundEnvelopes(64uL, NOW, emptyList()).size
 
@@ -315,7 +370,19 @@ class CoreRelayPassRunnerTest {
 
         private fun plan() = CoreRelayPassPlan(
             own = CoreRelayEndpointConfig(baseUrl, "member-token"),
-            contacts = emptyList(),
+            contacts = if (contactToken == null) {
+                emptyList()
+            } else {
+                listOf(
+                    CoreRelayContactConfig(
+                        userId = peer.userId,
+                        relayUrl = baseUrl,
+                        relayToken = contactToken,
+                        endpointUsable = true,
+                        endpointAnswering = true,
+                    ),
+                )
+            },
             ownUserId = identity.userId,
             fetchHints = if (hinted) listOf(ownHint()) else emptyList(),
             presenceAnnounce = emptyList(),
@@ -330,7 +397,7 @@ class CoreRelayPassRunnerTest {
 
     /** A relay that answers, counts, and can be told to say no. */
     private class FakeRelay(
-        private val postResponse: () -> MockResponse = {
+        private val postResponse: (RecordedRequest) -> MockResponse = {
             MockResponse().setResponseCode(200).setBody("""{"id":1}""")
         },
     ) {
@@ -355,7 +422,7 @@ class CoreRelayPassRunnerTest {
                     val path = request.path.orEmpty()
                     if (path == "/envelopes" && request.method == "POST") {
                         posts++
-                        return postResponse()
+                        return postResponse(request)
                     }
                     if (path == "/envelopes/ack" && request.method == "POST") {
                         acks++

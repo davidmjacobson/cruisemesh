@@ -105,10 +105,22 @@ private final class DiagnosticArchiveBackgroundTask: @unchecked Sendable {
 /// addresses, counts, lamports, and contact/group *names* -- never message
 /// text or payloads (audited) -- and any value marked private is redacted to
 /// `<private>` in `composedMessage` regardless.
+///
+/// Addresses do not survive into the archive. Every line copied out of the
+/// unified log goes through `coreRedactLogLine` first, so a Wi-Fi address, a
+/// Bluetooth device address or a contact's public key is replaced by a short
+/// stand-in derived from a salt this phone keeps to itself. The stand-in is
+/// stable, so two lines about the same peer still read as the same peer; the
+/// core module documents why that shape was chosen and what it costs.
+/// Redacting on the way into the file rather than at the share sheet is
+/// deliberate: the file is what every export path hands out, and a future
+/// export path cannot forget a step it does not have to take. `DebugFileLog`
+/// does the same at the same point on Android.
 enum DiagnosticLogExport {
     private static let subsystem = "com.cruisemesh"
     private static let enabledKey = "diagnostic_log_export_enabled"
     private static let lastArchivedAtKey = "diagnostic_log_export_last_archived_at"
+    private static let redactionSaltKey = "diagnostic_log_redaction_salt"
     private static let directoryName = "Diagnostics"
     private static let fileName = "cruisemesh-diagnostics.txt"
     private static let lock = NSLock()
@@ -182,6 +194,43 @@ enum DiagnosticLogExport {
         return url
     }
 
+    /// This phone's redaction salt, minted on first use.
+    ///
+    /// Kept for the life of the archive rather than per share, so a support
+    /// thread holding two archives from the same phone still reads as one
+    /// story. It never leaves the device, which is what stops a shared archive
+    /// from being matched back to a real address. Erasing the archive erases
+    /// it: the stand-ins only ever meant anything against the lines they named.
+    ///
+    /// The caller already holds `lock`.
+    private static func redactionSalt() -> String {
+        let defaults = UserDefaults.standard
+        if let existing = defaults.string(forKey: redactionSaltKey), !existing.isEmpty {
+            return existing
+        }
+        let salt = coreNewLogRedactionSalt()
+        defaults.set(salt, forKey: redactionSaltKey)
+        // Repair whatever an earlier build captured. An update must not leave
+        // a file on disk that the diagnostics note now describes wrongly, and
+        // deleting a tester's archive to achieve that would be worse than
+        // rewriting it. Written atomically, so an interrupted rewrite leaves
+        // the original intact rather than a half-redacted log.
+        if let url = archiveURL(), let existing = try? String(contentsOf: url, encoding: .utf8) {
+            try? Data(redactLines(salt: salt, text: existing).utf8)
+                .write(to: url, options: .atomic)
+        }
+        return salt
+    }
+
+    /// Redacts a block that may span several lines -- a `composedMessage` can,
+    /// and so can the launch banner. Line-at-a-time so the core scanner never
+    /// has to reason about newlines.
+    static func redactLines(salt: String, text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { coreRedactLogLine(salt: salt, line: String($0)) }
+            .joined(separator: "\n")
+    }
+
     private static func archiveCurrentSession(
         force: Bool,
         cancellation: DiagnosticArchiveCancellation? = nil
@@ -225,10 +274,12 @@ enum DiagnosticLogExport {
         guard !records.isEmpty, let url = archiveURL() else { return }
         if records.count > maxEntries { records = Array(records.suffix(maxEntries)) }
 
-        var text = records.map(\.line).joined(separator: "\n") + "\n"
+        let salt = redactionSalt()
+        var text = records.map { redactLines(salt: salt, text: $0.line) }
+            .joined(separator: "\n") + "\n"
         if !sessionBannerWritten {
             sessionBannerWritten = true
-            text = sessionBanner() + text
+            text = redactLines(salt: salt, text: sessionBanner()) + text
         }
         if !FileManager.default.fileExists(atPath: url.path) {
             text = "CruiseMesh diagnostics — opt-in archive (metadata only)\n\n" + text
@@ -323,6 +374,9 @@ enum DiagnosticLogExport {
             try? FileManager.default.removeItem(at: url)
         }
         UserDefaults.standard.set(Date(), forKey: lastArchivedAtKey)
+        // The salt only ever meant anything against the lines it named, so it
+        // goes with them; the next capture starts a fresh namespace.
+        UserDefaults.standard.removeObject(forKey: redactionSaltKey)
     }
 
     private static func archiveURL() -> URL? {

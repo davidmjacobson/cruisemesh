@@ -114,6 +114,7 @@ class ConnectionDetailsLogicTest {
             RelayHealth.Ok(NOW) to CoreRelayPathState.CONNECTED,
             RelayHealth.Failing(NOW) to CoreRelayPathState.UNREACHABLE,
             RelayHealth.Expired(NOW) to CoreRelayPathState.PASS_EXPIRED,
+            RelayHealth.ExpiredReadOnly(NOW) to CoreRelayPathState.PASS_EXPIRED_READ_ONLY,
             RelayHealth.Suspended(NOW) to CoreRelayPathState.PASS_SUSPENDED,
             RelayHealth.TokenRejected(NOW) to CoreRelayPathState.SETUP_REJECTED,
             RelayHealth.QuotaFull(NOW) to CoreRelayPathState.STORAGE_FULL,
@@ -1040,5 +1041,46 @@ class ConnectionDetailsLogicTest {
     fun `a page with only blocked friends has no contacts to show`() {
         val result = state(people = listOf(person(9, "Blocked", blocked = true)))
         assertFalse(result.hasContacts)
+    }
+
+    @Test
+    fun `an expired pass is offered renewal instead of the screen that cannot renew`() {
+        assertEquals(
+            HowToFixAction.RENEW_SHORE_PASS,
+            howToFixAction(CoreHealthReason.PASS_EXPIRED),
+        )
+        assertEquals(
+            HowToFixAction.RENEW_SHORE_PASS,
+            howToFixAction(CoreDeliveryBlockedReason.PASS_EXPIRED),
+        )
+    }
+
+    @Test
+    fun `the faults the pass screen can still repair keep leading there`() {
+        for (reason in listOf(CoreHealthReason.PASS_SUSPENDED, CoreHealthReason.OWN_SETUP_REJECTED)) {
+            assertEquals(reason.name, HowToFixAction.MANAGE_SHORE_PASS, howToFixAction(reason))
+        }
+        for (
+            reason in listOf(
+                CoreDeliveryBlockedReason.PASS_SUSPENDED,
+                CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
+            )
+        ) {
+            assertEquals(reason.name, HowToFixAction.MANAGE_SHORE_PASS, howToFixAction(reason))
+        }
+    }
+
+    @Test
+    fun `faults no pass action repairs still carry no button`() {
+        for (
+            reason in listOf(
+                CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
+                CoreDeliveryBlockedReason.STORAGE_FULL,
+                CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
+            )
+        ) {
+            assertEquals(reason.name, HowToFixAction.NONE, howToFixAction(reason))
+        }
+        assertEquals(HowToFixAction.NONE, howToFixAction(CoreHealthReason.MESH_STOPPED))
     }
 }

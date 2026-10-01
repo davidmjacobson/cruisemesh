@@ -19,11 +19,13 @@ mod framing;
 mod gossip;
 mod groups;
 mod identity;
+mod json_fault;
 mod lan_session;
 mod lan_util;
 mod late_arrival;
 mod limits;
 mod link_detect;
+mod log_redaction;
 // The blob plane (specs/media-two-plane.md). Deliberately dark: declared so it
 // compiles and is tested, exported over no binding, reachable from neither
 // shell. Nothing is re-exported at the crate root, which is what keeps the
@@ -130,12 +132,12 @@ pub use device_roster::{
     core_own_device_lan_proof, core_own_device_lan_proof_open, core_own_identity_peer,
     core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_names_a_sibling,
     core_roster_person_root_sign_pk, core_roster_validate, core_sign_device_cert, core_sign_roster,
-    core_verify_device_cert, generate_device_keypair, CoreLanOwnDeviceProof, CoreLanProofRole,
-    CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain,
-    DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
-    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
-    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
-    ROSTER_MAX_VERSION_JUMP,
+    core_verify_device_cert, generate_device_keypair, own_identity_lan_peer, CoreLanOwnDeviceProof,
+    CoreLanProofRole, CoreOwnIdentityLanPeer, CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert,
+    DeviceKeypair, DeviceSigningDomain, DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection,
+    RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, RosterVersion,
+    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP,
+    LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN, ROSTER_MAX_VERSION_JUMP,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
@@ -185,6 +187,7 @@ pub use limits::{MAX_ENVELOPE_SEALED_BYTES, MAX_P2P_FRAME_BYTES};
 pub use link_detect::{
     core_detect_links, core_link_openable_scheme, CoreDetectedLink, CoreLinkScheme,
 };
+pub use log_redaction::{core_new_log_redaction_salt, core_redact_log_line};
 // Plain Rust policy, deliberately not `#[uniffi::export]`: the shells never
 // decide any of this. The store executes it, and `core/tests` asserts it under
 // `QUEUE-01`.
@@ -254,15 +257,16 @@ pub use relay_status::{
 };
 pub use relay_wire::{
     core_group_fanout_relay_target, normalize_relay_url, relay_build_fetch_path,
-    relay_contact_shares_own_family, relay_decode_fetch_page, relay_decode_post_response,
-    relay_decode_presence_page, relay_decode_rotate_response, relay_deposit_token_for,
-    relay_encode_ack_request, relay_encode_post_envelope, relay_encode_presence_request,
-    relay_encode_rotate_request, relay_fetch_batch_limit, relay_fetch_shrunk_limit,
-    relay_max_response_bytes, relay_rotate_path, relay_token_is_deposit,
+    relay_contact_shares_own_family, relay_decode_family_status, relay_decode_fetch_page,
+    relay_decode_post_response, relay_decode_presence_page, relay_decode_rotate_response,
+    relay_deposit_token_for, relay_encode_ack_request, relay_encode_post_envelope,
+    relay_encode_presence_request, relay_encode_rotate_request, relay_family_status_path,
+    relay_fetch_batch_limit, relay_fetch_shrunk_limit, relay_max_response_bytes,
+    relay_pass_delivery_through_ms, relay_rotate_path, relay_token_is_deposit,
     resolved_contact_delivery_poll_relay, resolved_contact_delivery_relay,
-    resolved_contact_poll_relay, resolved_contact_relay, CoreRelayFetchPage,
-    CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage, CoreRelayRotation,
-    GroupRelayMember, RelayEndpoint,
+    resolved_contact_poll_relay, resolved_contact_relay, CoreFamilyPassState, CoreFamilyStatus,
+    CoreRelayFetchPage, CoreRelayFetchedEnvelope, CoreRelayPresence, CoreRelayPresencePage,
+    CoreRelayRotation, GroupRelayMember, RelayEndpoint,
 };
 pub use revocation::{
     core_recovery_revoke_roster, core_revoke_devices_roster, core_roster_newly_revoked,

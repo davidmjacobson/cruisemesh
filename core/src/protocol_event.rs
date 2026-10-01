@@ -275,6 +275,7 @@ pub const PROTOCOL_INVARIANT_IDS: &[&str] = &[
     "EVICT-01",
     "ENDPOINT-01",
     "FANOUT-01",
+    "HEALTH-01",
     "HELLO-01",
     "IDEMP-01",
     "LIVE-01",

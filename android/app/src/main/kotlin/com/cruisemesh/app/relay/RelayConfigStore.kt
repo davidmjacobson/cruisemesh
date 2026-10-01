@@ -127,7 +127,7 @@ object RelayConfigStore {
         Log.i(
             RelayClient.TAG,
             "Relay configured: host=${hostOf(config.relayUrl)} " +
-                "token=${tokenPrefix(config.relayToken)}… " +
+                "pass=${tokenFingerprint(config.relayToken)} " +
                 "epoch=${relayEpoch(context)} shareOnline=${shareOnline(context)}",
         )
     }
@@ -136,10 +136,18 @@ object RelayConfigStore {
         runCatching { java.net.URL(url).host }.getOrNull() ?: "unparseable"
 
     /**
-     * The first eight characters only. Enough to tell one family's pass from
-     * another's, and from the shared tester pass, while staying useless to
-     * anyone who reads the file: it is a bearer credential, so the full value
-     * must never reach a share sheet.
+     * A digest of the pass, never any part of the pass itself.
+     *
+     * Enough to tell one household's pass from another's, and from the shared
+     * tester pass, and to recognise the same pass across two logs — which is
+     * all triage ever needed from it. A prefix answered the same question by
+     * printing eight characters of a live bearer credential into a file that
+     * gets mailed to whoever is helping; the fingerprint answers it while
+     * carrying nothing back.
+     *
+     * Derived in the core so this shell and iOS print the same label for the
+     * same pass; two hand-written digests would drift.
      */
-    internal fun tokenPrefix(token: String): String = token.take(8)
+    internal fun tokenFingerprint(token: String): String =
+        uniffi.cruisemesh_core.relayTokenFingerprint(token)
 }

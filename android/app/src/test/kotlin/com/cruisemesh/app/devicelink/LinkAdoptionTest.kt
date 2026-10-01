@@ -74,6 +74,11 @@ class LinkAdoptionTest {
         // first-run setup has nothing left to ask.
         assertTrue(OnboardingStore.isCompleted(context))
         assertTrue(ProfileStore.loadStoredDisplayName(context).isNotEmpty())
+        // ...except the one thing this route went around. The wizard carries
+        // the permissions step; an adopted phone never saw it, and used to land
+        // on the chat list with the mesh off behind a "Permissions required"
+        // notice. `FirstRunRouter` collects this on the way in.
+        assertEquals(false, OnboardingStore.permissionsStepDone(context))
     }
 
     @Test

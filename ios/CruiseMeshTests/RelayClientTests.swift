@@ -442,11 +442,63 @@ final class RelayClientTests: XCTestCase {
         ) { error in
             XCTAssertEqual((error as? RelayHTTPError)?.statusCode, 502)
             XCTAssertFalse(error is RelayPageTooBigError)
-            // Only a preview of the page is kept, not all 64 KiB of it.
-            XCTAssertLessThanOrEqual((error as? RelayHTTPError)?.responseBody.count ?? .max, 2_048)
+            // Only a preview of the page was ever read, not all 64 KiB of
+            // it -- and only its size is kept, never its bytes.
+            XCTAssertLessThanOrEqual(
+                (error as? RelayHTTPError)?.responseBodyBytes ?? .max, 2_048
+            )
         }
         // One request, not nine: the ladder was never entered.
         XCTAssertEqual(RelayMockURLProtocol.requests.count, 1)
+    }
+
+    func testAnErrorResponseBodyStaysOutOfTheErrorDescription() {
+        // Whatever answers a relay call is not necessarily the relay: a
+        // captive portal, a proxy, a gateway. Its bytes are logged verbatim
+        // wherever a caller writes `error.localizedDescription`, so the
+        // description carries the status, relayd's code and the size -- and
+        // nothing that came off the wire. Mirrors Android
+        // `an error response body stays out of the exception message`.
+        let portal = "<html><title>Guest Wi-Fi sign in</title>deck 5 stateroom 8042</html>"
+        RelayMockURLProtocol.responses = [
+            .init(statusCode: 502, body: Data(portal.utf8), headers: [:]),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope())
+        ) { error in
+            // Whole-description equality on purpose. "does not contain the
+            // body" is the property, but only pinning the description exactly
+            // rules out a future edit appending something else off the wire.
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Relay request failed (502) [-] body=\(portal.utf8.count)B"
+            )
+        }
+    }
+
+    func testARelayCodeStillNamesTheFailureWithoutTheBody() {
+        RelayMockURLProtocol.responses = [
+            .init(
+                statusCode: 507,
+                body: Data(#"{"error":"mailbox is full","code":"mailbox_full"}"#.utf8),
+                headers: [:]
+            ),
+        ]
+        let config = RelayConfig(relayUrl: "https://relay.test", relayToken: "family-token")
+
+        XCTAssertThrowsError(
+            try RelayClient.postOutboundEnvelope(config: config, envelope: sampleOutboundEnvelope())
+        ) { error in
+            XCTAssertEqual((error as? RelayHTTPError)?.relayCode, "mailbox_full")
+            // relayd's own code names the failure; the sentence it shipped
+            // alongside does not travel.
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Relay request failed (507) [mailbox_full] body=49B"
+            )
+        }
     }
 
     func testARateLimitKeepsItsRetryAfterInsteadOfLookingLikeAnOversizePage() {

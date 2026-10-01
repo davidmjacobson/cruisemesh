@@ -151,6 +151,10 @@ object BackupService {
         RelayConfigStore.setShareOnline(context, payload.shareOnline, durable = true)
         FriendsOfFriendsStore.restoreEnabled(context, payload.friendsOfFriendsEnabled)
         OnboardingStore.markCompleted(context, durable = true)
+        // A restore skips the wizard, and with it the permissions step. Say so,
+        // so the relaunch lands on that step instead of on a chat list with the
+        // mesh off. Durable like every write above it: the caller hard-exits.
+        OnboardingStore.markPermissionsStepPending(context, durable = true)
     }
 
     fun defaultContentOptions() = BackupContentOptions(

@@ -4,6 +4,7 @@ import android.net.Network
 import android.util.Log
 import com.google.gson.JsonParser
 import uniffi.cruisemesh_core.CarriedEnvelope
+import uniffi.cruisemesh_core.CoreFamilyStatus
 import uniffi.cruisemesh_core.CoreGroupFanoutRow
 import uniffi.cruisemesh_core.OutboundEnvelope
 import uniffi.cruisemesh_core.OutgoingReceiptEnvelope
@@ -15,12 +16,14 @@ import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import uniffi.cruisemesh_core.relayBuildFetchPath
+import uniffi.cruisemesh_core.relayDecodeFamilyStatus
 import uniffi.cruisemesh_core.relayDecodeFetchPage
 import uniffi.cruisemesh_core.relayDecodePostResponse
 import uniffi.cruisemesh_core.relayDecodePresencePage
 import uniffi.cruisemesh_core.relayEncodeAckRequest
 import uniffi.cruisemesh_core.relayEncodePostEnvelope
 import uniffi.cruisemesh_core.relayEncodePresenceRequest
+import uniffi.cruisemesh_core.relayFamilyStatusPath
 import uniffi.cruisemesh_core.relayFetchShrunkLimit
 import uniffi.cruisemesh_core.relayMaxResponseBytes
 import uniffi.cruisemesh_core.relayRotatePath
@@ -68,6 +71,11 @@ data class RelayCappedFetch(
  * Relay HTTP failure carrying the status, relayd's stable error code, and --
  * for 429s -- the raw `Retry-After` header (CP2b; parsed/clamped by the
  * core's `relayRetryAfterMs`, never here).
+ *
+ * The response body is not among them, in the message or in a field. Callers
+ * log [message] as-is, so anything on here is content the far end chose and
+ * this app then wrote into a file a user shares. Mirrors iOS
+ * `RelayHTTPError`.
  */
 class RelayHttpException(
     val code: Int,
@@ -313,6 +321,21 @@ object RelayClient {
     }
 
     /**
+     * What the family's pass says about itself: plan, end date, account state.
+     *
+     * A read of the caller's own family under the member credential, shaped
+     * like every other GET here -- core names the route and decodes the body,
+     * the shell only carries bytes. A deposit-class credential is refused with
+     * the same structured 403 the other read routes give it, so
+     * [FamilyStatusStore] declines to ask on one at all rather than spending a
+     * round trip to be told.
+     */
+    fun fetchFamilyStatus(config: RelayConfig, network: Network? = null): CoreFamilyStatus {
+        val connection = openConnection(buildUrl(config.relayUrl, relayFamilyStatusPath()), "GET", config, network)
+        return connection.useJsonResponse { relayDecodeFamilyStatus(it) }
+    }
+
+    /**
      * The one place an envelope becomes an HTTP POST. Internal rather than
      * private because a device-link rendezvous
      * ([com.cruisemesh.app.devicelink.LinkRelayWire]) posts a row that belongs
@@ -392,10 +415,37 @@ object RelayClient {
         Log.e(TAG, "$method $path failed after ${ms}ms: $detail")
     }
 
+    /**
+     * How a failure that came back with a 2xx is described in the log.
+     *
+     * A relay answered, the body arrived whole, and the decoder refused it.
+     * That is the one relay failure whose cause is *in* the bytes, which is
+     * exactly why the bytes are not here: whatever answered the request may
+     * not have been the relay at all, and this line lands in a file the user
+     * exports and mails to whoever is helping.
+     *
+     * What replaces them is what the reader works from. The size says whether
+     * a whole page came back or a stub; the exception class says which
+     * decoder gave up; and the core's message (see `json_fault`) says which
+     * kind of malformation it was and the line and column it stopped at --
+     * derived from the body, never quoting it.
+     *
+     * Its own function so a test can pin the whole sentence. `Log` is a
+     * no-op stub under JVM unit tests, so an assertion on what was logged has
+     * to be an assertion on what was handed to [logFailure].
+     */
+    internal fun decodeFailureDetail(bytes: Int, e: Throwable): String =
+        "could not decode ${bytes}B: ${e.javaClass.simpleName}: ${e.message}"
+
     private inline fun <T> HttpURLConnection.useJsonResponse(block: (ByteArray) -> T): T {
         val started = System.currentTimeMillis()
         val method = requestMethod ?: "?"
         val path = runCatching { url.path }.getOrNull() ?: "?"
+        // Set once the decode catch below has written its own line, so the
+        // transport catch does not write a second, vaguer one about the same
+        // failure -- the same reason [RelayHttpException] is caught and
+        // rethrown untouched.
+        var decodeLogged = false
         return try {
             val code = responseCode
             val maxBytes = relayMaxResponseBytes().toInt()
@@ -407,11 +457,10 @@ object RelayClient {
             // read to name the failure, so only a preview of it is taken, and
             // a body that will not finish arriving does not hide the status.
             if (code !in 200..299) {
-                val preview = String(
+                val previewBytes =
                     runCatching { errorStream?.use { it.readAtMost(ERROR_BODY_PREVIEW_BYTES) } }
-                        .getOrNull() ?: ByteArray(0),
-                    StandardCharsets.UTF_8,
-                )
+                        .getOrNull() ?: ByteArray(0)
+                val preview = String(previewBytes, StandardCharsets.UTF_8)
                 val relayCode = runCatching {
                     JsonParser.parseString(preview).asJsonObject.get("code")?.asString
                 }.getOrNull()
@@ -419,18 +468,29 @@ object RelayClient {
                 val retryAfter = getHeaderField("Retry-After")
                 // The fields that explain a stuck relay: relayd's own
                 // machine-readable reason, and the header the carry re-upload
-                // storm ignored. The body preview is deliberately not logged --
-                // it is the one part of a relay response not under our control.
+                // storm ignored.
                 Log.e(
                     TAG,
                     "$method $path -> $code${semantic.ifEmpty { " [-]" }} " +
                         "in ${System.currentTimeMillis() - started}ms " +
                         "retryAfter=${retryAfter ?: "-"}",
                 )
+                // `preview` ends here. It was read to name the failure, and
+                // `relayCode` is that name; the bytes themselves are whatever
+                // the far end chose to send -- a captive-portal page, a proxy
+                // banner, a gateway error -- and this exception's message is
+                // logged verbatim at a dozen call sites in RelaySyncEngine and
+                // again with the throwable during Shore Pass setup. It is not
+                // kept as an unlogged field either: nothing reads one, and a
+                // field that exists is one `Log.w(TAG, msg, e)` away from being
+                // in the archive anyway. What survives is what triage used:
+                // status, relayd's code, and whether a body came back at all.
                 throw RelayHttpException(
                     code,
                     relayCode,
-                    "Relay request failed ($code)$semantic: $preview",
+                    "Relay request failed ($code)${semantic.ifEmpty { " [-]" }} " +
+                        "body=${previewBytes.size}" +
+                        (if (previewBytes.size >= ERROR_BODY_PREVIEW_BYTES) "+" else "") + "B",
                     retryAfter = retryAfter,
                 )
             }
@@ -439,15 +499,41 @@ object RelayClient {
             }
             val body = inputStream?.use { it.readBounded(maxBytes) } ?: ByteArray(0)
             logOutcome(method, path, code, System.currentTimeMillis() - started, body.size)
-            block(body)
+            try {
+                block(body)
+            } catch (e: Exception) {
+                // Separated from the transport catch below because the two
+                // failures read nothing alike and are fixed nowhere alike: the
+                // call succeeded, the bytes are all here, and something about
+                // them is wrong. Naming that phase and the size is the whole
+                // difference between "the relay is unreachable" and "the
+                // relay, or whatever is standing in for it, is answering with
+                // something this build cannot read".
+                logFailure(
+                    method,
+                    path,
+                    System.currentTimeMillis() - started,
+                    decodeFailureDetail(body.size, e),
+                )
+                decodeLogged = true
+                throw e
+            }
         } catch (e: RelayHttpException) {
             // Already logged above with its status and Retry-After; re-logging
             // here would double every relay failure in the shared archive.
             throw e
         } catch (e: Exception) {
-            // Transport and decode failures never reach the branch above, so
-            // this is their only chance to be recorded.
-            logFailure(method, path, System.currentTimeMillis() - started, "${e.javaClass.simpleName}: ${e.message}")
+            // Transport failures never reach either branch above, so this is
+            // their only chance to be recorded. A decode failure passes
+            // through here too, already described one line up.
+            if (!decodeLogged) {
+                logFailure(
+                    method,
+                    path,
+                    System.currentTimeMillis() - started,
+                    "${e.javaClass.simpleName}: ${e.message}",
+                )
+            }
             throw e
         } finally {
             disconnect()

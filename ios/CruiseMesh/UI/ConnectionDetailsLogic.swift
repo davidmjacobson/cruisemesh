@@ -371,6 +371,7 @@ enum ConnectionInputs {
         case .ok: return .connected
         case .failing: return .unreachable
         case .expired: return .passExpired
+        case .expiredReadOnly: return .passExpiredReadOnly
         case .suspended: return .passSuspended
         case .tokenRejected: return .setupRejected
         case .quotaFull: return .storageFull

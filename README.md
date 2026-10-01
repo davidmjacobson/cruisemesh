@@ -18,6 +18,10 @@ hand-me-down phone with no SIM or a Wi-Fi-only tablet.
 [![Localization](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ui-localization.yml/badge.svg)](https://github.com/davidmjacobson/cruisemesh/actions/workflows/ui-localization.yml)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 
+[Get it on the App Store](https://apps.apple.com/app/id6789561040) ·
+[Get it on Google Play](https://play.google.com/store/apps/details?id=com.cruisemesh.app)
+· free, no account.
+
 A Rust core with native iOS and Android shells, plus a relay server you can run
 yourself. It's all AGPL.
 
@@ -67,10 +71,11 @@ lose the internet, not after.
 
 ## Status
 
-Both apps are in release testing — Play closed track and TestFlight — ahead of
-public store listings. The Rust workspace and the Android unit suite gate every
-pull request; the iOS build and test suite runs on any change touching `ios/`
-or `core/`, and nightly.
+Both apps are published: [App Store](https://apps.apple.com/app/id6789561040)
+and [Google Play](https://play.google.com/store/apps/details?id=com.cruisemesh.app).
+They're free, and there is no account to create. The Rust workspace and the
+Android unit suite gate every pull request; the iOS build and test suite runs
+on any change touching `ios/` or `core/`, and nightly.
 
 What works today: 1:1 and group messaging, delivery and read receipts, photos
 with drawing and push-to-talk voice messages (inline, up to 180 KiB), QR

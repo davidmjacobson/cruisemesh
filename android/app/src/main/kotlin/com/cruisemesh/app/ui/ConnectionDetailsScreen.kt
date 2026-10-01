@@ -2,6 +2,7 @@ package com.cruisemesh.app.ui
 
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
@@ -94,6 +95,7 @@ import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
 import com.cruisemesh.app.mesh.RelaySyncEvents
+import com.cruisemesh.app.mesh.shorePassRenewUrl
 import com.cruisemesh.app.relay.RelayConfigStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
@@ -158,7 +160,12 @@ fun ConnectionDetailsScreen(
     val presenceLastSeen by MeshConnectivityStatus.presenceLastSeen.collectAsState()
     val contactLastSeen by MeshConnectivityStatus.contactLastSeen.collectAsState()
     val lanState by LanTransportDiagnostics.state.collectAsState()
-    val relayConfigured = remember { RelayConfigStore.load(context) != null }
+    val relayConfig = remember { RelayConfigStore.load(context) }
+    val relayConfigured = relayConfig != null
+    // Where an expired pass is renewed. Built here rather than in the sheet so
+    // the sheet stays a renderer; null means there is no link to offer and the
+    // sheet keeps its Manage button.
+    val renewUrl = remember(relayConfig) { relayConfig?.relayToken?.let(::shorePassRenewUrl) }
 
     val resumed = rememberPageResumed()
     val nowMs = rememberPageClock(resumed)
@@ -408,6 +415,7 @@ fun ConnectionDetailsScreen(
     howToFix?.let { topic ->
         HowToFixSheet(
             topic = topic,
+            renewUrl = renewUrl,
             onManageShorePass = {
                 howToFix = null
                 onManageShorePass()
@@ -1375,18 +1383,23 @@ private fun TroubleshootingControls(
     }
     Button(
         onClick = {
-            // One button, everything captured -- see DiagnosticsShare.
-            DiagnosticsShare.shareIntent(context)?.let { intent ->
-                if (onShareDiagnostics != null) {
-                    onShareDiagnostics(intent)
-                } else {
-                    context.startActivity(
-                        Intent.createChooser(intent, context.getString(R.string.ui_share_diagnostics)),
-                    )
+            // One button, everything captured -- see DiagnosticsShare. Zipping
+            // the captured files is disk (and SQLite) work, so it moves off
+            // the calling thread; only the chooser launch stays on Main.
+            scope.launch {
+                val intent = withContext(Dispatchers.IO) { DiagnosticsShare.shareIntent(context) }
+                intent?.let {
+                    if (onShareDiagnostics != null) {
+                        onShareDiagnostics(it)
+                    } else {
+                        context.startActivity(
+                            Intent.createChooser(it, context.getString(R.string.ui_share_diagnostics)),
+                        )
+                    }
+                    hasCapturedDiagnostics = true
+                } ?: run {
+                    supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
                 }
-                hasCapturedDiagnostics = true
-            } ?: run {
-                supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
             }
         },
         modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
@@ -1396,12 +1409,18 @@ private fun TroubleshootingControls(
             // A share sheet is only as good as the apps behind it, and at sea
             // there may be none: no mail account signed in, nothing willing to
             // take a zip, no network for either. The same bytes, into a folder.
-            DiagnosticsShare.savePlan(context)?.let { plan ->
-                pendingSaveSource = plan.source
-                saveLauncher.launch(plan.intent)
-                hasCapturedDiagnostics = true
-            } ?: run {
-                supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+            // Preparing them is the same disk work as the share path, moved
+            // off the calling thread the same way; only the picker launch
+            // stays on Main.
+            scope.launch {
+                val plan = withContext(Dispatchers.IO) { DiagnosticsShare.savePlan(context) }
+                plan?.let {
+                    pendingSaveSource = it.source
+                    saveLauncher.launch(it.intent)
+                    hasCapturedDiagnostics = true
+                } ?: run {
+                    supportMessage = context.getString(R.string.ui_no_diagnostics_captured_yet)
+                }
             }
         },
         modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
@@ -1481,6 +1500,8 @@ private fun howToFixTextId(reason: CoreHealthReason): Int? = when (reason) {
     CoreHealthReason.OWN_SETUP_REJECTED -> R.string.ui_how_to_fix_setup_rejected
     CoreHealthReason.STORAGE_FULL -> R.string.ui_how_to_fix_storage_full
     CoreHealthReason.PASS_EXPIRED -> R.string.ui_how_to_fix_pass_expired
+    CoreHealthReason.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_how_to_fix_pass_expired_still_receiving
     CoreHealthReason.PASS_SUSPENDED -> R.string.ui_how_to_fix_pass_suspended
     else -> null
 }
@@ -1522,29 +1543,6 @@ private fun namesTheFriend(reason: CoreDeliveryBlockedReason): Boolean = when (r
     -> false
 }
 
-/** Does this fault have a button on it, and does that button do something? */
-private fun offersManageShorePass(reason: CoreDeliveryBlockedReason): Boolean = when (reason) {
-    CoreDeliveryBlockedReason.PASS_EXPIRED,
-    CoreDeliveryBlockedReason.PASS_SUSPENDED,
-    CoreDeliveryBlockedReason.OWN_SETUP_REJECTED,
-    -> true
-    // Nothing on the Shore Pass screen repairs a friend's card, an oversized
-    // message, or a full mailbox, and a button that leads somewhere useless
-    // costs a reader more than no button at all.
-    CoreDeliveryBlockedReason.CONTACT_SETUP_REJECTED,
-    CoreDeliveryBlockedReason.STORAGE_FULL,
-    CoreDeliveryBlockedReason.MESSAGE_TOO_LARGE,
-    -> false
-}
-
-private fun offersManageShorePass(reason: CoreHealthReason): Boolean = when (reason) {
-    CoreHealthReason.PASS_EXPIRED,
-    CoreHealthReason.PASS_SUSPENDED,
-    CoreHealthReason.OWN_SETUP_REJECTED,
-    -> true
-    else -> false
-}
-
 /**
  * The How-to-fix content, on a sheet.
  *
@@ -1557,15 +1555,16 @@ private fun offersManageShorePass(reason: CoreHealthReason): Boolean = when (rea
 @Composable
 private fun HowToFixSheet(
     topic: HowToFixTopic,
+    renewUrl: String?,
     onManageShorePass: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val body: String?
-    val showManage: Boolean
+    val chosen: HowToFixAction
     when (topic) {
         is HowToFixTopic.Device -> {
             body = howToFixTextId(topic.reason)?.let { stringResource(it) }
-            showManage = offersManageShorePass(topic.reason)
+            chosen = howToFixAction(topic.reason)
         }
         is HowToFixTopic.Person -> {
             val id = howToFixTextId(topic.reason)
@@ -1574,9 +1573,18 @@ private fun HowToFixSheet(
             } else {
                 stringResource(id)
             }
-            showManage = offersManageShorePass(topic.reason)
+            chosen = howToFixAction(topic.reason)
         }
     }
+    // An expired pass with no renewal link to offer -- no saved pass to name,
+    // or a credential the site cannot resolve -- falls back to the pass screen
+    // rather than losing its button. Every fault that had one still has one.
+    val action = if (chosen == HowToFixAction.RENEW_SHORE_PASS && renewUrl == null) {
+        HowToFixAction.MANAGE_SHORE_PASS
+    } else {
+        chosen
+    }
+    val context = LocalContext.current
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
             modifier = Modifier
@@ -1598,14 +1606,27 @@ private fun HowToFixSheet(
                 body ?: stringResource(R.string.ui_how_to_fix_unknown),
                 style = MaterialTheme.typography.bodyMedium,
             )
-            if (showManage) {
+            if (action != HowToFixAction.NONE) {
+                val renewing = action == HowToFixAction.RENEW_SHORE_PASS
                 Button(
-                    onClick = onManageShorePass,
+                    onClick = {
+                        if (renewing && renewUrl != null) {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(renewUrl)))
+                        } else {
+                            onManageShorePass()
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 20.dp)
                         .minimumInteractiveComponentSize(),
-                ) { Text(stringResource(R.string.ui_manage_shore_pass)) }
+                ) {
+                    Text(
+                        stringResource(
+                            if (renewing) R.string.ui_renew_shore_pass else R.string.ui_manage_shore_pass,
+                        ),
+                    )
+                }
             }
         }
     }
@@ -1649,6 +1670,8 @@ private fun relayEvidenceId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_shore_pass_state_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_shore_pass_state_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_shore_pass_state_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_shore_pass_state_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_shore_pass_state_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_shore_pass_state_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_shore_pass_state_storage_full
@@ -1663,6 +1686,8 @@ private fun relayRowStateId(relay: CoreRelayPathState): Int = when (relay) {
     CoreRelayPathState.WAITING_FOR_INTERNET -> R.string.ui_path_shore_pass_waiting_for_internet
     CoreRelayPathState.UNREACHABLE -> R.string.ui_path_shore_pass_unreachable
     CoreRelayPathState.PASS_EXPIRED -> R.string.ui_path_shore_pass_expired
+    CoreRelayPathState.PASS_EXPIRED_READ_ONLY ->
+        R.string.ui_path_shore_pass_expired_still_receiving
     CoreRelayPathState.PASS_SUSPENDED -> R.string.ui_path_shore_pass_suspended
     CoreRelayPathState.SETUP_REJECTED -> R.string.ui_path_shore_pass_setup_rejected
     CoreRelayPathState.STORAGE_FULL -> R.string.ui_path_shore_pass_storage_full

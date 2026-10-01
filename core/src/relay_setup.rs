@@ -4,7 +4,9 @@
 //! fragments to the server, which keeps the household relay token out of
 //! access logs while still allowing one-tap App Link / Universal Link setup.
 
-use data_encoding::BASE64URL_NOPAD;
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
+use data_encoding::{BASE64URL_NOPAD, HEXLOWER};
 use serde::{Deserialize, Serialize};
 
 use crate::{normalize_relay_url, CoreError};
@@ -13,6 +15,13 @@ const RELAY_SETUP_PREFIX: &str = "CMRELAY1:";
 const MAX_RELAY_SETUP_TEXT_BYTES: usize = 8 * 1024;
 const MAX_RELAY_URL_BYTES: usize = 2 * 1024;
 const MAX_RELAY_TOKEN_BYTES: usize = 1024;
+/// Four bytes, printed as eight hex characters. Wide enough that the handful
+/// of passes one support conversation compares never collide by accident,
+/// short enough to sit inline in a log line.
+const RELAY_TOKEN_FINGERPRINT_LEN: usize = 4;
+/// Domain separation, so this digest can never be confused with, or replayed
+/// against, any other BLAKE2b use in the protocol.
+const RELAY_TOKEN_FINGERPRINT_DOMAIN: &[u8] = b"CruiseMesh relay token fingerprint v1\0";
 /// The hosted relay's host name, kept as a macro so both the host and the full
 /// URL below come from one literal. Anything needing the official relay must
 /// use one of the two consts rather than its own copy of the string: the
@@ -111,6 +120,33 @@ pub fn relay_setup_is_official(relay_url: String) -> bool {
         Some(host) => host.eq_ignore_ascii_case(OFFICIAL_RELAY_HOST),
         None => false,
     }
+}
+
+/// Short, stable, non-reversible label for a Shore Pass token, for logs.
+///
+/// A shared diagnostics log has to be able to answer "which pass is this
+/// phone using, and is it the same one as in yesterday's log" without the
+/// file carrying the pass itself. Truncation cannot do both jobs: every
+/// character it prints is a character of a live bearer credential. A digest
+/// can — the same token always produces the same label, and the label says
+/// nothing about the token that produced it.
+///
+/// Both shells call this rather than hashing on their own: two hand-written
+/// digests would drift, and the moment they did, a support person comparing
+/// an Android archive against an iPhone's would stop seeing a match with
+/// nothing failing to say so. Changing the domain string or the output length
+/// breaks that same correlation across app versions, so don't.
+#[uniffi::export]
+pub fn relay_token_fingerprint(relay_token: String) -> String {
+    let mut hasher =
+        Blake2bVar::new(RELAY_TOKEN_FINGERPRINT_LEN).expect("valid blake2b output length");
+    hasher.update(RELAY_TOKEN_FINGERPRINT_DOMAIN);
+    hasher.update(relay_token.as_bytes());
+    let mut out = [0u8; RELAY_TOKEN_FINGERPRINT_LEN];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("output buffer matches configured length");
+    HEXLOWER.encode(&out)
 }
 
 fn validate_setup(relay_url: String, relay_token: String) -> Result<RelaySetup, CoreError> {
@@ -229,5 +265,54 @@ mod tests {
         );
         assert!(parse_relay_setup_text(unknown).is_err());
         assert!(parse_relay_setup_text("x".repeat(MAX_RELAY_SETUP_TEXT_BYTES + 1)).is_err());
+    }
+
+    const HEX_TOKEN: &str = "4ac9f24f8b1e4d7fae0c3b19d6725f88";
+    const FAMILY_TOKEN: &str = "cmfam1-9d41c0b7e2a54f16";
+
+    #[test]
+    fn token_fingerprint_is_stable_and_distinguishes_passes() {
+        for token in [HEX_TOKEN, FAMILY_TOKEN] {
+            let first = relay_token_fingerprint(token.to_string());
+            assert_eq!(first, relay_token_fingerprint(token.to_string()));
+            assert_eq!(first.len(), RELAY_TOKEN_FINGERPRINT_LEN * 2);
+            assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(
+            relay_token_fingerprint(HEX_TOKEN.to_string()),
+            relay_token_fingerprint(FAMILY_TOKEN.to_string())
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_leaks_no_run_of_the_token() {
+        for token in [HEX_TOKEN, FAMILY_TOKEN] {
+            let fingerprint = relay_token_fingerprint(token.to_string());
+            // No window of the token, down to a two-character run, survives
+            // into the label -- which is what separates a digest from a
+            // prefix, and the property a future "just make it shorter"
+            // refactor would break.
+            for width in 2..=token.len() {
+                for window in token.as_bytes().windows(width) {
+                    let run = std::str::from_utf8(window).unwrap();
+                    assert!(
+                        !fingerprint.contains(run),
+                        "fingerprint {fingerprint} contains token run {run}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pins the exact bytes. Both shells restate these vectors in their own
+    /// suites; if the domain string or the length ever moves, all three fail
+    /// together rather than two archives silently stopping matching.
+    #[test]
+    fn token_fingerprint_matches_golden_vectors() {
+        assert_eq!(relay_token_fingerprint(HEX_TOKEN.to_string()), "056855d3");
+        assert_eq!(
+            relay_token_fingerprint(FAMILY_TOKEN.to_string()),
+            "6ae48e6b"
+        );
     }
 }

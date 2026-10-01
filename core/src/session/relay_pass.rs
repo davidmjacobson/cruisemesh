@@ -392,7 +392,10 @@ pub struct CoreRelayEndpointConfig {
 /// * **Rejection** — the endpoint answered, authoritatively, that it will not
 ///   serve us. The card is wrong. Falling back to this device's own mailbox
 ///   is right: a `401` proves nothing about our own relay, and when both
-///   sides have since moved to the same host it really delivers.
+///   sides have since moved to the same host it really delivers. Not for a
+///   card carrying another family's deposit token, though (a friend whose
+///   pass lapsed, typically): our mailbox is one they never read, so that
+///   card gets the silence answer below instead.
 /// * **Silence** — nothing answered at all. Falling back would put a
 ///   cross-family contact's mail in a mailbox they never read, and
 ///   `relay_posted_at` is terminal, so that is a permanent misroute rather
@@ -768,6 +771,16 @@ struct PendingUpload {
     sealed: Vec<u8>,
     expiry_ms: i64,
     endpoint: RelayEndpoint,
+    /// The contact whose card credential `endpoint` is, when it is not this
+    /// device's own. `None` for every row posted with our own credential:
+    /// carried rows, same-family cards resolved to our member token, and a
+    /// written-off card's fallback. A refusal of our own credential is
+    /// evidence about our own pass and about nobody else's card.
+    ///
+    /// This is the attribution the pass needs so that a contact's lapsed or
+    /// suspended family reads as *that contact* being unreachable, never as
+    /// this device's own pass having expired.
+    contact_user_id: Option<Vec<u8>>,
     /// Set when this row is one member's copy of a group-addressed envelope's
     /// fan-out. `None` for every 1:1, receipt and carried row.
     fanout: Option<FanoutRow>,
@@ -962,8 +975,14 @@ struct PassState {
     /// stage 8 can say whether this device's own mailbox answered.
     provisional_silence: Vec<(Vec<u8>, String)>,
     /// Contacts whose endpoint answered authoritatively that it will not
-    /// serve us. Needs no proof of own connectivity (`SILENCE-01`).
+    /// serve us. Needs no proof of own connectivity (`SILENCE-01`). Each
+    /// contact appears at most once: one pass is one step of the streak
+    /// however many rows it tried, the legacy shells' once-per-pass rule.
     rejections: Vec<Vec<u8>>,
+    /// Contacts whose card endpoint accepted a post this pass, so any
+    /// rejection streak they carry clears. A successful post is the only
+    /// thing that clears one (`clear_contact_relay_rejection`).
+    rejection_recoveries: Vec<Vec<u8>>,
     /// Contact endpoints that answered, so any earlier streak clears.
     recoveries: Vec<Vec<u8>>,
 
@@ -1052,6 +1071,7 @@ impl CoreRelayPass {
                 worst_fault: None,
                 provisional_silence: Vec::new(),
                 rejections: Vec::new(),
+                rejection_recoveries: Vec::new(),
                 recoveries: Vec::new(),
                 quiet_until_ms: 0,
                 rate_limited: false,
@@ -1561,6 +1581,7 @@ impl PassState {
             let Some(endpoint) = self.upload_endpoint_for(&row.recipient_user_id) else {
                 continue;
             };
+            let contact_user_id = self.card_owner(&endpoint, &row.recipient_user_id);
             self.uploads.push_back(PendingUpload {
                 lane: UploadLane::Receipt,
                 msg_id: row.msg_id,
@@ -1569,6 +1590,7 @@ impl PassState {
                 sealed: row.sealed,
                 expiry_ms: row.expiry,
                 endpoint,
+                contact_user_id,
                 fanout: None,
             });
         }
@@ -1606,6 +1628,7 @@ impl PassState {
             let Some(endpoint) = self.upload_endpoint_for(&row.recipient_user_id) else {
                 continue;
             };
+            let contact_user_id = self.card_owner(&endpoint, &row.recipient_user_id);
             self.uploads.push_back(PendingUpload {
                 lane: UploadLane::Authored,
                 msg_id: row.msg_id,
@@ -1614,9 +1637,104 @@ impl PassState {
                 sealed: row.sealed,
                 expiry_ms: row.expiry,
                 endpoint,
+                contact_user_id,
                 fanout: None,
             });
             queued += 1;
+        }
+    }
+
+    /// This device's own mailbox as the routing functions resolve it, so a
+    /// comparison against an upload's endpoint compares like with like (both
+    /// normalized, both trimmed).
+    fn own_endpoint(&self) -> Option<RelayEndpoint> {
+        let own = self.plan.own.as_ref()?;
+        resolved_contact_relay(None, None, Some(own.url.clone()), Some(own.token.clone()))
+    }
+
+    /// Is `endpoint` this device's own credential? A mailbox is the (url,
+    /// token) pair, never the host: the hosted relay serves every family, so
+    /// another family's deposit card on our own host is somebody else's
+    /// credential.
+    ///
+    /// Both sides are normalized: a carried row is addressed with the plan's
+    /// own config verbatim while a 1:1 row carries the routing functions'
+    /// normalized form, and the two must not disagree about whose mailbox it
+    /// is over a trailing slash.
+    fn is_own_endpoint(&self, endpoint: &RelayEndpoint) -> bool {
+        let Some(own) = self.own_endpoint() else {
+            return false;
+        };
+        resolved_contact_relay(
+            None,
+            None,
+            Some(endpoint.url.clone()),
+            Some(endpoint.token.clone()),
+        )
+        .is_some_and(|candidate| candidate == own)
+    }
+
+    /// Whose card credential a row to `recipient` is being posted with:
+    /// `None` when it is our own, else the recipient.
+    fn card_owner(&self, endpoint: &RelayEndpoint, recipient: &[u8]) -> Option<Vec<u8>> {
+        if self.is_own_endpoint(endpoint) {
+            None
+        } else {
+            Some(recipient.to_vec())
+        }
+    }
+
+    /// Did the request behind `intent` carry this device's own credential?
+    ///
+    /// The own-pass health fold ([`core_relay_pass_health`]) is only correct
+    /// when every fault it is handed was earned by our own credential. A
+    /// friend's lapsed family answers `403 family_expired` to *their* deposit
+    /// token, and folding that in told a family with a healthy, never-expiring
+    /// pass that theirs had expired. A contact's refusal is evidence about that
+    /// contact's card, and is recorded against it instead.
+    fn intent_used_own_credential(&self, intent: &ActionIntent) -> bool {
+        match intent {
+            ActionIntent::Upload(upload) => self.is_own_endpoint(&upload.endpoint),
+            ActionIntent::Presence { config }
+            | ActionIntent::Fetch { config, .. }
+            | ActionIntent::Ack { config, .. } => {
+                self.configs.get(*config).is_some_and(WalkConfig::is_own)
+            }
+            // A cross-family query carries the contact's post-only credential.
+            ActionIntent::PresenceProbe { .. } => false,
+        }
+    }
+
+    /// Fold `fault` into the own-pass health, but only when our own
+    /// credential earned it. `429` is the one exception, folded from any
+    /// endpoint on purpose: `RATE-01` reads it as a family-budget verdict,
+    /// exactly as both legacy shells do.
+    fn fold_fault(&mut self, intent: &ActionIntent, fault: CoreRelayFault) {
+        if fault == CoreRelayFault::RateLimited || self.intent_used_own_credential(intent) {
+            self.worst_fault = Some(core_worse_relay_fault(self.worst_fault, fault));
+        }
+    }
+
+    /// Record one authoritative refusal of `user_id`'s card endpoint. At most
+    /// one step per contact per pass; whichever of a refusal and a success
+    /// came last in the pass is what is recorded.
+    fn note_contact_rejection(&mut self, user_id: Vec<u8>) {
+        self.rejection_recoveries.retain(|seen| seen != &user_id);
+        if !self.rejections.contains(&user_id) {
+            self.rejections.push(user_id);
+        }
+    }
+
+    /// Record that `user_id`'s card endpoint accepted a post, which clears
+    /// any rejection streak it carries and settles transport silence, as the
+    /// legacy shells' `noteContactRelaySuccess` does.
+    fn note_contact_rejection_recovery(&mut self, user_id: Vec<u8>) {
+        self.rejections.retain(|seen| seen != &user_id);
+        if !self.recoveries.contains(&user_id) {
+            self.recoveries.push(user_id.clone());
+        }
+        if !self.rejection_recoveries.contains(&user_id) {
+            self.rejection_recoveries.push(user_id);
         }
     }
 
@@ -1653,7 +1771,7 @@ impl PassState {
         room: usize,
     ) -> usize {
         let own = self.plan.own.clone();
-        let members: Vec<GroupRelayMember> = group
+        let (member_ids, members): (Vec<Vec<u8>>, Vec<GroupRelayMember>) = group
             .member_user_ids
             .iter()
             .filter_map(|member_id| {
@@ -1662,20 +1780,47 @@ impl PassState {
                     .contacts
                     .iter()
                     .find(|candidate| &candidate.user_id == member_id)?;
-                Some(GroupRelayMember {
-                    relay_url: contact.relay_url.clone(),
-                    relay_token: contact.relay_token.clone(),
-                    endpoint_usable: contact.endpoint_usable,
-                    endpoint_answering: contact.endpoint_answering,
-                })
+                Some((
+                    member_id.clone(),
+                    GroupRelayMember {
+                        relay_url: contact.relay_url.clone(),
+                        relay_token: contact.relay_token.clone(),
+                        endpoint_usable: contact.endpoint_usable,
+                        endpoint_answering: contact.endpoint_answering,
+                    },
+                ))
             })
-            .collect();
+            .unzip();
         let Some(endpoint) = core_group_fanout_relay_target(
-            members,
+            members.clone(),
             own.as_ref().map(|o| o.url.clone()),
             own.as_ref().map(|o| o.token.clone()),
         ) else {
             return 0;
+        };
+        // Whose card the chosen mailbox came from: the first answering member
+        // whose card resolves to it, which is the member
+        // `core_group_fanout_relay_target` picked. `None` when the mailbox is
+        // our own, so a refusal there stays our own pass's health.
+        let card_owner = if self.is_own_endpoint(&endpoint) {
+            None
+        } else {
+            member_ids
+                .iter()
+                .zip(members)
+                .filter(|(_, member)| member.endpoint_answering)
+                .find(|(_, member)| {
+                    resolved_contact_delivery_relay(
+                        member.relay_url.clone(),
+                        member.relay_token.clone(),
+                        own.as_ref().map(|o| o.url.clone()),
+                        own.as_ref().map(|o| o.token.clone()),
+                        member.endpoint_usable,
+                    )
+                    .as_ref()
+                        == Some(&endpoint)
+                })
+                .map(|(member_id, _)| member_id.clone())
         };
 
         let recipients: Vec<Vec<u8>> = group
@@ -1739,6 +1884,7 @@ impl PassState {
                 sealed: row.sealed,
                 expiry_ms: row.expiry,
                 endpoint: endpoint.clone(),
+                contact_user_id: card_owner.clone(),
                 fanout: Some(FanoutRow {
                     envelope_msg_id: envelope.msg_id.clone(),
                     member_user_id,
@@ -1775,6 +1921,7 @@ impl PassState {
                     url: own.url.clone(),
                     token: own.token.clone(),
                 },
+                contact_user_id: None,
                 fanout: None,
             });
         }
@@ -2304,7 +2451,10 @@ impl PassState {
 
         let code = relay_error_code(&result.body);
         let fault = relay_classify_http_error(status, code);
-        self.worst_fault = Some(core_worse_relay_fault(self.worst_fault, fault));
+        // Only our own credential's faults describe our own pass. A friend's
+        // lapsed family answers `family_expired` to their card, and that is
+        // recorded against the friend below, not against us.
+        self.fold_fault(&outstanding.intent, fault);
 
         let actor = self.actor_of(&outstanding.intent);
         let mut draft = ProtocolEventDraft::new(
@@ -2346,8 +2496,28 @@ impl PassState {
                 if fault != CoreRelayFault::MessageTooLarge
                     && fault != CoreRelayFault::MsgIdConflict
                 {
-                    let url = upload.endpoint.url.clone();
-                    self.uploads.retain(|queued| queued.endpoint.url != url);
+                    if fault == CoreRelayFault::Outage {
+                        // An unstructured failure is the host's, so the rest
+                        // of that host's rows would only fail the same way.
+                        let url = upload.endpoint.url.clone();
+                        self.uploads.retain(|queued| queued.endpoint.url != url);
+                    } else {
+                        // A structured refusal is about one credential. The
+                        // hosted relay serves every family, so stopping the
+                        // whole host for one dead card starved our own
+                        // mailbox and every healthy contact behind it.
+                        let endpoint = upload.endpoint.clone();
+                        self.uploads.retain(|queued| queued.endpoint != endpoint);
+                    }
+                }
+                // The contact's card, not our pass: one step of their
+                // rejection streak per pass, so a lapsed friend is written off
+                // and surfaced as unreachable instead of being posted to on
+                // every pass forever.
+                if let Some(user_id) = upload.contact_user_id.clone() {
+                    if crate::contact_relay_fault_is_authoritative(fault) {
+                        self.note_contact_rejection(user_id);
+                    }
                 }
             }
             // A refused cross-family presence query is recorded (the event
@@ -2374,7 +2544,7 @@ impl PassState {
                     .and_then(|c| c.contact_user_id.clone())
                 {
                     if crate::contact_relay_fault_is_authoritative(fault) {
-                        self.rejections.push(user_id);
+                        self.note_contact_rejection(user_id);
                     }
                 }
                 if matches!(outstanding.intent, ActionIntent::Presence { .. }) {
@@ -2450,10 +2620,7 @@ impl PassState {
                 if let Some(walk) = self.configs.get_mut(index).and_then(|c| c.walk.as_mut()) {
                     walk.done = true;
                 }
-                self.worst_fault = Some(core_worse_relay_fault(
-                    self.worst_fault,
-                    CoreRelayFault::Outage,
-                ));
+                self.fold_fault(&outstanding.intent, CoreRelayFault::Outage);
                 let mut draft = ProtocolEventDraft::new(
                     ProtocolEventCode::RequestRejected,
                     self.now_ms,
@@ -2473,10 +2640,7 @@ impl PassState {
         if error == CoreRelayTransportError::Cancelled {
             self.cancelled = true;
         }
-        self.worst_fault = Some(core_worse_relay_fault(
-            self.worst_fault,
-            CoreRelayFault::Outage,
-        ));
+        self.fold_fault(&outstanding.intent, CoreRelayFault::Outage);
         let actor = self.actor_of(&outstanding.intent);
         let mut draft = ProtocolEventDraft::new(
             ProtocolEventCode::RequestRejected,
@@ -2544,8 +2708,14 @@ impl PassState {
         match outstanding.intent {
             ActionIntent::Upload(upload) => {
                 self.any_relay_succeeded = true;
-                if Some(&upload.endpoint.url) == self.plan.own.as_ref().map(|o| &o.url) {
+                // Our mailbox answering means our credential answering. Another
+                // family's deposit on the same host proves the host is up, not
+                // that our own pass works (`SILENCE-01`'s proof).
+                if self.is_own_endpoint(&upload.endpoint) {
                     self.own_relay_succeeded = true;
+                }
+                if let Some(user_id) = upload.contact_user_id.clone() {
+                    self.note_contact_rejection_recovery(user_id);
                 }
                 let marker_result = match upload.lane {
                     UploadLane::Receipt => {
@@ -3165,6 +3335,9 @@ impl PassState {
         for user_id in std::mem::take(&mut self.rejections) {
             let _ = self.store.note_contact_relay_rejected(user_id, now_ms);
         }
+        for user_id in std::mem::take(&mut self.rejection_recoveries) {
+            let _ = self.store.clear_contact_relay_rejection(user_id);
+        }
         for user_id in std::mem::take(&mut self.recoveries) {
             let _ = self.store.clear_contact_relay_unreachable(user_id);
         }
@@ -3400,6 +3573,9 @@ fn derive_pass_id(requested: &str) -> String {
 /// alternative forever and the messages would never leave the queue. Skipping
 /// it falls through to our own, exactly as though the card had carried no
 /// relay fields — which is what [`resolved_contact_delivery_relay`] does.
+/// The exception is a written-off card carrying another family's deposit
+/// token: our mailbox would strand that family's mail, so it resolves to
+/// `None` and waits for the periodic re-probe.
 ///
 /// An endpoint resting for *silence* takes the other answer: `None`, meaning
 /// "post nothing to this recipient this pass". See

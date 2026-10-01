@@ -78,14 +78,22 @@ export CRUISEMESH_RELAY_TOKENS="<paste token(s) here>"
 Optional: put the exports in a root-only `.env` next to `docker-compose.yml`
 (Compose loads it automatically). **Do not commit `.env`.**
 
+`.env` holds only values that stay true between deploys — the domain, the
+tokens, the APNs settings. **Never put `GIT_SHA` in it**; §3.1 explains what
+that cost. An older version of `provision-hetzner.sh` wrote one, so on an
+existing box delete the line if it is still there:
+
+```sh
+sed -i '/^GIT_SHA=/d' /opt/cruisemesh/relayd/.env
+```
+
+Nothing reads it any more, so a leftover line is inert rather than dangerous —
+but it invites the next person to trust it.
+
 ## 3. Start
 
 ```sh
-# Optional but recommended: bakes the exact commit into the image so
-# /healthz reports what's actually running instead of "unknown".
-export GIT_SHA=$(git rev-parse --short HEAD)
-
-docker compose up -d --build
+../tools/relay_deploy.sh
 docker compose ps
 curl -fsS "https://${RELAY_DOMAIN}/healthz"
 # → {"status":"ok","version":"0.1.0","commit":"abc1234"}
@@ -94,6 +102,42 @@ curl -fsS "https://${RELAY_DOMAIN}/healthz"
 Caddy obtains a Let's Encrypt cert for `RELAY_DOMAIN` on first start. If
 `/healthz` fails, check `docker compose logs caddy` (DNS not pointed yet is
 the usual cause).
+
+### 3.1 Redeploying a new commit
+
+```sh
+git -C /opt/cruisemesh pull --ff-only origin master
+/opt/cruisemesh/tools/relay_deploy.sh
+```
+
+That is the whole upgrade procedure. The script reads `HEAD` from the checkout,
+passes it to the image build as `--build-arg GIT_SHA=…` for that invocation
+only, starts the stack, then reads `/healthz` back and fails if the commit it
+reports is not the one just built.
+
+**Use it instead of `docker compose up -d --build`.** The commit in `/healthz`
+is baked in at build time, and the build context deliberately excludes `.git`
+(see `relayd/Dockerfile`), so the image cannot work out its own commit. It used
+to be handed in from a static `GIT_SHA=` line in `.env`, which meant pulling
+new code without also hand-editing `.env` produced a relay that ran the new
+commit and reported the previous one. `/healthz` is exactly what you consult
+when you are unsure whether a fix is live, so a wrong answer there is worse
+than no answer — that one sent two deploy investigations chasing changes which
+had in fact already shipped. A build with no `GIT_SHA` now fails outright
+rather than guessing.
+
+Two consequences:
+
+- The script **refuses to deploy a tree with uncommitted changes to tracked
+  files**, since the image would not be the commit it claims. Commit or revert
+  them, or set `ALLOW_DIRTY=1` to proceed — the image is then stamped
+  `<sha>-dirty`, so `/healthz` keeps saying that what is running is not exactly
+  any commit. Untracked files (`.env`, a private
+  `docker-compose.override.yml`, backups) are ignored; they do not change what
+  gets compiled.
+- `docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD) relayd`
+  followed by `docker compose up -d` is the same thing by hand, if you need to
+  take it a step at a time.
 
 ## 4. Point phones at the relay
 
@@ -140,6 +184,10 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_APNS_ENVIRONMENT` | `production` | `production`, `sandbox`, or `development` (`development` aliases `sandbox`). |
 | `RELAY_DOMAIN` | *(compose required)* | Hostname in the Caddyfile for TLS. |
 
+`GIT_SHA` is **not** in that table and does not belong in `.env`: it is a
+build-time argument, supplied per deploy by `tools/relay_deploy.sh` and baked
+into the image, not a setting the running process reads. See §3.1.
+
 ### The `CRUISEMESH_RELAY_DB` path gotcha
 
 During live bring-up the Windows binary was started without
@@ -182,6 +230,7 @@ named volume so this cannot silently drift.
 - **WebSocket push** (`GET /ws`): see §7. Acks remain `POST /envelopes/ack`;
   poll stays available and unchanged for offline/reconnect catch-up.
 - **Self-service token rotation** (`POST /family/rotate`): see §6.1.
+- **Pass status read** (`GET /family/status`): see §6.2.
 
 ### 6.1 Self-service token rotation (`POST /family/rotate`)
 
@@ -265,6 +314,43 @@ Operational note: after a rotation the family appears under a **new token** in
 `GET /admin/families`, but its `family_id` is unchanged — record that, not the
 token, if you track a customer across time (§12).
 
+### 6.2 Pass status (`GET /family/status`)
+
+What each phone's Shore Pass surface reads to say when internet delivery runs
+out, and to decide whether to offer a renewal. Member credential only — a
+deposit token is refused with the same `deposit_only` 403 as any other
+member-only op, because when someone else's pass lapses is not a friend's
+business.
+
+```sh
+curl -sS https://relay.example.com/family/status \
+  -H "Authorization: Bearer $MEMBER_TOKEN"
+```
+
+```json
+{"plan": "shore-pass", "expires_ms": 1767225600000, "state": "active"}
+```
+
+- `state` is `active`, `grace` (past `expires_ms` but inside
+  `FAMILY_EXPIRY_GRACE_MS`: queued mail still drains, new envelopes are
+  refused) or `suspended` (an administrative suspension, or an expiry past the
+  grace window — from a phone's side those are the same fact, and a client
+  that wants to tell them apart already holds `expires_ms`).
+- `expires_ms` is `null` for a family with no end date. `plan` is `null` for a
+  static env-allowlist family (`CRUISEMESH_RELAY_TOKENS`), which has no
+  `families` row because no pass was ever sold for it; those read as `active`
+  with no expiry. A phone shows no delivery date at all in that case rather
+  than inventing one, and offers no renewal.
+- **This is the one route that answers while the family is suspended or past
+  its grace window.** Every other authenticated route 403s in those states,
+  which are exactly the states the renewal prompt exists for — a 403 here
+  would leave the phone with nothing to show. Nothing else is relaxed: the
+  class boundary above still applies, the read is of the caller's own row
+  only, and no field is exposed that the family does not already hold.
+- Every field already lives on the `families` row, so there is **no schema
+  change** and nothing new is written. It costs one request unit, like
+  `GET /envelopes`.
+
 ## 7. WebSocket push (`GET /ws`)
 
 Phones with a live internet path can subscribe instead of only polling:
@@ -324,7 +410,7 @@ export CRUISEMESH_APNS_TEAM_ID=DEF456
 export CRUISEMESH_APNS_BUNDLE_ID=com.cruisemesh.app
 export CRUISEMESH_APNS_PRIVATE_KEY_FILE=/run/secrets/cruisemesh-apns.p8
 export CRUISEMESH_APNS_ENVIRONMENT=production
-docker compose up -d --build
+../tools/relay_deploy.sh          # §3.1 — supplies the GIT_SHA build arg
 docker compose logs relayd | grep apns_wakes
 ```
 
@@ -550,6 +636,73 @@ envelope, so a rejected envelope stays queued locally for a later retry
 shrinking the payload; useful for the quota error, which resolves once the
 family drains their mailbox).
 
+### Deposit-class shares of that quota
+
+The quota above is one pool per family, and a family's deposit credential
+(§1, "Token classes") is stamped onto every friend card it hands out. Charged naively, the
+pool a family's own phones depend on can be filled entirely by posts none of
+those phones sent — and once it is full, the family's own posts are refused
+too, until the deposited rows age out. Two additional ceilings, applied only
+to deposit-class posts, take that away:
+
+| Ceiling | Default | Applies to |
+| --- | --- | --- |
+| Family storage quota | 100% (`CRUISEMESH_RELAY_FAMILY_QUOTA_BYTES`) | every post, member or deposit |
+| All deposit-class rows together | 50% of that quota | deposit-class posts only |
+| Any one depositor | 25% of that quota | deposit-class posts only |
+
+Both are fixed percentages of whatever quota the family has, so a per-family
+`quota_bytes` override scales them with it; there is no separate knob and no
+operator step.
+
+**Member-class posts are unchanged** — the family's own devices still see the
+whole quota, and are still the only class that can be told the mailbox is
+full. The reservation is one-sided: a family whose friends post nothing
+notices nothing, and a family whose friends post constantly still has half a
+mailbox of its own that no friend card can reach.
+
+Shares deliberately do not shrink as depositors arrive. A share divided by a
+live depositor count would let any credential holder shrink everyone else's
+allowance by inventing depositors, and would make an honest friend's
+admission depend on strangers. Fixed shares oversubscribe instead (four
+depositors at a quarter each would sum to the whole quota), which is exactly
+what the 50% aggregate ceiling is for: however many friend cards are in
+circulation, their shares can never add up to a family locked out of its own
+mailbox.
+
+A post over a deposit ceiling is refused with its own `code`, never the
+family's:
+
+```
+HTTP 507 Insufficient Storage
+{ "error": "this deposit credential's share of the family mailbox is full: ...",
+  "code": "depositor_share_exceeded" }     # this credential alone is at its share
+{ "error": "the deposit-class share of the family mailbox is full: ...",
+  "code": "deposit_share_exceeded" }       # deposit-class rows together are at theirs
+```
+
+The status stays 507 on purpose — the server understood the request and will
+not store the result — and `core/src/relay_status.rs` falls back to the
+status when it does not recognize a `code`, so an app predating these codes
+reads them exactly as it reads a full mailbox today (persistent storage
+condition, envelope stays queued locally for retry). That is the correct
+degrade. Reusing `family_quota_exceeded` would not be: it asserts the mailbox
+is full, which in these two cases it is not, and it would send a family
+looking for a backlog to drain when draining changes nothing.
+
+Accounting is keyed on the *presented credential*. Today a family derives one
+deposit token and every friend card carries it, so the relay genuinely cannot
+tell one friend from another, and the credential is the finest depositor it
+can honestly distinguish — the per-depositor and aggregate ceilings coincide
+until friend cards carry per-friend credentials, at which point each gets its
+own share with no further change. `POST /family/rotate` retires every
+outstanding card, so rows deposited before a rotation keep counting against
+the family quota but stop counting against any live depositor's share.
+
+Rows are attributed by a `depositor` column on `envelopes`, added by an
+additive startup migration whose constant default makes every row that
+predates it read as member class — see §11, "Schema migrations".
+
 ### Request and upload rate limits
 
 The two limits above bound how much a family can *store*; neither bounds how
@@ -720,17 +873,38 @@ to take at most a few seconds; there is no separate migration step to run
 by hand. If you operate an unusually large relayd database, expect a
 one-time longer startup on the first upgrade.
 
-### `families` schema migrations
+### Schema migrations
 
-Column additions to `families` are applied by `RelayStore::open` on start,
-idempotently, with no operator step and no downtime beyond the restart:
-`deposit_token` (backfilled by derivation from each existing member token),
-then `family_id` (backfilled with a freshly minted `cmfid1-…` per row) and
-`rotation_pk`. `rotation_pk` is deliberately **not** backfilled — NULL is its
-meaningful value and means "no rotation authority registered yet", which is
-the correct starting state for every family that predates §6.1. Re-running is
-a no-op, so a rollback and re-upgrade is safe; a downgrade to a build that
-predates these columns also works, since it simply ignores them.
+Column additions are applied by `RelayStore::open` on start, idempotently,
+with no operator step and no downtime beyond the restart.
+
+On `families`: `deposit_token` (backfilled by derivation from each existing
+member token), then `family_id` (backfilled with a freshly minted `cmfid1-…`
+per row) and `rotation_pk`. `rotation_pk` is deliberately **not** backfilled —
+NULL is its meaningful value and means "no rotation authority registered
+yet", which is the correct starting state for every family that predates
+§6.1.
+
+On `envelopes`: `depositor TEXT NOT NULL DEFAULT ''`, which carries the
+deposit-share accounting in §10. The constant `DEFAULT` is what makes a
+`NOT NULL` `ADD COLUMN` legal at all, and it means SQLite records the column
+in the schema and synthesizes the default on read: **no existing row is
+rewritten, moved, or deleted**, there is nothing to backfill, and no envelope
+is at risk. Every row that predates the column therefore reads as member
+class, the only safe reading of rows posted before the relay recorded who
+deposited them — guessing "deposit" would charge a family's existing friend
+mail against a share that did not exist when it was posted, and could refuse
+that family's friends on restart for history rather than behavior.
+
+Re-running any of them is a no-op, so a rollback and re-upgrade is safe; a
+downgrade to a build that predates these columns also works, since it simply
+ignores them — an older binary keeps writing envelopes without a `depositor`,
+SQLite supplies `''`, and a later re-upgrade reads those rows as member class
+exactly as it does the rest.
+
+**Check after deploying**: `PRAGMA table_info(envelopes)` on the live
+database should list `depositor`, and the startup log carries
+`migration: envelopes.depositor added` once (and only once).
 
 ## 12. Hosted-family admin API (`/admin/families`)
 

@@ -110,6 +110,114 @@ class RelayClientTest {
         }
     }
 
+    /**
+     * A 200 whose body will not decode. Whatever answered may not have been
+     * the relay -- a captive portal and a proxy can both answer 200 -- so the
+     * line this writes into the shared log describes the failure and quotes
+     * none of it.
+     *
+     * Whole-message equality on purpose. "Does not contain the body" is the
+     * property, but only pinning the sentence exactly rules out a later edit
+     * appending something else that came off the wire.
+     */
+    @Test
+    fun `a body that will not decode is described without quoting it`() {
+        val server = MockWebServer()
+        val portal = """{"id":"MARKER-cabin-8042"}"""
+        server.enqueue(MockResponse().setResponseCode(200).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(Exception::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            assertEquals(
+                "could not decode ${portal.length}B: Malformed: v1=" +
+                    "invalid relay JSON: data error at line 1 column 25 of ${portal.length}B",
+                RelayClient.decodeFailureDetail(portal.length, error),
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    /**
+     * The other half of the same line: a sign-in page served with a 200. The
+     * status branch never sees this one, so the decode failure is all the
+     * reader gets -- and it still has to be enough to act on.
+     */
+    @Test
+    fun `a sign-in page served with a 200 is named by shape and size`() {
+        val server = MockWebServer()
+        val portal = "<html><title>MARKER Guest Wi-Fi</title></html>"
+        server.enqueue(MockResponse().setResponseCode(200).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(Exception::class.java) {
+                RelayClient.fetchEnvelopes(config, listOf(ByteArray(8) { 2 }), 0, 16)
+            }
+            assertEquals(
+                "could not decode ${portal.length}B: Malformed: v1=" +
+                    "invalid relay JSON: syntax error at line 1 column 1 of ${portal.length}B",
+                RelayClient.decodeFailureDetail(portal.length, error),
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `an error response body stays out of the exception message`() {
+        // Whatever answers a relay call is not necessarily the relay: a
+        // captive portal, a proxy, a gateway. Its bytes are logged verbatim
+        // wherever RelaySyncEngine writes `${e.message}`, so the message
+        // carries the status, relayd's code and the size -- and nothing that
+        // came off the wire.
+        val server = MockWebServer()
+        val portal = "<html><title>Guest Wi-Fi sign in</title>deck 5 stateroom 8042</html>"
+        server.enqueue(MockResponse().setResponseCode(502).setBody(portal))
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(RelayHttpException::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            // Whole-message equality on purpose. "does not contain the body"
+            // is the property, but only pinning the message exactly rules out
+            // a future edit appending something else that came off the wire.
+            assertEquals(
+                "Relay request failed (502) [-] body=${portal.length}B",
+                error.message,
+            )
+        } finally {
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `a relay code still names the failure without the body`() {
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(507)
+                .setBody("""{"error":"mailbox is full","code":"mailbox_full"}"""),
+        )
+        server.start()
+        try {
+            val config = RelayConfig(server.url("/").toString(), "family-token")
+            val error = assertThrows(RelayHttpException::class.java) {
+                RelayClient.postOutboundEnvelope(config, sampleOutboundEnvelope())
+            }
+            assertEquals("mailbox_full", error.relayCode)
+            // relayd's own code names the failure; the sentence it shipped
+            // alongside does not travel.
+            assertEquals("Relay request failed (507) [mailbox_full] body=49B", error.message)
+        } finally {
+            server.shutdown()
+        }
+    }
+
     @Test
     fun `post receipt envelope uses the same relay contract`() {
         val server = MockWebServer()

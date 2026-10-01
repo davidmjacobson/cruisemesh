@@ -391,15 +391,17 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
         let lan = LanTransport(
             identity: identity,
-            trustedPeerForStaticKey: { [weak self, store = self.store] remoteStaticKey in
-                if let userId = trustedLanPeerUserId(
+            trustedPeerForStaticKey: { [store = self.store] remoteStaticKey in
+                trustedLanPeerUserId(
                     contacts: (try? store.listContacts()) ?? [],
                     remoteStaticKey: remoteStaticKey
-                ) {
-                    return userId
-                }
-                self?.recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: remoteStaticKey)
-                return nil
+                )
+            },
+            onOwnIdentityPeer: { [weak self] remoteStaticKey, provenPeerDeviceId in
+                self?.recordOwnIdentityCloneIfAuthenticated(
+                    remoteStaticKey: remoteStaticKey,
+                    provenPeerDeviceId: provenPeerDeviceId
+                )
             },
             ownDeviceLanProof: { [weak self] handshakeHash, role in
                 self?.ownDeviceLanProof(handshakeHash: handshakeHash, role: role)
@@ -1441,11 +1443,68 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         stopOnMeshQueue()
     }
 
-    private func recordOwnIdentityCloneIfAuthenticated(remoteStaticKey: Data) {
-        guard ownLanStaticKeyMatches(ownAgreePk: identity.agreePk, remoteStaticKey: remoteStaticKey) else {
+    /// **The clone guard**, asked once per own-device LAN link at the moment the
+    /// handshake has settled what the far end actually is
+    /// (`specs/multi-device-v1.md` §1, §6, §10 step 5).
+    ///
+    /// It runs from the transport's own-device arm now, not from the
+    /// trusted-peer lookup that used to raise it. The lookup is asked in the
+    /// *middle* of the handshake — before §10 step 5's proof has been exchanged,
+    /// because the proof signs a transcript hash that is not final until the last
+    /// handshake message has gone out — so a guard placed there had no device id
+    /// to reason about, and this shell asked the key question and nothing else:
+    /// it recorded a clone warning for any peer whose Noise static was this
+    /// identity's own agreement key and never asked core whether that peer was a
+    /// device of this person's at all. Android at least asked, with a hardcoded
+    /// null; this shell was the larger half of the gap.
+    ///
+    /// It does not follow that the answer changes today. The clone arm of the
+    /// handshake is symmetric and exchanges no proof, so what arrives here is
+    /// still nil and the verdict is still a clone — see `OwnIdentityClonePolicy`
+    /// for why that is the handshake's property and not the rule's.
+    ///
+    /// `provenPeerDeviceId` is `coreOwnDeviceLanProofOpen`'s answer for *this*
+    /// session and nothing weaker. The rule it feeds lives in
+    /// `OwnIdentityClonePolicy`, where a unit test can read it — including the
+    /// honest note that today's clone arm exchanges no proof, so the sibling
+    /// answer is not yet reachable over LAN.
+    ///
+    /// Mirrors Android's `MeshService.recordOwnIdentityCloneIfAuthenticated`.
+    private func recordOwnIdentityCloneIfAuthenticated(
+        remoteStaticKey: Data,
+        provenPeerDeviceId: Data?
+    ) {
+        switch OwnIdentityClonePolicy.verdict(
+            ownAgreePk: identity.agreePk,
+            remoteStaticKey: remoteStaticKey,
+            // Read on the mesh queue, for the same reason
+            // `trustedPeerForStaticKey` reads `listContacts` there: it is one
+            // indexed read of a handful of rows, and the alternative is judging
+            // a peer that holds this identity's key against a projection
+            // fetched after the link went live. The policy asks for it only
+            // once the key test has passed, so an ordinary refused stranger
+            // costs nothing.
+            fleet: {
+                guard let fleet = try? self.store.ownDeviceFleet() else {
+                    self.log.warning("Could not read this phone's own devices")
+                    return nil
+                }
+                return fleet
+            },
+            provenPeerDeviceId: provenPeerDeviceId
+        ) {
+        case .notOurIdentity:
             return
+        case .sibling:
+            // A device this person's own roster names is not a clone. Warning
+            // about one would greet a deliberate link with the most alarming
+            // sentence the app can say — and a warning that fires on the normal
+            // case is one people learn to dismiss, which leaves it useless for
+            // the real thing.
+            log.info("A device of ours presented our identity; not a clone")
+        case .clone:
+            recordOwnIdentityClone()
         }
-        recordOwnIdentityClone()
     }
 
     private func recordOwnIdentityClone() {
@@ -3326,6 +3385,27 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             receiptType: ReceiptType.delivered,
             throughLamport: through
         )
+        // The live receipt below is best-effort: it reaches the sender only if
+        // a link happens to be up right now. The durable half is this sealed
+        // receipt envelope, which the next relay sync uploads -- it is what
+        // eventually moves the sender's DELIVERED watermark and lets them
+        // retire their carried copy of the request. Every other consuming
+        // handler in this file queues it (`handleIncomingChatMessage`,
+        // `handleIncomingProfileSync`, and every hidden kind via
+        // `acknowledgeHiddenMessage`), and so does Android's twin, whose
+        // friend-request path runs the shared `acknowledgePeerStream`. This
+        // one did not, so a friend request that was accepted while the
+        // requester was offline was re-sprayed for the whole life of the
+        // envelope.
+        if queueOutgoingReceiptForRelay(
+            identity: identity,
+            contact: contact,
+            receiptType: ReceiptType.delivered,
+            ackedSenderUserId: senderUserId,
+            throughLamport: through
+        ) {
+            RelaySyncEvents.requestSync()
+        }
         if let sourceAddress {
             sendReceiptOnAddress(
                 identity: identity,
@@ -5322,8 +5402,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             /// mailbox. Falling back for them would post a cross-family
             /// member's copy where they never read, and `relayPostedAt` is
             /// terminal, so that is a permanent misroute rather than a retry.
-            /// A member written off for *rejection* still falls back,
-            /// unchanged. Mirrors RelaySyncEngine.kt.
+            /// A member written off for *rejection* still falls back, unless
+            /// their card carries another family's deposit token, which
+            /// blocks the fallback the same way. Mirrors RelaySyncEngine.kt.
             func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
                 guard let group = groupsById[groupId] else { return config }
                 let members = group.memberUserIds.compactMap { member -> GroupRelayMember? in
@@ -5992,8 +6073,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         relaySyncLog.info(
             "Core relay pass complete: outcome=\(String(describing: outcome), privacy: .public) requests=\(summary.requestsIssued, privacy: .public) ingested=\(summary.rowsIngested, privacy: .public)"
         )
+        // Re-read after the pass: core has just written this pass's rejection
+        // and silence streaks. A friend whose card core wrote off (their family
+        // pass lapsed, say) is *their* problem, never this device's pass health
+        // (`HEALTH-01`), so it is surfaced here, per contact, exactly as the
+        // legacy pass surfaces it. Without this the chat banner that says their
+        // card is stale never lit on the core engine.
+        let staleAfterPass = Self.staleRelayContactIds(
+            rejections: (try? store.listContactRelayRejections()) ?? [],
+            unreachable: (try? store.listContactRelayUnreachable()) ?? []
+        )
         await MainActor.run {
             MeshConnectivityStatus.shared.setRelayHealth(health)
+            MeshConnectivityStatus.shared.setStaleRelayContacts(staleAfterPass)
         }
         // `relayRateLimitedUntilMs` and the backoff counter are the controller's
         // own state, read by `runRelaySync` on `meshQueue`, so they are written
@@ -6026,6 +6118,25 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// The contacts whose card endpoint should be reported stale, from the
+    /// persisted streaks alone. Not from either current usability probe: a
+    /// relay stays reported stale while a periodic recheck is due, so the
+    /// explanation does not blink out merely because one request is
+    /// temporarily permitted. The thresholds are core's.
+    static func staleRelayContactIds(
+        rejections: [ContactRelayRejection],
+        unreachable: [ContactRelayUnreachable]
+    ) -> Set<Data> {
+        Set(
+            rejections
+                .filter { coreContactRelayIsStale(rejectStreak: $0.rejectStreak) }
+                .map(\.userId)
+            + unreachable
+                .filter { coreContactRelayUnreachableIsStale(unreachableStreak: $0.unreachableStreak) }
+                .map(\.userId)
+        )
+    }
+
     /// Projects the core pass's own health onto this shell's display type,
     /// attaching the shell's clock reading. The precedence itself is core policy
     /// (`coreRelayPassHealth`, `RATE-01`); this is the same projection
@@ -6037,6 +6148,7 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         case .messageTooLarge: return .messageTooLarge(lastAttemptMs: nowMs)
         case .rateLimited: return .rateLimited(lastAttemptMs: nowMs)
         case .expired: return .expired(lastAttemptMs: nowMs)
+        case .expiredReadOnly: return .expiredReadOnly(lastAttemptMs: nowMs)
         case .suspended: return .suspended(lastAttemptMs: nowMs)
         case .tokenRejected: return .tokenRejected(lastAttemptMs: nowMs)
         case .failing: return .failing(lastAttemptMs: nowMs)

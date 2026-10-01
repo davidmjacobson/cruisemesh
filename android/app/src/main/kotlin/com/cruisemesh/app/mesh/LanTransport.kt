@@ -67,6 +67,37 @@ internal class LanTransport(
     private val identity: Identity,
     private val trustedPeerForStaticKey: (ByteArray) -> ByteArray?,
     /**
+     * **The clone guard's one call site.** Raised once per link that reached the
+     * own-device arm — the peer is nobody's contact — with the Noise static key
+     * the far end proved it holds and the device id §10 step 5's roster proof
+     * named for *this* session, or null when it named none.
+     *
+     * Deliberately here rather than inside [trustedPeerForStaticKey], which is
+     * where it used to live. That lookup is asked in the middle of the
+     * handshake, and a proof signs a transcript hash that is not final until the
+     * last handshake message has gone out — so a guard placed there could never
+     * have a device id to reason about, and passed a hardcoded null that
+     * `core_own_identity_peer` can only read as a clone. This runs one decision
+     * later, on both roles, and before the cross-connect rule has had a chance
+     * to turn the link away: a peer that got far enough to present this
+     * identity's key has been seen whether or not its socket is the one kept.
+     *
+     * Not raised for a contact's link, and not raised for a peer the proof
+     * exchange refused. Neither can be holding this identity's own agreement
+     * key — the clone arm of [acceptOwnDeviceOrRefuse] answers before any proof
+     * is exchanged, so a peer that reaches the exchange at all is one the key
+     * test has already cleared.
+     *
+     * The corollary is worth being blunt about: the two arms are disjoint, so on
+     * today's wire this is raised either with a device id and a static key that
+     * is *not* ours, or with our static key and a null device id — never both.
+     * [OwnIdentityClonePolicy] therefore answers `SIBLING` for nobody yet. That
+     * is a property of §10 step 5's symmetric clone arm, not of the rule, and
+     * the rule is where it belongs so that changing the arm is the only work
+     * left when a proof can cross it.
+     */
+    private val onOwnIdentityPeer: (ByteArray, ByteArray?) -> Unit,
+    /**
      * This device's own §10 step 5 proof for a finished LAN Noise session:
      * [uniffi.cruisemesh_core.coreOwnDeviceLanProof] over the session's
      * transcript hash and the end this device is speaking from, signed with
@@ -1391,6 +1422,7 @@ internal class LanTransport(
                         role = "LAN responder",
                         peerEndpoint = peerEndpoint,
                     )
+                    onOwnIdentityPeer(remoteStatic, provenOwnDevice?.deviceId)
                     return@run null
                 }
                 if (expectedUserId != null && !userId.contentEquals(expectedUserId)) {
@@ -1429,6 +1461,7 @@ internal class LanTransport(
                         role = "LAN initiator",
                         peerEndpoint = peerEndpoint,
                     )
+                    onOwnIdentityPeer(remoteStatic, provenOwnDevice?.deviceId)
                 }
                 userId
             }

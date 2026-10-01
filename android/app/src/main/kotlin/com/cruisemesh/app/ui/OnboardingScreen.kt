@@ -47,7 +47,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.testTag
 import com.cruisemesh.app.R
 
-private data class PermissionItem(
+internal data class PermissionItem(
     val title: String,
     val detail: String,
     val enabled: Boolean,
@@ -338,7 +338,7 @@ private fun WifiSlide() {
 }
 
 @Composable
-private fun PermissionsSlide(
+internal fun PermissionsSlide(
     meshPermissionsGranted: Boolean,
     notificationPermissionGranted: Boolean,
     batteryExemptionGranted: Boolean,
@@ -496,7 +496,7 @@ private fun ProfileSlide(
 }
 
 @Composable
-private fun SlideScaffold(
+internal fun SlideScaffold(
     eyebrow: String,
     title: String,
     body: String,
@@ -544,7 +544,7 @@ private fun HighlightCard(title: String, detail: String) {
 }
 
 @Composable
-private fun PermissionStatusCard(item: PermissionItem) {
+internal fun PermissionStatusCard(item: PermissionItem) {
     val missingRequired = item.required && !item.enabled
     Surface(
         modifier = Modifier

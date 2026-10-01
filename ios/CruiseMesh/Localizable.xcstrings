@@ -1435,6 +1435,16 @@
         }
       }
     },
+    "Couldn't send. Your message is still here.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Couldn't send. Your message is still here."
+          }
+        }
+      }
+    },
     "CruiseMesh doesn't have step-by-step help for this one yet. Open Troubleshooting & diagnostics, share diagnostics, and contact support.": {
       "localizations": {
         "en": {
@@ -2097,6 +2107,16 @@
         }
       }
     },
+    "Opens cruisemesh.app to renew your family's pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Opens cruisemesh.app to renew your family's pass."
+          }
+        }
+      }
+    },
     "Optional. If you bought one, add it before trading codes.": {
       "localizations": {
         "en": {
@@ -2165,6 +2185,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Pass expired"
+          }
+        }
+      }
+    },
+    "Pass expired · still receiving": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Pass expired · still receiving"
           }
         }
       }
@@ -2357,6 +2387,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Removing…"
+          }
+        }
+      }
+    },
+    "Renew Shore Pass": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Renew Shore Pass"
           }
         }
       }
@@ -2623,6 +2663,16 @@
         }
       }
     },
+    "Shore Pass expired · still receiving": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Shore Pass expired · still receiving"
+          }
+        }
+      }
+    },
     "Shore Pass is catching up": {
       "localizations": {
         "en": {
@@ -2789,6 +2839,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Start again"
+          }
+        }
+      }
+    },
+    "Start using CruiseMesh": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Start using CruiseMesh"
           }
         }
       }
@@ -3333,12 +3393,12 @@
         }
       }
     },
-    "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names.": {
+    "Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Diagnostics contain friend identity, path type, event type, time, hashed chat tags, and delivery timings. They never contain message content, relay tokens, IP addresses, or Wi-Fi names."
+            "value": "Diagnostics record which path each message took, how long it took, and your friends’ and groups’ names. Wi-Fi and Bluetooth addresses and the long code that identifies a phone are swapped for short stand-ins. Message content, Wi-Fi names and your Shore Pass setup card are never recorded."
           }
         }
       }
@@ -3703,6 +3763,16 @@
         }
       }
     },
+    "Internet delivery through %@": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Internet delivery through %@"
+          }
+        }
+      }
+    },
     "Keep current pass": {
       "localizations": {
         "en": {
@@ -3809,6 +3879,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Message info"
+          }
+        }
+      }
+    },
+    "Messages already on their way still arrive. Renew your pass to send over the internet again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Messages already on their way still arrive. Renew your pass to send over the internet again."
           }
         }
       }
@@ -5609,6 +5689,26 @@
         }
       }
     },
+    "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until you renew the pass.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until you renew the pass."
+          }
+        }
+      }
+    },
+    "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your Shore Pass has run out. Messages already on their way to you still arrive, and messages still reach your friends whenever you are near each other. New messages can't go out over the internet until the pass is renewed. Open Manage Shore Pass to renew it."
+          }
+        }
+      }
+    },
     "Your Shore Pass is suspended": {
       "localizations": {
         "en": {
@@ -5715,6 +5815,26 @@
           "stringUnit": {
             "state": "translated",
             "value": "Your other devices will need your Shore Pass setup card again. Open Shore Pass on this phone and show the code to each of them."
+          }
+        }
+      }
+    },
+    "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your pass has run out, so messages can't travel over the internet. Renewing it starts internet delivery again. Messages still reach your friends whenever you are near each other."
+          }
+        }
+      }
+    },
+    "Your phone is set up. One last thing before you start.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Your phone is set up. One last thing before you start."
           }
         }
       }

@@ -265,7 +265,7 @@ final class RelayRotationDriverTests: XCTestCase {
         let fleet = try Fleet.revoked(nowMs: nowMs)
         let pass = SavedPass(RelayConfig(relayUrl: relayUrl, relayToken: oldToken))
         let relay = Relay { _, _ in
-            throw RelayHTTPError(statusCode: 500, relayCode: nil, responseBody: "having a day")
+            throw RelayHTTPError(statusCode: 500, relayCode: nil, responseBodyBytes: 12)
         }
         let driver = RelayRotationDriver(
             store: fleet.store,
@@ -303,7 +303,7 @@ final class RelayRotationDriverTests: XCTestCase {
                 throw RelayHTTPError(
                     statusCode: 401,
                     relayCode: nil,
-                    responseBody: "unknown family token"
+                    responseBodyBytes: 20
                 )
             }
             // relayd answers a repeat presentation with the same values and
@@ -337,7 +337,7 @@ final class RelayRotationDriverTests: XCTestCase {
             throw RelayHTTPError(
                 statusCode: 429,
                 relayCode: "rate_limited",
-                responseBody: "too fast",
+                responseBodyBytes: 8,
                 retryAfter: "60"
             )
         }
@@ -381,7 +381,7 @@ final class RelayRotationDriverTests: XCTestCase {
             throw RelayHTTPError(
                 statusCode: 409,
                 relayCode: "rotation_unsupported",
-                responseBody: "configured on the server"
+                responseBodyBytes: 24
             )
         }
         var now = nowMs
@@ -590,7 +590,7 @@ final class RelayRotationDriverTests: XCTestCase {
             throw RelayHTTPError(
                 statusCode: 403,
                 relayCode: "rotation_unauthorized",
-                responseBody: "somebody else holds the key"
+                responseBodyBytes: 27
             )
         }
         var blocked: Bool?

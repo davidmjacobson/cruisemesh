@@ -193,7 +193,7 @@ final class CoreBindingSmokeTests: XCTestCase {
     }
 
     /// Every declared case of the returned enum is reachable, so none of the
-    /// eight discriminants lifts onto another's name. Which input produces
+    /// nine discriminants lifts onto another's name. Which input produces
     /// which is the core's business and is not asserted; only that the set is
     /// covered.
     func testEveryPassHealthCaseLiftsBackDistinctly() {
@@ -342,12 +342,12 @@ final class CoreBindingSmokeTests: XCTestCase {
     private static let allPassHealthCases: [CoreRelayPassHealth] = {
         let all: [CoreRelayPassHealth] = [
             .ok, .quotaFull, .messageTooLarge, .rateLimited,
-            .expired, .suspended, .tokenRejected, .failing,
+            .expired, .expiredReadOnly, .suspended, .tokenRejected, .failing,
         ]
         for value in all {
             switch value {
             case .ok, .quotaFull, .messageTooLarge, .rateLimited,
-                 .expired, .suspended, .tokenRejected, .failing: break
+                 .expired, .expiredReadOnly, .suspended, .tokenRejected, .failing: break
             }
         }
         return all

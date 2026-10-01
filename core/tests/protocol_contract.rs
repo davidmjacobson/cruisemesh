@@ -183,6 +183,13 @@ const CONTRACT: &[Invariant] = &[
         owner: Owner::Core("core/src/contact_relay_health.rs silence tests"),
     },
     Invariant {
+        id: "HEALTH-01",
+        statement: "Own pass health comes only from requests made with this device's own                     credential; a contact endpoint's refusal advances that contact's streak                     instead (429 excepted, RATE-01).",
+        owner: Owner::Core(
+            "core/src/session/relay_pass.rs own-credential fold gate;              core/tests/relay_pass_replay.rs contact-refusal scenarios",
+        ),
+    },
+    Invariant {
         id: "UI-01",
         statement: "Delivery and via-transport claims require persisted arrival or receipt \
                     evidence, never a current-link guess.",
@@ -1243,6 +1250,130 @@ fn silence_01_silence_needs_proof_that_the_internet_worked() {
              {fault:?}"
         );
     }
+}
+
+#[test]
+fn health_01_a_contacts_lapsed_pass_is_not_our_own() {
+    let id = lookup("HEALTH-01").id;
+    let now_ms = 1_700_000_000_000_i64;
+    let own_url = "https://relay.example";
+    let own_token = "member-token-cccccccccccc";
+    let friend: Vec<u8> = vec![9u8; 32];
+    let friend_deposit =
+        cruisemesh_core::relay_deposit_token_for("member-token-eeeeeeeeeeee".to_string());
+
+    let store = Arc::new(MessageStore::open(":memory:".to_string()).expect("store"));
+    store
+        .upsert_contact(Contact {
+            user_id: friend.clone(),
+            name: "Friend".to_string(),
+            sign_pk: vec![1u8; 32],
+            agree_pk: vec![2u8; 32],
+            relay_url: Some(own_url.to_string()),
+            relay_token: Some(friend_deposit.clone()),
+            nickname: None,
+        })
+        .expect("contact");
+    store
+        .upsert_outgoing_receipt_envelope(
+            cruisemesh_core::OutgoingReceiptEnvelope {
+                msg_id: vec![0x42u8; 16],
+                recipient_user_id: friend.clone(),
+                chat_id: vec![3u8; 32],
+                sender_user_id: vec![7u8; 32],
+                receipt_type: RECEIPT_TYPE_DELIVERED,
+                through_lamport: 5,
+                timestamp: now_ms,
+                hop_ttl: 3,
+                expiry: now_ms + MS_PER_DAY,
+                recipient_hint: compute_recipient_hint(friend.clone(), now_ms),
+                sealed: vec![0x22u8; 64],
+            },
+            now_ms,
+        )
+        .expect("receipt");
+
+    let plan = CoreRelayPassPlan {
+        own: Some(CoreRelayEndpointConfig {
+            url: own_url.to_string(),
+            token: own_token.to_string(),
+        }),
+        contacts: vec![cruisemesh_core::CoreRelayContactConfig {
+            user_id: friend.clone(),
+            relay_url: Some(own_url.to_string()),
+            relay_token: Some(friend_deposit.clone()),
+            endpoint_usable: true,
+            endpoint_answering: true,
+        }],
+        own_user_id: (0u8..32).collect(),
+        fetch_hints: vec![compute_recipient_hint((0u8..32).collect(), now_ms)],
+        presence_announce: Vec::new(),
+        presence_query: Vec::new(),
+        own_endpoint_changed: false,
+        swept_this_session: true,
+        consecutive_rate_limits: 0,
+        quiet_until_ms: 0,
+        budgets: core_relay_pass_default_budgets(),
+    };
+    let pass = CoreRelayPass::new(store.clone(), plan, "h1".to_string());
+    let mut action = pass.start(now_ms);
+    let mut clock = now_ms;
+    let mut refused = 0u32;
+    let summary = loop {
+        match action.kind {
+            CoreRelayActionKind::Finished { summary } => break summary,
+            CoreRelayActionKind::Sleep { .. } => break pass.summary().expect("summary"),
+            CoreRelayActionKind::NotStarted => panic!("a started pass cannot answer NotStarted"),
+            CoreRelayActionKind::Http { ref request } => {
+                let friends = request
+                    .headers
+                    .iter()
+                    .any(|h| h.name == "Authorization" && h.value.ends_with(&friend_deposit));
+                let (status, body) = if friends {
+                    refused += 1;
+                    (403, b"{\"code\":\"family_expired\"}".to_vec())
+                } else if request.operation == CoreRelayOperation::FetchPage {
+                    (200, EMPTY_RELAY_PAGE.to_vec())
+                } else {
+                    (200, b"{}".to_vec())
+                };
+                clock += 25;
+                action = pass.resume_http(CoreRelayHttpResult {
+                    pass_id: action.pass_id.clone(),
+                    action_id: action.action_id,
+                    status,
+                    headers: Vec::new(),
+                    body,
+                    error: None,
+                    completed_at_ms: clock,
+                });
+            }
+        }
+    };
+
+    contract_assert!(
+        id,
+        refused > 0,
+        "the friend's card must have been refused at least once"
+    );
+    contract_assert!(
+        id,
+        summary.health == cruisemesh_core::CoreRelayPassHealth::Ok,
+        "a friend's lapsed family must not read as our own pass health, got {:?}",
+        summary.health
+    );
+    let streak = store
+        .list_contact_relay_rejections()
+        .expect("rejections")
+        .into_iter()
+        .find(|row| row.user_id == friend)
+        .map(|row| row.reject_streak)
+        .unwrap_or(0);
+    contract_assert!(
+        id,
+        streak == 1,
+        "the refusal must advance the friend's streak by exactly one, got {streak}"
+    );
 }
 
 #[test]
@@ -2763,6 +2894,11 @@ fn every_invariant_is_exercised_by_at_least_one_fixture_or_is_explicitly_not_yet
         "DEDUP-01",
         "EVICT-01",
         "PRESENCE-01",
+        // HEALTH-01 is an attribution rule inside one pass, pinned by driven
+        // passes in `relay_pass_replay.rs` and re-asserted here. Its field
+        // incident was a shell screenshot and a relay log, not a pass
+        // transcript this corpus could have recorded.
+        "HEALTH-01",
     ];
 
     let mut covered: BTreeMap<String, Vec<&str>> = BTreeMap::new();

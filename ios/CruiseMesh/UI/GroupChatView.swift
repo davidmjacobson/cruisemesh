@@ -332,29 +332,43 @@ struct GroupChatView: View {
     }
 
     private func sendCurrentDraft() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let replyToMsgId = replyingTo.flatMap { replyMetadata[replyMessageKey($0)]?.msgId }
-        if let photo = pendingPhoto {
-            sender.sendAttachment(
-                group: activeGroup,
-                attachment: AttachmentPayload(
-                    mediaType: .image,
-                    mimeType: "image/jpeg",
-                    durationMs: 0,
-                    blob: photo,
-                    caption: text
-                ),
-                replyToMsgId: replyToMsgId
-            )
-            pendingPhoto = nil
-        } else {
-            guard !text.isEmpty else { return }
-            sender.sendText(group: activeGroup, text: text, replyToMsgId: replyToMsgId)
+        let groupSender = sender
+        let group = activeGroup
+        let outcome = ComposerSendPolicy.attempt(
+            draft: draft,
+            pendingPhoto: pendingPhoto,
+            sendPhoto: { photo, caption in
+                groupSender.sendAttachment(
+                    group: group,
+                    attachment: AttachmentPayload(
+                        mediaType: .image,
+                        mimeType: "image/jpeg",
+                        durationMs: 0,
+                        blob: photo,
+                        caption: caption
+                    ),
+                    replyToMsgId: replyToMsgId
+                )
+            },
+            sendText: { text in
+                groupSender.sendText(group: group, text: text, replyToMsgId: replyToMsgId)
+            }
+        )
+        // Assigned back unconditionally: the composer empties only when
+        // `ComposerSendPolicy` says the message is durably queued.
+        draft = outcome.draft
+        pendingPhoto = outcome.pendingPhoto
+        switch outcome.status {
+        case .queued:
+            replyingTo = nil
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            reload()
+        case .notQueued:
+            statusMessage = String(localized: "Couldn't send. Your message is still here.")
+        case .nothingToSend:
+            break
         }
-        draft = ""
-        replyingTo = nil
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        reload()
     }
 
     private func sendVoice(url: URL, durationMs: Int32) {

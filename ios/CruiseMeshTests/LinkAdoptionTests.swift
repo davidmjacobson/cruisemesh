@@ -13,6 +13,7 @@ final class LinkAdoptionTests: XCTestCase {
     private let displayNameKey = "cruisemesh.displayName"
     private let avatarEpochKey = "cruisemesh.ownAvatarEpoch"
     private let onboardingKey = "cruisemesh.onboarding.completed"
+    private let permissionsStepKey = "cruisemesh.onboarding.permissionsStepDone"
     private let photo = Data((0..<64).map { UInt8($0) })
     private let epoch: Int64 = 1_755_000_000_000
 
@@ -30,6 +31,7 @@ final class LinkAdoptionTests: XCTestCase {
         AppDefaults.current.removeObject(forKey: displayNameKey)
         AppDefaults.current.removeObject(forKey: avatarEpochKey)
         AppDefaults.current.removeObject(forKey: onboardingKey)
+        AppDefaults.current.removeObject(forKey: permissionsStepKey)
         ProfilePhotoStore.clear()
     }
 
@@ -66,6 +68,11 @@ final class LinkAdoptionTests: XCTestCase {
         // first-run setup has nothing left to ask.
         XCTAssertTrue(OnboardingStore.isCompleted())
         XCTAssertFalse(ProfileStore.loadStoredDisplayName().isEmpty)
+        // ...except the one thing this route went around. The wizard carries
+        // the permissions step; an adopted phone never saw it, and used to land
+        // on the chat list with the mesh off and nothing on screen saying why.
+        // `FirstRunRouter` collects this on the way in.
+        XCTAssertEqual(OnboardingStore.permissionsStepDone(), false)
     }
 
     func testAnExportWithNoNameLeavesTheQuestionOpenRatherThanBlankingIt() {

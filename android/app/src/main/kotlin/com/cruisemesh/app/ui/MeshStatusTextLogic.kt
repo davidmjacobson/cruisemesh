@@ -117,7 +117,12 @@ object MeshStatusTextLogic {
             // above): a saved card the running mesh has not checked yet.
             RelayHealth.NoConfig -> "no internet delivery set up"
             is RelayHealth.Failing -> "$serviceName unreachable"
-            is RelayHealth.Expired ->
+            // The grace window is not given its own suffix: the pill has room
+            // for three words, and the asymmetry it would have to explain is
+            // spelled out on the pass screens instead.
+            is RelayHealth.Expired,
+            is RelayHealth.ExpiredReadOnly,
+            ->
                 if (internetDeliveryService == InternetDeliveryService.SHORE_PASS) {
                     "Shore Pass expired"
                 } else {
