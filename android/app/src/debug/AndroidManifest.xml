@@ -42,6 +42,7 @@
                 <action android:name="com.cruisemesh.app.debug.SEND_TEXT" />
                 <action android:name="com.cruisemesh.app.debug.REQUEST_RELAY_SYNC" />
                 <action android:name="com.cruisemesh.app.debug.START_MESH" />
+                <action android:name="com.cruisemesh.app.debug.SEED_PLAY_LISTING" />
             </intent-filter>
         </receiver>
     </application>
