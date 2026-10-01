@@ -658,12 +658,11 @@ designed around (iOS background BLE) before any real investment.
    where available and BLE covered the gaps. What remains is per-ship
    variance in LAN client isolation, which the app probes and routes around
    automatically.
-3. **Store review** — distribution is no longer hypothetical: both store
-   listings are complete, Play closed testing is underway, and TestFlight
-   distributes to the beta group. The remaining risk is review friction
-   (Apple poking at BLE background modes; Play's first-review pass), managed
-   with reviewer notes explaining the no-account model and the two-device
-   nature of mesh testing.
+3. **Store review** — retired: both apps passed review and are published on
+   the App Store and Google Play. The reviewer notes that carried them
+   (explaining the no-account model and the two-device nature of mesh
+   testing) are the thing to keep for every future submission, since each
+   update is reviewed again against the same background-mode questions.
 4. **Battery** — duty-cycle scanning (e.g. 10 s scan / 50 s idle when on battery,
    aggressive when charging). Budget: <5%/day radio overhead.
 5. **Crypto review** — standing gate from SECURITY-DESIGN: a paid independent
