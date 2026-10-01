@@ -3385,6 +3385,27 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             receiptType: ReceiptType.delivered,
             throughLamport: through
         )
+        // The live receipt below is best-effort: it reaches the sender only if
+        // a link happens to be up right now. The durable half is this sealed
+        // receipt envelope, which the next relay sync uploads -- it is what
+        // eventually moves the sender's DELIVERED watermark and lets them
+        // retire their carried copy of the request. Every other consuming
+        // handler in this file queues it (`handleIncomingChatMessage`,
+        // `handleIncomingProfileSync`, and every hidden kind via
+        // `acknowledgeHiddenMessage`), and so does Android's twin, whose
+        // friend-request path runs the shared `acknowledgePeerStream`. This
+        // one did not, so a friend request that was accepted while the
+        // requester was offline was re-sprayed for the whole life of the
+        // envelope.
+        if queueOutgoingReceiptForRelay(
+            identity: identity,
+            contact: contact,
+            receiptType: ReceiptType.delivered,
+            ackedSenderUserId: senderUserId,
+            throughLamport: through
+        ) {
+            RelaySyncEvents.requestSync()
+        }
         if let sourceAddress {
             sendReceiptOnAddress(
                 identity: identity,
@@ -5381,8 +5402,9 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             /// mailbox. Falling back for them would post a cross-family
             /// member's copy where they never read, and `relayPostedAt` is
             /// terminal, so that is a permanent misroute rather than a retry.
-            /// A member written off for *rejection* still falls back,
-            /// unchanged. Mirrors RelaySyncEngine.kt.
+            /// A member written off for *rejection* still falls back, unless
+            /// their card carries another family's deposit token, which
+            /// blocks the fallback the same way. Mirrors RelaySyncEngine.kt.
             func relayConfigForGroupRecipient(_ groupId: Data) -> RelayConfig? {
                 guard let group = groupsById[groupId] else { return config }
                 let members = group.memberUserIds.compactMap { member -> GroupRelayMember? in
@@ -6051,8 +6073,19 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         relaySyncLog.info(
             "Core relay pass complete: outcome=\(String(describing: outcome), privacy: .public) requests=\(summary.requestsIssued, privacy: .public) ingested=\(summary.rowsIngested, privacy: .public)"
         )
+        // Re-read after the pass: core has just written this pass's rejection
+        // and silence streaks. A friend whose card core wrote off (their family
+        // pass lapsed, say) is *their* problem, never this device's pass health
+        // (`HEALTH-01`), so it is surfaced here, per contact, exactly as the
+        // legacy pass surfaces it. Without this the chat banner that says their
+        // card is stale never lit on the core engine.
+        let staleAfterPass = Self.staleRelayContactIds(
+            rejections: (try? store.listContactRelayRejections()) ?? [],
+            unreachable: (try? store.listContactRelayUnreachable()) ?? []
+        )
         await MainActor.run {
             MeshConnectivityStatus.shared.setRelayHealth(health)
+            MeshConnectivityStatus.shared.setStaleRelayContacts(staleAfterPass)
         }
         // `relayRateLimitedUntilMs` and the backoff counter are the controller's
         // own state, read by `runRelaySync` on `meshQueue`, so they are written
@@ -6083,6 +6116,25 @@ final class MeshController: ObservableObject, @unchecked Sendable {
                 self.scheduleMailboxContinuation()
             }
         }
+    }
+
+    /// The contacts whose card endpoint should be reported stale, from the
+    /// persisted streaks alone. Not from either current usability probe: a
+    /// relay stays reported stale while a periodic recheck is due, so the
+    /// explanation does not blink out merely because one request is
+    /// temporarily permitted. The thresholds are core's.
+    static func staleRelayContactIds(
+        rejections: [ContactRelayRejection],
+        unreachable: [ContactRelayUnreachable]
+    ) -> Set<Data> {
+        Set(
+            rejections
+                .filter { coreContactRelayIsStale(rejectStreak: $0.rejectStreak) }
+                .map(\.userId)
+            + unreachable
+                .filter { coreContactRelayUnreachableIsStale(unreachableStreak: $0.unreachableStreak) }
+                .map(\.userId)
+        )
     }
 
     /// Projects the core pass's own health onto this shell's display type,

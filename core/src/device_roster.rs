@@ -1629,6 +1629,72 @@ pub fn core_own_identity_peer(
     CoreOwnIdentityPeer::Clone
 }
 
+/// What the far end of a finished LAN Noise handshake is, on a link that
+/// matched no accepted contact.
+///
+/// The first answer is the one [`CoreOwnIdentityPeer`] deliberately does not
+/// have: most links that reach this question belong to nobody this device has
+/// an opinion about, and answering those at all is how a neighbour's phone ends
+/// up warned about as this person's own backup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreOwnIdentityLanPeer {
+    /// A peer whose Noise static key was never this identity's agreement key:
+    /// every stranger sweeping the subnet, and — because §9's ceremony gives a
+    /// linked device keys of its own — every sibling that ceremony links. None
+    /// of the clone guard's business.
+    NotOurIdentity,
+    /// A device this person's own roster names, which proved it on this
+    /// session. Admit it, and say nothing to the person about it.
+    Sibling,
+    /// This person's identity on a device their roster cannot name. Warn.
+    Clone,
+}
+
+/// The whole own-identity rule for one finished LAN session, in the order its
+/// two tests have to run in (`specs/multi-device-v1.md` §1, §6, §10 step 5).
+///
+/// [`core_own_identity_peer`] answers the roster half. This adds the key half
+/// and, more to the point, fixes the *order*: the key test comes first, so a
+/// device whose own-device projection cannot be read fails loud only about a
+/// peer that really did present this identity's agreement key. Reversed, an
+/// unreadable store would convict the stranger on the next Wi-Fi.
+///
+/// `fleet` is deferred for exactly that reason — a peer that does not hold this
+/// identity's key is answered without the projection being asked for at all —
+/// and `None` from it (a store this device could not read) means
+/// [`CoreOwnIdentityLanPeer::Clone`], never "probably fine".
+///
+/// `peer_device_id` is §10 step 5's opened proof
+/// ([`core_own_device_lan_proof_open`]) and nothing weaker: never a device id
+/// read out of a frame, never a user id out of a HELLO. `None` — no proof
+/// opened — is [`CoreOwnIdentityLanPeer::Clone`], for the reason
+/// [`core_own_identity_peer`] spells out at length.
+///
+/// Both phone shells carry this same ordering in an `OwnIdentityClonePolicy` of
+/// their own, written against a lazily supplied projection that the FFI has no
+/// shape for. Collapsing those onto this function is a shell change and is not
+/// made here. The desktop node, which links against core as an ordinary Rust
+/// crate, calls it directly rather than growing a third copy of the rule.
+pub fn own_identity_lan_peer(
+    own_agree_pk: &[u8],
+    remote_static_key: &[u8],
+    fleet: impl FnOnce() -> Option<OwnDeviceFleet>,
+    peer_device_id: Option<Vec<u8>>,
+) -> CoreOwnIdentityLanPeer {
+    // Empty is not a key. Two absent keys comparing equal would hand a peer
+    // this identity's own arm for free on any caller that had not loaded one.
+    if own_agree_pk.is_empty() || own_agree_pk != remote_static_key {
+        return CoreOwnIdentityLanPeer::NotOurIdentity;
+    }
+    let Some(fleet) = fleet() else {
+        return CoreOwnIdentityLanPeer::Clone;
+    };
+    match core_own_identity_peer(fleet, peer_device_id) {
+        CoreOwnIdentityPeer::Sibling => CoreOwnIdentityLanPeer::Sibling,
+        CoreOwnIdentityPeer::Clone => CoreOwnIdentityLanPeer::Clone,
+    }
+}
+
 /// The person root signing key `roster` is rooted in, recovered from the
 /// document itself.
 ///
@@ -3378,6 +3444,80 @@ mod tests {
         assert_eq!(
             core_own_identity_peer(OwnDeviceFleet::default(), Some(stranger)),
             CoreOwnIdentityPeer::Clone
+        );
+    }
+
+    /// The LAN rule's own half: which peers it has an opinion about at all, and
+    /// that the key test answers before the projection is so much as read.
+    #[test]
+    fn the_lan_own_identity_rule_judges_only_peers_holding_this_identitys_key() {
+        let own = vec![0x01; DEVICE_ID_LEN];
+        let sibling = vec![0x02; DEVICE_ID_LEN];
+        let stranger_device = vec![0x03; DEVICE_ID_LEN];
+        let agree_pk = vec![0x77; KEY_LEN];
+        let someone_elses_key = vec![0x88; KEY_LEN];
+        let fleet = OwnDeviceFleet {
+            own_device_id: Some(own),
+            device_ids: vec![vec![0x01; DEVICE_ID_LEN], sibling.clone()],
+            projected_from: RosterVersion::default(),
+        };
+
+        assert_eq!(
+            own_identity_lan_peer(
+                &agree_pk,
+                &agree_pk.clone(),
+                || Some(fleet.clone()),
+                Some(sibling),
+            ),
+            CoreOwnIdentityLanPeer::Sibling,
+            "a proven device of this person's own is a sibling, not a clone"
+        );
+        assert_eq!(
+            own_identity_lan_peer(
+                &agree_pk,
+                &agree_pk.clone(),
+                || Some(fleet.clone()),
+                Some(stranger_device),
+            ),
+            CoreOwnIdentityLanPeer::Clone
+        );
+        assert_eq!(
+            own_identity_lan_peer(&agree_pk, &agree_pk.clone(), || Some(fleet.clone()), None),
+            CoreOwnIdentityLanPeer::Clone,
+            "no proof means clone: an unidentified peer holding this identity is the case"
+        );
+
+        // The key test comes first, so the projection is never asked for about
+        // a peer that never held this identity's key -- which is what stops an
+        // unreadable store convicting the neighbour's phone.
+        let mut projection_reads = 0;
+        assert_eq!(
+            own_identity_lan_peer(
+                &agree_pk,
+                &someone_elses_key,
+                || {
+                    projection_reads += 1;
+                    None
+                },
+                None,
+            ),
+            CoreOwnIdentityLanPeer::NotOurIdentity
+        );
+        assert_eq!(
+            projection_reads, 0,
+            "the key test must answer before this device's own devices are read"
+        );
+
+        // A store this device could not read fails loud about a peer that did
+        // hold the key.
+        assert_eq!(
+            own_identity_lan_peer(&agree_pk, &agree_pk.clone(), || None, None),
+            CoreOwnIdentityLanPeer::Clone
+        );
+        // Two absent keys are not a match.
+        assert_eq!(
+            own_identity_lan_peer(&[], &[], || Some(fleet), None),
+            CoreOwnIdentityLanPeer::NotOurIdentity
         );
     }
 

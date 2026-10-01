@@ -419,37 +419,36 @@ fun ChatScreen(
         onClearPendingPhoto = { pendingPhoto = null },
         onDrawPendingPhoto = { drawingPhoto = pendingPhoto },
         onSend = {
-            val text = draft.trim()
-            val photo = pendingPhoto
             val replyToMsgId = replyingTo?.let(::replyTargetId)
-            if (photo != null) {
-                val result = sender.sendAttachment(
-                    currentContact,
-                    AttachmentPayload(
-                        mediaType = AttachmentPayload.MediaType.IMAGE,
-                        mimeType = "image/jpeg",
-                        durationMs = 0,
-                        blob = photo,
-                        caption = text,
-                    ),
-                    replyToMsgId,
-                )
-                if (result == SendResult.STORED) {
-                    pendingPhoto = null
-                    draft = ""
+            val outcome = ComposerSendPolicy.attempt(
+                draft = draft,
+                pendingPhoto = pendingPhoto,
+                sendPhoto = { photo, caption ->
+                    sender.sendAttachment(
+                        currentContact,
+                        AttachmentPayload(
+                            mediaType = AttachmentPayload.MediaType.IMAGE,
+                            mimeType = "image/jpeg",
+                            durationMs = 0,
+                            blob = photo,
+                            caption = caption,
+                        ),
+                        replyToMsgId,
+                    )
+                },
+                sendText = { text -> sender.sendText(currentContact, text, replyToMsgId) },
+            )
+            // Assigned back unconditionally: the composer empties only when
+            // [ComposerSendPolicy] says the message is durably queued.
+            draft = outcome.draft
+            pendingPhoto = outcome.pendingPhoto
+            when (outcome.status) {
+                ComposerSendStatus.QUEUED -> {
                     replyingTo = null
                     reload()
-                } else {
-                    showSendFailure()
                 }
-            } else if (text.isNotEmpty()) {
-                if (sender.sendText(currentContact, text, replyToMsgId) == SendResult.STORED) {
-                    draft = ""
-                    replyingTo = null
-                    reload()
-                } else {
-                    showSendFailure()
-                }
+                ComposerSendStatus.NOT_QUEUED -> showSendFailure()
+                ComposerSendStatus.NOTHING_TO_SEND -> Unit
             }
         },
         onReact = { target, emoji ->

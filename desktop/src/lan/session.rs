@@ -11,10 +11,11 @@ use anyhow::{bail, Context, Result};
 use cruisemesh_core::{
     core_lan_network_id_for_ipv4, core_own_capabilities, digest_through_lamport_for_sender,
     encode_digest, encode_envelope_frame, encode_hello, encode_hello2, encode_lan_endpoint,
-    encode_transport_probe, parse_frame, recent_hints_for, Contact, CoreInboundSource,
-    CoreMeshRouterState, CoreTransport, Frame, Identity, LanEndpointContent, LanNoiseSession,
-    MessageStore, CARRIED_SPRAY_BUDGET_BYTES, OWN_OUTBOUND_SPRAY_BUDGET_BYTES,
-    OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED, RECEIPT_TYPE_READ,
+    encode_transport_probe, own_identity_lan_peer, parse_frame, recent_hints_for, Contact,
+    CoreInboundSource, CoreMeshRouterState, CoreOwnIdentityLanPeer, CoreTransport, Frame, Identity,
+    LanEndpointContent, LanNoiseSession, MessageStore, CARRIED_SPRAY_BUDGET_BYTES,
+    OWN_OUTBOUND_SPRAY_BUDGET_BYTES, OWN_RECEIPT_SPRAY_BUDGET_BYTES, RECEIPT_TYPE_DELIVERED,
+    RECEIPT_TYPE_READ,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -142,12 +143,16 @@ pub(crate) async fn run_session_with_authenticated_signal(
 ) -> Result<Vec<u8>> {
     let address = stream.peer_addr()?.to_string();
     let local_address = stream.local_addr()?;
-    let (stream, noise, contact) = timeout(
+    let (stream, noise, peer) = timeout(
         HANDSHAKE_TIMEOUT,
         authenticate(stream, initiator, expected_peer, &services),
     )
     .await
     .context("LAN Noise handshake timed out")??;
+    let contact = match peer {
+        LanPeer::Contact(contact) => contact,
+        LanPeer::OwnDevice => return run_own_device_session(stream, noise, authenticated).await,
+    };
     let peer_user_id = contact.user_id.clone();
     let (mut reader, mut writer) = stream.into_split();
     let (send, mut receive) = mpsc::channel::<Vec<u8>>(256);
@@ -224,12 +229,54 @@ pub(crate) async fn run_session_with_authenticated_signal(
     result.map(|_| peer_user_id)
 }
 
+/// Keep a link to one of this person's own devices open, without treating it
+/// as a peer (`specs/multi-device-v1.md` §10 step 5).
+///
+/// A sibling shares this person's user id, so a route to it is a route back to
+/// this node: it is deliberately not registered with [`PeerHub`], is sent no
+/// HELLO, no digest and no endpoint, and has none of its frames processed.
+/// That is also what keeps both standing invariants trivially safe on this arm
+/// — nothing here can ack a relay copy, and no endpoint of anyone's is recorded
+/// or forwarded. Transport probes are answered so the far end can see the link
+/// is alive; every other frame is dropped, because the one frame a sibling link
+/// exists to carry is the own-roster notice, and this node has no own roster to
+/// converge yet (see the `Frame::OwnRoster` arm below).
+///
+/// The empty user id it reports is what a sibling has: no user id at all.
+/// Discovery reads it as "this address answered", which is what it proves — the
+/// phones credit a sweep for a sibling the same way and for the same reason.
+async fn run_own_device_session(
+    stream: TcpStream,
+    noise: Arc<LanNoiseSession>,
+    authenticated: Option<oneshot::Sender<Vec<u8>>>,
+) -> Result<Vec<u8>> {
+    if let Some(authenticated) = authenticated {
+        let _ = authenticated.send(Vec::new());
+    }
+    let (mut reader, mut writer) = stream.into_split();
+    loop {
+        let record = read_packet(&mut reader).await?;
+        let Some(bytes) = noise.decrypt_record(record)? else {
+            continue;
+        };
+        if let Frame::TransportProbe {
+            nonce,
+            response: false,
+        } = parse_frame(bytes)?
+        {
+            for record in noise.encrypt_frame(encode_transport_probe(nonce, true))? {
+                write_packet(&mut writer, &record).await?;
+            }
+        }
+    }
+}
+
 async fn authenticate(
     mut stream: TcpStream,
     initiator: bool,
     expected_peer: Option<Vec<u8>>,
     services: &SessionServices,
-) -> Result<(TcpStream, Arc<LanNoiseSession>, Contact)> {
+) -> Result<(TcpStream, Arc<LanNoiseSession>, LanPeer)> {
     let noise = Arc::new(LanNoiseSession::new(
         initiator,
         services.identity.agree_sk.clone(),
@@ -238,40 +285,95 @@ async fn authenticate(
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
         noise.read_handshake_message(read_packet(&mut stream).await?)?;
-        let contact = trusted_contact(
+        let peer = admit_peer(
             &services.store,
             &services.identity,
             noise.remote_static_key(),
             expected_peer,
+            proven_own_device_id(),
         )?;
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
-        Ok((stream, noise, contact))
+        Ok((stream, noise, peer))
     } else {
         noise.read_handshake_message(read_packet(&mut stream).await?)?;
         let message = noise.write_handshake_message()?;
         write_packet(&mut stream, &message).await?;
         noise.read_handshake_message(read_packet(&mut stream).await?)?;
-        let contact = trusted_contact(
+        let peer = admit_peer(
             &services.store,
             &services.identity,
             noise.remote_static_key(),
             expected_peer,
+            proven_own_device_id(),
         )?;
-        Ok((stream, noise, contact))
+        Ok((stream, noise, peer))
     }
 }
 
-fn trusted_contact(
+/// What a finished handshake's far end turned out to be, and the only two
+/// things this node will carry a session for.
+enum LanPeer {
+    /// An accepted contact: a peer, with a user id, a route and a digest.
+    Contact(Contact),
+    /// One of this person's own devices (`specs/multi-device-v1.md` §10 step
+    /// 5). Admitted, but deliberately not a peer — see
+    /// [`run_own_device_session`].
+    OwnDevice,
+}
+
+/// The device id §10 step 5's own-device proof named on this session, or `None`
+/// when no proof was opened.
+///
+/// `None` always, today, and not as a shortcut: minting a proof takes a device
+/// signing key and opening one takes an own roster, and this node has neither
+/// until it links as a device of this person's. That is the same work-package
+/// the `Frame::OwnRoster` arm is waiting on, and it is where an opened proof
+/// will arrive from — [`admit_peer`] needs no change when it does.
+///
+/// The phones are in the same position by a different route: their clone arm is
+/// symmetric and exchanges no proof frame, so they too hand the rule `None`.
+/// Until one end can prove itself, every peer presenting this identity's key is
+/// a clone, which is exactly what the rule should say about a peer that cannot
+/// name itself.
+fn proven_own_device_id() -> Option<Vec<u8>> {
+    None
+}
+
+/// Decide what a finished Noise handshake is talking to: an accepted contact, a
+/// device of this person's own, or nothing this node will carry.
+///
+/// The own-identity arm used to be a bare `bail!` with an unconditional clone
+/// warning — the same test the phones ran before they had a person/device
+/// split, and the wrong one once a person can have several devices: §6 makes
+/// the inbox key person-scoped, so a deliberately linked sibling can hold the
+/// very key that test reads as a clone. The verdict now comes from core's
+/// [`own_identity_lan_peer`], which both phone shells' own rule mirrors, so a
+/// sibling is admitted in silence and a clone is refused and recorded exactly
+/// as before.
+fn admit_peer(
     store: &MessageStore,
     identity: &Identity,
     remote_static: Option<Vec<u8>>,
     expected_peer: Option<Vec<u8>>,
-) -> Result<Contact> {
+    proven_peer_device_id: Option<Vec<u8>>,
+) -> Result<LanPeer> {
     let remote_static = remote_static.context("Noise did not reveal the remote static key")?;
-    if remote_static == identity.agree_pk {
-        let _ = store.record_identity_clone_warning(identity.user_id.clone(), now_ms());
-        bail!("Noise static key is this device's own identity");
+    match own_identity_lan_peer(
+        &identity.agree_pk,
+        &remote_static,
+        // Read only once the key test has passed, and `None` when it cannot be
+        // read at all: an unreadable projection must fail loud about a peer
+        // holding this identity, never about a stranger on the same Wi-Fi.
+        || store.own_device_fleet().ok(),
+        proven_peer_device_id,
+    ) {
+        CoreOwnIdentityLanPeer::NotOurIdentity => {}
+        CoreOwnIdentityLanPeer::Sibling => return Ok(LanPeer::OwnDevice),
+        CoreOwnIdentityLanPeer::Clone => {
+            let _ = store.record_identity_clone_warning(identity.user_id.clone(), now_ms());
+            bail!("Noise static key is this device's own identity");
+        }
     }
     let contact = store
         .list_contacts()?
@@ -281,7 +383,7 @@ fn trusted_contact(
     if expected_peer.is_some_and(|expected| expected != contact.user_id) {
         bail!("discovered endpoint authenticated as a different contact");
     }
-    Ok(contact)
+    Ok(LanPeer::Contact(contact))
 }
 
 async fn read_frames<R: AsyncRead + Unpin>(
@@ -544,7 +646,7 @@ fn local_network_id(host: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cruisemesh_core::generate_identity;
+    use cruisemesh_core::{generate_identity, OwnDeviceFleet, RosterVersion, DEVICE_ID_LEN};
 
     #[tokio::test]
     async fn packet_framing_is_big_endian_and_bounded() {
@@ -571,13 +673,103 @@ mod tests {
             .unwrap();
         let us = generate_identity();
         assert_eq!(
-            trusted_contact(&store, &us, Some(peer.agree_pk), None)
-                .unwrap()
-                .user_id,
+            contact_of(admit_peer(&store, &us, Some(peer.agree_pk), None, None).unwrap()).user_id,
             peer.user_id
         );
-        assert!(trusted_contact(&store, &us, Some(vec![9; 32]), None).is_err());
-        assert!(trusted_contact(&store, &us, Some(us.agree_pk.clone()), None).is_err());
+        assert!(admit_peer(&store, &us, Some(vec![9; 32]), None, None).is_err());
+        assert!(admit_peer(&store, &us, Some(us.agree_pk.clone()), None, None).is_err());
+        assert!(store
+            .has_identity_clone_warning(us.user_id.clone())
+            .unwrap());
+    }
+
+    fn contact_of(peer: LanPeer) -> Contact {
+        match peer {
+            LanPeer::Contact(contact) => contact,
+            LanPeer::OwnDevice => panic!("expected an accepted contact"),
+        }
+    }
+
+    fn linked_fleet(own: &[u8], sibling: &[u8]) -> OwnDeviceFleet {
+        OwnDeviceFleet {
+            own_device_id: Some(own.to_vec()),
+            device_ids: vec![own.to_vec(), sibling.to_vec()],
+            projected_from: RosterVersion {
+                recovery_epoch: 0,
+                seq: 1,
+            },
+        }
+    }
+
+    /// A device this person's own roster names, which proved itself on this
+    /// session, is admitted as a sibling: no clone warning, and no refusal.
+    ///
+    /// The proof stands in for what §10 step 5 will hand [`admit_peer`] once
+    /// this node links as a device — [`proven_own_device_id`] returns `None`
+    /// until then, so nothing on today's wire reaches this arm. What is pinned
+    /// here is the decision, which is core's, and the admission it drives.
+    #[test]
+    fn a_proven_sibling_is_admitted_and_never_warned_about() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let us = generate_identity();
+        let own = vec![0x01; DEVICE_ID_LEN];
+        let sibling = vec![0x02; DEVICE_ID_LEN];
+        store
+            .set_own_device_fleet(linked_fleet(&own, &sibling))
+            .unwrap();
+
+        let peer = admit_peer(
+            &store,
+            &us,
+            // A sibling holds the person-scoped inbox key -- generation 0 of
+            // which is this identity's own agreement key -- so it presents the
+            // very key the old bare test read as a clone.
+            Some(us.agree_pk.clone()),
+            None,
+            Some(sibling),
+        )
+        .unwrap();
+        assert!(matches!(peer, LanPeer::OwnDevice));
+        assert!(
+            !store
+                .has_identity_clone_warning(us.user_id.clone())
+                .unwrap(),
+            "a device this person linked on purpose must not be reported as a clone"
+        );
+    }
+
+    /// The case the guard exists for, unchanged: this identity on a device the
+    /// roster cannot name is refused, and the warning is recorded.
+    #[test]
+    fn a_clone_is_still_refused_and_recorded_on_a_linked_node() {
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        let us = generate_identity();
+        let own = vec![0x01; DEVICE_ID_LEN];
+        let sibling = vec![0x02; DEVICE_ID_LEN];
+        store
+            .set_own_device_fleet(linked_fleet(&own, &sibling))
+            .unwrap();
+
+        // A peer this identity's roster never heard of.
+        assert!(admit_peer(
+            &store,
+            &us,
+            Some(us.agree_pk.clone()),
+            None,
+            Some(vec![0x03; DEVICE_ID_LEN]),
+        )
+        .is_err());
+        assert!(store
+            .has_identity_clone_warning(us.user_id.clone())
+            .unwrap());
+
+        // And a peer that proved nothing at all -- which is every peer on
+        // today's wire, a restored `.cmbak` running beside its source included.
+        let store = MessageStore::open(":memory:".into()).unwrap();
+        store
+            .set_own_device_fleet(linked_fleet(&own, &sibling))
+            .unwrap();
+        assert!(admit_peer(&store, &us, Some(us.agree_pk.clone()), None, None).is_err());
         assert!(store
             .has_identity_clone_warning(us.user_id.clone())
             .unwrap());

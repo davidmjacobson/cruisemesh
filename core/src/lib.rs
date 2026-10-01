@@ -132,12 +132,12 @@ pub use device_roster::{
     core_own_device_lan_proof, core_own_device_lan_proof_open, core_own_identity_peer,
     core_roster_accept, core_roster_device_ids, core_roster_head_hash, core_roster_names_a_sibling,
     core_roster_person_root_sign_pk, core_roster_validate, core_sign_device_cert, core_sign_roster,
-    core_verify_device_cert, generate_device_keypair, CoreLanOwnDeviceProof, CoreLanProofRole,
-    CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert, DeviceKeypair, DeviceSigningDomain,
-    DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection, RosterUpdateDecision,
-    RosterUpdateOutcome, RosterUpdateReason, RosterVersion, DEVICE_CERT_FLAG_ROSTER_SIGNING,
-    DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP, LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN,
-    ROSTER_MAX_VERSION_JUMP,
+    core_verify_device_cert, generate_device_keypair, own_identity_lan_peer, CoreLanOwnDeviceProof,
+    CoreLanProofRole, CoreOwnIdentityLanPeer, CoreOwnIdentityPeer, DeviceAddOutcome, DeviceCert,
+    DeviceKeypair, DeviceSigningDomain, DeviceTombstone, OwnDeviceFleet, Roster, RosterRejection,
+    RosterUpdateDecision, RosterUpdateOutcome, RosterUpdateReason, RosterVersion,
+    DEVICE_CERT_FLAG_ROSTER_SIGNING, DEVICE_HARD_CAP, DEVICE_ID_LEN, DEVICE_SOFT_CAP,
+    LEGACY_DEVICE_ID, ROSTER_HEAD_HASH_LEN, ROSTER_MAX_VERSION_JUMP,
 };
 pub use engine::{
     core_consumed_seen_is_ackable, core_consumed_seen_is_ackable_with_hidden,
