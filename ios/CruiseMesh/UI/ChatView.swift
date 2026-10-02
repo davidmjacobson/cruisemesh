@@ -594,12 +594,32 @@ struct ChatView: View {
         return ChatListLogic.contactDisplayName(contact)
     }
 
-    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
+    /// Scrolls to the newest message, then checks the bottom of the thread
+    /// really came into view and tries again if it did not.
+    ///
+    /// The thread is a LazyVStack, which only estimates the heights of rows it
+    /// has not drawn yet. One scroll straight after a long thread loads can
+    /// therefore land short of the bottom, leaving the newest message just out
+    /// of sight; the late-arrival UI test caught exactly that. The bottom
+    /// sentinel's onAppear is the ground truth for "we got there", so a short
+    /// bounded retry corrects the undershoot without guessing at timing. It
+    /// gives up if a newer message has arrived meanwhile, since that path makes
+    /// its own scroll decision.
+    private func scrollToLatest(
+        proxy: ScrollViewProxy,
+        animated: Bool = true,
+        attemptsLeft: Int = 2
+    ) {
         guard let last = rows.last else { return }
         if animated {
-            withAnimation { proxy.scrollTo(last.rowId, anchor: .bottom) }
+            withAnimation { proxy.scrollTo(conversationBottomId, anchor: .bottom) }
         } else {
-            proxy.scrollTo(last.rowId, anchor: .bottom)
+            proxy.scrollTo(conversationBottomId, anchor: .bottom)
+        }
+        guard attemptsLeft > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.5 : 0.15)) {
+            guard !isNearConversationBottom, rows.last?.rowId == last.rowId else { return }
+            scrollToLatest(proxy: proxy, animated: false, attemptsLeft: attemptsLeft - 1)
         }
     }
 

@@ -354,7 +354,14 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
         openChat(named: "Bob")
         let newest = app.staticTexts["History message \(Self.seededHistoryCount)"]
-        XCTAssertTrue(newest.waitForExistence(timeout: Self.uiTimeout))
+        // A chat opens at its newest message. When this has failed it failed
+        // here, before the test's own scrolling began, so keep a picture of
+        // where the thread actually landed.
+        guard newest.waitForExistence(timeout: Self.uiTimeout) else {
+            attachScreenshot(named: "Chat-late-arrival-opened-without-newest")
+            XCTFail("Opening a long chat did not show its newest message")
+            return
+        }
 
         // Scrolling away from the newest message is this test's precondition,
         // not scene-setting: the jump action only exists while the reader is
