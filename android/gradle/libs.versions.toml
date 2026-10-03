@@ -17,7 +17,7 @@ exifinterface = "1.4.2"
 androidxTest = "1.7.0"
 androidxTestJunit = "1.3.0"
 androidxTestOrchestrator = "1.6.1"
-robolectric = "4.16.1"
+robolectric = "4.17"
 # alpha10+ renders ONLY previews annotated @PreviewTest; alpha09 rendered every
 # @Preview. Every preview in src/screenshotTest carries it, and if one ever
 # stops, validateDebugScreenshotTest quietly renders fewer previews while still
