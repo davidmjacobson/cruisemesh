@@ -14,7 +14,7 @@ clap = { version = "4", features = ["derive"] }
 cruisemesh-core = { path = "../core" }
 futures-util = "0.3"
 if-addrs = "0.14"
-mdns-sd = "0.15"
+mdns-sd = "0.21"
 rand = "0.8"
 qrcode = { version = "0.14", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
