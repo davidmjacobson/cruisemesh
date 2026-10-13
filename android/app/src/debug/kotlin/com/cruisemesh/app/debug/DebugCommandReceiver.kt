@@ -24,6 +24,7 @@ class DebugCommandReceiver : BroadcastReceiver() {
             ACTION_SEND_TEXT -> handleSendText(context, intent)
             ACTION_REQUEST_RELAY_SYNC -> handleRequestRelaySync()
             ACTION_START_MESH -> handleStartMesh(context)
+            ACTION_SEED_PLAY_LISTING -> handleSeedPlayListing(context)
             else -> Log.w(TAG, "Ignoring unknown debug action=${intent.action}")
         }
     }
@@ -67,10 +68,16 @@ class DebugCommandReceiver : BroadcastReceiver() {
         Log.i(TAG, "START_MESH requested")
     }
 
+    private fun handleSeedPlayListing(context: Context) {
+        val applied = PlayListingSeed.apply(context)
+        Log.i(TAG, if (applied) "SEED_PLAY_LISTING applied" else "SEED_PLAY_LISTING already present")
+    }
+
     companion object {
         const val ACTION_SEND_TEXT = "com.cruisemesh.app.debug.SEND_TEXT"
         const val ACTION_REQUEST_RELAY_SYNC = "com.cruisemesh.app.debug.REQUEST_RELAY_SYNC"
         const val ACTION_START_MESH = "com.cruisemesh.app.debug.START_MESH"
+        const val ACTION_SEED_PLAY_LISTING = "com.cruisemesh.app.debug.SEED_PLAY_LISTING"
         const val EXTRA_CONTACT_USER_ID_HEX = "contact_user_id_hex"
         const val EXTRA_TEXT = "text"
     }
