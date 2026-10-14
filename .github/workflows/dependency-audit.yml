@@ -9,8 +9,9 @@ name: Dependency audit
 # Cargo.toml excludes (desktop/ui/src-tauri), and the fuzz crate (fuzz/). Each
 # is checked against the same deny.toml. The messenger frontend's npm graph
 # (desktop/ui/package-lock.json) has no cargo-deny equivalent; `npm audit`
-# covers its advisories, here on the same schedule and again in the Windows
-# job of rust.yml before it is built.
+# covers its advisories in the npm-audit job below, on the same triggers and
+# schedule. It is deliberately not repeated in rust.yml's Windows job, where a
+# newly published advisory would block every PR's Windows tests and build.
 #
 # The daily schedule is the half a pull request cannot cover: an advisory
 # published against a crate nobody touched that week would otherwise sit

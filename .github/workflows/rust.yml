@@ -58,7 +58,6 @@ jobs:
         working-directory: desktop/ui
         run: |
           npm ci
-          npm audit --audit-level=high
           npm test
           npm run build
       - name: Lint Tauri messenger host
