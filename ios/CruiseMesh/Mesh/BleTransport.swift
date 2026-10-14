@@ -4,9 +4,6 @@ import os.log
 
 /// Dual-role BLE GATT transport (DESIGN.md §5.2) — central scan/connect + peripheral advertise.
 final class BleTransport: NSObject {
-    typealias FrameHandler = (String, Data) -> Void
-    typealias ConnectionHandler = (String) -> Void
-
     private let log = Logger(subsystem: "com.cruisemesh", category: "BleTransport")
     private let queue = DispatchQueue(label: "com.cruisemesh.ble", qos: .userInitiated)
     private var central: CBCentralManager!
@@ -28,11 +25,11 @@ final class BleTransport: NSObject {
     private var reconnectWorkItems: [String: DispatchWorkItem] = [:]
     private let backoff = ReconnectBackoffTracker()
 
-    var onFrame: FrameHandler?
-    var onCentralConnected: ConnectionHandler?
-    var onCentralDisconnected: ConnectionHandler?
-    var onPeripheralSubscribed: ConnectionHandler?
-    var onPeripheralUnsubscribed: ConnectionHandler?
+    /// Every report to `MeshController` goes through here, on `queue`. A
+    /// restore can fire before `start(handlers:)` has delivered the handlers
+    /// (see `BleEventGate`), so events are held until then instead of being
+    /// reported into nothing.
+    private let events = BleEventGate()
 
     private var running = false
 
@@ -58,9 +55,14 @@ final class BleTransport: NSObject {
         )
     }
 
-    func start() {
+    /// `handlers` are installed on `queue` before anything else here runs, so
+    /// they are never written from one queue while read on another, and any
+    /// events a state restoration produced before this call are replayed into
+    /// them in order.
+    func start(handlers: BleTransportHandlers) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.events.open(handlers)
             self.running = true
             self.startScanIfReady()
             self.startAdvertisingIfReady()
@@ -71,6 +73,7 @@ final class BleTransport: NSObject {
         queue.async { [weak self] in
             guard let self else { return }
             self.running = false
+            self.events.close()
             if self.central.state == .poweredOn {
                 self.central.stopScan()
                 for peripheral in self.peripheralsById.values {
@@ -222,7 +225,7 @@ final class BleTransport: NSObject {
         let reassembler = reassemblers[address] ?? FrameReassembler()
         reassemblers[address] = reassembler
         if let frame = reassembler.accept(fragment) {
-            onFrame?(address, frame)
+            events.emit(.frame(address: address, frame: frame))
         }
     }
 
@@ -232,7 +235,7 @@ final class BleTransport: NSObject {
               notifyChars[address]?.isNotifying == true,
               readyCentralAddresses.insert(address).inserted else { return }
         centralMtuPayload[address] = peripheral.maximumWriteValueLength(for: .withoutResponse)
-        onCentralConnected?(address)
+        events.emit(.centralConnected(address: address))
     }
 
     private func scheduleReconnect(peripheral: CBPeripheral, address: String, nowMs: Int64) {
@@ -282,17 +285,27 @@ extension BleTransport: CBCentralManagerDelegate {
         log.info("Central manager restoring state: \(peripherals.count) peripheral(s)")
         for peripheral in peripherals {
             let address = peripheral.identifier.uuidString
-            peripheral.delegate = self
-            peripheralsById[address] = peripheral
-            reassemblers[address] = FrameReassembler()
-            if peripheral.state == .connected {
+            switch peripheral.state {
+            case .connected:
+                peripheral.delegate = self
+                peripheralsById[address] = peripheral
+                reassemblers[address] = FrameReassembler()
                 peripheral.discoverServices([MeshConstants.serviceUUID])
+            case .connecting:
+                // A pending connect the system carried across the relaunch.
+                // CoreBluetooth connects never time out, so it is still live:
+                // keep the object (and ourselves as its delegate) so
+                // `didConnect` picks it up exactly like a fresh connect.
+                peripheral.delegate = self
+                peripheralsById[address] = peripheral
+            default:
+                // `.disconnected`/`.disconnecting`: nothing will ever call
+                // back for it. Tracking it in `peripheralsById` would make
+                // `didDiscover` treat the address as already handled and
+                // never reconnect, so leave it untracked and let the scan
+                // restarted below rediscover and connect it normally.
+                continue
             }
-            // Not connected (`.connecting`/`.disconnecting`/`.disconnected`):
-            // nothing to rediscover yet -- `didFailToConnect`/
-            // `didDisconnectPeripheral` were never delivered for this
-            // process, so `scheduleReconnect`'s backoff bookkeeping also
-            // never ran; the scan restarted below is what picks it back up.
         }
         // Central.state may still be `.unknown` at this point (Apple
         // delivers `willRestoreState` before the first
@@ -354,7 +367,7 @@ extension BleTransport: CBCentralManagerDelegate {
         readyCentralAddresses.remove(address)
         guard running else { return }
         backoff.recordFailure(address: address, nowMs: now)
-        onCentralDisconnected?(address)
+        events.emit(.centralDisconnected(address: address))
         scheduleReconnect(peripheral: peripheral, address: address, nowMs: now)
     }
 }
@@ -437,9 +450,11 @@ extension BleTransport: CBPeripheralManagerDelegate {
     /// restore onto the returned characteristic objects, unlike this
     /// transport's own dictionaries -- so `sendAsPeripheral` can resume
     /// writing to already-subscribed centrals without waiting for them to
-    /// resubscribe on their own. Fires `onPeripheralSubscribed` for each one,
-    /// same as a live `didSubscribeTo` -- `MeshController` needs that to
-    /// re-register the route with `MeshRouter` and re-send `Hello`.
+    /// resubscribe on their own. Reports each one as subscribed, same as a
+    /// live `didSubscribeTo` -- `MeshController` needs that to re-register
+    /// the route with `MeshRouter` and re-send `Hello`. This runs before
+    /// `MeshController` has started, so `events` holds those reports until
+    /// `start(handlers:)` replays them.
     func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
         running = true
         let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService] ?? []
@@ -456,7 +471,7 @@ extension BleTransport: CBPeripheralManagerDelegate {
                         subscribedCentrals[address] = central
                         reassemblers[address] = FrameReassembler()
                         peripheralMtuPayload[address] = max(20, central.maximumUpdateValueLength)
-                        onPeripheralSubscribed?(address)
+                        events.emit(.peripheralSubscribed(address: address))
                     }
                 }
             }
@@ -477,7 +492,7 @@ extension BleTransport: CBPeripheralManagerDelegate {
         subscribedCentrals[address] = central
         reassemblers[address] = FrameReassembler()
         peripheralMtuPayload[address] = max(20, central.maximumUpdateValueLength)
-        onPeripheralSubscribed?(address)
+        events.emit(.peripheralSubscribed(address: address))
     }
 
     func peripheralManager(
@@ -490,7 +505,7 @@ extension BleTransport: CBPeripheralManagerDelegate {
         reassemblers.removeValue(forKey: address)
         peripheralMtuPayload.removeValue(forKey: address)
         pendingPeripheralUpdates.removeValue(forKey: address)
-        onPeripheralUnsubscribed?(address)
+        events.emit(.peripheralUnsubscribed(address: address))
     }
 
     func peripheralManager(

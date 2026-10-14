@@ -573,56 +573,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         startLanHealthLoop()
         startDigestMaintenanceLoop()
 
-        transport.onFrame = { [weak self] address, frame in
-            self?.meshQueue.async { self?.onFrameReceived(address: address, frame: frame) }
-        }
-        transport.onCentralConnected = { [weak self] address in
-            self?.meshQueue.async {
-                MeshRouter.onConnected(address: address, transport: .central)
-                self?.sendHello(address: address)
-                self?.refreshNearby()
-            }
-        }
-        transport.onCentralDisconnected = { [weak self] address in
-            // FI6: hopped onto `meshQueue` exactly like the connect callbacks
-            // above, and for the same reason. Both callbacks arrive on
-            // `BleTransport`'s own serial queue, and `DispatchQueue.async`
-            // enqueues FIFO, so a fast connect->disconnect cannot have its
-            // disconnect processed first and re-register a dead route. The
-            // queue makes this stronger than the `Task { @MainActor }` hop it
-            // replaces: frames land in the same queue as connection events, so
-            // the whole mesh event stream keeps one order.
-            self?.meshQueue.async {
-                let peerUserId = MeshRouter.userIdFor(address: address)
-                let wasSelected = MeshRouter.isSelectedRoute(address: address)
-                MeshController.shared.recordPeerDisconnected(address: address)
-                MeshRouter.onDisconnected(address: address)
-                if wasSelected, let peerUserId {
-                    MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
-                }
-                MeshController.shared.refreshNearby()
-            }
-        }
-        transport.onPeripheralSubscribed = { [weak self] address in
-            self?.meshQueue.async {
-                MeshRouter.onConnected(address: address, transport: .peripheral)
-                self?.sendHello(address: address)
-                self?.refreshNearby()
-            }
-        }
-        transport.onPeripheralUnsubscribed = { [weak self] address in
-            self?.meshQueue.async {
-                let peerUserId = MeshRouter.userIdFor(address: address)
-                let wasSelected = MeshRouter.isSelectedRoute(address: address)
-                MeshController.shared.recordPeerDisconnected(address: address)
-                MeshRouter.onDisconnected(address: address)
-                if wasSelected, let peerUserId {
-                    MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
-                }
-                MeshController.shared.refreshNearby()
-            }
-        }
-
         registerBluetoothAudioObserver()
         startRelayLoop()
         startMeshRoles()
@@ -770,9 +720,67 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         }
     }
 
+    /// What `BleTransport` reports into. Handed over in `startMeshRoles` via
+    /// `transport.start(handlers:)`, which installs them on the transport's
+    /// own queue and replays anything a CoreBluetooth state restoration
+    /// reported before the mesh had started (see `BleEventGate`).
+    private func makeBleHandlers() -> BleTransportHandlers {
+        BleTransportHandlers(
+            onFrame: { [weak self] address, frame in
+                self?.meshQueue.async { self?.onFrameReceived(address: address, frame: frame) }
+            },
+            onCentralConnected: { [weak self] address in
+                self?.meshQueue.async {
+                    MeshRouter.onConnected(address: address, transport: .central)
+                    self?.sendHello(address: address)
+                    self?.refreshNearby()
+                }
+            },
+            onCentralDisconnected: { [weak self] address in
+                // FI6: hopped onto `meshQueue` exactly like the connect callbacks
+                // above, and for the same reason. Both callbacks arrive on
+                // `BleTransport`'s own serial queue, and `DispatchQueue.async`
+                // enqueues FIFO, so a fast connect->disconnect cannot have its
+                // disconnect processed first and re-register a dead route. The
+                // queue makes this stronger than the `Task { @MainActor }` hop it
+                // replaces: frames land in the same queue as connection events, so
+                // the whole mesh event stream keeps one order.
+                self?.meshQueue.async {
+                    let peerUserId = MeshRouter.userIdFor(address: address)
+                    let wasSelected = MeshRouter.isSelectedRoute(address: address)
+                    MeshController.shared.recordPeerDisconnected(address: address)
+                    MeshRouter.onDisconnected(address: address)
+                    if wasSelected, let peerUserId {
+                        MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
+                    }
+                    MeshController.shared.refreshNearby()
+                }
+            },
+            onPeripheralSubscribed: { [weak self] address in
+                self?.meshQueue.async {
+                    MeshRouter.onConnected(address: address, transport: .peripheral)
+                    self?.sendHello(address: address)
+                    self?.refreshNearby()
+                }
+            },
+            onPeripheralUnsubscribed: { [weak self] address in
+                self?.meshQueue.async {
+                    let peerUserId = MeshRouter.userIdFor(address: address)
+                    let wasSelected = MeshRouter.isSelectedRoute(address: address)
+                    MeshController.shared.recordPeerDisconnected(address: address)
+                    MeshRouter.onDisconnected(address: address)
+                    if wasSelected, let peerUserId {
+                        MeshController.shared.scheduleFailoverResume(peerUserId: peerUserId)
+                    }
+                    MeshController.shared.refreshNearby()
+                }
+            }
+        )
+    }
+
     private func startMeshRoles() {
         guard !meshRolesRunning else { return }
-        transport.start()
+        transport.start(handlers: makeBleHandlers())
         meshRolesRunning = true
         // DL-3's third trigger, and the only one that works with no internet at
         // all. The relay pass fires the same idempotent call, but a person who
