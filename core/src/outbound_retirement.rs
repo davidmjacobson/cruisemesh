@@ -20,8 +20,8 @@
 //! A 1:1 outbound envelope whose lamport is at or below the recipient's
 //! `RECEIPT_TYPE_DELIVERED` watermark for that chat has digest proof of
 //! receipt, which is the removal condition the DTN ack-safety invariant
-//! permits. Three properties make the removal safe rather than merely
-//! permitted:
+//! permits — **once the relay lane has carried it**. Four properties make the
+//! removal safe rather than merely permitted:
 //!
 //! * **It is the authority already in use.** `core_digest_spray_plan` seeks
 //!   from `lamport > delivered_through`, so a covered row is *already* never
@@ -44,8 +44,22 @@
 //!   `MessageStore::backfill_pairwise_envelope`). This is what makes an
 //!   over-reported watermark — the receipt-repair lane reports a peer-stream
 //!   MAX that can legitimately sit above a lamport the peer never filed —
-//!   harmless: a peer that later notices the hole asks for it by contiguous
-//!   digest and the envelope is rebuilt from the stored message.
+//!   harmless *on BLE and LAN*: a peer that later notices the hole asks for it
+//!   by contiguous digest and the envelope is rebuilt from the stored message.
+//! * **The relay lane must already have had it.** That digest repair runs only
+//!   over BLE or LAN; nothing on the relay lane asks for a hole, and the relay
+//!   uploader draws only from this queue (`relay_posted_at IS NULL`). So a row
+//!   that has never been posted is retired by coverage only after it has been
+//!   (`relay_posted_at IS NOT NULL` in [`RETIRE_COVERED_SQL`]). Without that
+//!   guard the MAX watermark strands mail: lamports 1, 2, 3 go out over BLE at
+//!   sea, 1 and 2 are lost on the air, 3 lands, the peer receipts "through 3",
+//!   and rows 1 and 2 leave a queue the relay never drew them from. A
+//!   friendship that carries on over the relay after the cruise has no BLE or
+//!   LAN link left to run the digest on, so 1 and 2 would never arrive. The
+//!   cost of the guard is one relay upload per BLE-delivered row the first
+//!   time the phone reaches the internet — the price the relay lane paid for
+//!   every row before #283 — after which [`retire_covered_after_relay_post`]
+//!   retires it on the spot.
 //!
 //! That last property is not free, and getting it wrong would undo the whole
 //! module. The re-seal path used to *re-queue* whatever it rebuilt, under a
@@ -292,6 +306,13 @@ pub fn covered_by_delivered_watermark(lamport: u64, delivered_through: u64) -> b
 ///   other sender matches nothing.
 /// * `lamport <= ?3` — the coverage predicate; see
 ///   [`covered_by_delivered_watermark`].
+/// * `relay_posted_at IS NOT NULL` — the relay-lane guard. The watermark is a
+///   MAX over the peer's stream (`WM-01`), so it can cover a lamport the peer
+///   never filed; the only repair for that hole is a BLE/LAN digest. A row the
+///   relay has never been handed is therefore kept until the uploader has
+///   posted it, so a relay-only friendship can still receive it. A cleared
+///   stamp (the contact moved relay) makes the row ineligible again until it
+///   is re-posted, which is the same conservative direction.
 /// * `EXISTS (… contacts …)` **and** `NOT EXISTS (… groups …)` — the
 ///   structural group exclusion, stated both ways on purpose. The positive
 ///   half says what the rule is *for* (a pairwise conversation with a person
@@ -311,6 +332,7 @@ pub(crate) const RETIRE_COVERED_SQL: &str = "DELETE FROM outbound_envelopes
        AND chat_id = ?1
        AND sender_user_id = ?2
        AND lamport <= ?3
+       AND relay_posted_at IS NOT NULL
        AND EXISTS (SELECT 1 FROM contacts WHERE user_id = ?1)
        AND NOT EXISTS (SELECT 1 FROM groups WHERE group_id = ?1)
        AND EXISTS (
@@ -371,6 +393,55 @@ pub(crate) fn retire_receipt_covered(
     Ok(removed as u64)
 }
 
+/// The second incremental hook: the relay uploader has just stamped
+/// `msg_id` as posted, so if the stored delivered watermark already covers it
+/// the row has nothing left to wait for and retires now, rather than at the
+/// next receipt or the next launch sweep. Returns how many rows went.
+///
+/// Runs the same [`RETIRE_COVERED_SQL`] against the same stored watermark, so
+/// it can only remove what the receipt hook would have removed had the row
+/// been posted first — never a group row, never a row without its message,
+/// never a carried row (those live in another table). A `msg_id` that is not
+/// in the queue, or a chat with no delivered watermark, retires nothing.
+pub(crate) fn retire_covered_after_relay_post(
+    conn: &Connection,
+    msg_id: &[u8],
+) -> Result<u64, CoreError> {
+    let row: Option<(Vec<u8>, Vec<u8>)> = conn
+        .query_row(
+            "SELECT chat_id, sender_user_id FROM outbound_envelopes WHERE msg_id = ?1",
+            params![msg_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_err)?;
+    let Some((chat_id, sender_user_id)) = row else {
+        return Ok(0);
+    };
+    let delivered_through = delivered_watermark(conn, &chat_id, &sender_user_id)?;
+    retire_receipt_covered(conn, &chat_id, &sender_user_id, delivered_through)
+}
+
+/// The stored `RECEIPT_TYPE_DELIVERED` watermark for `(chat_id,
+/// sender_user_id)`, or 0 when none has been recorded.
+fn delivered_watermark(
+    conn: &Connection,
+    chat_id: &[u8],
+    sender_user_id: &[u8],
+) -> Result<u64, CoreError> {
+    let through: i64 = conn
+        .query_row(
+            "SELECT through_lamport FROM receipts
+             WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
+            params![chat_id, sender_user_id, RECEIPT_TYPE_DELIVERED as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(store_err)?
+        .unwrap_or(0);
+    Ok(through.max(0) as u64)
+}
+
 /// Retire the queued older generations of `(recipient_user_id, kind)` that the
 /// generation at `lamport` replaces. No-op for kinds that are not snapshots.
 pub(crate) fn retire_superseded(
@@ -428,7 +499,10 @@ pub(crate) fn retire_superseded(
 /// * **A receipt-covered lamport never rejoins.** Its absence is not a gap in
 ///   the queue; it is the proof of delivery doing its job. Re-admitting it
 ///   would undo the retirement and hand the relay uploader mail the recipient
-///   has already acknowledged.
+///   has already acknowledged. (Under the relay-lane guard in
+///   [`RETIRE_COVERED_SQL`] a covered row leaves the queue only after the
+///   relay lane has carried it, so keeping the re-seal off the queue denies
+///   the relay nothing it has not already had.)
 ///
 /// Everything else does rejoin — genuinely undelivered visible mail whose
 /// sealed copy predates the outbound queue table. That is the case this path
@@ -440,23 +514,10 @@ pub(crate) fn backfill_rejoins_the_queue(
     if supersedes_queued_generations(envelope.kind) {
         return Ok(false);
     }
-    let delivered_through: i64 = conn
-        .query_row(
-            "SELECT through_lamport FROM receipts
-             WHERE chat_id = ?1 AND sender_user_id = ?2 AND receipt_type = ?3",
-            params![
-                &envelope.chat_id,
-                &envelope.sender_user_id,
-                RECEIPT_TYPE_DELIVERED as i64
-            ],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(store_err)?
-        .unwrap_or(0);
+    let delivered_through = delivered_watermark(conn, &envelope.chat_id, &envelope.sender_user_id)?;
     Ok(!covered_by_delivered_watermark(
         envelope.lamport,
-        delivered_through.max(0) as u64,
+        delivered_through,
     ))
 }
 
@@ -561,6 +622,20 @@ mod tests {
             .into_iter()
             .map(|envelope| (envelope.lamport, envelope.kind))
             .collect()
+    }
+
+    /// What a successful relay pass does: stamp every unposted row as posted.
+    /// Receipt coverage only retires rows the relay lane has already carried,
+    /// so tests about coverage itself post first.
+    fn post_everything(store: &MessageStore) {
+        for envelope in store
+            .pending_relay_outbound_envelopes(u64::MAX >> 1, NOW, vec![])
+            .unwrap()
+        {
+            assert!(store
+                .mark_outbound_envelope_relay_posted(envelope.msg_id, NOW + 1)
+                .unwrap());
+        }
     }
 
     fn author(
@@ -851,6 +926,7 @@ mod tests {
         for body in [&b"one"[..], b"two", b"three", b"four"] {
             author(&store, &me, &contact, KIND_TEXT, body);
         }
+        post_everything(&store);
         assert_eq!(queued(&store, &me, &peer).len(), 4);
 
         store
@@ -891,6 +967,7 @@ mod tests {
         for body in [&b"one"[..], b"two", b"three"] {
             author(&store, &me, &contact, KIND_TEXT, body);
         }
+        post_everything(&store);
         for through in [2, 1, 2] {
             store
                 .record_receipt(
@@ -915,6 +992,7 @@ mod tests {
     fn only_the_delivered_watermark_retires() {
         let (store, me, peer, contact) = pairing(":memory:");
         author(&store, &me, &contact, KIND_TEXT, b"one");
+        post_everything(&store);
         store
             .record_receipt(
                 peer.user_id.clone(),
@@ -936,6 +1014,7 @@ mod tests {
     fn a_per_message_delivery_metric_is_not_proof_the_queue_may_act_on() {
         let (store, me, peer, contact) = pairing(":memory:");
         author(&store, &me, &contact, KIND_TEXT, b"one");
+        post_everything(&store);
         store
             .record_sent_metric(peer.user_id.clone(), 1, NOW)
             .unwrap();
@@ -959,6 +1038,7 @@ mod tests {
         let profile = author(&store, &me, &contact, KIND_PROFILE_SYNC, b"profile");
         let hint = author(&store, &me, &contact, KIND_LAN_ENDPOINT_HINT, b"hint");
         assert!(text < profile && profile < hint);
+        post_everything(&store);
 
         store
             .record_receipt(
@@ -1005,6 +1085,9 @@ mod tests {
             .outbound_envelopes_after(group.id.clone(), me.user_id.clone(), 0)
             .unwrap();
         assert_eq!(before.len(), 1);
+        // Posted, so only the group exclusion -- not the relay-lane guard --
+        // can be what keeps it.
+        post_everything(&store);
 
         store
             .record_receipt(
@@ -1041,6 +1124,7 @@ mod tests {
         store
             .queue_group_invites(me.clone(), group.clone(), vec![contact.clone()], NOW)
             .unwrap();
+        post_everything(&store);
         store
             .record_receipt(
                 peer.user_id.clone(),
@@ -1074,6 +1158,7 @@ mod tests {
         for body in [&b"one"[..], b"two", b"three"] {
             author(&store, &me, &contact, KIND_TEXT, body);
         }
+        post_everything(&store);
         // Write the watermark the way a pre-#283 build did: straight into
         // `receipts`, with no retirement attached.
         {
@@ -1125,6 +1210,7 @@ mod tests {
         for body in [&b"x"[..], b"y"] {
             author(&store, &me, &other_contact, KIND_TEXT, body);
         }
+        post_everything(&store);
         // The restored image proves delivery for one conversation only, and
         // only part of it.
         {
@@ -1227,6 +1313,7 @@ mod tests {
             author(&store, &me, &contact, KIND_PROFILE_SYNC, &[generation; 4]);
         }
         assert_eq!(queued(&store, &me, &peer).len(), 4);
+        post_everything(&store);
 
         store
             .record_receipt(
@@ -1279,6 +1366,7 @@ mod tests {
                 NOW,
             )
             .unwrap();
+        post_everything(&store);
         store
             .record_receipt(
                 peer.user_id.clone(),
@@ -1630,7 +1718,10 @@ mod tests {
     /// The relay-upload path and the BLE/LAN digest offer path read the same
     /// `outbound_envelopes` rows, so retirement has to shrink both. The relay
     /// path is the one that changes behaviour: it consults no receipt, so
-    /// before this it re-uploaded rows the recipient had already acknowledged.
+    /// before #283 it re-uploaded rows the recipient had already acknowledged
+    /// every time their stamps were cleared (a relay move). A covered row the
+    /// relay has carried once is gone from the queue, so it can never be
+    /// re-posted; only the uncovered row comes back.
     #[test]
     fn retirement_shrinks_the_relay_upload_set_and_the_digest_offer_set_together() {
         let (store, me, peer, contact) = pairing(":memory:");
@@ -1656,6 +1747,7 @@ mod tests {
             .unwrap();
         assert_eq!(offered.len(), 3);
 
+        post_everything(&store);
         store
             .record_receipt(
                 peer.user_id.clone(),
@@ -1667,6 +1759,13 @@ mod tests {
             )
             .unwrap();
 
+        // The contact moves relay: every surviving row's stamp is cleared so
+        // it is deposited in the new mailbox.
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute("UPDATE outbound_envelopes SET relay_posted_at = NULL", [])
+                .unwrap();
+        }
         assert_eq!(
             store
                 .pending_relay_outbound_envelopes(64, NOW, vec![])
@@ -1763,6 +1862,7 @@ mod tests {
                 format!("message {index}").as_bytes(),
             );
         }
+        post_everything(&store);
         let conn = store.conn.lock().expect("store mutex poisoned");
         let plan: Vec<String> = conn
             .prepare(
@@ -1802,5 +1902,133 @@ mod tests {
             0,
             "a second sweep finds nothing left to do"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 7. A MAX receipt must not strand the relay lane
+    // -----------------------------------------------------------------
+
+    /// Lamports of everything the relay uploader would post to `peer`.
+    fn relay_candidates(store: &MessageStore, peer: &Identity) -> Vec<u64> {
+        let mut lamports: Vec<u64> = store
+            .pending_relay_outbound_envelopes(1_000, NOW, vec![])
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| envelope.recipient_user_id == peer.user_id)
+            .map(|envelope| envelope.lamport)
+            .collect();
+        lamports.sort_unstable();
+        lamports
+    }
+
+    /// The holey-BLE scenario. Three texts go out over BLE while the phone has
+    /// no internet; the first two are lost on the air and only the third lands.
+    /// The recipient's delivered receipt is a MAX over what it holds (`WM-01`),
+    /// so it reports "through 3" although it never filed 1 or 2.
+    ///
+    /// Those two rows were never posted to the relay. If the receipt retired
+    /// them, the relay lane could never carry them: the uploader draws only
+    /// from the queue, and the digest re-seal that would repair the hole runs
+    /// on BLE or LAN alone -- a link that a friendship carried on over the
+    /// relay after the cruise never has again. They must stay queued until the
+    /// relay lane has had them, and leave the moment it has.
+    #[test]
+    fn a_max_receipt_over_a_holey_ble_stream_still_leaves_unposted_rows_for_the_relay() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        for body in [&b"lost on the air"[..], b"also lost", b"landed"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                3,
+                Some(0),
+                Some(NOW),
+            )
+            .unwrap();
+
+        assert_eq!(
+            relay_candidates(&store, &peer),
+            vec![1, 2, 3],
+            "a receipt must not remove mail the relay lane has never carried"
+        );
+        // The BLE/LAN offer still seeks from the delivered watermark, so the
+        // covered rows cost nothing on those links meanwhile.
+        let (offered, _) = store
+            .outbound_envelopes_after_budgeted(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                3,
+                &HashSet::new(),
+                NOW,
+                u64::MAX,
+            )
+            .unwrap();
+        assert!(offered.is_empty());
+
+        // Back in signal: the uploader posts them, and each covered row
+        // retires as soon as the relay has it.
+        post_everything(&store);
+        assert!(
+            queued(&store, &me, &peer).is_empty(),
+            "a covered row the relay now holds has nothing left to wait for"
+        );
+    }
+
+    /// The same scenario across a restart: the launch sweep follows the same
+    /// rule as the incremental hook, so reopening the store does not retire
+    /// the unposted rows either.
+    #[test]
+    fn the_launch_sweep_also_leaves_unposted_covered_rows_for_the_relay() {
+        let path = temp_store_path("holey-sweep");
+        let (store, me, peer, contact) = pairing(&path);
+        for body in [&b"lost"[..], b"lost too", b"landed"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+        {
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute(
+                "INSERT INTO receipts (chat_id, sender_user_id, receipt_type, through_lamport)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    peer.user_id.clone(),
+                    me.user_id.clone(),
+                    RECEIPT_TYPE_DELIVERED as i64,
+                    3i64
+                ],
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = MessageStore::open(path.clone()).unwrap();
+        assert_eq!(relay_candidates(&reopened, &peer), vec![1, 2, 3]);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Posting is not coverage. A row the relay holds but no receipt covers
+    /// stays queued for the BLE/LAN offer, exactly as before.
+    #[test]
+    fn posting_an_uncovered_row_to_the_relay_does_not_retire_it() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        for body in [&b"one"[..], b"two"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                1,
+                None,
+                None,
+            )
+            .unwrap();
+        post_everything(&store);
+        assert_eq!(queued(&store, &me, &peer), vec![(2, KIND_TEXT)]);
     }
 }
