@@ -200,7 +200,7 @@ struct ContactDetailsSheet: View {
                                         )
                                 }
                             }
-                            Text("Match these words with your friend's screen to confirm it's really them.")
+                            Text("Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }

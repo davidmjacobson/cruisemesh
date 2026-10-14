@@ -300,7 +300,7 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(verify.waitForExistence(timeout: Self.uiTimeout))
         verify.tap()
         XCTAssertTrue(
-            app.staticTexts["Match these words with your friend's screen to confirm it's really them."]
+            app.staticTexts["Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app."]
                 .waitForExistence(timeout: Self.uiTimeout)
         )
 
