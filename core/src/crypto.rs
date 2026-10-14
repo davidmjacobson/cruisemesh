@@ -170,11 +170,13 @@ pub(crate) fn unpad(data: &[u8]) -> Result<Vec<u8>, CoreError> {
     if data.len() < 4 {
         return Err(CoreError::Crypto("padded body too short".to_string()));
     }
-    let len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-    if 4 + len > data.len() {
-        return Err(CoreError::Crypto("corrupt padding length".to_string()));
-    }
-    Ok(data[4..4 + len].to_vec())
+    let corrupt = || CoreError::Crypto("corrupt padding length".to_string());
+    // Checked end offset: on 32-bit targets `4 + len` wraps for a hostile
+    // length near u32::MAX, so never trust the declared length unchecked.
+    let len = usize::try_from(u32::from_le_bytes(data[0..4].try_into().unwrap()))
+        .map_err(|_| corrupt())?;
+    let end = len.checked_add(4).ok_or_else(corrupt)?;
+    data.get(4..end).map(<[u8]>::to_vec).ok_or_else(corrupt)
 }
 
 pub(crate) fn signing_key_from_bytes(bytes: &[u8]) -> Result<SigningKey, CoreError> {
@@ -287,5 +289,28 @@ mod tests {
 
         let err = open_message(bob, sealed).unwrap_err();
         assert!(matches!(err, CoreError::Crypto(_)));
+    }
+
+    /// A declared length near `u32::MAX` must be rejected, not wrap. On a
+    /// 32-bit target (armeabi-v7a) `4 + len` overflowed `usize` for
+    /// `len >= u32::MAX - 3`, the bounds check passed and the slice panicked.
+    #[test]
+    fn unpad_rejects_lengths_that_overflow_usize_on_32_bit() {
+        for len in [u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3] {
+            let mut padded = len.to_le_bytes().to_vec();
+            padded.extend_from_slice(&[0u8; 252]);
+            let err = unpad(&padded).unwrap_err();
+            assert!(matches!(err, CoreError::Crypto(_)), "len {len:#x}");
+        }
+    }
+
+    #[test]
+    fn unpad_rejects_length_one_past_the_buffer() {
+        let mut padded = 253u32.to_le_bytes().to_vec();
+        padded.extend_from_slice(&[0u8; 252]);
+        assert!(matches!(unpad(&padded), Err(CoreError::Crypto(_))));
+
+        padded[0..4].copy_from_slice(&252u32.to_le_bytes());
+        assert_eq!(unpad(&padded).expect("exact fit").len(), 252);
     }
 }
