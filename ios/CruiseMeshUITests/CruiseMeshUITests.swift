@@ -299,8 +299,11 @@ final class CruiseMeshUITests: XCTestCase {
         let verify = app.buttons["Verify contact"]
         XCTAssertTrue(verify.waitForExistence(timeout: Self.uiTimeout))
         verify.tap()
+        // XCUIElementQuery subscripts reject identifiers over 128 characters,
+        // and this explanation is longer, so match its label with a predicate.
+        let verifyExplanation = "Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app."
         XCTAssertTrue(
-            app.staticTexts["Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app."]
+            app.staticTexts.matching(NSPredicate(format: "label == %@", verifyExplanation)).firstMatch
                 .waitForExistence(timeout: Self.uiTimeout)
         )
 
