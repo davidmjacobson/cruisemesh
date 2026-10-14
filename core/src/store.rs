@@ -1983,16 +1983,21 @@ fn backup_inventory_from_conn(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(store_err)?;
+    // A receipt-covered row kept only for the relay lane is already delivered
+    // as far as the person can tell (two ticks), so it is not pending here.
+    let pending_own_delivery_sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM (
+             SELECT LENGTH(sealed) AS bytes FROM outbound_envelopes
+             WHERE expiry > ?1 AND NOT {covered}
+             UNION ALL
+             SELECT LENGTH(sealed) AS bytes FROM outgoing_receipt_envelopes WHERE expiry > ?1
+         )",
+        covered = crate::outbound_retirement::COVERED_AWAITING_RELAY_SQL,
+    );
     let (pending_own_delivery_count, pending_own_delivery_bytes) = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM (
-                 SELECT LENGTH(sealed) AS bytes FROM outbound_envelopes WHERE expiry > ?1
-                 UNION ALL
-                 SELECT LENGTH(sealed) AS bytes FROM outgoing_receipt_envelopes WHERE expiry > ?1
-             )",
-            params![now_ms],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
+        .query_row(&pending_own_delivery_sql, params![now_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
         .map_err(store_err)?;
     let (pending_courier_delivery_count, pending_courier_delivery_bytes) = conn
         .query_row(
@@ -3547,16 +3552,20 @@ impl MessageStore {
     /// though the reason changed with #283 and is worth restating exactly.
     /// `record_receipt` now *does* retire the `outbound_envelopes` rows a
     /// delivered watermark covers, so an overstated watermark reaching the
-    /// sender does remove sealed rows for messages that peer never filed. What
-    /// makes that harmless is that retirement removes only the sealed
-    /// retransmission artifact and only where the `messages` row that
-    /// regenerates it survives (see `crate::outbound_retirement`): the sender
-    /// still holds the message, the peer's *digest* still reports the gap-aware
+    /// sender can remove sealed rows for messages that peer never filed. What
+    /// makes that harmless is two guards (see `crate::outbound_retirement`).
+    /// Retirement removes only the sealed retransmission artifact and only
+    /// where the `messages` row that regenerates it survives: the sender still
+    /// holds the message, the peer's *digest* still reports the gap-aware
     /// contiguous watermark, and the digest responder re-seals the envelope
-    /// from the stored message. Nothing a sender still owes becomes
-    /// unsendable. Carried rows -- other people's mail, which this device is
-    /// the only copy of -- are untouched by all of this and still leave only
-    /// on their own digest proof.
+    /// from the stored message. That repair runs only over BLE or LAN,
+    /// though, and a friendship that continues over the relay may never have
+    /// either again -- so retirement also waits until the row has been posted
+    /// to the relay (`relay_posted_at IS NOT NULL`), so the relay lane has its
+    /// copy before the queue lets go of it. Nothing a sender still owes
+    /// becomes unsendable. Carried rows -- other people's mail, which this
+    /// device is the only copy of -- are untouched by all of this and still
+    /// leave only on their own digest proof.
     pub fn highest_lamport(
         &self,
         chat_id: Vec<u8>,
@@ -3716,13 +3725,19 @@ impl MessageStore {
             format!(" AND recipient_user_id NOT IN ({placeholders})")
         };
         args.push(Value::Integer(limit as i64));
+        // Within one recipient, rows their delivered receipt does not cover yet
+        // go first. A covered row is kept only so the relay lane can repair a
+        // hole under a MAX watermark (`crate::outbound_retirement`), and after
+        // a long run on BLE there can be hundreds of them; ranking purely by
+        // queue age would make a new message wait behind all of them.
+        let covered = crate::outbound_retirement::COVERED_AWAITING_RELAY_SQL;
         let sql = format!(
             "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
                     timestamp, hop_ttl, expiry, recipient_hint, sealed
              FROM (
                  SELECT *, ROW_NUMBER() OVER (
                             PARTITION BY recipient_user_id
-                            ORDER BY queued_at ASC, msg_id ASC
+                            ORDER BY {covered} ASC, queued_at ASC, msg_id ASC
                         ) AS recipient_rank
                  FROM outbound_envelopes
                  WHERE relay_posted_at IS NULL AND expiry > ?{skip_clause}
@@ -3920,18 +3935,28 @@ impl MessageStore {
 
     /// Mark one outbound envelope as successfully posted to a relay. Returns
     /// `true` if a queued row was updated.
+    ///
+    /// A 1:1 row the stored delivered watermark already covers retires in the
+    /// same transaction: receipt coverage waits for the relay lane to have
+    /// carried a row (`crate::outbound_retirement`), and this is the moment it
+    /// has. A row no receipt covers stays queued for BLE/LAN exactly as before.
     pub fn mark_outbound_envelope_relay_posted(
         &self,
         msg_id: Vec<u8>,
         posted_at_ms: i64,
     ) -> Result<bool, CoreError> {
-        let conn = lock_conn(&self.conn);
-        let changed = conn
+        let mut conn = lock_conn(&self.conn);
+        let tx = conn.transaction().map_err(store_err)?;
+        let changed = tx
             .execute(
                 "UPDATE outbound_envelopes SET relay_posted_at = ?2 WHERE msg_id = ?1",
                 params![msg_id, posted_at_ms],
             )
             .map_err(store_err)?;
+        if changed > 0 {
+            crate::outbound_retirement::retire_covered_after_relay_post(&tx, &msg_id)?;
+        }
+        tx.commit().map_err(store_err)?;
         Ok(changed > 0)
     }
 
@@ -18796,9 +18821,10 @@ mod tests {
     /// and never leaving anything it still owes unsendable.
     ///
     /// Since #283 "harmlessly" no longer means "changes nothing". The covered
-    /// envelope is retired, because the watermark is the same proof the spray
-    /// planner already seeks past and the same proof the UI already draws two
-    /// ticks from -- keeping a row nobody will ever offer again was the defect.
+    /// envelope is retired once the relay lane has carried it, because the
+    /// watermark is the same proof the spray planner already seeks past and
+    /// the same proof the UI already draws two ticks from -- keeping a row
+    /// nobody will ever offer again was the defect.
     /// What must survive is the *ability to send it again*, and that is what
     /// this pins: the `messages` row stays, so the digest responder's backfill
     /// can re-seal the envelope for a peer whose contiguous digest later
@@ -18857,7 +18883,23 @@ mod tests {
                 .unwrap(),
             9_999
         );
-        // The covered envelope is retired...
+        // The covered envelope has never been posted to the relay, and the
+        // relay lane has no digest repair of its own, so it stays queued until
+        // the uploader has carried it...
+        assert_eq!(
+            store
+                .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store
+            .mark_outbound_envelope_relay_posted(
+                authored.envelope.msg_id.clone(),
+                1_700_000_001_000
+            )
+            .unwrap());
+        // ...and is retired the moment it has...
         assert!(store
             .outbound_envelopes_after(bob.user_id.clone(), alice.user_id.clone(), 0)
             .unwrap()

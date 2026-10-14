@@ -1047,7 +1047,10 @@ fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
     );
 
     // Coverage: a delivered watermark retires what it covers, in the queue the
-    // relay uploader and the digest spray both read.
+    // relay uploader and the digest spray both read -- once the relay lane has
+    // carried it. The watermark is a MAX (`WM-01`) and the only repair for a
+    // hole under it runs on BLE/LAN, so a row never posted to the relay must
+    // survive the receipt or a relay-only friendship could never receive it.
     let covered_through = queued[1].lamport;
     store
         .record_receipt(
@@ -1059,21 +1062,34 @@ fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
             None,
         )
         .expect("record receipt");
-    let after = store
-        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
-        .expect("queued after receipt");
-    contract_assert!(
-        id,
-        after.iter().all(|row| row.lamport > covered_through),
-        "a delivered watermark must retire everything it covers"
-    );
     let relay_pending = store
         .pending_relay_outbound_envelopes(64, now_ms, vec![])
         .expect("relay candidates");
     contract_assert!(
         id,
-        relay_pending.len() == after.len(),
-        "the relay uploader must see the same shrunken set as the digest path"
+        relay_pending.len() == queued.len(),
+        "a receipt must not retire a row the relay lane has never carried"
+    );
+    let spray = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), covered_through)
+        .expect("spray candidates");
+    contract_assert!(
+        id,
+        spray.iter().all(|row| row.lamport > covered_through),
+        "the digest spray must already stop offering covered rows"
+    );
+    for row in &relay_pending {
+        store
+            .mark_outbound_envelope_relay_posted(row.msg_id.clone(), now_ms)
+            .expect("mark posted");
+    }
+    let after = store
+        .outbound_envelopes_after(peer.user_id.clone(), me.user_id.clone(), 0)
+        .expect("queued after receipt");
+    contract_assert!(
+        id,
+        !after.is_empty() && after.iter().all(|row| row.lamport > covered_through),
+        "a delivered watermark must retire everything it covers once the relay has it"
     );
 
     // The obligation survives the row: the stored message can still be
@@ -1123,9 +1139,9 @@ fn queue_01_proof_of_delivery_shrinks_the_advertised_set() {
         store
             .pending_relay_outbound_envelopes(64, now_ms, vec![])
             .expect("relay candidates after rebuild")
-            .len()
-            == after.len(),
-        "answering a digest must not hand the relay uploader acknowledged mail"
+            .is_empty(),
+        "answering a digest must not hand the relay uploader acknowledged mail \
+         (everything left was already posted above)"
     );
 
     // Expiry is right-sized, not flat: a payload that states its own short
