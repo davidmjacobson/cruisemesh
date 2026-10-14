@@ -199,3 +199,78 @@ func lanNetworkId(ipv4Address: String?) -> String? {
 func subnet24Hosts(localAddress: String) -> [String] {
     lanSubnetHosts(localAddress: localAddress, prefixLength: defaultLanScanPrefixLength)
 }
+
+/// What a tapped or scanned LAN address link may do, decided before anything
+/// is dialed. Matches Android's `LanEndpointLinkDecision`.
+///
+/// A link is someone else's input. Dialing it unasked would hand whoever wrote
+/// it this phone's address and a handshake attempt, and turning the mesh on
+/// for it would override the person's own choice to leave it off. So a link
+/// never starts the mesh, never dials an address that is not on the Wi-Fi
+/// network this phone is on, and never dials anything without the person
+/// saying yes to the address it names. Only `.confirm` leads to a connection,
+/// and only after that yes.
+///
+/// A link is the only way a manual address reaches the transport, so this is
+/// the whole gate. The cost is that a link to a peer on a routed, different
+/// subnet is refused; such a peer is still reached through the contact's own
+/// hint once both phones are friends.
+enum LanEndpointLinkDecision: Equatable {
+    /// The mesh is off. The link names the address but turns nothing on.
+    case meshOff(LanManualEndpoint)
+    /// This phone has no Wi-Fi address to compare the link against.
+    case noWifi(LanManualEndpoint)
+    /// The address is not on the Wi-Fi network this phone is using.
+    case otherNetwork(LanManualEndpoint)
+    /// Show the address and connect only if the person agrees.
+    case confirm(LanManualEndpoint)
+
+    var endpoint: LanManualEndpoint {
+        switch self {
+        case let .meshOff(endpoint), let .noWifi(endpoint),
+             let .otherNetwork(endpoint), let .confirm(endpoint):
+            return endpoint
+        }
+    }
+
+    /// Whether this decision offers to connect, as opposed to a refusal.
+    var isConfirm: Bool {
+        if case .confirm = self { return true }
+        return false
+    }
+}
+
+/// Decide what `endpoint` from a link may do. `localEndpoint` is this phone's
+/// own published LAN endpoint (`host:port`, IPv6 bracketed), or nil when it
+/// has none; `localPrefixLength` is the subnet prefix its interface reports,
+/// or nil when none was read. With a prefix the test is the shared core's
+/// `lanHostIsOnLocalSubnet`, so a ship's /16 counts as one network; without
+/// one it falls back to `lanHostsShareLocalNetwork` (IPv4 /24, IPv6 /64).
+/// `sameNetwork` is only a seam for tests.
+func decideLanEndpointLink(
+    _ endpoint: LanManualEndpoint,
+    meshRunning: Bool,
+    localEndpoint: String?,
+    localPrefixLength: Int? = nil,
+    sameNetwork: (_ localHost: String, _ prefixLength: Int?, _ candidateHost: String) -> Bool =
+        lanHostOnLocalNetwork
+) -> LanEndpointLinkDecision {
+    guard meshRunning else { return .meshOff(endpoint) }
+    // The port is irrelevant to the comparison; any valid one parses the host.
+    guard let localEndpoint,
+          let localHost = parseLanManualEndpoint(localEndpoint, defaultPort: 1)?.host
+    else { return .noWifi(endpoint) }
+    guard sameNetwork(localHost, localPrefixLength, endpoint.host) else { return .otherNetwork(endpoint) }
+    return .confirm(endpoint)
+}
+
+func lanHostOnLocalNetwork(_ localHost: String, _ prefixLength: Int?, _ candidateHost: String) -> Bool {
+    guard let prefixLength, (1...128).contains(prefixLength) else {
+        return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)
+    }
+    return lanHostIsOnLocalSubnet(
+        localHost: localHost,
+        prefixLength: UInt8(prefixLength),
+        candidateHost: candidateHost
+    )
+}

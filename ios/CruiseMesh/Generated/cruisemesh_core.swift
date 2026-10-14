@@ -55596,6 +55596,31 @@ public func lanEndpointHostIsLocal(host: String) -> Bool {
 })
 }
 /**
+ * Whether `candidate_host` is on the subnet this phone's own interface
+ * reports: `local_host/prefix_length`, as the platform hands it out.
+ *
+ * [`lan_hosts_share_local_network`] answers a narrower question with a fixed
+ * IPv4 /24, because a cache fingerprint must not depend on the netmask. A
+ * person-facing "is this address on my Wi-Fi?" check needs the real subnet
+ * instead: a ship's /16 is one network, and two phones in different /24s of
+ * it can reach each other directly.
+ *
+ * Both hosts must be address literals of the same family (brackets and an
+ * interface zone are tolerated). IPv6 link-local, loopback and unspecified
+ * addresses answer `false`, as in [`lan_hosts_share_local_network`]: a match
+ * there is no evidence. A prefix of zero, or one longer than the family
+ * allows, also answers `false`.
+ */
+public func lanHostIsOnLocalSubnet(localHost: String, prefixLength: UInt8, candidateHost: String) -> Bool {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cruisemesh_core_fn_func_lan_host_is_on_local_subnet(
+        FfiConverterString.lower(localHost),
+        FfiConverterUInt8.lower(prefixLength),
+        FfiConverterString.lower(candidateHost),$0
+    )
+})
+}
+/**
  * Whether two LAN host literals identify the same network address.
  *
  * This is intentionally stricter than "same network": it is the shared
@@ -58128,6 +58153,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_endpoint_host_is_local() != 16139) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cruisemesh_core_checksum_func_lan_host_is_on_local_subnet() != 7963) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_lan_hosts_are_same_address() != 764) {

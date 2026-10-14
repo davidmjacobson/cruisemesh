@@ -139,9 +139,10 @@ struct CruiseMeshApp: App {
                     guard (try? parseRelaySetupText(text: fragment)) != nil else { return }
                     appModel.pendingRelayCard = fragment
                 case .lan:
+                    // Never dial or start the mesh from a link: show the
+                    // address and let the person decide (or say why not).
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
-                    LanTransportDiagnostics.shared.queueManualConnection(endpoint)
-                    appModel.startMesh()
+                    appModel.handleLanEndpointLink(endpoint)
                 case .deviceLink:
                     // A device-link offer is scanned inside the linking
                     // ceremony, by the device that is already part of this
@@ -150,6 +151,28 @@ struct CruiseMeshApp: App {
                     // finish what the link starts.
                     return
                 }
+            }
+            // Two alerts, not one alert whose content changes: a Connect
+            // tap that finds the answer has changed must not have the
+            // confirm alert's own dismissal wipe the refusal that replaces it.
+            .alert(
+                Text("Connect to this address?"),
+                isPresented: lanLinkAlertBinding(confirm: true),
+                presenting: appModel.lanLinkDecision
+            ) { _ in
+                Button("Connect") { appModel.confirmLanEndpointLink() }
+                Button("Cancel", role: .cancel) {}
+            } message: { decision in
+                lanLinkMessage(decision)
+            }
+            .alert(
+                lanLinkTitle(appModel.lanLinkDecision),
+                isPresented: lanLinkAlertBinding(confirm: false),
+                presenting: appModel.lanLinkDecision
+            ) { _ in
+                Button("Close", role: .cancel) {}
+            } message: { decision in
+                lanLinkMessage(decision)
             }
             .onChange(of: scenePhase) { phase in
                 appModel.setAppForeground(phase == .active)
@@ -160,6 +183,50 @@ struct CruiseMeshApp: App {
                 DiagnosticLogExport.archiveCurrentSession()
             }
         }
+    }
+}
+
+extension CruiseMeshApp {
+    /// Presents the confirm alert (`confirm: true`) or the refusal alert for
+    /// the pending LAN link. A link waits, like Android's, until setup is
+    /// done: no alert over the terms, permissions or onboarding screens.
+    fileprivate func lanLinkAlertBinding(confirm: Bool) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard termsAccepted, !deviceRemoval.removed, firstRun == .home,
+                      let decision = appModel.lanLinkDecision else { return false }
+                return decision.isConfirm == confirm
+            },
+            set: { presented in
+                guard !presented else { return }
+                appModel.dismissLanEndpointLink(fromConfirmAlert: confirm)
+            }
+        )
+    }
+}
+
+private func lanLinkTitle(_ decision: LanEndpointLinkDecision?) -> Text {
+    switch decision {
+    case .some(.confirm), .none:
+        return Text("Connect to this address?")
+    case .some(.meshOff):
+        return Text("Mesh is off")
+    case .some(.noWifi), .some(.otherNetwork):
+        return Text("Can't connect to this address")
+    }
+}
+
+private func lanLinkMessage(_ decision: LanEndpointLinkDecision) -> Text {
+    let address = decision.endpoint.display
+    switch decision {
+    case .confirm:
+        return Text("This link asks CruiseMesh to connect to \(address) on your Wi-Fi. Only connect if someone you trust shared it with you.")
+    case .meshOff:
+        return Text("This link points to \(address). Turn the mesh on, then open the link again.")
+    case .noWifi:
+        return Text("This link points to \(address), but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again.")
+    case .otherNetwork:
+        return Text("\(address) isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again.")
     }
 }
 
