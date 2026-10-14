@@ -182,12 +182,11 @@ struct CruiseMeshApp: App {
 /// created with restoration identifiers (FI3) specifically so the system
 /// can redeliver `willRestoreState` to them -- but that only helps once
 /// `MeshController.shared` (and therefore `BleTransport`) actually exists,
-/// and `MeshController.start()` has run far enough to wire its frame/
-/// connection callbacks (see `MeshController.start()`'s callback
-/// assignments) -- otherwise a restored peripheral's frames arrive at
-/// `BleTransport.onFrame`, which is still `nil`, and are silently dropped.
-/// Both only happen today when something calls into `MeshController`, which
-/// this provides for the background-relaunch case specifically.
+/// and the restored links only reach the mesh once `MeshController.start()`
+/// hands `BleTransport` its handlers (`BleTransport.start(handlers:)`);
+/// until then `BleEventGate` holds what the restore reported. Both only
+/// happen when something calls into `MeshController`, which this provides
+/// for the background-relaunch case specifically.
 final class AppDelegate: NSObject, UIApplicationDelegate {
     private static let log = Logger(subsystem: "com.cruisemesh", category: "AppDelegate")
 
