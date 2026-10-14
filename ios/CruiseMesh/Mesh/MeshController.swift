@@ -75,10 +75,10 @@ final class MeshController: ObservableObject, @unchecked Sendable {
 
     private let log = Logger(subsystem: "com.cruisemesh", category: "MeshController")
     private let transport = BleTransport()
-    /// Set while `applyLinkVisibility` has taken the mesh down for a §9.4
-    /// pre-activation window, so the allow branch restarts only a mesh this
-    /// ceremony stopped.
-    private var linkSilenced = false
+    /// §9.4's radio silence: whether a start may bring the radios up, and
+    /// whether the end of the pre-activation window restarts the mesh. See
+    /// `LinkSilenceLatch`.
+    private var linkSilence = LinkSilenceLatch()
     private var lanTransport: LanTransport?
     private let lanHealth = LanHealthTracker()
     /// §10 step 5's re-offer bookkeeping; see `OwnRosterNoticeSchedule`.
@@ -271,7 +271,12 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     }
 
     func stop() {
-        meshQueue.async { self.stopOnMeshQueue() }
+        meshQueue.async {
+            // The person switched the mesh off, so the end of a §9.4 window
+            // must not switch it back on behind their back.
+            self.linkSilence.personStopped()
+            self.stopOnMeshQueue()
+        }
     }
 
     func setAppForeground(_ foreground: Bool) {
@@ -291,18 +296,23 @@ final class MeshController: ObservableObject, @unchecked Sendable {
     /// `startOnMeshQueue` and there is no seam that stops one and keeps the rest.
     /// That is strictly more silence than §9.4 asks for, which is the safe
     /// direction — §9.4 forbids acking and authoring over the relay in the same
-    /// breath. `linkSilenced` is what keeps the allow branch from *starting* a
-    /// mesh the person had switched off themselves.
+    /// breath. `linkSilence` is what keeps the allow branch from *starting* a
+    /// mesh the person had switched off themselves, and what keeps every other
+    /// way into `startOnMeshQueue` from bringing the radios back up during the
+    /// window.
+    ///
+    /// Idempotent: `LinkVisibility.refresh` calls it on every refresh, not only
+    /// when the gate's answer flips, because only this queue can see whether
+    /// the controller's running state still matches the gate.
     func applyLinkVisibility(_ allowed: Bool, completion: @escaping () -> Void) {
         meshQueue.async {
-            if allowed {
-                if self.linkSilenced {
-                    self.linkSilenced = false
-                    self.startOnMeshQueue()
-                }
-            } else if self.isRunning {
-                self.linkSilenced = true
+            switch self.linkSilence.apply(allowed: allowed, isRunning: self.isRunning) {
+            case .startMesh:
+                self.startOnMeshQueue()
+            case .stopMesh:
                 self.stopOnMeshQueue()
+            case .nothing:
+                break
             }
             completion()
         }
@@ -367,6 +377,24 @@ final class MeshController: ObservableObject, @unchecked Sendable {
             // a background BLE relaunch may never show any UI at all, and
             // `startMeshIfEnabled` would keep trying on every one of them.
             stopBecauseThisDeviceWasRemoved()
+            return
+        }
+        // §9.4: a device between "the channel is confirmed" and "the roster head
+        // is acknowledged" may not advertise anything. Asked here, before any
+        // radio comes up, because every way into this function -- the chat list
+        // appearing, an APNs relay wake, a background BLE relaunch, a deep link,
+        // the end of the window itself -- has to pass it, and a process killed
+        // mid-ceremony comes back with the window still open and no ceremony
+        // left to ask on its behalf. Fails closed on a gate read error. One
+        // select per start, and nothing changes on the overwhelming majority of
+        // installs, which have never linked a device. Mirrors Android's
+        // `MeshService`, which reads the gate before its radios start.
+        guard linkSilence.admitStart(gateAllowed: LinkVisibility.readGate(store: store)) else {
+            log.info("Holding the mesh down: this device is not yet linked")
+            // A no-op unless already running, which means the gate closed
+            // without this queue hearing about it.
+            stopOnMeshQueue()
+            LinkVisibility.markApplied(false)
             return
         }
         if isRunning {
@@ -598,15 +626,6 @@ final class MeshController: ObservableObject, @unchecked Sendable {
         registerBluetoothAudioObserver()
         startRelayLoop()
         startMeshRoles()
-        // §9.4, for the phone that was killed mid-ceremony: core still refuses
-        // everything it holds, and this is what stops the radios disagreeing
-        // with it. Asked here rather than only from `LinkSession` because a
-        // process that died inside the pre-activation window comes back with the
-        // window still open and no ceremony left to ask on its behalf. Costs one
-        // gate read per mesh start and changes nothing on the overwhelming
-        // majority of installs, which have never linked a device. Mirrors
-        // Android's `MeshService`, which refreshes at start and on its tick.
-        LinkVisibility.refresh(store: store)
         refreshBluetoothAudioState(reason: "mesh start")
         let nearby = MeshRouter.connectedUserCount()
         onMain { MeshRuntimeStatus.shared.markMeshing(nearby: nearby) }
