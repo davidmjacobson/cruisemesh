@@ -1983,16 +1983,21 @@ fn backup_inventory_from_conn(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .map_err(store_err)?;
+    // A receipt-covered row kept only for the relay lane is already delivered
+    // as far as the person can tell (two ticks), so it is not pending here.
+    let pending_own_delivery_sql = format!(
+        "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM (
+             SELECT LENGTH(sealed) AS bytes FROM outbound_envelopes
+             WHERE expiry > ?1 AND NOT {covered}
+             UNION ALL
+             SELECT LENGTH(sealed) AS bytes FROM outgoing_receipt_envelopes WHERE expiry > ?1
+         )",
+        covered = crate::outbound_retirement::COVERED_AWAITING_RELAY_SQL,
+    );
     let (pending_own_delivery_count, pending_own_delivery_bytes) = conn
-        .query_row(
-            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM (
-                 SELECT LENGTH(sealed) AS bytes FROM outbound_envelopes WHERE expiry > ?1
-                 UNION ALL
-                 SELECT LENGTH(sealed) AS bytes FROM outgoing_receipt_envelopes WHERE expiry > ?1
-             )",
-            params![now_ms],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
+        .query_row(&pending_own_delivery_sql, params![now_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
         .map_err(store_err)?;
     let (pending_courier_delivery_count, pending_courier_delivery_bytes) = conn
         .query_row(
@@ -3720,13 +3725,19 @@ impl MessageStore {
             format!(" AND recipient_user_id NOT IN ({placeholders})")
         };
         args.push(Value::Integer(limit as i64));
+        // Within one recipient, rows their delivered receipt does not cover yet
+        // go first. A covered row is kept only so the relay lane can repair a
+        // hole under a MAX watermark (`crate::outbound_retirement`), and after
+        // a long run on BLE there can be hundreds of them; ranking purely by
+        // queue age would make a new message wait behind all of them.
+        let covered = crate::outbound_retirement::COVERED_AWAITING_RELAY_SQL;
         let sql = format!(
             "SELECT msg_id, recipient_user_id, chat_id, sender_user_id, kind, lamport,
                     timestamp, hop_ttl, expiry, recipient_hint, sealed
              FROM (
                  SELECT *, ROW_NUMBER() OVER (
                             PARTITION BY recipient_user_id
-                            ORDER BY queued_at ASC, msg_id ASC
+                            ORDER BY {covered} ASC, queued_at ASC, msg_id ASC
                         ) AS recipient_rank
                  FROM outbound_envelopes
                  WHERE relay_posted_at IS NULL AND expiry > ?{skip_clause}

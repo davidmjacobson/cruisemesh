@@ -68,7 +68,7 @@ of it: the gap is now countable.
 | `HELLO-01` | Legacy HELLO never gains trailing fields; new capabilities use HELLO2 frame `0x06`. | core | `core/src/protocol.rs` HELLO/HELLO2 codec tests; index re-asserts both shapes |
 | `IDEMP-01` | Duplicate, late, or replayed external results cannot double-apply a mutation, regress a cursor, or consume a carried row. | core | `CoreRelayPass::resume_http` compares `pass_id`/`action_id` against the single outstanding action; `core/tests/relay_pass_replay.rs` permutes duplicate, future-id, stale-id, wrong-pass, late-after-finish and cancellation against a clean run and requires an identical store |
 | `TXN-01` | No store transaction spans external I/O. Page consume and frontier advancement retain their documented two-transaction crash safety. | core | `MessageStore::ingest_relay_page` is one transaction that commits before it returns, and the action/result seam makes the boundary structural; `core/tests/relay_pass_replay.rs` kills a pass between the consume and its ack and relaunches |
-| `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage; flat expiry is a backstop, never the only retirement path. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession, expiry and relay-lane tests (#283); index re-asserts that a delivered watermark retires a covered row once the relay lane has carried it, and never before |
+| `QUEUE-01` | Proof of delivery for a 1:1 outbound envelope permits — and the queue eventually performs — its retirement, and a payload whose usefulness is shorter than its expiry is superseded rather than re-advertised. The advertised outbound set shrinks under coverage at once; a covered row leaves the queue as soon as the relay lane has carried it, and flat expiry retires it only for a recipient this device never posts to. | core | `core/src/outbound_retirement.rs` coverage, sweep, supersession, expiry and relay-lane tests (#283); index re-asserts that a delivered watermark retires a covered row once the relay lane has carried it, and never before |
 | `SECRET-01` | Events, fixtures, summaries, and exported diagnostics contain no relay tokens, raw friend cards, plaintext, private keys, or full endpoint-bearing bodies. | core | three layers: `core/src/protocol_event.rs` refuses to store a record that trips a canary or carries an undeclared key, `core/tests/protocol_event_ring.rs` runs the canary against a live store's export, and `core/tests/protocol_contract.rs` scans the checked-in fixture corpus |
 | `DEDUP-01` | A relay mailbox is keyed on `(family_token, msg_id)` by content: it keeps the first stored ciphertext and never overwrites it, an identical re-post is an idempotent dedupe, and a same-id post carrying different immutable content is a distinct reported conflict — never a success that retires the sender's retry state. | core | server enforcement in `relayd/src/lib.rs` (`insert_envelope` and `insert_envelope_with_quota` resolve a same-id re-post by comparing sealed bytes; the differing-content case returns the additive 409 `msg_id_conflict` and leaves the stored row untouched) with `relayd/tests/e2e_mailbox.rs` conflict + dedupe e2e; sender classification in `core/src/relay_status.rs` (`relay_classify_http_error` → `CoreRelayFault::MsgIdConflict`) and `core/src/session/relay_pass.rs` (a conflict is per-envelope, never reaches `apply_success`, so the row stays queued); `core/tests/relay_pass_replay.rs` drives a real pass and proves the outbound row is not marked posted |
 | `BLOB-01` | Plane separation. Blob bytes never enter an envelope, a carry queue, a digest spray plan, or any BLE frame. Only manifests and thumbnails cross the message plane, and no third party ever stores, forwards, or serves another person's blob. | unimplemented | the media integration phase, which adds blob-flavoured adversarial cases to the existing spray and carry suites; today the rule holds only because `core/src/media/` is reachable from no dispatch, carry, or framing path |
@@ -554,7 +554,8 @@ shrink for the two reasons that actually retire an obligation:
    notice — is replaced by its successor instead of both being advertised.
 
 Flat expiry is a backstop for what neither rule reaches, never the only
-retirement path. Issue #283 records the failure mode: a real device holding
+retirement path (save the one case "Coverage waits for the relay lane"
+below names). Issue #283 records the failure mode: a real device holding
 3,786 unexpired outbound rows, 2,018 of them already covered by receipts, of
 which roughly 93% were service kinds, including week-old reachability hints
 whose payload stops being true after about fifteen minutes. The advertised
@@ -580,9 +581,14 @@ one that lost them had carried them, and a friendship that continues over
 the relay after the cruise — no BLE or LAN link left to run a digest on —
 would never receive them. The row is not offered on BLE or LAN meanwhile
 (the spray seeks above the watermark), so the advertised set still shrinks
-under coverage; the cost is one relay upload per such row. Carried rows — other people's
-mail, of which this device may be the only copy — are outside this rule
-entirely and keep leaving only under `CARRY-01`.
+under coverage. The cost is one relay upload per such row, ranked behind
+every uncovered row to the same recipient; the row is not counted as a
+pending delivery in the backup inventory or the connection details page.
+For a recipient this device never posts to (no relay configured, or none
+usable) the queue row itself is retired by the flat expiry, which is then
+the only path for it. Carried rows — other people's mail, of which this
+device may be the only copy — are outside this rule entirely and keep
+leaving only under `CARRY-01`.
 
 **A re-seal answers the peer; it does not re-admit the row.** The two
 watermarks in the previous paragraph do not move together: a digest reports

@@ -61,6 +61,15 @@
 //!   every row before #283 — after which [`retire_covered_after_relay_post`]
 //!   retires it on the spot.
 //!
+//!   A recipient this device never posts to (no Shore Pass and no card relay,
+//!   a card that is written off, an upload the relay refuses) never stamps the
+//!   row, so for that recipient the seven-day expiry is what retires covered
+//!   rows. They still cost nothing on the mesh — the spray seeks above the
+//!   watermark — and the backup inventory does not count them as pending
+//!   ([`COVERED_AWAITING_RELAY_SQL`]). Inside the uploader they rank behind
+//!   every uncovered row to the same recipient, so a backlog the peer already
+//!   holds never delays a message it does not.
+//!
 //! That last property is not free, and getting it wrong would undo the whole
 //! module. The re-seal path used to *re-queue* whatever it rebuilt, under a
 //! fresh random `msg_id` and with `relay_posted_at` cleared. Since a holey peer
@@ -342,6 +351,40 @@ pub(crate) const RETIRE_COVERED_SQL: &str = "DELETE FROM outbound_envelopes
                AND m.lamport = outbound_envelopes.lamport
            )";
 
+/// A predicate over one `outbound_envelopes` row (columns qualified by the
+/// table name, so it can sit in any `FROM outbound_envelopes` query): true
+/// when [`RETIRE_COVERED_SQL`] would retire the row under the stored delivered
+/// watermark if only the relay lane had carried it. Every clause of that
+/// statement except `relay_posted_at IS NOT NULL` is here, with the watermark
+/// read from `receipts` rather than bound.
+///
+/// Such a row is already delivered as far as anyone can tell: the spray never
+/// offers it and the UI draws it with two ticks. It is kept only so the relay
+/// lane can repair a hole under a MAX watermark. So it is left out of the
+/// pending-delivery count a person reads, and the uploader ranks it behind
+/// every uncovered row to the same recipient.
+///
+/// The `1` is `RECEIPT_TYPE_DELIVERED`; `covered_awaiting_relay_sql_names_the_delivered_receipt_type`
+/// pins it.
+pub(crate) const COVERED_AWAITING_RELAY_SQL: &str = "(
+       outbound_envelopes.recipient_user_id = outbound_envelopes.chat_id
+       AND EXISTS (
+             SELECT 1 FROM receipts r
+             WHERE r.chat_id = outbound_envelopes.chat_id
+               AND r.sender_user_id = outbound_envelopes.sender_user_id
+               AND r.receipt_type = 1
+               AND outbound_envelopes.lamport <= r.through_lamport
+           )
+       AND EXISTS (SELECT 1 FROM contacts WHERE user_id = outbound_envelopes.chat_id)
+       AND NOT EXISTS (SELECT 1 FROM groups WHERE group_id = outbound_envelopes.chat_id)
+       AND EXISTS (
+             SELECT 1 FROM messages m
+             WHERE m.chat_id = outbound_envelopes.chat_id
+               AND m.sender_user_id = outbound_envelopes.sender_user_id
+               AND m.lamport = outbound_envelopes.lamport
+           )
+     )";
+
 /// The supersession statement. Bindings: `?1` recipient/chat id, `?2` the
 /// authoring (own) user id, `?3` kind, `?4` the lamport of the generation just
 /// authored — strictly greater than every generation it replaces, since the
@@ -407,9 +450,14 @@ pub(crate) fn retire_covered_after_relay_post(
     conn: &Connection,
     msg_id: &[u8],
 ) -> Result<u64, CoreError> {
+    // Only a pairwise row with a contact can ever retire, so a group row or a
+    // group invite skips the watermark lookup and the chat-wide statement.
     let row: Option<(Vec<u8>, Vec<u8>)> = conn
         .query_row(
-            "SELECT chat_id, sender_user_id FROM outbound_envelopes WHERE msg_id = ?1",
+            "SELECT chat_id, sender_user_id FROM outbound_envelopes
+             WHERE msg_id = ?1
+               AND recipient_user_id = chat_id
+               AND EXISTS (SELECT 1 FROM contacts WHERE user_id = outbound_envelopes.chat_id)",
             params![msg_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -612,6 +660,15 @@ mod tests {
             .join(format!("cruisemesh-retire-{tag}-{unique}.sqlite"))
             .to_string_lossy()
             .to_string()
+    }
+
+    /// Deletes a temp store file when the test ends, pass or fail.
+    struct RemoveOnDrop(String);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
     }
 
     /// Everything still queued to `peer` from `me`, by lamport.
@@ -1984,6 +2041,7 @@ mod tests {
     #[test]
     fn the_launch_sweep_also_leaves_unposted_covered_rows_for_the_relay() {
         let path = temp_store_path("holey-sweep");
+        let _cleanup = RemoveOnDrop(path.clone());
         let (store, me, peer, contact) = pairing(&path);
         for body in [&b"lost"[..], b"lost too", b"landed"] {
             author(&store, &me, &contact, KIND_TEXT, body);
@@ -2006,8 +2064,8 @@ mod tests {
 
         let reopened = MessageStore::open(path.clone()).unwrap();
         assert_eq!(relay_candidates(&reopened, &peer), vec![1, 2, 3]);
-        drop(reopened);
-        let _ = std::fs::remove_file(&path);
+        post_everything(&reopened);
+        assert!(queued(&reopened, &me, &peer).is_empty());
     }
 
     /// Posting is not coverage. A row the relay holds but no receipt covers
@@ -2030,5 +2088,80 @@ mod tests {
             .unwrap();
         post_everything(&store);
         assert_eq!(queued(&store, &me, &peer), vec![(2, KIND_TEXT)]);
+    }
+
+    #[test]
+    fn covered_awaiting_relay_sql_names_the_delivered_receipt_type() {
+        assert_eq!(RECEIPT_TYPE_DELIVERED, 1);
+        assert!(COVERED_AWAITING_RELAY_SQL.contains("r.receipt_type = 1"));
+    }
+
+    /// A phone with no relay lane keeps covered rows until expiry. They are
+    /// delivered as far as the person can tell, so the backup screen's
+    /// "pending deliveries from me" must not count them.
+    #[test]
+    fn covered_rows_kept_for_the_relay_are_not_pending_deliveries() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        for body in [&b"one"[..], b"two", b"three"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+        let before = store.backup_inventory(NOW).unwrap();
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                2,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(queued(&store, &me, &peer).len(), 3, "kept for the relay");
+        let after = store.backup_inventory(NOW).unwrap();
+        assert_eq!(
+            after.pending_own_delivery_count + 2,
+            before.pending_own_delivery_count
+        );
+        assert!(after.pending_own_delivery_bytes < before.pending_own_delivery_bytes);
+    }
+
+    /// After a long run on BLE, a backlog the peer already holds must not
+    /// make a new message wait behind it in the uploader.
+    #[test]
+    fn the_uploader_offers_uncovered_rows_before_a_covered_backlog() {
+        let (store, me, peer, contact) = pairing(":memory:");
+        for body in [&b"one"[..], b"two", b"three"] {
+            author(&store, &me, &contact, KIND_TEXT, body);
+        }
+        store
+            .record_receipt(
+                peer.user_id.clone(),
+                me.user_id.clone(),
+                RECEIPT_TYPE_DELIVERED,
+                3,
+                None,
+                None,
+            )
+            .unwrap();
+        author(&store, &me, &contact, KIND_TEXT, b"new");
+        {
+            // The backlog was queued first; make that explicit rather than
+            // leaning on a shared clock tick.
+            let conn = store.conn.lock().expect("store mutex poisoned");
+            conn.execute("UPDATE outbound_envelopes SET queued_at = lamport", [])
+                .unwrap();
+        }
+        let first = store
+            .pending_relay_outbound_envelopes(1, NOW, vec![])
+            .unwrap();
+        assert_eq!(first.iter().map(|e| e.lamport).collect::<Vec<_>>(), vec![4]);
+        // The covered backlog is still offered, after it, oldest first.
+        let all: Vec<u64> = store
+            .pending_relay_outbound_envelopes(10, NOW, vec![])
+            .unwrap()
+            .into_iter()
+            .map(|e| e.lamport)
+            .collect();
+        assert_eq!(all, vec![4, 1, 2, 3]);
     }
 }
