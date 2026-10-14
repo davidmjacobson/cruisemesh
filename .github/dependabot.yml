@@ -10,6 +10,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+    ignore:
+      # AGP majors are deliberate upgrades; the 8.x line is pinned (see #456).
+      - dependency-name: com.android.application
+        update-types: ["version-update:semver-major"]
+      # Pinned to alpha15, see #457.
+      - dependency-name: com.android.tools.screenshot:screenshot-validation-api
+      # Deliberate upgrade pending.
+      - dependency-name: androidx.compose:compose-bom
   - package-ecosystem: github-actions
     directory: /
     schedule:
