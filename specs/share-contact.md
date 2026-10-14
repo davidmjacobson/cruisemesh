@@ -153,7 +153,7 @@ approve it.
 ### Receiving
 
 Scanning a shared code lands on the existing friend confirmation screen, with the introducer line reading "Shared by Mom" and the
-same four fingerprint words and same-name/different-key warning as any other
+same six fingerprint words and same-name/different-key warning as any other
 import. The primary action stays **Add friend**.
 
 An expired card gets a specific, literal message: "This code has expired. Ask

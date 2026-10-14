@@ -43,6 +43,7 @@ mod relay_wire;
 mod revocation;
 mod roster_gossip;
 mod roster_store;
+mod safety_wordlist;
 mod sail_checklist;
 mod semantic;
 mod session;

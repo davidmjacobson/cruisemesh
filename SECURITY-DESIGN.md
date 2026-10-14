@@ -71,11 +71,21 @@ limits.
 - **UserID** = first 16 bytes of BLAKE2b(Ed25519 public key), shown base32
   for out-of-band sharing.
 - **Friending** exchanges names and both public keys via QR code or pasted
-  string, normally in person. Contact cards display a 4-word fingerprint
-  phrase for verbal verification (Signal-safety-number style). Trust is
-  TOFU-with-verification: the QR/string you scanned *is* the key you talk
-  to; verify the phrase aloud if you didn't control the channel.
-- **Card self-signature.** The 4-word fingerprint is derived from the UserID,
+  string, normally in person. Contact cards display a 6-word fingerprint
+  phrase ("safety words") for verbal verification (Signal-safety-number
+  style). Trust is TOFU-with-verification: the QR/string you scanned *is* the
+  key you talk to; verify the phrase aloud if you didn't control the channel.
+  The phrase is six words from the 2048-word BIP-39 English list, taken as
+  six 11-bit chunks of `BLAKE2b-256("cruisemesh-safety-words-v1" ‖ UserID)`
+  (`fingerprint_words`, `core/src/identity.rs`, pinned by a golden vector).
+  That is **66 bits**: forging a signing key whose words match a target's
+  costs ~2^66 hashes, beyond a casual or opportunistic attacker but short of
+  the full 128-bit UserID. Comparing the full `CM-…` UserID is the stronger
+  check for anyone who wants it. (Before this, the phrase was 4 words from a
+  64-word list over the first 4 UserID bytes — only 24 bits, forgeable in
+  about a minute on a laptop; old and new builds therefore show different
+  words for the same person until both sides update.)
+- **Card self-signature.** The 6-word fingerprint is derived from the UserID,
   i.e. from the Ed25519 signing key alone — it does *not* cover the X25519
   agreement key or the relay fields. To stop a key-substitution swap on a
   tamperable sharing channel (a card forwarded as text, with `agree_pk`

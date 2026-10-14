@@ -251,8 +251,10 @@ and the design must remain boring enough to describe in one page.
 - **Friending**: QR code (or pasted string) containing `{name, both public keys,
   optional relay URL, optional relay token}`. Scanning imports the contact and queues a signed
   friend-request envelope back; friendship is mutual once both sides hold each
-  other's keys. Contact card shows a short fingerprint phrase (4 words) for verbal
-  verification, Signal-safety-number style.
+  other's keys. Contact card shows a short fingerprint phrase (6 BIP-39 words,
+  66 bits of a hash of the UserID) for verbal verification,
+  Signal-safety-number style. A match rules out a casually forged key (~2^66
+  work); the full UserID remains the stronger comparison.
 - **Friends-of-friends introductions** can reduce a connected family's
   physical setup from `N(N - 1) / 2` to `N - 1` QR scans. Public contact cards are
   suggested through named mutual friends; the user explicitly adds a suggestion,

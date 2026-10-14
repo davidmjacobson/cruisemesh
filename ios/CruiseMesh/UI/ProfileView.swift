@@ -60,7 +60,7 @@ struct ProfileView: View {
                         Text(fingerprintWords(userId: identity.userId).joined(separator: " "))
                             .font(.body.monospaced())
                             .textSelection(.enabled)
-                        Text("Have your friend match these words against your name in their contacts to confirm it's really you.")
+                        Text("Have your friend match these words against your name in their contacts to confirm it's really you. If the number of words differs, make sure you both have the latest app.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

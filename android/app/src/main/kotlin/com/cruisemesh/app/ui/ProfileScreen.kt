@@ -244,7 +244,7 @@ fun ProfileScreenPreview() {
         ProfileScreen(
             profileUserId = byteArrayOf(1, 2, 3, 4),
             displayId = "CM-K7QX-9M2P-3F8J-QRTZ-AB",
-            fingerprint = listOf("anchor", "beacon", "coral", "dock"),
+            fingerprint = listOf("task", "climb", "bamboo", "mix", "history", "salmon"),
             onShowMyQr = {},
             onBack = {},
         )
