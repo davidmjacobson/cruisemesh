@@ -5,17 +5,39 @@
 //! envelopes reuse the same authenticated inner layout as 1:1 traffic
 //! (`sender_sign_pk || signature || payload`, padded to 256-byte buckets),
 //! but replace the outer `crypto_box` seal with symmetric XChaCha20-Poly1305.
+//!
+//! From group envelope version 2 the signature covers a transcript under the
+//! group domain, bound to the group id ([`crate::crypto::SignatureBinding`]),
+//! so a group body cannot be replayed as a pairwise body or into another
+//! group. The same open-both, seal-legacy-for-one-release rollout as the
+//! pairwise seal applies, flipped by the same constant
+//! ([`crate::crypto::SEAL_BOUND_SIGNATURE`]); see `crypto.rs`.
 
 use chacha20poly1305::aead::{Aead, AeadCore};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
 use rand_core::{OsRng, RngCore};
 
-use crate::crypto::{key_len_err, open_signed_payload, sign_and_pad};
+use crate::crypto::{key_len_err, open_signed_payload, sign_and_pad, SignatureBinding};
 use crate::{CoreError, Identity};
 
 const GROUP_ID_LEN: usize = 16;
 const GROUP_KEY_LEN: usize = 32;
-const GROUP_ENVELOPE_VERSION: u8 = 1;
+/// Legacy group envelope: the signature covers the bare payload. Opening
+/// only, under the same removal conditions as `crypto.rs`'s
+/// `ENVELOPE_VERSION_LEGACY`.
+const GROUP_ENVELOPE_VERSION_LEGACY: u8 = 1;
+/// Current group envelope: the signature is domain-separated from pairwise
+/// bodies and bound to the group id.
+const GROUP_ENVELOPE_VERSION_BOUND: u8 = 2;
+/// The group envelope version this build seals: held at the legacy version
+/// for one release so members on builds that predate version 2 keep reading
+/// the group. Derived from [`crate::crypto::SEAL_BOUND_SIGNATURE`], the one
+/// flip shared with the pairwise seal (issue #497).
+const SEAL_GROUP_ENVELOPE_VERSION: u8 = if crate::crypto::SEAL_BOUND_SIGNATURE {
+    GROUP_ENVELOPE_VERSION_BOUND
+} else {
+    GROUP_ENVELOPE_VERSION_LEGACY
+};
 const GROUP_NONCE_LEN: usize = 24;
 const GROUP_METADATA_VERSION: u8 = 1;
 const USER_ID_LEN: usize = 16;
@@ -314,17 +336,39 @@ pub fn seal_group_message(
     group: Group,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, CoreError> {
-    validate_group(&group)?;
+    seal_group_message_as_version(&sender, &group, &payload, SEAL_GROUP_ENVELOPE_VERSION)
+}
+
+/// [`seal_group_message`] at an explicit envelope version. Private so the
+/// rollout step stays one constant; tests use it to exercise both versions.
+fn seal_group_message_as_version(
+    sender: &Identity,
+    group: &Group,
+    payload: &[u8],
+    version: u8,
+) -> Result<Vec<u8>, CoreError> {
+    validate_group(group)?;
+    let binding = match version {
+        GROUP_ENVELOPE_VERSION_LEGACY => SignatureBinding::Legacy,
+        GROUP_ENVELOPE_VERSION_BOUND => SignatureBinding::Group {
+            group_id: &group.id,
+        },
+        other => {
+            return Err(CoreError::Crypto(format!(
+                "cannot seal group envelope version {other}"
+            )))
+        }
+    };
     let key = group_key_from_bytes(&group.key)?;
     let cipher = XChaCha20Poly1305::new(&key);
     let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let padded = sign_and_pad(&sender, &payload)?;
+    let padded = sign_and_pad(sender, binding, payload)?;
     let ciphertext = cipher
         .encrypt(&nonce, padded.as_slice())
         .map_err(|_| CoreError::Crypto("group seal failed".to_string()))?;
 
     let mut envelope = Vec::with_capacity(1 + GROUP_NONCE_LEN + ciphertext.len());
-    envelope.push(GROUP_ENVELOPE_VERSION);
+    envelope.push(version);
     envelope.extend_from_slice(nonce.as_slice());
     envelope.extend_from_slice(&ciphertext);
     Ok(envelope)
@@ -353,10 +397,10 @@ pub fn open_group_message(
         return Err(CoreError::Crypto("group envelope too short".to_string()));
     }
     let (version, rest) = sealed.split_at(1);
-    if version[0] != GROUP_ENVELOPE_VERSION {
+    let version = version[0];
+    if version != GROUP_ENVELOPE_VERSION_LEGACY && version != GROUP_ENVELOPE_VERSION_BOUND {
         return Err(CoreError::Crypto(format!(
-            "unsupported group envelope version {} (this client speaks {GROUP_ENVELOPE_VERSION})",
-            version[0]
+            "unsupported group envelope version {version} (this client opens {GROUP_ENVELOPE_VERSION_LEGACY} and {GROUP_ENVELOPE_VERSION_BOUND})"
         )));
     }
     let (nonce_bytes, ciphertext) = rest.split_at(GROUP_NONCE_LEN);
@@ -366,7 +410,17 @@ pub fn open_group_message(
     let padded = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|_| CoreError::Crypto("group open failed".to_string()))?;
-    open_signed_payload(&padded)
+    // Bound to the group this device opened with, never to anything the
+    // envelope says; a version-2 envelope is never checked under the legacy
+    // rule.
+    let binding = if version == GROUP_ENVELOPE_VERSION_BOUND {
+        SignatureBinding::Group {
+            group_id: &group.id,
+        }
+    } else {
+        SignatureBinding::Legacy
+    };
+    open_signed_payload(&padded, binding)
 }
 
 pub(crate) fn validate_group(group: &Group) -> Result<(), CoreError> {
@@ -748,5 +802,117 @@ mod tests {
 
         let err = open_group_message(group, sealed).unwrap_err();
         assert!(matches!(err, CoreError::Crypto(_)));
+    }
+
+    fn group_encrypt_padded(group: &Group, padded: &[u8], version: u8) -> Vec<u8> {
+        let cipher = XChaCha20Poly1305::new(&group_key_from_bytes(&group.key).unwrap());
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let mut out = vec![version];
+        out.extend_from_slice(nonce.as_slice());
+        out.extend_from_slice(&cipher.encrypt(&nonce, padded).unwrap());
+        out
+    }
+
+    fn group_decrypt_padded(group: &Group, sealed: &[u8]) -> Vec<u8> {
+        let cipher = XChaCha20Poly1305::new(&group_key_from_bytes(&group.key).unwrap());
+        let nonce = *XNonce::from_slice(&sealed[1..1 + GROUP_NONCE_LEN]);
+        cipher
+            .decrypt(&nonce, &sealed[1 + GROUP_NONCE_LEN..])
+            .unwrap()
+    }
+
+    fn other_group() -> Group {
+        Group {
+            id: vec![0x44; GROUP_ID_LEN],
+            key: vec![0x55; GROUP_KEY_LEN],
+            ..sample_group()
+        }
+    }
+
+    #[test]
+    fn default_group_seal_uses_the_rollout_version() {
+        let alice = generate_identity();
+        let sealed = seal_group_message(alice, sample_group(), b"hi".to_vec()).unwrap();
+        assert_eq!(sealed[0], SEAL_GROUP_ENVELOPE_VERSION);
+    }
+
+    #[test]
+    fn bound_group_envelope_round_trips_and_identifies_sender() {
+        let alice = generate_identity();
+        let group = sample_group();
+        let sealed = seal_group_message_as_version(
+            &alice,
+            &group,
+            b"group dinner at 7",
+            GROUP_ENVELOPE_VERSION_BOUND,
+        )
+        .unwrap();
+        assert_eq!(sealed[0], GROUP_ENVELOPE_VERSION_BOUND);
+        let opened = open_group_message(group, sealed).unwrap();
+        assert_eq!(opened.payload, b"group dinner at 7");
+        assert_eq!(opened.sender_user_id, alice.user_id);
+    }
+
+    /// A member of two groups cannot lift a signed body out of one and replay
+    /// it into the other as the original author.
+    #[test]
+    fn bound_group_body_moved_into_another_group_fails_signature() {
+        let alice = generate_identity();
+        let first = sample_group();
+        let second = other_group();
+        let sealed = seal_group_message_as_version(
+            &alice,
+            &first,
+            b"for the first group",
+            GROUP_ENVELOPE_VERSION_BOUND,
+        )
+        .unwrap();
+        let padded = group_decrypt_padded(&first, &sealed);
+
+        for version in [GROUP_ENVELOPE_VERSION_BOUND, GROUP_ENVELOPE_VERSION_LEGACY] {
+            let moved = group_encrypt_padded(&second, &padded, version);
+            let err = open_group_message(second.clone(), moved).unwrap_err();
+            assert!(matches!(err, CoreError::SignatureInvalid), "{err:?}");
+        }
+    }
+
+    /// Domain separation: a body signed for a pairwise recipient never verifies
+    /// as a group body, even in a group whose id is that recipient's key bytes.
+    #[test]
+    fn pairwise_bound_body_in_a_group_envelope_fails_signature() {
+        let alice = generate_identity();
+        let group = sample_group();
+        let padded = sign_and_pad(
+            &alice,
+            SignatureBinding::Pairwise {
+                recipient_agree_pk: &group.id,
+            },
+            b"pairwise",
+        )
+        .unwrap();
+        let sealed = group_encrypt_padded(&group, &padded, GROUP_ENVELOPE_VERSION_BOUND);
+        let err = open_group_message(group, sealed).unwrap_err();
+        assert!(matches!(err, CoreError::SignatureInvalid), "{err:?}");
+    }
+
+    /// A group envelope built the way pre-version-2 builds built it still opens.
+    #[test]
+    fn group_envelope_from_a_pre_binding_build_still_opens() {
+        use ed25519_dalek::Signer;
+
+        let alice = generate_identity();
+        let group = sample_group();
+        let payload = b"sent from an older build";
+        let signature = crate::crypto::signing_key_from_bytes(&alice.sign_sk)
+            .unwrap()
+            .sign(payload);
+        let mut body = alice.sign_pk.clone();
+        body.extend_from_slice(&signature.to_bytes());
+        body.extend_from_slice(payload);
+        let sealed = group_encrypt_padded(&group, &crate::crypto::pad_to_bucket(&body), 1);
+
+        let opened = open_group_message(group, sealed).unwrap();
+        assert_eq!(opened.payload, payload);
+        assert_eq!(opened.sender_user_id, alice.user_id);
     }
 }
