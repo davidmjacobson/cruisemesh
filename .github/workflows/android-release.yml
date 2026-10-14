@@ -51,12 +51,17 @@ on:
           - "yes"
         default: "no"
 
+# Least privilege for GITHUB_TOKEN: every job reads the repo and nothing
+# else unless it asks for more at job level.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    # contents: write is needed only by `gh release create` below.
+    permissions:
+      contents: write
     env:
       # The one switch every publishing step gates on. A tag push is, by
       # definition, a request to distribute; a manual run is a rehearsal unless
@@ -78,7 +83,7 @@ jobs:
       # to the same file (it reads this variable itself).
       CRUISEMESH_PROVENANCE_FILE: ${{ github.workspace }}/release-provenance.txt
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # --- Release intent ---------------------------------------------------
       # Decide, before anything is built, whether this run publishes. If it
@@ -153,19 +158,19 @@ jobs:
         run: bash tools/assert_release_tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           # core/build-android.sh cross-compiles for these three ABIs via
           # cargo-ndk (arm64-v8a, armeabi-v7a, x86_64 -- see that script's
           # header comment for the authoritative list).
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: temurin
           java-version: "17"
@@ -177,7 +182,7 @@ jobs:
       # $ANDROID_HOME/ndk otherwise).
       - name: Install Android NDK
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
         with:
           ndk-version: r27c
           local-cache: true
@@ -410,7 +415,7 @@ jobs:
       - name: Upload provenance artifact
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-provenance-${{ github.ref_name }}
           path: ${{ github.workspace }}/release-provenance.txt

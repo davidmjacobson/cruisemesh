@@ -16,6 +16,11 @@ on:
     # Longer nightly run to actually explore, not just smoke-build.
     - cron: "0 5 * * *"
 
+# Least privilege for GITHUB_TOKEN: every job reads the repo and nothing
+# else unless it asks for more at job level.
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -29,15 +34,15 @@ jobs:
           - noise_handshake
           - backup_wire
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust nightly
         id: nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
       # FR9: caches cargo's registry/git indexes and the `fuzz/` crate's own
       # target dir (a separate, non-workspace crate -- see fuzz/Cargo.toml).
       # Every matrix job previously cold-compiled cruisemesh-core + all its
       # deps from scratch.
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz
           # One cache lineage per fuzz target so ble_reassembly's build
@@ -45,7 +50,7 @@ jobs:
           # cold-cache state before this).
           key: ${{ matrix.target }}
       - name: Cache cargo-fuzz
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-fuzz
           # FR9: was a single never-invalidating key -- a cargo-fuzz binary
@@ -73,7 +78,7 @@ jobs:
       # step always writes a fresh entry); restore-keys falls back to the
       # most recent previous entry for this target via prefix match.
       - name: Cache fuzz corpus
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -94,7 +99,7 @@ jobs:
             -max_total_time=$SECONDS_TO_RUN -rss_limit_mb=4096
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
