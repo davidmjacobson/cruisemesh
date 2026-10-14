@@ -16,7 +16,12 @@ final class AppModel: ObservableObject {
     @Published var pendingRelayCard: String?
     /// A tapped LAN address link waiting for the person's answer. See
     /// `LanEndpointLinkDecision` for why a link never dials on its own.
-    @Published var lanLinkDecision: LanEndpointLinkDecision?
+    @Published private(set) var pendingLanLink: LanManualEndpoint?
+    /// What `pendingLanLink` may do right now, re-derived whenever the mesh
+    /// or this phone's Wi-Fi address changes. A link opened while the mesh is
+    /// still coming up therefore turns into a question once the listener has
+    /// an address, instead of staying a "not on Wi-Fi" refusal.
+    @Published private(set) var lanLinkDecision: LanEndpointLinkDecision?
 
     init() {
         try? BackupService.installPendingRestoreIfNeeded()
@@ -26,6 +31,7 @@ final class AppModel: ObservableObject {
         self.displayName = ProfileStore.loadDisplayName()
         self.pendingFriendToken = nil
         self.pendingRelayCard = nil
+        self.pendingLanLink = nil
         self.lanLinkDecision = nil
         if UITestConfiguration.isEnabled {
             self.meshEnabled = false
@@ -37,6 +43,16 @@ final class AppModel: ObservableObject {
         if !UITestConfiguration.isEnabled {
             MeshController.shared.configure(identity: id)
         }
+        // `LanTransportDiagnostics` publishes on the main queue (see its
+        // `publish`), so this lands on the main actor without a hop.
+        Publishers.CombineLatest3($pendingLanLink, $meshEnabled, LanTransportDiagnostics.shared.$snapshot)
+            .map { endpoint, meshEnabled, snapshot in
+                endpoint.map {
+                    Self.decideLanLink($0, meshEnabled: meshEnabled, snapshot: snapshot)
+                }
+            }
+            .removeDuplicates()
+            .assign(to: &$lanLinkDecision)
     }
 
     func startMesh() {
@@ -62,31 +78,46 @@ final class AppModel: ObservableObject {
         MeshController.shared.stop()
     }
 
-    /// A LAN address link arrived: decide what it may do and show that.
+    /// A LAN address link arrived: hold it and show what it may do.
     /// Nothing is dialed and the mesh is never started from here.
     func handleLanEndpointLink(_ endpoint: LanManualEndpoint) {
-        lanLinkDecision = currentLanLinkDecision(endpoint)
+        pendingLanLink = endpoint
     }
 
     /// The person said yes to the address. Ask again at that moment: the mesh
-    /// or the Wi-Fi network may have changed while the alert was open.
-    func confirmLanEndpointLink(_ endpoint: LanManualEndpoint) {
-        let current = currentLanLinkDecision(endpoint)
-        guard case let .confirm(confirmed) = current else {
-            // The alert is dismissing itself as this runs; show the reason
-            // once it has gone rather than having the dismissal clear it.
-            DispatchQueue.main.async { [weak self] in self?.lanLinkDecision = current }
-            return
-        }
-        lanLinkDecision = nil
+    /// or the Wi-Fi network may have changed since the alert last drew. A
+    /// changed answer keeps the link, so the alert shows the reason instead.
+    func confirmLanEndpointLink() {
+        guard let endpoint = pendingLanLink,
+              case let .confirm(confirmed) = Self.decideLanLink(
+                  endpoint,
+                  meshEnabled: meshEnabled,
+                  snapshot: LanTransportDiagnostics.shared.snapshot
+              )
+        else { return }
+        pendingLanLink = nil
         LanTransportDiagnostics.shared.queueManualConnection(confirmed)
     }
 
-    private func currentLanLinkDecision(_ endpoint: LanManualEndpoint) -> LanEndpointLinkDecision {
+    /// The confirm alert (`fromConfirmAlert`) or the refusal alert went away
+    /// (Cancel, Close, Connect, or a tap outside). Drop the link only if that
+    /// alert still matches the current answer; when the answer has changed
+    /// underneath it, the other alert takes over and must keep the link.
+    func dismissLanEndpointLink(fromConfirmAlert: Bool) {
+        guard let current = lanLinkDecision, current.isConfirm == fromConfirmAlert else { return }
+        pendingLanLink = nil
+    }
+
+    nonisolated private static func decideLanLink(
+        _ endpoint: LanManualEndpoint,
+        meshEnabled: Bool,
+        snapshot: LanTransportSnapshot
+    ) -> LanEndpointLinkDecision {
         decideLanEndpointLink(
             endpoint,
-            meshRunning: meshEnabled && !UITestConfiguration.isEnabled,
-            localEndpoint: LanTransportDiagnostics.shared.snapshot.localEndpoint
+            meshRunning: meshEnabled,
+            localEndpoint: snapshot.localEndpoint,
+            localPrefixLength: snapshot.localPrefixLength
         )
     }
 

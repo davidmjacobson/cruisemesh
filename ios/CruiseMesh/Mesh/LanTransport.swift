@@ -561,7 +561,7 @@ final class LanTransport {
         guard let port = listener?.port else { return }
         let endpoint = LanManualEndpoint(host: network.address, port: port.rawValue)
         let networkId = lanNetworkId(ipv4Address: network.address)
-        diagnostics.listening(localEndpoint: endpoint.display)
+        diagnostics.listening(localEndpoint: endpoint.display, prefixLength: network.prefixLength)
         if endpoint != announcedEndpoint || networkId != announcedNetworkId {
             announcedEndpoint = endpoint
             announcedNetworkId = networkId

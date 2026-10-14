@@ -176,9 +176,9 @@ pub use lan_util::{
     core_lan_own_device_search_since, core_lan_own_device_search_window_ms,
     core_lan_reconnect_target_is_exhausted, core_lan_scan_gate_open, core_make_lan_endpoint_link,
     core_parse_lan_endpoint, core_parse_lan_endpoint_link, core_subnet_24_hosts,
-    lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local, lan_hosts_are_same_address,
-    lan_hosts_share_local_network, should_resend_lan_endpoint, CoreLanEndpoint,
-    LAN_OWN_DEVICE_SEARCH_WINDOW_MS,
+    lan_endpoint_cache_is_fresh, lan_endpoint_host_is_local, lan_host_is_on_local_subnet,
+    lan_hosts_are_same_address, lan_hosts_share_local_network, should_resend_lan_endpoint,
+    CoreLanEndpoint, LAN_OWN_DEVICE_SEARCH_WINDOW_MS,
 };
 pub use late_arrival::{
     core_late_arrival_flags, late_arrival_flags, LateArrivalInput, LATE_ARRIVAL_MIN_DELAY_MS,

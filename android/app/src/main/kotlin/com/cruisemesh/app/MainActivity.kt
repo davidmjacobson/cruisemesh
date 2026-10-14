@@ -38,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -110,6 +111,7 @@ import com.cruisemesh.app.mesh.ContactReachability
 import com.cruisemesh.app.mesh.LanEndpointLinkDecision
 import com.cruisemesh.app.mesh.LanManualEndpoint
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
+import com.cruisemesh.app.mesh.LanTransportSnapshot
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
@@ -302,8 +304,12 @@ fun CruiseMeshApp(
     }
     val navController = rememberNavController()
     // A tapped LAN address link waits here for the person's answer; see
-    // [LanEndpointLinkDecision] for why a link never dials on its own.
-    var lanLinkDecision by remember { mutableStateOf<LanEndpointLinkDecision?>(null) }
+    // [LanEndpointLinkDecision] for why a link never dials on its own. Only the
+    // address is held (saved across rotation, since the deep link itself is
+    // already consumed); the decision is derived from live mesh and Wi-Fi
+    // state, so a link opened while the mesh is still starting turns into a
+    // question once the phone has its Wi-Fi address.
+    var pendingLanLink by rememberSaveable { mutableStateOf<String?>(null) }
     var termsAccepted by remember {
         mutableStateOf(TermsAcceptanceStore.isCurrentVersionAccepted(context))
     }
@@ -571,7 +577,7 @@ fun CruiseMeshApp(
         }
         link.lanEndpoint?.let { endpointText ->
             val endpoint = parseLanManualEndpoint(endpointText, lanDefaultTcpPort().toInt())
-            if (endpoint != null) lanLinkDecision = currentLanEndpointLinkDecision(endpoint)
+            if (endpoint != null) pendingLanLink = endpoint.display
             onPendingDeepLinkConsumed()
             return@LaunchedEffect
         }
@@ -583,31 +589,43 @@ fun CruiseMeshApp(
         onPendingDeepLinkConsumed()
     }
 
-    lanLinkDecision?.let { decision ->
+    // The held text is an endpoint this code already parsed, so it re-parses.
+    pendingLanLink?.let { parseLanManualEndpoint(it, lanDefaultTcpPort().toInt()) }?.let { endpoint ->
+        val meshState by MeshRuntimeStatus.state.collectAsState()
+        val lanState by LanTransportDiagnostics.state.collectAsState()
+        val decision = lanEndpointLinkDecision(endpoint, meshState, lanState)
         LanEndpointLinkDialog(
             decision = decision,
             onConnect = {
                 // Ask again at the moment of the yes: the mesh or the Wi-Fi
-                // network may have changed while the dialog was open.
-                val current = currentLanEndpointLinkDecision(decision.endpoint)
+                // network may have changed since the dialog last drew. A
+                // changed answer simply redraws the dialog with the reason.
+                val current = lanEndpointLinkDecision(
+                    endpoint,
+                    MeshRuntimeStatus.state.value,
+                    LanTransportDiagnostics.state.value,
+                )
                 if (current is LanEndpointLinkDecision.Confirm) {
-                    lanLinkDecision = null
+                    pendingLanLink = null
                     LanTransportDiagnostics.queueManualConnection(current.endpoint)
                     navController.navigate("profile") { launchSingleTop = true }
-                } else {
-                    lanLinkDecision = current
                 }
             },
-            onDismiss = { lanLinkDecision = null },
+            onDismiss = { pendingLanLink = null },
         )
     }
 }
 
-private fun currentLanEndpointLinkDecision(endpoint: LanManualEndpoint): LanEndpointLinkDecision =
+private fun lanEndpointLinkDecision(
+    endpoint: LanManualEndpoint,
+    meshState: MeshRuntimeState,
+    lanState: LanTransportSnapshot,
+): LanEndpointLinkDecision =
     decideLanEndpointLink(
         endpoint = endpoint,
-        meshRunning = MeshRuntimeStatus.state.value != MeshRuntimeState.STOPPED,
-        localEndpoint = LanTransportDiagnostics.state.value.localEndpoint,
+        meshRunning = meshState != MeshRuntimeState.STOPPED,
+        localEndpoint = lanState.localEndpoint,
+        localPrefixLength = lanState.localPrefixLength,
     )
 
 /**

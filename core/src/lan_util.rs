@@ -118,6 +118,61 @@ pub fn lan_hosts_share_local_network(local_host: String, candidate_host: String)
     routable_ipv6_prefix_64(&candidate_host).is_some_and(|candidate| candidate == local)
 }
 
+/// Whether `candidate_host` is on the subnet this phone's own interface
+/// reports: `local_host/prefix_length`, as the platform hands it out.
+///
+/// [`lan_hosts_share_local_network`] answers a narrower question with a fixed
+/// IPv4 /24, because a cache fingerprint must not depend on the netmask. A
+/// person-facing "is this address on my Wi-Fi?" check needs the real subnet
+/// instead: a ship's /16 is one network, and two phones in different /24s of
+/// it can reach each other directly.
+///
+/// Both hosts must be address literals of the same family (brackets and an
+/// interface zone are tolerated). IPv6 link-local, loopback and unspecified
+/// addresses answer `false`, as in [`lan_hosts_share_local_network`]: a match
+/// there is no evidence. A prefix of zero, or one longer than the family
+/// allows, also answers `false`.
+#[uniffi::export]
+pub fn lan_host_is_on_local_subnet(
+    local_host: String,
+    prefix_length: u8,
+    candidate_host: String,
+) -> bool {
+    use std::net::IpAddr;
+    let (Some(local), Some(candidate)) = (
+        normalized_lan_ip(&local_host),
+        normalized_lan_ip(&candidate_host),
+    ) else {
+        return false;
+    };
+    match (local, candidate) {
+        (IpAddr::V4(local), IpAddr::V4(candidate)) => {
+            if prefix_length == 0 || prefix_length > 32 {
+                return false;
+            }
+            let mask = u32::MAX << (32 - u32::from(prefix_length));
+            u32::from(local) & mask == u32::from(candidate) & mask
+        }
+        (IpAddr::V6(local), IpAddr::V6(candidate)) => {
+            if prefix_length == 0 || prefix_length > 128 {
+                return false;
+            }
+            let fingerprints = |address: std::net::Ipv6Addr| {
+                let octets = address.octets();
+                !(address.is_loopback()
+                    || address.is_unspecified()
+                    || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80))
+            };
+            if !fingerprints(local) || !fingerprints(candidate) {
+                return false;
+            }
+            let mask = u128::MAX << (128 - u32::from(prefix_length));
+            u128::from(local) & mask == u128::from(candidate) & mask
+        }
+        _ => false,
+    }
+}
+
 /// Whether two LAN host literals identify the same network address.
 ///
 /// This is intentionally stricter than "same network": it is the shared
@@ -734,6 +789,79 @@ mod tests {
             "192.168.86.31".into(),
             "192.168.86.31".into()
         ));
+    }
+
+    #[test]
+    fn local_subnet_check_uses_the_interface_prefix() {
+        // The cruise-ship case: one /16 Wi-Fi network, two different /24s.
+        assert!(lan_host_is_on_local_subnet(
+            "10.20.3.15".into(),
+            16,
+            "10.20.97.4".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "10.20.3.15".into(),
+            16,
+            "10.21.3.15".into()
+        ));
+        // A /24 network still refuses its neighbour.
+        assert!(!lan_host_is_on_local_subnet(
+            "192.168.86.31".into(),
+            24,
+            "192.168.87.23".into()
+        ));
+        assert!(lan_host_is_on_local_subnet(
+            "192.168.86.31".into(),
+            24,
+            "192.168.86.23".into()
+        ));
+        // A narrower-than-/24 network is honoured too.
+        assert!(!lan_host_is_on_local_subnet(
+            "192.168.86.31".into(),
+            26,
+            "192.168.86.200".into()
+        ));
+        // Nonsense prefixes and mixed or unparseable hosts say no.
+        assert!(!lan_host_is_on_local_subnet(
+            "10.0.0.1".into(),
+            0,
+            "8.8.8.8".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "10.0.0.1".into(),
+            33,
+            "10.0.0.2".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "10.0.0.1".into(),
+            24,
+            "fd00::1".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "10.0.0.1".into(),
+            24,
+            "phone.local".into()
+        ));
+    }
+
+    #[test]
+    fn local_subnet_check_handles_ipv6_and_ignores_link_local() {
+        assert!(lan_host_is_on_local_subnet(
+            "2001:db8:1:2::31".into(),
+            64,
+            "[2001:db8:1:2::23]".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "2001:db8:1:2::31".into(),
+            64,
+            "2001:db8:1:3::23".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet(
+            "fe80::1%wlan0".into(),
+            64,
+            "fe80::2".into()
+        ));
+        assert!(!lan_host_is_on_local_subnet("::1".into(), 64, "::1".into()));
     }
 
     #[test]

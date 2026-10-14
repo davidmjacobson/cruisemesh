@@ -37,7 +37,7 @@ class LanEndpointLinkTest {
             endpoint = peer,
             meshRunning = false,
             localEndpoint = "192.168.86.31:45892",
-            sameNetwork = { _, _ -> compared = true; true },
+            sameNetwork = { _, _, _ -> compared = true; true },
         )
 
         assertEquals(LanEndpointLinkDecision.MeshOff(peer), decision)
@@ -70,6 +70,40 @@ class LanEndpointLinkTest {
         assertEquals(
             LanEndpointLinkDecision.OtherNetwork(named),
             decideLanEndpointLink(named, meshRunning = true, localEndpoint = "192.168.86.31:45892"),
+        )
+    }
+
+    /**
+     * A ship's Wi-Fi is often one /16: two phones in different /24s of it are
+     * on the same network, so the interface's real prefix decides.
+     */
+    @Test
+    fun linkAcrossA24InsideTheLocal16AsksBeforeConnecting() {
+        val shipPeer = LanManualEndpoint("10.20.97.4", 45_892)
+        assertEquals(
+            LanEndpointLinkDecision.Confirm(shipPeer),
+            decideLanEndpointLink(
+                shipPeer,
+                meshRunning = true,
+                localEndpoint = "10.20.3.15:45892",
+                localPrefixLength = 16,
+            ),
+        )
+        // Without a reported prefix the fixed /24 still refuses it.
+        assertEquals(
+            LanEndpointLinkDecision.OtherNetwork(shipPeer),
+            decideLanEndpointLink(shipPeer, meshRunning = true, localEndpoint = "10.20.3.15:45892"),
+        )
+        // And outside the /16 it is another network.
+        val outside = LanManualEndpoint("10.21.3.4", 45_892)
+        assertEquals(
+            LanEndpointLinkDecision.OtherNetwork(outside),
+            decideLanEndpointLink(
+                outside,
+                meshRunning = true,
+                localEndpoint = "10.20.3.15:45892",
+                localPrefixLength = 16,
+            ),
         )
     }
 

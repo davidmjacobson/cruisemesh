@@ -215,7 +215,7 @@ func subnet24Hosts(localAddress: String) -> [String] {
 /// the whole gate. The cost is that a link to a peer on a routed, different
 /// subnet is refused; such a peer is still reached through the contact's own
 /// hint once both phones are friends.
-enum LanEndpointLinkDecision: Equatable, Identifiable {
+enum LanEndpointLinkDecision: Equatable {
     /// The mesh is off. The link names the address but turns nothing on.
     case meshOff(LanManualEndpoint)
     /// This phone has no Wi-Fi address to compare the link against.
@@ -233,33 +233,44 @@ enum LanEndpointLinkDecision: Equatable, Identifiable {
         }
     }
 
-    var id: String {
-        switch self {
-        case .meshOff: return "meshOff:\(endpoint.display)"
-        case .noWifi: return "noWifi:\(endpoint.display)"
-        case .otherNetwork: return "otherNetwork:\(endpoint.display)"
-        case .confirm: return "confirm:\(endpoint.display)"
-        }
+    /// Whether this decision offers to connect, as opposed to a refusal.
+    var isConfirm: Bool {
+        if case .confirm = self { return true }
+        return false
     }
 }
 
 /// Decide what `endpoint` from a link may do. `localEndpoint` is this phone's
 /// own published LAN endpoint (`host:port`, IPv6 bracketed), or nil when it
-/// has none. The same-network test is the shared core's
-/// `lanHostsShareLocalNetwork`; `sameNetwork` is only a seam for tests.
+/// has none; `localPrefixLength` is the subnet prefix its interface reports,
+/// or nil when none was read. With a prefix the test is the shared core's
+/// `lanHostIsOnLocalSubnet`, so a ship's /16 counts as one network; without
+/// one it falls back to `lanHostsShareLocalNetwork` (IPv4 /24, IPv6 /64).
+/// `sameNetwork` is only a seam for tests.
 func decideLanEndpointLink(
     _ endpoint: LanManualEndpoint,
     meshRunning: Bool,
     localEndpoint: String?,
-    sameNetwork: (_ localHost: String, _ candidateHost: String) -> Bool = {
-        lanHostsShareLocalNetwork(localHost: $0, candidateHost: $1)
-    }
+    localPrefixLength: Int? = nil,
+    sameNetwork: (_ localHost: String, _ prefixLength: Int?, _ candidateHost: String) -> Bool =
+        lanHostOnLocalNetwork
 ) -> LanEndpointLinkDecision {
     guard meshRunning else { return .meshOff(endpoint) }
     // The port is irrelevant to the comparison; any valid one parses the host.
     guard let localEndpoint,
           let localHost = parseLanManualEndpoint(localEndpoint, defaultPort: 1)?.host
     else { return .noWifi(endpoint) }
-    guard sameNetwork(localHost, endpoint.host) else { return .otherNetwork(endpoint) }
+    guard sameNetwork(localHost, localPrefixLength, endpoint.host) else { return .otherNetwork(endpoint) }
     return .confirm(endpoint)
+}
+
+func lanHostOnLocalNetwork(_ localHost: String, _ prefixLength: Int?, _ candidateHost: String) -> Bool {
+    guard let prefixLength, (1...128).contains(prefixLength) else {
+        return lanHostsShareLocalNetwork(localHost: localHost, candidateHost: candidateHost)
+    }
+    return lanHostIsOnLocalSubnet(
+        localHost: localHost,
+        prefixLength: UInt8(prefixLength),
+        candidateHost: candidateHost
+    )
 }

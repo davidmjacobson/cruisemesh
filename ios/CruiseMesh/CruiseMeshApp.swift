@@ -152,20 +152,25 @@ struct CruiseMeshApp: App {
                     return
                 }
             }
+            // Two alerts, not one alert whose content changes: a Connect
+            // tap that finds the answer has changed must not have the
+            // confirm alert's own dismissal wipe the refusal that replaces it.
+            .alert(
+                Text("Connect to this address?"),
+                isPresented: lanLinkAlertBinding(confirm: true),
+                presenting: appModel.lanLinkDecision
+            ) { _ in
+                Button("Connect") { appModel.confirmLanEndpointLink() }
+                Button("Cancel", role: .cancel) {}
+            } message: { decision in
+                lanLinkMessage(decision)
+            }
             .alert(
                 lanLinkTitle(appModel.lanLinkDecision),
-                isPresented: Binding(
-                    get: { appModel.lanLinkDecision != nil },
-                    set: { presented in if !presented { appModel.lanLinkDecision = nil } }
-                ),
+                isPresented: lanLinkAlertBinding(confirm: false),
                 presenting: appModel.lanLinkDecision
-            ) { decision in
-                if case .confirm = decision {
-                    Button("Connect") { appModel.confirmLanEndpointLink(decision.endpoint) }
-                    Button("Cancel", role: .cancel) {}
-                } else {
-                    Button("Close", role: .cancel) {}
-                }
+            ) { _ in
+                Button("Close", role: .cancel) {}
             } message: { decision in
                 lanLinkMessage(decision)
             }
@@ -178,6 +183,25 @@ struct CruiseMeshApp: App {
                 DiagnosticLogExport.archiveCurrentSession()
             }
         }
+    }
+}
+
+extension CruiseMeshApp {
+    /// Presents the confirm alert (`confirm: true`) or the refusal alert for
+    /// the pending LAN link. A link waits, like Android's, until setup is
+    /// done: no alert over the terms, permissions or onboarding screens.
+    fileprivate func lanLinkAlertBinding(confirm: Bool) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard termsAccepted, !deviceRemoval.removed, firstRun == .home,
+                      let decision = appModel.lanLinkDecision else { return false }
+                return decision.isConfirm == confirm
+            },
+            set: { presented in
+                guard !presented else { return }
+                appModel.dismissLanEndpointLink(fromConfirmAlert: confirm)
+            }
+        )
     }
 }
 

@@ -22,7 +22,7 @@ final class LanEndpointLinkDecisionTests: XCTestCase {
             peer,
             meshRunning: false,
             localEndpoint: localEndpoint,
-            sameNetwork: { _, _ in
+            sameNetwork: { _, _, _ in
                 compared = true
                 return true
             }
@@ -56,6 +56,36 @@ final class LanEndpointLinkDecisionTests: XCTestCase {
         XCTAssertEqual(
             decideLanEndpointLink(named, meshRunning: true, localEndpoint: localEndpoint),
             .otherNetwork(named)
+        )
+    }
+
+    /// A ship's Wi-Fi is often one /16: two phones in different /24s of it are
+    /// on the same network, so the interface's real prefix decides.
+    func testLinkAcrossA24InsideTheLocal16AsksBeforeConnecting() {
+        let shipPeer = LanManualEndpoint(host: "10.20.97.4", port: 45_892)
+        XCTAssertEqual(
+            decideLanEndpointLink(
+                shipPeer,
+                meshRunning: true,
+                localEndpoint: "10.20.3.15:45892",
+                localPrefixLength: 16
+            ),
+            .confirm(shipPeer)
+        )
+        // Without a reported prefix the fixed /24 still refuses it.
+        XCTAssertEqual(
+            decideLanEndpointLink(shipPeer, meshRunning: true, localEndpoint: "10.20.3.15:45892"),
+            .otherNetwork(shipPeer)
+        )
+        let outside = LanManualEndpoint(host: "10.21.3.4", port: 45_892)
+        XCTAssertEqual(
+            decideLanEndpointLink(
+                outside,
+                meshRunning: true,
+                localEndpoint: "10.20.3.15:45892",
+                localPrefixLength: 16
+            ),
+            .otherNetwork(outside)
         )
     }
 

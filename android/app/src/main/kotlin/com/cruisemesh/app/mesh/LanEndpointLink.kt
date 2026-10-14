@@ -3,6 +3,7 @@ package com.cruisemesh.app.mesh
 import uniffi.cruisemesh_core.CoreLanEndpoint
 import uniffi.cruisemesh_core.coreMakeLanEndpointLink
 import uniffi.cruisemesh_core.coreParseLanEndpointLink
+import uniffi.cruisemesh_core.lanHostIsOnLocalSubnet
 import uniffi.cruisemesh_core.lanHostsShareLocalNetwork
 
 internal fun lanEndpointLink(endpoint: LanManualEndpoint): String {
@@ -50,21 +51,36 @@ internal sealed interface LanEndpointLinkDecision {
 /**
  * Decide what [endpoint] from a link may do. [localEndpoint] is this phone's
  * own published LAN endpoint (`host:port`, IPv6 bracketed), or null when it
- * has none. The same-network test is the shared core's
- * `lanHostsShareLocalNetwork`; [sameNetwork] is only a seam for tests.
+ * has none; [localPrefixLength] is the subnet prefix its interface reports
+ * for that address, or null when the platform gave none. With a prefix the
+ * test is the shared core's `lanHostIsOnLocalSubnet`, so a ship's /16 counts
+ * as one network; without one it falls back to `lanHostsShareLocalNetwork`
+ * (IPv4 /24, IPv6 /64). [sameNetwork] is only a seam for tests.
  */
 internal fun decideLanEndpointLink(
     endpoint: LanManualEndpoint,
     meshRunning: Boolean,
     localEndpoint: String?,
-    sameNetwork: (localHost: String, candidateHost: String) -> Boolean = { local, candidate ->
-        lanHostsShareLocalNetwork(localHost = local, candidateHost = candidate)
-    },
+    localPrefixLength: Int? = null,
+    sameNetwork: (localHost: String, prefixLength: Int?, candidateHost: String) -> Boolean =
+        ::lanHostOnLocalNetwork,
 ): LanEndpointLinkDecision {
     if (!meshRunning) return LanEndpointLinkDecision.MeshOff(endpoint)
     // The port is irrelevant to the comparison; any valid one parses the host.
     val localHost = localEndpoint?.let { parseLanManualEndpoint(it, defaultPort = 1)?.host }
         ?: return LanEndpointLinkDecision.NoWifi(endpoint)
-    if (!sameNetwork(localHost, endpoint.host)) return LanEndpointLinkDecision.OtherNetwork(endpoint)
+    if (!sameNetwork(localHost, localPrefixLength, endpoint.host)) {
+        return LanEndpointLinkDecision.OtherNetwork(endpoint)
+    }
     return LanEndpointLinkDecision.Confirm(endpoint)
+}
+
+private fun lanHostOnLocalNetwork(localHost: String, prefixLength: Int?, candidateHost: String): Boolean {
+    val prefix = prefixLength?.takeIf { it in 1..128 }
+        ?: return lanHostsShareLocalNetwork(localHost = localHost, candidateHost = candidateHost)
+    return lanHostIsOnLocalSubnet(
+        localHost = localHost,
+        prefixLength = prefix.toUByte(),
+        candidateHost = candidateHost,
+    )
 }
