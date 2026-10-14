@@ -4,6 +4,14 @@ name: Dependency audit
 # through deny.toml. Everything that page calls release-blocking is checked
 # here, including `sources` -- every dependency must come from crates.io.
 #
+# There is one Cargo.lock per Cargo workspace, and the repository has three:
+# the root workspace (core, relayd, desktop), the Tauri messenger host the root
+# Cargo.toml excludes (desktop/ui/src-tauri), and the fuzz crate (fuzz/). Each
+# is checked against the same deny.toml. The messenger frontend's npm graph
+# (desktop/ui/package-lock.json) has no cargo-deny equivalent; `npm audit`
+# covers its advisories, here on the same schedule and again in the Windows
+# job of rust.yml before it is built.
+#
 # The daily schedule is the half a pull request cannot cover: an advisory
 # published against a crate nobody touched that week would otherwise sit
 # undiscovered until the next unrelated PR, which makes the response deadlines
@@ -27,3 +35,29 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories bans licenses sources
+      # `!cancelled()` so one red graph does not hide the state of the others.
+      - name: Check Tauri messenger host dependencies
+        if: ${{ !cancelled() }}
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: desktop/ui/src-tauri/Cargo.toml
+          command: check advisories bans licenses sources
+      - name: Check fuzz crate dependencies
+        if: ${{ !cancelled() }}
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: fuzz/Cargo.toml
+          command: check advisories bans licenses sources
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      # Reads package-lock.json only; nothing is installed or run.
+      - name: Audit messenger frontend npm dependencies
+        working-directory: desktop/ui
+        run: npm audit --audit-level=high
