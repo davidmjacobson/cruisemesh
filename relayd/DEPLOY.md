@@ -177,6 +177,7 @@ it can also open `wss://relay.example.com/ws?hints=...&after=...` for push
 | `CRUISEMESH_RELAY_RATE_GLOBAL_REQUESTS_PER_MIN` | `6000` | Requests per minute across all tokens combined — the coarse backstop. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_QUERIES` | `4` | Cross-family `POST /presence` queries allowed for a single family **deposit** token per window (also the burst size). Charged to its own bucket, never the family's request/byte allowance. See §10. Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS` | `900` | The window the above allowance is spread over. See §10. Must be a positive integer; unset uses the default. |
+| `CRUISEMESH_RELAY_AUTH_REJECTS_PER_IP_PER_MIN` | `60` | Credential rejects (401s) one client address may cause per minute before its requests are refused with 429, unread. Successful requests never count. See §10 "Unauthenticated requests". Must be a positive integer; unset uses the default. |
 | `CRUISEMESH_APNS_KEY_ID` | *(unset = APNs off)* | Apple push notification key ID. Set together with the next three fields; see §7.1. |
 | `CRUISEMESH_APNS_TEAM_ID` | *(unset = APNs off)* | Apple Developer Team ID. |
 | `CRUISEMESH_APNS_BUNDLE_ID` | *(unset = APNs off)* | App topic, currently `com.cruisemesh.app`. |
@@ -807,7 +808,8 @@ Notes an operator will care about:
   tokens are rejected by auth (401) and never allocate a bucket. Idle
   buckets are evicted lazily once the map grows past a threshold; there is
   no background sweeper.
-- **`/healthz` and `/admin/*` are exempt.** Uptime monitors poll healthz
+- **`/healthz` and `/admin/*` are exempt** (from these per-family buckets;
+  the pre-auth reject limit below still applies to `/admin/*`). Uptime monitors poll healthz
   constantly and a 429 there would read as an outage; admin is a trusted
   operator path already guarded by its own token (§12), and the purchase
   flow provisioning a pass must never be throttled behind a family's
@@ -824,6 +826,58 @@ Notes an operator will care about:
   checked before either is debited, so a post that trips the byte allowance
   does not also burn a request token; and a family that is over its own
   limit never eats into the global backstop.
+
+### Unauthenticated requests
+
+Every bucket above is charged only once a token authorizes, so on their own
+they leave a caller with *no* valid token unmetered. Three further bounds
+cover that caller:
+
+- **The body is read only after the bearer authorizes.** A request with a
+  missing or unknown token is answered 401 without its body ever being
+  buffered or parsed.
+- **Every body-bearing route has a ceiling sized to its payload**, instead
+  of axum's 2 MiB default: 1 MiB for `POST /envelopes` (a maximum 512 KiB
+  envelope is ~683 KiB of base64, so one somewhat over the sealed cap still
+  gets the coded `envelope_too_large` 413), and 64 KiB for everything else
+  (ack, presence, push registration, rotation, admin). Over the ceiling is a
+  plain 413.
+- **Credential rejects are rate-limited per client address.** Each 401 an
+  address causes is charged to a bucket of 60/min
+  (`CRUISEMESH_RELAY_AUTH_REJECTS_PER_IP_PER_MIN`); once it is spent, further
+  requests from that address are refused with the usual `429 rate_limited`
+  and a `Retry-After` — *before* the token is looked up in SQLite or the body
+  is read. Successful requests never charge it, and a request bearing one of
+  the static `CRUISEMESH_RELAY_TOKENS` (or its deposit token) is never
+  refused by it, since recognising those costs no store read. A hosted
+  family with good tokens therefore only meets it if its address as a whole
+  keeps presenting bad ones — and a whole ship can share one NAT address, so
+  raise the figure if the WARN line below shows a ship's address tripping
+  it. A client treats this 429 like any other: it ends the pass and backs
+  off (`RATE-01`). This covers `/admin/*` and `GET /ws` too. IPv6 clients
+  are keyed by their /64.
+
+  The client address is the socket peer, except when that peer is loopback
+  or private — in the compose deploy, Caddy on the compose network — in which
+  case it is the last `X-Forwarded-For` entry, the one Caddy wrote. Caddy
+  ignores a client-supplied `X-Forwarded-For` by default, and relayd ignores
+  it from any public peer, so a client cannot pick its own bucket. Do not
+  publish relayd's port directly on an untrusted private network: a peer
+  there could set `X-Forwarded-For` itself and dodge this limit.
+
+Both WARN lines involved — `auth reject` for each 401, and `request rejected:
+too many credential rejects from this address (429)`, which names the client
+address — are sampled to at most 20 per minute each; the next line written
+carries `suppressed=<n>`, the number dropped since the last one.
+
+### Container log rotation
+
+`docker-compose.yml` caps each service's log with Docker's `json-file`
+driver (`max-size: 10m`, `max-file: 5`, so at most ~50 MiB per container).
+Caddy access-logs every request and relayd logs every rejection class, so
+without the cap a request flood would turn into a disk-filling log on a small
+VPS. `docker compose logs` still works as before. If you use a different
+logging driver, set an equivalent cap there.
 
 ## 11. Background maintenance
 

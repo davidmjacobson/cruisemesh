@@ -54,14 +54,15 @@
 pub mod apns;
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -72,6 +73,7 @@ use blake2::Blake2bVar;
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand_core::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
@@ -291,9 +293,84 @@ pub const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 ///
 /// Base64 inflation of the JSON `sealed` field (this cap applies to the
 /// decoded bytes, not the wire string) is handled separately: 512 KiB
-/// decoded is ~683 KiB of base64, comfortably inside axum's default 2 MiB
-/// request-body limit, so this cap is the one that actually fires.
+/// decoded is ~683 KiB of base64, comfortably inside the route's
+/// [`MAX_ENVELOPE_BODY_BYTES`] body ceiling, so this cap is the one that
+/// actually fires.
 pub const MAX_ENVELOPE_SEALED_BYTES: usize = 512 * 1024;
+
+/// Request-body ceiling for `POST /envelopes`, enforced while the body is
+/// buffered (axum `DefaultBodyLimit`), i.e. before a byte of it is parsed.
+///
+/// Sized to the real payload rather than left at axum's 2 MiB default: a
+/// maximum envelope is `MAX_ENVELOPE_SEALED_BYTES` of sealed bytes, which is
+/// 699,051 bytes of unpadded base64url (no characters a JSON encoder
+/// escapes), plus well under 1 KiB of other fields. 1 MiB leaves ~330 KiB
+/// above that, so an envelope somewhat *over* the sealed cap still reaches
+/// the handler and gets the coded `envelope_too_large` 413 a client can act
+/// on, while a body that is not an envelope at all is cut off at half the old
+/// default. The body is only read after the bearer has authorized
+/// (`json_body`), so this bounds what an authorized caller can make the relay
+/// buffer; unauthenticated bodies are never read at all.
+pub const MAX_ENVELOPE_BODY_BYTES: usize = 1024 * 1024;
+
+/// Request-body ceiling for every other body-bearing route (ack, presence,
+/// push registration, rotation, admin).
+///
+/// The largest of those payloads is an ack of `MAX_ACK_IDS` ids, at most
+/// ~11 KiB even if every id printed as `i64::MIN`; a full member-class
+/// presence query (`MAX_PRESENCE_QUERY` 11-character hints) is ~7 KiB, and a
+/// rotation or provisioning body is two tokens of at most
+/// `MAX_FAMILY_TOKEN_LEN` plus a key and a signature. 64 KiB is several times
+/// the largest of them, so the handlers' own "too many entries" 400s still
+/// fire for anything a buggy client would plausibly send.
+pub const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
+
+/// The largest envelope, base64url-encoded, plus generous room for the other
+/// four fields, must fit the envelope body ceiling — or a legitimate maximum
+/// envelope would be refused with a bare 413 before the handler could judge
+/// it.
+const _: () = assert!(MAX_ENVELOPE_SEALED_BYTES.div_ceil(3) * 4 + 1024 <= MAX_ENVELOPE_BODY_BYTES);
+
+/// Abuse protection (`DEPLOY.md` §10): how many *credential rejects* (401s)
+/// one client address may cause per minute before the relay stops looking
+/// its requests up. Configurable via
+/// `CRUISEMESH_RELAY_AUTH_REJECTS_PER_IP_PER_MIN`.
+///
+/// Every per-family bucket is charged only after a token authorizes (see
+/// `AppState::check_rate_limit`), so before this an unauthenticated caller
+/// was entirely unmetered: each guess cost a SQLite lookup under the store's
+/// single mutex and a log line. This bucket is keyed by client address
+/// instead of by the (unverified) token, charged only by a 401, and checked
+/// before anything else runs, so a spent address is refused with a 429
+/// before its body is read or its bearer is looked up.
+///
+/// Sized for the address that matters most: a cruise ship's NAT, which puts
+/// a whole ship behind one. Legitimate 401s are rare and slow — a device
+/// whose own card was typo'd or whose pass was revoked, or a contact's stale
+/// friend card hit at most once per pass — so sixty a minute is many such
+/// devices at once with room to spare. Exhausting it matters to them: the
+/// refusal is a `429 rate_limited`, which a client treats as "back off and
+/// end this pass" (`RATE-01`). Against a guesser it still caps the lookup
+/// rate at one a second per address, a load the store does not notice.
+/// Successful requests never charge it, and a request bearing a static
+/// allowlist credential is never refused by it (checking that costs a hash
+/// lookup, not a store read), so a self-hosted family is never collateral.
+pub const DEFAULT_AUTH_REJECTS_PER_IP_PER_MIN: u32 = 60;
+
+/// Hard cap on how many client addresses the reject-bucket map tracks. An
+/// entry is a few dozen bytes, so this is a few MiB at worst. Past it, new
+/// addresses go untracked (the gate fails open for them) rather than letting
+/// a caller with many addresses grow the map without bound — the same reason
+/// the family buckets are keyed only on authorized tokens.
+const AUTH_REJECT_IP_MAX_ENTRIES: usize = 65_536;
+
+/// How many `auth reject` log lines are written per
+/// [`AUTH_REJECT_LOG_WINDOW`] before further ones are counted instead of
+/// written. The next line written reports how many were suppressed, so the
+/// signal (who is being rejected, and how often) survives while a flood can
+/// no longer turn into a disk-filling log stream.
+const AUTH_REJECT_LOG_LINES_PER_WINDOW: u32 = 20;
+const AUTH_REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 
 /// DTN_TODOS.md D7 (N2): default per-family-token storage quota (sum of
 /// `LENGTH(sealed)` across that family's rows), configurable via
@@ -819,6 +896,10 @@ pub struct RateLimitConfig {
     /// the bucket the device being revoked can exhaust.
     pub rotation_requests: u32,
     pub rotation_window_secs: u64,
+    /// Credential rejects (401s) one client address may cause per minute
+    /// before its requests are refused unread. See
+    /// [`DEFAULT_AUTH_REJECTS_PER_IP_PER_MIN`].
+    pub auth_rejects_per_ip_per_min: u32,
 }
 
 impl Default for RateLimitConfig {
@@ -833,6 +914,7 @@ impl Default for RateLimitConfig {
             deposit_presence_window_secs: DEFAULT_DEPOSIT_PRESENCE_WINDOW_SECS,
             rotation_requests: DEFAULT_ROTATION_REQUESTS,
             rotation_window_secs: DEFAULT_ROTATION_WINDOW_SECS,
+            auth_rejects_per_ip_per_min: DEFAULT_AUTH_REJECTS_PER_IP_PER_MIN,
         }
     }
 }
@@ -1059,6 +1141,8 @@ enum RateLimitScope {
     GlobalRequests,
     PresenceQueries,
     RotationRequests,
+    /// Pre-auth: this client address has caused too many 401s.
+    AuthRejects,
 }
 
 impl RateLimitScope {
@@ -1070,6 +1154,7 @@ impl RateLimitScope {
             Self::GlobalRequests => "global_requests",
             Self::PresenceQueries => "presence_queries",
             Self::RotationRequests => "rotation_requests",
+            Self::AuthRejects => "auth_rejects",
         }
     }
 
@@ -1082,6 +1167,7 @@ impl RateLimitScope {
             Self::GlobalRequests => "server-wide request rate limit",
             Self::PresenceQueries => "cross-family presence query rate limit",
             Self::RotationRequests => "family token rotation rate limit",
+            Self::AuthRejects => "rejected-credential rate limit for this address",
         }
     }
 }
@@ -1122,6 +1208,194 @@ fn evict_idle_rate_buckets(buckets: &mut HashMap<String, FamilyBuckets>, now: In
             && family.presence.is_full()
             && family.rotation.is_full())
     });
+}
+
+/// Per-client-address credential-reject buckets (the pre-auth gate).
+#[derive(Default)]
+struct AuthRejectBuckets {
+    buckets: HashMap<IpAddr, TokenBucket>,
+    last_sweep: Option<Instant>,
+}
+
+impl AuthRejectBuckets {
+    /// Before tracking a new address on a busy map, drop every bucket that
+    /// has refilled to full — re-creating one also starts full, so dropping
+    /// it hands nothing back. At most one sweep a second, so a caller cycling
+    /// through addresses cannot make every request pay a full scan.
+    fn make_room(&mut self, now: Instant) {
+        if self.buckets.len() < RATE_BUCKET_EVICT_THRESHOLD {
+            return;
+        }
+        if self
+            .last_sweep
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.last_sweep = Some(now);
+        self.buckets.retain(|_, bucket| {
+            bucket.refill(now);
+            !bucket.is_full()
+        });
+    }
+}
+
+/// Lets the first `per_window` events of each window through and counts the
+/// rest, so a log line that an unauthenticated caller can trigger at will
+/// cannot be turned into a disk-filling stream.
+struct LogSampler {
+    window_start: Option<Instant>,
+    written: u32,
+    suppressed: u64,
+}
+
+impl LogSampler {
+    const fn new() -> Self {
+        Self {
+            window_start: None,
+            written: 0,
+            suppressed: 0,
+        }
+    }
+
+    /// `Some(n)` when this event should be logged, where `n` is how many were
+    /// suppressed since the last one that was; `None` when it should not.
+    fn admit(&mut self, now: Instant, per_window: u32, window: Duration) -> Option<u64> {
+        let in_window = self
+            .window_start
+            .is_some_and(|start| now.saturating_duration_since(start) < window);
+        if !in_window {
+            self.window_start = Some(now);
+            self.written = 0;
+        }
+        if self.written < per_window {
+            self.written += 1;
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
+
+static AUTH_REJECT_LOG: Mutex<LogSampler> = Mutex::new(LogSampler::new());
+static AUTH_REJECT_GATE_LOG: Mutex<LogSampler> = Mutex::new(LogSampler::new());
+
+fn admit_log(sampler: &Mutex<LogSampler>) -> Option<u64> {
+    sampler.lock().unwrap_or_else(|e| e.into_inner()).admit(
+        Instant::now(),
+        AUTH_REJECT_LOG_LINES_PER_WINDOW,
+        AUTH_REJECT_LOG_WINDOW,
+    )
+}
+
+/// The address a request's credential rejects are charged to.
+///
+/// The socket peer, unless that peer is the reverse proxy in front of us — a
+/// loopback or private address, which in the shipped compose deploy is Caddy
+/// on the compose network (relayd publishes no port of its own). Then the
+/// *last* `X-Forwarded-For` entry, the one the proxy itself appended: Caddy
+/// does not trust a client-supplied `X-Forwarded-For` by default and writes
+/// the real peer, and anything earlier in the list is client-controlled.
+/// A public peer's `X-Forwarded-For` is ignored outright, so a client talking
+/// to relayd directly cannot pick its own bucket.
+///
+/// `None` when the server was not started with connect info (in-process
+/// tests): the gate then stands aside.
+fn client_address(request: &Request) -> Option<IpAddr> {
+    let ConnectInfo(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>()?;
+    let peer = peer.ip().to_canonical();
+    let address = if is_local_proxy_peer(peer) {
+        request
+            .headers()
+            .get_all("x-forwarded-for")
+            .iter()
+            .next_back()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|last| last.trim().parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
+            .unwrap_or(peer)
+    } else {
+        peer
+    };
+    Some(rate_key_for_address(address))
+}
+
+fn is_local_proxy_peer(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private(),
+        // Loopback or unique-local (fc00::/7).
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// IPv6 clients are keyed by their /64: one subscriber is routinely handed a
+/// whole /64, and keying on the full address would let it mint a fresh bucket
+/// per request.
+fn rate_key_for_address(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
+
+/// Pre-auth abuse gate, in front of every route.
+///
+/// Refuses a request from an address that has spent its credential-reject
+/// allowance before anything else runs — no body read, no store lookup — and
+/// charges that allowance whenever a request ends in a 401. Requests that
+/// authorize are never charged, and a request bearing a static allowlist
+/// credential is let through even from a spent address: recognising one is a
+/// hash lookup, which is exactly the cost the gate exists to avoid paying
+/// more than.
+async fn preauth_reject_gate(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Some(client) = client_address(&request) else {
+        return next.run(request).await;
+    };
+    let retry_after = state
+        .auth_reject_retry_after(client, Instant::now())
+        .filter(|_| !state.bears_static_credential(request.headers()));
+    if let Some(retry_after_secs) = retry_after {
+        if let Some(suppressed) = admit_log(&AUTH_REJECT_GATE_LOG) {
+            warn!(
+                client = %client,
+                retry_after_secs,
+                suppressed,
+                "request rejected: too many credential rejects from this address (429)"
+            );
+        }
+        return ApiError::rate_limited(RateLimitScope::AuthRejects, retry_after_secs)
+            .into_response();
+    }
+    let response = next.run(request).await;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        state.charge_auth_reject(client, Instant::now());
+    }
+    response
+}
+
+/// Deserialize a JSON request body — called by each handler only *after* its
+/// bearer has authorized, so an unauthenticated request never gets its body
+/// buffered or parsed. Same extractor, same status codes (400/413/415/422) as
+/// taking `Json<T>` as a handler argument; only the moment it runs moved.
+async fn json_body<T: DeserializeOwned>(request: Request) -> Result<T, ApiError> {
+    match Json::<T>::from_request(request, &()).await {
+        Ok(Json(value)) => Ok(value),
+        Err(rejection) => Err(ApiError {
+            status: rejection.status(),
+            message: rejection.body_text(),
+            code: None,
+            retry_after_secs: None,
+        }),
+    }
 }
 
 /// Build the 429 for a tripped limit, logging it first (FR2: every rejection
@@ -1175,6 +1449,9 @@ pub struct AppState {
     rate_buckets: Arc<Mutex<HashMap<String, FamilyBuckets>>>,
     /// Abuse protection: coarse request backstop shared by every token.
     rate_global: Arc<Mutex<TokenBucket>>,
+    /// Abuse protection, pre-auth: per-client-address buckets charged by
+    /// credential rejects (`preauth_reject_gate`).
+    auth_rejects: Arc<Mutex<AuthRejectBuckets>>,
     /// Bearer token for the `/admin/families` provisioning API
     /// (`CRUISEMESH_RELAY_ADMIN_TOKEN`). `None` disables the admin routes
     /// entirely (they answer 404), which is the self-hosted default.
@@ -1328,6 +1605,7 @@ impl AppState {
                 f64::from(rate_limits.global_requests_per_min),
                 Instant::now(),
             ))),
+            auth_rejects: Arc::new(Mutex::new(AuthRejectBuckets::default())),
             admin_token: None,
             push_wake_tx: None,
         }
@@ -1419,6 +1697,57 @@ impl AppState {
         charge(buckets.entry(access.rate_key.clone()).or_insert_with(|| {
             FamilyBuckets::new(requests_per_min, bytes_per_min, presence, rotation, now)
         }))
+    }
+
+    /// Pre-auth gate: `Some(retry_after_secs)` when `client` has already
+    /// spent its credential-reject allowance. Only reads the bucket — a
+    /// request is charged by its outcome (`charge_auth_reject`), not by
+    /// arriving, so a client whose tokens are good never spends anything.
+    fn auth_reject_retry_after(&self, client: IpAddr, now: Instant) -> Option<u64> {
+        let mut rejects = self.auth_rejects.lock().unwrap_or_else(|e| e.into_inner());
+        let bucket = rejects.buckets.get_mut(&client)?;
+        bucket.refill(now);
+        if bucket.has(1.0) {
+            None
+        } else {
+            Some(bucket.retry_after_secs(1.0))
+        }
+    }
+
+    /// Whether the request's bearer is one of the static allowlist's member
+    /// tokens or their derived deposit tokens. In-memory only, so the
+    /// pre-auth gate can ask it without touching the store.
+    fn bears_static_credential(&self, headers: &HeaderMap) -> bool {
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| {
+                self.auth_tokens.contains(token) || self.static_deposit_tokens.contains_key(token)
+            })
+    }
+
+    /// Charge one credential reject (a 401) to `client`'s bucket.
+    ///
+    /// Keyed by address, never by the presented token, for the reason
+    /// spelled out on `check_rate_limit`: an unverified token is attacker
+    /// chosen. An address is not free to mint, and the map is bounded anyway
+    /// (`AUTH_REJECT_IP_MAX_ENTRIES`).
+    fn charge_auth_reject(&self, client: IpAddr, now: Instant) {
+        let per_min = f64::from(self.rate_limits.auth_rejects_per_ip_per_min);
+        let mut rejects = self.auth_rejects.lock().unwrap_or_else(|e| e.into_inner());
+        if !rejects.buckets.contains_key(&client) {
+            rejects.make_room(now);
+            if rejects.buckets.len() >= AUTH_REJECT_IP_MAX_ENTRIES {
+                return;
+            }
+        }
+        let bucket = rejects
+            .buckets
+            .entry(client)
+            .or_insert_with(|| TokenBucket::per_minute(per_min, now));
+        bucket.refill(now);
+        bucket.take(1.0);
     }
 
     /// Charge one `POST /family/rotate` attempt against the rotation bucket
@@ -3402,29 +3731,52 @@ pub fn spawn_prune_task(store: RelayStore, interval: Duration) -> tokio::task::J
     })
 }
 
+/// The relay's routes. Production serves this with
+/// `into_make_service_with_connect_info::<SocketAddr>()` so the pre-auth gate
+/// can key on the client address; without connect info the gate stands
+/// aside (in-process tests).
 pub fn app(state: AppState) -> Router {
+    // Each body-bearing route carries a ceiling sized to its real payload,
+    // replacing axum's 2 MiB default. Bodies are read only after the bearer
+    // authorizes (`json_body`), so these bound authorized callers;
+    // unauthenticated bodies are never read at all.
+    let envelope_body = DefaultBodyLimit::max(MAX_ENVELOPE_BODY_BYTES);
+    let control_body = DefaultBodyLimit::max(MAX_CONTROL_BODY_BYTES);
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ws", get(ws_handler))
-        .route("/envelopes", post(post_envelope).get(get_envelopes))
-        .route("/envelopes/ack", post(ack_envelopes))
-        .route("/presence", post(sync_presence))
-        .route("/push/registrations", put(put_push_registration))
+        .route(
+            "/envelopes",
+            post(post_envelope).get(get_envelopes).layer(envelope_body),
+        )
+        .route("/envelopes/ack", post(ack_envelopes).layer(control_body))
+        .route("/presence", post(sync_presence).layer(control_body))
+        .route(
+            "/push/registrations",
+            put(put_push_registration).layer(control_body),
+        )
         // §10 step 2. Under `/family/` rather than `/admin/families/` on
         // purpose: this is the family acting on itself with its own
         // credential, not an operator acting on a family with theirs.
-        .route("/family/rotate", post(rotate_family))
+        .route("/family/rotate", post(rotate_family).layer(control_body))
         .route("/family/status", get(family_status))
         .route(
             "/admin/families",
-            post(admin_provision_family).get(admin_list_families),
+            post(admin_provision_family)
+                .get(admin_list_families)
+                .layer(control_body),
         )
         .route(
             "/admin/families/{token}",
             get(admin_get_family)
                 .patch(admin_patch_family)
-                .delete(admin_delete_family),
+                .delete(admin_delete_family)
+                .layer(control_body),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            preauth_reject_gate,
+        ))
         .with_state(state)
 }
 
@@ -3543,7 +3895,7 @@ struct PostEnvelopeResponse {
 async fn post_envelope(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PostEnvelopeRequest>,
+    body: Request,
 ) -> Result<Json<PostEnvelopeResponse>, ApiError> {
     let access = authorize_bearer(&state, &headers, FamilyOp::Post).await?;
     // CP4: rows are always stored (and broadcast) under the canonical
@@ -3556,6 +3908,9 @@ async fn post_envelope(
     // is charged separately below, once the payload's real size is known.
     // Charged per presented credential class (member vs deposit buckets).
     state.check_rate_limit(&access, 1.0, 0.0)?;
+    // Only now is the body read: an unauthenticated (or rate-limited) caller
+    // never gets it buffered or parsed.
+    let request: PostEnvelopeRequest = json_body(body).await?;
     let msg_id = decode_base64_field(&request.msg_id, "msg_id")?;
     if msg_id.len() != MSG_ID_LEN {
         return Err(ApiError::bad_request(format!(
@@ -3830,11 +4185,12 @@ struct AckResponse {
 async fn ack_envelopes(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<AckRequest>,
+    body: Request,
 ) -> Result<Json<AckResponse>, ApiError> {
     let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
     // Enforced only once the token has authorized (see `check_rate_limit`).
     state.check_rate_limit(&access, 1.0, 0.0)?;
+    let request: AckRequest = json_body(body).await?;
     let family_token = access.token;
     if request.ids.len() > MAX_ACK_IDS {
         return Err(ApiError::bad_request(format!(
@@ -3871,16 +4227,17 @@ struct PutPushRegistrationResponse {
 async fn put_push_registration(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PutPushRegistrationRequest>,
+    body: Request,
 ) -> Result<Json<PutPushRegistrationResponse>, ApiError> {
     // Deposit credentials appear in friend cards and can only post sealed
     // mail. They must never be able to bind an APNs token to a family.
     let access = authorize_bearer(&state, &headers, FamilyOp::Read).await?;
     state.check_rate_limit(&access, 1.0, 0.0)?;
+    let request: PutPushRegistrationRequest = json_body(body).await?;
 
     let device_token = request.device_token.trim().to_ascii_lowercase();
     let valid_token = (32..=200).contains(&device_token.len())
-        && device_token.len() % 2 == 0
+        && device_token.len().is_multiple_of(2)
         && device_token.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !valid_token {
         return Err(ApiError::bad_request(
@@ -3970,7 +4327,7 @@ fn coarse_presence(age_ms: i64, now_ms: i64) -> (&'static str, i64) {
 async fn sync_presence(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<PresenceRequest>,
+    body: Request,
 ) -> Result<Json<PresenceResponse>, ApiError> {
     let access = authorize_bearer(&state, &headers, FamilyOp::Presence).await?;
     let cross_family = access.class == TokenClass::Deposit;
@@ -3987,6 +4344,7 @@ async fn sync_presence(
     } else {
         state.check_rate_limit(&access, 1.0, 0.0)?;
     }
+    let request: PresenceRequest = json_body(body).await?;
     let family_token = access.token;
     // A cross-family caller may ask, and may not tell. Announcing this
     // device's hints into another family's mailbox is the half of the
@@ -4168,9 +4526,10 @@ fn validate_quota_bytes(quota_bytes: Option<u64>) -> Result<(), ApiError> {
 async fn admin_provision_family(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ProvisionFamilyRequest>,
+    body: Request,
 ) -> Result<Json<FamilyResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
+    let request: ProvisionFamilyRequest = json_body(body).await?;
     let token = request.token.trim();
     if token.is_empty() || token.len() > MAX_FAMILY_TOKEN_LEN {
         return Err(ApiError::bad_request(format!(
@@ -4321,9 +4680,10 @@ async fn admin_patch_family(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id_or_token): Path<String>,
-    Json(request): Json<PatchFamilyRequest>,
+    body: Request,
 ) -> Result<Json<FamilyResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
+    let request: PatchFamilyRequest = json_body(body).await?;
     if let Some(status) = request.status.as_deref() {
         if status != "active" && status != "suspended" {
             return Err(ApiError::bad_request(
@@ -4484,13 +4844,14 @@ struct RotateFamilyResponse {
 async fn rotate_family(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<RotateFamilyRequest>,
+    body: Request,
 ) -> Result<Json<RotateFamilyResponse>, ApiError> {
     let presented = raw_bearer_token(&headers)?;
     let access = authorize_family(&state, &presented, FamilyOp::Rotate, now_ms()).await?;
     // Its own small bucket, never the family's shared request allowance —
     // see `AppState::check_rotation_rate_limit`.
     state.check_rotation_rate_limit(&access)?;
+    let request: RotateFamilyRequest = json_body(body).await?;
 
     let new_token = request.new_token.trim().to_string();
     if new_token.len() < MIN_ROTATION_TOKEN_LEN || new_token.len() > MAX_FAMILY_TOKEN_LEN {
@@ -5344,10 +5705,14 @@ impl ApiError {
     }
 
     fn unauthorized(message: String) -> Self {
-        // FR2: log every auth reject so a field incident (wrong token
-        // rolled out, QR card typo'd, family fleet locked out) is visible
-        // server-side instead of only as a client-side error toast.
-        warn!(reason = %message, "auth reject");
+        // FR2: log auth rejects so a field incident (wrong token rolled
+        // out, QR card typo'd, family fleet locked out) is visible
+        // server-side instead of only as a client-side error toast. Sampled:
+        // anyone can cause one, so an unsampled line per reject let a caller
+        // fill the disk. The next line written carries the suppressed count.
+        if let Some(suppressed) = admit_log(&AUTH_REJECT_LOG) {
+            warn!(reason = %message, suppressed, "auth reject");
+        }
         Self {
             status: StatusCode::UNAUTHORIZED,
             message,
@@ -9457,5 +9822,66 @@ mod tests {
         assert!(!error.message.contains("secret"));
         assert!(!error.message.contains("sqlite"));
         assert_eq!(error.message, "internal server error");
+    }
+
+    #[test]
+    fn log_sampler_writes_a_burst_per_window_and_reports_what_it_dropped() {
+        let window = Duration::from_secs(60);
+        let start = Instant::now();
+        let mut sampler = LogSampler::new();
+        for _ in 0..3 {
+            assert_eq!(sampler.admit(start, 3, window), Some(0));
+        }
+        for _ in 0..5 {
+            assert_eq!(
+                sampler.admit(start + Duration::from_secs(30), 3, window),
+                None
+            );
+        }
+        // Next window: written again, carrying the count it dropped.
+        assert_eq!(sampler.admit(start + window, 3, window), Some(5));
+        assert_eq!(sampler.admit(start + window, 3, window), Some(0));
+    }
+
+    #[test]
+    fn rate_key_keeps_ipv4_and_truncates_ipv6_to_its_slash_64() {
+        let v4: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(rate_key_for_address(v4), v4);
+        let v6: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        assert_eq!(
+            rate_key_for_address(v6),
+            "2001:db8:1:2::".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn only_loopback_and_private_peers_count_as_the_local_proxy() {
+        for local in [
+            "127.0.0.1",
+            "10.0.0.2",
+            "172.18.0.3",
+            "192.168.1.1",
+            "::1",
+            "fd00::1",
+        ] {
+            assert!(is_local_proxy_peer(local.parse().unwrap()), "{local}");
+        }
+        for public in ["198.51.100.7", "8.8.8.8", "2001:db8::1"] {
+            assert!(!is_local_proxy_peer(public.parse().unwrap()), "{public}");
+        }
+    }
+
+    #[test]
+    fn the_reject_map_drops_refilled_buckets_before_tracking_a_new_address() {
+        let store = RelayStore::open(":memory:").unwrap();
+        let state = AppState::new(store, HashSet::new());
+        let start = Instant::now();
+        for i in 0..RATE_BUCKET_EVICT_THRESHOLD as u32 {
+            state.charge_auth_reject(IpAddr::from(i.to_be_bytes()), start);
+        }
+        let later = start + Duration::from_secs(120);
+        state.charge_auth_reject("203.0.113.9".parse().unwrap(), later);
+        let rejects = state.auth_rejects.lock().unwrap();
+        assert_eq!(rejects.buckets.len(), 1);
     }
 }
