@@ -352,6 +352,77 @@ async fn a_static_credential_is_served_even_from_a_spent_address() {
 }
 
 #[tokio::test]
+async fn a_hosted_credential_that_authorized_recently_is_served_from_a_spent_address() {
+    // A ship's NAT puts every passenger behind one address. One device stuck
+    // on a revoked token must not lock out the hosted families beside it, so
+    // a hosted credential the store recognised recently is exempt the same
+    // way a static one is.
+    let app = test_app(gate_limits(1));
+    let provision = request(
+        "POST",
+        "/admin/families",
+        ADMIN_TOKEN,
+        Body::from(serde_json::json!({ "token": "hosted-family" }).to_string()),
+    );
+    assert_eq!(
+        app.clone().oneshot(provision).await.unwrap().status(),
+        StatusCode::OK
+    );
+    let peer = "198.51.100.7:4000";
+    let response = app
+        .clone()
+        .oneshot(from_peer(fetch("hosted-family"), peer))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Someone else behind the same address spends its allowance.
+    for expected in [StatusCode::UNAUTHORIZED, StatusCode::TOO_MANY_REQUESTS] {
+        let response = app
+            .clone()
+            .oneshot(from_peer(fetch("wrong"), peer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(from_peer(fetch("hosted-family"), peer))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_static_query_token_on_the_websocket_route_is_not_refused_by_the_gate() {
+    // `GET /ws` also takes its credential as `?token=`, so the exemption has
+    // to look there too.
+    let app = test_app(gate_limits(1));
+    let peer = "198.51.100.7:4000";
+    for expected in [StatusCode::UNAUTHORIZED, StatusCode::TOO_MANY_REQUESTS] {
+        let response = app
+            .clone()
+            .oneshot(from_peer(fetch("wrong"), peer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+    let ws = Request::builder()
+        .method("GET")
+        .uri(format!(
+            "/ws?hints={}&token={FAMILY}",
+            URL_SAFE_NO_PAD.encode([1u8; 8])
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(from_peer(ws, peer)).await.unwrap();
+    // Not a real upgrade, so the handler refuses it, but the gate let it
+    // through to get there.
+    assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
 async fn ipv6_clients_are_keyed_by_their_slash_64() {
     // One host owns a whole /64; rotating the low bits must not buy fresh
     // allowance.

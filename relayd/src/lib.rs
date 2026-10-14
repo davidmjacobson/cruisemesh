@@ -353,8 +353,10 @@ const _: () = assert!(MAX_ENVELOPE_SEALED_BYTES.div_ceil(3) * 4 + 1024 <= MAX_EN
 /// end this pass" (`RATE-01`). Against a guesser it still caps the lookup
 /// rate at one a second per address, a load the store does not notice.
 /// Successful requests never charge it, and a request bearing a static
-/// allowlist credential is never refused by it (checking that costs a hash
-/// lookup, not a store read), so a self-hosted family is never collateral.
+/// allowlist credential, or a hosted one that authorized within
+/// `RECENT_HOSTED_CREDENTIAL_TTL`, is never refused by it (checking that
+/// costs a hash lookup, not a store read), so a family already in use behind
+/// a shared address is not collateral.
 pub const DEFAULT_AUTH_REJECTS_PER_IP_PER_MIN: u32 = 60;
 
 /// Hard cap on how many client addresses the reject-bucket map tracks. An
@@ -363,6 +365,20 @@ pub const DEFAULT_AUTH_REJECTS_PER_IP_PER_MIN: u32 = 60;
 /// a caller with many addresses grow the map without bound — the same reason
 /// the family buckets are keyed only on authorized tokens.
 const AUTH_REJECT_IP_MAX_ENTRIES: usize = 65_536;
+
+/// How long a hosted (store-backed) credential that recently authorized stays
+/// exempt from the pre-auth gate. The gate is per address, and a cruise ship
+/// puts every passenger behind one NAT address, so without this one device
+/// stuck on a revoked token (or one passenger guessing on purpose) would get
+/// every hosted family on the ship refused. Static allowlist credentials are
+/// exempt by a hash lookup; this extends the same lookup to hosted ones that
+/// have proved themselves against the store within the window.
+const RECENT_HOSTED_CREDENTIAL_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Hard cap on the recently-authorized hosted credential set. Past it, newly
+/// authorized credentials are not recorded until expired ones are swept, so
+/// they simply get no exemption — the gate's behaviour without this set.
+const RECENT_HOSTED_CREDENTIAL_MAX_ENTRIES: usize = 16_384;
 
 /// How many `auth reject` log lines are written per
 /// [`AUTH_REJECT_LOG_WINDOW`] before further ones are counted instead of
@@ -1240,6 +1256,42 @@ impl AuthRejectBuckets {
     }
 }
 
+/// Hosted credentials that authorized against the store recently, so the
+/// pre-auth gate can exempt them without a store read. Only a credential the
+/// store recognised is ever inserted (an attacker cannot plant one), and one
+/// the store stops recognising is dropped on its first 401.
+#[derive(Default)]
+struct RecentHostedCredentials {
+    seen: HashMap<String, Instant>,
+}
+
+impl RecentHostedCredentials {
+    fn contains(&self, token: &str, now: Instant) -> bool {
+        self.seen
+            .get(token)
+            .is_some_and(|at| now.saturating_duration_since(*at) < RECENT_HOSTED_CREDENTIAL_TTL)
+    }
+
+    fn record(&mut self, token: &str, now: Instant) {
+        if let Some(at) = self.seen.get_mut(token) {
+            *at = now;
+            return;
+        }
+        if self.seen.len() >= RECENT_HOSTED_CREDENTIAL_MAX_ENTRIES {
+            self.seen
+                .retain(|_, at| now.saturating_duration_since(*at) < RECENT_HOSTED_CREDENTIAL_TTL);
+            if self.seen.len() >= RECENT_HOSTED_CREDENTIAL_MAX_ENTRIES {
+                return;
+            }
+        }
+        self.seen.insert(token.to_string(), now);
+    }
+
+    fn forget(&mut self, token: &str) {
+        self.seen.remove(token);
+    }
+}
+
 /// Lets the first `per_window` events of each window through and counts the
 /// rest, so a log line that an unauthenticated caller can trigger at will
 /// cannot be turned into a disk-filling stream.
@@ -1348,10 +1400,12 @@ fn rate_key_for_address(address: IpAddr) -> IpAddr {
 /// Refuses a request from an address that has spent its credential-reject
 /// allowance before anything else runs — no body read, no store lookup — and
 /// charges that allowance whenever a request ends in a 401. Requests that
-/// authorize are never charged, and a request bearing a static allowlist
-/// credential is let through even from a spent address: recognising one is a
-/// hash lookup, which is exactly the cost the gate exists to avoid paying
-/// more than.
+/// authorize are never charged, and a request bearing a known credential — a
+/// static allowlist one, or a hosted one that authorized against the store
+/// within `RECENT_HOSTED_CREDENTIAL_TTL` — is let through even from a spent
+/// address: recognising one is a hash lookup, which is exactly the cost the
+/// gate exists to avoid paying more than. That keeps one bad client behind a
+/// ship's shared NAT address from locking out every family behind it.
 async fn preauth_reject_gate(
     State(state): State<AppState>,
     request: Request,
@@ -1362,7 +1416,7 @@ async fn preauth_reject_gate(
     };
     let retry_after = state
         .auth_reject_retry_after(client, Instant::now())
-        .filter(|_| !state.bears_static_credential(request.headers()));
+        .filter(|_| !state.bears_known_credential(&request));
     if let Some(retry_after_secs) = retry_after {
         if let Some(suppressed) = admit_log(&AUTH_REJECT_GATE_LOG) {
             warn!(
@@ -1452,6 +1506,9 @@ pub struct AppState {
     /// Abuse protection, pre-auth: per-client-address buckets charged by
     /// credential rejects (`preauth_reject_gate`).
     auth_rejects: Arc<Mutex<AuthRejectBuckets>>,
+    /// Abuse protection, pre-auth: hosted credentials that authorized
+    /// recently, exempt from the gate above (`RecentHostedCredentials`).
+    recent_hosted_credentials: Arc<Mutex<RecentHostedCredentials>>,
     /// Bearer token for the `/admin/families` provisioning API
     /// (`CRUISEMESH_RELAY_ADMIN_TOKEN`). `None` disables the admin routes
     /// entirely (they answer 404), which is the self-hosted default.
@@ -1606,6 +1663,7 @@ impl AppState {
                 Instant::now(),
             ))),
             auth_rejects: Arc::new(Mutex::new(AuthRejectBuckets::default())),
+            recent_hosted_credentials: Arc::new(Mutex::new(RecentHostedCredentials::default())),
             admin_token: None,
             push_wake_tx: None,
         }
@@ -1714,17 +1772,52 @@ impl AppState {
         }
     }
 
-    /// Whether the request's bearer is one of the static allowlist's member
-    /// tokens or their derived deposit tokens. In-memory only, so the
-    /// pre-auth gate can ask it without touching the store.
-    fn bears_static_credential(&self, headers: &HeaderMap) -> bool {
-        headers
+    /// Whether the request carries a credential the relay already knows: one
+    /// of the static allowlist's member tokens or their derived deposit
+    /// tokens, or a hosted credential that authorized recently. Looks at the
+    /// `Authorization` bearer and, on `GET /ws`, the `?token=` query
+    /// parameter that route also accepts. In-memory only, so the pre-auth
+    /// gate can ask it without touching the store.
+    fn bears_known_credential(&self, request: &Request) -> bool {
+        let header_token = request
+            .headers()
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| {
-                self.auth_tokens.contains(token) || self.static_deposit_tokens.contains_key(token)
-            })
+            .map(str::to_string);
+        let query_token = (request.uri().path() == "/ws")
+            .then(|| Query::<HashMap<String, String>>::try_from_uri(request.uri()).ok())
+            .flatten()
+            .and_then(|Query(mut params)| params.remove("token"));
+        let now = Instant::now();
+        [header_token, query_token]
+            .into_iter()
+            .flatten()
+            .any(|token| self.is_known_credential(&token, now))
+    }
+
+    fn is_known_credential(&self, token: &str, now: Instant) -> bool {
+        if self.auth_tokens.contains(token) || self.static_deposit_tokens.contains_key(token) {
+            return true;
+        }
+        self.recent_hosted_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(token, now)
+    }
+
+    fn record_hosted_credential(&self, token: &str) {
+        self.recent_hosted_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(token, Instant::now());
+    }
+
+    fn forget_hosted_credential(&self, token: &str) {
+        self.recent_hosted_credentials
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .forget(token);
     }
 
     /// Charge one credential reject (a 401) to `client`'s bucket.
@@ -5601,8 +5694,16 @@ async fn authorize_family(
         .await
         .map_err(ApiError::internal)?;
     let Some((family, class)) = family else {
+        // A rotated-away or deleted credential loses its gate exemption on
+        // its first 401, so a stale device stops bypassing the gate at once.
+        state.forget_hosted_credential(token);
         return Err(ApiError::unauthorized("unknown family token".to_string()));
     };
+    // The store recognised it, so the pre-auth gate may let it through a
+    // spent address from now on without paying this lookup first. Recorded
+    // before the billing checks: a suspended or lapsed family answers 403,
+    // never 401, so it never charges the gate either way.
+    state.record_hosted_credential(token);
     // Class boundary first: the op simply does not exist for a deposit
     // credential, regardless of the family's billing state.
     if class == TokenClass::Deposit && !op.allowed_for_deposit() {

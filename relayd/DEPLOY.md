@@ -847,13 +847,17 @@ cover that caller:
   (`CRUISEMESH_RELAY_AUTH_REJECTS_PER_IP_PER_MIN`); once it is spent, further
   requests from that address are refused with the usual `429 rate_limited`
   and a `Retry-After` — *before* the token is looked up in SQLite or the body
-  is read. Successful requests never charge it, and a request bearing one of
-  the static `CRUISEMESH_RELAY_TOKENS` (or its deposit token) is never
-  refused by it, since recognising those costs no store read. A hosted
-  family with good tokens therefore only meets it if its address as a whole
-  keeps presenting bad ones — and a whole ship can share one NAT address, so
-  raise the figure if the WARN line below shows a ship's address tripping
-  it. A client treats this 429 like any other: it ends the pass and backs
+  is read. Successful requests never charge it, and a request is never
+  refused by it when it bears one of the static `CRUISEMESH_RELAY_TOKENS`
+  (or its deposit token), or a hosted family credential that authorized in
+  the last 15 minutes: recognising either is an in-memory lookup, not a
+  store read. The credential may be in the `Authorization` header or, on
+  `GET /ws`, the `?token=` parameter. A whole ship can share one NAT
+  address, so this keeps one stale device or one guesser there from
+  locking out the families already in use behind it. It does not cover a
+  hosted credential the relay has not seen in that window (a device's
+  first request after a long gap, or after a relay restart), so raise the
+  figure if the WARN line below shows a ship's address tripping it. A client treats this 429 like any other: it ends the pass and backs
   off (`RATE-01`). This covers `/admin/*` and `GET /ws` too. IPv6 clients
   are keyed by their /64.
 
