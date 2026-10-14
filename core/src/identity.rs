@@ -219,14 +219,37 @@ pub fn format_user_id(user_id: Vec<u8>) -> String {
     format!("CM-{grouped}")
 }
 
-/// Short verbal-verification phrase for a UserID (Signal-safety-number style),
-/// not a security boundary by itself — a convenience for "read this out loud".
+/// Number of safety words shown for a UserID: 6 words x 11 bits = 66 bits.
+pub(crate) const SAFETY_WORD_COUNT: usize = 6;
+
+/// Domain-separation tag for the safety-word hash, so the phrase can never
+/// coincide with any other BLAKE2b use of a UserID in the protocol.
+const SAFETY_WORDS_DOMAIN: &[u8] = b"cruisemesh-safety-words-v1";
+
+/// Verbal-verification phrase for a UserID (Signal-safety-number style): the
+/// words two people read aloud to confirm a card was not swapped in transit.
+///
+/// Scheme (pinned by a golden-vector test, identical on every platform):
+/// `h = BLAKE2b-256(SAFETY_WORDS_DOMAIN || user_id)`; the first 66 bits of `h`,
+/// read big-endian, are split into six 11-bit indices into the BIP-39 English
+/// wordlist. Every UserID byte feeds the hash, and a phrase match carries
+/// 66 bits: forging a key whose words match a target's takes ~2^66 work, out
+/// of reach for a casual attacker, unlike the earlier 4-word phrase (24 bits).
 #[uniffi::export]
 pub fn fingerprint_words(user_id: Vec<u8>) -> Vec<String> {
-    (0..4)
+    let mut hasher = Blake2bVar::new(32).expect("valid blake2b output length");
+    hasher.update(SAFETY_WORDS_DOMAIN);
+    hasher.update(&user_id);
+    let mut digest = [0u8; 32];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("output buffer matches configured length");
+    // 66 bits fit in the top of a u128 built from the first 16 digest bytes.
+    let bits = u128::from_be_bytes(digest[..16].try_into().expect("16 bytes"));
+    (0..SAFETY_WORD_COUNT)
         .map(|i| {
-            let byte = user_id.get(i).copied().unwrap_or(0);
-            WORDLIST[byte as usize % WORDLIST.len()].to_string()
+            let index = (bits >> (128 - 11 * (i + 1))) & 0x7ff;
+            crate::safety_wordlist::BIP39_ENGLISH[index as usize].to_string()
         })
         .collect()
 }
@@ -1426,75 +1449,6 @@ fn validate_shared_card_shape(shared: &SharedFriendCard) -> Result<(), CoreError
     Ok(())
 }
 
-/// Small nautical/travel-themed wordlist for fingerprint phrases. Not
-/// security-critical (only 4 words are shown), so a compact list is fine.
-const WORDLIST: [&str; 64] = [
-    "anchor",
-    "atoll",
-    "beacon",
-    "bilge",
-    "boatswain",
-    "bosun",
-    "bow",
-    "breeze",
-    "bridge",
-    "buoy",
-    "cabin",
-    "captain",
-    "chart",
-    "clipper",
-    "coast",
-    "compass",
-    "coral",
-    "current",
-    "dock",
-    "dolphin",
-    "ferry",
-    "fjord",
-    "flag",
-    "fleet",
-    "galley",
-    "gangway",
-    "harbor",
-    "helm",
-    "horizon",
-    "island",
-    "jetty",
-    "keel",
-    "knot",
-    "lagoon",
-    "lantern",
-    "latitude",
-    "lighthouse",
-    "longitude",
-    "mast",
-    "mate",
-    "moor",
-    "navigate",
-    "ocean",
-    "oar",
-    "pier",
-    "port",
-    "quay",
-    "reef",
-    "rudder",
-    "sail",
-    "sextant",
-    "shore",
-    "starboard",
-    "stern",
-    "swell",
-    "tide",
-    "tropic",
-    "vessel",
-    "voyage",
-    "wake",
-    "wave",
-    "wharf",
-    "wind",
-    "yacht",
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2689,7 +2643,67 @@ mod tests {
         let a = fingerprint_words(id.user_id.clone());
         let b = fingerprint_words(id.user_id);
         assert_eq!(a, b);
-        assert_eq!(a.len(), 4);
+        assert_eq!(a.len(), SAFETY_WORD_COUNT);
+    }
+
+    #[test]
+    fn safety_words_are_six_bip39_words() {
+        assert_eq!(SAFETY_WORD_COUNT, 6);
+        let words = fingerprint_words(generate_identity().user_id);
+        assert_eq!(words.len(), 6);
+        for word in &words {
+            assert!(
+                crate::safety_wordlist::BIP39_ENGLISH.contains(&word.as_str()),
+                "{word} is not a BIP-39 English word"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_words_golden_vector() {
+        // Pinned so the phrase two devices compare can never drift between
+        // releases or platforms. Scheme: BLAKE2b-256 over the domain tag then
+        // the UserID; first 66 bits, big-endian, as six 11-bit indices.
+        let user_id: Vec<u8> = (0u8..16).collect();
+        assert_eq!(
+            fingerprint_words(user_id),
+            ["task", "climb", "bamboo", "mix", "history", "salmon"]
+        );
+    }
+
+    #[test]
+    fn safety_words_depend_on_every_user_id_byte() {
+        // The old 4-word phrase only read the first four bytes, so two
+        // UserIDs sharing them were indistinguishable aloud. A forged key
+        // only needed ~2^24 tries to land such a collision.
+        let base = [0x5au8; USER_ID_LEN];
+        let reference = fingerprint_words(base.to_vec());
+        for i in 0..USER_ID_LEN {
+            let mut other = base;
+            other[i] ^= 0x01;
+            assert_ne!(
+                fingerprint_words(other.to_vec()),
+                reference,
+                "flipping byte {i} must change the safety words"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_wordlist_is_the_bip39_english_list() {
+        use sha2::{Digest, Sha256};
+        let list = crate::safety_wordlist::BIP39_ENGLISH;
+        let mut file = String::new();
+        for word in list {
+            file.push_str(word);
+            file.push('\n');
+        }
+        let digest = Sha256::digest(file.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda"
+        );
     }
 
     fn contact(user_id: &[u8], name: &str) -> Contact {

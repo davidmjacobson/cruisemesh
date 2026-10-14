@@ -340,20 +340,26 @@ fun ContactDetailsSheetContent(
                     Column(
                         modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 20.dp),
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            fingerprint.forEach { word ->
-                                OutlinedCard(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = word,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 12.dp),
-                                        textAlign = TextAlign.Center,
-                                        style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
-                                    )
+                        // Six words: two rows of three so each word keeps
+                        // enough width to read on a phone-width sheet.
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            fingerprint.chunked(3).forEach { rowWords ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    rowWords.forEach { word ->
+                                        OutlinedCard(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = word,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(vertical = 12.dp),
+                                                textAlign = TextAlign.Center,
+                                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
+                                            )
+                                        }
+                                    }
                                 }
                             }
                         }
