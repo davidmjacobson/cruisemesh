@@ -139,9 +139,10 @@ struct CruiseMeshApp: App {
                     guard (try? parseRelaySetupText(text: fragment)) != nil else { return }
                     appModel.pendingRelayCard = fragment
                 case .lan:
+                    // Never dial or start the mesh from a link: show the
+                    // address and let the person decide (or say why not).
                     guard let endpoint = parseLanEndpointLink(fragment) else { return }
-                    LanTransportDiagnostics.shared.queueManualConnection(endpoint)
-                    appModel.startMesh()
+                    appModel.handleLanEndpointLink(endpoint)
                 case .deviceLink:
                     // A device-link offer is scanned inside the linking
                     // ceremony, by the device that is already part of this
@@ -150,6 +151,23 @@ struct CruiseMeshApp: App {
                     // finish what the link starts.
                     return
                 }
+            }
+            .alert(
+                lanLinkTitle(appModel.lanLinkDecision),
+                isPresented: Binding(
+                    get: { appModel.lanLinkDecision != nil },
+                    set: { presented in if !presented { appModel.lanLinkDecision = nil } }
+                ),
+                presenting: appModel.lanLinkDecision
+            ) { decision in
+                if case .confirm = decision {
+                    Button("Connect") { appModel.confirmLanEndpointLink(decision.endpoint) }
+                    Button("Cancel", role: .cancel) {}
+                } else {
+                    Button("Close", role: .cancel) {}
+                }
+            } message: { decision in
+                lanLinkMessage(decision)
             }
             .onChange(of: scenePhase) { phase in
                 appModel.setAppForeground(phase == .active)
@@ -160,6 +178,31 @@ struct CruiseMeshApp: App {
                 DiagnosticLogExport.archiveCurrentSession()
             }
         }
+    }
+}
+
+private func lanLinkTitle(_ decision: LanEndpointLinkDecision?) -> Text {
+    switch decision {
+    case .some(.confirm), .none:
+        return Text("Connect to this address?")
+    case .some(.meshOff):
+        return Text("Mesh is off")
+    case .some(.noWifi), .some(.otherNetwork):
+        return Text("Can't connect to this address")
+    }
+}
+
+private func lanLinkMessage(_ decision: LanEndpointLinkDecision) -> Text {
+    let address = decision.endpoint.display
+    switch decision {
+    case .confirm:
+        return Text("This link asks CruiseMesh to connect to \(address) on your Wi-Fi. Only connect if someone you trust shared it with you.")
+    case .meshOff:
+        return Text("This link points to \(address). Turn the mesh on, then open the link again.")
+    case .noWifi:
+        return Text("This link points to \(address), but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again.")
+    case .otherNetwork:
+        return Text("\(address) isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again.")
     }
 }
 

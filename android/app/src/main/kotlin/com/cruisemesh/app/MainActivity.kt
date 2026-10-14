@@ -24,10 +24,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -105,6 +107,8 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.mesh.LanEndpointLinkDecision
+import com.cruisemesh.app.mesh.LanManualEndpoint
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
@@ -114,6 +118,7 @@ import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.mesh.shouldStartMeshOnAppOpen
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.RelayHealth
+import com.cruisemesh.app.mesh.decideLanEndpointLink
 import com.cruisemesh.app.mesh.parseLanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.notify.ChatVisibility
@@ -296,6 +301,9 @@ fun CruiseMeshApp(
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
     }
     val navController = rememberNavController()
+    // A tapped LAN address link waits here for the person's answer; see
+    // [LanEndpointLinkDecision] for why a link never dials on its own.
+    var lanLinkDecision by remember { mutableStateOf<LanEndpointLinkDecision?>(null) }
     var termsAccepted by remember {
         mutableStateOf(TermsAcceptanceStore.isCurrentVersionAccepted(context))
     }
@@ -563,13 +571,7 @@ fun CruiseMeshApp(
         }
         link.lanEndpoint?.let { endpointText ->
             val endpoint = parseLanManualEndpoint(endpointText, lanDefaultTcpPort().toInt())
-            if (endpoint != null) {
-                LanTransportDiagnostics.queueManualConnection(endpoint)
-                if (MeshRuntimeStatus.state.value == MeshRuntimeState.STOPPED) {
-                    startMesh(context)
-                }
-                navController.navigate("profile") { launchSingleTop = true }
-            }
+            if (endpoint != null) lanLinkDecision = currentLanEndpointLinkDecision(endpoint)
             onPendingDeepLinkConsumed()
             return@LaunchedEffect
         }
@@ -580,6 +582,77 @@ fun CruiseMeshApp(
         }
         onPendingDeepLinkConsumed()
     }
+
+    lanLinkDecision?.let { decision ->
+        LanEndpointLinkDialog(
+            decision = decision,
+            onConnect = {
+                // Ask again at the moment of the yes: the mesh or the Wi-Fi
+                // network may have changed while the dialog was open.
+                val current = currentLanEndpointLinkDecision(decision.endpoint)
+                if (current is LanEndpointLinkDecision.Confirm) {
+                    lanLinkDecision = null
+                    LanTransportDiagnostics.queueManualConnection(current.endpoint)
+                    navController.navigate("profile") { launchSingleTop = true }
+                } else {
+                    lanLinkDecision = current
+                }
+            },
+            onDismiss = { lanLinkDecision = null },
+        )
+    }
+}
+
+private fun currentLanEndpointLinkDecision(endpoint: LanManualEndpoint): LanEndpointLinkDecision =
+    decideLanEndpointLink(
+        endpoint = endpoint,
+        meshRunning = MeshRuntimeStatus.state.value != MeshRuntimeState.STOPPED,
+        localEndpoint = LanTransportDiagnostics.state.value.localEndpoint,
+    )
+
+/**
+ * The only door from a LAN address link to a connection: it names the
+ * address, and only [LanEndpointLinkDecision.Confirm] offers to connect.
+ */
+@Composable
+private fun LanEndpointLinkDialog(
+    decision: LanEndpointLinkDecision,
+    onConnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val address = decision.endpoint.display
+    val (title, body) = when (decision) {
+        is LanEndpointLinkDecision.Confirm ->
+            stringResource(R.string.ui_lan_link_confirm_title) to
+                stringResource(R.string.ui_lan_link_confirm_body, address)
+        is LanEndpointLinkDecision.MeshOff ->
+            stringResource(R.string.ui_lan_link_mesh_off_title) to
+                stringResource(R.string.ui_lan_link_mesh_off_body, address)
+        is LanEndpointLinkDecision.NoWifi ->
+            stringResource(R.string.ui_lan_link_refused_title) to
+                stringResource(R.string.ui_lan_link_no_wifi_body, address)
+        is LanEndpointLinkDecision.OtherNetwork ->
+            stringResource(R.string.ui_lan_link_refused_title) to
+                stringResource(R.string.ui_lan_link_other_network_body, address)
+    }
+    val confirming = decision is LanEndpointLinkDecision.Confirm
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = {
+            if (confirming) {
+                TextButton(onClick = onConnect) { Text(stringResource(R.string.ui_connect)) }
+            } else {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_close)) }
+            }
+        },
+        dismissButton = if (confirming) {
+            { TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_cancel)) } }
+        } else {
+            null
+        },
+    )
 }
 
 @Composable
