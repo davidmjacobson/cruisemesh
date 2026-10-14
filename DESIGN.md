@@ -318,9 +318,11 @@ ratchet/PQ upgrade can ship later without a flag day.
 **Version 2 rollout.** Current builds open versions 1 and 2 but still seal
 version 1, because a build that predates version 2 fails closed on it and the
 message would never be shown. A later release flips the seal side to version 2
-(one constant in `core/src/crypto.rs`); until it does, and until the version-1
-open path is removed, a version-1 body can still be forwarded as above. The
-removal conditions are written next to `ENVELOPE_VERSION_LEGACY`.
+(`SEAL_BOUND_SIGNATURE` in `core/src/crypto.rs`, which drives both the pairwise
+and the group seal version); until it does, and until the version-1 open path
+is removed, a version-1 body can still be forwarded as above. The removal
+conditions are written next to `ENVELOPE_VERSION_LEGACY`; both steps are
+tracked in issue #497.
 
 ### 6.4 What observers see
 

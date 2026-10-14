@@ -52,9 +52,13 @@
 //! envelope looks foreign and is carried rather than delivered -- which for a
 //! family messenger is a lost message, the failure DESIGN.md §6.3 refuses a
 //! flag day over. So the seal side flips to version 2 in a later release, once
-//! the field fleet opens it; the constant is the whole flip. Until then, and
-//! until the legacy open path below is removed, a version-1 body can still be
-//! forwarded in the way described above.
+//! the field fleet opens it. [`SEAL_BOUND_SIGNATURE`] is the whole flip: it
+//! drives both [`SEAL_ENVELOPE_VERSION`] and the group seal version in
+//! [`crate::groups`]. Until then, and until the legacy open path below is
+//! removed, a version-1 body can still be forwarded in the way described
+//! above. Both remaining steps are tracked in issue #497.
+
+use std::borrow::Cow;
 
 use crypto_box::aead::{Aead, AeadCore};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
@@ -74,17 +78,25 @@ use crate::{CoreError, Identity};
 /// version-1 sealing build went out of support, so no live envelope still
 /// carries it, and (c) nothing re-opens stored version-1 ciphertext (the §8
 /// sync-record backlog re-sealed on inbox-key rotation in `revocation.rs`).
+/// Tracked in issue #497.
 const ENVELOPE_VERSION_LEGACY: u8 = 1;
 /// Current pairwise envelope: the signature covers a domain-separated
 /// transcript binding the recipient's X25519 public key.
 const ENVELOPE_VERSION_BOUND: u8 = 2;
-/// The highest pairwise envelope version this build opens.
-const ENVELOPE_VERSION: u8 = ENVELOPE_VERSION_BOUND;
-/// The pairwise envelope version this build seals. Held at the legacy version
-/// for one release so builds that predate version 2 keep receiving mail; see
-/// the module docs ("Rollout"). Flipping it to [`ENVELOPE_VERSION_BOUND`] is
-/// the whole second step.
-const SEAL_ENVELOPE_VERSION: u8 = ENVELOPE_VERSION_LEGACY;
+/// Whether this build seals bound (version-2) signatures, pairwise and group
+/// alike. Held at `false` for one release so builds that predate version 2
+/// keep receiving mail; see the module docs ("Rollout"). Setting it to `true`
+/// is the whole second step (issue #497): [`SEAL_ENVELOPE_VERSION`] and
+/// `groups::SEAL_GROUP_ENVELOPE_VERSION` both derive from it, so the pairwise
+/// and group seals cannot be flipped apart.
+pub(crate) const SEAL_BOUND_SIGNATURE: bool = false;
+/// The pairwise envelope version this build seals; see
+/// [`SEAL_BOUND_SIGNATURE`].
+const SEAL_ENVELOPE_VERSION: u8 = if SEAL_BOUND_SIGNATURE {
+    ENVELOPE_VERSION_BOUND
+} else {
+    ENVELOPE_VERSION_LEGACY
+};
 const EPHEMERAL_PK_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 pub(crate) const PAD_BUCKET: usize = 256;
@@ -122,9 +134,13 @@ impl SignatureBinding<'_> {
     /// big-endian length followed by `x`. Every variable field is framed, so
     /// no two distinct `(domain, binding, payload)` triples share a
     /// transcript.
-    fn transcript(&self, sender_sign_pk: &[u8], payload: &[u8]) -> Result<Vec<u8>, CoreError> {
+    fn transcript<'p>(
+        &self,
+        sender_sign_pk: &[u8],
+        payload: &'p [u8],
+    ) -> Result<Cow<'p, [u8]>, CoreError> {
         let (domain, binding) = match *self {
-            SignatureBinding::Legacy => return Ok(payload.to_vec()),
+            SignatureBinding::Legacy => return Ok(Cow::Borrowed(payload)),
             SignatureBinding::Pairwise { recipient_agree_pk } => {
                 (PAIRWISE_SIGNATURE_DOMAIN, recipient_agree_pk)
             }
@@ -137,7 +153,7 @@ impl SignatureBinding<'_> {
         write_framed(&mut out, binding)?;
         out.extend_from_slice(sender_sign_pk);
         write_framed(&mut out, payload)?;
-        Ok(out)
+        Ok(Cow::Owned(out))
     }
 }
 
@@ -157,9 +173,9 @@ fn looks_like_bound_transcript(payload: &[u8]) -> bool {
     [PAIRWISE_SIGNATURE_DOMAIN, GROUP_SIGNATURE_DOMAIN]
         .iter()
         .any(|domain| {
-            let mut prefix = (domain.len() as u32).to_be_bytes().to_vec();
-            prefix.extend_from_slice(domain);
-            payload.starts_with(&prefix)
+            payload.len() >= 4
+                && payload[..4] == (domain.len() as u32).to_be_bytes()
+                && payload[4..].starts_with(domain)
         })
 }
 
@@ -253,7 +269,7 @@ pub(crate) fn open_sealed_with_agree_sk(
     let version = version[0];
     if version != ENVELOPE_VERSION_LEGACY && version != ENVELOPE_VERSION_BOUND {
         return Err(CoreError::Crypto(format!(
-            "unsupported envelope version {version} (this client speaks up to {ENVELOPE_VERSION})"
+            "unsupported envelope version {version} (this client opens {ENVELOPE_VERSION_LEGACY} and {ENVELOPE_VERSION_BOUND})"
         )));
     }
     let (ephemeral_pk_bytes, rest) = rest.split_at(EPHEMERAL_PK_LEN);

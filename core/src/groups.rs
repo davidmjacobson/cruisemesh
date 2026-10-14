@@ -10,7 +10,8 @@
 //! group domain, bound to the group id ([`crate::crypto::SignatureBinding`]),
 //! so a group body cannot be replayed as a pairwise body or into another
 //! group. The same open-both, seal-legacy-for-one-release rollout as the
-//! pairwise seal applies; see `crypto.rs`.
+//! pairwise seal applies, flipped by the same constant
+//! ([`crate::crypto::SEAL_BOUND_SIGNATURE`]); see `crypto.rs`.
 
 use chacha20poly1305::aead::{Aead, AeadCore};
 use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
@@ -28,13 +29,15 @@ const GROUP_ENVELOPE_VERSION_LEGACY: u8 = 1;
 /// Current group envelope: the signature is domain-separated from pairwise
 /// bodies and bound to the group id.
 const GROUP_ENVELOPE_VERSION_BOUND: u8 = 2;
-/// The highest group envelope version this build opens.
-const GROUP_ENVELOPE_VERSION: u8 = GROUP_ENVELOPE_VERSION_BOUND;
 /// The group envelope version this build seals: held at the legacy version
 /// for one release so members on builds that predate version 2 keep reading
-/// the group. Flipping it to [`GROUP_ENVELOPE_VERSION_BOUND`] is the whole
-/// second step.
-const SEAL_GROUP_ENVELOPE_VERSION: u8 = GROUP_ENVELOPE_VERSION_LEGACY;
+/// the group. Derived from [`crate::crypto::SEAL_BOUND_SIGNATURE`], the one
+/// flip shared with the pairwise seal (issue #497).
+const SEAL_GROUP_ENVELOPE_VERSION: u8 = if crate::crypto::SEAL_BOUND_SIGNATURE {
+    GROUP_ENVELOPE_VERSION_BOUND
+} else {
+    GROUP_ENVELOPE_VERSION_LEGACY
+};
 const GROUP_NONCE_LEN: usize = 24;
 const GROUP_METADATA_VERSION: u8 = 1;
 const USER_ID_LEN: usize = 16;
@@ -397,7 +400,7 @@ pub fn open_group_message(
     let version = version[0];
     if version != GROUP_ENVELOPE_VERSION_LEGACY && version != GROUP_ENVELOPE_VERSION_BOUND {
         return Err(CoreError::Crypto(format!(
-            "unsupported group envelope version {version} (this client speaks up to {GROUP_ENVELOPE_VERSION})"
+            "unsupported group envelope version {version} (this client opens {GROUP_ENVELOPE_VERSION_LEGACY} and {GROUP_ENVELOPE_VERSION_BOUND})"
         )));
     }
     let (nonce_bytes, ciphertext) = rest.split_at(GROUP_NONCE_LEN);
