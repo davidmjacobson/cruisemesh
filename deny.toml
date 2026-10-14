@@ -3,8 +3,10 @@
 # policy"); the two are meant to say the same thing, and a change to either is
 # incomplete until it is a change to both.
 #
-# Enforced by .github/workflows/dependency-audit.yml on every pull request,
-# every push to master, and daily -- the daily run is what catches an advisory
+# Enforced by .github/workflows/dependency-audit.yml against every Cargo.lock
+# in the repository (the root workspace, the Tauri messenger host in
+# desktop/ui/src-tauri, and fuzz/) on every pull request, every push to
+# master, and daily -- the daily run is what catches an advisory
 # published against code nobody touched that week.
 
 [advisories]
@@ -31,6 +33,13 @@ unmaintained = "all"
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
+    # Tauri messenger host (desktop/ui/src-tauri/Cargo.lock) only.
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained, not a vulnerability. Compile-time only, via glib-macros in Tauri's Linux GTK stack; the shipped Windows build does not link it. Reviewed at each release." },
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
 ]
 
 [licenses]
@@ -61,6 +70,15 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+# Per-crate exceptions: a license accepted for one named crate only, never
+# added to the allowlist above. Each carries its reason. Kept identical to the
+# list in SECURITY.md.
+exceptions = [
+    # Public-domain dedication. Compile-time only (const-random-macro) in the Tauri host's graph.
+    { allow = ["CC0-1.0"], crate = "tiny-keccak" },
+    # libFuzzer's permissive LLVM license. fuzz/ only; never part of a shipped binary.
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
 
 [bans]
 # Duplicate versions are a tidiness and binary-size matter, not a security one,

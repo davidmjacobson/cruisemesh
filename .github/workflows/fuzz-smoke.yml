@@ -84,6 +84,17 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-${{ matrix.target }}-
+      # fuzz/ is its own workspace with its own committed Cargo.lock, which
+      # dependency-audit.yml audits. cargo-fuzz has no --locked flag, so
+      # enforce it here: this fails if the lockfile is missing or stale, and
+      # once it passes cargo honours the committed lock unchanged for the
+      # build and run below instead of resolving a fresh, unaudited graph.
+      - name: Verify fuzz lockfile is current
+        run: |
+          cargo +nightly fetch --locked --manifest-path fuzz/Cargo.toml || {
+            echo "::error file=fuzz/Cargo.lock::fuzz/Cargo.lock is stale. Rebuild it from the root lockfile: cp Cargo.lock fuzz/Cargo.lock && cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null (see fuzz/README.md)"
+            exit 1
+          }
       # Build always runs (cheap regression guard against API drift in core).
       - name: Build target
         run: cargo +nightly fuzz build ${{ matrix.target }}
