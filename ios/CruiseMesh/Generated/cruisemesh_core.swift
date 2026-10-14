@@ -6737,16 +6737,20 @@ public protocol MessageStoreProtocol : AnyObject {
      * though the reason changed with #283 and is worth restating exactly.
      * `record_receipt` now *does* retire the `outbound_envelopes` rows a
      * delivered watermark covers, so an overstated watermark reaching the
-     * sender does remove sealed rows for messages that peer never filed. What
-     * makes that harmless is that retirement removes only the sealed
-     * retransmission artifact and only where the `messages` row that
-     * regenerates it survives (see `crate::outbound_retirement`): the sender
-     * still holds the message, the peer's *digest* still reports the gap-aware
+     * sender can remove sealed rows for messages that peer never filed. What
+     * makes that harmless is two guards (see `crate::outbound_retirement`).
+     * Retirement removes only the sealed retransmission artifact and only
+     * where the `messages` row that regenerates it survives: the sender still
+     * holds the message, the peer's *digest* still reports the gap-aware
      * contiguous watermark, and the digest responder re-seals the envelope
-     * from the stored message. Nothing a sender still owes becomes
-     * unsendable. Carried rows -- other people's mail, which this device is
-     * the only copy of -- are untouched by all of this and still leave only
-     * on their own digest proof.
+     * from the stored message. That repair runs only over BLE or LAN,
+     * though, and a friendship that continues over the relay may never have
+     * either again -- so retirement also waits until the row has been posted
+     * to the relay (`relay_posted_at IS NOT NULL`), so the relay lane has its
+     * copy before the queue lets go of it. Nothing a sender still owes
+     * becomes unsendable. Carried rows -- other people's mail, which this
+     * device is the only copy of -- are untouched by all of this and still
+     * leave only on their own digest proof.
      */
     func highestLamport(chatId: Data, senderUserId: Data) throws  -> UInt64
     
@@ -7065,6 +7069,11 @@ public protocol MessageStoreProtocol : AnyObject {
     /**
      * Mark one outbound envelope as successfully posted to a relay. Returns
      * `true` if a queued row was updated.
+     *
+     * A 1:1 row the stored delivered watermark already covers retires in the
+     * same transaction: receipt coverage waits for the relay lane to have
+     * carried a row (`crate::outbound_retirement`), and this is the moment it
+     * has. A row no receipt covers stays queued for BLE/LAN exactly as before.
      */
     func markOutboundEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64) throws  -> Bool
     
@@ -11264,16 +11273,20 @@ open func highestContiguousLamport(chatId: Data, senderUserId: Data)throws  -> U
      * though the reason changed with #283 and is worth restating exactly.
      * `record_receipt` now *does* retire the `outbound_envelopes` rows a
      * delivered watermark covers, so an overstated watermark reaching the
-     * sender does remove sealed rows for messages that peer never filed. What
-     * makes that harmless is that retirement removes only the sealed
-     * retransmission artifact and only where the `messages` row that
-     * regenerates it survives (see `crate::outbound_retirement`): the sender
-     * still holds the message, the peer's *digest* still reports the gap-aware
+     * sender can remove sealed rows for messages that peer never filed. What
+     * makes that harmless is two guards (see `crate::outbound_retirement`).
+     * Retirement removes only the sealed retransmission artifact and only
+     * where the `messages` row that regenerates it survives: the sender still
+     * holds the message, the peer's *digest* still reports the gap-aware
      * contiguous watermark, and the digest responder re-seals the envelope
-     * from the stored message. Nothing a sender still owes becomes
-     * unsendable. Carried rows -- other people's mail, which this device is
-     * the only copy of -- are untouched by all of this and still leave only
-     * on their own digest proof.
+     * from the stored message. That repair runs only over BLE or LAN,
+     * though, and a friendship that continues over the relay may never have
+     * either again -- so retirement also waits until the row has been posted
+     * to the relay (`relay_posted_at IS NOT NULL`), so the relay lane has its
+     * copy before the queue lets go of it. Nothing a sender still owes
+     * becomes unsendable. Carried rows -- other people's mail, which this
+     * device is the only copy of -- are untouched by all of this and still
+     * leave only on their own digest proof.
      */
 open func highestLamport(chatId: Data, senderUserId: Data)throws  -> UInt64 {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -11761,6 +11774,11 @@ open func markCarriedEnvelopeRelayUploaded(msgId: Data, relayUrl: String)throws 
     /**
      * Mark one outbound envelope as successfully posted to a relay. Returns
      * `true` if a queued row was updated.
+     *
+     * A 1:1 row the stored delivered watermark already covers retires in the
+     * same transaction: receipt coverage waits for the relay lane to have
+     * carried a row (`crate::outbound_retirement`), and this is the moment it
+     * has. A row no receipt covers stays queued for BLE/LAN exactly as before.
      */
 open func markOutboundEnvelopeRelayPosted(msgId: Data, postedAtMs: Int64)throws  -> Bool {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeCoreError.lift) {
@@ -59056,7 +59074,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_contiguous_lamport() != 34271) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 49979) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_highest_lamport() != 41564) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_hint_matches_known_target() != 30294) {
@@ -59131,7 +59149,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_carried_envelope_relay_uploaded() != 31075) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outbound_envelope_relay_posted() != 18680) {
+    if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outbound_envelope_relay_posted() != 13142) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_method_messagestore_mark_outgoing_receipt_envelope_relay_posted() != 16233) {
