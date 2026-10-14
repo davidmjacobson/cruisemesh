@@ -55340,8 +55340,15 @@ public func fanoutMsgId(originalMsgId: Data, memberUserId: Data) -> Data {
 })
 }
 /**
- * Short verbal-verification phrase for a UserID (Signal-safety-number style),
- * not a security boundary by itself — a convenience for "read this out loud".
+ * Verbal-verification phrase for a UserID (Signal-safety-number style): the
+ * words two people read aloud to confirm a card was not swapped in transit.
+ *
+ * Scheme (pinned by a golden-vector test, identical on every platform):
+ * `h = BLAKE2b-256(SAFETY_WORDS_DOMAIN || user_id)`; the first 66 bits of `h`,
+ * read big-endian, are split into six 11-bit indices into the BIP-39 English
+ * wordlist. Every UserID byte feeds the hash, and a phrase match carries
+ * 66 bits: forging a key whose words match a target's takes ~2^66 work, out
+ * of reach for a casual attacker, unlike the earlier 4-word phrase (24 bits).
  */
 public func fingerprintWords(userId: Data) -> [String] {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
@@ -58057,7 +58064,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_cruisemesh_core_checksum_func_fanout_msg_id() != 44547) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cruisemesh_core_checksum_func_fingerprint_words() != 59656) {
+    if (uniffi_cruisemesh_core_checksum_func_fingerprint_words() != 42196) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cruisemesh_core_checksum_func_format_user_id() != 35242) {
