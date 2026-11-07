@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.update
 data class LanTransportSnapshot(
     val state: String = "Waiting for Wi-Fi",
     val localEndpoint: String? = null,
+    /** Subnet prefix the interface reports for [localEndpoint]'s address. */
+    val localPrefixLength: Int? = null,
     val lastPeerEndpoint: String? = null,
     val activePeerNames: List<String> = emptyList(),
     val lastError: String? = null,
@@ -106,11 +108,12 @@ object LanTransportDiagnostics {
         }
     }
 
-    internal fun listening(localEndpoint: String?) {
+    internal fun listening(localEndpoint: String?, localPrefixLength: Int? = null) {
         mutableState.update {
             it.copy(
                 state = "Listening for CruiseMesh friends",
                 localEndpoint = localEndpoint,
+                localPrefixLength = localEndpoint?.let { localPrefixLength },
                 lastError = null,
                 probeStatus = null,
             )

@@ -111,16 +111,30 @@ Per-message **sign-then-seal**, using libsodium constructions whole:
 
 1. The plaintext body (which includes sender ID, chat ID, a per-chat Lamport
    counter, timestamp, and payload) is **signed** with the sender's Ed25519
-   key.
+   key. From envelope version 2 the signature covers a domain-separated,
+   length-framed transcript that also names the **recipient's X25519 public
+   key**, and the recipient verifies it against its own key. This stops
+   *surreptitious forwarding*: a contact who received your message cannot
+   re-seal it to someone else and have it accepted as written by you.
 2. The signed body is **sealed** to the recipient's X25519 key with an
    ephemeral sender key (`crypto_box_seal`-style ECIES with embedded sender
    authentication).
 3. Plaintext is **padded to the next 256-byte bucket** before sealing so
    observers can't distinguish "ok" from a paragraph.
 
+**Rollout of the recipient binding.** Current builds open both version 1
+(bare-payload signature) and version 2, and still *seal* version 1 so family
+members on older builds keep receiving messages; a later release switches
+sealing to version 2. Until then — and until the version-1 open path is
+removed — a version-1 message can still be forwarded as described above. A
+version-2 envelope is never accepted under the version-1 rule, and a version-2
+body cannot be relabelled as version 1.
+
 Groups use a shared symmetric **XChaCha20-Poly1305 group key**, distributed
 pairwise-sealed (as above) by the group creator; group messages are signed by
-the individual sender then encrypted with the group key. Membership removal
+the individual sender then encrypted with the group key. Version-2 group
+signatures use a separate domain bound to the group id, so a group message
+cannot be replayed as a 1:1 message or into another group. Membership removal
 rotates the key and re-invites; a removed member can read only pre-rotation
 traffic. This is family-scale group crypto by intent — no MLS, no tree KEMs.
 
