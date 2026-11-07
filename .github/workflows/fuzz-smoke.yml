@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust nightly
         id: nightly
-        uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # nightly
       # FR9: caches cargo's registry/git indexes and the `fuzz/` crate's own
       # target dir (a separate, non-workspace crate -- see fuzz/Cargo.toml).
       # Every matrix job previously cold-compiled cruisemesh-core + all its
