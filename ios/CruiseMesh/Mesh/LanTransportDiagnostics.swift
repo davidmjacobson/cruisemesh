@@ -4,6 +4,8 @@ import Foundation
 struct LanTransportSnapshot {
     var state = "Waiting for Wi-Fi"
     var localEndpoint: String?
+    /// Subnet prefix the interface reports for `localEndpoint`'s address.
+    var localPrefixLength: Int?
     var lastPeerEndpoint: String?
     var activePeerNames: [String] = []
     var lastError: String?
@@ -84,11 +86,12 @@ final class LanTransportDiagnostics: ObservableObject {
         }
     }
 
-    func listening(localEndpoint: String?) {
+    func listening(localEndpoint: String?, prefixLength: Int? = nil) {
         publish {
             var next = $0
             next.state = "Listening for CruiseMesh friends"
             next.localEndpoint = localEndpoint
+            next.localPrefixLength = localEndpoint == nil ? nil : prefixLength
             next.lastError = nil
             return next
         }

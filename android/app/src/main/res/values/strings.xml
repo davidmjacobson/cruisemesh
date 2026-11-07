@@ -984,6 +984,13 @@
     <string name="ui_waiting_to_connect_count">Waiting to connect (%1$d)</string>
     <string name="ui_x_wants_to_connect">%1$s wants to connect</string>
     <string name="ui_connect">Connect</string>
+    <string name="ui_lan_link_confirm_title">Connect to this address?</string>
+    <string name="ui_lan_link_confirm_body">This link asks CruiseMesh to connect to %1$s on your Wi-Fi. Only connect if someone you trust shared it with you.</string>
+    <string name="ui_lan_link_mesh_off_title">Mesh is off</string>
+    <string name="ui_lan_link_mesh_off_body">This link points to %1$s. Turn the mesh on, then open the link again.</string>
+    <string name="ui_lan_link_refused_title">Can\'t connect to this address</string>
+    <string name="ui_lan_link_no_wifi_body">This link points to %1$s, but this phone isn\'t on Wi-Fi. Join the same Wi-Fi network, then open the link again.</string>
+    <string name="ui_lan_link_other_network_body">%1$s isn\'t on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again.</string>
     <string name="ui_dont_ask_again">Don\'t ask again</string>
     <string name="ui_waiting_for_x_to_accept">Waiting for %1$s to accept.</string>
     <string name="ui_x_didnt_respond">%1$s didn\'t respond. Ask them to scan your code directly.</string>

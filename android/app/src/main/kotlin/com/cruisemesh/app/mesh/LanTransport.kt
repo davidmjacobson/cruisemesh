@@ -805,7 +805,10 @@ internal class LanTransport(
                 port = it.port.toUShort(),
             )
         }
-        LanTransportDiagnostics.listening(localEndpoint?.display)
+        LanTransportDiagnostics.listening(
+            localEndpoint?.display,
+            localEndpoint?.let { prefixLengthFor(network, it.host) },
+        )
         Log.i(
             TAG,
             "LAN session ready on ${localEndpoint?.display ?: "the selected Wi-Fi network"}",
@@ -869,7 +872,7 @@ internal class LanTransport(
         endpointHint = hint
         ownHostAddresses = null
         ownHostAddressesAtMs = 0L
-        LanTransportDiagnostics.listening(endpoint.display)
+        LanTransportDiagnostics.listening(endpoint.display, prefixLengthFor(network, endpoint.host))
         Log.i(TAG, "This phone's local Wi-Fi address is now ${endpoint.display}")
         onNetworkReady(hint, currentNetworkId)
     }
@@ -2214,6 +2217,18 @@ internal class LanTransport(
             ?.firstOrNull { it.address == local }
             ?.prefixLength
             ?: DEFAULT_SCAN_PREFIX_LENGTH
+
+    /**
+     * The prefix length the network reports for this phone's own published
+     * [host], or null when no link address matches. Published with the
+     * endpoint so a LAN link is judged against the real subnet (a /16 ship
+     * network is one network), not a fixed /24.
+     */
+    private fun prefixLengthFor(network: Network, host: String): Int? =
+        connectivityManager.getLinkProperties(network)
+            ?.linkAddresses
+            ?.firstOrNull { it.address.hostAddress == host }
+            ?.prefixLength
 
     private fun isEligibleWifiNetwork(network: Network): Boolean {
         val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
