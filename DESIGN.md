@@ -295,7 +295,15 @@ Profile photos are **not** general chat media. They are durable contact metadata
 
 Per-message **sign-then-seal**:
 
-1. Plaintext body (§7.1) is signed with sender's Ed25519 key.
+1. Plaintext body (§7.1) is signed with sender's Ed25519 key. From envelope
+   version 2 the signature covers a domain-separated, length-framed transcript
+   that also names the **recipient's X25519 public key**
+   (`frame("cruisemesh/sealed-body/pairwise/v2") ‖ frame(recipient_agree_pk) ‖
+   sender_sign_pk ‖ frame(payload)`), and the recipient verifies it against its
+   own key. Without that binding a contact could keep a body someone sealed to
+   them and re-seal it to a third party, who would accept it as authentically
+   from the original author ("surreptitious forwarding"). Version 1 signed the
+   bare payload.
 2. Signed body is encrypted to the recipient's X25519 key with an ephemeral sender
    key — libsodium `crypto_box_seal` + embedded sender auth (i.e., HPKE-style ECIES).
 3. Padded to the next 256-byte bucket before sealing, so relays can't distinguish
@@ -308,6 +316,15 @@ exists to prevent. Per-message ephemeral keys give confidentiality and sender-si
 forward secrecy; we give up recipient-compromise forward secrecy. For "meet at the
 buffet," robustness wins. The envelope has a `version` byte precisely so a
 ratchet/PQ upgrade can ship later without a flag day.
+
+**Version 2 rollout.** Current builds open versions 1 and 2 but still seal
+version 1, because a build that predates version 2 fails closed on it and the
+message would never be shown. A later release flips the seal side to version 2
+(`SEAL_BOUND_SIGNATURE` in `core/src/crypto.rs`, which drives both the pairwise
+and the group seal version); until it does, and until the version-1 open path
+is removed, a version-1 body can still be forwarded as above. The removal
+conditions are written next to `ENVELOPE_VERSION_LEGACY`; both steps are
+tracked in issue #497.
 
 ### 6.4 What observers see
 
@@ -333,6 +350,10 @@ works when announcing is off.
   group costs N sealed invites, then one small envelope per message regardless of size.
 - Group messages: signed by sender's Ed25519 key, encrypted with the group key,
   addressed with a group `recipient_hint`. Members mule for the whole group by default.
+  From group envelope version 2 the signature uses its own domain
+  (`cruisemesh/sealed-body/group/v2`) and binds the group id, so a group body cannot
+  be replayed as a 1:1 body or into another group. Same open-both, seal-v1-for-now
+  rollout as §6.3.
 - Membership change ⇒ creator rotates the key and re-invites (a "remove" leaves the
   removed member able to read only pre-rotation traffic). Family-scale simplicity;
   no MLS.
@@ -377,6 +398,12 @@ kinds: text=1, receipt=2, friend-request=3, group-invite=4,
 
 The allocation lives in `core/src/protocol.rs` (`KIND_*`); that file is
 authoritative if this list ever drifts from it.
+
+The body above is what the sender signs, but from envelope version 2 the
+signature does not cover it alone: it covers the body framed together with the
+recipient's key (1:1) or the group id (groups), under a per-kind-of-seal domain
+(§6.3, §6.5). The `chat id` inside the body is still sender-chosen data; the
+binding is what proves the body was written for this recipient.
 
 The per-chat **lamport counter** orders messages when clocks drift and lets a
 recipient detect gaps ("message 12 arrived, 11 hasn't — keep waiting" shown as a

@@ -7,6 +7,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.createGraph
 import androidx.navigation.testing.TestNavHostController
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.cruisemesh.app.mesh.LanManualEndpoint
+import com.cruisemesh.app.mesh.lanEndpointLink
 import com.cruisemesh.app.notify.MessageNotifier
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -55,6 +57,20 @@ class NavigationRegressionUiTest {
             android.net.Uri.parse("https://cruisemesh.app/link#CMLINK1:AZoB"),
         )
         assertNull(derivePendingDeepLink(intent))
+    }
+
+    /**
+     * A LAN address link only names an address; deriving it must not dial.
+     * The confirmation is decided later by `decideLanEndpointLink`.
+     */
+    @Test
+    fun lanAddressLinkBecomesAPendingEndpointAndIsConsumed() {
+        val endpoint = LanManualEndpoint("192.168.86.23", 45_892)
+        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(lanEndpointLink(endpoint)))
+
+        assertEquals(PendingDeepLink(lanEndpoint = endpoint.display), derivePendingDeepLink(intent))
+        assertEquals(PendingDeepLink(lanEndpoint = endpoint.display), consumePendingDeepLink(intent))
+        assertNull(consumePendingDeepLink(intent))
     }
 
     @Test
