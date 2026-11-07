@@ -54,6 +54,11 @@ on:
       - "tools/run-ios-ui-tests.ps1"
       - ".github/workflows/ios.yml"
 
+# Least privilege for GITHUB_TOKEN: every job reads the repo and nothing
+# else unless it asks for more at job level.
+permissions:
+  contents: read
+
 jobs:
   ios:
     runs-on: macos-latest
@@ -62,19 +67,19 @@ jobs:
       matrix:
         profile: ${{ fromJSON((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.profiles == 'nightly')) && '["standard","compact-accessibility","ipad-dark"]' || '["standard"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Select latest stable Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
       - name: Install Rust stable + iOS targets
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -210,7 +215,7 @@ jobs:
 
       - name: Upload iOS test evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           # Always profile-suffixed: a multi-profile run uploads one artifact
           # per job, and two jobs sharing a name is an upload error.

@@ -299,8 +299,11 @@ final class CruiseMeshUITests: XCTestCase {
         let verify = app.buttons["Verify contact"]
         XCTAssertTrue(verify.waitForExistence(timeout: Self.uiTimeout))
         verify.tap()
+        // XCUIElementQuery subscripts reject identifiers over 128 characters,
+        // and this explanation is longer, so match its label with a predicate.
+        let verifyExplanation = "Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app."
         XCTAssertTrue(
-            app.staticTexts["Match these words with your friend's screen to confirm it's really them."]
+            app.staticTexts.matching(NSPredicate(format: "label == %@", verifyExplanation)).firstMatch
                 .waitForExistence(timeout: Self.uiTimeout)
         )
 
@@ -354,7 +357,14 @@ final class CruiseMeshUITests: XCTestCase {
         XCTAssertTrue(element("screen.chat-list").waitForExistence(timeout: Self.uiTimeout))
         openChat(named: "Bob")
         let newest = app.staticTexts["History message \(Self.seededHistoryCount)"]
-        XCTAssertTrue(newest.waitForExistence(timeout: Self.uiTimeout))
+        // A chat opens at its newest message. When this has failed it failed
+        // here, before the test's own scrolling began, so keep a picture of
+        // where the thread actually landed.
+        guard newest.waitForExistence(timeout: Self.uiTimeout) else {
+            attachScreenshot(named: "Chat-late-arrival-opened-without-newest")
+            XCTFail("Opening a long chat did not show its newest message")
+            return
+        }
 
         // Scrolling away from the newest message is this test's precondition,
         // not scene-setting: the jump action only exists while the reader is

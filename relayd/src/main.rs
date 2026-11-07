@@ -1,4 +1,5 @@
 use std::env;
+use std::net::SocketAddr;
 
 use tokio::net::TcpListener;
 use tracing::info;
@@ -89,6 +90,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(raw) = env::var("CRUISEMESH_RELAY_DEPOSIT_PRESENCE_WINDOW_SECS") {
         rate_limits.deposit_presence_window_secs = parse_presence_window_secs(&raw)?;
     }
+    // Pre-auth: credential rejects (401s) one client address may cause per
+    // minute before its requests are refused unread (see DEPLOY.md §10).
+    if let Ok(raw) = env::var("CRUISEMESH_RELAY_AUTH_REJECTS_PER_IP_PER_MIN") {
+        rate_limits.auth_rejects_per_ip_per_min = parse_rate_requests_per_min(&raw)?;
+    }
 
     let listener = TcpListener::bind(parse_bind(&bind)?).await?;
     let store = RelayStore::open(&db_path)?;
@@ -115,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_global_requests_per_min = rate_limits.global_requests_per_min,
         deposit_presence_queries = rate_limits.deposit_presence_queries,
         deposit_presence_window_secs = rate_limits.deposit_presence_window_secs,
+        auth_rejects_per_ip_per_min = rate_limits.auth_rejects_per_ip_per_min,
         prune_interval_secs = DEFAULT_PRUNE_INTERVAL.as_secs(),
         admin_api = admin_token.is_some(),
         apns_wakes = apns_enabled,
@@ -136,9 +143,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // Connect info: the pre-auth reject gate keys on the client address.
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

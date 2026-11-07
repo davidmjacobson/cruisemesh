@@ -79,7 +79,7 @@ on any change touching `ios/` or `core/`, and nightly.
 
 What works today: 1:1 and group messaging, delivery and read receipts, photos
 with drawing and push-to-talk voice messages (inline, up to 180 KiB), QR
-friending with a spoken 4-word fingerprint, friends-of-friends introductions,
+friending with a spoken 6-word fingerprint, friends-of-friends introductions,
 all four delivery routes above, block and report, and passphrase-encrypted
 local backup and restore.
 
