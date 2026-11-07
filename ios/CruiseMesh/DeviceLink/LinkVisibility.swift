@@ -44,7 +44,27 @@ enum LinkVisibility {
     /// This only *asks* for the change: the controller's work happens on its own
     /// serial queue, so the radios are still up when this returns. See
     /// `awaitApplied` for the caller that must not proceed until they are not.
+    ///
+    /// The controller is asked on every refresh, not only when the gate's answer
+    /// flips: a start that slipped past an earlier silence leaves the radios up
+    /// while the gate still reads "not allowed", and a flip-only refresh would
+    /// see nothing to do. Whether the running state disagrees with the gate is
+    /// only knowable on the controller's queue, so the decision is made there
+    /// and is a no-op when they agree.
     static func refresh(store: MessageStore) {
+        let next = readGate(store: store)
+        // Deliberately no optimistic write to `applied` here: it stays at what
+        // the radios are actually doing until the controller says otherwise, so
+        // `awaitApplied(false)` blocks rather than returning on a flag this
+        // function set for itself.
+        MeshController.shared.applyLinkVisibility(next) { markApplied(next) }
+    }
+
+    /// Read the core gate for advertising, failing closed, and record the
+    /// answer for `mayAdvertise`. Does not touch the radios; `refresh` is the
+    /// call that does.
+    @discardableResult
+    static func readGate(store: MessageStore) -> Bool {
         let next: Bool
         do {
             next = try store.linkGate(action: .advertise).allowed
@@ -53,15 +73,9 @@ enum LinkVisibility {
             next = false
         }
         lock.lock()
-        let changed = next != advertisingAllowed
         advertisingAllowed = next
         lock.unlock()
-        guard changed else { return }
-        // Deliberately no optimistic write to `applied` here: it stays at what
-        // the radios are actually doing until the controller says otherwise, so
-        // `awaitApplied(false)` blocks rather than returning on a flag this
-        // function set for itself.
-        MeshController.shared.applyLinkVisibility(next) { markApplied(next) }
+        return next
     }
 
     /// Block until the mesh controller has actually applied `target`.
