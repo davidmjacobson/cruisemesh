@@ -61,6 +61,16 @@
         }
       }
     },
+    "%@ isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again."
+          }
+        }
+      }
+    },
     "%@ received your message via %@ · %@": {
       "localizations": {
         "en": {
@@ -1035,6 +1045,16 @@
         }
       }
     },
+    "Can't connect to this address": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Can't connect to this address"
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -1261,6 +1281,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Connect"
+          }
+        }
+      }
+    },
+    "Connect to this address?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connect to this address?"
           }
         }
       }
@@ -1851,6 +1881,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Medium pen"
+          }
+        }
+      }
+    },
+    "Mesh is off": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mesh is off"
           }
         }
       }
@@ -3109,6 +3149,36 @@
           "stringUnit": {
             "state": "translated",
             "value": "This is the only device signed in as you. Add another and they will share your contacts, groups and messages."
+          }
+        }
+      }
+    },
+    "This link asks CruiseMesh to connect to %@ on your Wi-Fi. Only connect if someone you trust shared it with you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link asks CruiseMesh to connect to %@ on your Wi-Fi. Only connect if someone you trust shared it with you."
+          }
+        }
+      }
+    },
+    "This link points to %@, but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link points to %@, but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again."
+          }
+        }
+      }
+    },
+    "This link points to %@. Turn the mesh on, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link points to %@. Turn the mesh on, then open the link again."
           }
         }
       }
