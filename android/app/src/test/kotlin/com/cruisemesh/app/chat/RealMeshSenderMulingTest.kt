@@ -79,6 +79,7 @@ class RealMeshSenderMulingTest {
                 val candidates = listOf(
                     root.resolve("target/debug/cruisemesh_core.dll"),
                     root.resolve("target/debug/libcruisemesh_core.so"),
+                    root.resolve("target/debug/libcruisemesh_core.dylib"),
                 ).map { it.normalize() }
                 val found = candidates.firstOrNull { it.isRegularFile() }
                 if (found != null) {
