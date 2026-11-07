@@ -48,11 +48,18 @@ on every pull request, every push to `master`, and once a day. If this page and
 that file ever disagree, that is a bug in one of them; fix both in the same
 change.
 
+The Rust rules below apply to every `Cargo.lock` in the repository, each
+checked against the same `deny.toml`: the root workspace (`core`, `relayd`,
+`desktop`), the Windows messenger's Tauri host (`desktop/ui/src-tauri`, its own
+workspace) and the fuzz harness (`fuzz/`, its own workspace). The messenger's
+JavaScript dependencies (`desktop/ui/package-lock.json`) are covered by
+`npm audit` in the same workflow, under the narrower rule stated below.
+
 ### What blocks a release
 
 A release is cut from a tag, and a tag is pushed only at a commit whose
-`Dependency audit` job is green on `master`. That job fails — and therefore the
-release does not happen — when any of these is true:
+`Dependency audit` workflow is green on `master`. That workflow fails — and
+therefore the release does not happen — when any of these is true:
 
 - **A security advisory applies to the dependency graph**: any RustSec
   advisory, at any severity. There is no threshold below which one is waved
@@ -66,6 +73,11 @@ release does not happen — when any of these is true:
 - **A dependency comes from anywhere but crates.io.** A git dependency or a
   second registry is code with no published provenance and no advisory
   database behind it.
+- **An npm advisory rated high or critical applies to the messenger frontend's
+  dependency graph.** `npm audit` runs with `--audit-level=high`, so moderate
+  and low npm advisories do not fail the job; they still fall under the
+  deadlines below once known. The npm graph has no yanked, unmaintained,
+  license or source check — those rules are enforced for Rust crates only.
 
 Duplicate versions of one crate are the deliberate exception: they warn and do
 not fail. That is a binary-size and tidiness matter, and the graph carries a
@@ -129,10 +141,19 @@ library- and file-scoped and are compatible with shipping a store binary.
 Stronger copyleft inside a dependency is a decision for a human, and is
 deliberately absent from the list.
 
+A license may also be accepted for one named crate only, without joining the
+allowlist. Each such exception lives in `deny.toml` with its reason:
+
+- `CC0-1.0` for `tiny-keccak` — a public-domain dedication, used only at
+  compile time in the Tauri host's graph.
+- `NCSA` for `libfuzzer-sys` — libFuzzer's permissive license, in the fuzz
+  harness only, never in a shipped binary.
+
 ### Dependency updates
 
 [Dependabot](.github/dependabot.yml) opens weekly update pull requests for
-Cargo, Gradle and GitHub Actions. Those pull requests run the same audit as
+each of the three Cargo lockfiles above, the messenger's npm dependencies,
+Gradle and GitHub Actions. Those pull requests run the same audit as
 everything else. They are a convenience for staying current, not the mechanism
 that enforces any of the above.
 

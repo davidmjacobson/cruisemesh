@@ -71,11 +71,21 @@ limits.
 - **UserID** = first 16 bytes of BLAKE2b(Ed25519 public key), shown base32
   for out-of-band sharing.
 - **Friending** exchanges names and both public keys via QR code or pasted
-  string, normally in person. Contact cards display a 4-word fingerprint
-  phrase for verbal verification (Signal-safety-number style). Trust is
-  TOFU-with-verification: the QR/string you scanned *is* the key you talk
-  to; verify the phrase aloud if you didn't control the channel.
-- **Card self-signature.** The 4-word fingerprint is derived from the UserID,
+  string, normally in person. Contact cards display a 6-word fingerprint
+  phrase ("safety words") for verbal verification (Signal-safety-number
+  style). Trust is TOFU-with-verification: the QR/string you scanned *is* the
+  key you talk to; verify the phrase aloud if you didn't control the channel.
+  The phrase is six words from the 2048-word BIP-39 English list, taken as
+  six 11-bit chunks of `BLAKE2b-256("cruisemesh-safety-words-v1" ‖ UserID)`
+  (`fingerprint_words`, `core/src/identity.rs`, pinned by a golden vector).
+  That is **66 bits**: forging a signing key whose words match a target's
+  costs ~2^66 hashes, beyond a casual or opportunistic attacker but short of
+  the full 128-bit UserID. Comparing the full `CM-…` UserID is the stronger
+  check for anyone who wants it. (Before this, the phrase was 4 words from a
+  64-word list over the first 4 UserID bytes — only 24 bits, forgeable in
+  about a minute on a laptop; old and new builds therefore show different
+  words for the same person until both sides update.)
+- **Card self-signature.** The 6-word fingerprint is derived from the UserID,
   i.e. from the Ed25519 signing key alone — it does *not* cover the X25519
   agreement key or the relay fields. To stop a key-substitution swap on a
   tamperable sharing channel (a card forwarded as text, with `agree_pk`
@@ -101,16 +111,30 @@ Per-message **sign-then-seal**, using libsodium constructions whole:
 
 1. The plaintext body (which includes sender ID, chat ID, a per-chat Lamport
    counter, timestamp, and payload) is **signed** with the sender's Ed25519
-   key.
+   key. From envelope version 2 the signature covers a domain-separated,
+   length-framed transcript that also names the **recipient's X25519 public
+   key**, and the recipient verifies it against its own key. This stops
+   *surreptitious forwarding*: a contact who received your message cannot
+   re-seal it to someone else and have it accepted as written by you.
 2. The signed body is **sealed** to the recipient's X25519 key with an
    ephemeral sender key (`crypto_box_seal`-style ECIES with embedded sender
    authentication).
 3. Plaintext is **padded to the next 256-byte bucket** before sealing so
    observers can't distinguish "ok" from a paragraph.
 
+**Rollout of the recipient binding.** Current builds open both version 1
+(bare-payload signature) and version 2, and still *seal* version 1 so family
+members on older builds keep receiving messages; a later release switches
+sealing to version 2. Until then — and until the version-1 open path is
+removed — a version-1 message can still be forwarded as described above. A
+version-2 envelope is never accepted under the version-1 rule, and a version-2
+body cannot be relabelled as version 1.
+
 Groups use a shared symmetric **XChaCha20-Poly1305 group key**, distributed
 pairwise-sealed (as above) by the group creator; group messages are signed by
-the individual sender then encrypted with the group key. Membership removal
+the individual sender then encrypted with the group key. Version-2 group
+signatures use a separate domain bound to the group id, so a group message
+cannot be replayed as a 1:1 message or into another group. Membership removal
 rotates the key and re-invites; a removed member can read only pre-rotation
 traffic. This is family-scale group crypto by intent — no MLS, no tree KEMs.
 

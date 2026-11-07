@@ -24,10 +24,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -36,6 +38,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -105,7 +108,10 @@ import com.cruisemesh.app.identity.ProfileStore
 import com.cruisemesh.app.media.createCameraCaptureUri
 import com.cruisemesh.app.mesh.ChatViewEvents
 import com.cruisemesh.app.mesh.ContactReachability
+import com.cruisemesh.app.mesh.LanEndpointLinkDecision
+import com.cruisemesh.app.mesh.LanManualEndpoint
 import com.cruisemesh.app.mesh.LanTransportDiagnostics
+import com.cruisemesh.app.mesh.LanTransportSnapshot
 import com.cruisemesh.app.mesh.MeshConnectivityStatus
 import com.cruisemesh.app.mesh.MeshRuntimeState
 import com.cruisemesh.app.mesh.MeshRuntimeStatus
@@ -114,6 +120,7 @@ import com.cruisemesh.app.mesh.MeshStartupPreferences
 import com.cruisemesh.app.mesh.shouldStartMeshOnAppOpen
 import com.cruisemesh.app.mesh.ReachabilityLevel
 import com.cruisemesh.app.mesh.RelayHealth
+import com.cruisemesh.app.mesh.decideLanEndpointLink
 import com.cruisemesh.app.mesh.parseLanEndpointLink
 import com.cruisemesh.app.mesh.parseLanManualEndpoint
 import com.cruisemesh.app.notify.ChatVisibility
@@ -296,6 +303,13 @@ fun CruiseMeshApp(
         IdentityStore.load(context) ?: generateIdentity().also { IdentityStore.save(context, it) }
     }
     val navController = rememberNavController()
+    // A tapped LAN address link waits here for the person's answer; see
+    // [LanEndpointLinkDecision] for why a link never dials on its own. Only the
+    // address is held (saved across rotation, since the deep link itself is
+    // already consumed); the decision is derived from live mesh and Wi-Fi
+    // state, so a link opened while the mesh is still starting turns into a
+    // question once the phone has its Wi-Fi address.
+    var pendingLanLink by rememberSaveable { mutableStateOf<String?>(null) }
     var termsAccepted by remember {
         mutableStateOf(TermsAcceptanceStore.isCurrentVersionAccepted(context))
     }
@@ -563,13 +577,7 @@ fun CruiseMeshApp(
         }
         link.lanEndpoint?.let { endpointText ->
             val endpoint = parseLanManualEndpoint(endpointText, lanDefaultTcpPort().toInt())
-            if (endpoint != null) {
-                LanTransportDiagnostics.queueManualConnection(endpoint)
-                if (MeshRuntimeStatus.state.value == MeshRuntimeState.STOPPED) {
-                    startMesh(context)
-                }
-                navController.navigate("profile") { launchSingleTop = true }
-            }
+            if (endpoint != null) pendingLanLink = endpoint.display
             onPendingDeepLinkConsumed()
             return@LaunchedEffect
         }
@@ -580,6 +588,89 @@ fun CruiseMeshApp(
         }
         onPendingDeepLinkConsumed()
     }
+
+    // The held text is an endpoint this code already parsed, so it re-parses.
+    pendingLanLink?.let { parseLanManualEndpoint(it, lanDefaultTcpPort().toInt()) }?.let { endpoint ->
+        val meshState by MeshRuntimeStatus.state.collectAsState()
+        val lanState by LanTransportDiagnostics.state.collectAsState()
+        val decision = lanEndpointLinkDecision(endpoint, meshState, lanState)
+        LanEndpointLinkDialog(
+            decision = decision,
+            onConnect = {
+                // Ask again at the moment of the yes: the mesh or the Wi-Fi
+                // network may have changed since the dialog last drew. A
+                // changed answer simply redraws the dialog with the reason.
+                val current = lanEndpointLinkDecision(
+                    endpoint,
+                    MeshRuntimeStatus.state.value,
+                    LanTransportDiagnostics.state.value,
+                )
+                if (current is LanEndpointLinkDecision.Confirm) {
+                    pendingLanLink = null
+                    LanTransportDiagnostics.queueManualConnection(current.endpoint)
+                    navController.navigate("profile") { launchSingleTop = true }
+                }
+            },
+            onDismiss = { pendingLanLink = null },
+        )
+    }
+}
+
+private fun lanEndpointLinkDecision(
+    endpoint: LanManualEndpoint,
+    meshState: MeshRuntimeState,
+    lanState: LanTransportSnapshot,
+): LanEndpointLinkDecision =
+    decideLanEndpointLink(
+        endpoint = endpoint,
+        meshRunning = meshState != MeshRuntimeState.STOPPED,
+        localEndpoint = lanState.localEndpoint,
+        localPrefixLength = lanState.localPrefixLength,
+    )
+
+/**
+ * The only door from a LAN address link to a connection: it names the
+ * address, and only [LanEndpointLinkDecision.Confirm] offers to connect.
+ */
+@Composable
+private fun LanEndpointLinkDialog(
+    decision: LanEndpointLinkDecision,
+    onConnect: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val address = decision.endpoint.display
+    val (title, body) = when (decision) {
+        is LanEndpointLinkDecision.Confirm ->
+            stringResource(R.string.ui_lan_link_confirm_title) to
+                stringResource(R.string.ui_lan_link_confirm_body, address)
+        is LanEndpointLinkDecision.MeshOff ->
+            stringResource(R.string.ui_lan_link_mesh_off_title) to
+                stringResource(R.string.ui_lan_link_mesh_off_body, address)
+        is LanEndpointLinkDecision.NoWifi ->
+            stringResource(R.string.ui_lan_link_refused_title) to
+                stringResource(R.string.ui_lan_link_no_wifi_body, address)
+        is LanEndpointLinkDecision.OtherNetwork ->
+            stringResource(R.string.ui_lan_link_refused_title) to
+                stringResource(R.string.ui_lan_link_other_network_body, address)
+    }
+    val confirming = decision is LanEndpointLinkDecision.Confirm
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(body) },
+        confirmButton = {
+            if (confirming) {
+                TextButton(onClick = onConnect) { Text(stringResource(R.string.ui_connect)) }
+            } else {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_close)) }
+            }
+        },
+        dismissButton = if (confirming) {
+            { TextButton(onClick = onDismiss) { Text(stringResource(R.string.ui_cancel)) } }
+        } else {
+            null
+        },
+    )
 }
 
 @Composable

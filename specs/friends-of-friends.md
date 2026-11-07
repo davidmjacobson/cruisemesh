@@ -150,7 +150,7 @@ friend** is enough.
 The confirmation sheet shows:
 
 - display name and formatted UserID;
-- the four fingerprint words;
+- the six fingerprint words;
 - “Introduced by Alice” (or all mutual friends);
 - the existing same-name/different-key warning;
 - honest delivery copy if no relay is configured: the request will wait for a
