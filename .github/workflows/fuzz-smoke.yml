@@ -37,12 +37,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust nightly
         id: nightly
-        uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # nightly
       # FR9: caches cargo's registry/git indexes and the `fuzz/` crate's own
       # target dir (a separate, non-workspace crate -- see fuzz/Cargo.toml).
       # Every matrix job previously cold-compiled cruisemesh-core + all its
       # deps from scratch.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
           # One cache lineage per fuzz target so ble_reassembly's build
