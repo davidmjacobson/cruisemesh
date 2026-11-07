@@ -61,6 +61,16 @@
         }
       }
     },
+    "%@ isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "%@ isn't on the Wi-Fi network this phone is using. Join the same Wi-Fi network, then open the link again."
+          }
+        }
+      }
+    },
     "%@ received your message via %@ · %@": {
       "localizations": {
         "en": {
@@ -795,12 +805,12 @@
         }
       }
     },
-    "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.": {
+    "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them. If the number of words differs, make sure you both have the latest app.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them."
+            "value": "Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them. If the number of words differs, make sure you both have the latest app."
           }
         }
       }
@@ -1035,6 +1045,16 @@
         }
       }
     },
+    "Can't connect to this address": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Can't connect to this address"
+          }
+        }
+      }
+    },
     "Cancel": {
       "localizations": {
         "en": {
@@ -1261,6 +1281,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Connect"
+          }
+        }
+      }
+    },
+    "Connect to this address?": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Connect to this address?"
           }
         }
       }
@@ -1851,6 +1881,16 @@
           "stringUnit": {
             "state": "translated",
             "value": "Medium pen"
+          }
+        }
+      }
+    },
+    "Mesh is off": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Mesh is off"
           }
         }
       }
@@ -3113,6 +3153,36 @@
         }
       }
     },
+    "This link asks CruiseMesh to connect to %@ on your Wi-Fi. Only connect if someone you trust shared it with you.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link asks CruiseMesh to connect to %@ on your Wi-Fi. Only connect if someone you trust shared it with you."
+          }
+        }
+      }
+    },
+    "This link points to %@, but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link points to %@, but this phone isn't on Wi-Fi. Join the same Wi-Fi network, then open the link again."
+          }
+        }
+      }
+    },
+    "This link points to %@. Turn the mesh on, then open the link again.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This link points to %@. Turn the mesh on, then open the link again."
+          }
+        }
+      }
+    },
     "This phone": {
       "localizations": {
         "en": {
@@ -3653,12 +3723,12 @@
         }
       }
     },
-    "Have your friend match these words against your name in their contacts to confirm it's really you.": {
+    "Have your friend match these words against your name in their contacts to confirm it's really you. If the number of words differs, make sure you both have the latest app.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Have your friend match these words against your name in their contacts to confirm it's really you."
+            "value": "Have your friend match these words against your name in their contacts to confirm it's really you. If the number of words differs, make sure you both have the latest app."
           }
         }
       }
@@ -3823,12 +3893,12 @@
         }
       }
     },
-    "Match these words with your friend's screen to confirm it's really them.": {
+    "Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app.": {
       "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "Match these words with your friend's screen to confirm it's really them."
+            "value": "Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app."
           }
         }
       }

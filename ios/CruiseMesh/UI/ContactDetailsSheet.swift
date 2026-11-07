@@ -182,8 +182,14 @@ struct ContactDetailsSheet: View {
 
                     DisclosureGroup(isExpanded: $showVerification) {
                         VStack(alignment: .leading, spacing: 12) {
-                            HStack(spacing: 8) {
-                                ForEach(fingerprint, id: \.self) { word in
+                            // Six words: two rows of three so each word keeps
+                            // enough width to read on a phone-width sheet.
+                            // Indexed, not keyed by word: a phrase can repeat one.
+                            LazyVGrid(
+                                columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3),
+                                spacing: 8
+                            ) {
+                                ForEach(Array(fingerprint.enumerated()), id: \.offset) { _, word in
                                     Text(word)
                                         .font(.subheadline.weight(.medium))
                                         .frame(maxWidth: .infinity)
@@ -194,7 +200,7 @@ struct ContactDetailsSheet: View {
                                         )
                                 }
                             }
-                            Text("Match these words with your friend's screen to confirm it's really them.")
+                            Text("Match these words with your friend's screen to confirm it's really them. If the number of words differs, make sure you both have the latest app.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }

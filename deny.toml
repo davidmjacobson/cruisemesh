@@ -33,6 +33,7 @@ unmaintained = "all"
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.x unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained, not a vulnerability. Transitive; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml unmaintained, not a vulnerability. Compile-time only: a dependency of the askama_derive proc-macro in uniffi 0.28's build tooling, with no runtime path into the shipped apps or relayd. Goes away with a uniffi upgrade. Reviewed at each release." },
     # Tauri messenger host (desktop/ui/src-tauri/Cargo.lock) only.
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained, not a vulnerability. Compile-time only, via glib-macros in Tauri's Linux GTK stack; the shipped Windows build does not link it. Reviewed at each release." },
     { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
@@ -40,6 +41,9 @@ ignore = [
     { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
     { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
     { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained, not a vulnerability. Transitive via tauri-utils -> urlpattern 0.3; replacing it is upstream's call. Reviewed at each release." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained, not a vulnerability; merged into zbus 6. Linux only, via zbus 5 in notify-rust and tauri-plugin-single-instance; the Tauri host only compiles for Windows, so the shipped build does not link it. Drop when both move to zbus 6, and re-assess before any Linux desktop build. Reviewed at each release." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained, not a vulnerability; merged into zbus 6. Linux only, via zbus 5 in notify-rust and tauri-plugin-single-instance; the Tauri host only compiles for Windows, so the shipped build does not link it. Drop when both move to zbus 6, and re-assess before any Linux desktop build. Reviewed at each release." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained, not a vulnerability; merged into zbus 6. Linux only, via zbus 5 in notify-rust and tauri-plugin-single-instance; the Tauri host only compiles for Windows, so the shipped build does not link it. Drop when both move to zbus 6, and re-assess before any Linux desktop build. Reviewed at each release." },
 ]
 
 [licenses]

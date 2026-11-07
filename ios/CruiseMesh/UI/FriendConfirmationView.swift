@@ -157,7 +157,7 @@ struct FriendPreviewView: View {
                     .multilineTextAlignment(.center)
                 SafetyWordsRow(label: String(localized: "This card"), userId: state.contact.userId)
                 SafetyWordsRow(label: otherName, userId: otherUserId)
-                Text("Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them.")
+                Text("Ask them to read their safety words aloud from Profile, Verify my identity. Different words mean different people — add this card and nickname one of them. If the number of words differs, make sure you both have the latest app.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
