@@ -5,6 +5,25 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 3
+  # Excluded from the root workspace, so it has its own Cargo.lock that the
+  # root entry above never touches: the Tauri messenger host.
+  - package-ecosystem: cargo
+    directory: /desktop/ui/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  # The fuzz crate is its own workspace with its own Cargo.lock.
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+  # The messenger frontend and the Tauri CLI that builds it.
+  - package-ecosystem: npm
+    directory: /desktop/ui
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
   - package-ecosystem: gradle
     directory: /android
     schedule:

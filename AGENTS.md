@@ -17,6 +17,22 @@ CI does not close that gap for you either. The Linux job runs
 `cargo test --workspace --exclude cruisemesh-node`; the desktop crate is
 built and tested only by the separate Windows job in the same workflow.
 
+## Fuzz lockfile follows the root lockfile
+
+`fuzz/` is its own workspace with a committed `fuzz/Cargo.lock`, and the
+fuzz-smoke workflow fails all five targets if that lock is stale. Any change
+that moves core's dependency graph in the root `Cargo.lock` (a new or changed
+dependency in `core/Cargo.toml`, a `cargo update -p` for an advisory, or a root
+Dependabot bump that reaches core) must rebuild it in the same change:
+
+```sh
+cp Cargo.lock fuzz/Cargo.lock
+cargo metadata --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
+```
+
+Root Dependabot PRs do not do this for you; push the refreshed lock onto the
+Dependabot branch. Details in [fuzz/README.md](fuzz/README.md).
+
 ## Android and iOS parity
 
 Treat Android and iOS as peer shells by default. For every user-visible feature,

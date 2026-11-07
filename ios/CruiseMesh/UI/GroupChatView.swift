@@ -408,12 +408,24 @@ struct GroupChatView: View {
         "\(UserIdHex.encode(message.senderUserId))-\(message.lamport)-\(message.kind)"
     }
 
-    private func scrollToLatest(proxy: ScrollViewProxy, animated: Bool = true) {
+    /// Scrolls to the newest message and retries if the bottom of the thread
+    /// did not come into view. Same LazyVStack undershoot and same bounded
+    /// correction as `ChatView.scrollToLatest`; keep the two in step.
+    private func scrollToLatest(
+        proxy: ScrollViewProxy,
+        animated: Bool = true,
+        attemptsLeft: Int = 2
+    ) {
         guard let last = rows.last else { return }
         if animated {
-            withAnimation { proxy.scrollTo(last.rowId, anchor: .bottom) }
+            withAnimation { proxy.scrollTo(conversationBottomId, anchor: .bottom) }
         } else {
-            proxy.scrollTo(last.rowId, anchor: .bottom)
+            proxy.scrollTo(conversationBottomId, anchor: .bottom)
+        }
+        guard attemptsLeft > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.5 : 0.15)) {
+            guard !isNearConversationBottom, rows.last?.rowId == last.rowId else { return }
+            scrollToLatest(proxy: proxy, animated: false, attemptsLeft: attemptsLeft - 1)
         }
     }
 
