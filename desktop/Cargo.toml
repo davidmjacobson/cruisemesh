@@ -13,7 +13,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 cruisemesh-core = { path = "../core" }
 futures-util = "0.3"
-if-addrs = "0.14"
+if-addrs = "0.15"
 mdns-sd = "0.15"
 rand = "0.8"
 qrcode = { version = "0.14", default-features = false }
